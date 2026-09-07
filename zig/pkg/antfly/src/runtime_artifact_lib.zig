@@ -42,6 +42,7 @@ const cli_runtime = if (unit_options.unit == .cli) @import("cli_runtime.zig") el
 // archive does not code-generate a second copy of the HA storage closure.
 const ha_runtime = if (unit_options.unit == .distributed) @import("cmd/ha.zig") else struct {};
 const data_runtime = if (unit_options.unit == .distributed) @import("data/runtime.zig") else struct {};
+const graph_metric_maintenance_runtime = if (unit_options.unit == .distributed) @import("cmd/graph_metric_maintenance.zig") else struct {};
 const metadata_runtime = if (unit_options.unit == .distributed) @import("metadata/runtime.zig") else struct {};
 const serverless_runtime = if (unit_options.unit == .serverless) @import("cmd/serverless.zig") else struct {};
 const inference_runtime = if (unit_options.unit == .inference) @import("inference_runtime/runtime.zig") else struct {};
@@ -224,6 +225,10 @@ fn runData(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterat
     return data_runtime.runFromIterator(init, "antfly", args);
 }
 
+fn runGraphMetricMaintenance(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+    return graph_metric_maintenance_runtime.runFromIterator(init, "antfly", args);
+}
+
 fn runHa(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
     return ha_runtime.runFromIterator(init, "antfly", args);
 }
@@ -251,6 +256,10 @@ fn cliEntry(context: *const bridge.Context) callconv(.c) c_int {
 
 fn dataEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "data", runData);
+}
+
+fn graphMetricMaintenanceEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "graph_metric_maintenance", runGraphMetricMaintenance);
 }
 
 fn haEntry(context: *const bridge.Context) callconv(.c) c_int {
@@ -288,6 +297,7 @@ comptime {
             // C ABI library names link this exact compiled artifact.
             _ = storage_kernel_exports;
             exportInternal(&dataEntry, "antfly_runtime_data");
+            exportInternal(&graphMetricMaintenanceEntry, "antfly_runtime_graph_metric_maintenance");
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");

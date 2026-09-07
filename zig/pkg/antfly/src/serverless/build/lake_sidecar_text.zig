@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const artifact_ref = @import("../manifest/artifact_ref.zig");
 const artifact_store = @import("../artifacts/store.zig");
 const indexed_reader = @import("../query/indexed_reader.zig");
@@ -36,6 +37,7 @@ pub const TextSidecarBuildOptions = struct {
     config_json: []const u8 = "{}",
     artifact_id: []const u8 = &.{},
     limits: lake_build_limits.Limits = .{},
+    cancellation: CancellationToken = .none,
 };
 
 pub const TextSidecarBuildResult = struct {
@@ -91,7 +93,9 @@ fn buildTextSidecarBoundedAlloc(
     }
     var posting_count: usize = 0;
 
-    while (try source.next(alloc)) |batch| {
+    while (true) {
+        try options.cancellation.check();
+        const batch = try source.next(alloc) orelse break;
         try budget.admitBatch(batch);
         try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
             .name = options.name,
@@ -185,7 +189,7 @@ pub fn publishTextSidecarFromRowSourceAlloc(
     defer alloc.free(built.payload);
     errdefer freeOwnedDeclaration(alloc, built.declaration);
 
-    var metadata = try artifacts.put(built.payload);
+    var metadata = try artifacts.putWithCancellation(built.payload, options.cancellation);
     var metadata_owned = true;
     errdefer if (metadata_owned) metadata.deinit(alloc);
 

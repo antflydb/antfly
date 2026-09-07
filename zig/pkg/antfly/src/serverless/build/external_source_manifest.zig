@@ -27,6 +27,20 @@ pub const PublishedArtifact = struct {
     byte_len: u64,
     checksum: []const u8,
     name: []const u8 = &.{},
+    metadata_version: u16 = 0,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    computed_at_ms: u64 = 0,
+    materializer_fingerprint: u64 = 0,
+    graph_metric_control_len: u32 = 0,
+    graph_metric_routing_footer_len: u32 = 0,
+    graph_metric_control_checksum: [32]u8 = @splat(0),
+    graph_metric_routing_checksum: [32]u8 = @splat(0),
+    graph_metric_point_index_checksum: [32]u8 = @splat(0),
+    graph_metric_config_fingerprint: u64 = 0,
+    graph_metric_source_checksum: [32]u8 = @splat(0),
+    graph_metric_materialization_state: manifest_artifact.GraphMetricMaterializationState = .ready,
+    graph_metric_rejection_reason: manifest_artifact.GraphMetricRejectionReason = .none,
 };
 
 pub const Plan = struct {
@@ -189,6 +203,20 @@ fn cloneArtifactRef(
         .artifact_id = try alloc.dupe(u8, artifact.artifact_id),
         .byte_len = artifact.byte_len,
         .checksum = try alloc.dupe(u8, artifact.checksum),
+        .metadata_version = artifact.metadata_version,
+        .published_generation = artifact.published_generation,
+        .edge_generation = artifact.edge_generation,
+        .computed_at_ms = artifact.computed_at_ms,
+        .materializer_fingerprint = artifact.materializer_fingerprint,
+        .graph_metric_control_len = artifact.graph_metric_control_len,
+        .graph_metric_routing_footer_len = artifact.graph_metric_routing_footer_len,
+        .graph_metric_control_checksum = artifact.graph_metric_control_checksum,
+        .graph_metric_routing_checksum = artifact.graph_metric_routing_checksum,
+        .graph_metric_point_index_checksum = artifact.graph_metric_point_index_checksum,
+        .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
+        .graph_metric_source_checksum = artifact.graph_metric_source_checksum,
+        .graph_metric_materialization_state = artifact.graph_metric_materialization_state,
+        .graph_metric_rejection_reason = artifact.graph_metric_rejection_reason,
     };
 }
 
@@ -210,6 +238,20 @@ fn cloneAppendedArtifactsAlloc(
             .byte_len = artifact.byte_len,
             .checksum = artifact.checksum,
             .name = artifact.name,
+            .metadata_version = artifact.metadata_version,
+            .published_generation = artifact.published_generation,
+            .edge_generation = artifact.edge_generation,
+            .computed_at_ms = artifact.computed_at_ms,
+            .materializer_fingerprint = artifact.materializer_fingerprint,
+            .graph_metric_control_len = artifact.graph_metric_control_len,
+            .graph_metric_routing_footer_len = artifact.graph_metric_routing_footer_len,
+            .graph_metric_control_checksum = artifact.graph_metric_control_checksum,
+            .graph_metric_routing_checksum = artifact.graph_metric_routing_checksum,
+            .graph_metric_point_index_checksum = artifact.graph_metric_point_index_checksum,
+            .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
+            .graph_metric_source_checksum = artifact.graph_metric_source_checksum,
+            .graph_metric_materialization_state = artifact.graph_metric_materialization_state,
+            .graph_metric_rejection_reason = artifact.graph_metric_rejection_reason,
         });
         initialized += 1;
     }
@@ -219,6 +261,20 @@ fn cloneAppendedArtifactsAlloc(
             .byte_len = artifact.byte_len,
             .checksum = artifact.checksum,
             .name = artifact.name,
+            .metadata_version = artifact.metadata_version,
+            .published_generation = artifact.published_generation,
+            .edge_generation = artifact.edge_generation,
+            .computed_at_ms = artifact.computed_at_ms,
+            .materializer_fingerprint = artifact.materializer_fingerprint,
+            .graph_metric_control_len = artifact.graph_metric_control_len,
+            .graph_metric_routing_footer_len = artifact.graph_metric_routing_footer_len,
+            .graph_metric_control_checksum = artifact.graph_metric_control_checksum,
+            .graph_metric_routing_checksum = artifact.graph_metric_routing_checksum,
+            .graph_metric_point_index_checksum = artifact.graph_metric_point_index_checksum,
+            .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
+            .graph_metric_source_checksum = artifact.graph_metric_source_checksum,
+            .graph_metric_materialization_state = artifact.graph_metric_materialization_state,
+            .graph_metric_rejection_reason = artifact.graph_metric_rejection_reason,
         });
         initialized += 1;
     }

@@ -37,6 +37,7 @@ const selectTestFilters = antfly_tests_build.selectTestFilters;
 const RuntimeArtifactRole = enum {
     cli,
     data,
+    graph_metric_maintenance,
     inference,
     metadata,
     standalone,
@@ -1457,7 +1458,7 @@ pub fn build(b: *std.Build) void {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
-    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
+    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, graph_metric_maintenance, inference, metadata, or standalone");
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -2171,6 +2172,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, api_http_runtime_test_mod, true, true);
+
+    const api_graph_metric_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_graph_metric_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_graph_metric_test_mod, true, true);
 
     const metadata_unit_baseline_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_reconciler_test_root.zig",
@@ -4144,6 +4152,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
     addRuntimeTestFilters(b, run_lib_unit_tests, lib_unit_filters);
+    // The broad root discovery anchor may retain API tests after a merge adds
+    // imports. Keep this stateful error-path test in its dedicated API shards.
+    run_lib_unit_tests.addArgs(&.{
+        "--skip-test-filter",
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+    });
     for (root_test_skip_filters) |filter| {
         run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -4234,6 +4248,7 @@ pub fn build(b: *std.Build) void {
         "local inference connection ABI retains C layout and validates capabilities",
         "local inference response validation contains malformed ownership",
         "inference connection invocation requires inference write permission",
+        "graph metric operational actions require table admin permission",
         "httpx inference connection preserves upstream retry guidance",
         "typed internal HTTP errors preserve conflict semantics",
         "internal transaction HTTP responses prove not-proposed only before decision",
@@ -4337,6 +4352,27 @@ pub fn build(b: *std.Build) void {
     const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
     cmd_test_step.dependOn(&run_cmd_tests.step);
+
+    const graph_metric_command_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cmd_graph_metric_maintenance_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, graph_metric_command_test_mod, true, true);
+    graph_metric_command_test_mod.addImport("antfly-zig", lib_mod);
+    graph_metric_command_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    const graph_metric_command_tests = b.addTest(.{
+        .root_module = graph_metric_command_test_mod,
+        .filters = &.{"cmd.graph_metric_maintenance.test.graph metric maintenance"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_command_tests = addFilteredTestRunArtifact(b, graph_metric_command_tests);
+    const graph_metric_command_test_step = b.step("graph-metric-command-test", "Run graph metric maintenance CLI and supervisor tests");
+    graph_metric_command_test_step.dependOn(&run_graph_metric_command_tests.step);
+    cmd_test_step.dependOn(&run_graph_metric_command_tests.step);
 
     const lite_cmd_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_cmd_test.zig"),
@@ -8375,6 +8411,241 @@ pub fn build(b: *std.Build) void {
     storage_vopr_step.dependOn(&run_db_split_vopr_tests.step);
     sim_test_step.dependOn(storage_vopr_step);
 
+    const graph_metric_unit_filters = [_][]const u8{
+        "graph metric runtime config rejects",
+        "graph metric runtime role gates apply",
+        "graph metric runtime worker pool identity",
+        "graph metric runtime boundary tick",
+        "graph metric runtime retirement",
+        "ownership state tracks lease takeover and loss",
+        "ownership state renews only at the cached renewal deadline",
+        "graph metric query shape bounds clauses and unique dependencies",
+        "borrowed graph metric names do not allocate per node",
+        "graph metric column selection retains deterministic bounded top k",
+        "graph metric shared column application is allocation-failure safe",
+        "graph metric stable row materialization moves nodes once and is allocation-failure safe",
+        "graph metric order and filter dependencies attach status without projection",
+        "graph metric order and filter apply max results after metric processing",
+        "shortest path metric filtering evaluates the complete bounded candidate set",
+        "pattern metric filtering evaluates matches beyond the response limit",
+        "graph both direction emits one physical self loop and preserves reciprocal edges",
+        "graph durable writes reject invalid edge types before mutation",
+        "graph bounded adjacency pages preserve order and fail before budget overflow",
+        "graph edge encoding round-trip",
+        "graph metric reverse edge parser borrows ordinary keys and owns escaped components",
+        "graph storage rejects non-finite edge weights",
+        "graph metric metadata preserves score epoch input and decodes v3",
+        "graph metric edge filter equality and fingerprint treat types as set",
+        "graph metric rebuild at unchanged edge generation publishes an isolated score epoch",
+        "graph metric native rank index retains only the supported top-k prefix",
+        "graph degree scan attempt adoption resumes in bounded pages",
+        "graph degree scan page reclaim recomputes without double counting partials",
+        "graph degree large-build summary counts filtered materialization without coordinator scan",
+        "graph metric large-build summary",
+        "graph metric vector chunks",
+        "graph metric ordinal",
+        "graph metric consumer barrier",
+        "ordinal blocks",
+        "graph degree planned build honors edge filter during scan page execution",
+        "graph metric filtered scan checkpoints advance past excluded edges",
+        "graph metric partition spans remain balanced at production cardinality",
+        "graph metric floating page aggregates are deterministic across adoption order",
+        "graph metric column snapshots preserve order across chunks and reject stale reads before scores",
+        "graph metric status exposes queued and active local build lease",
+        "graph metric coordinator reports expired exhausted page lease",
+        "graph planned metric build retires a superseded generation without poisoning newer work",
+        "graph pagerank planned build publishes scores matching local runner",
+        "graph pagerank warm rebuild normalizes changed node sets across summary pages",
+        "graph metric execution epoch fences old jobs without hiding published scores",
+        "graph pagerank reclaimed contribution and reduce pages overwrite partial output",
+        "graph pagerank scan adoption maintains one idempotent out-degree total",
+        "graph eigenvector reclaimed contribution and reduce pages overwrite stale output",
+        "graph hits reclaimed contribution and reduce pages overwrite stale output",
+        "graph hits planned build drains partitioned paired pages across workers",
+        "graph pagerank coordinator publish failure preserves prior published generation after reopen",
+        "graph pagerank exhausted publish page preserves root cause and prior generation",
+        "graph hits coordinator publish failure preserves prior published pair after reopen",
+    };
+    const graph_metric_unit_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"db default primary backend survives reopen"},
+            &graph_metric_unit_filters,
+        ),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_unit_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_metric_unit_tests,
+        &graph_metric_unit_filters,
+    );
+    const graph_metric_unit_test_step = b.step("graph-metric-unit-test", "Run cheap graph metric runtime, ownership, and query tests");
+    graph_metric_unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_command_tests.step);
+
+    const graph_metric_fan_in_filters = [_][]const u8{
+        "query parser accepts direct graph metric reads",
+        "query parser accepts graph metric rerank",
+        "api query contract bounds graph metric top k",
+        "api query contract uses portable graph metric filter operators",
+        "api query contract rejects oversized and duplicate graph metric clauses",
+        "query encoder emits graph metric results",
+        "query profile reports failed graph metric status across read surfaces",
+        "query encoder emits graph metric rerank score details",
+        "query merge applies deterministic graph metric top-k across shards",
+        "query merge rejects missing or unpublished graph metric shard results",
+        "query merge rejects duplicate direct graph metric score nodes",
+        "query merge rejects non-finite direct graph metric scores",
+        "query merge rejects duplicate direct graph metric shard results",
+        "query merge rejects mismatched direct graph metric shard identity",
+        "query merge rejects inconsistent graph metric fan-in status state",
+        "query merge rejects non-finite graph metric fan-in status numbers",
+        "query merge rejects out-of-range graph metric fan-in progress",
+        "query merge rejects incompatible graph metric fan-in metadata",
+        "query merge rejects unsolicited graph score surfaces",
+        "query merge rejects unsolicited graph search metric status",
+        "query merge validates included graph search metric status list",
+        "query merge rejects malformed graph search metric payloads",
+        "query merge rejects malformed graph search traversal payloads",
+        "query merge rejects unqualified graph search identity collisions without collapsing qualified identities",
+        "query merge rejects malformed graph search hit payloads",
+        "query merge preserves failed graph metric status across shard fan-in",
+        "query merge requires comparable graph search metric generations across shards",
+        "query merge allows unpublished projected graph search metric status",
+        "query merge rejects ambiguous graph search fan-in metric status",
+        "query merge preserves failed graph search metric status across shards",
+        "query merge enforces graph search order and filter metric generations across shards",
+        "query profile reports merged graph search metric generation",
+        "query merge requires comparable graph metric rerank generations across shards",
+        "query merge rejects malformed graph metric rerank score details",
+        "query merge rejects missing or unpublished graph metric rerank shard status",
+        "distributed graph result accounting includes shared metric storage and status details",
+        "distributed graph expand request bounds deferred worker metric candidates",
+        "distributed graph metric status merge validates metadata compatibility",
+        "distributed graph metric post processing applies max results after filter and order",
+        "public index contract exposes runtime status metadata",
+        "indexes openapi parses graph metric runtime summary",
+        "client openapi parses graph metric runtime summary",
+        "metadata openapi module generates extractor surface for routed endpoints",
+        "index encoders expose graph metric runtime ownership summary",
+        "index encoders expose mixed graph metric runtime roles without aggregate role",
+        "graph metric status encoder exposes active build pages",
+        "public table graph metric action handler returns status response",
+        "db query result shape executeSingleNonPatternQueryWithSets hides metric status unless requested",
+        "graph metric status clone owns active build worker id",
+        "graph metric index stats cleanup owns nested status payloads",
+        "graph metric cached index stats clone retains owned progress and survives allocation failures",
+    };
+    const graph_metric_fan_in_tests = b.addTest(.{
+        .root_module = api_graph_metric_test_mod,
+        .filters = &graph_metric_fan_in_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_fan_in_tests = addFilteredTestRunArtifact(b, graph_metric_fan_in_tests);
+    const graph_metric_fan_in_test_step = b.step("graph-metric-fan-in-test", "Run graph metric API contract and fail-closed distributed fan-in tests");
+    graph_metric_fan_in_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    graph_metric_unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+
+    const graph_metric_remote_wire_filters = [_][]const u8{
+        "api http client authenticates only the internal API namespace",
+        "multi-shard reads fail closed for shard-local graph metric scores",
+        "graph metric shard request carries internal status without mutating public request",
+        "encode query request includes graph metric read rerank and traversal status",
+        "remote query parser preserves graph metric fan-in provenance and durable status",
+        "remote query parser rejects invalid graph metric status and duplicate rerank profiles",
+        "graph metric queries use general table read preparation and search path",
+        "hosted cross-range graph metric fan-in merges compatible published shard generations",
+        "hosted cross-range graph metric fan-in merges active stale shard for published",
+        "hosted cross-range graph metric fan-in merges nonuniform promotion shard layout",
+        "hosted cross-range graph metric fan-in merges compatible hits pair",
+        "hosted cross-range graph metric fan-in rejects incompatible remote hits pair",
+        "hosted cross-range graph metric fan-in rejects missing remote hits status",
+        "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
+    };
+    const graph_metric_remote_wire_tests = b.addTest(.{
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &graph_metric_remote_wire_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_remote_wire_tests = addFilteredTestRunArtifact(b, graph_metric_remote_wire_tests);
+    const graph_metric_remote_wire_test_step = b.step("graph-metric-remote-wire-test", "Run hosted graph metric shard request and remote-wire tests");
+    graph_metric_remote_wire_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
+    graph_metric_unit_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
+
+    const graph_metric_smoke_filters = [_][]const u8{
+        "db graph metric runtime background coordinator and worker pool loops publish pagerank",
+    };
+    const graph_metric_smoke_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"db default primary backend survives reopen"},
+            &graph_metric_smoke_filters,
+        ),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_smoke_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_metric_smoke_tests,
+        &graph_metric_smoke_filters,
+    );
+    const graph_metric_smoke_test_step = b.step("graph-metric-smoke-test", "Run a small end-to-end PageRank scheduler and worker smoke test");
+    graph_metric_smoke_test_step.dependOn(&run_graph_metric_smoke_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_smoke_tests.step);
+
+    const graph_metric_integration_filters = [_][]const u8{
+        "graph.graph.test.graph pagerank ",
+        "graph.graph.test.graph eigenvector ",
+        "graph.graph.test.graph hits ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime planned ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime query ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime role ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime lease ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime operations ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime degree canary ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime default gate ",
+        "graph metric failed planned build",
+        "graph metric repeated failed",
+        "graph metric build job cleanup",
+    };
+    const graph_metric_integration_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"db default primary backend survives reopen"},
+            &graph_metric_integration_filters,
+        ),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_integration_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_metric_integration_tests,
+        &graph_metric_integration_filters,
+    );
+    const graph_metric_integration_test_step = b.step("graph-metric-integration-test", "Run graph metric scheduler, worker, query, cleanup, and runtime lifecycle tests");
+    graph_metric_integration_test_step.dependOn(&run_graph_metric_integration_tests.step);
+    integration_test_step.dependOn(&run_graph_metric_integration_tests.step);
+
     const db_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
         .test_runner = .{
@@ -8387,6 +8658,25 @@ pub fn build(b: *std.Build) void {
     addRuntimeSkipTestFilters(run_db_unit_tests, &release_scale_test_filters);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
+
+    const graph_runtime_filters = [_][]const u8{
+        "storage.db.graph_runtime.test.",
+    };
+    const graph_runtime_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &graph_runtime_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_runtime_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_runtime_tests,
+        &graph_runtime_filters,
+    );
+    const graph_runtime_test_step = b.step("graph-runtime-test", "Run graph artifact replay, repair, and traversal integration tests");
+    graph_runtime_test_step.dependOn(&run_graph_runtime_tests.step);
 
     // Keep the small, deterministic release-blocker primitives in the PR/base
     // unit gate. The corpus-scale fixtures below protect thresholds that only
@@ -8624,6 +8914,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.document_mapper.",
             "storage.db.document_query.",
             "storage.db.generation_lifecycle.",
+            "storage.db.graph_runtime.",
             "storage.db.graph_asset_state.",
             "storage.db.graph_edge_contender.",
             "storage.db.graph_state_name.",
@@ -11270,7 +11561,7 @@ pub fn build(b: *std.Build) void {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.cli)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
             },
-            .data, .metadata => {
+            .data, .graph_metric_maintenance, .metadata => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
             },
@@ -11310,6 +11601,30 @@ pub fn build(b: *std.Build) void {
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
     antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);
+
+    const graph_metric_process_harness_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cmd/graph_metric_process_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    graph_metric_process_harness_mod.addImport("antfly-zig", lib_mod);
+    graph_metric_process_harness_mod.addImport("antfly_platform", platform_mod);
+    graph_metric_process_harness_mod.addImport("httpx", httpx_mod);
+    const graph_metric_process_harness = b.addExecutable(.{
+        .name = "graph-metric-process-harness",
+        .root_module = graph_metric_process_harness_mod,
+    });
+    graph_metric_process_harness.root_module.linkLibrary(
+        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?,
+    );
+    graph_metric_process_harness.step.dependOn(&antfly_main.step);
+    const run_graph_metric_process_harness = b.addRunArtifact(graph_metric_process_harness);
+    run_graph_metric_process_harness.addArtifactArg(antfly_main);
+    run_graph_metric_process_harness.addArgs(&.{ "--profile", "promotion" });
+    run_graph_metric_process_harness.has_side_effects = true;
+    const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run process-level graph metric promotion and failover gates");
+    graph_metric_process_test_step.dependOn(&run_graph_metric_process_harness.step);
+    integration_test_step.dependOn(&run_graph_metric_process_harness.step);
 
     // The aggregate intentionally runs with normal CPU concurrency. Give every
     // compile step a conservative scheduler claim unless it already has a

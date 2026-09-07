@@ -13,7 +13,9 @@
 // limitations.
 
 test {
+    _ = @import("graph/query.zig");
     _ = @import("storage/db/db.zig");
+    _ = @import("storage/db/graph_runtime.zig");
     _ = @import("storage/db/promotion_runtime.zig");
     _ = @import("storage/db/resolution_runtime.zig");
 }

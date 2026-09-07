@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
@@ -25,6 +26,10 @@ const query_mod = @import("../query/mod.zig");
 const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("../build/builder.zig");
+const graph_metric_policy = @import("../build/graph_metric_policy.zig");
+const graph_metric_config = @import("../build/graph_metric_config.zig");
+const graph_metric_segment = @import("../graph_metric_segment/mod.zig");
+const lake_graph_metric = @import("../build/lake_graph_metric.zig");
 const impact_planner = @import("../build/impact_planner.zig");
 const external_source_manifest = @import("../build/external_source_manifest.zig");
 const publication_plan = @import("../build/publication_plan.zig");
@@ -43,6 +48,101 @@ const PublicationPlanPurpose = enum {
     status,
     publication,
 };
+
+const GraphMetricReadiness = struct {
+    configured: usize = 0,
+    pending: usize = 0,
+    rejected: usize = 0,
+};
+
+fn graphMetricReadinessAlloc(alloc: Allocator, manifest: ?manifest_mod.Manifest, indexes_json: []const u8) !GraphMetricReadiness {
+    const current = graph_metric_policy.materializerFingerprint(.{});
+    const specs = try graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json);
+    defer graph_metric_config.freeIndexSpecs(alloc, specs);
+    var readiness = GraphMetricReadiness{};
+    for (specs) |spec| {
+        const graph_artifact = if (manifest) |value|
+            findManifestNamedArtifact(value, .graph_segment, spec.index_name)
+        else
+            null;
+        for (spec.configs) |config| {
+            readiness.configured += 1;
+            const value = manifest orelse {
+                readiness.pending += 1;
+                continue;
+            };
+            const name = try graph_metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
+            defer alloc.free(name);
+            const artifact = findManifestNamedArtifact(value, .graph_metric_segment, name) orelse {
+                readiness.pending += 1;
+                continue;
+            };
+            const source_digest = if (graph_artifact) |graph_ref| blk: {
+                artifacts_mod.validateSha256ArtifactIdentity(graph_ref.artifact_id, graph_ref.checksum) catch break :blk null;
+                break :blk artifacts_mod.sha256DigestFromChecksum(graph_ref.checksum) catch null;
+            } else null;
+            const current_artifact = artifact.metadata_version == graph_metric_segment.wire_version and
+                artifact.graph_metric_control_len != 0 and
+                artifact.graph_metric_routing_footer_len != 0 and
+                artifact.materializer_fingerprint == current and
+                artifact.graph_metric_config_fingerprint == lake_graph_metric.configFingerprint(config) and
+                source_digest != null and
+                std.mem.eql(u8, &source_digest.?, &artifact.graph_metric_source_checksum);
+            if (!current_artifact) {
+                readiness.pending += 1;
+                continue;
+            }
+            if (artifact.graph_metric_materialization_state == .rejected) readiness.rejected += 1;
+        }
+    }
+    return readiness;
+}
+
+fn graphMetricMaterializationStaleAlloc(alloc: Allocator, manifest: manifest_mod.Manifest, indexes_json: []const u8) !bool {
+    return (try graphMetricReadinessAlloc(alloc, manifest, indexes_json)).pending != 0;
+}
+
+test "serverless catalog schedules idle graph metric policy upgrades from manifest metadata" {
+    var artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .graph_segment,
+            .name = "graph_idx",
+            .artifact_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .byte_len = 1,
+            .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+        .{
+            .kind = .graph_metric_segment,
+            .name = "9:graph_idx4:rank",
+            .artifact_id = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .byte_len = 1,
+            .checksum = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .materializer_fingerprint = 0,
+        },
+    };
+    var manifest = manifest_mod.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = &artifacts,
+    };
+    const indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
+    try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+    const specs = try graph_metric_config.parseIndexSpecsAlloc(std.testing.allocator, indexes_json);
+    defer graph_metric_config.freeIndexSpecs(std.testing.allocator, specs);
+    artifacts[1].metadata_version = graph_metric_segment.wire_version;
+    artifacts[1].materializer_fingerprint = graph_metric_policy.materializerFingerprint(.{});
+    artifacts[1].graph_metric_control_len = 1;
+    artifacts[1].graph_metric_routing_footer_len = 1;
+    artifacts[1].graph_metric_config_fingerprint = lake_graph_metric.configFingerprint(specs[0].configs[0]);
+    artifacts[1].graph_metric_source_checksum = @splat(0xaa);
+    try std.testing.expect(!try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+    manifest.artifacts = manifest.artifacts[0..0];
+    try std.testing.expect(try graphMetricMaterializationStaleAlloc(std.testing.allocator, manifest, indexes_json));
+}
 
 fn ensureSchemaWritesAllowedAlloc(alloc: Allocator, schema_json: []const u8) !void {
     var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(alloc, schema_json)) orelse return;
@@ -471,6 +571,11 @@ pub const CatalogService = struct {
         const pending_materialization_rebuild =
             !head_republish_recommended and
             (plan.artifact_actions.any() or plan.derived_output_actions.any());
+        const graph_metric_readiness = try graphMetricReadinessAlloc(
+            self.alloc,
+            published_head.manifest,
+            plan.table_definition.indexes_json,
+        );
 
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
@@ -494,6 +599,9 @@ pub const CatalogService = struct {
             .document_lineage_versions = head_document_lineage_versions,
             .head_republish_recommended = head_republish_recommended,
             .pending_materialization_rebuild = pending_materialization_rebuild,
+            .graph_metrics_configured = graph_metric_readiness.configured,
+            .graph_metrics_pending = graph_metric_readiness.pending,
+            .graph_metrics_rejected = graph_metric_readiness.rejected,
             .pending_materialization_families = pending_materialization_families,
             .head_artifact_actions = head_actions.artifact_actions,
             .head_full_text_index_actions = try cloneCatalogFullTextIndexActionsAlloc(self.alloc, head_actions.full_text_index_actions),
@@ -673,20 +781,38 @@ pub const CatalogService = struct {
     }
 
     pub fn buildNamespace(self: *CatalogService, namespace: []const u8) !builder_mod.BuildResult {
+        return try self.buildNamespaceWithCancellation(namespace, .none);
+    }
+
+    pub fn buildNamespaceWithCancellation(
+        self: *CatalogService,
+        namespace: []const u8,
+        cancellation: CancellationToken,
+    ) !builder_mod.BuildResult {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
         defer plan.deinit(self.alloc);
-        return try self.builder.publishNamespaceWithMetricAndPlan(
+        return try self.builder.publishNamespaceWithMetricAndPlanWithCancellation(
             namespace,
             policy.vector_distance_metric,
             plan,
+            cancellation,
         );
     }
 
     pub fn buildTable(self: *CatalogService, table_name: []const u8) !builder_mod.BuildResult {
+        return try self.buildTableWithCancellation(table_name, .none);
+    }
+
+    pub fn buildTableWithCancellation(
+        self: *CatalogService,
+        table_name: []const u8,
+        cancellation: CancellationToken,
+    ) !builder_mod.BuildResult {
+        try cancellation.check();
         const namespace = try self.resolveTableNamespaceAlloc(table_name);
         defer self.alloc.free(namespace);
-        return try self.buildNamespace(namespace);
+        return try self.buildNamespaceWithCancellation(namespace, cancellation);
     }
 
     pub fn tableBuildStatus(self: *CatalogService, table_name: []const u8) !catalog_types.BuildStatus {
@@ -807,6 +933,7 @@ pub const CatalogService = struct {
                 metadata_republish.chunk_preview_policy_changed = can_republish_chunk_preview;
                 metadata_republish.chunk_embeddings_policy_changed = can_republish_chunk_embeddings;
                 metadata_republish.rerank_terms_policy_changed = can_republish_rerank_terms;
+                metadata_republish.graph_metric_policy_changed = try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
 
                 const full_text_index_actions = try planFullTextIndexActionsAlloc(
                     self.alloc,
@@ -1546,7 +1673,7 @@ fn planNamedIndexActionsAlloc(
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         const action: publication_plan.ArtifactAction = blk: {
             if (before_object.get(entry.key_ptr.*)) |before_value| {
-                if (isNamedIndexKindValue(before_value, kind) and jsonValueEql(entry.value_ptr.*, before_value)) {
+                if (isNamedIndexKindValue(before_value, kind) and namedIndexConfigEql(entry.value_ptr.*, before_value, kind)) {
                     break :blk .reuse;
                 }
             }
@@ -1741,7 +1868,7 @@ fn findEquivalentRenamedIndexName(
     while (before_it.next()) |entry| {
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         if (after_object.get(entry.key_ptr.*) != null) continue;
-        if (!jsonValueEql(entry.value_ptr.*, target_value)) continue;
+        if (!namedIndexConfigEql(entry.value_ptr.*, target_value, kind)) continue;
         if (match != null) return null;
         match = entry.key_ptr.*;
     }
@@ -1912,6 +2039,38 @@ fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
             break :blk true;
         },
     };
+}
+
+fn namedIndexConfigEql(lhs: std.json.Value, rhs: std.json.Value, kind: NamedSearchSourceKind) bool {
+    if (kind != .graph) return jsonValueEql(lhs, rhs);
+    if (lhs != .object or rhs != .object) return false;
+    var lhs_count: usize = 0;
+    var lhs_it = lhs.object.iterator();
+    while (lhs_it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "metrics")) continue;
+        lhs_count += 1;
+        const other = rhs.object.get(entry.key_ptr.*) orelse return false;
+        if (!jsonValueEql(entry.value_ptr.*, other)) return false;
+    }
+    var rhs_count: usize = 0;
+    var rhs_it = rhs.object.iterator();
+    while (rhs_it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "metrics")) rhs_count += 1;
+    }
+    return lhs_count == rhs_count;
+}
+
+test "serverless named graph planning reuses topology for metric-only changes" {
+    const actions = try planNamedIndexActionsAlloc(
+        std.testing.allocator,
+        "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}",
+        "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40}}}}",
+        .graph,
+        1,
+    );
+    defer freeNamedArtifactActions(std.testing.allocator, actions);
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, actions[0].action);
 }
 
 fn publishedSearchSourcesMatch(

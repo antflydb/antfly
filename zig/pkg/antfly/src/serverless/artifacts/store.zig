@@ -39,6 +39,13 @@ pub fn validateSha256Checksum(checksum: []const u8) !void {
     }
 }
 
+pub fn sha256DigestFromChecksum(checksum: []const u8) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    try validateSha256Checksum(checksum);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, checksum) catch return error.InvalidArtifactId;
+    return digest;
+}
+
 pub fn validateSha256ArtifactIdentity(artifact_id: []const u8, checksum: []const u8) !void {
     try validateSha256Checksum(checksum);
     const id_checksum = try sha256ChecksumFromArtifactId(artifact_id);
@@ -69,12 +76,15 @@ pub const ArtifactStore = struct {
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         put: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
+        put_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         get_alloc: *const fn (*anyopaque, Allocator, []const u8) anyerror![]u8,
         get_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror![]u8 = null,
         get_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         get_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
+        get_verified_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
         stat: *const fn (*anyopaque, Allocator, []const u8) anyerror!ArtifactMetadata,
         stat_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
+        verify_content: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, CancellationToken) anyerror!void = null,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
     };
 
@@ -84,7 +94,18 @@ pub const ArtifactStore = struct {
     }
 
     pub fn put(self: *ArtifactStore, contents: []const u8) !ArtifactMetadata {
-        return try self.vtable.put(self.ptr, self.allocator, contents);
+        return try self.putWithCancellation(contents, .none);
+    }
+
+    pub fn putWithCancellation(self: *ArtifactStore, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
+        try cancellation.check();
+        var metadata = if (self.vtable.put_with_cancellation) |put_with_cancellation|
+            try put_with_cancellation(self.ptr, self.allocator, contents, cancellation)
+        else
+            try self.vtable.put(self.ptr, self.allocator, contents);
+        errdefer metadata.deinit(self.allocator);
+        try cancellation.check();
+        return metadata;
     }
 
     pub fn getAlloc(self: *ArtifactStore, artifact_id: []const u8) ![]u8 {
@@ -222,6 +243,74 @@ pub const ArtifactStore = struct {
         return payload;
     }
 
+    /// Loads a range from the exact object or file identity authenticated by
+    /// `expected_checksum`. Native backends pin the provider generation, ETag,
+    /// or open file identity across verification and reading. The fallback is
+    /// retained for test and custom stores, but production stores should
+    /// implement the vtable entry so replacement cannot race a range read.
+    pub fn getVerifiedRangeAllocWithCancellationUsingAllocator(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch
+            return error.ArtifactIntegrityMismatch;
+        const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch
+            return error.InvalidRange;
+        if (end > expected_byte_len) return error.InvalidRange;
+        if (len == 0) {
+            try self.verifyContentWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                expected_byte_len,
+                expected_checksum,
+                cancellation,
+            );
+            const empty = try result_alloc.alloc(u8, 0);
+            errdefer result_alloc.free(empty);
+            try cancellation.check();
+            return empty;
+        }
+
+        const payload = if (self.vtable.get_verified_range_alloc_with_cancellation) |get_verified_range|
+            try get_verified_range(
+                self.ptr,
+                result_alloc,
+                artifact_id,
+                expected_byte_len,
+                expected_checksum,
+                offset,
+                len,
+                cancellation,
+            )
+        else blk: {
+            try self.verifyContentWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                expected_byte_len,
+                expected_checksum,
+                cancellation,
+            );
+            break :blk try self.getRangeAllocWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                offset,
+                len,
+                cancellation,
+            );
+        };
+        errdefer result_alloc.free(payload);
+        if (payload.len != len) return error.ArtifactIntegrityMismatch;
+        try cancellation.check();
+        return payload;
+    }
+
     pub fn stat(self: *ArtifactStore, artifact_id: []const u8) !ArtifactMetadata {
         return try self.statWithCancellation(artifact_id, .none);
     }
@@ -248,6 +337,56 @@ pub const ArtifactStore = struct {
 
     pub fn delete(self: *ArtifactStore, artifact_id: []const u8) !void {
         try self.vtable.delete(self.ptr, artifact_id);
+    }
+
+    /// Verifies a content-addressed artifact with bounded memory. Backends may
+    /// provide a native streaming verifier; the portable fallback hashes
+    /// bounded ranges and therefore never allocates the full artifact.
+    pub fn verifyContentWithCancellationUsingAllocator(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        cancellation: CancellationToken,
+    ) !void {
+        try cancellation.check();
+        validateSha256ArtifactIdentity(artifact_id, expected_checksum) catch return error.ArtifactIntegrityMismatch;
+
+        // A backend verifier owns the complete identity, length, and content
+        // check. Calling stat here as well would duplicate provider HEADs on
+        // every verification and defeat backend identity caches.
+        if (self.vtable.verify_content) |verify_content| {
+            try verify_content(self.ptr, result_alloc, artifact_id, expected_byte_len, expected_checksum, cancellation);
+            return;
+        }
+
+        // Portable backends without a native verifier first validate the
+        // declared metadata, then hash bounded ranges below.
+        var metadata = try self.statWithCancellationUsingAllocator(result_alloc, artifact_id, cancellation);
+        defer metadata.deinit(result_alloc);
+        if (metadata.byte_len != expected_byte_len or
+            !std.mem.eql(u8, metadata.artifact_id, artifact_id) or
+            !std.mem.eql(u8, metadata.checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
+
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        const chunk_bytes: usize = 8 * 1024 * 1024;
+        var offset: u64 = 0;
+        while (offset < expected_byte_len) {
+            try cancellation.check();
+            const remaining = expected_byte_len - offset;
+            const len: usize = @intCast(@min(remaining, chunk_bytes));
+            const chunk = try self.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+            defer result_alloc.free(chunk);
+            if (chunk.len != len) return error.ArtifactIntegrityMismatch;
+            hasher.update(chunk);
+            offset += len;
+        }
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        const actual = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, &actual, expected_checksum)) return error.ArtifactIntegrityMismatch;
+        try cancellation.check();
     }
 };
 

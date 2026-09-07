@@ -45,6 +45,7 @@ const db_query_graph = @import("../../storage/db/query/graph_exec.zig");
 const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_work_budget_mod = @import("../../graph/work_budget.zig");
 const graph_node_admission = @import("../../graph/node_admission.zig");
@@ -74,8 +75,23 @@ const managed_embedder = @import("../../inference/managed_embedder.zig");
 const scraping = @import("antfly_scraping");
 const platform_time = @import("antfly_platform").time;
 const graph_segment_mod = @import("../graph_segment/mod.zig");
+const graph_metric_segment_mod = @import("../graph_metric_segment/mod.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
 const query_execution = @import("query_execution.zig");
+
+const SyncWaitCancellation = struct {
+    upstream: CancellationToken,
+    deadline_ns: u64,
+
+    fn token(self: *const @This()) CancellationToken {
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+    }
+
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const state: *const @This() = @ptrCast(@alignCast(ptr));
+        return state.upstream.isCancelled() or platform_time.monotonicNs() >= state.deadline_ns;
+    }
+};
 const json_helpers = @import("../../api/json_helpers.zig");
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
@@ -738,6 +754,8 @@ pub const HttpHandler = struct {
             else => return err,
         };
         validateServerlessIndexCatalog(self.alloc, indexes_json) catch |err| switch (err) {
+            error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
+            error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 graph metric indexes, 16 metrics per graph, 64 metrics total, 64 edge types per filter, 256-byte index names, and 128-byte metric names)"),
             error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
@@ -784,7 +802,9 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const body = encodeServerlessIndexListAlloc(self.alloc, table.indexes_json, status) catch |err| {
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null, .none);
+        defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
+        const body = encodeServerlessIndexListWithGraphMetricsAlloc(self.alloc, table.indexes_json, status, metric_statuses) catch |err| {
             std.log.err("table index list encode failed table={s} err={}", .{ table_name, err });
             return error.InternalFailure;
         };
@@ -800,7 +820,9 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        const body = (encodeServerlessSingleIndexAlloc(self.alloc, table.indexes_json, index_name, status) catch |err| {
+        const metric_statuses = try self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name, .none);
+        defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
+        const body = (encodeServerlessSingleIndexWithGraphMetricsAlloc(self.alloc, table.indexes_json, index_name, status, metric_statuses) catch |err| {
             std.log.err("table index encode failed table={s} index={s} err={}", .{ table_name, index_name, err });
             return error.InternalFailure;
         }) orelse {
@@ -808,6 +830,108 @@ pub const HttpHandler = struct {
         };
         defer self.alloc.free(body);
         return try jsonSliceResponse(self.alloc, 200, body);
+    }
+
+    fn graphMetricIndexStatusesAlloc(
+        self: *HttpHandler,
+        table_name: []const u8,
+        indexes_json: []const u8,
+        only_index_name: ?[]const u8,
+        cancellation: CancellationToken,
+    ) ![]ServerlessGraphMetricStatus {
+        try cancellation.check();
+        const specs = try build_mod.graph_metric_config.parseIndexSpecsAlloc(self.alloc, indexes_json);
+        defer build_mod.graph_metric_config.freeIndexSpecs(self.alloc, specs);
+        var status_count: usize = 0;
+        for (specs) |spec| {
+            if (only_index_name) |name| if (!std.mem.eql(u8, spec.index_name, name)) continue;
+            status_count = std.math.add(usize, status_count, spec.configs.len) catch return error.OutOfMemory;
+        }
+        if (status_count == 0) return try self.alloc.alloc(ServerlessGraphMetricStatus, 0);
+
+        const statuses = try self.alloc.alloc(ServerlessGraphMetricStatus, status_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (statuses[0..initialized]) |*status| status.deinit(self.alloc);
+            self.alloc.free(statuses);
+        }
+
+        const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (namespace) |value| self.alloc.free(value);
+        var maybe_session: ?query_mod.QuerySession = if (namespace) |value|
+            self.query.openHeadSession(value) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            }
+        else
+            null;
+        defer if (maybe_session) |*session| session.deinit();
+        if (maybe_session) |*session| session.setCancellation(cancellation);
+
+        for (specs) |spec| {
+            if (only_index_name) |name| if (!std.mem.eql(u8, spec.index_name, name)) continue;
+            for (spec.configs) |config| {
+                try cancellation.check();
+                const owned_index_name = try self.alloc.dupe(u8, spec.index_name);
+                var index_name_moved = false;
+                errdefer if (!index_name_moved) self.alloc.free(owned_index_name);
+                const owned_metric_name = try self.alloc.dupe(u8, config.name);
+                var metric_name_moved = false;
+                errdefer if (!metric_name_moved) self.alloc.free(owned_metric_name);
+                var status = ServerlessGraphMetricStatus{
+                    .index_name = owned_index_name,
+                    .metric_name = owned_metric_name,
+                    .kind = config.kind,
+                    .config_fingerprint = build_mod.lake_graph_metric.configFingerprint(config),
+                    .state = .pending,
+                };
+                index_name_moved = true;
+                metric_name_moved = true;
+                var status_moved = false;
+                errdefer if (!status_moved) status.deinit(self.alloc);
+
+                if (maybe_session) |*session| {
+                    const graph_index = session.findNamedArtifactIndex(.graph_segment, spec.index_name);
+                    const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(self.alloc, spec.index_name, config.name);
+                    defer self.alloc.free(artifact_name);
+                    const metric_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name);
+                    if (graph_index != null and metric_index != null) {
+                        const metric_ref = session.artifactRef(metric_index.?).?;
+                        const graph_ref = session.artifactRef(graph_index.?).?;
+                        status.published_generation = if (metric_ref.published_generation != 0)
+                            metric_ref.published_generation
+                        else
+                            session.manifest.version;
+                        status.materializer_fingerprint = metric_ref.materializer_fingerprint;
+                        const source_checksum = blk: {
+                            artifacts_mod.validateSha256ArtifactIdentity(graph_ref.artifact_id, graph_ref.checksum) catch break :blk null;
+                            break :blk artifacts_mod.sha256DigestFromChecksum(graph_ref.checksum) catch null;
+                        };
+                        const valid_identity = metric_ref.graph_metric_config_fingerprint == status.config_fingerprint;
+                        const valid_source = if (source_checksum) |digest|
+                            std.mem.eql(u8, &digest, &metric_ref.graph_metric_source_checksum)
+                        else
+                            false;
+                        const current_policy = metric_ref.materializer_fingerprint == build_mod.lake_graph_metric.materializerFingerprint(.{});
+                        const current_format = metric_ref.metadata_version == graph_metric_segment_mod.wire_version;
+                        status.state = if (!valid_identity or !valid_source or !current_policy or !current_format)
+                            .stale
+                        else switch (metric_ref.graph_metric_materialization_state) {
+                            .ready => .ready,
+                            .rejected => .rejected,
+                        };
+                        status.rejection_reason = @enumFromInt(@intFromEnum(metric_ref.graph_metric_rejection_reason));
+                    }
+                }
+                statuses[initialized] = status;
+                initialized += 1;
+                status_moved = true;
+            }
+        }
+        return statuses;
     }
 
     fn handleCreateTableIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8, body: []const u8) !HttpResponse {
@@ -837,6 +961,8 @@ pub const HttpHandler = struct {
         const next_indexes_json = try indexes_api.addIndexToTableIndexesJson(self.alloc, table.indexes_json, index_name, expanded_index_json);
         defer self.alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedGraphMetricRefreshMode => return try textResponse(self.alloc, 400, "manual graph metric refresh is not supported in serverless; use background refresh"),
+            error.GraphMetricConfigurationLimitExceeded => return try textResponse(self.alloc, 400, "graph metric configuration exceeds serverless limits (maximum 16 graph metric indexes, 16 metrics per graph, 64 metrics total, 64 edge types per filter, 256-byte index names, and 128-byte metric names)"),
             error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
@@ -944,13 +1070,16 @@ pub const HttpHandler = struct {
         var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(cancellation));
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            201 => blk: {
+            201, 202 => blk: {
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const parsed = try parseJsonResponseBody(metadata_openapi.BatchResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponse(self.alloc, 201, parsed);
+                break :blk try jsonResponse(self.alloc, resp.status, parsed);
             },
-            else => try textResponse(self.alloc, resp.status, resp.body),
+            else => if (resp.json)
+                try jsonSliceResponse(self.alloc, resp.status, resp.body)
+            else
+                try textResponse(self.alloc, resp.status, resp.body),
         };
     }
 
@@ -1166,7 +1295,14 @@ pub const HttpHandler = struct {
         };
     }
 
-    fn executePublishedSearch(self: *HttpHandler, namespace: []const u8, table_name: ?[]const u8, body: []const u8, cancellation: CancellationToken) !SearchExecution {
+    fn executePublishedSearch(
+        self: *HttpHandler,
+        namespace: []const u8,
+        table_name: ?[]const u8,
+        body: []const u8,
+        cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
+    ) !SearchExecution {
         try cancellation.check();
         var status = try self.catalog.buildStatus(namespace);
         errdefer status.deinit(self.alloc);
@@ -1183,6 +1319,12 @@ pub const HttpHandler = struct {
         var session = try self.query.openHeadSession(namespace);
         errdefer session.deinit();
         session.setCancellation(cancellation);
+        session.setDiagnostics(diagnostics);
+        // Install the runtime before any query work. Graph-metric reranking
+        // happens immediately after this function returns its pinned session;
+        // deferring setIo until graph traversal silently serialized all of its
+        // independent immutable range reads.
+        session.setIo(self.io);
 
         var execution_stats = query_mod.QuerySearchExecutionStats{};
         const hits = try query_mod.searchIndexedPlanWithStatsAlloc(self.alloc, &session, plan, &execution_stats);
@@ -1244,10 +1386,10 @@ pub const HttpHandler = struct {
                 var owned = parsed_join;
                 owned.deinit(self.alloc);
             }
-            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation);
+            return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation, null);
         }
 
-        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation);
+        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation, null);
     }
 
     fn executeForeignPublicTableQueryJsonValueAlloc(
@@ -1602,7 +1744,13 @@ pub const HttpHandler = struct {
         return hits;
     }
 
-    fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+    fn executePlainPublicTableQueryJsonAlloc(
+        self: *HttpHandler,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
+    ) anyerror![]u8 {
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
             return error.InvalidQueryRequest;
         defer raw_request.deinit();
@@ -1612,6 +1760,7 @@ pub const HttpHandler = struct {
             body,
             raw_request.value,
             cancellation,
+            diagnostics,
         );
     }
 
@@ -1621,12 +1770,13 @@ pub const HttpHandler = struct {
         body: []const u8,
         raw_request: std.json.Value,
         cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
     ) anyerror![]u8 {
         try cancellation.check();
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        const graph_response = self.handleTablePublicGraphQueryRequestValue(table_name, namespace, body, raw_request, cancellation) catch |err| switch (err) {
+        const graph_response = self.handleTablePublicGraphQueryRequestValue(table_name, namespace, body, raw_request, cancellation, diagnostics) catch |err| switch (err) {
             // Once the graph boundary has recognized the request, unsupported
             // semantics are an exact-execution capability response, not a
             // malformed request or an internal server failure.
@@ -1651,7 +1801,7 @@ pub const HttpHandler = struct {
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| {
+        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, diagnostics) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
@@ -2270,6 +2420,7 @@ pub const HttpHandler = struct {
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
         cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
     ) anyerror![]u8 {
         try cancellation.check();
         var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
@@ -2284,7 +2435,7 @@ pub const HttpHandler = struct {
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
 
-        const primary_json = self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation) catch |err| {
+        const primary_json = self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation, diagnostics) catch |err| {
             std.log.warn("serverless joined query rejected rewritten left input table={s} err={}", .{ table_name, err });
             return err;
         };
@@ -2696,15 +2847,28 @@ pub const HttpHandler = struct {
 
     fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         try cancellation.check();
+        var diagnostics = api_operation.RequestDiagnostics{};
         var resp = try public_table_http.handleTableQueryRequest(
             self.alloc,
             table_name,
             body,
             null,
-            self.tableApi(cancellation),
+            self.tableApiWithDiagnostics(cancellation, &diagnostics),
         );
         defer resp.deinit(self.alloc);
         try cancellation.check();
+        if (resp.status == 422) {
+            if (diagnostics.graph_metric_rejection) |*diagnostic| {
+                const rejection_body = try public_table_http.graphMetricMaterializationRejectedBodyWithContext(
+                    self.alloc,
+                    diagnostic.graphIndexName(),
+                    diagnostic.metricName(),
+                    diagnostic.materializer_fingerprint,
+                );
+                defer self.alloc.free(rejection_body);
+                return try jsonSliceResponse(self.alloc, 422, rejection_body);
+            }
+        }
         return try adaptPublicTableQueryResponse(self.alloc, resp);
     }
 
@@ -2725,6 +2889,7 @@ pub const HttpHandler = struct {
             body,
             raw_request.value,
             cancellation,
+            null,
         );
     }
 
@@ -2735,6 +2900,7 @@ pub const HttpHandler = struct {
         body: []const u8,
         raw_request: std.json.Value,
         cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
     ) !?HttpResponse {
         try cancellation.check();
         if (raw_request != .object) return error.InvalidQueryRequest;
@@ -2747,8 +2913,11 @@ pub const HttpHandler = struct {
             );
             return error.UnsupportedQueryRequest;
         }
-        const graph_request = raw_request.object.get("graph_queries") orelse return null;
-        if (graph_request == .null) return error.InvalidQueryRequest;
+        const graph_request = raw_request.object.get("graph_queries");
+        if (graph_request) |value| if (value == .null) return error.InvalidQueryRequest;
+        const has_graph_metric = public_search_request.hasNonNullField(raw_request.object, "graph_metric");
+        const has_graph_metric_rerank = public_search_request.hasNonNullField(raw_request.object, "graph_metric_rerank");
+        if (graph_request == null and !has_graph_metric and !has_graph_metric_rerank) return null;
 
         const unsupported_controls = [_][]const u8{
             "aggregations",
@@ -2781,9 +2950,6 @@ pub const HttpHandler = struct {
         }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
         const request = parsed_request.value;
-        if (request.graph_queries == null)
-            return error.InvalidQueryRequest;
-
         const started_ns = platform_time.monotonicNs();
         const graph_queries = public_graph_query.parseCanonicalGraphQueriesAlloc(self.alloc, request) catch |err| {
             std.log.warn("serverless public graph request admission failed table={s} err={}", .{ table_name, err });
@@ -2791,25 +2957,30 @@ pub const HttpHandler = struct {
         };
         defer public_graph_query.freeNamedGraphQueries(self.alloc, graph_queries);
 
+        var metric_requests = try query_api.parseGraphMetricRequestsAlloc(self.alloc, body);
+        defer metric_requests.deinit(self.alloc);
+
         var req: db_types.SearchRequest = .{
             .count_only = request.count == true,
             .profile = request.profile == true,
             .graph_queries = graph_queries,
+            .graph_metric_queries = metric_requests.queries,
+            .graph_metric_rerank = metric_requests.rerank,
             .limit = if (request.limit) |limit| std.math.cast(u32, limit) orelse 10 else 10,
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
             .cancellation = cancellation,
         };
-        const canonical_operations = raw_request.object.get("graph_queries") orelse
-            return error.InvalidQueryRequest;
-        req.graph_query_transport = graph_wire_envelope.captureCanonicalOperationsAlloc(
-            self.alloc,
-            canonical_operations,
-            graph_queries,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidQueryRequest,
-        };
-        defer req.graph_query_transport.?.deinit(self.alloc);
+        if (graph_request) |canonical_operations| {
+            req.graph_query_transport = graph_wire_envelope.captureCanonicalOperationsAlloc(
+                self.alloc,
+                canonical_operations,
+                graph_queries,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidQueryRequest,
+            };
+        }
+        defer if (req.graph_query_transport) |*transport| transport.deinit(self.alloc);
         var search_hits: []db_types.SearchHit = &.{};
         defer if (search_hits.len > 0) freeDbSearchHits(self.alloc, search_hits);
         var search_total_hits: u32 = 0;
@@ -2819,14 +2990,20 @@ pub const HttpHandler = struct {
         var session: query_mod.QuerySession = undefined;
         var session_initialized = false;
         defer if (session_initialized) session.deinit();
+        var graph_metric_rerank_status: ?db_types.GraphMetricStatus = null;
+        defer if (graph_metric_rerank_status) |*status| status.deinit(self.alloc);
 
         if (requestHasSearchInputs(request)) {
-            var search_request = request;
-            search_request.graph_queries = null;
+            var search_request = requestWithoutGraphControls(request);
+            if (metric_requests.rerank) |rerank| {
+                try db_types.validateGraphMetricRerankWindow(rerank, req.offset, req.limit);
+                search_request.offset = 0;
+                search_request.limit = @intCast(db_types.graphMetricRerankCandidateCount(rerank, req.offset, req.limit));
+            }
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
-            var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation) catch |err| switch (err) {
+            var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation, diagnostics) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
@@ -2846,6 +3023,21 @@ pub const HttpHandler = struct {
             req.profile = execution.profile_requested;
             search_hits = try allocDbSearchHitsAlloc(self.alloc, execution.hits);
             search_total_hits = publicGraphSeedTotalHits(execution.hits.len, req.limit);
+
+            session = execution.takeSession();
+            session_initialized = true;
+            if (metric_requests.rerank) |rerank| {
+                if (req.count_only) return error.UnsupportedQueryRequest;
+                const reranked = try self.applyPublicGraphMetricRerank(
+                    &session,
+                    search_hits,
+                    rerank,
+                    req.offset,
+                    req.limit,
+                );
+                graph_metric_rerank_status = reranked.status;
+                search_hits = reranked.hits;
+            }
             try initial_sets.append(self.alloc, .{
                 .name = "$query_results",
                 .hits = search_hits,
@@ -2877,9 +3069,6 @@ pub const HttpHandler = struct {
                     .total_hits = search_total_hits,
                 });
             }
-
-            session = execution.takeSession();
-            session_initialized = true;
         } else {
             session = self.query.openHeadSession(namespace) catch |err| switch (err) {
                 error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -2887,7 +3076,14 @@ pub const HttpHandler = struct {
             };
             session_initialized = true;
             session.setCancellation(cancellation);
+            session.setDiagnostics(diagnostics);
         }
+        session.setIo(self.io);
+        if (metric_requests.rerank) |rerank| {
+            _ = rerank;
+            if (!requestHasSearchInputs(request)) return error.UnsupportedQueryRequest;
+        }
+
         const results = self.executePublicGraphQueriesAlloc(&session, table_name, graph_queries, initial_sets.items) catch |err| {
             std.log.warn("serverless public graph request execution failed table={s} err={}", .{ table_name, err });
             return err;
@@ -2897,11 +3093,19 @@ pub const HttpHandler = struct {
             if (results.len > 0) self.alloc.free(results);
         }
 
+        const metric_results = try self.executePublicGraphMetricQueriesAlloc(&session, metric_requests.queries);
+        defer {
+            for (metric_results) |*metric_result| metric_result.deinit(self.alloc);
+            if (metric_results.len > 0) self.alloc.free(metric_results);
+        }
+
         const result: db_types.SearchResult = .{
             .alloc = self.alloc,
             .hits = search_hits,
             .total_hits = search_total_hits,
             .graph_results = results,
+            .graph_metric_results = metric_results,
+            .graph_metric_rerank_status = graph_metric_rerank_status,
         };
 
         var response = query_api.encodeQueryResponses(
@@ -2918,6 +3122,751 @@ pub const HttpHandler = struct {
         return try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, response.json);
     }
 
+    fn executePublicGraphMetricQueriesAlloc(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        queries: []const db_types.NamedGraphMetricQuery,
+    ) ![]db_types.GraphMetricResult {
+        const results = try self.alloc.alloc(db_types.GraphMetricResult, queries.len);
+        errdefer self.alloc.free(results);
+        var initialized: usize = 0;
+        errdefer for (results[0..initialized]) |*result| result.deinit(self.alloc);
+        for (queries, 0..) |named, i| {
+            try session.checkCancellation();
+            var metric = try query_mod.graphMetricTopAlloc(self.alloc, session, named.query.index_name, named.query.metric_name, named.query.top_k);
+            defer metric.deinit(self.alloc);
+            const scores = try self.alloc.alloc(db_types.GraphMetricScore, metric.scores.len);
+            errdefer self.alloc.free(scores);
+            var initialized_scores: usize = 0;
+            errdefer for (scores[0..initialized_scores]) |*score| score.deinit(self.alloc);
+            for (metric.scores, 0..) |score, score_index| {
+                scores[score_index] = .{ .node = try self.alloc.dupe(u8, score.node_id), .score = score.value };
+                initialized_scores += 1;
+            }
+            const name = try self.alloc.dupe(u8, named.name);
+            errdefer self.alloc.free(name);
+            const index_name = try self.alloc.dupe(u8, named.query.index_name);
+            errdefer self.alloc.free(index_name);
+            const metric_name = try self.alloc.dupe(u8, named.query.metric_name);
+            errdefer self.alloc.free(metric_name);
+            var status = try self.graphMetricStatusAlloc(
+                named.query.metric_name,
+                metric.config_fingerprint,
+                metric.edge_filter,
+                metric.converged,
+                metric.iterations_completed,
+                metric.delta,
+                metric.metadata_version,
+                metric.published_generation,
+                metric.edge_generation,
+                metric.computed_at_ms,
+            );
+            errdefer status.deinit(self.alloc);
+            results[i] = .{
+                .name = name,
+                .index_name = index_name,
+                .metric_name = metric_name,
+                .scores = scores,
+                .status = status,
+            };
+            initialized += 1;
+        }
+        return results;
+    }
+
+    const PublicGraphMetricColumns = struct {
+        columns: [][]?f64,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            for (self.columns) |column| if (column.len > 0) alloc.free(column);
+            if (self.columns.len > 0) alloc.free(self.columns);
+            self.* = undefined;
+        }
+    };
+
+    const CachedPublicGraphMetricColumn = struct {
+        scores: []?f64,
+        /// Stable indexes into the original graph result. This slice is owned
+        /// by the request workspace and shared by columns loaded together.
+        source_rows: []const usize,
+    };
+
+    fn metricDependencyIndex(names: []const []const u8, name: []const u8) ?usize {
+        for (names, 0..) |candidate, i| if (std.mem.eql(u8, candidate, name)) return i;
+        return null;
+    }
+
+    fn releaseUnusedPublicGraphMetricColumns(
+        self: *HttpHandler,
+        dependency_names: []const []const u8,
+        cached_columns: []?CachedPublicGraphMetricColumn,
+        first_future_names: []const []const u8,
+        second_future_names: []const []const u8,
+    ) void {
+        std.debug.assert(dependency_names.len == cached_columns.len);
+        for (dependency_names, cached_columns) |name, *maybe_column| {
+            if (metricDependencyIndex(first_future_names, name) != null or
+                metricDependencyIndex(second_future_names, name) != null)
+            {
+                continue;
+            }
+            const column = maybe_column.* orelse continue;
+            if (column.scores.len > 0) self.alloc.free(column.scores);
+            maybe_column.* = null;
+        }
+    }
+
+    fn loadPublicGraphMetricColumns(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        graph_index_name: []const u8,
+        metric_names: []const []const u8,
+        nodes: []const graph_query_mod.GraphResultNode,
+        source_rows: []const usize,
+        dependency_names: []const []const u8,
+        statuses: []db_types.GraphMetricStatus,
+        status_initialized: []bool,
+    ) !PublicGraphMetricColumns {
+        if (statuses.len != dependency_names.len or status_initialized.len != dependency_names.len)
+            return error.InvalidQueryRequest;
+        const columns = try self.alloc.alloc([]?f64, metric_names.len);
+        var initialized_columns: usize = 0;
+        errdefer {
+            for (columns[0..initialized_columns]) |column| self.alloc.free(column);
+            if (columns.len > 0) self.alloc.free(columns);
+        }
+
+        // Metric segments contain only nodes local to the query table. Keep
+        // table-qualified identities out of the lookup entirely; flattening
+        // them to `key` could alias an unrelated local node with the same key.
+        var local_node_count: usize = 0;
+        for (source_rows) |source_row| {
+            if (source_row >= nodes.len) return error.InvalidQueryRequest;
+            local_node_count += @intFromBool(graphMetricLocalNodeId(nodes[source_row]) != null);
+        }
+        const node_ids = try self.alloc.alloc([]const u8, local_node_count);
+        defer self.alloc.free(node_ids);
+        const local_node_indexes = try self.alloc.alloc(usize, local_node_count);
+        defer self.alloc.free(local_node_indexes);
+        var local_node_index: usize = 0;
+        for (source_rows, 0..) |source_row, result_index| {
+            const node = nodes[source_row];
+            const node_id = graphMetricLocalNodeId(node) orelse continue;
+            node_ids[local_node_index] = node_id;
+            local_node_indexes[local_node_index] = result_index;
+            local_node_index += 1;
+        }
+
+        var point_score_columns = try query_mod.graphMetricScoreColumnsAlloc(
+            self.alloc,
+            session,
+            graph_index_name,
+            metric_names,
+            node_ids,
+        );
+        defer point_score_columns.deinit(self.alloc);
+        for (metric_names, point_score_columns.columns, 0..) |metric_name, *point_scores, i| {
+            const dependency_index = metricDependencyIndex(dependency_names, metric_name) orelse
+                return error.InvalidQueryRequest;
+            if (!status_initialized[dependency_index]) {
+                statuses[dependency_index] = try self.graphMetricStatusAlloc(metric_name, point_scores.config_fingerprint, point_scores.edge_filter, point_scores.converged, point_scores.iterations_completed, point_scores.delta, point_scores.metadata_version, point_scores.published_generation, point_scores.edge_generation, point_scores.computed_at_ms);
+                status_initialized[dependency_index] = true;
+            }
+            const local_scores = try point_scores.takeScores();
+            var local_scores_owned = true;
+            errdefer if (local_scores_owned) self.alloc.free(local_scores);
+            if (local_node_count != source_rows.len) {
+                const aligned_bytes = std.math.mul(usize, source_rows.len, @sizeOf(?f64)) catch
+                    return error.GraphMetricQueryBudgetExceeded;
+                // The local result remains live while the aligned column is
+                // allocated, so charge the peak expansion rather than only
+                // the eventual delta.
+                try session.chargeGraphMetricRetained(aligned_bytes);
+            }
+            columns[i] = try scatterLocalGraphMetricScoresAlloc(
+                self.alloc,
+                source_rows.len,
+                local_node_indexes,
+                local_scores,
+            );
+            local_scores_owned = false;
+            initialized_columns += 1;
+        }
+        return .{ .columns = columns };
+    }
+
+    fn ensurePublicGraphMetricColumns(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        graph_index_name: []const u8,
+        requested_names: []const []const u8,
+        nodes: []const graph_query_mod.GraphResultNode,
+        source_rows: []const usize,
+        dependency_names: []const []const u8,
+        statuses: []db_types.GraphMetricStatus,
+        status_initialized: []bool,
+        cached_columns: []?CachedPublicGraphMetricColumn,
+    ) !void {
+        var missing_names: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
+        var missing_count: usize = 0;
+        for (requested_names) |name| {
+            const dependency_index = metricDependencyIndex(dependency_names, name) orelse
+                return error.InvalidQueryRequest;
+            if (cached_columns[dependency_index] != null) continue;
+            missing_names[missing_count] = name;
+            missing_count += 1;
+        }
+        if (missing_count == 0) return;
+        var loaded = try self.loadPublicGraphMetricColumns(
+            session,
+            graph_index_name,
+            missing_names[0..missing_count],
+            nodes,
+            source_rows,
+            dependency_names,
+            statuses,
+            status_initialized,
+        );
+        defer loaded.deinit(self.alloc);
+        for (missing_names[0..missing_count], loaded.columns) |name, *column| {
+            const dependency_index = metricDependencyIndex(dependency_names, name).?;
+            cached_columns[dependency_index] = .{ .scores = column.*, .source_rows = source_rows };
+            column.* = @constCast((&[_]?f64{})[0..]);
+        }
+    }
+
+    fn publicGraphMetricStageColumns(
+        dependency_names: []const []const u8,
+        stage_names: []const []const u8,
+        cached_columns: []const ?CachedPublicGraphMetricColumn,
+        active_rows: []const usize,
+        out: [][]?f64,
+    ) !void {
+        if (out.len != stage_names.len) return error.InvalidQueryRequest;
+        for (stage_names, out) |name, *column| {
+            const dependency_index = metricDependencyIndex(dependency_names, name) orelse
+                return error.InvalidQueryRequest;
+            const cached = cached_columns[dependency_index] orelse return error.InvalidQueryRequest;
+            // Every selection transition rebases all resident columns with the
+            // direct parent indexes returned by the shared selector. A cache
+            // entry from another lineage is corrupt request state; recovering
+            // its position with per-row binary searches hides that invariant
+            // and turns repeated clauses into O(columns * rows * log(rows)).
+            if (!std.mem.eql(usize, cached.source_rows, active_rows))
+                return error.InvalidQueryRequest;
+            column.* = cached.scores;
+        }
+    }
+
+    fn rebasePublicGraphMetricColumns(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        cached_columns: []?CachedPublicGraphMetricColumn,
+        current_rows: []const usize,
+        next_rows: []const usize,
+        selected_parent_indexes: []const usize,
+    ) !void {
+        if (next_rows.len != selected_parent_indexes.len) return error.InvalidQueryRequest;
+        if (cached_columns.len > graph_query_mod.graph_metric_dependency_limit)
+            return error.InvalidQueryRequest;
+
+        // Rebase transactionally. A late allocation or corrupt parent index
+        // must leave every cache entry on the old lineage; otherwise earlier
+        // entries would retain source_rows pointing at a selection the caller
+        // is about to free while later entries still describe current_rows.
+        var replacements: [graph_query_mod.graph_metric_dependency_limit]?[]?f64 = @splat(null);
+        errdefer for (replacements[0..cached_columns.len]) |maybe_scores| if (maybe_scores) |scores| self.alloc.free(scores);
+        for (cached_columns, 0..) |maybe_column, column_index| {
+            const cached = maybe_column orelse continue;
+            if (!std.mem.eql(usize, cached.source_rows, current_rows) or cached.scores.len != current_rows.len)
+                return error.InvalidQueryRequest;
+            const retained_bytes = std.math.mul(usize, next_rows.len, @sizeOf(?f64)) catch
+                return error.GraphMetricQueryBudgetExceeded;
+            try session.chargeGraphMetricRetained(retained_bytes);
+            const rebased = try self.alloc.alloc(?f64, next_rows.len);
+            // Register ownership before validating/copying the selector. The
+            // transaction rollback must also cover malformed parent ordinals.
+            replacements[column_index] = rebased;
+            for (selected_parent_indexes, rebased) |parent_index, *score| {
+                if (parent_index >= cached.scores.len) return error.InvalidQueryRequest;
+                score.* = cached.scores[parent_index];
+            }
+        }
+        for (cached_columns, replacements[0..cached_columns.len]) |*maybe_column, *maybe_replacement| {
+            const cached = if (maybe_column.*) |*value| value else continue;
+            const rebased = maybe_replacement.*.?;
+            if (cached.scores.len > 0) self.alloc.free(cached.scores);
+            cached.scores = rebased;
+            cached.source_rows = next_rows;
+            maybe_replacement.* = null;
+        }
+    }
+
+    fn applyPublicGraphMetricShape(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        query: graph_query_mod.GraphQuery,
+        result: *db_types.GraphSearchResult,
+    ) !void {
+        try graph_query_mod.validateGraphMetricQueryShape(query);
+        var dependency_names: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
+        var dependency_count: usize = 0;
+        for (query.metrics) |metric| appendUniqueMetricDependency(&dependency_names, &dependency_count, metric.name);
+        for (query.order_by) |order| appendUniqueMetricDependency(&dependency_names, &dependency_count, order.name);
+        for (query.where_metric) |filter| appendUniqueMetricDependency(&dependency_names, &dependency_count, filter.name);
+        if (dependency_count == 0) return;
+        if (graphMetricPostProcessingNeeded(query) and result.nodes.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
+
+        const statuses = try self.alloc.alloc(db_types.GraphMetricStatus, dependency_count);
+        var status_initialized: [graph_query_mod.graph_metric_dependency_limit]bool = @splat(false);
+        var statuses_owned = true;
+        errdefer if (statuses_owned) {
+            for (statuses, status_initialized[0..dependency_count]) |*status, initialized| if (initialized) status.deinit(self.alloc);
+            self.alloc.free(statuses);
+        };
+        var filter_names_buffer: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
+        var filter_name_count: usize = 0;
+        for (query.where_metric) |filter| appendUniqueMetricDependency(&filter_names_buffer, &filter_name_count, filter.name);
+
+        var order_names_buffer: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
+        var order_name_count: usize = 0;
+        for (query.order_by) |order| appendUniqueMetricDependency(&order_names_buffer, &order_name_count, order.name);
+
+        var projection_names_buffer: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
+        var projection_name_count: usize = 0;
+        for (query.metrics) |metric| appendUniqueMetricDependency(&projection_names_buffer, &projection_name_count, metric.name);
+
+        const initial_row_bytes = std.math.mul(usize, result.nodes.len, @sizeOf(usize)) catch
+            return error.GraphMetricQueryBudgetExceeded;
+        try session.chargeGraphMetricRetained(initial_row_bytes);
+        const initial_rows = try self.alloc.alloc(usize, result.nodes.len);
+        for (initial_rows, 0..) |*row, i| row.* = i;
+        var active_rows: []usize = initial_rows;
+        defer if (active_rows.len > 0) self.alloc.free(active_rows);
+
+        var cached_columns: [graph_query_mod.graph_metric_dependency_limit]?CachedPublicGraphMetricColumn = @splat(null);
+        defer for (cached_columns[0..dependency_count]) |maybe_column| if (maybe_column) |column| {
+            if (column.scores.len > 0) self.alloc.free(column.scores);
+        };
+        var stage_column_buffer: [graph_query_mod.graph_metric_dependency_limit][]?f64 = undefined;
+
+        // Resolve selective filters first so later I/O only covers survivors.
+        // Stable original-row ordinals compose across stages; resident columns
+        // are rebased transactionally and nodes move once after selection.
+        if (filter_name_count > 0) {
+            try self.ensurePublicGraphMetricColumns(
+                session,
+                query.index_name,
+                filter_names_buffer[0..filter_name_count],
+                result.nodes,
+                active_rows,
+                dependency_names[0..dependency_count],
+                statuses,
+                status_initialized[0..dependency_count],
+                cached_columns[0..dependency_count],
+            );
+            const filter_columns = stage_column_buffer[0..filter_name_count];
+            try publicGraphMetricStageColumns(
+                dependency_names[0..dependency_count],
+                filter_names_buffer[0..filter_name_count],
+                cached_columns[0..dependency_count],
+                active_rows,
+                filter_columns,
+            );
+            var filter_query = query;
+            filter_query.metrics = &.{};
+            filter_query.order_by = &.{};
+            const selected = try graph_query_mod.GraphQueryEngine.selectLoadedMetricCandidateIndexesAlloc(
+                self.alloc,
+                filter_names_buffer[0..filter_name_count],
+                filter_columns,
+                filter_query,
+                order_name_count == 0,
+                active_rows.len,
+            );
+            defer self.alloc.free(selected);
+            self.releaseUnusedPublicGraphMetricColumns(
+                dependency_names[0..dependency_count],
+                cached_columns[0..dependency_count],
+                order_names_buffer[0..order_name_count],
+                projection_names_buffer[0..projection_name_count],
+            );
+            const filtered_rows = blk: {
+                const rows = try self.alloc.alloc(usize, selected.len);
+                errdefer self.alloc.free(rows);
+                for (selected, rows) |source_index, *row| {
+                    if (source_index >= active_rows.len) return error.InvalidQueryRequest;
+                    row.* = active_rows[source_index];
+                }
+                try session.chargeGraphMetricRetained(std.math.mul(usize, rows.len, @sizeOf(usize)) catch
+                    return error.GraphMetricQueryBudgetExceeded);
+                try self.rebasePublicGraphMetricColumns(
+                    session,
+                    cached_columns[0..dependency_count],
+                    active_rows,
+                    rows,
+                    selected,
+                );
+                break :blk rows;
+            };
+            if (active_rows.len > 0) self.alloc.free(active_rows);
+            active_rows = filtered_rows;
+        }
+
+        if (order_name_count > 0) {
+            try self.ensurePublicGraphMetricColumns(
+                session,
+                query.index_name,
+                order_names_buffer[0..order_name_count],
+                result.nodes,
+                active_rows,
+                dependency_names[0..dependency_count],
+                statuses,
+                status_initialized[0..dependency_count],
+                cached_columns[0..dependency_count],
+            );
+            const order_columns = stage_column_buffer[0..order_name_count];
+            try publicGraphMetricStageColumns(
+                dependency_names[0..dependency_count],
+                order_names_buffer[0..order_name_count],
+                cached_columns[0..dependency_count],
+                active_rows,
+                order_columns,
+            );
+            var order_query = query;
+            order_query.metrics = &.{};
+            order_query.where_metric = &.{};
+            const selected = try graph_query_mod.GraphQueryEngine.selectLoadedMetricCandidateIndexesAlloc(
+                self.alloc,
+                order_names_buffer[0..order_name_count],
+                order_columns,
+                order_query,
+                true,
+                active_rows.len,
+            );
+            defer self.alloc.free(selected);
+            self.releaseUnusedPublicGraphMetricColumns(
+                dependency_names[0..dependency_count],
+                cached_columns[0..dependency_count],
+                projection_names_buffer[0..projection_name_count],
+                &.{},
+            );
+            const ordered_rows = blk: {
+                const rows = try self.alloc.alloc(usize, selected.len);
+                errdefer self.alloc.free(rows);
+                for (selected, rows) |source_index, *row| {
+                    if (source_index >= active_rows.len) return error.InvalidQueryRequest;
+                    row.* = active_rows[source_index];
+                }
+                try session.chargeGraphMetricRetained(std.math.mul(usize, rows.len, @sizeOf(usize)) catch
+                    return error.GraphMetricQueryBudgetExceeded);
+                try self.rebasePublicGraphMetricColumns(
+                    session,
+                    cached_columns[0..dependency_count],
+                    active_rows,
+                    rows,
+                    selected,
+                );
+                break :blk rows;
+            };
+            if (active_rows.len > 0) self.alloc.free(active_rows);
+            active_rows = ordered_rows;
+        }
+
+        try self.ensurePublicGraphMetricColumns(
+            session,
+            query.index_name,
+            projection_names_buffer[0..projection_name_count],
+            result.nodes,
+            active_rows,
+            dependency_names[0..dependency_count],
+            statuses,
+            status_initialized[0..dependency_count],
+            cached_columns[0..dependency_count],
+        );
+        for (status_initialized[0..dependency_count]) |initialized| if (!initialized)
+            return error.InvalidQueryRequest;
+
+        const projected_value_count = std.math.mul(usize, active_rows.len, query.metrics.len) catch
+            return error.GraphMetricQueryBudgetExceeded;
+        var projected_retained_bytes = std.math.mul(usize, projected_value_count, @sizeOf(graph_query_mod.GraphMetricValue)) catch
+            return error.GraphMetricQueryBudgetExceeded;
+        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, dependency_count, @sizeOf([]u8)) catch
+            return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, dependency_count, @sizeOf(db_types.GraphMetricStatus)) catch
+            return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+        for (statuses[0..dependency_count]) |status| {
+            // The status and the projection dictionary intentionally own
+            // independent copies: status may be omitted from the response
+            // while projected metric names must remain valid.
+            projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, status.name.len, 2) catch
+                return error.GraphMetricQueryBudgetExceeded) catch
+                return error.GraphMetricQueryBudgetExceeded;
+            projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, status.edge_filter.types.len, @sizeOf([]const u8)) catch
+                return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+            for (status.edge_filter.types) |edge_type| {
+                projected_retained_bytes = std.math.add(usize, projected_retained_bytes, edge_type.len) catch
+                    return error.GraphMetricQueryBudgetExceeded;
+            }
+        }
+        try session.chargeGraphMetricRetained(projected_retained_bytes);
+
+        const metric_value_names = try self.alloc.alloc([]u8, dependency_count);
+        var initialized_metric_names: usize = 0;
+        var metric_names_owned = true;
+        errdefer if (metric_names_owned) {
+            for (metric_value_names[0..initialized_metric_names]) |name| self.alloc.free(name);
+            self.alloc.free(metric_value_names);
+        };
+        for (statuses[0..dependency_count], 0..) |status, i| {
+            metric_value_names[i] = try self.alloc.dupe(u8, status.name);
+            initialized_metric_names += 1;
+        }
+        // Keep the old slab alive until the single final node move has
+        // installed every replacement view. Filtering and ordering above only
+        // changed stable ordinals, so no intermediate node or metric copies
+        // are required.
+        const projection_columns = stage_column_buffer[0..projection_name_count];
+        try publicGraphMetricStageColumns(
+            dependency_names[0..dependency_count],
+            projection_names_buffer[0..projection_name_count],
+            cached_columns[0..dependency_count],
+            active_rows,
+            projection_columns,
+        );
+        const projection_metric_value_names = try self.alloc.alloc([]const u8, projection_name_count);
+        defer self.alloc.free(projection_metric_value_names);
+        for (projection_names_buffer[0..projection_name_count], 0..) |name, i| {
+            const dependency_index = metricDependencyIndex(dependency_names[0..dependency_count], name) orelse
+                return error.InvalidQueryRequest;
+            projection_metric_value_names[i] = metric_value_names[dependency_index];
+        }
+        const previous_metric_values_slab = result.metric_values_slab;
+        const replacement_metric_values_slab = try graph_query_mod.GraphQueryEngine.materializeSelectedMetricColumns(
+            self.alloc,
+            projection_metric_value_names,
+            projection_columns,
+            active_rows,
+            &result.nodes,
+        );
+        result.metric_values_slab = replacement_metric_values_slab;
+        if (previous_metric_values_slab.len > 0) self.alloc.free(previous_metric_values_slab);
+        for (result.metric_value_names) |name| self.alloc.free(name);
+        if (result.metric_value_names.len > 0) self.alloc.free(result.metric_value_names);
+        result.metric_value_names = metric_value_names;
+        metric_names_owned = false;
+        for (result.metric_status) |*status| status.deinit(self.alloc);
+        if (result.metric_status.len > 0) self.alloc.free(result.metric_status);
+        result.metric_status = statuses;
+        statuses_owned = false;
+        if (!query.include_metric_status) {
+            try stripServerlessGraphMetricStatus(self.alloc, result);
+        }
+        if (result.paths.len > 0) try self.rebuildPublicGraphPathsFromNodes(result);
+        try self.rebuildPublicGraphHitsFromNodes(session.cancellation, result);
+    }
+
+    fn rebuildPublicGraphPathsFromNodes(self: *HttpHandler, result: *db_types.GraphSearchResult) !void {
+        const paths = try self.alloc.alloc(db_types.GraphPath, result.nodes.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (paths[0..initialized]) |path| graph_paths.freePath(self.alloc, path);
+            self.alloc.free(paths);
+        }
+        for (result.nodes, 0..) |node, i| {
+            paths[i] = try graphResultNodeToDbPathAlloc(self.alloc, node);
+            initialized += 1;
+        }
+        for (result.paths) |path| graph_paths.freePath(self.alloc, path);
+        self.alloc.free(result.paths);
+        result.paths = paths;
+    }
+
+    const PublicGraphHitKey = struct {
+        source_table: ?[]const u8,
+        id: []const u8,
+    };
+
+    const PublicGraphHitKeyContext = struct {
+        pub fn hash(_: @This(), key: PublicGraphHitKey) u64 {
+            var hasher = std.hash.Wyhash.init(0x6772_6170_682d_6869);
+            if (key.source_table) |table| {
+                hasher.update(&.{1});
+                hasher.update(table);
+            } else {
+                hasher.update(&.{0});
+            }
+            hasher.update(&.{0});
+            hasher.update(key.id);
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), lhs: PublicGraphHitKey, rhs: PublicGraphHitKey) bool {
+            if (!std.mem.eql(u8, lhs.id, rhs.id)) return false;
+            if (lhs.source_table == null or rhs.source_table == null) return lhs.source_table == null and rhs.source_table == null;
+            return std.mem.eql(u8, lhs.source_table.?, rhs.source_table.?);
+        }
+    };
+
+    fn rebuildPublicGraphHitsFromNodes(
+        self: *HttpHandler,
+        cancellation: CancellationToken,
+        result: *db_types.GraphSearchResult,
+    ) !void {
+        var hit_indexes = std.HashMapUnmanaged(PublicGraphHitKey, usize, PublicGraphHitKeyContext, std.hash_map.default_max_load_percentage).empty;
+        defer hit_indexes.deinit(self.alloc);
+        try hit_indexes.ensureTotalCapacity(self.alloc, @intCast(result.hits.len));
+        for (result.hits, 0..) |hit, i| {
+            if (i % 4096 == 0) try cancellation.check();
+            const gop = hit_indexes.getOrPutAssumeCapacity(.{ .source_table = hit.source_table, .id = hit.id });
+            if (!gop.found_existing) gop.value_ptr.* = i;
+        }
+
+        const hits = try self.alloc.alloc(db_types.SearchHit, result.nodes.len);
+        errdefer if (hits.len > 0) self.alloc.free(hits);
+        var initialized: usize = 0;
+        errdefer for (hits[0..initialized]) |*hit| hit.deinit(self.alloc);
+        for (result.nodes, 0..) |node, i| {
+            if (i % 4096 == 0) try cancellation.check();
+            if (hit_indexes.get(.{ .source_table = node.table, .id = node.key })) |existing_index| {
+                const existing = result.hits[existing_index];
+                hits[i] = try existing.clone(self.alloc);
+                hits[i].score = clampGraphMetricScore(node.distance);
+            } else {
+                hits[i] = try newPublicGraphHitAlloc(self.alloc, node);
+            }
+            initialized += 1;
+        }
+        for (result.hits) |*hit| hit.deinit(self.alloc);
+        if (result.hits.len > 0) self.alloc.free(result.hits);
+        result.hits = hits;
+        // Pattern-query totals count matches, while traversal totals count
+        // result nodes. Metric filtering/sorting applies to nodes only.
+        if (result.matches.len == 0) result.total_hits = @intCast(result.nodes.len);
+    }
+
+    fn newPublicGraphHitAlloc(alloc: Allocator, node: graph_query_mod.GraphResultNode) !db_types.SearchHit {
+        const id = try alloc.dupe(u8, node.key);
+        errdefer alloc.free(id);
+        const source_table = if (node.table) |table| try alloc.dupe(u8, table) else null;
+        return .{ .id = id, .source_table = source_table, .score = clampGraphMetricScore(node.distance) };
+    }
+
+    const PublicGraphMetricRerankResult = struct {
+        status: db_types.GraphMetricStatus,
+        hits: []db_types.SearchHit,
+    };
+
+    fn applyPublicGraphMetricRerank(
+        self: *HttpHandler,
+        session: *query_mod.QuerySession,
+        hits: []db_types.SearchHit,
+        rerank: db_types.GraphMetricRerank,
+        offset: u32,
+        limit: u32,
+    ) !PublicGraphMetricRerankResult {
+        const node_ids = try self.alloc.alloc([]const u8, hits.len);
+        defer self.alloc.free(node_ids);
+        for (hits, 0..) |hit, i| node_ids[i] = hit.id;
+        var metric = try query_mod.graphMetricScoresAlloc(self.alloc, session, rerank.index_name, rerank.metric_name, node_ids);
+        defer metric.deinit(self.alloc);
+        try session.checkCancellation();
+        const selected = try graph_metric_rerank.selectPageAlloc(
+            self.alloc,
+            hits,
+            metric.scores,
+            .{
+                .base_weight = rerank.base_weight,
+                .metric_weight = rerank.weight,
+                .missing_score = rerank.missing_score,
+            },
+            offset,
+            limit,
+        );
+        defer self.alloc.free(selected);
+        try session.checkCancellation();
+        var status = try self.graphMetricStatusAlloc(
+            rerank.metric_name,
+            metric.config_fingerprint,
+            metric.edge_filter,
+            metric.converged,
+            metric.iterations_completed,
+            metric.delta,
+            metric.metadata_version,
+            metric.published_generation,
+            metric.edge_generation,
+            metric.computed_at_ms,
+        );
+        errdefer status.deinit(self.alloc);
+        for (selected) |selection| {
+            try session.checkCancellation();
+            const hit = &hits[selection.original_index];
+            const index_name = try self.alloc.dupe(u8, rerank.index_name);
+            errdefer self.alloc.free(index_name);
+            const metric_name = try self.alloc.dupe(u8, rerank.metric_name);
+            if (hit.score_details) |*old| old.deinit(self.alloc);
+            hit.score_details = .{
+                .index_name = index_name,
+                .metric_name = metric_name,
+                .base_score = selection.base_score,
+                .base_weight = rerank.base_weight,
+                .metric_score = selection.metric_score,
+                .metric_score_used = selection.metric_score_used,
+                .metric_weight = rerank.weight,
+                .missing_score_used = selection.metric_score == null,
+                .final_score = selection.final_score,
+                .published_generation = metric.published_generation,
+            };
+            hit.score = selection.final_score;
+        }
+        const retained = try self.alloc.alloc(bool, hits.len);
+        defer self.alloc.free(retained);
+        @memset(retained, false);
+        const kept = try self.alloc.alloc(db_types.SearchHit, selected.len);
+        for (selected, 0..) |selection, i| {
+            retained[selection.original_index] = true;
+            kept[i] = hits[selection.original_index];
+            hits[selection.original_index] = undefined;
+        }
+        for (hits, retained) |*hit, keep| if (!keep) hit.deinit(self.alloc);
+        if (hits.len > 0) self.alloc.free(hits);
+        return .{ .status = status, .hits = kept };
+    }
+
+    fn graphMetricStatusAlloc(
+        self: *HttpHandler,
+        metric_name: []const u8,
+        config_fingerprint: u64,
+        edge_filter: graph_mod.GraphMetricEdgeFilter,
+        converged: bool,
+        iterations_completed: u32,
+        delta: f64,
+        metadata_version: u16,
+        published_generation: u64,
+        edge_generation: u64,
+        computed_at_ms: u64,
+    ) !db_types.GraphMetricStatus {
+        const name = try self.alloc.dupe(u8, metric_name);
+        errdefer self.alloc.free(name);
+        const owned_filter = try edge_filter.cloneAlloc(self.alloc);
+        return .{
+            .name = name,
+            .state = .fresh,
+            .phase = .complete,
+            .edge_filter = owned_filter,
+            .metadata_version = metadata_version,
+            .config_fingerprint = config_fingerprint,
+            .published_generation = published_generation,
+            .edge_generation = edge_generation,
+            .target_edge_generation = edge_generation,
+            .progress = 1,
+            .converged = converged,
+            .iterations_completed = iterations_completed,
+            .delta = delta,
+            .computed_at_ms = computed_at_ms,
+        };
+    }
+
     fn handleQuerySearch(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
@@ -2925,7 +3874,7 @@ pub const HttpHandler = struct {
         };
         defer if (aggregations_json) |json| self.alloc.free(json);
 
-        var execution = self.executePublishedSearch(namespace, null, body, cancellation) catch |err| {
+        var execution = self.executePublishedSearch(namespace, null, body, cancellation, null) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
@@ -3016,7 +3965,7 @@ pub const HttpHandler = struct {
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
-        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| switch (err) {
+        var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, null) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.EmbeddingIndexNotFound,
             error.InvalidEmbeddingDimensions,
@@ -3274,13 +4223,14 @@ pub const HttpHandler = struct {
                 }
                 return err;
             };
+            initialized += 1;
+            try self.applyPublicGraphMetricShape(session, named_query.query, &results[idx]);
             try available_sets.append(self.alloc, .{
                 .name = results[idx].name,
                 .hits = results[idx].hits,
                 .total_hits = results[idx].total_hits,
                 .graph_result = &results[idx],
             });
-            initialized += 1;
         }
         // The shared request budget is stack-owned. Preserve its output
         // charges across all named operations, then detach release hooks only
@@ -3798,6 +4748,15 @@ pub const HttpHandler = struct {
             if (matches.len > 0) self.alloc.free(matches);
         }
 
+        const nodes = if (graphMetricDependenciesNeeded(named_query.query))
+            try collectUniquePublicPatternNodesAlloc(self.alloc, matches)
+        else
+            try self.alloc.alloc(graph_query_mod.GraphResultNode, 0);
+        errdefer {
+            for (nodes) |*node| node.deinit(self.alloc);
+            if (nodes.len > 0) self.alloc.free(nodes);
+        }
+
         const hits = try self.buildPatternDocumentHitsAlloc(source_table, named_query.query, matches, request_cache);
         errdefer {
             for (hits) |*hit| hit.deinit(self.alloc);
@@ -3806,7 +4765,7 @@ pub const HttpHandler = struct {
 
         return .{
             .name = try self.alloc.dupe(u8, named_query.name),
-            .nodes = &.{},
+            .nodes = nodes,
             .paths = &.{},
             .matches = matches,
             .hits = hits,
@@ -4713,9 +5672,17 @@ pub const HttpHandler = struct {
     }
 
     fn tableApi(self: *HttpHandler, cancellation: CancellationToken) public_table_http.TableApi {
+        return self.tableApiWithDiagnostics(cancellation, null);
+    }
+
+    fn tableApiWithDiagnostics(
+        self: *HttpHandler,
+        cancellation: CancellationToken,
+        diagnostics: ?*api_operation.RequestDiagnostics,
+    ) public_table_http.TableApi {
         return .{
             .ptr = self,
-            .request = .{ .cancellation = cancellation },
+            .request = .{ .cancellation = cancellation, .diagnostics = diagnostics },
             .vtable = &.{
                 .execute_table_batch = executePublicTableBatch,
                 .execute_table_query_request = executePublicTableQueryRequest,
@@ -4759,6 +5726,8 @@ pub const HttpHandler = struct {
         };
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) return error.Backpressured;
+        request.cancellation.check() catch return error.Canceled;
+        try self.preflightPublicTableBatchSyncLevel(req.sync_level, status);
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
@@ -4788,7 +5757,7 @@ pub const HttpHandler = struct {
         };
         defer result.deinit(self.alloc);
 
-        self.enforcePublicTableBatchSyncLevel(table_name, req.sync_level, result.end_lsn, status, request.cancellation) catch |err| {
+        self.enforcePublicTableBatchSyncLevel(table_name, namespace, req.sync_level, result.end_lsn, request.cancellation) catch |err| {
             if (err == error.InternalFailure) {
                 std.log.err("serverless public table batch sync wait failed table={s} sync_level={} end_lsn={} err={}", .{
                     table_name,
@@ -4801,38 +5770,59 @@ pub const HttpHandler = struct {
         };
     }
 
+    fn preflightPublicTableBatchSyncLevel(
+        self: *HttpHandler,
+        sync_level: db_types.SyncLevel,
+        status: catalog_types.BuildStatus,
+    ) public_table_http.TableApi.ExecuteBatchError!void {
+        const requires_background_materialization = switch (sync_level) {
+            .propose, .write => false,
+            .full_text => status.chunk_preview_enabled,
+            .enrichments, .full_index => status.enrichment_enabled or
+                status.chunk_preview_enabled or
+                status.chunk_embeddings_enabled or
+                status.rerank_terms_enabled,
+        };
+        switch (sync_level) {
+            .propose, .write => {},
+            .full_text, .enrichments, .full_index => if (requires_background_materialization) {
+                const runtime = self.runtime_metrics orelse return error.UnsupportedSyncLevel;
+                if (!runtime.supportsSynchronousMaterialization()) return error.UnsupportedSyncLevel;
+            },
+        }
+        if (sync_level != .full_index) return;
+        if (status.graph_metrics_rejected != 0) return error.GraphMetricMaterializationRejected;
+    }
+
     fn enforcePublicTableBatchSyncLevel(
         self: *HttpHandler,
         table_name: []const u8,
+        namespace: []const u8,
         sync_level: db_types.SyncLevel,
         end_lsn: u64,
-        status_before_write: catalog_types.BuildStatus,
         cancellation: CancellationToken,
     ) public_table_http.TableApi.ExecuteBatchError!void {
-        const requires_background_materialization =
-            status_before_write.enrichment_enabled or
-            status_before_write.chunk_preview_enabled or
-            status_before_write.chunk_embeddings_enabled or
-            status_before_write.rerank_terms_enabled;
-
         switch (sync_level) {
             .propose, .write => return,
-            .full_text => {},
-            .enrichments, .full_index => if (requires_background_materialization and self.runtime_metrics == null) {
-                return error.UnsupportedSyncLevel;
-            },
+            .full_text, .enrichments, .full_index => {},
         }
-
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
+        const deadline_ns = start_ns +| timeout_ns;
+        const sync_cancellation_state = SyncWaitCancellation{
+            .upstream = cancellation,
+            .deadline_ns = deadline_ns,
+        };
+        const sync_cancellation = sync_cancellation_state.token();
         while (true) {
-            cancellation.check() catch return error.Canceled;
-            const build_result = self.catalog.buildTable(table_name) catch |err| switch (err) {
-                error.NamespaceNotFound => return error.NotFound,
+            sync_cancellation.check() catch return error.CommittedPending;
+            const build_result = self.catalog.buildTableWithCancellation(table_name, sync_cancellation) catch |err| switch (err) {
+                error.Canceled => return error.CommittedPending,
+                error.NamespaceNotFound => return error.CommittedRepairRequired,
                 error.HeadChanged => null,
                 else => {
                     std.log.err("serverless public table batch build failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
-                    return error.InternalFailure;
+                    return error.CommittedRepairRequired;
                 },
             };
             if (build_result) |build| {
@@ -4840,26 +5830,32 @@ pub const HttpHandler = struct {
                 owned_build.deinit(self.alloc);
             }
 
-            if (self.runtime_metrics) |runtime| {
-                _ = runtime.runOnce() catch |err| {
-                    std.log.err("serverless public table batch maintenance run failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
-                    return error.InternalFailure;
-                };
-            }
-
             var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
-                error.NamespaceNotFound => return error.NotFound,
+                error.NamespaceNotFound => return error.CommittedRepairRequired,
                 else => {
                     std.log.err("serverless public table batch post-build status failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
-                    return error.InternalFailure;
+                    return error.CommittedRepairRequired;
                 },
             };
             defer status.deinit(self.alloc);
 
+            if (sync_level == .full_index and status.graph_metrics_rejected != 0) return error.CommittedGraphMetricMaterializationRejected;
             if (tableSyncLevelSatisfied(sync_level, end_lsn, status)) return;
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) {
+
+            if (syncLevelNeedsBackgroundMaterialization(sync_level, status)) {
+                const runtime = self.runtime_metrics orelse return error.CommittedRepairRequired;
+                _ = runtime.runNamespaceMaterializationOnceWithCancellation(namespace, sync_cancellation) catch |err| switch (err) {
+                    error.Canceled => return error.CommittedPending,
+                    else => {
+                        std.log.err("serverless public table batch targeted materialization failed table={s} namespace={s} sync_level={} err={}", .{ table_name, namespace, sync_level, err });
+                        return error.CommittedRepairRequired;
+                    },
+                };
+            }
+            if (cancellation.isCancelled()) return error.CommittedPending;
+            if (platform_time.monotonicNs() >= deadline_ns) {
                 std.log.err(
-                    "serverless public table batch sync timeout table={s} sync_level={} end_lsn={} published={} latest={} pending_rebuild={} enrichment_complete={} chunk_preview_complete={} chunk_embeddings_complete={} rerank_terms_complete={} active_stage={any}",
+                    "serverless public table batch sync timeout table={s} sync_level={} end_lsn={} published={} latest={} pending_rebuild={} enrichment_complete={} chunk_preview_complete={} chunk_embeddings_complete={} rerank_terms_complete={} graph_metrics_configured={} graph_metrics_pending={} graph_metrics_rejected={} active_stage={any}",
                     .{
                         table_name,
                         sync_level,
@@ -4871,10 +5867,13 @@ pub const HttpHandler = struct {
                         status.chunk_preview_complete,
                         status.chunk_embeddings_complete,
                         status.rerank_terms_complete,
+                        status.graph_metrics_configured,
+                        status.graph_metrics_pending,
+                        status.graph_metrics_rejected,
                         status.enrichment_active_stage,
                     },
                 );
-                return error.UnsupportedSyncLevel;
+                return error.CommittedPending;
             }
 
             sleepNs(10 * std.time.ns_per_ms);
@@ -4896,6 +5895,18 @@ pub const HttpHandler = struct {
         };
     }
 
+    fn syncLevelNeedsBackgroundMaterialization(sync_level: db_types.SyncLevel, status: catalog_types.BuildStatus) bool {
+        return switch (sync_level) {
+            .propose, .write => false,
+            .full_text => status.chunk_preview_enabled and !status.chunk_preview_complete,
+            .enrichments => !status.enrichment_complete,
+            .full_index => (status.enrichment_enabled and !status.enrichment_complete) or
+                (status.chunk_preview_enabled and !status.chunk_preview_complete) or
+                (status.chunk_embeddings_enabled and !status.chunk_embeddings_complete) or
+                (status.rerank_terms_enabled and !status.rerank_terms_complete),
+        };
+    }
+
     fn fullTextSyncSatisfied(status: catalog_types.BuildStatus) bool {
         if (status.artifact_actions.document_segment == .rebuild) return false;
         if (status.full_text_index_actions.len > 0) {
@@ -4913,6 +5924,8 @@ pub const HttpHandler = struct {
     }
 
     fn fullIndexSyncSatisfied(status: catalog_types.BuildStatus) bool {
+        if (status.graph_metrics_pending != 0 or status.graph_metrics_rejected != 0) return false;
+        if (status.head_republish_recommended or status.pending_materialization_rebuild) return false;
         if (!status.enrichment_complete) return false;
         if (!fullTextSyncSatisfied(status)) return false;
         if (status.artifact_actions.dense_vector == .rebuild) return false;
@@ -4960,6 +5973,7 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.GraphTraversalQueryBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
@@ -5030,7 +6044,7 @@ pub const HttpHandler = struct {
         ptr: *anyopaque,
         alloc: Allocator,
         table_name: []const u8,
-        _: api_operation.RequestContext,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch |err| {
@@ -5043,7 +6057,12 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        return encodeServerlessIndexListAlloc(alloc, table.indexes_json, status) catch |err| {
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, null, request.cancellation) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return error.InternalFailure,
+        };
+        defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
+        return encodeServerlessIndexListWithGraphMetricsAlloc(alloc, table.indexes_json, status, metric_statuses) catch |err| {
             std.log.err("serverless public table index list encode failed table={s} err={}", .{ table_name, err });
             return error.InternalFailure;
         };
@@ -5054,7 +6073,7 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         table_name: []const u8,
         index_name: []const u8,
-        _: api_operation.RequestContext,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch |err| {
@@ -5067,7 +6086,12 @@ pub const HttpHandler = struct {
             return error.InternalFailure;
         };
         defer status.deinit(self.alloc);
-        return (encodeServerlessSingleIndexAlloc(alloc, table.indexes_json, index_name, status) catch |err| {
+        const metric_statuses = self.graphMetricIndexStatusesAlloc(table_name, table.indexes_json, index_name, request.cancellation) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return error.InternalFailure,
+        };
+        defer freeServerlessGraphMetricStatuses(self.alloc, metric_statuses);
+        return (encodeServerlessSingleIndexWithGraphMetricsAlloc(alloc, table.indexes_json, index_name, status, metric_statuses) catch |err| {
             std.log.err("serverless public table index encode failed table={s} index={s} err={}", .{ table_name, index_name, err });
             return error.InternalFailure;
         }) orelse error.NotFound;
@@ -5130,8 +6154,9 @@ pub const HttpHandler = struct {
         const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
         errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedCreateTableRequest, error.UnsupportedGraphMetricRefreshMode, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
+            error.GraphMetricConfigurationLimitExceeded => return error.GraphMetricConfigurationLimitExceeded,
             error.UnsupportedServerlessArtifactIndexSources => return error.UnsupportedArtifactIndexSources,
-            error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
         request.ensureActive() catch |err| switch (err) {
@@ -6705,11 +7730,241 @@ fn freeOwnedGraphEdge(alloc: Allocator, edge: graph_mod.Edge) void {
 }
 
 fn requestHasSearchInputs(request: metadata_openapi.QueryRequest) bool {
-    return request.full_text_search != null or
+    return request.query != null or
+        request.full_text_search != null or
         request.embeddings != null or
         request.semantic_search != null or
         request.filter_query != null or
         request.exclusion_query != null;
+}
+
+fn requestWithoutGraphControls(request: metadata_openapi.QueryRequest) metadata_openapi.QueryRequest {
+    var search_request = request;
+    // Graph controls execute against the same pinned session after ordinary
+    // retrieval and must never leak into the ordinary search planner.
+    search_request.graph_queries = null;
+    search_request.graph_metric = null;
+    search_request.graph_metric_rerank = null;
+    return search_request;
+}
+
+fn graphMetricPostProcessingNeeded(query: graph_query_mod.GraphQuery) bool {
+    return query.where_metric.len > 0 or query.order_by.len > 0;
+}
+
+fn graphMetricLocalNodeId(node: graph_query_mod.GraphResultNode) ?[]const u8 {
+    if (node.table != null) return null;
+    return node.key;
+}
+
+/// Takes ownership of `local_scores` on success and expands it into graph
+/// result order. Qualified rows are deliberately left null.
+fn scatterLocalGraphMetricScoresAlloc(
+    alloc: Allocator,
+    node_count: usize,
+    local_node_indexes: []const usize,
+    local_scores: []?f64,
+) ![]?f64 {
+    if (local_node_indexes.len != local_scores.len or local_scores.len > node_count)
+        return error.InvalidQueryRequest;
+    if (local_scores.len == node_count) {
+        for (local_node_indexes, 0..) |result_index, expected_index| {
+            if (result_index != expected_index) return error.InvalidQueryRequest;
+        }
+        return local_scores;
+    }
+    const scores = try alloc.alloc(?f64, node_count);
+    errdefer alloc.free(scores);
+    @memset(scores, null);
+    var previous_index: ?usize = null;
+    for (local_node_indexes, local_scores) |result_index, score| {
+        if (result_index >= node_count or (previous_index != null and result_index <= previous_index.?))
+            return error.InvalidQueryRequest;
+        scores[result_index] = score;
+        previous_index = result_index;
+    }
+    alloc.free(local_scores);
+    return scores;
+}
+
+test "serverless graph metric lookup preserves qualified node identity" {
+    const local: graph_query_mod.GraphResultNode = .{ .key = "shared", .depth = 0, .distance = 0 };
+    const qualified: graph_query_mod.GraphResultNode = .{ .key = "shared", .table = "entities", .depth = 0, .distance = 0 };
+    try std.testing.expectEqualStrings("shared", graphMetricLocalNodeId(local).?);
+    try std.testing.expect(graphMetricLocalNodeId(qualified) == null);
+
+    const local_scores = try std.testing.allocator.alloc(?f64, 1);
+    local_scores[0] = 42;
+    const scattered = try scatterLocalGraphMetricScoresAlloc(
+        std.testing.allocator,
+        2,
+        &.{0},
+        local_scores,
+    );
+    defer std.testing.allocator.free(scattered);
+    try std.testing.expectEqual(@as(?f64, 42), scattered[0]);
+    try std.testing.expectEqual(@as(?f64, null), scattered[1]);
+}
+
+test "serverless graph metric qualified scatter is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const local_scores = try alloc.alloc(?f64, 1);
+            local_scores[0] = 7;
+            const scattered = scatterLocalGraphMetricScoresAlloc(alloc, 2, &.{0}, local_scores) catch |err| {
+                alloc.free(local_scores);
+                return err;
+            };
+            defer alloc.free(scattered);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+fn graphMetricDependenciesNeeded(query: graph_query_mod.GraphQuery) bool {
+    return query.metrics.len > 0 or graphMetricPostProcessingNeeded(query);
+}
+
+fn appendUniqueMetricDependency(
+    names: *[graph_query_mod.graph_metric_dependency_limit][]const u8,
+    count: *usize,
+    name: []const u8,
+) void {
+    for (names[0..count.*]) |existing| if (std.mem.eql(u8, existing, name)) return;
+    std.debug.assert(count.* < names.len);
+    names[count.*] = name;
+    count.* += 1;
+}
+
+fn clampGraphMetricScore(value: f64) f32 {
+    if (std.math.isNan(value)) return 0;
+    const max = std.math.floatMax(f32);
+    return @floatCast(std.math.clamp(value, -max, max));
+}
+
+fn stripServerlessGraphMetricStatus(alloc: Allocator, result: *db_types.GraphSearchResult) !void {
+    // Projected values intern names in the status list while scoring. Give the
+    // output-bounded projection independent ownership before hiding and
+    // releasing that internal lifecycle metadata.
+    for (result.nodes) |*node| {
+        for (node.metrics) |*metric| try metric.ensureNameOwned(alloc);
+    }
+    for (result.metric_status) |*status| status.deinit(alloc);
+    if (result.metric_status.len > 0) alloc.free(result.metric_status);
+    result.metric_status = &.{};
+}
+
+fn graphResultNodeToDbPathAlloc(alloc: Allocator, node: graph_query_mod.GraphResultNode) !db_types.GraphPath {
+    const source_nodes = node.path orelse return error.InvalidGraphQueryResult;
+    const source_edges = node.path_edges orelse return error.InvalidGraphQueryResult;
+    if (source_edges.len + 1 != source_nodes.len) return error.InvalidGraphQueryResult;
+
+    const nodes = try alloc.alloc([]const u8, source_nodes.len);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |item| alloc.free(item);
+        alloc.free(nodes);
+    }
+    for (source_nodes, 0..) |item, i| {
+        nodes[i] = try alloc.dupe(u8, item);
+        initialized_nodes += 1;
+    }
+
+    var node_tables: []?[]const u8 = &.{};
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (node_tables[0..initialized_tables]) |table| if (table) |value| alloc.free(value);
+        if (node_tables.len > 0) alloc.free(node_tables);
+    }
+    if (node.path_tables) |source_tables| {
+        if (source_tables.len != source_nodes.len) return error.InvalidGraphQueryResult;
+        node_tables = try alloc.alloc(?[]const u8, source_tables.len);
+        @memset(node_tables, null);
+        for (source_tables, 0..) |table, i| {
+            if (table) |value| node_tables[i] = try alloc.dupe(u8, value);
+            initialized_tables += 1;
+        }
+    }
+
+    const edges = try alloc.alloc(graph_paths.PathEdge, source_edges.len);
+    var initialized_edges: usize = 0;
+    errdefer {
+        for (edges[0..initialized_edges]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(edges);
+    }
+    for (source_edges, 0..) |edge, i| {
+        const source = try alloc.dupe(u8, edge.source);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, edge.target);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, edge.edge_type);
+        errdefer alloc.free(edge_type);
+        const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
+        edges[i] = .{
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = edge.weight,
+            .metadata = metadata,
+            .traversal_direction = edge.traversal_direction,
+        };
+        initialized_edges += 1;
+    }
+    return .{
+        .nodes = nodes,
+        .node_tables = node_tables,
+        .edges = edges,
+        .total_weight = node.distance,
+        .length = node.depth,
+    };
+}
+
+fn collectUniquePublicPatternNodesAlloc(
+    alloc: Allocator,
+    matches: []const db_types.GraphPatternMatch,
+) ![]graph_query_mod.GraphResultNode {
+    var binding_count: usize = 0;
+    for (matches) |match| binding_count = std.math.add(usize, binding_count, match.bindings.len) catch
+        return error.QueryCandidateBudgetExceeded;
+
+    var seen = graph_node_identity.BorrowedMap(void){};
+    defer seen.deinit(alloc);
+    try seen.ensureTotalCapacity(alloc, binding_count);
+    var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
+    errdefer {
+        for (nodes.items) |*result_node| result_node.deinit(alloc);
+        nodes.deinit(alloc);
+    }
+    try nodes.ensureTotalCapacity(alloc, binding_count);
+
+    for (matches) |match| {
+        for (match.bindings) |binding| {
+            const identity = graph_node_identity.Ref{ .table = binding.node.table, .key = binding.node.key };
+            if (seen.contains(identity)) continue;
+            const key = try alloc.dupe(u8, binding.node.key);
+            const table = if (binding.node.table) |value|
+                alloc.dupe(u8, value) catch |err| {
+                    alloc.free(key);
+                    return err;
+                }
+            else
+                null;
+            nodes.appendAssumeCapacity(.{
+                .key = key,
+                .table = table,
+                .depth = binding.node.depth,
+                .distance = binding.node.distance,
+            });
+            const stored = nodes.items[nodes.items.len - 1];
+            seen.putAssumeCapacityNoClobber(.{ .table = stored.table, .key = stored.key }, {});
+        }
+    }
+    return try nodes.toOwnedSlice(alloc);
 }
 
 fn firstEdgeType(edge_types: ?[]const []const u8) ?[]const u8 {
@@ -7294,10 +8549,67 @@ const ServerlessIndexStatus = struct {
     chunked_source_count: usize = 0,
 };
 
+const GraphMetricMaterializationState = enum {
+    unsupported,
+    pending,
+    ready,
+    rejected,
+    stale,
+    unavailable,
+};
+
+const ServerlessGraphMetricStatus = struct {
+    index_name: []u8,
+    metric_name: []u8,
+    kind: graph_mod.GraphMetricKind,
+    state: GraphMetricMaterializationState = .pending,
+    rejection_reason: graph_metric_segment_mod.RejectionReason = .none,
+    config_fingerprint: u64,
+    materializer_fingerprint: u64 = 0,
+    published_generation: u64 = 0,
+
+    fn deinit(self: *ServerlessGraphMetricStatus, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        self.* = undefined;
+    }
+};
+
+fn freeServerlessGraphMetricStatuses(alloc: Allocator, statuses: []ServerlessGraphMetricStatus) void {
+    for (statuses) |*status| status.deinit(alloc);
+    if (statuses.len > 0) alloc.free(statuses);
+}
+
+fn graphMetricStatusesForIndex(
+    statuses: []const ServerlessGraphMetricStatus,
+    index_name: []const u8,
+) []const ServerlessGraphMetricStatus {
+    var start: ?usize = null;
+    var end: usize = 0;
+    for (statuses, 0..) |status, i| {
+        if (!std.mem.eql(u8, status.index_name, index_name)) {
+            if (start != null) break;
+            continue;
+        }
+        if (start == null) start = i;
+        end = i + 1;
+    }
+    return if (start) |value| statuses[value..end] else &.{};
+}
+
 fn encodeServerlessIndexListAlloc(
     alloc: Allocator,
     indexes_json: []const u8,
     status: catalog_types.BuildStatus,
+) ![]u8 {
+    return try encodeServerlessIndexListWithGraphMetricsAlloc(alloc, indexes_json, status, &.{});
+}
+
+fn encodeServerlessIndexListWithGraphMetricsAlloc(
+    alloc: Allocator,
+    indexes_json: []const u8,
+    status: catalog_types.BuildStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) ![]u8 {
     const config_map_json = try indexes_api.encodeIndexConfigMap(alloc, indexes_json);
     defer alloc.free(config_map_json);
@@ -7312,7 +8624,7 @@ fn encodeServerlessIndexListAlloc(
     while (it.next()) |entry| {
         if (!first) try out.append(alloc, ',');
         first = false;
-        try appendServerlessIndexEntry(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, status);
+        try appendServerlessIndexEntry(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, status, graph_metric_statuses);
     }
     try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
@@ -7324,6 +8636,16 @@ fn encodeServerlessSingleIndexAlloc(
     index_name: []const u8,
     status: catalog_types.BuildStatus,
 ) !?[]u8 {
+    return try encodeServerlessSingleIndexWithGraphMetricsAlloc(alloc, indexes_json, index_name, status, &.{});
+}
+
+fn encodeServerlessSingleIndexWithGraphMetricsAlloc(
+    alloc: Allocator,
+    indexes_json: []const u8,
+    index_name: []const u8,
+    status: catalog_types.BuildStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
+) !?[]u8 {
     const config_json = try indexes_api.encodeSingleIndexConfig(alloc, indexes_json, index_name);
     defer if (config_json) |value| alloc.free(value);
     const encoded = config_json orelse return null;
@@ -7333,7 +8655,7 @@ fn encodeServerlessSingleIndexAlloc(
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendServerlessIndexEntry(alloc, &out, index_name, config, status);
+    try appendServerlessIndexEntry(alloc, &out, index_name, config, status, graph_metric_statuses);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -7343,14 +8665,16 @@ fn appendServerlessIndexEntry(
     index_name: []const u8,
     config: std.json.Value,
     status: catalog_types.BuildStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) !void {
     const config_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(config, .{})});
     defer alloc.free(config_json);
-    const runtime = try serverlessIndexStatus(index_name, config, status);
+    const index_metric_statuses = graphMetricStatusesForIndex(graph_metric_statuses, index_name);
+    const runtime = try serverlessIndexStatus(index_name, config, status, index_metric_statuses);
     try out.appendSlice(alloc, "{\"config\":");
     try out.appendSlice(alloc, config_json);
     try out.appendSlice(alloc, ",\"status\":");
-    try appendServerlessIndexStatusJson(alloc, out, runtime);
+    try appendServerlessIndexStatusJson(alloc, out, runtime, index_metric_statuses);
     try out.appendSlice(alloc, ",\"shard_status\":{}}");
 }
 
@@ -7358,6 +8682,7 @@ fn appendServerlessIndexStatusJson(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
     status: ServerlessIndexStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) !void {
     try out.appendSlice(alloc, "{\"readiness\":{\"state\":");
     try out.appendSlice(alloc, if (status.readiness_ready) "\"ready\"" else "\"pending\"");
@@ -7497,6 +8822,34 @@ fn appendServerlessIndexStatusJson(
         defer alloc.free(encoded_chunk_count);
         try out.appendSlice(alloc, encoded_chunk_count);
     }
+    if (graph_metric_statuses.len > 0) {
+        try out.appendSlice(alloc, ",\"graph_metrics\":[");
+        for (graph_metric_statuses, 0..) |metric, i| {
+            if (i > 0) try out.append(alloc, ',');
+            const encoded_name = try std.json.Stringify.valueAlloc(alloc, metric.metric_name, .{});
+            defer alloc.free(encoded_name);
+            try out.print(
+                alloc,
+                "{{\"name\":{s},\"kind\":\"{s}\",\"state\":\"{s}\",\"config_fingerprint\":\"{x:0>16}\",\"materializer_fingerprint\":\"{x:0>16}\",\"published_generation\":{}",
+                .{
+                    encoded_name,
+                    @tagName(metric.kind),
+                    @tagName(metric.state),
+                    metric.config_fingerprint,
+                    metric.materializer_fingerprint,
+                    metric.published_generation,
+                },
+            );
+            if (metric.rejection_reason != .none) {
+                try out.print(alloc, ",\"rejection_reason\":\"{s}\"", .{@tagName(metric.rejection_reason)});
+            }
+            if (metric.state == .unsupported) {
+                try out.appendSlice(alloc, ",\"unavailable_reason\":\"graph_metric_publication_not_enabled\",\"retryable\":false");
+            }
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+    }
     try out.append(alloc, '}');
 }
 
@@ -7504,6 +8857,7 @@ fn serverlessIndexStatus(
     index_name: []const u8,
     config: std.json.Value,
     status: catalog_types.BuildStatus,
+    graph_metric_statuses: []const ServerlessGraphMetricStatus,
 ) !ServerlessIndexStatus {
     if (config != .object) return error.InvalidTableIndexMetadata;
     const kind = switch (indexes_api.inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata) {
@@ -7562,6 +8916,13 @@ fn serverlessIndexStatus(
             0
     else
         0;
+    var graph_metric_blocked = false;
+    for (graph_metric_statuses) |metric| {
+        if (metric.state != .ready) {
+            graph_metric_blocked = true;
+            break;
+        }
+    }
     const materialization_blocker: ?[]const u8 = if (std.mem.eql(u8, kind, "full_text")) blk: {
         if (full_text_action) |action| {
             if (action.chunked_source_count > 0 and status.pending_materialization_families.chunk_preview) break :blk "chunk_preview";
@@ -7577,7 +8938,10 @@ fn serverlessIndexStatus(
         if (indexUsesChunkEmbeddings(config) and status.pending_materialization_families.chunk_embeddings) break :blk "chunk_embeddings";
         if (status.pending_materialization_families.dense_vector) break :blk "dense_vector";
         break :blk null;
-    } else null;
+    } else if (std.mem.eql(u8, kind, "graph") and graph_metric_blocked)
+        "graph_metric"
+    else
+        null;
     const is_vector_driver = std.mem.eql(u8, kind, "embeddings") and !try isSparseEmbeddingsIndex(config) and status.vector_compaction_driver_index_name != null and std.mem.eql(u8, status.vector_compaction_driver_index_name.?, index_name);
     const readiness_ready = config_published and built and materialization_blocker == null;
     return .{
@@ -7703,7 +9067,7 @@ test "serverless readiness serializes durable incarnation as an opaque token" {
         .backfill_active = false,
         .doc_count = 0,
         .total_indexed = 0,
-    });
+    }, &.{});
     try ant_json.testing.expectSubsetJsonText(
         alloc,
         "{\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true,\"pending_reasons\":[]}}",
@@ -7724,7 +9088,7 @@ test "serverless pending readiness is explicitly non-queryable and incomplete" {
         .backfill_active = true,
         .doc_count = 0,
         .total_indexed = 0,
-    });
+    }, &.{});
     try ant_json.testing.expectSubsetJsonText(
         alloc,
         "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"publication\"]}}",
@@ -7737,6 +9101,11 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         error.OutOfMemory => return err,
         else => return error.InvalidTableIndexMetadata,
     };
+    const graph_metric_specs = build_mod.graph_metric_config.parseIndexSpecsAlloc(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory, error.UnsupportedGraphMetricRefreshMode, error.GraphMetricConfigurationLimitExceeded => return err,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    defer build_mod.graph_metric_config.freeIndexSpecs(alloc, graph_metric_specs);
     var parsed = try std.json.parseFromSlice(JsonValueMap, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -7945,6 +9314,29 @@ fn allocDbSearchHitsAlloc(
 fn freeDbSearchHits(alloc: Allocator, hits: []db_types.SearchHit) void {
     for (hits) |*hit| hit.deinit(alloc);
     alloc.free(hits);
+}
+
+fn pagePublicGraphMetricRerankedHits(
+    alloc: Allocator,
+    hits: []db_types.SearchHit,
+    offset: u32,
+    limit: u32,
+) ![]db_types.SearchHit {
+    const start = @min(@as(usize, offset), hits.len);
+    const keep_len = @min(@as(usize, limit), hits.len - start);
+    if (start == 0 and keep_len == hits.len) return hits;
+
+    const kept = try alloc.alloc(db_types.SearchHit, keep_len);
+    for (hits, 0..) |*hit, i| {
+        if (i >= start and i < start + keep_len) {
+            kept[i - start] = hit.*;
+            hit.* = undefined;
+        } else {
+            hit.deinit(alloc);
+        }
+    }
+    alloc.free(hits);
+    return kept;
 }
 
 fn allocQueryHitsAlloc(
@@ -10484,6 +11876,63 @@ test "serverless index catalog validation rejects malformed configs" {
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
         \\{"relations":{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[0]"}}}
     ));
+    try std.testing.expectError(error.UnsupportedGraphMetricRefreshMode, validateServerlessIndexCatalog(alloc,
+        \\{"relations":{"type":"graph","metrics":{"rank":{"kind":"pagerank","refresh":"manual"}}}}
+    ));
+}
+
+test "serverless graph metric node post-processing preserves hydrated hits and pattern totals" {
+    const alloc = std.testing.allocator;
+    var handler: HttpHandler = undefined;
+    handler.alloc = alloc;
+
+    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    nodes[0] = .{ .key = try alloc.dupe(u8, "doc-a"), .depth = 0, .distance = 0.75, .path = null, .path_edges = null };
+    const hits = try alloc.alloc(db_types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc-a"), .stored_data = try alloc.dupe(u8, "{\"title\":\"kept\"}") };
+    const matches = try alloc.alloc(db_types.GraphPatternMatch, 1);
+    matches[0] = .{ .bindings = &.{}, .path = &.{} };
+    var result = db_types.GraphSearchResult{
+        .name = try alloc.dupe(u8, "pattern"),
+        .nodes = nodes,
+        .matches = matches,
+        .hits = hits,
+        .total_hits = 7,
+    };
+    defer result.deinit(alloc);
+
+    try handler.rebuildPublicGraphHitsFromNodes(.none, &result);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("{\"title\":\"kept\"}", result.hits[0].stored_data.?);
+    try std.testing.expectEqual(@as(u32, 7), result.total_hits);
+}
+
+test "serverless hidden graph metric status leaves projected names independently owned" {
+    const alloc = std.testing.allocator;
+    const statuses = try alloc.alloc(db_types.GraphMetricStatus, 1);
+    statuses[0] = .{ .name = try alloc.dupe(u8, "pagerank") };
+    const values = try alloc.alloc(graph_query_mod.GraphMetricValue, 1);
+    values[0] = .{ .name = statuses[0].name, .score = 0.75, .name_owned = false };
+    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc-a"),
+        .depth = 0,
+        .distance = 0,
+        .metrics = values,
+    };
+    var result = db_types.GraphSearchResult{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = nodes,
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = statuses,
+    };
+    defer result.deinit(alloc);
+
+    try stripServerlessGraphMetricStatus(alloc, &result);
+    try std.testing.expectEqual(@as(usize, 0), result.metric_status.len);
+    try std.testing.expect(result.nodes[0].metrics[0].name_owned);
+    try std.testing.expectEqualStrings("pagerank", result.nodes[0].metrics[0].name);
 }
 
 test "serverless index catalog rejects artifact-backed sources before publication" {
@@ -11475,11 +12924,21 @@ test "http handler honors public serverless sync levels on table batch writes" {
     defer unsupported.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), unsupported.status);
     try std.testing.expect(std.mem.indexOf(u8, unsupported.body, "unsupported sync_level") != null);
+    try std.testing.expectEqual(@as(u64, 0), try wal_store.latestLsn("enriched"));
 }
 
 test "serverless full_index sync waits for enrichment and index publication" {
     var status = readyServerlessBuildStatusForSyncTest();
     try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    try std.testing.expect(!HttpHandler.syncLevelNeedsBackgroundMaterialization(.full_text, status));
+    try std.testing.expect(!HttpHandler.syncLevelNeedsBackgroundMaterialization(.full_index, status));
+
+    status.chunk_preview_enabled = true;
+    status.chunk_preview_complete = false;
+    try std.testing.expect(HttpHandler.syncLevelNeedsBackgroundMaterialization(.full_text, status));
+    try std.testing.expect(HttpHandler.syncLevelNeedsBackgroundMaterialization(.full_index, status));
+    status.chunk_preview_enabled = false;
+    status.chunk_preview_complete = true;
 
     status.enrichment_complete = false;
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
@@ -11529,8 +12988,48 @@ test "serverless full_index sync waits for enrichment and index publication" {
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
     status.artifact_actions.dense_vector = .reuse;
 
+    status.graph_metrics_configured = 1;
+    status.graph_metrics_pending = 1;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.graph_metrics_pending = 0;
+    status.graph_metrics_rejected = 1;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.graph_metrics_rejected = 0;
+    try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+
     try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 11, status));
     try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.enrichments, 10, status));
+}
+
+test "serverless sync wait cancellation combines request cancellation and deadline" {
+    var upstream_signal = std.atomic.Value(bool).init(false);
+    const expired = SyncWaitCancellation{
+        .upstream = CancellationToken.fromAtomic(&upstream_signal),
+        .deadline_ns = 0,
+    };
+    try std.testing.expect(expired.token().isCancelled());
+
+    const upstream_only = SyncWaitCancellation{
+        .upstream = CancellationToken.fromAtomic(&upstream_signal),
+        .deadline_ns = std.math.maxInt(u64),
+    };
+    try std.testing.expect(!upstream_only.token().isCancelled());
+    upstream_signal.store(true, .release);
+    try std.testing.expect(upstream_only.token().isCancelled());
+}
+
+test "serverless full_index graph metric preflight fails before commit" {
+    var status = readyServerlessBuildStatusForSyncTest();
+    status.graph_metrics_configured = 1;
+    var handler: HttpHandler = undefined;
+    try handler.preflightPublicTableBatchSyncLevel(.full_index, status);
+    try handler.preflightPublicTableBatchSyncLevel(.write, status);
+
+    status.graph_metrics_rejected = 1;
+    try std.testing.expectError(
+        error.GraphMetricMaterializationRejected,
+        handler.preflightPublicTableBatchSyncLevel(.full_index, status),
+    );
 }
 
 fn readyServerlessBuildStatusForSyncTest() catalog_types.BuildStatus {
@@ -11614,6 +13113,68 @@ fn readyServerlessBuildStatusForSyncTest() catalog_types.BuildStatus {
         .enrichment_publish_min_pending_records = 16,
         .enrichment_pipeline_version = 1,
     };
+}
+
+test "serverless graph index status exposes rejected metric policy and blocker" {
+    const alloc = std.testing.allocator;
+    const status = readyServerlessBuildStatusForSyncTest();
+    var metric_status = ServerlessGraphMetricStatus{
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .kind = .pagerank,
+        .state = .rejected,
+        .rejection_reason = .build_budget_exceeded,
+        .config_fingerprint = 0x11,
+        .materializer_fingerprint = 0x22,
+        .published_generation = 7,
+    };
+    defer metric_status.deinit(alloc);
+    const metric_statuses = [_]ServerlessGraphMetricStatus{metric_status};
+    const encoded = (try encodeServerlessSingleIndexWithGraphMetricsAlloc(
+        alloc,
+        "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"pagerank\":{\"kind\":\"pagerank\"}}}}",
+        "graph_idx",
+        status,
+        &metric_statuses,
+    )).?;
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const runtime = parsed.value.object.get("status").?.object;
+    try std.testing.expect(runtime.get("materialization_blocked").?.bool);
+    try std.testing.expectEqualStrings("graph_metric", runtime.get("materialization_blocker").?.string);
+    const metric = runtime.get("graph_metrics").?.array.items[0].object;
+    try std.testing.expectEqualStrings("rejected", metric.get("state").?.string);
+    try std.testing.expectEqualStrings("build_budget_exceeded", metric.get("rejection_reason").?.string);
+    try std.testing.expectEqualStrings("0000000000000022", metric.get("materializer_fingerprint").?.string);
+}
+
+test "serverless graph index status exposes disabled publication as terminal" {
+    const alloc = std.testing.allocator;
+    const status = readyServerlessBuildStatusForSyncTest();
+    var metric_status = ServerlessGraphMetricStatus{
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .kind = .pagerank,
+        .state = .unsupported,
+        .config_fingerprint = 0x11,
+    };
+    defer metric_status.deinit(alloc);
+    const metric_statuses = [_]ServerlessGraphMetricStatus{metric_status};
+    const encoded = (try encodeServerlessSingleIndexWithGraphMetricsAlloc(
+        alloc,
+        "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"pagerank\":{\"kind\":\"pagerank\"}}}}",
+        "graph_idx",
+        status,
+        &metric_statuses,
+    )).?;
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const metric = parsed.value.object.get("status").?.object.get("graph_metrics").?.array.items[0].object;
+    try std.testing.expectEqualStrings("unsupported", metric.get("state").?.string);
+    try std.testing.expectEqualStrings("graph_metric_publication_not_enabled", metric.get("unavailable_reason").?.string);
+    try std.testing.expect(!metric.get("retryable").?.bool);
 }
 
 test "http handler serves published graph query endpoints" {
@@ -12682,6 +14243,23 @@ test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {
         graph_pattern_mod.default_max_scanned_anchors - docs.len,
         work_budget.remaining_anchors,
     );
+}
+
+test "serverless ordinary search planning strips every graph metric control" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        \\{"full_text_search":{"query":"needle"},"graph_metric":{"index":"graph_idx","metric":"pagerank"},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank"},"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}}
+    ,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const search_request = requestWithoutGraphControls(parsed.value);
+    try std.testing.expect(search_request.full_text_search != null);
+    try std.testing.expect(search_request.graph_metric == null);
+    try std.testing.expect(search_request.graph_metric_rerank == null);
+    try std.testing.expect(search_request.graph_queries == null);
 }
 
 test "serverless graph HTTP result copies are allocation-failure safe" {

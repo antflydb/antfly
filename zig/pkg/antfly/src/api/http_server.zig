@@ -10480,6 +10480,7 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_table_graph_metric_action = executePublicTableGraphMetricAction,
                 .execute_put_artifact_enrichment = executePublicPutArtifactEnrichment,
                 .execute_delete_artifact_enrichment = executePublicDeleteArtifactEnrichment,
                 .execute_list_artifact_enrichments = executePublicListArtifactEnrichments,
@@ -10651,6 +10652,9 @@ pub const ApiHttpServer = struct {
             => return error.StorageReadTemporarilyUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
@@ -10833,6 +10837,9 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
+                error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+                error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+                error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -10897,6 +10904,9 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded,
@@ -10990,6 +11000,9 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -13133,6 +13146,43 @@ pub const ApiHttpServer = struct {
         }) orelse error.MethodNotAllowed;
     }
 
+    fn executePublicTableGraphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        request: api_operation.RequestContext,
+    ) public_table_http.TableApi.ExecuteGraphMetricActionError![]u8 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
+        const source = self.table_writes orelse return error.MethodNotAllowed;
+        var status = (source.graphMetricActionWithCancellation(alloc, table_name, index_name, metric_name, action, request.cancellation) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.HAReadOnlyStandby,
+            error.HAPromotedStandbyRequiresPrimaryOpen,
+            error.HAFencedPrimary,
+            => return error.NotLeader,
+            error.TableTransitionActive,
+            error.TableGenerationChanged,
+            error.GraphMetricDisabled,
+            error.GraphMetricStatusConflict,
+            error.GraphMetricActionPartialOutcome,
+            => return error.Conflict,
+            error.LeaderUnavailable, error.UnknownGroup => return error.NotLeader,
+            error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded, error.BackendRuntimeShuttingDown => return error.Backpressured,
+            error.InvalidGraphMetricAction => return error.InvalidGraphMetricAction,
+            error.TableNotFound, error.IndexNotFound, error.MetricNotReady => return error.NotFound,
+            else => {
+                std.log.err("public graph metric action failed table={s} index={s} metric={s} action={s} err={}", .{ table_name, index_name, metric_name, action, err });
+                return error.InternalFailure;
+            },
+        }) orelse return error.NotFound;
+        defer status.deinit(alloc);
+        return indexes_api.encodeGraphMetricStatusResponse(alloc, status) catch return error.InternalFailure;
+    }
+
     fn executePublicClusterBackupList(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -14814,6 +14864,21 @@ pub const ApiHttpServer = struct {
             error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
             error.UnsupportedExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .unsupported),
             error.UnsupportedExactSort => try contextualUnsupportedExactSortResponse(self.alloc),
+            error.GraphMetricGlobalMaterializationRequired => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricGlobalMaterializationRequiredBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricMaterializationRejected => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricMaterializationRejectedBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricQueryBudgetExceeded => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricQueryBudgetExceededBody(self.alloc),
+                false,
+            ),
             error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
@@ -19292,6 +19357,10 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
+    if (routes.Routes.matchTableGraphMetricAction(path)) |metric_action| return switch (method) {
+        .POST => try tablePermission(alloc, metric_action.table_name, .admin),
+        .GET, .PUT, .DELETE => null,
+    };
     if (routes.Routes.matchTableIndexes(path)) |indexes| return try tablePermission(alloc, indexes.table_name, switch (method) {
         .GET => .read,
         .POST => .admin,
@@ -19453,6 +19522,38 @@ test "inference connection invocation requires inference write permission" {
         std.testing.allocator,
         .POST,
         "/connections/local-inference/inference/generate/extra",
+    )) == null);
+}
+
+test "graph metric operational actions require table admin permission" {
+    const alloc = std.testing.allocator;
+    const required = (try requiredPermissionForRequest(
+        alloc,
+        .POST,
+        "/tables/docs%20archive/indexes/graph_idx/graph-metrics/pagerank:delete",
+    )).?;
+    defer required.deinit(alloc);
+    try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+    try std.testing.expectEqualStrings("docs archive", required.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+
+    const reader_permissions = [_]usermgr.Permission{.{
+        .resource_type = .table,
+        .resource = @constCast("docs archive"),
+        .type = .read,
+    }};
+    try std.testing.expect(!permissionsAllow(&reader_permissions, required.resource_type, required.resource, required.permission_type));
+
+    const admin_permissions = [_]usermgr.Permission{.{
+        .resource_type = .table,
+        .resource = @constCast("docs archive"),
+        .type = .admin,
+    }};
+    try std.testing.expect(permissionsAllow(&admin_permissions, required.resource_type, required.resource, required.permission_type));
+    try std.testing.expect((try requiredPermissionForRequest(
+        alloc,
+        .GET,
+        "/tables/docs%20archive/indexes/graph_idx/graph-metrics/pagerank:delete",
     )) == null);
 }
 

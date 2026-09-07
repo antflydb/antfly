@@ -2407,6 +2407,93 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum:
+            - refresh
+            - rebuild
+            - delete
+            - pause
+            - resume
+    post:
+      summary: Execute a graph metric operational action
+      description: >
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+
+        graph metric. The metric configuration remains owned by the graph index.
+
+        Refresh and rebuild durably enqueue bounded, resumable maintenance and
+
+        return the aggregate shard status without waiting for graph-sized work.
+
+        `delete` clears materialized metric state and durably disables automatic
+
+        maintenance. A later refresh, rebuild, or resume action re-enables the
+
+        metric and can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeGraphMetricAction
+      responses:
+        '200':
+          description: Aggregate graph metric status after the action is durably accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphMetricActionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: The table topology or write-owner generation changed, or only some shards accepted
+            the action; retrying is consistency-safe and reuses any still-active build
+          content:
+            text/plain:
+              schema:
+                type: string
+        '429':
+          description: Local storage resources are temporarily exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/transactions/commit:
     post:
       summary: Commit an OCC transaction
@@ -11761,6 +11848,13 @@ components:
           $ref: '#/components/schemas/CreatedIndex'
         status:
           $ref: '#/components/schemas/IndexStats'
+    GraphMetricActionResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
     LsmStorageStatus:
       type: object
       description: Compact LSM backend operational status. Detailed low-level counters are available through
@@ -12422,9 +12516,11 @@ components:
 
             participant propagation is still completing. `committed_repair_required`
 
-            means the primary write committed, but a terminal enrichment failure needs
+            means the primary write committed, but a terminal background materialization
 
-            operator repair and will not be retried indefinitely.
+            failure needs operator repair and will not be retried indefinitely. Inspect
+
+            `failure` when present; retrying the document write is unnecessary.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -12434,6 +12530,34 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+        failure:
+          $ref: '#/components/schemas/BatchCommittedFailure'
+    BatchCommittedFailure:
+      type: object
+      description: >
+        Additive details for a committed batch that needs operator action. The
+
+        open string code is forward-compatible with older SDKs; clients should
+
+        treat unknown codes as non-retryable when `retryable` is false.
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable failure code, such as `graph_metric_materialization_rejected`.
+        message:
+          type: string
+          description: Actionable operator guidance.
+        reason:
+          type: string
+          description: Optional stable reason within the failure category, such as `build_budget_exceeded`.
+        retryable:
+          type: boolean
+          description: Whether replaying the document mutation is safe. Committed repair outcomes are
+            false.
     DenseRepairBackpressureError:
       type: object
       description: A dense-index rebuild is retaining replay history and the node has reached its hard
@@ -14927,6 +15051,10 @@ components:
                   - required:
                       - reranker
                   - required:
+                      - graph_metric
+                  - required:
+                      - graph_metric_rerank
+                  - required:
                       - analyses
                   - required:
                       - aggregations
@@ -15517,6 +15645,16 @@ components:
             }
 
             ```
+        graph_metric:
+          $ref: '#/components/schemas/GraphMetricQuery'
+          description: Direct top-k read from a published graph metric generation. Results are returned
+            in graph_metric_results under the requested name or the metric name when no explicit name
+            is supplied.
+        graph_metric_rerank:
+          $ref: '#/components/schemas/GraphMetricRerank'
+          description: Blend a published graph metric feature into ordinary search hit scores. Requests
+            may require either any published generation or a generation that is fresh with respect to
+            graph writes.
         analyses:
           $ref: '#/components/schemas/Analyses'
         graph_queries:
@@ -16009,10 +16147,43 @@ components:
         merge:
           $ref: '#/components/schemas/MergeProfile'
           description: Result merge statistics (present for hybrid search).
+        graph_metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricProfile'
+          description: Graph metric freshness and generation details for metric-aware query work.
         sort:
           $ref: '#/components/schemas/SortProfile'
           description: Sort execution statistics (present when the query used ordered page options and
             profiling was enabled).
+    GraphMetricProfile:
+      type: object
+      required:
+        - query_name
+        - source
+        - index_name
+        - metric_name
+        - freshness
+        - status
+      properties:
+        query_name:
+          type: string
+          description: Name of the graph query or graph metric query that used the metric.
+        source:
+          type: string
+          description: Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+        index_name:
+          type: string
+          description: Graph index that owns the metric.
+        metric_name:
+          type: string
+          description: Graph metric name within the index.
+        freshness:
+          type: string
+          description: Effective freshness mode requested for this metric use.
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
+          description: Published generation and freshness status observed by the query.
     SortProfile:
       type: object
       additionalProperties: false
@@ -16619,6 +16790,67 @@ components:
           description: Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
           items:
             $ref: '#/components/schemas/HierarchyMatchHit'
+    QueryScoreDetails:
+      type: object
+      description: Optional score provenance for ranking features that changed the final hit score.
+      properties:
+        graph_metric_rerank:
+          $ref: '#/components/schemas/GraphMetricRerankScoreDetails'
+          description: Score contribution from an explicit graph_metric_rerank request.
+    GraphMetricRerankScoreDetails:
+      type: object
+      required:
+        - index_name
+        - metric_name
+        - base_score
+        - base_weight
+        - metric_score_used
+        - metric_weight
+        - missing_score_used
+        - final_score
+        - published_generation
+      properties:
+        index_name:
+          type: string
+          description: Graph index that provided the metric score.
+        metric_name:
+          type: string
+          description: Graph metric used as a score feature.
+        base_score:
+          type: number
+          format: double
+          description: Hit score before graph metric rerank composition.
+        base_weight:
+          type: number
+          format: double
+          description: Weight applied to the base score.
+        metric_score:
+          type: number
+          format: double
+          nullable: true
+          description: Published metric score for this hit, or null when the hit was missing from the
+            metric generation.
+        metric_score_used:
+          type: number
+          format: double
+          description: Metric feature value used in the formula after applying missing_score fallback
+            if needed.
+        metric_weight:
+          type: number
+          format: double
+          description: Weight applied to the metric score feature.
+        missing_score_used:
+          type: boolean
+          description: True when metric_score was missing and the request's missing_score fallback was
+            used.
+        final_score:
+          type: number
+          format: double
+          description: Final hit score after graph metric rerank composition.
+        published_generation:
+          type: integer
+          format: int64
+          description: Published graph metric score generation used for this hit.
     QueryHit:
       type: object
       description: A single query result hit
@@ -16657,6 +16889,10 @@ components:
             format: double
           description: Scores partitioned by index when using RRF search.
           x-go-name: indexScores
+        _score_details:
+          $ref: '#/components/schemas/QueryScoreDetails'
+          description: Optional score provenance for ranking features applied to this hit.
+          x-go-name: scoreDetails
         _source:
           type: object
           additionalProperties: true
@@ -16771,6 +17007,11 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/AnalysesResult'
           description: Analysis results like PCA and t-SNE per index embeddings.
+        graph_metric_results:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricResult'
+          description: Results from direct graph metric reads.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -21411,6 +21652,161 @@ components:
           type: object
           additionalProperties: true
           description: Artifact promotion replay diagnostics.
+    GraphMetricRuntimeStats:
+      type: object
+      description: Summarized graph metric maintenance runtime state. Identity fields are stable hashes,
+        not raw process or owner identifiers.
+      properties:
+        enabled:
+          type: boolean
+        role:
+          type: string
+          enum:
+            - combined
+            - coordinator
+            - worker
+            - worker_pool
+        runtime_id_hash:
+          type: integer
+          format: uint64
+        owner_id_hash:
+          type: integer
+          format: uint64
+        lease_key_hash:
+          type: integer
+          format: uint64
+        worker_id_hash:
+          type: integer
+          format: uint64
+        worker_count:
+          type: integer
+          format: uint64
+        lease_owned:
+          type: boolean
+        has_lease:
+          type: boolean
+        acquisition_count:
+          type: integer
+          format: uint64
+        takeover_count:
+          type: integer
+          format: uint64
+        lease_acquire_failures:
+          type: integer
+          format: uint64
+        lost_leases:
+          type: integer
+          format: uint64
+        last_acquired_ms:
+          type: integer
+          format: uint64
+        lease_expires_at_ms:
+          type: integer
+          format: uint64
+          description: Cached expiry of the currently held maintenance lease, or zero when no lease is
+            held.
+        lease_renew_after_ms:
+          type: integer
+          format: uint64
+          description: Earliest time the runtime will renew its maintenance lease, or zero when no lease
+            is held.
+        renewal_count:
+          type: integer
+          format: uint64
+          description: Number of durable maintenance lease renewals completed by this runtime.
+        started:
+          type: boolean
+        shutdown:
+          type: boolean
+        notified:
+          type: boolean
+        ticks_started:
+          type: integer
+          format: uint64
+        ticks_completed:
+          type: integer
+          format: uint64
+        durable_progress_ticks:
+          type: integer
+          format: uint64
+        idle_ticks:
+          type: integer
+          format: uint64
+        error_ticks:
+          type: integer
+          format: uint64
+        last_error_name:
+          type: string
+        total_metrics_scanned:
+          type: integer
+          format: uint64
+        total_active_builds:
+          type: integer
+          format: uint64
+        total_builds_started:
+          type: integer
+          format: uint64
+        total_worker_steps:
+          type: integer
+          format: uint64
+        total_coordinator_steps:
+          type: integer
+          format: uint64
+        total_retired_input_records:
+          description: Consumed intermediate records retired at completed reduction barriers.
+          type: integer
+          format: uint64
+        total_pages_claimed:
+          type: integer
+          format: uint64
+        total_pages_completed:
+          type: integer
+          format: uint64
+        total_phases_advanced:
+          type: integer
+          format: uint64
+        total_published:
+          type: integer
+          format: uint64
+        total_failed_builds:
+          type: integer
+          format: uint64
+        last_metrics_scanned:
+          type: integer
+          format: uint64
+        last_active_builds:
+          type: integer
+          format: uint64
+        last_builds_started:
+          type: integer
+          format: uint64
+        last_worker_steps:
+          type: integer
+          format: uint64
+        last_coordinator_steps:
+          type: integer
+          format: uint64
+        last_retired_input_records:
+          description: Consumed intermediate records retired in the latest maintenance tick.
+          type: integer
+          format: uint64
+        last_pages_claimed:
+          type: integer
+          format: uint64
+        last_pages_completed:
+          type: integer
+          format: uint64
+        last_phases_advanced:
+          type: integer
+          format: uint64
+        last_published:
+          type: integer
+          format: uint64
+        last_failed_builds:
+          type: integer
+          format: uint64
+        last_budget_exhausted:
+          type: boolean
     GraphIndexStats:
       type: object
       description: Statistics for graph index
@@ -21650,6 +22046,9 @@ components:
                 result_nodes:
                   type: integer
                   format: uint64
+        graph_metric_runtime:
+          x-go-type-skip-optional-pointer: true
+          $ref: '#/components/schemas/GraphMetricRuntimeStats'
     AlgebraicIndexStats:
       type: object
       description: Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive,
@@ -21967,6 +22366,251 @@ components:
         - $ref: '#/components/schemas/EmbeddingsIndexStats'
         - $ref: '#/components/schemas/GraphIndexStats'
         - $ref: '#/components/schemas/AlgebraicIndexStats'
+    GraphMetricEdgeFilterStatus:
+      type: object
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - all
+            - types
+        types:
+          type: array
+          items:
+            type: string
+    GraphMetricBuildPageStatus:
+      type: object
+      required:
+        - phase
+        - iteration
+        - page_id
+        - state
+        - range_kind
+      properties:
+        phase:
+          type: string
+        iteration:
+          type: integer
+          format: int64
+        page_id:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum:
+            - pending
+            - leased
+            - complete
+            - failed
+        range_kind:
+          type: string
+          enum:
+            - full
+            - reverse_edges
+            - nodes
+            - scores
+            - contributions
+            - job_control
+            - summary
+        worker_id:
+          type: string
+          description: Worker id that owns or last failed this page.
+        lease_expires_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+        attempt:
+          type: integer
+          format: int64
+          description: Current attempt number for this page.
+        cursor:
+          type: string
+          description: Opaque resumable cursor for this page.
+        completed_units:
+          type: integer
+          format: int64
+          description: Completed work units for this page.
+        total_units:
+          type: integer
+          format: int64
+          description: Estimated total work units for this page.
+        last_error:
+          type: string
+          description: Last page-level error.
+    GraphMetricEvent:
+      type: object
+      required:
+        - sequence
+        - kind
+        - at_ms
+        - target_edge_generation
+        - published_generation
+        - score_count
+      properties:
+        sequence:
+          type: integer
+          format: int64
+        kind:
+          type: string
+          enum:
+            - publish
+            - delete
+            - pause
+            - resume
+            - failed
+        at_ms:
+          type: integer
+          format: int64
+        target_edge_generation:
+          type: integer
+          format: int64
+        published_generation:
+          type: integer
+          format: int64
+        score_count:
+          type: integer
+          format: int64
+    GraphMetricStatus:
+      type: object
+      required:
+        - state
+        - phase
+        - published_generation
+        - edge_generation
+        - target_edge_generation
+        - build_queued
+        - progress
+        - converged
+        - iterations_completed
+        - delta
+        - computed_at_ms
+      properties:
+        state:
+          type: string
+        phase:
+          type: string
+          enum:
+            - idle
+            - computing
+            - publishing
+            - complete
+            - prepare_generation
+            - scan_edges_and_out_degree
+            - initialize_ranks
+            - iterate_contributions
+            - reduce_ranks
+            - hits_hub_contributions
+            - hits_hub_reduce_ranks
+            - check_convergence
+            - publish_generation
+            - cleanup_old_generations
+        edge_filter:
+          $ref: '#/components/schemas/GraphMetricEdgeFilterStatus'
+        metadata_version:
+          type: integer
+          format: int64
+          description: Version of the published graph metric metadata schema.
+        config_fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{16}$
+          description: Deterministic configuration fingerprint encoded as fixed-width hexadecimal so every
+            SDK preserves all 64 bits.
+        maintenance_paused:
+          type: boolean
+        build_queued:
+          type: boolean
+          description: Whether a local or distributed build is queued after the currently published or
+            building generation.
+        published_generation:
+          type: integer
+          format: int64
+        edge_generation:
+          type: integer
+          format: int64
+        target_edge_generation:
+          type: integer
+          format: int64
+        queued_generation:
+          type: integer
+          format: int64
+          description: Pending edge generation waiting to build, or 0 when no build is queued.
+        building_generation:
+          type: integer
+          format: int64
+          description: Edge generation currently held by an active build lease, or 0 when idle.
+        build_job_id:
+          type: integer
+          format: int64
+          description: Durable identifier for the active graph metric build job, or 0 when idle.
+        build_started_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+        build_iteration:
+          type: integer
+          format: int64
+          description: Iteration number reported by the active build lease, or 0 when idle or not iterative.
+        build_lease_expires_at_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+        build_worker_id:
+          type: string
+          description: Worker id that owns the active build lease. Local builds use `local`.
+        build_cursor:
+          type: string
+          description: Opaque resumable cursor for the active build phase. Empty or omitted when idle
+            or when the phase has no cursor.
+        build_completed_units:
+          type: integer
+          format: int64
+          description: Completed work units for the active graph metric build, or 0 when idle or unknown.
+        build_total_units:
+          type: integer
+          format: int64
+          description: Estimated total work units for the active graph metric build, or 0 when idle or
+            unknown.
+        build_pages:
+          type: array
+          description: Active leased or failed build pages for the current build phase, capped and ordered
+            by durable page key.
+          items:
+            $ref: '#/components/schemas/GraphMetricBuildPageStatus'
+        build_pages_truncated:
+          type: boolean
+          description: Whether build_pages was capped before every active page could be included.
+        retry_count:
+          type: integer
+          format: int64
+          description: Number of consecutive failed build attempts for the current target generation,
+            or 0 when no failure applies.
+        last_error:
+          type: string
+          description: Last build error for the current failed target generation.
+        progress:
+          type: number
+          format: double
+          description: Build progress for the target edge generation, from 0.0 to 1.0
+        converged:
+          type: boolean
+        iterations_completed:
+          type: integer
+          format: int64
+        delta:
+          type: number
+          format: double
+        computed_at_ms:
+          type: integer
+          format: int64
+        last_event:
+          $ref: '#/components/schemas/GraphMetricEvent'
+        recent_events:
+          type: array
+          description: Recent graph metric events, newest first.
+          items:
+            $ref: '#/components/schemas/GraphMetricEvent'
     ChatToolName:
       type: string
       description: >
@@ -23892,6 +24536,90 @@ components:
         provider: cohere
         model: rerank-v4.0-pro
         field: content
+    GraphMetricQuery:
+      type: object
+      description: Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables
+        require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required
+        instead of merging mathematically incompatible shard-local scores.
+      required:
+        - index
+        - metric
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Optional result key. Defaults to the metric name.
+        index:
+          type: string
+          minLength: 1
+          description: Graph index that owns the published metric.
+        metric:
+          type: string
+          minLength: 1
+          description: Graph metric to read.
+        top_k:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 10000
+          default: 10
+          description: Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated
+            metric snapshot.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Whether the latest published generation may be stale or must match the graph edge
+            generation.
+    GraphMetricRerank:
+      type: object
+      description: Blends a published graph metric into hit scores. Multi-shard tables require a globally
+        coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
+      required:
+        - index
+        - metric
+      properties:
+        index:
+          type: string
+          description: Graph index that owns the published metric.
+        metric:
+          type: string
+          description: Graph metric name to blend into the search hit score.
+        candidate_count:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 10000
+          description: Bounded retrieval window scored by the graph metric before offset and limit are
+            applied. When omitted, Antfly uses an adaptive four-times page window, capped at 10,000 candidates.
+            An explicit value must cover offset plus limit. Larger windows improve promotion recall at
+            predictable linear score-read cost.
+        base_weight:
+          type: number
+          format: double
+          default: 1.0
+          description: Multiplier applied to the existing hit score before adding the graph metric feature.
+        weight:
+          type: number
+          format: double
+          default: 1.0
+          description: Multiplier applied to the graph metric score before it is added to the existing
+            hit score.
+        missing_score:
+          type: number
+          format: double
+          default: 0.0
+          description: Metric feature value to use for hits that do not have a score in the published
+            metric generation.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Whether stale published generations are acceptable or the metric must be fresh.
     GraphIdentifier:
       type: string
       minLength: 1
@@ -24698,6 +25426,50 @@ components:
         - $ref: '#/components/schemas/GraphIdentityNodeSelector'
         - $ref: '#/components/schemas/GraphResultRefNodeSelector'
       description: Select graph nodes using exactly one explicit, exact selector form.
+    GraphMetricOrder:
+      type: object
+      required:
+        - metric
+      properties:
+        metric:
+          type: string
+          minLength: 1
+        direction:
+          type: string
+          enum:
+            - asc
+            - desc
+        nulls:
+          type: string
+          enum:
+            - first
+            - last
+            - nulls_first
+            - nulls_last
+    GraphMetricFilter:
+      type: object
+      required:
+        - metric
+        - op
+        - value
+      properties:
+        metric:
+          type: string
+          minLength: 1
+        op:
+          type: string
+          description: Semantic comparison operator. Named values keep generated SDK enums portable and
+            readable.
+          enum:
+            - gt
+            - gte
+            - lt
+            - lte
+            - eq
+            - neq
+        value:
+          type: number
+          format: double
     GraphTraversal:
       type: object
       additionalProperties: false
@@ -24746,6 +25518,38 @@ components:
           items:
             type: string
           description: Requires include_documents=true. Omit to include all document fields.
+        metrics:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Graph metric names to project onto returned traversal nodes.
+        order_by:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/GraphMetricOrder'
+          description: Sort traversal candidates by graph metric score before applying limit.
+        where_metric:
+          type: array
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/GraphMetricFilter'
+          description: Filter traversal candidates by graph metric score before applying limit.
+        metric_freshness:
+          type: string
+          enum:
+            - published
+            - fresh
+          default: published
+          description: Freshness required for projected, ordered, and filtered graph metrics.
+        include_metric_status:
+          type: boolean
+          default: false
+          description: Include graph metric status metadata in the traversal profile.
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
           description: Non-scoring structured stored-document predicate for reached nodes.
@@ -25199,6 +26003,70 @@ components:
           type: array
           items:
             type: string
+        metrics:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Graph metric names to project onto legacy graph_searches result nodes.
+        order_by:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/GraphMetricOrder'
+          description: Sort legacy graph_searches result nodes by graph metric score.
+        where_metric:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/GraphMetricFilter'
+          description: Filter legacy graph_searches result nodes by graph metric score.
+        metric_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - published
+            - fresh
+          description: Freshness required for projected, ordered, and filtered graph metrics.
+        include_metric_status:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Include graph metric status metadata in the legacy graph_searches result.
+    GraphMetricScore:
+      type: object
+      required:
+        - node
+        - score
+      properties:
+        node:
+          type: string
+        score:
+          type: number
+          format: double
+    GraphMetricResult:
+      type: object
+      required:
+        - index_name
+        - metric
+        - scores
+        - status
+      properties:
+        index_name:
+          type: string
+        metric:
+          type: string
+        scores:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphMetricScore'
+        status:
+          $ref: '#/components/schemas/GraphMetricStatus'
     GraphBindingNode:
       type: object
       additionalProperties: false
@@ -25430,6 +26298,12 @@ components:
             type: string
           description: Algebraic provenance labels folded into this result, when requested by an algebraic
             graph executor
+        metrics:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Projected graph metric scores keyed by metric name. Values are numbers or null
+            when a requested metric has no score for the node.
         evidence:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -25456,6 +26330,11 @@ components:
           items:
             $ref: '#/components/schemas/GraphResultNode'
           description: Traversal result nodes; requested paths are stored on each node.
+        metric_status:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricStatus'
+          description: Graph metric status metadata keyed by metric name when requested.
         stats:
           $ref: '#/components/schemas/GraphResultStats'
     GraphPath:
@@ -25692,6 +26571,12 @@ components:
           deprecated: true
           description: Whole-query execution time in milliseconds; optional for compatibility with v0.2
             responses. Use the parent query result's took field.
+        metric_status:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/GraphMetricStatus'
+          description: Graph metric status metadata keyed by metric name.
     StatefulGraphResult:
       description: Graph result emitted by the stateful compatibility transport. Canonical graph_queries
         produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the

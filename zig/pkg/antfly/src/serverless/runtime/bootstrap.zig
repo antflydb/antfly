@@ -56,6 +56,8 @@ pub const BootstrapConfig = struct {
     query_cache_dir: ?[]const u8 = null,
     query_cache_max_bytes: u64 = 4 * 1024 * 1024 * 1024,
     query_cache_payload_max_bytes: u64 = 64 * 1024 * 1024,
+    /// Only the current wire is supported while serverless is unreleased.
+    manifest_write_version: u16 = manifest_mod.codec.wire_version,
     embedding_indexes_json: ?[]const u8 = null,
     sparse_embedding_index_name: []const u8 = search_sources.default_sparse_embedding_index_name,
     chunk_embedding_index_name: []const u8 = search_sources.default_chunk_embedding_index_name,
@@ -74,6 +76,10 @@ pub const BootstrapConfig = struct {
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
+    /// CPU fanout available to one graph-metric kernel. Work is scheduled on
+    /// the shared std.Io backend, so deployments can align this with their
+    /// runtime capacity instead of materializers creating private threads.
+    graph_metric_max_parallelism: u8 = @intCast(build_mod.default_graph_metric_compute_parallelism),
 };
 
 pub const RuntimeStatus = api_mod.RuntimeStatusResult;
@@ -484,6 +490,7 @@ pub const OwnedStack = struct {
             try ensureConfiguredBucket(client, target.bucket, shouldCreateGcsBucket(cfg.gcs_options[1]));
             break :blk try manifest_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
         } else try manifest_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.manifests_uri, cfg.s3_options[1]);
+        try self.manifests_impl.setWriteVersion(cfg.manifest_write_version);
         self.manifests = self.manifests_impl.manifestStore();
         errdefer self.manifests.deinit();
 
@@ -536,6 +543,8 @@ pub const OwnedStack = struct {
         errdefer self.catalog_store.deinit();
 
         self.builder = build_mod.Builder.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
+        self.builder.setIo(io);
+        try self.builder.setGraphMetricMaxParallelism(cfg.graph_metric_max_parallelism);
         self.catalog = catalog_mod.CatalogService.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal, &self.builder, &self.catalog_store);
         self.external_source_object_store_resolver = .{};
         self.external_source_object_store_resolver.configure(cfg.node_config, cfg.secret_store);
@@ -557,7 +566,13 @@ pub const OwnedStack = struct {
             self.query_cache = null;
             self.query = query_mod.QueryRuntime.init(alloc, &self.artifacts, &self.manifests, &self.progress);
         }
+        var query_cache_owned = self.query_cache != null;
+        errdefer if (query_cache_owned) self.query_cache.?.deinit();
+        var query_owned = true;
+        errdefer if (query_owned) self.query.deinit();
         self.status = try runtimeStatusAlloc(alloc, cfg);
+        var status_owned = true;
+        errdefer if (status_owned) self.status.deinit(alloc);
         self.runtime = runtime_manager.ManagedRuntime.init(alloc, .{
             .tick_interval_ms = cfg.tick_interval_ms,
             .role = cfg.role,
@@ -566,36 +581,64 @@ pub const OwnedStack = struct {
             .prune_enabled = cfg.prune_enabled,
             .enrichment_enabled = cfg.enrichment_enabled,
         }, &self.catalog, build_mod.Pruner.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal));
+        var runtime_owned = true;
+        errdefer if (runtime_owned) self.runtime.deinit();
         self.runtime.setCompactor(build_mod.Compactor.init(alloc, &self.artifacts, &self.manifests, &self.progress));
         var enricher = enrichment_mod.SparseEnricher.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
+        var enricher_owned = true;
+        errdefer if (enricher_owned) enricher.deinit();
+        var pending_query_embedder: ?managed_embedder.ManagedEmbedder = null;
+        errdefer if (pending_query_embedder) |*query_embedder| query_embedder.deinit();
+        var pending_dense_query_index_name: ?[]u8 = null;
+        errdefer if (pending_dense_query_index_name) |index_name| alloc.free(index_name);
         if (cfg.embedding_indexes_json) |indexes_json| {
             const embedder_options = managed_embedder.InitOptions{
                 .io = io,
                 .remote_content = cfg.remote_content,
                 .provider_runtime = &self.embedding_provider_runtime,
             };
-            var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, embedder_options);
-            errdefer query_embedder.deinit();
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+            defer parsed.deinit();
+            var query_embedder = try managed_embedder.ManagedEmbedder.initDenseFromIndexValueObjectWithOptions(alloc, parsed.value, embedder_options);
+            var query_embedder_owned = true;
+            errdefer if (query_embedder_owned) query_embedder.deinit();
             if (query_embedder.hasDenseEntries()) {
-                self.managed_query_embedder = query_embedder;
-                self.dense_query_index_name = try alloc.dupe(u8, cfg.chunk_embedding_index_name);
+                pending_query_embedder = query_embedder;
+                query_embedder_owned = false;
+                pending_dense_query_index_name = try alloc.dupe(u8, cfg.chunk_embedding_index_name);
             } else {
                 query_embedder.deinit();
-                self.managed_query_embedder = null;
-                self.dense_query_index_name = null;
+                query_embedder_owned = false;
             }
-            if (try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(alloc, indexes_json, embedder_options)) |sparse_embedder| {
+            if (try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(alloc, parsed.value, embedder_options)) |sparse_embedder| {
+                var embedder_owned = true;
+                errdefer if (embedder_owned) sparse_embedder.deinit(alloc);
                 try enricher.setSparseEmbedder(sparse_embedder, cfg.sparse_embedding_index_name);
+                embedder_owned = false;
             }
-            if (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, indexes_json, embedder_options)) |dense_embedder| {
+            if (try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(alloc, parsed.value, embedder_options)) |dense_embedder| {
+                var embedder_owned = true;
+                errdefer if (embedder_owned) dense_embedder.deinit(alloc);
                 try enricher.setChunkEmbedder(dense_embedder, cfg.chunk_embedding_index_name, cfg.chunk_embedding_dimensions);
+                embedder_owned = false;
             }
-        } else {
-            self.managed_query_embedder = null;
-            self.dense_query_index_name = null;
         }
-        self.sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
+        const sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
+        var sparse_query_index_name_owned = true;
+        errdefer if (sparse_query_index_name_owned) alloc.free(sparse_query_index_name);
+
+        // Commit the interdependent runtime resources only after every
+        // fallible allocation and provider construction has succeeded. This
+        // keeps init failure cleanup local and prevents partially initialized
+        // fields from leaking or being observed by the handler.
+        self.managed_query_embedder = pending_query_embedder;
+        pending_query_embedder = null;
+        self.dense_query_index_name = pending_dense_query_index_name;
+        pending_dense_query_index_name = null;
+        self.sparse_query_index_name = sparse_query_index_name;
+        sparse_query_index_name_owned = false;
         self.runtime.setEnricher(enricher);
+        enricher_owned = false;
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
         try self.handler.setGraphExecutionLimits(cfg.graph_execution_limits);
         self.handler.setIo(io);
@@ -626,6 +669,10 @@ pub const OwnedStack = struct {
             self.handler.setManagedDenseQueryEmbedder(query_embedder, self.dense_query_index_name.?);
         }
         self.handler.setRuntimeMetrics(&self.runtime);
+        runtime_owned = false;
+        status_owned = false;
+        query_owned = false;
+        query_cache_owned = false;
     }
 
     pub fn deinit(self: *OwnedStack) void {
@@ -654,6 +701,11 @@ pub const OwnedStack = struct {
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
+    if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
+        return error.InvalidGraphMetricBuildOptions;
+    if (cfg.manifest_write_version != manifest_mod.codec.wire_version) {
+        return error.UnsupportedManifestWriteVersion;
+    }
     if (cfg.query_cache_dir) |path| {
         if (std.mem.trim(u8, path, &std.ascii.whitespace).len == 0) return error.InvalidQueryCacheDir;
         if (cfg.query_cache_max_bytes == 0) return error.InvalidQueryCacheBudget;
@@ -833,6 +885,62 @@ test "runtime bootstrap assembles serverless stack from uri config" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"table_name\":\"docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"doc_id\":\"doc-a\"") != null);
+}
+
+test "serverless runtime bootstrap failure unwinds query cache and runtime ownership" {
+    const alloc = std.testing.allocator;
+
+    var artifacts_buf: [256]u8 = undefined;
+    var manifests_buf: [256]u8 = undefined;
+    var wal_buf: [256]u8 = undefined;
+    var progress_buf: [256]u8 = undefined;
+    var catalog_buf: [256]u8 = undefined;
+    var cache_buf: [256]u8 = undefined;
+    const artifacts_root = tmpPath(&artifacts_buf, "bootstrap-failure-artifacts");
+    const manifests_root = tmpPath(&manifests_buf, "bootstrap-failure-manifests");
+    const wal_root = tmpPath(&wal_buf, "bootstrap-failure-wal");
+    const progress_root = tmpPath(&progress_buf, "bootstrap-failure-progress");
+    const catalog_root = tmpPath(&catalog_buf, "bootstrap-failure-catalog");
+    const cache_root = tmpPath(&cache_buf, "bootstrap-failure-cache");
+    defer cleanupTmp(artifacts_root);
+    defer cleanupTmp(manifests_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(progress_root);
+    defer cleanupTmp(catalog_root);
+    defer cleanupTmp(cache_root);
+
+    const artifacts_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(artifacts_root)});
+    defer alloc.free(artifacts_uri);
+    const manifests_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(manifests_root)});
+    defer alloc.free(manifests_uri);
+    const wal_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(wal_root)});
+    defer alloc.free(wal_uri);
+    const progress_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(progress_root)});
+    defer alloc.free(progress_uri);
+    const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
+    defer alloc.free(catalog_uri);
+
+    const base = BootstrapConfig{
+        .artifacts_uri = artifacts_uri,
+        .manifests_uri = manifests_uri,
+        .wal_uri = wal_uri,
+        .progress_uri = progress_uri,
+        .catalog_uri = catalog_uri,
+        .query_cache_dir = std.mem.span(cache_root),
+        .query_cache_max_bytes = 1024 * 1024,
+        .query_cache_payload_max_bytes = 256 * 1024,
+        .tick_interval_ms = 1,
+    };
+    var invalid = base;
+    invalid.embedding_indexes_json = "{";
+
+    var failed_stack: OwnedStack = undefined;
+    try std.testing.expectError(error.UnexpectedEndOfInput, failed_stack.init(alloc, invalid, std.testing.io));
+
+    // A clean retry exercises file/lease release as well as allocator cleanup.
+    var retry_stack: OwnedStack = undefined;
+    try retry_stack.init(alloc, base, std.testing.io);
+    retry_stack.deinit();
 }
 
 test "runtime bootstrap wires foreign registry into public join handler" {
@@ -1257,6 +1365,29 @@ test "runtime bootstrap requires bounded query cache budgets" {
     invalid = base;
     invalid.query_cache_payload_max_bytes = 2048;
     try std.testing.expectError(error.QueryCachePayloadExceedsBudget, validateConfig(alloc, invalid));
+}
+
+test "runtime bootstrap requires bounded graph metric parallelism and current manifest wire" {
+    const alloc = std.testing.allocator;
+    const base = BootstrapConfig{
+        .artifacts_uri = "file:///tmp/antfly-artifacts",
+        .manifests_uri = "file:///tmp/antfly-manifests",
+        .wal_uri = "file:///tmp/antfly-wal",
+        .progress_uri = "file:///tmp/antfly-progress",
+        .catalog_uri = "file:///tmp/antfly-catalog",
+    };
+    try validateConfig(alloc, base);
+    var invalid = base;
+    invalid.graph_metric_max_parallelism = 0;
+    try std.testing.expectError(error.InvalidGraphMetricBuildOptions, validateConfig(alloc, invalid));
+    invalid.graph_metric_max_parallelism = 17;
+    try std.testing.expectError(error.InvalidGraphMetricBuildOptions, validateConfig(alloc, invalid));
+    try std.testing.expectEqual(manifest_mod.codec.wire_version, base.manifest_write_version);
+    invalid = base;
+    for ([_]u16{ 12, manifest_mod.codec.wire_version - 1, manifest_mod.codec.wire_version + 1 }) |version| {
+        invalid.manifest_write_version = version;
+        try std.testing.expectError(error.UnsupportedManifestWriteVersion, validateConfig(alloc, invalid));
+    }
 }
 
 test "runtime bootstrap bucket provisioning fails closed" {

@@ -26,6 +26,7 @@ const shard_mod = @import("../shard.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
+const graph_edge_types = @import("graph_edge_types.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
 const document_content_hash = @import("document_content_hash.zig");
@@ -236,23 +237,8 @@ pub const BatchRequest = struct {
     transaction: ?TransactionMutation = null,
 };
 
-pub const GraphEdgeWrite = struct {
-    index_name: []const u8,
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-    weight: f64 = 1.0,
-    created_at: u64 = 0,
-    updated_at: u64 = 0,
-    metadata_json: []const u8 = "",
-};
-
-pub const GraphEdgeDelete = struct {
-    index_name: []const u8,
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-};
+pub const GraphEdgeWrite = graph_edge_types.GraphEdgeWrite;
+pub const GraphEdgeDelete = graph_edge_types.GraphEdgeDelete;
 
 pub const IndexKind = enum {
     full_text,
@@ -1367,6 +1353,8 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    graph_metric_queries: []const NamedGraphMetricQuery = &.{},
+    graph_metric_rerank: ?GraphMetricRerank = null,
     /// Trusted operator-owned graph admission ceilings. Public request parsing
     /// never reads these from JSON, and shard transport must not serialize them.
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
@@ -1499,6 +1487,8 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "dense_queries",
     "sparse_queries",
     "graph_queries",
+    "graph_metric_queries",
+    "graph_metric_rerank",
     "graph_query_transport",
     "merge_config",
     "reranker",
@@ -1738,6 +1728,52 @@ pub const NamedGraphQuery = struct {
     query: graph_query_mod.GraphQuery,
 };
 
+pub const GraphMetricFreshness = enum {
+    published,
+    fresh,
+};
+
+pub const GraphMetricQuery = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    top_k: u32 = 10,
+    freshness: GraphMetricFreshness = .published,
+};
+
+pub const NamedGraphMetricQuery = struct {
+    name: []const u8,
+    query: GraphMetricQuery,
+};
+
+pub const GraphMetricRerank = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    freshness: GraphMetricFreshness = .published,
+    candidate_count: ?u32 = null,
+    base_weight: f64 = 1.0,
+    weight: f64 = 1.0,
+    missing_score: f64 = 0.0,
+};
+
+pub const graph_metric_rerank_max_candidates: u32 = 10_000;
+pub const graph_metric_rerank_default_oversample: u32 = 4;
+
+pub fn graphMetricRerankCandidateCount(rerank: GraphMetricRerank, offset: u32, limit: u32) u32 {
+    if (rerank.candidate_count) |count| return count;
+    const page_boundary = offset +| limit;
+    const adaptive = offset +| (limit *| graph_metric_rerank_default_oversample);
+    return @min(graph_metric_rerank_max_candidates, @max(page_boundary, adaptive));
+}
+
+pub fn validateGraphMetricRerankWindow(rerank: GraphMetricRerank, offset: u32, limit: u32) !void {
+    const page_boundary = offset +| limit;
+    if (page_boundary > graph_metric_rerank_max_candidates) return error.QueryCandidateBudgetExceeded;
+    if (rerank.candidate_count) |count| {
+        if (count == 0 or count > graph_metric_rerank_max_candidates or count < page_boundary)
+            return error.InvalidQueryRequest;
+    }
+}
+
 pub const NamedFullTextQuery = struct {
     name: []const u8,
     index_name: []const u8,
@@ -1763,6 +1799,44 @@ pub const MergeConfig = struct {
     weights: []const fusion_mod.NamedWeight = &.{},
 };
 
+pub const GraphMetricRerankScoreDetails = struct {
+    index_name: []u8,
+    metric_name: []u8,
+    base_score: f64 = 0.0,
+    base_weight: f64 = 1.0,
+    metric_score: ?f64 = null,
+    metric_score_used: f64 = 0.0,
+    metric_weight: f64 = 1.0,
+    missing_score_used: bool = false,
+    final_score: f64 = 0.0,
+    published_generation: u64 = 0,
+
+    pub fn clone(self: GraphMetricRerankScoreDetails, alloc: Allocator) !GraphMetricRerankScoreDetails {
+        const index_name = try alloc.dupe(u8, self.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, self.metric_name);
+        errdefer alloc.free(metric_name);
+        return .{
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .base_score = self.base_score,
+            .base_weight = self.base_weight,
+            .metric_score = self.metric_score,
+            .metric_score_used = self.metric_score_used,
+            .metric_weight = self.metric_weight,
+            .missing_score_used = self.missing_score_used,
+            .final_score = self.final_score,
+            .published_generation = self.published_generation,
+        };
+    }
+
+    pub fn deinit(self: *GraphMetricRerankScoreDetails, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        self.* = undefined;
+    }
+};
+
 pub const SearchHit = struct {
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
@@ -1772,6 +1846,7 @@ pub const SearchHit = struct {
     native_text_doc_id: ?u32 = null,
     /// Higher-is-better relevance score used by every public query path.
     score: ?f32 = null,
+    score_details: ?GraphMetricRerankScoreDetails = null,
     /// Metric-native dense-vector distance. Lower values are better. This is
     /// retained separately so score ordering never depends on the metric.
     distance: ?f32 = null,
@@ -1788,6 +1863,7 @@ pub const SearchHit = struct {
         errdefer {
             alloc.free(cloned.id);
             if (cloned.source_table) |table| alloc.free(table);
+            if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
@@ -1799,6 +1875,7 @@ pub const SearchHit = struct {
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
         cloned.score = self.score;
+        cloned.score_details = if (self.score_details) |details| try details.clone(alloc) else null;
         cloned.distance = self.distance;
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
@@ -1826,6 +1903,7 @@ pub const SearchHit = struct {
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.source_table) |table| alloc.free(table);
+        if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
@@ -2089,13 +2167,46 @@ pub const SearchResult = struct {
     shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
     sort_profile: ?SortProfile = null,
     graph_results: []GraphSearchResult = &.{},
+    graph_metric_results: []GraphMetricResult = &.{},
+    graph_metric_rerank_status: ?GraphMetricStatus = null,
 
     pub fn deinit(self: *SearchResult) void {
         for (self.hits) |*hit| hit.deinit(self.alloc);
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        for (self.graph_metric_results) |*metric_result| metric_result.deinit(self.alloc);
+        if (self.graph_metric_results.len > 0) self.alloc.free(self.graph_metric_results);
+        if (self.graph_metric_rerank_status) |*status| status.deinit(self.alloc);
         if (self.shard_identity_read_generations.len > 0) self.alloc.free(self.shard_identity_read_generations);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricScore = struct {
+    node: []u8,
+    score: f64,
+
+    pub fn deinit(self: *GraphMetricScore, alloc: Allocator) void {
+        alloc.free(self.node);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricResult = struct {
+    name: []u8,
+    index_name: []u8,
+    metric_name: []u8,
+    scores: []GraphMetricScore,
+    status: GraphMetricStatus,
+
+    pub fn deinit(self: *GraphMetricResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        for (self.scores) |*score| score.deinit(alloc);
+        if (self.scores.len > 0) alloc.free(self.scores);
+        self.status.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2103,11 +2214,14 @@ pub const SearchResult = struct {
 pub const GraphSearchResult = struct {
     name: []u8,
     nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
+    metric_value_names: [][]u8 = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
     aggregates: []GraphAggregateResult = &.{},
     hits: []SearchHit,
     total_hits: u32,
+    metric_status: []GraphMetricStatus = &.{},
     truncated: bool = false,
 
     /// Detach request-scoped retained-state release hooks at the result
@@ -2121,6 +2235,9 @@ pub const GraphSearchResult = struct {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
+        for (self.metric_value_names) |name| alloc.free(name);
+        if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
         for (self.paths) |path| paths_mod.freePath(alloc, path);
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
@@ -2129,10 +2246,136 @@ pub const GraphSearchResult = struct {
         if (self.aggregates.len > 0) alloc.free(self.aggregates);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
+        freeGraphMetricStatuses(alloc, self.metric_status);
         self.* = undefined;
     }
 };
 
+pub const GraphMetricStatus = struct {
+    name: []u8,
+    state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
+    metadata_version: u32 = 0,
+    config_fingerprint: u64 = 0,
+    maintenance_paused: bool = false,
+    build_queued: bool = false,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    target_edge_generation: u64 = 0,
+    queued_generation: u64 = 0,
+    building_generation: u64 = 0,
+    build_job_id: u64 = 0,
+    build_started_at_ms: u64 = 0,
+    build_iteration: u32 = 0,
+    build_lease_expires_at_ms: u64 = 0,
+    build_worker_id: []const u8 = "",
+    build_cursor: []const u8 = "",
+    build_completed_units: u64 = 0,
+    build_total_units: u64 = 0,
+    build_pages: []GraphMetricBuildPageStatus = &.{},
+    build_pages_truncated: bool = false,
+    retry_count: u64 = 0,
+    last_error: []const u8 = "",
+    progress: f64 = 0.0,
+    converged: bool = false,
+    iterations_completed: u32 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
+    last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
+    recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
+
+    pub fn cloneAlloc(self: GraphMetricStatus, alloc: Allocator) !GraphMetricStatus {
+        var out = self;
+        out.name = try alloc.dupe(u8, self.name);
+        out.edge_filter = .{};
+        out.build_worker_id = "";
+        out.build_cursor = "";
+        out.build_pages = &.{};
+        out.last_error = "";
+        out.recent_events = &.{};
+        errdefer out.deinit(alloc);
+        out.edge_filter = try self.edge_filter.cloneAlloc(alloc);
+        out.build_worker_id = try alloc.dupe(u8, self.build_worker_id);
+        out.build_cursor = try alloc.dupe(u8, self.build_cursor);
+        out.last_error = try alloc.dupe(u8, self.last_error);
+        out.recent_events = try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, self.recent_events);
+        out.build_pages = try cloneGraphMetricBuildPageStatuses(alloc, self.build_pages);
+        return out;
+    }
+
+    pub fn deinit(self: *GraphMetricStatus, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.edge_filter.deinit(alloc);
+        if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
+        if (self.build_cursor.len > 0) alloc.free(self.build_cursor);
+        for (self.build_pages) |*page| page.deinit(alloc);
+        if (self.build_pages.len > 0) alloc.free(self.build_pages);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        if (self.recent_events.len > 0) alloc.free(self.recent_events);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricBuildPageStatus = struct {
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    iteration: u32 = 0,
+    page_id: u64 = 0,
+    state: graph_mod.GraphIndex.GraphMetricBuildPageState = .pending,
+    range_kind: graph_mod.GraphIndex.GraphMetricBuildPageRangeKind = .full,
+    worker_id: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempt: u64 = 0,
+    cursor: []const u8 = "",
+    completed_units: u64 = 0,
+    total_units: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *GraphMetricBuildPageStatus, alloc: Allocator) void {
+        if (self.worker_id.len > 0) alloc.free(self.worker_id);
+        if (self.cursor.len > 0) alloc.free(self.cursor);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        self.* = undefined;
+    }
+};
+
+pub fn freeGraphMetricStatuses(alloc: Allocator, statuses: []GraphMetricStatus) void {
+    for (statuses) |*status| status.deinit(alloc);
+    if (statuses.len > 0) alloc.free(statuses);
+}
+
+pub fn cloneGraphMetricStatuses(alloc: Allocator, statuses: []const GraphMetricStatus) ![]GraphMetricStatus {
+    const out = try alloc.alloc(GraphMetricStatus, statuses.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*status| status.deinit(alloc);
+        alloc.free(out);
+    }
+    for (statuses, 0..) |status, i| {
+        out[i] = try status.cloneAlloc(alloc);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneGraphMetricBuildPageStatuses(alloc: Allocator, source: []const GraphMetricBuildPageStatus) ![]GraphMetricBuildPageStatus {
+    const out = try alloc.alloc(GraphMetricBuildPageStatus, source.len);
+    for (out) |*page| page.* = .{};
+    errdefer {
+        for (out) |*page| page.deinit(alloc);
+        alloc.free(out);
+    }
+    for (source, out) |original, *page| {
+        page.* = original;
+        page.worker_id = "";
+        page.cursor = "";
+        page.last_error = "";
+        page.worker_id = try alloc.dupe(u8, original.worker_id);
+        page.cursor = try alloc.dupe(u8, original.cursor);
+        page.last_error = try alloc.dupe(u8, original.last_error);
+    }
+    return out;
+}
 pub const GraphAggregateResult = struct {
     name: []u8,
     value: u128,
@@ -2429,6 +2672,117 @@ pub const TextMergeStats = struct {
     max_pending_bytes: u64 = 0,
 };
 
+pub const GraphMetricRuntimeRole = enum {
+    combined,
+    coordinator,
+    worker,
+    worker_pool,
+};
+
+pub const GraphMetricRuntimeStats = struct {
+    enabled: bool = false,
+    role: ?GraphMetricRuntimeRole = null,
+    runtime_id_hash: u64 = 0,
+    owner_id_hash: u64 = 0,
+    lease_key_hash: u64 = 0,
+    worker_id_hash: u64 = 0,
+    worker_count: u64 = 0,
+    lease_owned: bool = false,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    lease_expires_at_ms: u64 = 0,
+    lease_renew_after_ms: u64 = 0,
+    renewal_count: u64 = 0,
+    started: bool = false,
+    shutdown: bool = false,
+    notified: bool = false,
+    ticks_started: u64 = 0,
+    ticks_completed: u64 = 0,
+    durable_progress_ticks: u64 = 0,
+    idle_ticks: u64 = 0,
+    error_ticks: u64 = 0,
+    last_error_name: ?[]const u8 = null,
+    total_metrics_scanned: u64 = 0,
+    total_active_builds: u64 = 0,
+    total_builds_started: u64 = 0,
+    total_worker_steps: u64 = 0,
+    total_coordinator_steps: u64 = 0,
+    total_retired_input_records: u64 = 0,
+    total_pages_claimed: u64 = 0,
+    total_pages_completed: u64 = 0,
+    total_phases_advanced: u64 = 0,
+    total_published: u64 = 0,
+    total_failed_builds: u64 = 0,
+    last_metrics_scanned: u64 = 0,
+    last_active_builds: u64 = 0,
+    last_builds_started: u64 = 0,
+    last_worker_steps: u64 = 0,
+    last_coordinator_steps: u64 = 0,
+    last_retired_input_records: u64 = 0,
+    last_pages_claimed: u64 = 0,
+    last_pages_completed: u64 = 0,
+    last_phases_advanced: u64 = 0,
+    last_published: u64 = 0,
+    last_failed_builds: u64 = 0,
+    last_budget_exhausted: bool = false,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.enabled or
+            self.role != null or
+            self.runtime_id_hash != 0 or
+            self.owner_id_hash != 0 or
+            self.lease_key_hash != 0 or
+            self.worker_id_hash != 0 or
+            self.worker_count != 0 or
+            self.lease_owned or
+            self.has_lease or
+            self.acquisition_count != 0 or
+            self.takeover_count != 0 or
+            self.lease_acquire_failures != 0 or
+            self.lost_leases != 0 or
+            self.last_acquired_ms != 0 or
+            self.lease_expires_at_ms != 0 or
+            self.lease_renew_after_ms != 0 or
+            self.renewal_count != 0 or
+            self.started or
+            self.shutdown or
+            self.notified or
+            self.ticks_started != 0 or
+            self.ticks_completed != 0 or
+            self.durable_progress_ticks != 0 or
+            self.idle_ticks != 0 or
+            self.error_ticks != 0 or
+            self.last_error_name != null or
+            self.total_metrics_scanned != 0 or
+            self.total_active_builds != 0 or
+            self.total_builds_started != 0 or
+            self.total_worker_steps != 0 or
+            self.total_coordinator_steps != 0 or
+            self.total_retired_input_records != 0 or
+            self.total_pages_claimed != 0 or
+            self.total_pages_completed != 0 or
+            self.total_phases_advanced != 0 or
+            self.total_published != 0 or
+            self.total_failed_builds != 0 or
+            self.last_metrics_scanned != 0 or
+            self.last_active_builds != 0 or
+            self.last_builds_started != 0 or
+            self.last_worker_steps != 0 or
+            self.last_coordinator_steps != 0 or
+            self.last_retired_input_records != 0 or
+            self.last_pages_claimed != 0 or
+            self.last_pages_completed != 0 or
+            self.last_phases_advanced != 0 or
+            self.last_published != 0 or
+            self.last_failed_builds != 0 or
+            self.last_budget_exhausted;
+    }
+};
+
 pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
     dst.enabled = dst.enabled or src.enabled;
     dst.active_indexes +|= src.active_indexes;
@@ -2551,6 +2905,7 @@ pub const DBStats = struct {
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
+    graph_metric_runtime: GraphMetricRuntimeStats = .{},
     term_doc_freq_cache_hits: u64 = 0,
     term_doc_freq_cache_misses: u64 = 0,
     async_indexing: AsyncIndexingStats = .{},
@@ -3253,6 +3608,7 @@ pub const DBIndexStats = struct {
     algebraic_graph_traversal_rejected_count: u64 = 0,
     algebraic_graph_traversal_fallback_count: u64 = 0,
     algebraic_graph_traversal_result_node_count: u64 = 0,
+    graph_metric_status: []GraphMetricStatus = &.{},
     algebraic_observed_query_shape_count: u64 = 0,
     algebraic_recommendation_count: u64 = 0,
     algebraic_adaptive_candidate_count: u64 = 0,
@@ -3799,6 +4155,7 @@ pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiag
 }
 
 pub fn freeDBIndexStatsItem(alloc: Allocator, item: DBIndexStats) void {
+    freeGraphMetricStatuses(alloc, item.graph_metric_status);
     alloc.free(item.name);
     for (item.source_replay) |source| alloc.free(source.artifact_name);
     if (item.source_replay.len > 0) alloc.free(item.source_replay);
@@ -3851,4 +4208,23 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
     for (stats.indexes) |item| freeDBIndexStatsItem(alloc, item);
     if (stats.indexes.len > 0) alloc.free(stats.indexes);
+}
+
+test "graph metric index stats cleanup owns nested status payloads" {
+    const alloc = std.testing.allocator;
+    var item: DBIndexStats = .{ .name = try alloc.dupe(u8, "graph_idx"), .kind = .graph };
+    defer freeDBIndexStatsItem(alloc, item);
+    const statuses = blk: {
+        const owned = try alloc.alloc(GraphMetricStatus, 1);
+        errdefer alloc.free(owned);
+        owned[0] = .{ .name = try alloc.dupe(u8, "pagerank") };
+        break :blk owned;
+    };
+    item.graph_metric_status = statuses;
+    statuses[0].build_worker_id = try alloc.dupe(u8, "worker");
+    statuses[0].build_cursor = try alloc.dupe(u8, "cursor");
+    statuses[0].last_error = try alloc.dupe(u8, "diagnostic");
+    statuses[0].build_pages = try alloc.alloc(GraphMetricBuildPageStatus, 1);
+    statuses[0].build_pages[0] = .{};
+    statuses[0].build_pages[0].cursor = try alloc.dupe(u8, "page-cursor");
 }

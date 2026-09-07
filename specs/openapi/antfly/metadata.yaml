@@ -4412,6 +4412,13 @@ components:
           $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         status:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
+    GraphMetricActionResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricStatus"
     LsmStorageStatus:
       type: object
       description: Compact LSM backend operational status. Detailed low-level counters are available through metrics.
@@ -4995,8 +5002,9 @@ components:
           description: |
             Durable commit outcome. `committed_pending` means requested visibility or
             participant propagation is still completing. `committed_repair_required`
-            means the primary write committed, but a terminal enrichment failure needs
-            operator repair and will not be retried indefinitely.
+            means the primary write committed, but a terminal background materialization
+            failure needs operator repair and will not be retried indefinitely. Inspect
+            `failure` when present; retrying the document write is unnecessary.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -5006,6 +5014,28 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+        failure:
+          $ref: "#/components/schemas/BatchCommittedFailure"
+    BatchCommittedFailure:
+      type: object
+      description: |
+        Additive details for a committed batch that needs operator action. The
+        open string code is forward-compatible with older SDKs; clients should
+        treat unknown codes as non-retryable when `retryable` is false.
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable failure code, such as `graph_metric_materialization_rejected`.
+        message:
+          type: string
+          description: Actionable operator guidance.
+        reason:
+          type: string
+          description: Optional stable reason within the failure category, such as `build_budget_exceeded`.
+        retryable:
+          type: boolean
+          description: Whether replaying the document mutation is safe. Committed repair outcomes are false.
     DenseRepairBackpressureError:
       type: object
       description: A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
@@ -7162,6 +7192,8 @@ components:
                   - required: [count]
                   - required: [profile]
                   - required: [reranker]
+                  - required: [graph_metric]
+                  - required: [graph_metric_rerank]
                   - required: [analyses]
                   - required: [aggregations]
                   - required: [graph_queries]
@@ -7564,6 +7596,18 @@ components:
               "field": "content"
             }
             ```
+        graph_metric:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricQuery"
+          description: >-
+            Direct top-k read from a published graph metric generation. Results
+            are returned in graph_metric_results under the requested name or the
+            metric name when no explicit name is supplied.
+        graph_metric_rerank:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricRerank"
+          description: >-
+            Blend a published graph metric feature into ordinary search hit
+            scores. Requests may require either any published generation or a
+            generation that is fresh with respect to graph writes.
         analyses:
           $ref: "#/components/schemas/Analyses"
         graph_queries:
@@ -7941,9 +7985,42 @@ components:
         merge:
           $ref: "#/components/schemas/MergeProfile"
           description: Result merge statistics (present for hybrid search).
+        graph_metrics:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphMetricProfile"
+          description: Graph metric freshness and generation details for metric-aware query work.
         sort:
           $ref: "#/components/schemas/SortProfile"
           description: Sort execution statistics (present when the query used ordered page options and profiling was enabled).
+    GraphMetricProfile:
+      type: object
+      required:
+        - query_name
+        - source
+        - index_name
+        - metric_name
+        - freshness
+        - status
+      properties:
+        query_name:
+          type: string
+          description: Name of the graph query or graph metric query that used the metric.
+        source:
+          type: string
+          description: Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+        index_name:
+          type: string
+          description: Graph index that owns the metric.
+        metric_name:
+          type: string
+          description: Graph metric name within the index.
+        freshness:
+          type: string
+          description: Effective freshness mode requested for this metric use.
+        status:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricStatus"
+          description: Published generation and freshness status observed by the query.
     SortProfile:
       type: object
       additionalProperties: false
@@ -8437,6 +8514,64 @@ components:
           items:
             $ref: "#/components/schemas/HierarchyMatchHit"
 
+    QueryScoreDetails:
+      type: object
+      description: Optional score provenance for ranking features that changed the final hit score.
+      properties:
+        graph_metric_rerank:
+          $ref: "#/components/schemas/GraphMetricRerankScoreDetails"
+          description: Score contribution from an explicit graph_metric_rerank request.
+    GraphMetricRerankScoreDetails:
+      type: object
+      required:
+        - index_name
+        - metric_name
+        - base_score
+        - base_weight
+        - metric_score_used
+        - metric_weight
+        - missing_score_used
+        - final_score
+        - published_generation
+      properties:
+        index_name:
+          type: string
+          description: Graph index that provided the metric score.
+        metric_name:
+          type: string
+          description: Graph metric used as a score feature.
+        base_score:
+          type: number
+          format: double
+          description: Hit score before graph metric rerank composition.
+        base_weight:
+          type: number
+          format: double
+          description: Weight applied to the base score.
+        metric_score:
+          type: number
+          format: double
+          nullable: true
+          description: Published metric score for this hit, or null when the hit was missing from the metric generation.
+        metric_score_used:
+          type: number
+          format: double
+          description: Metric feature value used in the formula after applying missing_score fallback if needed.
+        metric_weight:
+          type: number
+          format: double
+          description: Weight applied to the metric score feature.
+        missing_score_used:
+          type: boolean
+          description: True when metric_score was missing and the request's missing_score fallback was used.
+        final_score:
+          type: number
+          format: double
+          description: Final hit score after graph metric rerank composition.
+        published_generation:
+          type: integer
+          format: int64
+          description: Published graph metric score generation used for this hit.
     QueryHit:
       type: object
       description: A single query result hit
@@ -8472,6 +8607,10 @@ components:
             format: double
           description: Scores partitioned by index when using RRF search.
           x-go-name: indexScores
+        _score_details:
+          $ref: "#/components/schemas/QueryScoreDetails"
+          description: Optional score provenance for ranking features applied to this hit.
+          x-go-name: scoreDetails
         _source:
           type: object
           additionalProperties: true # map[string]any for field values
@@ -8576,6 +8715,11 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/AnalysesResult"
           description: Analysis results like PCA and t-SNE per index embeddings.
+        graph_metric_results:
+          type: object
+          additionalProperties:
+            $ref: "indexes.yaml#/components/schemas/GraphMetricResult"
+          description: Results from direct graph metric reads.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -9632,6 +9776,77 @@ paths:
                 type: string
         "500":
           $ref: "#/components/responses/StatelessTransactionFailure"
+  /tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum: [refresh, rebuild, delete, pause, resume]
+    post:
+      summary: Execute a graph metric operational action
+      description: |
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+        graph metric. The metric configuration remains owned by the graph index.
+        Refresh and rebuild durably enqueue bounded, resumable maintenance and
+        return the aggregate shard status without waiting for graph-sized work.
+        `delete` clears materialized metric state and durably disables automatic
+        maintenance. A later refresh, rebuild, or resume action re-enables the
+        metric and can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeGraphMetricAction
+      responses:
+        "200":
+          description: Aggregate graph metric status after the action is durably accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphMetricActionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: The table topology or write-owner generation changed, or only some shards accepted the action; retrying is consistency-safe and reuses any still-active build
+          content:
+            text/plain:
+              schema:
+                type: string
+        "429":
+          description: Local storage resources are temporarily exhausted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /transactions/commit:
     post:
       summary: Commit an OCC transaction

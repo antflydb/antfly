@@ -2408,6 +2408,7 @@ const QueryBodyContractFields = struct {
     has_public_doc_filter_bindings: bool,
     has_public_hierarchy_controls: bool,
     has_query_timeout: bool,
+    has_graph_metric: bool,
 };
 
 const RawGraphValueEntry = struct {
@@ -2587,6 +2588,7 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
         .has_public_doc_filter_bindings = parsed.value.object.get("with") != null,
         .has_public_hierarchy_controls = objectHasNonNullField(parsed.value.object, "hierarchy"),
         .has_query_timeout = parsed.value.object.get("timeout_ms") != null,
+        .has_graph_metric = objectHasNonNullField(parsed.value.object, "graph_metric"),
     };
 }
 
@@ -2687,6 +2689,7 @@ pub fn parseQueryRequestWithDeadline(
         // Admission interprets this extension semantically, so escaped JSON
         // member names and the canonical spelling have identical behavior.
         .strip_query_timeout = contract_fields.has_query_timeout,
+        .strip_graph_metric = contract_fields.has_graph_metric,
     });
     defer if (contract_body) |owned| alloc.free(owned);
     try ensureQueryDeadline(execution_deadline_ns);
@@ -2779,6 +2782,11 @@ pub fn parseQueryRequestWithDeadline(
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
     req.graph_queries = try buildGraphQueries(alloc, request);
+    req.graph_metric_queries = try parseGraphMetricQueriesAlloc(alloc, effective_body);
+    req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank);
+    if (req.graph_metric_rerank) |rerank| {
+        try db_mod.types.validateGraphMetricRerankWindow(rerank, req.offset, req.limit);
+    }
     if (req.graph_queries.len > 0) {
         req.graph_query_transport = try captureGraphQueryTransportAlloc(alloc, effective_body, req.graph_queries);
     }
@@ -3522,6 +3530,10 @@ pub fn encodeQueryResponses(
         null;
 
     const profile = if (req.profile) try buildProfileValue(arena, req, meta, result) else null;
+    const graph_metric_results = if (result.graph_metric_results.len > 0)
+        try buildGraphMetricResults(arena, result.graph_metric_results)
+    else
+        null;
     const response_json = switch (graph_dialect orelse .canonical) {
         .canonical => blk: {
             const graph_results = if (graph_dialect != null)
@@ -3536,6 +3548,7 @@ pub fn encodeQueryResponses(
                     .max_score = computeMaxScore(emitted_hits),
                 },
                 .aggregations = aggregations,
+                .graph_metric_results = graph_metric_results,
                 .graph_results = graph_results,
                 .profile = profile,
                 .took = meta.took_ms,
@@ -3565,6 +3578,7 @@ pub fn encodeQueryResponses(
                     .max_score = computeMaxScore(emitted_hits),
                 },
                 .aggregations = aggregations,
+                .graph_metric_results = graph_metric_results,
                 .graph_results = graph_results,
                 .profile = profile,
                 .took = meta.took_ms,
@@ -3595,6 +3609,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
     return .{
         ._id = hit.id,
         ._score = if (hit.score) |score| finiteScoreOrZero(score) else 0,
+        ._score_details = toOpenApiScoreDetails(hit.score_details),
         ._distance = if (hit.distance) |distance| finiteScoreOrZero(distance) else null,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
@@ -3629,6 +3644,22 @@ fn takeOpenApiObjectMap(
     var invalid = value;
     db_mod.types.deinitJsonValue(alloc, &invalid);
     return error.InvalidRemoteResponse;
+}
+
+fn toOpenApiScoreDetails(details: ?db_mod.types.GraphMetricRerankScoreDetails) ?metadata_openapi.QueryScoreDetails {
+    const rerank = details orelse return null;
+    return .{ .graph_metric_rerank = .{
+        .index_name = rerank.index_name,
+        .metric_name = rerank.metric_name,
+        .base_score = rerank.base_score,
+        .base_weight = rerank.base_weight,
+        .metric_score = metadata_openapi.types.OpenApiOptionalNullable(f64).fromNullable(rerank.metric_score),
+        .metric_score_used = rerank.metric_score_used,
+        .metric_weight = rerank.metric_weight,
+        .missing_score_used = rerank.missing_score_used,
+        .final_score = rerank.final_score,
+        .published_generation = saturatingI64(rerank.published_generation),
+    } };
 }
 
 fn searchHitHierarchyOpenApiValue(
@@ -5521,6 +5552,129 @@ fn jsonValueToI64(value: std.json.Value) !?i64 {
     };
 }
 
+fn buildGraphMetricResults(
+    alloc: std.mem.Allocator,
+    results: []const db_mod.types.GraphMetricResult,
+) !std.json.ArrayHashMap(indexes_openapi.GraphMetricResult) {
+    var out: std.json.ArrayHashMap(indexes_openapi.GraphMetricResult) = .{};
+    errdefer out.deinit(alloc);
+    for (results) |result| {
+        const scores = try alloc.alloc(indexes_openapi.GraphMetricScore, result.scores.len);
+        for (result.scores, 0..) |score, i| scores[i] = .{ .node = score.node, .score = score.score };
+        try out.map.put(alloc, result.name, .{
+            .index_name = result.index_name,
+            .metric = result.metric_name,
+            .scores = scores,
+            .status = try toOpenApiGraphMetricStatus(alloc, result.status),
+        });
+    }
+    return out;
+}
+
+fn graphMetricStateName(state: graph_mod.GraphIndex.GraphMetricState) []const u8 {
+    return @tagName(state);
+}
+
+fn graphMetricPhaseName(phase: graph_mod.GraphIndex.GraphMetricBuildPhase) []const u8 {
+    return @tagName(phase);
+}
+
+fn saturatingI64(value: u64) i64 {
+    return std.math.cast(i64, value) orelse std.math.maxInt(i64);
+}
+
+fn toOpenApiGraphMetricBuildPages(
+    alloc: std.mem.Allocator,
+    pages: []const db_mod.types.GraphMetricBuildPageStatus,
+) !?[]const indexes_openapi.GraphMetricBuildPageStatus {
+    if (pages.len == 0) return null;
+    const out = try alloc.alloc(indexes_openapi.GraphMetricBuildPageStatus, pages.len);
+    for (pages, 0..) |page, i| out[i] = .{
+        .phase = @tagName(page.phase),
+        .iteration = @intCast(page.iteration),
+        .page_id = saturatingI64(page.page_id),
+        .state = @tagName(page.state),
+        .range_kind = @tagName(page.range_kind),
+        .worker_id = if (page.worker_id.len > 0) page.worker_id else null,
+        .lease_expires_at_ms = saturatingI64(page.lease_expires_at_ms),
+        .attempt = saturatingI64(page.attempt),
+        .cursor = if (page.cursor.len > 0) page.cursor else null,
+        .completed_units = saturatingI64(page.completed_units),
+        .total_units = saturatingI64(page.total_units),
+        .last_error = if (page.last_error.len > 0) page.last_error else null,
+    };
+    return out;
+}
+
+pub fn toOpenApiGraphMetricStatus(
+    alloc: std.mem.Allocator,
+    status: db_mod.types.GraphMetricStatus,
+) !indexes_openapi.GraphMetricStatus {
+    const events = if (status.recent_events.len > 0) blk: {
+        const out = try alloc.alloc(indexes_openapi.GraphMetricEvent, status.recent_events.len);
+        for (status.recent_events, 0..) |event, i| out[i] = toOpenApiGraphMetricEvent(event);
+        break :blk out;
+    } else null;
+    return .{
+        .state = graphMetricStateName(status.state),
+        .phase = graphMetricPhaseName(status.phase),
+        .edge_filter = .{ .mode = @tagName(status.edge_filter.mode), .types = if (status.edge_filter.types.len > 0) status.edge_filter.types else null },
+        .metadata_version = @intCast(status.metadata_version),
+        .config_fingerprint = try std.fmt.allocPrint(alloc, "{x:0>16}", .{status.config_fingerprint}),
+        .maintenance_paused = status.maintenance_paused,
+        .build_queued = status.build_queued,
+        .published_generation = saturatingI64(status.published_generation),
+        .edge_generation = saturatingI64(status.edge_generation),
+        .target_edge_generation = saturatingI64(status.target_edge_generation),
+        .queued_generation = saturatingI64(status.queued_generation),
+        .building_generation = saturatingI64(status.building_generation),
+        .build_job_id = saturatingI64(status.build_job_id),
+        .build_started_at_ms = saturatingI64(status.build_started_at_ms),
+        .build_iteration = @intCast(status.build_iteration),
+        .build_lease_expires_at_ms = saturatingI64(status.build_lease_expires_at_ms),
+        .build_worker_id = if (status.build_worker_id.len > 0) status.build_worker_id else null,
+        .build_cursor = if (status.build_cursor.len > 0) status.build_cursor else null,
+        .build_completed_units = saturatingI64(status.build_completed_units),
+        .build_total_units = saturatingI64(status.build_total_units),
+        .build_pages = try toOpenApiGraphMetricBuildPages(alloc, status.build_pages),
+        .build_pages_truncated = status.build_pages_truncated,
+        .retry_count = saturatingI64(status.retry_count),
+        .last_error = if (status.last_error.len > 0) status.last_error else null,
+        .progress = status.progress,
+        .converged = status.converged,
+        .iterations_completed = @intCast(status.iterations_completed),
+        .delta = status.delta,
+        .computed_at_ms = saturatingI64(status.computed_at_ms),
+        .last_event = if (status.last_event) |event| toOpenApiGraphMetricEvent(event) else null,
+        .recent_events = events,
+    };
+}
+
+fn toOpenApiGraphMetricEvent(event: graph_mod.GraphIndex.GraphMetricEvent) indexes_openapi.GraphMetricEvent {
+    return .{
+        .sequence = saturatingI64(event.sequence),
+        .kind = @tagName(event.kind),
+        .at_ms = saturatingI64(event.at_ms),
+        .target_edge_generation = saturatingI64(event.target_edge_generation),
+        .published_generation = saturatingI64(event.published_generation),
+        .score_count = saturatingI64(event.score_count),
+    };
+}
+
+fn toOpenApiGraphMetricStatusMap(
+    alloc: std.mem.Allocator,
+    statuses: []const db_mod.types.GraphMetricStatus,
+) !?std.json.ArrayHashMap(indexes_openapi.GraphMetricStatus) {
+    if (statuses.len == 0) return null;
+    var out: std.json.ArrayHashMap(indexes_openapi.GraphMetricStatus) = .{};
+    errdefer out.deinit(alloc);
+    for (statuses) |status| {
+        if (out.map.contains(status.name)) return error.InvalidRemoteResponse;
+        try out.map.put(alloc, status.name, try toOpenApiGraphMetricStatus(alloc, status));
+    }
+    return out;
+}
+
 fn buildGraphQueryResults(
     comptime Result: type,
     alloc: std.mem.Allocator,
@@ -5683,6 +5837,7 @@ fn toOpenApiStatefulGraphResultWithFormat(
             ),
             .total = @intCast(graph_result.total_hits),
             .took = meta.took_ms,
+            .metric_status = try toOpenApiGraphMetricStatusMap(alloc, graph_result.metric_status),
         };
         return .{ .legacy_graph_search_result = response };
     }
@@ -5779,6 +5934,7 @@ fn toOpenApiStatefulGraphResultWithFormat(
     response.* = .{
         .kind = "nodes",
         .nodes = nodes,
+        .metric_status = try toOpenApiGraphMetricStatusMap(alloc, graph_result.metric_status),
         .stats = .{
             .returned_items = @intCast(nodes.len),
             .truncated = graph_result.truncated,
@@ -7252,6 +7408,64 @@ test "graph document lookup enforces its defensive hydration budget" {
     );
 }
 
+fn buildGraphMetricProfiles(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+) !?[]metadata_openapi.GraphMetricProfile {
+    var count: usize = result.graph_metric_results.len;
+    for (result.graph_results) |graph_result| count += graph_result.metric_status.len;
+    if (result.graph_metric_rerank_status != null) count += 1;
+    if (count == 0) return null;
+    const profiles = try alloc.alloc(metadata_openapi.GraphMetricProfile, count);
+    var out: usize = 0;
+    for (result.graph_metric_results) |metric_result| {
+        var freshness: db_mod.types.GraphMetricFreshness = .published;
+        for (req.graph_metric_queries) |query| {
+            if (std.mem.eql(u8, query.name, metric_result.name)) freshness = query.query.freshness;
+        }
+        profiles[out] = .{
+            .query_name = metric_result.name,
+            .source = "graph_metric",
+            .index_name = metric_result.index_name,
+            .metric_name = metric_result.metric_name,
+            .freshness = @tagName(freshness),
+            .status = try toOpenApiGraphMetricStatus(alloc, metric_result.status),
+        };
+        out += 1;
+    }
+    for (result.graph_results) |graph_result| {
+        var index_name: []const u8 = "";
+        for (req.graph_queries) |query| if (std.mem.eql(u8, query.name, graph_result.name)) {
+            index_name = query.query.index_name;
+            break;
+        };
+        for (graph_result.metric_status) |status| {
+            profiles[out] = .{
+                .query_name = graph_result.name,
+                .source = "graph_query",
+                .index_name = index_name,
+                .metric_name = status.name,
+                .freshness = "published",
+                .status = try toOpenApiGraphMetricStatus(alloc, status),
+            };
+            out += 1;
+        }
+    }
+    if (result.graph_metric_rerank_status) |status| {
+        const rerank = req.graph_metric_rerank orelse return error.UnsupportedQueryRequest;
+        profiles[out] = .{
+            .query_name = "graph_metric_rerank",
+            .source = "graph_metric_rerank",
+            .index_name = rerank.index_name,
+            .metric_name = rerank.metric_name,
+            .freshness = @tagName(rerank.freshness),
+            .status = try toOpenApiGraphMetricStatus(alloc, status),
+        };
+    }
+    return profiles;
+}
+
 fn buildProfileValue(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
@@ -7284,6 +7498,7 @@ fn buildProfileValue(
             .semantic_hits = if (req.dense_queries.len > 0 or req.sparse_queries.len > 0) result.total_hits else 0,
             .duration_ms = meta.took_ms,
         } else null,
+        .graph_metrics = try buildGraphMetricProfiles(alloc, req, result),
     };
     const encoded = try jsonStringifyAlloc(alloc, profile);
     defer alloc.free(encoded);
@@ -10115,6 +10330,25 @@ pub fn parseLegacyGraphQuery(
     else
         @constCast((&[_][]const u8{})[0..]);
     errdefer freeOwnedStringSlice(alloc, fields);
+    const metric_freshness = if (query.metric_freshness) |freshness|
+        try parseGraphMetricFreshnessString(freshness)
+    else
+        graph_query_mod.GraphMetricFreshness.published;
+    const metrics = if (query.metrics) |values|
+        try parseGraphMetricReads(alloc, values, metric_freshness)
+    else
+        @constCast((&[_]graph_query_mod.GraphMetricRead{})[0..]);
+    errdefer freeGraphMetricReads(alloc, metrics);
+    const metric_order = if (query.order_by) |values|
+        try parseGraphMetricOrders(alloc, values, metric_freshness)
+    else
+        @constCast((&[_]graph_query_mod.GraphMetricOrder{})[0..]);
+    errdefer freeGraphMetricOrders(alloc, metric_order);
+    const metric_filters = if (query.where_metric) |values|
+        try parseGraphMetricFilters(alloc, values, metric_freshness)
+    else
+        @constCast((&[_]graph_query_mod.GraphMetricFilter{})[0..]);
+    errdefer freeGraphMetricFilters(alloc, metric_filters);
 
     if (query.type == .pattern) {
         if (pattern.len == 0) return error.UnsupportedQueryRequest;
@@ -10131,7 +10365,7 @@ pub fn parseLegacyGraphQuery(
     else
         1;
 
-    return .{
+    const parsed_query: graph_query_mod.GraphQuery = .{
         .query_type = switch (query.type) {
             .traverse => .traverse,
             .neighbors => .neighbors,
@@ -10149,7 +10383,251 @@ pub fn parseLegacyGraphQuery(
         .include_documents = query.include_documents orelse false,
         .fields = fields,
         .include_all_fields = query.fields == null,
+        .metrics = metrics,
+        .order_by = metric_order,
+        .where_metric = metric_filters,
+        .include_metric_status = query.include_metric_status orelse false,
     };
+    try graph_query_mod.validateGraphMetricQueryShape(parsed_query);
+    return parsed_query;
+}
+
+fn parseGraphMetricQueriesAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) ![]const db_mod.types.NamedGraphMetricQuery {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    if (parsed.value.object.get("_graph_metric_queries")) |internal_queries| {
+        if (internal_queries != .array or internal_queries.array.items.len == 0 or
+            internal_queries.array.items.len > graph_query_mod.graph_metric_projection_limit)
+            return error.InvalidQueryRequest;
+        const items = try alloc.alloc(db_mod.types.NamedGraphMetricQuery, internal_queries.array.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |item| {
+                alloc.free(item.name);
+                alloc.free(item.query.index_name);
+                alloc.free(item.query.metric_name);
+            }
+            alloc.free(items);
+        }
+        for (internal_queries.array.items, 0..) |value, i| {
+            if (value != .object) return error.InvalidQueryRequest;
+            const index_name = try parseRequiredStringField(value.object, "index");
+            const metric_name = try parseRequiredStringField(value.object, "metric");
+            const result_name = try parseRequiredStringField(value.object, "name");
+            if (index_name.len == 0 or metric_name.len == 0 or result_name.len == 0)
+                return error.InvalidQueryRequest;
+            for (items[0..initialized]) |prior| {
+                if (std.mem.eql(u8, prior.name, result_name)) return error.InvalidQueryRequest;
+            }
+            const top_k = if (value.object.get("top_k")) |raw| try parseOptionalU32FieldValue(raw) else 10;
+            if (top_k == 0 or top_k > 10_000) return error.InvalidQueryRequest;
+            const freshness = if (value.object.get("metric_freshness")) |raw|
+                try parseGraphMetricFreshness(raw)
+            else
+                db_mod.types.GraphMetricFreshness.published;
+            const owned_name = try alloc.dupe(u8, result_name);
+            errdefer alloc.free(owned_name);
+            const owned_index_name = try alloc.dupe(u8, index_name);
+            errdefer alloc.free(owned_index_name);
+            const owned_metric_name = try alloc.dupe(u8, metric_name);
+            errdefer alloc.free(owned_metric_name);
+            items[i] = .{
+                .name = owned_name,
+                .query = .{
+                    .index_name = owned_index_name,
+                    .metric_name = owned_metric_name,
+                    .top_k = top_k,
+                    .freshness = freshness,
+                },
+            };
+            initialized += 1;
+        }
+        return items;
+    }
+    const metric_value = parsed.value.object.get("graph_metric") orelse return &.{};
+    if (metric_value == .null) return &.{};
+    if (metric_value != .object) return error.InvalidQueryRequest;
+    const index_name = try parseRequiredStringField(metric_value.object, "index");
+    const metric_name = try parseRequiredStringField(metric_value.object, "metric");
+    if (index_name.len == 0 or metric_name.len == 0) return error.InvalidQueryRequest;
+    const result_name = if (metric_value.object.get("name") != null)
+        try parseRequiredStringField(metric_value.object, "name")
+    else
+        metric_name;
+    if (result_name.len == 0) return error.InvalidQueryRequest;
+    const top_k = if (metric_value.object.get("top_k")) |value| try parseOptionalU32FieldValue(value) else 10;
+    if (top_k == 0 or top_k > 10_000) return error.InvalidQueryRequest;
+    const freshness = if (metric_value.object.get("metric_freshness")) |value|
+        try parseGraphMetricFreshness(value)
+    else if (metric_value.object.get("freshness")) |value|
+        try parseGraphMetricFreshness(value)
+    else
+        db_mod.types.GraphMetricFreshness.published;
+    const items = try alloc.alloc(db_mod.types.NamedGraphMetricQuery, 1);
+    errdefer alloc.free(items);
+    const owned_name = try alloc.dupe(u8, result_name);
+    errdefer alloc.free(owned_name);
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const owned_metric_name = try alloc.dupe(u8, metric_name);
+    errdefer alloc.free(owned_metric_name);
+    items[0] = .{
+        .name = owned_name,
+        .query = .{
+            .index_name = owned_index_name,
+            .metric_name = owned_metric_name,
+            .top_k = top_k,
+            .freshness = freshness,
+        },
+    };
+    return items;
+}
+
+fn parseGraphMetricRerankAlloc(
+    alloc: std.mem.Allocator,
+    maybe_rerank: ?indexes_openapi.GraphMetricRerank,
+) !?db_mod.types.GraphMetricRerank {
+    const rerank = maybe_rerank orelse return null;
+    if (rerank.index.len == 0 or rerank.metric.len == 0) return error.InvalidQueryRequest;
+    const base_weight = rerank.base_weight orelse 1.0;
+    const weight = rerank.weight orelse 1.0;
+    const missing_score = rerank.missing_score orelse 0.0;
+    if (!std.math.isFinite(base_weight) or !std.math.isFinite(weight) or !std.math.isFinite(missing_score)) return error.InvalidQueryRequest;
+    const index_name = try alloc.dupe(u8, rerank.index);
+    errdefer alloc.free(index_name);
+    const metric_name = try alloc.dupe(u8, rerank.metric);
+    errdefer alloc.free(metric_name);
+    const freshness = if (rerank.metric_freshness) |value| try parseGraphMetricFreshnessStringForRequest(value) else .published;
+    return .{
+        .index_name = index_name,
+        .metric_name = metric_name,
+        .freshness = freshness,
+        .candidate_count = if (rerank.candidate_count) |count|
+            std.math.cast(u32, count) orelse return error.InvalidQueryRequest
+        else
+            null,
+        .base_weight = base_weight,
+        .weight = weight,
+        .missing_score = missing_score,
+    };
+}
+
+/// Parse only graph-metric extensions without invoking semantic embedding or
+/// the general search normalizer. Serverless serving uses this to compose
+/// immutable metric artifacts with its independent lake search planner.
+pub const OwnedGraphMetricRequests = struct {
+    queries: []const db_mod.types.NamedGraphMetricQuery = &.{},
+    rerank: ?db_mod.types.GraphMetricRerank = null,
+
+    pub fn deinit(self: *OwnedGraphMetricRequests, alloc: std.mem.Allocator) void {
+        freeNamedGraphMetricQueries(alloc, self.queries);
+        if (self.rerank) |rerank| {
+            alloc.free(@constCast(rerank.index_name));
+            alloc.free(@constCast(rerank.metric_name));
+        }
+        self.* = undefined;
+    }
+};
+
+pub fn parseGraphMetricRequestsAlloc(alloc: std.mem.Allocator, body: []const u8) !OwnedGraphMetricRequests {
+    if (body.len == 0) return error.InvalidQueryRequest;
+    var parsed = ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    const queries = try parseGraphMetricQueriesAlloc(alloc, body);
+    errdefer freeNamedGraphMetricQueries(alloc, queries);
+    return .{
+        .queries = queries,
+        .rerank = try parseGraphMetricRerankAlloc(alloc, parsed.value.graph_metric_rerank),
+    };
+}
+
+fn parseRequiredStringField(object: std.json.ObjectMap, field: []const u8) ![]const u8 {
+    const value = object.get(field) orelse return error.InvalidQueryRequest;
+    if (value != .string) return error.InvalidQueryRequest;
+    return value.string;
+}
+
+fn parseOptionalU32FieldValue(value: std.json.Value) !u32 {
+    if (value != .integer) return error.InvalidQueryRequest;
+    return std.math.cast(u32, value.integer) orelse return error.InvalidQueryRequest;
+}
+
+fn parseGraphMetricFreshness(value: std.json.Value) !db_mod.types.GraphMetricFreshness {
+    if (value != .string) return error.InvalidQueryRequest;
+    return try parseGraphMetricFreshnessStringForRequest(value.string);
+}
+
+fn parseGraphMetricFreshnessStringForRequest(value: []const u8) !db_mod.types.GraphMetricFreshness {
+    if (std.mem.eql(u8, value, "published")) return .published;
+    if (std.mem.eql(u8, value, "fresh")) return .fresh;
+    return error.InvalidQueryRequest;
+}
+
+fn parseGraphMetricFreshnessString(value: []const u8) !graph_query_mod.GraphMetricFreshness {
+    if (std.mem.eql(u8, value, "published")) return .published;
+    if (std.mem.eql(u8, value, "fresh")) return .fresh;
+    return error.InvalidQueryRequest;
+}
+
+fn parseGraphMetricReads(alloc: std.mem.Allocator, values: []const []const u8, freshness: graph_query_mod.GraphMetricFreshness) ![]const graph_query_mod.GraphMetricRead {
+    if (values.len > graph_query_mod.graph_metric_projection_limit) return error.InvalidQueryRequest;
+    const out = try alloc.alloc(graph_query_mod.GraphMetricRead, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item.name);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        if (value.len == 0) return error.InvalidQueryRequest;
+        out[i] = .{ .name = try alloc.dupe(u8, value), .freshness = freshness };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseGraphMetricOrders(alloc: std.mem.Allocator, values: []const indexes_openapi.GraphMetricOrder, freshness: graph_query_mod.GraphMetricFreshness) ![]const graph_query_mod.GraphMetricOrder {
+    if (values.len > graph_query_mod.graph_metric_order_limit) return error.InvalidQueryRequest;
+    const out = try alloc.alloc(graph_query_mod.GraphMetricOrder, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item.name);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        if (value.metric.len == 0) return error.InvalidQueryRequest;
+        out[i] = .{
+            .name = try alloc.dupe(u8, value.metric),
+            .direction = if (std.mem.eql(u8, value.direction orelse "desc", "asc")) .asc else if (std.mem.eql(u8, value.direction orelse "desc", "desc")) .desc else return error.InvalidQueryRequest,
+            .nulls = if (std.mem.eql(u8, value.nulls orelse "last", "first") or std.mem.eql(u8, value.nulls orelse "last", "nulls_first")) .first else if (std.mem.eql(u8, value.nulls orelse "last", "last") or std.mem.eql(u8, value.nulls orelse "last", "nulls_last")) .last else return error.InvalidQueryRequest,
+            .freshness = freshness,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseGraphMetricFilters(alloc: std.mem.Allocator, values: []const indexes_openapi.GraphMetricFilter, freshness: graph_query_mod.GraphMetricFreshness) ![]const graph_query_mod.GraphMetricFilter {
+    if (values.len > graph_query_mod.graph_metric_filter_limit) return error.InvalidQueryRequest;
+    const out = try alloc.alloc(graph_query_mod.GraphMetricFilter, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item.name);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        if (value.metric.len == 0 or !std.math.isFinite(value.value)) return error.InvalidQueryRequest;
+        const op = std.meta.stringToEnum(graph_query_mod.GraphMetricFilterOp, value.op) orelse return error.InvalidQueryRequest;
+        out[i] = .{ .name = try alloc.dupe(u8, value.metric), .op = op, .value = value.value, .freshness = freshness };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn parseLegacyPatternSteps(
@@ -10274,7 +10752,26 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
     errdefer freePatternNodeFilter(alloc, filter);
     const fields = if (traversal.fields) |items| try cloneFields(alloc, items) else &.{};
     errdefer freeOwnedStringSlice(alloc, fields);
-    return .{
+    const metric_freshness = if (traversal.metric_freshness) |freshness|
+        try parseGraphMetricFreshnessString(freshness)
+    else
+        graph_query_mod.GraphMetricFreshness.published;
+    const metrics = if (traversal.metrics) |values|
+        try parseGraphMetricReads(alloc, values, metric_freshness)
+    else
+        @constCast((&[_]graph_query_mod.GraphMetricRead{})[0..]);
+    errdefer freeGraphMetricReads(alloc, metrics);
+    const metric_order = if (traversal.order_by) |values|
+        try parseGraphMetricOrders(alloc, values, metric_freshness)
+    else
+        @constCast((&[_]graph_query_mod.GraphMetricOrder{})[0..]);
+    errdefer freeGraphMetricOrders(alloc, metric_order);
+    const metric_filters = if (traversal.where_metric) |values|
+        try parseGraphMetricFilters(alloc, values, metric_freshness)
+    else
+        @constCast((&[_]graph_query_mod.GraphMetricFilter{})[0..]);
+    errdefer freeGraphMetricFilters(alloc, metric_filters);
+    const parsed: graph_query_mod.GraphQuery = .{
         .query_type = .traverse,
         .index_name = index,
         .start_nodes = start,
@@ -10292,7 +10789,13 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
         .include_documents = traversal.include_documents orelse false,
         .fields = fields,
         .include_all_fields = traversal.fields == null,
+        .metrics = metrics,
+        .order_by = metric_order,
+        .where_metric = metric_filters,
+        .include_metric_status = traversal.include_metric_status orelse false,
     };
+    try graph_query_mod.validateGraphMetricQueryShape(parsed);
+    return parsed;
 }
 
 fn parseGraphPathQuery(
@@ -11367,6 +11870,11 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeNamedDenseQueries(alloc, req.dense_queries);
     freeNamedSparseQueries(alloc, req.sparse_queries);
     freeNamedGraphQueries(alloc, req.graph_queries);
+    freeNamedGraphMetricQueries(alloc, req.graph_metric_queries);
+    if (req.graph_metric_rerank) |rerank| {
+        alloc.free(@constCast(rerank.index_name));
+        alloc.free(@constCast(rerank.metric_name));
+    }
     if (req.graph_query_transport) |*transport| transport.deinit(alloc);
     freeNamedDocFilterBindings(alloc, req.doc_filter_bindings);
     if (req.sparse) |sparse| {
@@ -12309,6 +12817,7 @@ const QueryContractStripOptions = struct {
     strip_public_doc_filter_bindings: bool = false,
     strip_public_hierarchy_controls: bool = false,
     strip_query_timeout: bool = false,
+    strip_graph_metric: bool = false,
 };
 
 fn queryBodyForGeneratedContractAlloc(
@@ -12316,7 +12825,7 @@ fn queryBodyForGeneratedContractAlloc(
     body: []const u8,
     options: QueryContractStripOptions,
 ) !?[]u8 {
-    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls and !options.strip_query_timeout) return null;
+    if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls and !options.strip_query_timeout and !options.strip_graph_metric) return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -12333,6 +12842,9 @@ fn queryBodyForGeneratedContractAlloc(
     }
     if (options.strip_query_timeout) {
         _ = parsed.value.object.orderedRemove("timeout_ms");
+    }
+    if (options.strip_graph_metric) {
+        _ = parsed.value.object.orderedRemove("graph_metric");
     }
 
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
@@ -13209,6 +13721,30 @@ fn freeNamedGraphQueries(alloc: std.mem.Allocator, items: []const db_mod.types.N
     if (items.len > 0) alloc.free(items);
 }
 
+fn freeNamedGraphMetricQueries(alloc: std.mem.Allocator, items: []const db_mod.types.NamedGraphMetricQuery) void {
+    for (items) |item| {
+        alloc.free(item.name);
+        alloc.free(item.query.index_name);
+        alloc.free(item.query.metric_name);
+    }
+    if (items.len > 0) alloc.free(items);
+}
+
+fn freeGraphMetricReads(alloc: std.mem.Allocator, metrics: []const graph_query_mod.GraphMetricRead) void {
+    for (metrics) |metric| alloc.free(metric.name);
+    if (metrics.len > 0) alloc.free(metrics);
+}
+
+fn freeGraphMetricOrders(alloc: std.mem.Allocator, orders: []const graph_query_mod.GraphMetricOrder) void {
+    for (orders) |order| alloc.free(order.name);
+    if (orders.len > 0) alloc.free(orders);
+}
+
+fn freeGraphMetricFilters(alloc: std.mem.Allocator, filters: []const graph_query_mod.GraphMetricFilter) void {
+    for (filters) |filter| alloc.free(filter.name);
+    if (filters.len > 0) alloc.free(filters);
+}
+
 pub fn freeGraphQuery(alloc: std.mem.Allocator, query: graph_query_mod.GraphQuery) void {
     alloc.free(query.index_name);
     freeGraphNodeSelector(alloc, query.start_nodes);
@@ -13226,6 +13762,9 @@ pub fn freeGraphQuery(alloc: std.mem.Allocator, query: graph_query_mod.GraphQuer
     freeGraphCountAggregates(alloc, query.aggregates);
     for (query.fields) |field| alloc.free(field);
     if (query.fields.len > 0) alloc.free(query.fields);
+    freeGraphMetricReads(alloc, query.metrics);
+    freeGraphMetricOrders(alloc, query.order_by);
+    freeGraphMetricFilters(alloc, query.where_metric);
 }
 
 fn freeGraphMatchNodes(alloc: std.mem.Allocator, nodes: []const graph_pattern_mod.MatchNode) void {
@@ -17015,6 +17554,98 @@ test "api query contract rejects invalid timeout_ms" {
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"query":{"match_all":{}},"timeout_ms":1.5}
     ));
+}
+
+test "api query contract bounds graph metric top k" {
+    const alloc = std.testing.allocator;
+    const accepted = try parseGraphMetricQueriesAlloc(alloc,
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10000}}
+    );
+    defer freeNamedGraphMetricQueries(alloc, accepted);
+    try std.testing.expectEqual(@as(usize, 1), accepted.len);
+    try std.testing.expectEqual(@as(u32, 10_000), accepted[0].query.top_k);
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
+    ));
+}
+
+test "api query contract uses portable graph metric filter operators" {
+    const cases = [_]struct { wire: []const u8, expected: graph_query_mod.GraphMetricFilterOp }{
+        .{ .wire = "gt", .expected = .gt },
+        .{ .wire = "gte", .expected = .gte },
+        .{ .wire = "lt", .expected = .lt },
+        .{ .wire = "lte", .expected = .lte },
+        .{ .wire = "eq", .expected = .eq },
+        .{ .wire = "neq", .expected = .neq },
+    };
+    for (cases) |case| {
+        const filters = [_]indexes_openapi.GraphMetricFilter{.{
+            .metric = "pagerank",
+            .op = case.wire,
+            .value = 0.5,
+        }};
+        const parsed = try parseLegacyGraphQuery(std.testing.allocator, .{
+            .type = .traverse,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .where_metric = &filters,
+        });
+        defer freeGraphQuery(std.testing.allocator, parsed);
+        try std.testing.expectEqual(case.expected, parsed.where_metric[0].op);
+    }
+
+    const legacy = [_]indexes_openapi.GraphMetricFilter{.{
+        .metric = "pagerank",
+        .op = ">=",
+        .value = 0.5,
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, parseLegacyGraphQuery(std.testing.allocator, .{
+        .type = .traverse,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .where_metric = &legacy,
+    }));
+}
+
+test "api query contract rejects oversized and duplicate graph metric clauses" {
+    var metric_names: [graph_query_mod.graph_metric_projection_limit + 1][]const u8 = undefined;
+    @memset(&metric_names, "pagerank");
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricReads(
+        std.testing.allocator,
+        &metric_names,
+        .published,
+    ));
+
+    const duplicate_metrics = [_][]const u8{ "pagerank", "pagerank" };
+    try std.testing.expectError(error.InvalidQueryRequest, parseLegacyGraphQuery(std.testing.allocator, .{
+        .type = .traverse,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .metrics = &duplicate_metrics,
+    }));
+}
+
+test "api query contract preserves graph metric fingerprint precision" {
+    const alloc = std.testing.allocator;
+    const converted = try toOpenApiGraphMetricStatus(alloc, .{
+        .name = @constCast("pagerank"),
+        .config_fingerprint = std.math.maxInt(u64),
+    });
+    defer alloc.free(converted.config_fingerprint.?);
+    try std.testing.expectEqualStrings("ffffffffffffffff", converted.config_fingerprint.?);
+}
+
+test "api query contract treats nullable graph metric extensions as absent" {
+    const alloc = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(alloc, null, "docs",
+        \\{"full_text_search":{"match":"needle","field":"body"},"graph_metric":null,"graph_metric_rerank":null}
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.req.full_text != null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.req.graph_metric_queries.len);
+    try std.testing.expect(parsed.req.graph_metric_rerank == null);
 }
 
 test "api query contract rejects legacy native doc id constraint fields" {

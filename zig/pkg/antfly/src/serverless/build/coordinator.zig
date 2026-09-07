@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const catalog_service = @import("../catalog/service.zig");
 
 pub const PublishRunStats = struct {
@@ -57,11 +58,17 @@ pub const BackgroundPublisher = struct {
     }
 
     pub fn runOnce(self: *BackgroundPublisher) !PublishRunStats {
+        return try self.runOnceWithCancellation(.none);
+    }
+
+    pub fn runOnceWithCancellation(self: *BackgroundPublisher, cancellation: CancellationToken) !PublishRunStats {
+        try cancellation.check();
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         var stats = PublishRunStats{};
         for (namespaces) |namespace| {
+            try cancellation.check();
             var status = self.catalog.buildStatus(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => {
                     stats.idle_namespaces += 1;
@@ -75,7 +82,7 @@ pub const BackgroundPublisher = struct {
                 continue;
             }
 
-            var result = self.catalog.buildNamespace(namespace.name) catch |err| switch (err) {
+            var result = self.catalog.buildNamespaceWithCancellation(namespace.name, cancellation) catch |err| switch (err) {
                 error.HeadChanged => {
                     stats.head_conflicts += 1;
                     continue;
@@ -101,8 +108,9 @@ pub const BackgroundPublisher = struct {
     }
 
     fn runLoop(self: *BackgroundPublisher) void {
+        const cancellation = CancellationToken.fromAtomic(&self.stop_requested);
         while (!self.stop_requested.load(.monotonic)) {
-            _ = self.runOnce() catch PublishRunStats{};
+            _ = self.runOnceWithCancellation(cancellation) catch PublishRunStats{};
             sleepMs(@max(self.poll_interval_ms, 1));
         }
     }

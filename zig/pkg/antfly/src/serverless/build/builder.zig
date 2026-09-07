@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
@@ -26,11 +27,15 @@ const search_sources = @import("../search_sources.zig");
 const catalog_types = @import("../catalog/types.zig");
 const document_segment_mod = @import("../document_segment/mod.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
+const graph_metric_segment_mod = @import("../graph_metric_segment/mod.zig");
 const segment_mod = @import("../segment/mod.zig");
 const text_segment_mod = @import("../text_segment/mod.zig");
 const sparse_segment_mod = @import("../sparse_segment/mod.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("vector_index.zig");
+const graph_metric_config = @import("graph_metric_config.zig");
+const graph_metric_policy = @import("graph_metric_policy.zig");
+const lake_graph_metric = @import("lake_graph_metric.zig");
 const publication_plan = @import("publication_plan.zig");
 const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_publication = @import("external_source_publication.zig");
@@ -92,6 +97,8 @@ pub const Builder = struct {
     manifests: *manifest_mod.ManifestStore,
     progress: *catalog_mod.ProgressStore,
     wal: *wal_mod.WalStore,
+    io: ?std.Io = null,
+    graph_metric_max_parallelism: usize = lake_graph_metric.default_compute_parallelism,
 
     const CurrentHeadManifest = struct {
         progress_version: u64 = 0,
@@ -118,6 +125,22 @@ pub const Builder = struct {
             .progress = progress,
             .wal = wal,
         };
+    }
+
+    pub fn setIo(self: *Builder, io: ?std.Io) void {
+        self.io = io;
+    }
+
+    pub fn setGraphMetricMaxParallelism(self: *Builder, max_parallelism: usize) !void {
+        if (max_parallelism == 0 or max_parallelism > lake_graph_metric.max_compute_parallelism) return error.InvalidGraphMetricBuildOptions;
+        self.graph_metric_max_parallelism = max_parallelism;
+    }
+
+    fn realtimeNs(self: *const Builder) u64 {
+        if (self.io) |io| return @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        return @intCast(std.Io.Timestamp.now(io_impl.io(), .real).toNanoseconds());
     }
 
     fn loadCurrentHeadManifestAlloc(self: *Builder, namespace: []const u8) !CurrentHeadManifest {
@@ -231,6 +254,17 @@ pub const Builder = struct {
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
     ) !BuildResult {
+        return try self.publishNamespaceWithMetricAndPlanWithCancellation(namespace, vector_metric, plan, .none);
+    }
+
+    pub fn publishNamespaceWithMetricAndPlanWithCancellation(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        cancellation: CancellationToken,
+    ) !BuildResult {
+        try cancellation.check();
         const targets = plan.targets;
         var head = try self.loadCurrentHeadManifestAlloc(namespace);
         defer head.deinit(self.alloc);
@@ -256,7 +290,7 @@ pub const Builder = struct {
                 return try self.publishExternalManifestWithoutWal(namespace, current_head, next_version, start_lsn, plan);
             }
             if (current_head != 0 and plan.forceRepublishFromHead()) {
-                return try self.republishHeadWithPlan(namespace, current_head, vector_metric, plan);
+                return try self.republishHeadWithPlan(namespace, current_head, vector_metric, plan, cancellation);
             }
             return .{
                 .namespace = try self.alloc.dupe(u8, namespace),
@@ -359,9 +393,22 @@ pub const Builder = struct {
             targets.include_graph,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
+        const graph_metric_specs = if (targets.include_graph)
+            try graph_metric_config.parseIndexSpecsAlloc(self.alloc, plan.table_definition.indexes_json)
+        else
+            try self.alloc.alloc(graph_metric_config.IndexSpec, 0);
+        defer graph_metric_config.freeIndexSpecs(self.alloc, graph_metric_specs);
+        const built_at_ns = records[records.len - 1].timestamp_ns;
+        const graph_metric_refs = try buildGraphMetricArtifactRefsAlloc(self.alloc, self.artifacts, current_manifest, graph_refs, graph_metric_specs, cancellation, .{
+            .published_generation = next_version,
+            .edge_generation = next_version,
+            .computed_at_ms = @divTrunc(self.realtimeNs(), std.time.ns_per_ms),
+        }, self.io, self.graph_metric_max_parallelism);
+        defer freeArtifactRefs(self.alloc, graph_metric_refs);
+        const published_graph_refs = try concatArtifactRefSlicesAlloc(self.alloc, graph_refs, graph_metric_refs);
+        defer self.alloc.free(published_graph_refs);
 
         const wal_end_lsn = records[records.len - 1].lsn;
-        const built_at_ns = records[records.len - 1].timestamp_ns;
         var derived_outputs = try detectMaterializedDerivedOutputsAlloc(
             self.alloc,
             materialized.documents,
@@ -391,7 +438,7 @@ pub const Builder = struct {
                 text_refs,
                 sparse_refs,
                 vector_refs,
-                graph_refs,
+                published_graph_refs,
                 derived_outputs,
                 plan.policy,
                 plan.table_definition,
@@ -412,7 +459,7 @@ pub const Builder = struct {
                 text_refs,
                 sparse_refs,
                 vector_refs,
-                graph_refs,
+                published_graph_refs,
                 derived_outputs,
                 plan.policy,
                 plan.table_definition,
@@ -480,7 +527,7 @@ pub const Builder = struct {
         return try self.republishHeadWithPlan(namespace, current_head, vector_metric, .{
             .targets = targets,
             .metadata_republish = .{ .published_search_sources_changed = true },
-        });
+        }, .none);
     }
 
     fn republishHeadWithPlan(
@@ -489,7 +536,9 @@ pub const Builder = struct {
         current_head: u64,
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
+        cancellation: CancellationToken,
     ) !BuildResult {
+        try cancellation.check();
         const targets = plan.targets;
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
@@ -596,6 +645,20 @@ pub const Builder = struct {
             targets.include_graph,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
+        const graph_metric_specs = if (targets.include_graph)
+            try graph_metric_config.parseIndexSpecsAlloc(self.alloc, plan.table_definition.indexes_json)
+        else
+            try self.alloc.alloc(graph_metric_config.IndexSpec, 0);
+        defer graph_metric_config.freeIndexSpecs(self.alloc, graph_metric_specs);
+        const next_version = current_head + 1;
+        const graph_metric_refs = try buildGraphMetricArtifactRefsAlloc(self.alloc, self.artifacts, current, graph_refs, graph_metric_specs, cancellation, .{
+            .published_generation = next_version,
+            .edge_generation = next_version,
+            .computed_at_ms = @divTrunc(self.realtimeNs(), std.time.ns_per_ms),
+        }, self.io, self.graph_metric_max_parallelism);
+        defer freeArtifactRefs(self.alloc, graph_metric_refs);
+        const published_graph_refs = try concatArtifactRefSlicesAlloc(self.alloc, graph_refs, graph_metric_refs);
+        defer self.alloc.free(published_graph_refs);
 
         var scanned_derived_outputs: ?search_sources.MaterializedDerivedOutputs = null;
         defer if (scanned_derived_outputs) |*outputs| search_sources.deinitMaterializedDerivedOutputs(self.alloc, outputs);
@@ -624,7 +687,6 @@ pub const Builder = struct {
         );
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
 
-        const next_version = current_head + 1;
         var manifest = try buildCompactedManifestFromRefsAlloc(
             self.alloc,
             namespace,
@@ -640,7 +702,7 @@ pub const Builder = struct {
             text_refs,
             sparse_refs,
             vector_refs,
-            graph_refs,
+            published_graph_refs,
             derived_outputs,
             plan.policy,
             plan.table_definition,
@@ -873,8 +935,8 @@ fn buildManifestAlloc(
     const text_count: usize = text_refs.len;
     const sparse_count: usize = sparse_refs.len;
     const vector_count: usize = vector_refs.len;
-    const graph_count: usize = graph_refs.len;
-    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 2 + text_count + sparse_count + vector_count + graph_count);
+    const graph_count: usize = countArtifactRefsByKind(graph_refs, .graph_segment);
+    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 2 + text_count + sparse_count + vector_count + graph_refs.len);
     errdefer alloc.free(artifacts);
     artifacts[0] = .{
         .kind = .mutation_segment,
@@ -1052,8 +1114,8 @@ fn buildRebasedManifestFromRefsAlloc(
     const text_count: usize = text_refs.len;
     const sparse_count: usize = sparse_refs.len;
     const vector_count: usize = vector_refs.len;
-    const graph_count: usize = graph_refs.len;
-    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 1 + text_count + sparse_count + vector_count + graph_count);
+    const graph_count: usize = countArtifactRefsByKind(graph_refs, .graph_segment);
+    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 1 + text_count + sparse_count + vector_count + graph_refs.len);
     errdefer alloc.free(artifacts);
     artifacts[0] = try cloneArtifactRefAlloc(alloc, document_ref);
     var artifact_index: usize = 1;
@@ -1137,8 +1199,8 @@ fn buildCompactedManifestFromRefsAlloc(
     const text_count: usize = text_refs.len;
     const sparse_count: usize = sparse_refs.len;
     const vector_count: usize = vector_refs.len;
-    const graph_count: usize = graph_refs.len;
-    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 1 + text_count + sparse_count + vector_count + graph_count);
+    const graph_count: usize = countArtifactRefsByKind(graph_refs, .graph_segment);
+    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 1 + text_count + sparse_count + vector_count + graph_refs.len);
     errdefer alloc.free(artifacts);
     artifacts[0] = try cloneArtifactRefAlloc(alloc, document_ref);
     var artifact_index: usize = 1;
@@ -2249,6 +2311,14 @@ pub fn countArtifactsByKind(manifest: manifest_mod.Manifest, kind: manifest_mod.
     return count;
 }
 
+fn countArtifactRefsByKind(refs: []const manifest_mod.ArtifactRef, kind: manifest_mod.ArtifactKind) usize {
+    var count: usize = 0;
+    for (refs) |artifact| if (artifact.kind == kind) {
+        count += 1;
+    };
+    return count;
+}
+
 pub const VectorArtifactInfo = struct {
     metric: shared_vector.DistanceMetric = shared_vector.default_distance_metric,
     cluster_count: usize = 0,
@@ -2409,6 +2479,20 @@ pub fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_mod.ArtifactRe
         .artifact_id = try alloc.dupe(u8, artifact.artifact_id),
         .byte_len = artifact.byte_len,
         .checksum = try alloc.dupe(u8, artifact.checksum),
+        .metadata_version = artifact.metadata_version,
+        .published_generation = artifact.published_generation,
+        .edge_generation = artifact.edge_generation,
+        .computed_at_ms = artifact.computed_at_ms,
+        .materializer_fingerprint = artifact.materializer_fingerprint,
+        .graph_metric_control_len = artifact.graph_metric_control_len,
+        .graph_metric_routing_footer_len = artifact.graph_metric_routing_footer_len,
+        .graph_metric_control_checksum = artifact.graph_metric_control_checksum,
+        .graph_metric_routing_checksum = artifact.graph_metric_routing_checksum,
+        .graph_metric_point_index_checksum = artifact.graph_metric_point_index_checksum,
+        .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
+        .graph_metric_source_checksum = artifact.graph_metric_source_checksum,
+        .graph_metric_materialization_state = artifact.graph_metric_materialization_state,
+        .graph_metric_rejection_reason = artifact.graph_metric_rejection_reason,
     };
 }
 
@@ -3363,6 +3447,338 @@ fn cloneNamedArtifactRefAlloc(
         }
     }
     return null;
+}
+
+fn concatArtifactRefSlicesAlloc(
+    alloc: Allocator,
+    first: []const manifest_mod.ArtifactRef,
+    second: []const manifest_mod.ArtifactRef,
+) ![]manifest_mod.ArtifactRef {
+    const total = std.math.add(usize, first.len, second.len) catch return error.OutOfMemory;
+    const refs = try alloc.alloc(manifest_mod.ArtifactRef, total);
+    @memcpy(refs[0..first.len], first);
+    @memcpy(refs[first.len..], second);
+    return refs;
+}
+
+fn findArtifactRefByName(
+    refs: []const manifest_mod.ArtifactRef,
+    kind: manifest_mod.ArtifactKind,
+    name: []const u8,
+) ?manifest_mod.ArtifactRef {
+    for (refs) |ref| if (ref.kind == kind and std.mem.eql(u8, ref.name, name)) return ref;
+    if (refs.len == 1 and refs[0].kind == kind) return refs[0];
+    return null;
+}
+
+fn stampGraphTopologyGenerationsAlloc(
+    alloc: Allocator,
+    graph_refs: []manifest_mod.ArtifactRef,
+    current: ?manifest_mod.Manifest,
+    previous_specs: []const graph_metric_config.IndexSpec,
+    next_generation: u64,
+) !void {
+    for (graph_refs) |*graph_ref| {
+        graph_ref.edge_generation = next_generation;
+        const manifest = current orelse continue;
+        const previous_graph = findArtifactRefByName(manifest.artifacts, .graph_segment, graph_ref.name) orelse continue;
+        if (!artifactRefsIdentifySamePayload(previous_graph, graph_ref.*)) continue;
+
+        if (previous_graph.edge_generation != 0) {
+            graph_ref.edge_generation = previous_graph.edge_generation;
+            continue;
+        }
+
+        // Pre-provenance manifests did not stamp graph artifacts. Recover the
+        // topology generation from any metric already bound to this graph so a
+        // newly configured sibling receives the same snapshot identity.
+        var inferred_generation: ?u64 = null;
+        for (previous_specs) |spec| {
+            if (!std.mem.eql(u8, spec.index_name, graph_ref.name)) continue;
+            for (spec.configs) |config| {
+                const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
+                defer alloc.free(artifact_name);
+                const metric_index = findNamedArtifactIndex(manifest, .graph_metric_segment, artifact_name) orelse continue;
+                const candidate = manifest.artifacts[metric_index].edge_generation;
+                if (candidate == 0) continue;
+                inferred_generation = if (inferred_generation) |existing| @min(existing, candidate) else candidate;
+            }
+        }
+        graph_ref.edge_generation = inferred_generation orelse manifest.version;
+    }
+}
+
+fn buildGraphMetricArtifactRefsAlloc(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    graph_refs: []manifest_mod.ArtifactRef,
+    specs: []const graph_metric_config.IndexSpec,
+    cancellation: CancellationToken,
+    provenance: lake_graph_metric.Provenance,
+    io: ?std.Io,
+    max_parallelism: usize,
+) ![]manifest_mod.ArtifactRef {
+    var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
+    errdefer {
+        for (refs.items) |ref| freeArtifactRef(alloc, ref);
+        refs.deinit(alloc);
+    }
+
+    const previous_specs = if (current) |manifest|
+        graph_metric_config.parseIndexSpecsAlloc(alloc, manifest.stats.indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => try alloc.alloc(graph_metric_config.IndexSpec, 0),
+        }
+    else
+        try alloc.alloc(graph_metric_config.IndexSpec, 0);
+    defer graph_metric_config.freeIndexSpecs(alloc, previous_specs);
+
+    // Metric-bearing publications pin a shared topology generation.
+    if (specs.len > 0) {
+        try stampGraphTopologyGenerationsAlloc(alloc, graph_refs, current, previous_specs, provenance.edge_generation);
+    }
+
+    const graph_metric_limits = lake_graph_metric.Limits{};
+    var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
+    // Named graph indexes produced from materialized documents intentionally
+    // alias one content-addressed topology payload. Keep a single authenticated
+    // decode hot across those aliases; replacing it rather than accumulating a
+    // map preserves O(one graph) peak memory for external/mixed callers too.
+    var prepared_graph: ?lake_graph_metric.PreparedGraphArtifact = null;
+    defer if (prepared_graph) |*prepared| prepared.deinit(alloc);
+    for (specs) |spec| {
+        try cancellation.check();
+        const graph_ref = findArtifactRefByName(graph_refs, .graph_segment, spec.index_name) orelse continue;
+        const topology_unchanged = if (current) |manifest| topology: {
+            const previous_graph_ref = findArtifactRefByName(manifest.artifacts, .graph_segment, spec.index_name) orelse break :topology false;
+            break :topology artifactRefsIdentifySamePayload(previous_graph_ref, graph_ref);
+        } else false;
+        var effective_provenance = provenance;
+        effective_provenance.edge_generation = graph_ref.edge_generation;
+
+        // Resolve every configured metric independently. A missing or stale
+        // sibling must not consume rebuild budget or replace a healthy metric
+        // with a rejection sidecar. Dirty metrics remain batched so compatible
+        // HITS authority/hub pairs still share one computation.
+        const resolved = try alloc.alloc(?manifest_mod.ArtifactRef, spec.configs.len);
+        defer alloc.free(resolved);
+        @memset(resolved, null);
+        errdefer for (resolved) |maybe_ref| if (maybe_ref) |ref| freeArtifactRef(alloc, ref);
+
+        var dirty_configs = std.ArrayListUnmanaged(@import("../../graph/graph.zig").GraphMetricConfig).empty;
+        defer dirty_configs.deinit(alloc);
+        var dirty_indexes = std.ArrayListUnmanaged(usize).empty;
+        defer dirty_indexes.deinit(alloc);
+
+        for (spec.configs, 0..) |config, config_index| {
+            const previous_config = findGraphMetricConfig(previous_specs, spec.index_name, config.name);
+            const config_unchanged = previous_config != null and
+                lake_graph_metric.configFingerprint(previous_config.?) == lake_graph_metric.configFingerprint(config);
+            var reused = false;
+            if (topology_unchanged and config_unchanged) {
+                if (current) |manifest| {
+                    const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
+                    defer alloc.free(artifact_name);
+                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, artifact_name)) |metric_index| {
+                        const metric_ref = manifest.artifacts[metric_index];
+                        if (try graphMetricArtifactReusable(alloc, artifacts, metric_ref, config, graph_ref, cancellation)) {
+                            var cloned = try cloneArtifactRefAlloc(alloc, metric_ref);
+                            if (cloned.published_generation == 0) cloned.published_generation = effective_provenance.published_generation;
+                            if (cloned.edge_generation == 0) cloned.edge_generation = effective_provenance.edge_generation;
+                            if (cloned.computed_at_ms == 0) cloned.computed_at_ms = effective_provenance.computed_at_ms;
+                            if (cloned.materializer_fingerprint == 0) cloned.materializer_fingerprint = lake_graph_metric.materializerFingerprint(.{});
+                            resolved[config_index] = cloned;
+                            reused = true;
+                        }
+                    }
+                }
+            }
+            if (!reused) {
+                try dirty_configs.append(alloc, config);
+                try dirty_indexes.append(alloc, config_index);
+            }
+        }
+
+        if (dirty_configs.items.len == 0) {
+            try refs.ensureUnusedCapacity(alloc, resolved.len);
+            for (resolved) |*maybe_ref| {
+                refs.appendAssumeCapacity(maybe_ref.*.?);
+                maybe_ref.* = null;
+            }
+            continue;
+        }
+
+        const built = build: {
+            graph_metric_budget.chargeGraphPayload(graph_ref.artifact_id, graph_ref.checksum, graph_ref.byte_len) catch break :build try lake_graph_metric.publishRejectedManyAlloc(
+                alloc,
+                artifacts,
+                spec.index_name,
+                graph_ref,
+                dirty_configs.items,
+                cancellation,
+                .build_budget_exceeded,
+                graph_metric_limits,
+                effective_provenance,
+            );
+            if (prepared_graph == null or !prepared_graph.?.identifies(graph_ref)) {
+                if (prepared_graph) |*prepared| prepared.deinit(alloc);
+                prepared_graph = null;
+                prepared_graph = lake_graph_metric.prepareGraphArtifactAlloc(
+                    alloc,
+                    artifacts,
+                    graph_ref,
+                    cancellation,
+                    graph_metric_limits,
+                ) catch |err| switch (err) {
+                    error.GraphMetricBuildBudgetExceeded => break :build try lake_graph_metric.publishRejectedManyAlloc(
+                        alloc,
+                        artifacts,
+                        spec.index_name,
+                        graph_ref,
+                        dirty_configs.items,
+                        cancellation,
+                        .build_budget_exceeded,
+                        graph_metric_limits,
+                        effective_provenance,
+                    ),
+                    else => return err,
+                };
+            }
+            const prior_metrics = try alloc.alloc(?manifest_mod.ArtifactRef, dirty_configs.items.len);
+            defer alloc.free(prior_metrics);
+            @memset(prior_metrics, null);
+            if (current) |manifest| {
+                for (dirty_configs.items, 0..) |config, i| {
+                    const name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
+                    defer alloc.free(name);
+                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, name)) |index|
+                        prior_metrics[i] = manifest.artifacts[index];
+                }
+            }
+            break :build lake_graph_metric.publishManyFromPreparedGraphWithWarmStartsAlloc(
+                alloc,
+                artifacts,
+                spec.index_name,
+                graph_ref,
+                dirty_configs.items,
+                prior_metrics,
+                cancellation,
+                graph_metric_limits,
+                &graph_metric_budget,
+                &prepared_graph.?,
+                effective_provenance,
+                .{
+                    .io = io,
+                    .max_parallelism = if (io == null) 1 else max_parallelism,
+                },
+            ) catch |err| switch (err) {
+                error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
+                    alloc,
+                    artifacts,
+                    spec.index_name,
+                    graph_ref,
+                    dirty_configs.items,
+                    cancellation,
+                    .build_budget_exceeded,
+                    graph_metric_limits,
+                    effective_provenance,
+                ),
+                else => return err,
+            };
+        };
+        var built_refs_moved: usize = 0;
+        defer {
+            for (built[built_refs_moved..]) |ref| lake_graph_metric.freeArtifactRef(alloc, ref);
+            alloc.free(built);
+        }
+        for (built, dirty_indexes.items) |*ref, config_index| {
+            if (topology_unchanged) {
+                if (current) |manifest| {
+                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, ref.name)) |metric_index| {
+                        const previous_metric = manifest.artifacts[metric_index];
+                        // edge_generation identifies the topology snapshot,
+                        // not the metric configuration. Config-only rebuilds
+                        // therefore retain it while advancing publication and
+                        // computation provenance.
+                        if (previous_metric.edge_generation != 0) ref.edge_generation = previous_metric.edge_generation;
+                        const previous_config = findGraphMetricConfig(previous_specs, spec.index_name, spec.configs[config_index].name);
+                        const config_unchanged = previous_config != null and
+                            lake_graph_metric.configFingerprint(previous_config.?) == lake_graph_metric.configFingerprint(spec.configs[config_index]);
+                        if (config_unchanged) {
+                            if (previous_metric.published_generation != 0) ref.published_generation = previous_metric.published_generation;
+                            if (previous_metric.computed_at_ms != 0) ref.computed_at_ms = previous_metric.computed_at_ms;
+                        }
+                    }
+                }
+            }
+            resolved[config_index] = ref.*;
+            built_refs_moved += 1;
+        }
+        try refs.ensureUnusedCapacity(alloc, resolved.len);
+        for (resolved) |*maybe_ref| {
+            refs.appendAssumeCapacity(maybe_ref.*.?);
+            maybe_ref.* = null;
+        }
+    }
+    return try refs.toOwnedSlice(alloc);
+}
+
+fn findGraphMetricConfig(
+    specs: []const graph_metric_config.IndexSpec,
+    index_name: []const u8,
+    metric_name: []const u8,
+) ?@import("../../graph/graph.zig").GraphMetricConfig {
+    for (specs) |spec| {
+        if (!std.mem.eql(u8, spec.index_name, index_name)) continue;
+        for (spec.configs) |config| if (std.mem.eql(u8, config.name, metric_name)) return config;
+    }
+    return null;
+}
+
+fn artifactRefsIdentifySamePayload(lhs: manifest_mod.ArtifactRef, rhs: manifest_mod.ArtifactRef) bool {
+    return lhs.byte_len == rhs.byte_len and
+        std.mem.eql(u8, lhs.artifact_id, rhs.artifact_id) and
+        std.mem.eql(u8, lhs.checksum, rhs.checksum);
+}
+
+fn graphMetricArtifactReusable(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    ref: manifest_mod.ArtifactRef,
+    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    graph_ref: manifest_mod.ArtifactRef,
+    cancellation: CancellationToken,
+) !bool {
+    artifacts.verifyContentWithCancellationUsingAllocator(alloc, ref.artifact_id, ref.byte_len, ref.checksum, cancellation) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId, error.ArtifactIntegrityMismatch => return false,
+        else => return err,
+    };
+    const prefix_len = try graph_metric_segment_mod.headerProbeLen(
+        ref.byte_len,
+        graph_ref.artifact_id,
+        graph_ref.checksum,
+    );
+    const prefix = artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        ref.artifact_id,
+        ref.byte_len,
+        ref.checksum,
+        0,
+        prefix_len,
+        cancellation,
+    ) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidArtifactId, error.InvalidRange => return false,
+        error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return false,
+        else => return err,
+    };
+    defer alloc.free(prefix);
+    const header = graph_metric_segment_mod.decodeHeader(prefix) catch return false;
+    return header.kind == config.kind and
+        header.config_fingerprint == lake_graph_metric.configFingerprint(config) and
+        header.materializer_fingerprint == lake_graph_metric.materializerFingerprint(.{}) and
+        std.mem.eql(u8, header.source_graph_artifact_id, graph_ref.artifact_id) and
+        std.mem.eql(u8, header.source_graph_checksum, graph_ref.checksum);
 }
 
 fn namedArtifactActionForName(
@@ -5253,6 +5669,260 @@ test "builder publishes named graph segments for graph indexes" {
         manifest.artifacts[graph_a_index].artifact_id,
         manifest.artifacts[graph_b_index].artifact_id,
     );
+}
+
+test "serverless builder warm starts changed graphs and cold starts when prior scores disappear" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-graph-metric-seed");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-graph-metric-seed");
+    const wal_root = tmpPath(&wal_root_buf, "wal-graph-metric-seed");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    const plan = publication_plan.TablePublicationPlan{
+        .targets = .{
+            .published_search_sources = search_sources.defaultPublishedSearchSources(),
+            .include_graph = true,
+        },
+        .table_definition = .{ .indexes_json = @constCast(
+            \\{"graph_idx":{"type":"graph","metrics":{"rank":{"kind":"pagerank","max_iterations":1}}}}
+        ) },
+    };
+    var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    const metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "rank");
+    defer alloc.free(metric_name);
+    for ([_][]const u8{ "doc-a", "doc-c", "doc-d" }, 0..) |node, round| {
+        const mutation = try api_codec.encodeMutationAlloc(alloc, .{
+            .kind = .upsert,
+            .doc_id = node,
+            .body =
+            \\{"graph_edges":[{"target":"doc-b","edge_type":"cites"}]}
+            ,
+        });
+        defer alloc.free(mutation);
+        _ = try wal_store.append("docs", @intCast(100 * (round + 1)), mutation);
+        var result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+        defer result.deinit(alloc);
+        try std.testing.expect(result.published);
+        var runtime = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+        defer runtime.deinit();
+        var session = try runtime.openHeadSession("docs");
+        defer session.deinit();
+        var top = try query_mod.graphMetricTopAlloc(alloc, &session, "graph_idx", "rank", 10);
+        defer top.deinit(alloc);
+        try std.testing.expectEqual(round + 2, top.scores.len);
+        try std.testing.expectEqualStrings("doc-b", top.scores[0].node_id);
+        // One iteration makes use of the prior seed observable. Round 1 maps
+        // [0.2875, 0.7125] onto [a, b, c], giving c zero initial mass.
+        const expected_top: f64 = switch (round) {
+            0 => 0.7125,
+            1 => 0.49625,
+            else => 0.728125,
+        };
+        try std.testing.expectApproxEqAbs(expected_top, top.scores[0].value, 0.0000001);
+        if (round == 1) {
+            var manifest = try manifest_store.getAlloc("docs", 2);
+            defer manifest.deinit(alloc);
+            const prior = manifest.artifacts[findNamedArtifactIndex(manifest, .graph_metric_segment, metric_name).?];
+            // Missing optional acceleration cannot block the next authoritative
+            // graph publication; round 2 must use the four-node cold seed.
+            try artifact_store.delete(prior.artifact_id);
+        }
+    }
+}
+
+test "serverless builder publishes and lifecycle-binds configured graph metrics" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-graph-metric-lifecycle");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-graph-metric-lifecycle");
+    const wal_root = tmpPath(&wal_root_buf, "wal-graph-metric-lifecycle");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    const indexes_json = try alloc.dupe(u8,
+        \\{"graph_idx":{"type":"graph","metrics":{"degree":{"kind":"degree"},"rank":{"kind":"pagerank","max_iterations":20}}}}
+    );
+    defer alloc.free(indexes_json);
+    const plan = publication_plan.TablePublicationPlan{
+        .targets = .{
+            .published_search_sources = search_sources.defaultPublishedSearchSources(),
+            .include_graph = true,
+        },
+        .table_definition = .{ .indexes_json = indexes_json },
+    };
+    var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+
+    const first_mutation = try api_codec.encodeMutationAlloc(alloc, .{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"one\",\"graph_edges\":[{\"target\":\"doc-b\",\"edge_type\":\"cites\"}]}",
+    });
+    defer alloc.free(first_mutation);
+    _ = try wal_store.append("docs", 100, first_mutation);
+    var first_result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer first_result.deinit(alloc);
+    var first = try manifest_store.getAlloc("docs", 1);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), first.stats.graph_segment_count);
+    const metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "rank");
+    defer alloc.free(metric_name);
+    const degree_metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "degree");
+    defer alloc.free(degree_metric_name);
+    const first_graph = first.artifacts[findNamedArtifactIndex(first, .graph_segment, "graph_idx").?];
+    const first_metric = first.artifacts[findNamedArtifactIndex(first, .graph_metric_segment, metric_name).?];
+    try std.testing.expectEqual(@as(u64, 1), first_graph.edge_generation);
+    try std.testing.expectEqual(graph_metric_segment_mod.wire_version, first_metric.metadata_version);
+    try std.testing.expectEqual(@as(u64, 1), first_metric.published_generation);
+    try std.testing.expectEqual(@as(u64, 1), first_metric.edge_generation);
+    try std.testing.expectEqual(lake_graph_metric.materializerFingerprint(.{}), first_metric.materializer_fingerprint);
+    try std.testing.expect(findNamedArtifactIndex(first, .graph_metric_segment, degree_metric_name) != null);
+    try artifact_store.delete(first_metric.artifact_id);
+
+    const unchanged_graph_mutation = try api_codec.encodeMutationAlloc(alloc, .{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"two\",\"graph_edges\":[{\"target\":\"doc-b\",\"edge_type\":\"cites\"}]}",
+    });
+    defer alloc.free(unchanged_graph_mutation);
+    _ = try wal_store.append("docs", 200, unchanged_graph_mutation);
+    var second_result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer second_result.deinit(alloc);
+    var second = try manifest_store.getAlloc("docs", 2);
+    defer second.deinit(alloc);
+    const second_graph = second.artifacts[findNamedArtifactIndex(second, .graph_segment, "graph_idx").?];
+    const second_metric = second.artifacts[findNamedArtifactIndex(second, .graph_metric_segment, metric_name).?];
+    try std.testing.expectEqualStrings(first_graph.artifact_id, second_graph.artifact_id);
+    try std.testing.expectEqual(first_graph.edge_generation, second_graph.edge_generation);
+    try std.testing.expectEqualStrings(first_metric.artifact_id, second_metric.artifact_id);
+    try std.testing.expectEqual(first_metric.metadata_version, second_metric.metadata_version);
+    try std.testing.expectEqual(first_metric.published_generation, second_metric.published_generation);
+    try std.testing.expectEqual(first_metric.edge_generation, second_metric.edge_generation);
+    try std.testing.expectEqual(first_metric.computed_at_ms, second_metric.computed_at_ms);
+    var restored_metric = try artifact_store.stat(second_metric.artifact_id);
+    restored_metric.deinit(alloc);
+
+    const changed_graph_mutation = try api_codec.encodeMutationAlloc(alloc, .{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"three\",\"graph_edges\":[{\"target\":\"doc-c\",\"edge_type\":\"cites\"}]}",
+    });
+    defer alloc.free(changed_graph_mutation);
+    _ = try wal_store.append("docs", 300, changed_graph_mutation);
+    var third_result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer third_result.deinit(alloc);
+    var third = try manifest_store.getAlloc("docs", 3);
+    defer third.deinit(alloc);
+    const third_graph = third.artifacts[findNamedArtifactIndex(third, .graph_segment, "graph_idx").?];
+    const third_metric = third.artifacts[findNamedArtifactIndex(third, .graph_metric_segment, metric_name).?];
+    const third_degree_metric = third.artifacts[findNamedArtifactIndex(third, .graph_metric_segment, degree_metric_name).?];
+    try std.testing.expect(!std.mem.eql(u8, second_graph.artifact_id, third_graph.artifact_id));
+    try std.testing.expectEqual(@as(u64, 3), third_graph.edge_generation);
+    try std.testing.expect(!std.mem.eql(u8, second_metric.artifact_id, third_metric.artifact_id));
+    try std.testing.expectEqual(@as(u64, 3), third_metric.published_generation);
+    try std.testing.expectEqual(@as(u64, 3), third_metric.edge_generation);
+
+    var runtime = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer runtime.deinit();
+    var session = try runtime.openHeadSession("docs");
+    defer session.deinit();
+    var top = try query_mod.graphMetricTopAlloc(alloc, &session, "graph_idx", "rank", 2);
+    defer top.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), top.scores.len);
+    try std.testing.expect(top.scores[0].value >= top.scores[1].value);
+    try std.testing.expectEqual(@as(u64, 3), top.published_generation);
+
+    const payload = try artifact_store.getVerifiedAllocWithCancellationUsingAllocator(alloc, third_metric.artifact_id, third_metric.byte_len, third_metric.checksum, .none);
+    defer alloc.free(payload);
+    var decoded = try graph_metric_segment_mod.decodeAlloc(alloc, payload);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings(third_graph.artifact_id, decoded.source_graph_artifact_id);
+    try std.testing.expectEqualStrings(third_graph.checksum, decoded.source_graph_checksum);
+
+    const updated_indexes_json = try alloc.dupe(u8,
+        \\{"graph_idx":{"type":"graph","metrics":{"degree":{"kind":"degree"},"rank":{"kind":"pagerank","max_iterations":40}}}}
+    );
+    defer alloc.free(updated_indexes_json);
+    var fourth_result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, .{
+        .targets = plan.targets,
+        .table_definition = .{ .indexes_json = updated_indexes_json },
+        .metadata_republish = .{ .artifact_families_changed = true },
+        .artifact_actions = .{ .document_segment = .reuse, .full_text = .reuse, .dense_vector = .reuse, .sparse_vector = .reuse, .graph = .reuse },
+    });
+    defer fourth_result.deinit(alloc);
+    var fourth = try manifest_store.getAlloc("docs", 4);
+    defer fourth.deinit(alloc);
+    const fourth_graph = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_segment, "graph_idx").?];
+    const fourth_metric = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_metric_segment, metric_name).?];
+    const fourth_degree_metric = fourth.artifacts[findNamedArtifactIndex(fourth, .graph_metric_segment, degree_metric_name).?];
+    try std.testing.expectEqualStrings(third_graph.artifact_id, fourth_graph.artifact_id);
+    try std.testing.expectEqual(third_graph.edge_generation, fourth_graph.edge_generation);
+    try std.testing.expect(!std.mem.eql(u8, third_metric.artifact_id, fourth_metric.artifact_id));
+    try std.testing.expectEqual(@as(u64, 4), fourth_metric.published_generation);
+    try std.testing.expectEqual(third_metric.edge_generation, fourth_metric.edge_generation);
+    try std.testing.expectEqualStrings(third_degree_metric.artifact_id, fourth_degree_metric.artifact_id);
+    try std.testing.expectEqual(third_degree_metric.published_generation, fourth_degree_metric.published_generation);
+    try std.testing.expectEqual(third_degree_metric.edge_generation, fourth_degree_metric.edge_generation);
+    try std.testing.expectEqual(third_degree_metric.computed_at_ms, fourth_degree_metric.computed_at_ms);
+
+    const expanded_indexes_json = try alloc.dupe(u8,
+        \\{"graph_idx":{"type":"graph","metrics":{"degree":{"kind":"degree"},"rank":{"kind":"pagerank","max_iterations":40},"centrality":{"kind":"eigenvector"}}}}
+    );
+    defer alloc.free(expanded_indexes_json);
+    var fifth_result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, .{
+        .targets = plan.targets,
+        .table_definition = .{ .indexes_json = expanded_indexes_json },
+        .metadata_republish = .{ .artifact_families_changed = true },
+        .artifact_actions = .{ .document_segment = .reuse, .full_text = .reuse, .dense_vector = .reuse, .sparse_vector = .reuse, .graph = .reuse },
+    });
+    defer fifth_result.deinit(alloc);
+    var fifth = try manifest_store.getAlloc("docs", 5);
+    defer fifth.deinit(alloc);
+    const centrality_metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "centrality");
+    defer alloc.free(centrality_metric_name);
+    const fifth_graph = fifth.artifacts[findNamedArtifactIndex(fifth, .graph_segment, "graph_idx").?];
+    const fifth_metric = fifth.artifacts[findNamedArtifactIndex(fifth, .graph_metric_segment, metric_name).?];
+    const fifth_degree_metric = fifth.artifacts[findNamedArtifactIndex(fifth, .graph_metric_segment, degree_metric_name).?];
+    const fifth_centrality_metric = fifth.artifacts[findNamedArtifactIndex(fifth, .graph_metric_segment, centrality_metric_name).?];
+    try std.testing.expectEqualStrings(fourth_graph.artifact_id, fifth_graph.artifact_id);
+    try std.testing.expectEqual(fourth_graph.edge_generation, fifth_graph.edge_generation);
+    try std.testing.expectEqualStrings(fourth_metric.artifact_id, fifth_metric.artifact_id);
+    try std.testing.expectEqualStrings(fourth_degree_metric.artifact_id, fifth_degree_metric.artifact_id);
+    try std.testing.expectEqual(@as(u64, 5), fifth_centrality_metric.published_generation);
+    try std.testing.expectEqual(fourth_graph.edge_generation, fifth_centrality_metric.edge_generation);
 }
 
 test "builder reuses graph artifact when wal updates do not change graph projection" {

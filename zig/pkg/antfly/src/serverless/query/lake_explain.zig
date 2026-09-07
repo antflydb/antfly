@@ -353,7 +353,7 @@ fn accountArtifact(accounting: *ArtifactAccounting, artifact: artifact_ref.Artif
         .row_fragment_stats => accounting.row_fragment_stats_count += 1,
         .algebraic_segment => accounting.algebraic_segment_count += 1,
         .external_base_source => accounting.external_metadata_count += 1,
-        .text_segment, .vector_segment, .sparse_segment, .graph_segment => accounting.search_sidecar_count += 1,
+        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment => accounting.search_sidecar_count += 1,
         .doc_values, .stored_fields, .mutation_segment, .document_segment => {},
     }
 }

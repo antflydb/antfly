@@ -25,6 +25,17 @@ pub const LeaseRecord = struct {
     expires_at_ms: u64,
 };
 
+pub const AcquireResult = enum {
+    acquired,
+    renewed,
+    takeover,
+    blocked,
+
+    pub fn acquiredLease(self: AcquireResult) bool {
+        return self != .blocked;
+    }
+};
+
 pub const Lease = struct {
     allocator: Allocator,
     store: RuntimeStoreHandle,
@@ -61,6 +72,10 @@ pub const Lease = struct {
     }
 
     pub fn tryAcquire(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {
+        return (try self.tryAcquireDetailed(owner_id, now_ms, ttl_ms)).acquiredLease();
+    }
+
+    pub fn tryAcquireDetailed(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !AcquireResult {
         var txn = try self.store.store.beginWrite();
         var committed = false;
         defer if (!committed) txn.abort();
@@ -70,6 +85,7 @@ pub const Lease = struct {
             else => return err,
         };
 
+        var result: AcquireResult = .acquired;
         if (current_raw) |raw| {
             const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, raw, .{
                 .allocate = .alloc_always,
@@ -78,20 +94,21 @@ pub const Lease = struct {
 
             const current = parsed.value;
             if (current.expires_at_ms > now_ms and !std.mem.eql(u8, current.owner_id, owner_id)) {
-                return false;
+                return .blocked;
             }
+            result = if (std.mem.eql(u8, current.owner_id, owner_id)) .renewed else .takeover;
         }
 
         const payload = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
             .owner_id = owner_id,
-            .expires_at_ms = now_ms + ttl_ms,
+            .expires_at_ms = now_ms +| ttl_ms,
         }, .{});
         defer self.allocator.free(payload);
 
         try txn.put(self.key, payload);
         try txn.commit();
         committed = true;
-        return true;
+        return result;
     }
 
     pub fn renew(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {

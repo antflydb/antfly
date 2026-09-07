@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.legacy_graph_result_node import LegacyGraphResultNode
+    from ..models.legacy_graph_search_result_metric_status import LegacyGraphSearchResultMetricStatus
     from ..models.path import Path
     from ..models.pattern_match import PatternMatch
 
@@ -33,6 +34,7 @@ class LegacyGraphSearchResult:
         matches (list[PatternMatch] | Unset): Deprecated graph_searches pattern results; use rows for graph_queries.
         took (int | Unset): Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses.
             Use the parent query result's took field.
+        metric_status (LegacyGraphSearchResultMetricStatus | Unset): Graph metric status metadata keyed by metric name.
     """
 
     type_: GraphQueryType
@@ -42,6 +44,7 @@ class LegacyGraphSearchResult:
     paths: list[Path] | Unset = UNSET
     matches: list[PatternMatch] | Unset = UNSET
     took: int | Unset = UNSET
+    metric_status: LegacyGraphSearchResultMetricStatus | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         type_ = self.type_.value
@@ -75,6 +78,10 @@ class LegacyGraphSearchResult:
 
         took = self.took
 
+        metric_status: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metric_status, Unset):
+            metric_status = self.metric_status.to_dict()
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -93,12 +100,15 @@ class LegacyGraphSearchResult:
             field_dict["matches"] = matches
         if took is not UNSET:
             field_dict["took"] = took
+        if metric_status is not UNSET:
+            field_dict["metric_status"] = metric_status
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.legacy_graph_result_node import LegacyGraphResultNode
+        from ..models.legacy_graph_search_result_metric_status import LegacyGraphSearchResultMetricStatus
         from ..models.path import Path
         from ..models.pattern_match import PatternMatch
 
@@ -143,6 +153,13 @@ class LegacyGraphSearchResult:
 
         took = d.pop("took", UNSET)
 
+        _metric_status = d.pop("metric_status", UNSET)
+        metric_status: LegacyGraphSearchResultMetricStatus | Unset
+        if isinstance(_metric_status, Unset):
+            metric_status = UNSET
+        else:
+            metric_status = LegacyGraphSearchResultMetricStatus.from_dict(_metric_status)
+
         legacy_graph_search_result = cls(
             type_=type_,
             total=total,
@@ -151,6 +168,7 @@ class LegacyGraphSearchResult:
             paths=paths,
             matches=matches,
             took=took,
+            metric_status=metric_status,
         )
 
         return legacy_graph_search_result

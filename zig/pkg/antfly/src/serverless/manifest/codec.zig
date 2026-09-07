@@ -18,21 +18,15 @@ const bounded_decode = @import("../bounded_decode.zig");
 const catalog_types = @import("../catalog/types.zig");
 const manifest_base_source = @import("base_source.zig");
 const manifest_types = @import("types.zig");
+const artifact_ref = @import("artifact_ref.zig");
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
-pub const wire_version: u16 = 12;
+pub const wire_version = artifact_ref.graph_metric_manifest_wire_version;
 
-const header_size_v2 = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
-const header_size_v3 = header_size_v2 + 1 + 1;
-const header_size_v5 = header_size_v3 + 4;
-const header_size = header_size_v2 + 4 + 4;
-const header_size_v7 = header_size + 4 + 4 + 4;
 const policy_size = 98;
-const header_size_v8 = header_size_v7 + policy_size;
-const header_size_v10 = header_size_v8 + 8;
-const header_size_v11 = header_size_v10 + 1;
-const header_size_v12 = header_size_v11 + 4;
+const header_size = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 +
+    4 + 4 + 4 + 4 + 4 + policy_size + 8 + 1 + 4;
 
 fn encodePolicy(buf: []u8, policy: catalog_types.NamespacePolicy) void {
     var pos: usize = 0;
@@ -145,7 +139,9 @@ fn decodePolicy(data: []const u8, pos_ptr: *usize) !catalog_types.NamespacePolic
 }
 
 fn artifactEncodedSize(artifact: manifest_types.ArtifactRef) usize {
-    return 1 + 4 + 4 + 8 + 4 + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+    const provenance_bytes = 2 + 8 + 8 + 8 + 8;
+    const integrity_bytes: usize = if (artifact.kind == .graph_metric_segment) 4 + 4 + 32 + 32 + 32 + 8 + 32 + 1 + 1 else 0;
+    return 1 + 4 + 4 + 8 + 4 + provenance_bytes + integrity_bytes + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
 }
 
 fn publishedSearchSourceEncodedSize(source: search_sources.SearchSourceDescriptor) usize {
@@ -197,13 +193,30 @@ fn baseSourceEncodedSize(base_source: manifest_types.BaseSourceDescriptor) usize
 }
 
 pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
+    return try encodeForVersionAlloc(alloc, manifest, wire_version);
+}
+
+pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest, target_version: u16) ![]u8 {
+    if (target_version != wire_version) {
+        return error.UnsupportedManifestWriteVersion;
+    }
+    for (manifest.artifacts) |artifact| {
+        if (artifact.kind != .graph_metric_segment) continue;
+        if (artifact.metadata_version != artifact_ref.graph_metric_segment_wire_version or
+            artifact.graph_metric_control_len == 0 or artifact.graph_metric_routing_footer_len == 0 or
+            (artifact.graph_metric_materialization_state == .ready and artifact.graph_metric_rejection_reason != .none) or
+            (artifact.graph_metric_materialization_state == .rejected and artifact.graph_metric_rejection_reason == .none))
+        {
+            return error.InvalidManifest;
+        }
+    }
     const derived_output_items: []const search_sources.DerivedOutputDescriptor = manifest.stats.derived_outputs.items orelse &.{};
     const published_source_items: []const search_sources.SearchSourceDescriptor = manifest.stats.published_search_sources.items orelse &.{};
     const base_source_len: u32 = if (manifest.base_source) |base_source|
         @intCast(baseSourceEncodedSize(base_source))
     else
         0;
-    var size: usize = header_size_v12 + manifest.namespace.len +
+    var size: usize = header_size + manifest.namespace.len +
         manifest.stats.schema_json.len +
         manifest.stats.read_schema_json.len +
         manifest.stats.indexes_json.len +
@@ -218,7 +231,7 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
     var pos: usize = 0;
     @memcpy(buf[pos..][0..4], wire_magic);
     pos += 4;
-    std.mem.writeInt(u16, buf[pos..][0..2], wire_version, .little);
+    std.mem.writeInt(u16, buf[pos..][0..2], target_version, .little);
     pos += 2;
     std.mem.writeInt(u32, buf[pos..][0..4], @intCast(manifest.namespace.len), .little);
     pos += 4;
@@ -335,6 +348,36 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
         pos += 8;
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(artifact.checksum.len), .little);
         pos += 4;
+        std.mem.writeInt(u16, buf[pos..][0..2], artifact.metadata_version, .little);
+        pos += 2;
+        std.mem.writeInt(u64, buf[pos..][0..8], artifact.published_generation, .little);
+        pos += 8;
+        std.mem.writeInt(u64, buf[pos..][0..8], artifact.edge_generation, .little);
+        pos += 8;
+        std.mem.writeInt(u64, buf[pos..][0..8], artifact.computed_at_ms, .little);
+        pos += 8;
+        std.mem.writeInt(u64, buf[pos..][0..8], artifact.materializer_fingerprint, .little);
+        pos += 8;
+        if (artifact.kind == .graph_metric_segment) {
+            std.mem.writeInt(u32, buf[pos..][0..4], artifact.graph_metric_control_len, .little);
+            pos += 4;
+            std.mem.writeInt(u32, buf[pos..][0..4], artifact.graph_metric_routing_footer_len, .little);
+            pos += 4;
+            @memcpy(buf[pos..][0..32], &artifact.graph_metric_control_checksum);
+            pos += 32;
+            @memcpy(buf[pos..][0..32], &artifact.graph_metric_routing_checksum);
+            pos += 32;
+            @memcpy(buf[pos..][0..32], &artifact.graph_metric_point_index_checksum);
+            pos += 32;
+            std.mem.writeInt(u64, buf[pos..][0..8], artifact.graph_metric_config_fingerprint, .little);
+            pos += 8;
+            @memcpy(buf[pos..][0..32], &artifact.graph_metric_source_checksum);
+            pos += 32;
+            buf[pos] = @intFromEnum(artifact.graph_metric_materialization_state);
+            pos += 1;
+            buf[pos] = @intFromEnum(artifact.graph_metric_rejection_reason);
+            pos += 1;
+        }
         @memcpy(buf[pos..][0..artifact.name.len], artifact.name);
         pos += artifact.name.len;
         @memcpy(buf[pos..][0..artifact.artifact_id.len], artifact.artifact_id);
@@ -402,7 +445,7 @@ fn encodeBaseSource(buf: []u8, descriptor: manifest_types.BaseSourceDescriptor) 
 }
 
 pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest {
-    if (data.len < header_size_v2) return error.InvalidManifest;
+    if (data.len < 6) return error.InvalidManifest;
 
     var pos: usize = 0;
     if (!std.mem.eql(u8, data[pos..][0..4], wire_magic)) return error.InvalidManifest;
@@ -410,7 +453,8 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
 
     const version = std.mem.readInt(u16, data[pos..][0..2], .little);
     pos += 2;
-    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != wire_version) return error.UnsupportedManifestVersion;
+    if (version != wire_version) return error.UnsupportedManifestVersion;
+    if (data.len < header_size) return error.InvalidManifest;
 
     const namespace_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
@@ -424,12 +468,12 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
     pos += 8;
     const document_count = std.mem.readInt(u64, data[pos..][0..8], .little);
     pos += 8;
-    const document_base_version = if (version >= 10) blk: {
+    const document_base_version = blk: {
         const value = std.mem.readInt(u64, data[pos..][0..8], .little);
         pos += 8;
         break :blk value;
-    } else 0;
-    const document_publish_mode = if (version >= 11) blk: {
+    };
+    const document_publish_mode = blk: {
         const value: catalog_types.DocumentPublishMode = switch (data[pos]) {
             1 => .append_mutation_tail,
             2 => .inline_rebase,
@@ -438,10 +482,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         };
         pos += 1;
         break :blk value;
-    } else if (wal_start_lsn == wal_end_lsn)
-        catalog_types.DocumentPublishMode.inline_rebase
-    else
-        catalog_types.DocumentPublishMode.append_mutation_tail;
+    };
     const text_segment_count = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
     const vector_segment_count = std.mem.readInt(u32, data[pos..][0..4], .little);
@@ -452,58 +493,38 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
     pos += 4;
     const artifact_count = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
-    const has_vector_source = if (version >= 3 and version <= 5) blk: {
-        const value = data[pos] != 0;
-        pos += 1;
-        break :blk value;
-    } else false;
-    const has_sparse_source = if (version >= 3 and version <= 5) blk: {
-        const value = data[pos] != 0;
-        pos += 1;
-        break :blk value;
-    } else false;
-    const published_search_source_count = if (version >= 6) blk: {
+    const published_search_source_count = blk: {
         const value = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         break :blk value;
-    } else 0;
-    const has_chunk_preview_output = if (version == 4) blk: {
-        const value = data[pos] != 0;
-        pos += 1;
-        break :blk value;
-    } else false;
-    const has_rerank_terms_output = if (version == 4) blk: {
-        const value = data[pos] != 0;
-        pos += 1;
-        break :blk value;
-    } else false;
-    const derived_output_count = if (version >= 5) blk: {
+    };
+    const derived_output_count = blk: {
         const value = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         break :blk value;
-    } else 0;
-    const schema_len = if (version >= 7) blk: {
+    };
+    const schema_len = blk: {
         const value = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         break :blk value;
-    } else 0;
-    const read_schema_len = if (version >= 7) blk: {
+    };
+    const read_schema_len = blk: {
         const value = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         break :blk value;
-    } else 0;
-    const indexes_len = if (version >= 7) blk: {
+    };
+    const indexes_len = blk: {
         const value = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         break :blk value;
-    } else 0;
-    const policy = if (version >= 8) try decodePolicy(data, &pos) else catalog_types.NamespacePolicy{};
-    const base_source_len = if (version >= 12) blk: {
+    };
+    const policy = try decodePolicy(data, &pos);
+    const base_source_len = blk: {
         if (pos + 4 > data.len) return error.InvalidManifest;
         const value = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         break :blk value;
-    } else 0;
+    };
 
     if (pos + namespace_len > data.len) return error.InvalidManifest;
     const namespace = try alloc.dupe(u8, data[pos .. pos + namespace_len]);
@@ -516,91 +537,38 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
     errdefer if (read_schema_json.len > 0) alloc.free(read_schema_json);
     var indexes_json: []u8 = &.{};
     errdefer if (indexes_json.len > 0) alloc.free(indexes_json);
-    if (version >= 7) {
-        if (pos + schema_len + read_schema_len + indexes_len > data.len) return error.InvalidManifest;
-        if (schema_len > 0) schema_json = try alloc.dupe(u8, data[pos .. pos + schema_len]);
-        pos += schema_len;
-        if (read_schema_len > 0) read_schema_json = try alloc.dupe(u8, data[pos .. pos + read_schema_len]);
-        pos += read_schema_len;
-        if (indexes_len > 0) indexes_json = try alloc.dupe(u8, data[pos .. pos + indexes_len]);
-        pos += indexes_len;
-    }
+    if (pos + schema_len + read_schema_len + indexes_len > data.len) return error.InvalidManifest;
+    if (schema_len > 0) schema_json = try alloc.dupe(u8, data[pos .. pos + schema_len]);
+    pos += schema_len;
+    if (read_schema_len > 0) read_schema_json = try alloc.dupe(u8, data[pos .. pos + read_schema_len]);
+    pos += read_schema_len;
+    if (indexes_len > 0) indexes_json = try alloc.dupe(u8, data[pos .. pos + indexes_len]);
+    pos += indexes_len;
 
     var published_search_sources: search_sources.PublishedSearchSources = .{};
     errdefer search_sources.deinitPublishedSearchSources(alloc, &published_search_sources);
-    if (version >= 6) {
-        if (published_search_source_count > 0) {
-            const items = try alloc.alloc(search_sources.SearchSourceDescriptor, published_search_source_count);
-            errdefer alloc.free(items);
-            var initialized_sources: usize = 0;
-            errdefer {
-                for (items[0..initialized_sources]) |*item| search_sources.deinitSearchSourceDescriptor(alloc, item);
-            }
-            for (0..published_search_source_count) |idx| {
-                if (pos + 1 + 1 + 4 > data.len) return error.InvalidManifest;
-                const source_kind = data[pos];
-                pos += 1;
-                const kind = data[pos];
-                pos += 1;
-                const index_name_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-                pos += 4;
-                if (pos + index_name_len > data.len) return error.InvalidManifest;
-                const index_name = try alloc.dupe(u8, data[pos .. pos + index_name_len]);
-                pos += index_name_len;
-                items[idx] = switch (source_kind) {
-                    1 => .{ .vector = .{
-                        .index_name = index_name,
-                        .document_source = switch (kind) {
-                            1 => .top_level_embedding,
-                            2 => .chunk_embeddings,
-                            3 => .chunk_embeddings_or_top_level,
-                            else => return error.InvalidManifest,
-                        },
-                    } },
-                    2 => .{ .sparse = .{
-                        .index_name = index_name,
-                        .document_source = switch (kind) {
-                            1 => .sparse_embedding,
-                            else => return error.InvalidManifest,
-                        },
-                    } },
-                    3 => .{ .text = .{
-                        .index_name = index_name,
-                    } },
-                    else => return error.InvalidManifest,
-                };
-                initialized_sources += 1;
-            }
-            published_search_sources = blk: {
-                const owned = items;
-                var out = search_sources.PublishedSearchSources{ .items = owned };
-                for (owned) |item| switch (item) {
-                    .text => |value| {
-                        if (out.text == null) out.text = value;
-                    },
-                    .vector => |value| out.vector = value,
-                    .sparse => |value| out.sparse = value,
-                };
-                break :blk out;
-            };
-        }
-    } else {
-        var legacy_items = std.ArrayListUnmanaged(search_sources.SearchSourceDescriptor).empty;
+    if (published_search_source_count > 0) {
+        if (published_search_source_count > (data.len - pos) / 6) return error.InvalidManifest;
+        const items = try alloc.alloc(search_sources.SearchSourceDescriptor, published_search_source_count);
+        errdefer alloc.free(items);
+        var initialized_sources: usize = 0;
         errdefer {
-            for (legacy_items.items) |*item| search_sources.deinitSearchSourceDescriptor(alloc, item);
-            legacy_items.deinit(alloc);
+            for (items[0..initialized_sources]) |*item| search_sources.deinitSearchSourceDescriptor(alloc, item);
         }
-        if (has_vector_source) {
-            const value = blk: {
-                if (pos + 1 + 4 > data.len) return error.InvalidManifest;
-                const kind = data[pos];
-                pos += 1;
-                const index_name_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-                pos += 4;
-                if (pos + index_name_len > data.len) return error.InvalidManifest;
-                const index_name = try alloc.dupe(u8, data[pos .. pos + index_name_len]);
-                pos += index_name_len;
-                break :blk search_sources.VectorSourceDescriptor{
+        for (0..published_search_source_count) |idx| {
+            if (pos + 1 + 1 + 4 > data.len) return error.InvalidManifest;
+            const source_kind = data[pos];
+            pos += 1;
+            const kind = data[pos];
+            pos += 1;
+            const index_name_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4;
+            if (pos + index_name_len > data.len) return error.InvalidManifest;
+            const index_name = try alloc.dupe(u8, data[pos .. pos + index_name_len]);
+            errdefer alloc.free(index_name);
+            pos += index_name_len;
+            items[idx] = switch (source_kind) {
+                1 => .{ .vector = .{
                     .index_name = index_name,
                     .document_source = switch (kind) {
                         1 => .top_level_embedding,
@@ -608,32 +576,23 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
                         3 => .chunk_embeddings_or_top_level,
                         else => return error.InvalidManifest,
                     },
-                };
-            };
-            try legacy_items.append(alloc, .{ .vector = value });
-        }
-        if (has_sparse_source) {
-            const value = blk: {
-                if (pos + 1 + 4 > data.len) return error.InvalidManifest;
-                const kind = data[pos];
-                pos += 1;
-                const index_name_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-                pos += 4;
-                if (pos + index_name_len > data.len) return error.InvalidManifest;
-                const index_name = try alloc.dupe(u8, data[pos .. pos + index_name_len]);
-                pos += index_name_len;
-                break :blk search_sources.SparseSourceDescriptor{
+                } },
+                2 => .{ .sparse = .{
                     .index_name = index_name,
                     .document_source = switch (kind) {
                         1 => .sparse_embedding,
                         else => return error.InvalidManifest,
                     },
-                };
+                } },
+                3 => .{ .text = .{
+                    .index_name = index_name,
+                } },
+                else => return error.InvalidManifest,
             };
-            try legacy_items.append(alloc, .{ .sparse = value });
+            initialized_sources += 1;
         }
-        if (legacy_items.items.len > 0) {
-            const owned = try legacy_items.toOwnedSlice(alloc);
+        published_search_sources = blk: {
+            const owned = items;
             var out = search_sources.PublishedSearchSources{ .items = owned };
             for (owned) |item| switch (item) {
                 .text => |value| {
@@ -642,49 +601,21 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
                 .vector => |value| out.vector = value,
                 .sparse => |value| out.sparse = value,
             };
-            published_search_sources = out;
-        }
+            break :blk out;
+        };
     }
 
     var derived_outputs: search_sources.MaterializedDerivedOutputs = .{};
     errdefer search_sources.deinitMaterializedDerivedOutputs(alloc, &derived_outputs);
-    if (version >= 5) {
-        if (derived_output_count > 0) {
-            const items = try alloc.alloc(search_sources.DerivedOutputDescriptor, derived_output_count);
-            errdefer alloc.free(items);
-            var initialized_outputs: usize = 0;
-            errdefer {
-                for (items[0..initialized_outputs]) |*item| search_sources.deinitDerivedOutputDescriptor(alloc, item);
-            }
-            for (0..derived_output_count) |idx| {
-                if (pos + 1 + 4 > data.len) return error.InvalidManifest;
-                const kind = data[pos];
-                pos += 1;
-                const name_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-                pos += 4;
-                if (pos + name_len > data.len) return error.InvalidManifest;
-                const name = try alloc.dupe(u8, data[pos .. pos + name_len]);
-                pos += name_len;
-                items[idx] = .{
-                    .name = name,
-                    .kind = switch (kind) {
-                        1 => .chunk_preview,
-                        2 => .chunk_embeddings,
-                        3 => .rerank_terms,
-                        else => return error.InvalidManifest,
-                    },
-                };
-                initialized_outputs += 1;
-            }
-            derived_outputs = .{ .items = items };
-        }
-    } else {
-        var legacy_outputs = std.ArrayListUnmanaged(search_sources.DerivedOutputDescriptor).empty;
+    if (derived_output_count > 0) {
+        if (derived_output_count > (data.len - pos) / 5) return error.InvalidManifest;
+        const items = try alloc.alloc(search_sources.DerivedOutputDescriptor, derived_output_count);
+        errdefer alloc.free(items);
+        var initialized_outputs: usize = 0;
         errdefer {
-            for (legacy_outputs.items) |*item| search_sources.deinitDerivedOutputDescriptor(alloc, item);
-            legacy_outputs.deinit(alloc);
+            for (items[0..initialized_outputs]) |*item| search_sources.deinitDerivedOutputDescriptor(alloc, item);
         }
-        if (has_chunk_preview_output) {
+        for (0..derived_output_count) |idx| {
             if (pos + 1 + 4 > data.len) return error.InvalidManifest;
             const kind = data[pos];
             pos += 1;
@@ -692,8 +623,9 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             pos += 4;
             if (pos + name_len > data.len) return error.InvalidManifest;
             const name = try alloc.dupe(u8, data[pos .. pos + name_len]);
+            errdefer alloc.free(name);
             pos += name_len;
-            try legacy_outputs.append(alloc, .{
+            items[idx] = .{
                 .name = name,
                 .kind = switch (kind) {
                     1 => .chunk_preview,
@@ -701,34 +633,14 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
                     3 => .rerank_terms,
                     else => return error.InvalidManifest,
                 },
-            });
+            };
+            initialized_outputs += 1;
         }
-        if (has_rerank_terms_output) {
-            if (pos + 1 + 4 > data.len) return error.InvalidManifest;
-            const kind = data[pos];
-            pos += 1;
-            const name_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-            pos += 4;
-            if (pos + name_len > data.len) return error.InvalidManifest;
-            const name = try alloc.dupe(u8, data[pos .. pos + name_len]);
-            pos += name_len;
-            try legacy_outputs.append(alloc, .{
-                .name = name,
-                .kind = switch (kind) {
-                    1 => .chunk_preview,
-                    2 => .chunk_embeddings,
-                    3 => .rerank_terms,
-                    else => return error.InvalidManifest,
-                },
-            });
-        }
-        if (legacy_outputs.items.len > 0) {
-            derived_outputs = .{ .items = try legacy_outputs.toOwnedSlice(alloc) };
-        } else {
-            legacy_outputs.deinit(alloc);
-        }
+        derived_outputs = .{ .items = items };
     }
 
+    const min_artifact_header_len = 1 + 4 + 4 + 8 + 4 + 2 + 8 + 8 + 8 + 8;
+    if (artifact_count > (data.len - pos) / min_artifact_header_len) return error.InvalidManifest;
     const artifacts = try alloc.alloc(manifest_types.ArtifactRef, artifact_count);
     errdefer alloc.free(artifacts);
 
@@ -742,21 +654,87 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
     }
 
     for (0..artifact_count) |idx| {
-        const min_artifact_header_len: usize = if (version >= 9) 1 + 4 + 4 + 8 + 4 else 1 + 4 + 8 + 4;
         if (pos + min_artifact_header_len > data.len) return error.InvalidManifest;
-        const kind: manifest_types.ArtifactKind = @enumFromInt(data[pos]);
+        const kind = std.enums.fromInt(manifest_types.ArtifactKind, data[pos]) orelse return error.InvalidManifest;
         pos += 1;
-        const name_len = if (version >= 9) blk: {
+        const name_len = blk: {
             const value = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4;
             break :blk value;
-        } else 0;
+        };
         const artifact_id_len = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
         const byte_len = std.mem.readInt(u64, data[pos..][0..8], .little);
         pos += 8;
         const checksum_len = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
+        const metadata_version = blk: {
+            const value = std.mem.readInt(u16, data[pos..][0..2], .little);
+            pos += 2;
+            break :blk value;
+        };
+        if (kind == .graph_metric_segment and metadata_version != artifact_ref.graph_metric_segment_wire_version) {
+            return error.InvalidManifest;
+        }
+        const published_generation = blk: {
+            const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            break :blk value;
+        };
+        const edge_generation = blk: {
+            const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            break :blk value;
+        };
+        const computed_at_ms = blk: {
+            const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            break :blk value;
+        };
+        const materializer_fingerprint = blk: {
+            const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            break :blk value;
+        };
+        var graph_metric_control_len: u32 = 0;
+        var graph_metric_routing_footer_len: u32 = 0;
+        var graph_metric_control_checksum: [32]u8 = @splat(0);
+        var graph_metric_routing_checksum: [32]u8 = @splat(0);
+        var graph_metric_point_index_checksum: [32]u8 = @splat(0);
+        var graph_metric_config_fingerprint: u64 = 0;
+        var graph_metric_source_checksum: [32]u8 = @splat(0);
+        var graph_metric_materialization_state: artifact_ref.GraphMetricMaterializationState = .ready;
+        var graph_metric_rejection_reason: artifact_ref.GraphMetricRejectionReason = .none;
+        // Graph metrics are admitted only on the current manifest wire above,
+        // so there is no partially populated legacy integrity shape here.
+        if (kind == .graph_metric_segment) {
+            const integrity_len: usize = 4 + 4 + 32 + 32 + 32 + 8 + 32 + 1 + 1;
+            if (pos + integrity_len > data.len) return error.InvalidManifest;
+            graph_metric_control_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4;
+            graph_metric_routing_footer_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+            pos += 4;
+            @memcpy(&graph_metric_control_checksum, data[pos..][0..32]);
+            pos += 32;
+            @memcpy(&graph_metric_routing_checksum, data[pos..][0..32]);
+            pos += 32;
+            @memcpy(&graph_metric_point_index_checksum, data[pos..][0..32]);
+            pos += 32;
+            graph_metric_config_fingerprint = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+            @memcpy(&graph_metric_source_checksum, data[pos..][0..32]);
+            pos += 32;
+            graph_metric_materialization_state = std.enums.fromInt(artifact_ref.GraphMetricMaterializationState, data[pos]) orelse return error.InvalidManifest;
+            pos += 1;
+            graph_metric_rejection_reason = std.enums.fromInt(artifact_ref.GraphMetricRejectionReason, data[pos]) orelse return error.InvalidManifest;
+            pos += 1;
+            if (graph_metric_control_len == 0 or graph_metric_routing_footer_len == 0 or
+                (graph_metric_materialization_state == .ready and graph_metric_rejection_reason != .none) or
+                (graph_metric_materialization_state == .rejected and graph_metric_rejection_reason == .none))
+            {
+                return error.InvalidManifest;
+            }
+        }
 
         if (pos + name_len + artifact_id_len + checksum_len > data.len) return error.InvalidManifest;
         const name = if (name_len > 0) try alloc.dupe(u8, data[pos .. pos + name_len]) else &.{};
@@ -774,19 +752,31 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             .artifact_id = artifact_id,
             .byte_len = byte_len,
             .checksum = checksum,
+            .metadata_version = metadata_version,
+            .published_generation = published_generation,
+            .edge_generation = edge_generation,
+            .computed_at_ms = computed_at_ms,
+            .materializer_fingerprint = materializer_fingerprint,
+            .graph_metric_control_len = graph_metric_control_len,
+            .graph_metric_routing_footer_len = graph_metric_routing_footer_len,
+            .graph_metric_control_checksum = graph_metric_control_checksum,
+            .graph_metric_routing_checksum = graph_metric_routing_checksum,
+            .graph_metric_point_index_checksum = graph_metric_point_index_checksum,
+            .graph_metric_config_fingerprint = graph_metric_config_fingerprint,
+            .graph_metric_source_checksum = graph_metric_source_checksum,
+            .graph_metric_materialization_state = graph_metric_materialization_state,
+            .graph_metric_rejection_reason = graph_metric_rejection_reason,
         };
         initialized += 1;
     }
 
     var base_source: ?manifest_types.BaseSourceDescriptor = null;
     errdefer if (base_source) |*descriptor| manifest_base_source.freeOwnedDescriptor(alloc, descriptor);
-    if (version >= 12) {
-        if (pos + base_source_len > data.len) return error.InvalidManifest;
-        if (base_source_len > 0) {
-            base_source = try decodeBaseSourceAlloc(alloc, data[pos .. pos + base_source_len]);
-        }
-        pos += base_source_len;
+    if (pos + base_source_len > data.len) return error.InvalidManifest;
+    if (base_source_len > 0) {
+        base_source = try decodeBaseSourceAlloc(alloc, data[pos .. pos + base_source_len]);
     }
+    pos += base_source_len;
 
     if (pos != data.len) return error.InvalidManifest;
 
@@ -953,7 +943,7 @@ fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.Bas
     return descriptor;
 }
 
-test "manifest codec round-trips deterministically" {
+test "serverless manifest codec round-trips deterministically" {
     const alloc = std.testing.allocator;
     var manifest = manifest_types.Manifest{
         .namespace = try alloc.dupe(u8, "products"),
@@ -972,7 +962,7 @@ test "manifest codec round-trips deterministically" {
             .published_search_sources = try search_sources.defaultPublishedSearchSourcesAlloc(alloc),
             .derived_outputs = try search_sources.defaultMaterializedDerivedOutputsAlloc(alloc),
         },
-        .artifacts = try alloc.alloc(manifest_types.ArtifactRef, 4),
+        .artifacts = try alloc.alloc(manifest_types.ArtifactRef, 5),
     };
     defer manifest.deinit(alloc);
 
@@ -1001,6 +991,25 @@ test "manifest codec round-trips deterministically" {
         .byte_len = 512,
         .checksum = try alloc.dupe(u8, "sha256:graph"),
     };
+    manifest.artifacts[4] = .{
+        .kind = .graph_metric_segment,
+        .name = try alloc.dupe(u8, "5:graph8:pagerank"),
+        .artifact_id = try alloc.dupe(u8, "metric-0001"),
+        .byte_len = 256,
+        .checksum = try alloc.dupe(u8, "sha256:metric"),
+        .metadata_version = artifact_ref.graph_metric_segment_wire_version,
+        .published_generation = 40,
+        .edge_generation = 39,
+        .computed_at_ms = 123,
+        .materializer_fingerprint = 0x1234,
+        .graph_metric_control_len = 73,
+        .graph_metric_routing_footer_len = 17,
+        .graph_metric_control_checksum = @splat(0x11),
+        .graph_metric_routing_checksum = @splat(0x22),
+        .graph_metric_point_index_checksum = @splat(0x44),
+        .graph_metric_config_fingerprint = 0x5678,
+        .graph_metric_source_checksum = @splat(0x33),
+    };
 
     const encoded_a = try encodeAlloc(alloc, manifest);
     defer alloc.free(encoded_a);
@@ -1022,14 +1031,69 @@ test "manifest codec round-trips deterministically" {
     try std.testing.expectEqualStrings(search_sources.default_chunk_preview_output_name, decoded.stats.derived_outputs.findByKind(.chunk_preview).?.name);
     try std.testing.expectEqualStrings(search_sources.default_chunk_embeddings_output_name, decoded.stats.derived_outputs.findByKind(.chunk_embeddings).?.name);
     try std.testing.expectEqualStrings(search_sources.default_rerank_terms_output_name, decoded.stats.derived_outputs.findByKind(.rerank_terms).?.name);
-    try std.testing.expectEqual(@as(usize, 4), decoded.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 5), decoded.artifacts.len);
     try std.testing.expectEqual(manifest_types.ArtifactKind.text_segment, decoded.artifacts[0].kind);
     try std.testing.expectEqualStrings("vec-0001", decoded.artifacts[1].artifact_id);
     try std.testing.expectEqual(manifest_types.ArtifactKind.sparse_segment, decoded.artifacts[2].kind);
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_segment, decoded.artifacts[3].kind);
+    try std.testing.expectEqual(manifest_types.ArtifactKind.graph_metric_segment, decoded.artifacts[4].kind);
+    try std.testing.expectEqual(artifact_ref.graph_metric_segment_wire_version, decoded.artifacts[4].metadata_version);
+    try std.testing.expectEqual(@as(u64, 40), decoded.artifacts[4].published_generation);
+    try std.testing.expectEqual(@as(u64, 39), decoded.artifacts[4].edge_generation);
+    try std.testing.expectEqual(@as(u64, 123), decoded.artifacts[4].computed_at_ms);
+    try std.testing.expectEqual(@as(u64, 0x1234), decoded.artifacts[4].materializer_fingerprint);
+    try std.testing.expectEqual(@as(u32, 73), decoded.artifacts[4].graph_metric_control_len);
+    try std.testing.expectEqual(@as(u32, 17), decoded.artifacts[4].graph_metric_routing_footer_len);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x11} ** 32), &decoded.artifacts[4].graph_metric_control_checksum);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x44} ** 32), &decoded.artifacts[4].graph_metric_point_index_checksum);
+
+    // The current manifest layout retains the old field positions, but graph
+    // metrics deliberately fail closed if a pre-release version is forged.
+    const graph_metric_integrity_bytes: usize = 4 + 4 + 32 + 32 + 32 + 8 + 32 + 1 + 1;
+    const materializer_bytes: usize = 8;
+    const provenance_bytes: usize = 2 + 8 + 8 + 8;
+    var current_artifact_bytes: usize = 0;
+    for (manifest.artifacts) |artifact| current_artifact_bytes += artifactEncodedSize(artifact);
+    const prefix_len = encoded_a.len - current_artifact_bytes;
+    const encoded_v14 = try alloc.alloc(u8, encoded_a.len - materializer_bytes * manifest.artifacts.len - graph_metric_integrity_bytes);
+    defer alloc.free(encoded_v14);
+    @memcpy(encoded_v14[0..prefix_len], encoded_a[0..prefix_len]);
+    var src_pos = prefix_len;
+    var dst_pos = prefix_len;
+    const artifact_header_bytes: usize = 1 + 4 + 4 + 8 + 4;
+    for (manifest.artifacts) |artifact| {
+        const retained_header_bytes = artifact_header_bytes + provenance_bytes;
+        @memcpy(encoded_v14[dst_pos..][0..retained_header_bytes], encoded_a[src_pos..][0..retained_header_bytes]);
+        src_pos += retained_header_bytes + materializer_bytes;
+        if (artifact.kind == .graph_metric_segment) src_pos += graph_metric_integrity_bytes;
+        dst_pos += retained_header_bytes;
+        const payload_len = artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+        @memcpy(encoded_v14[dst_pos..][0..payload_len], encoded_a[src_pos..][0..payload_len]);
+        src_pos += payload_len;
+        dst_pos += payload_len;
+    }
+    std.mem.writeInt(u16, encoded_v14[4..6], 14, .little);
+    try std.testing.expectError(error.UnsupportedManifestVersion, decodeAlloc(alloc, encoded_v14));
+
+    const encoded_v13 = try alloc.alloc(u8, encoded_v14.len - provenance_bytes * manifest.artifacts.len);
+    defer alloc.free(encoded_v13);
+    @memcpy(encoded_v13[0..prefix_len], encoded_v14[0..prefix_len]);
+    src_pos = prefix_len;
+    dst_pos = prefix_len;
+    for (manifest.artifacts) |artifact| {
+        @memcpy(encoded_v13[dst_pos..][0..artifact_header_bytes], encoded_v14[src_pos..][0..artifact_header_bytes]);
+        src_pos += artifact_header_bytes + provenance_bytes;
+        dst_pos += artifact_header_bytes;
+        const payload_len = artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
+        @memcpy(encoded_v13[dst_pos..][0..payload_len], encoded_v14[src_pos..][0..payload_len]);
+        src_pos += payload_len;
+        dst_pos += payload_len;
+    }
+    std.mem.writeInt(u16, encoded_v13[4..6], 13, .little);
+    try std.testing.expectError(error.UnsupportedManifestVersion, decodeAlloc(alloc, encoded_v13));
 }
 
-test "manifest codec round-trips optional lake base source" {
+test "serverless manifest codec round-trips optional lake base source" {
     const alloc = std.testing.allocator;
     var manifest = manifest_types.Manifest{
         .namespace = try alloc.dupe(u8, "events"),
@@ -1074,13 +1138,111 @@ test "manifest codec round-trips optional lake base source" {
     try std.testing.expectEqualStrings("external-files-0001", decoded.artifacts[0].artifact_id);
 }
 
-test "manifest codec rejects bad magic" {
+test "serverless manifest codec rejects bad magic" {
     const alloc = std.testing.allocator;
     const bad = [_]u8{ 'B', 'A', 'D', '!', 1, 0 };
     try std.testing.expectError(error.InvalidManifest, decodeAlloc(alloc, &bad));
 }
 
-test "lake manifest base source decoder rejects forged string-list counts before allocation" {
+test "serverless manifest readers and writers require the latest wire" {
+    const alloc = std.testing.allocator;
+    var manifest = manifest_types.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = &.{},
+    };
+    const encoded = try encodeForVersionAlloc(alloc, manifest, wire_version);
+    defer alloc.free(encoded);
+    try std.testing.expectEqual(wire_version, std.mem.readInt(u16, encoded[4..6], .little));
+    var decoded = try decodeAlloc(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", decoded.namespace);
+
+    for (0..wire_version + 2) |candidate| {
+        if (candidate == wire_version) continue;
+        const unsupported: u16 = @intCast(candidate);
+        const forged = try alloc.dupe(u8, encoded);
+        defer alloc.free(forged);
+        std.mem.writeInt(u16, forged[4..6], unsupported, .little);
+        try std.testing.expectError(error.UnsupportedManifestVersion, decodeAlloc(alloc, forged));
+        try std.testing.expectError(error.UnsupportedManifestWriteVersion, encodeForVersionAlloc(alloc, manifest, unsupported));
+    }
+    for (0..header_size) |len| {
+        try std.testing.expectError(error.InvalidManifest, decodeAlloc(alloc, encoded[0..len]));
+    }
+
+    var graph_artifacts = [_]manifest_types.ArtifactRef{.{
+        .kind = .graph_metric_segment,
+        .artifact_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .byte_len = 1,
+        .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .metadata_version = artifact_ref.graph_metric_segment_wire_version,
+        .graph_metric_control_len = 1,
+        .graph_metric_routing_footer_len = 1,
+    }};
+    manifest.artifacts = &graph_artifacts;
+    try std.testing.expectError(
+        error.UnsupportedManifestWriteVersion,
+        encodeForVersionAlloc(alloc, manifest, 15),
+    );
+    try std.testing.expectError(
+        error.UnsupportedManifestWriteVersion,
+        encodeForVersionAlloc(alloc, manifest, 16),
+    );
+    const encoded_current = try encodeForVersionAlloc(alloc, manifest, wire_version);
+    defer alloc.free(encoded_current);
+    var decoded_current = try decodeAlloc(alloc, encoded_current);
+    defer decoded_current.deinit(alloc);
+    try std.testing.expectEqual(artifact_ref.graph_metric_segment_wire_version, decoded_current.artifacts[0].metadata_version);
+    for ([_]u16{ 15, 16, 17 }) |old_version| {
+        const forged = try alloc.dupe(u8, encoded_current);
+        defer alloc.free(forged);
+        std.mem.writeInt(u16, forged[4..6], old_version, .little);
+        try std.testing.expectError(error.UnsupportedManifestVersion, decodeAlloc(alloc, forged));
+        try std.testing.expectError(error.UnsupportedManifestWriteVersion, encodeForVersionAlloc(alloc, manifest, old_version));
+    }
+    try std.testing.expectError(
+        error.UnsupportedManifestWriteVersion,
+        encodeForVersionAlloc(alloc, manifest, 13),
+    );
+}
+
+test "serverless manifest rejects malformed descriptor tags without leaking names" {
+    const alloc = std.testing.allocator;
+    var sources = [_]search_sources.SearchSourceDescriptor{.{ .vector = .{
+        .index_name = "vec",
+        .document_source = .top_level_embedding,
+    } }};
+    var outputs = [_]search_sources.DerivedOutputDescriptor{.{ .name = "preview", .kind = .chunk_preview }};
+    const manifest = manifest_types.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{
+            .published_search_sources = .{ .items = &sources },
+            .derived_outputs = .{ .items = &outputs },
+        },
+        .artifacts = &.{},
+    };
+    const encoded = try encodeAlloc(alloc, manifest);
+    defer alloc.free(encoded);
+    const source_offset = header_size + manifest.namespace.len;
+    const output_offset = source_offset + publishedSearchSourceEncodedSize(sources[0]);
+    for ([_]usize{ source_offset, source_offset + 1, output_offset }) |offset| {
+        const saved = encoded[offset];
+        encoded[offset] = 255;
+        try std.testing.expectError(error.InvalidManifest, decodeAlloc(alloc, encoded));
+        encoded[offset] = saved;
+    }
+}
+
+test "serverless lake manifest base source decoder rejects forged string-list counts before allocation" {
     const alloc = std.testing.allocator;
     var encoded = [_]u8{0} ** 13;
     encoded[0] = @intFromEnum(manifest_types.BaseSourceKind.antfly_row_fragments);

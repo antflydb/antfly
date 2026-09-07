@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
@@ -49,6 +50,7 @@ pub const SparseEnricherConfig = struct {
     stage: catalog_mod.EnrichmentStage = .lexical_sparse,
     model_preference: catalog_mod.EnrichmentModelPreference = .prefer_model,
     failure_policy: catalog_mod.EnrichmentFailurePolicy = .skip_document,
+    cancellation: CancellationToken = .none,
 };
 
 const DerivedBodyResult = struct {
@@ -103,10 +105,14 @@ pub const SparseEnricher = struct {
     }
 
     pub fn setSparseEmbedder(self: *SparseEnricher, embedder: embedder_mod.SparseEmbedder, embedding_name: []const u8) !void {
+        // Ownership transfers only after all fallible preparation succeeds.
+        // This keeps the current configuration usable on allocation failure
+        // and leaves the caller responsible for the replacement on error.
+        const owned_name = try self.alloc.dupe(u8, embedding_name);
         if (self.sparse_embedder) |current| current.deinit(self.alloc);
         if (self.sparse_embedding_name) |name| self.alloc.free(name);
         self.sparse_embedder = embedder;
-        self.sparse_embedding_name = try self.alloc.dupe(u8, embedding_name);
+        self.sparse_embedding_name = owned_name;
     }
 
     pub fn clearSparseEmbedder(self: *SparseEnricher) void {
@@ -117,10 +123,11 @@ pub const SparseEnricher = struct {
     }
 
     pub fn setChunkEmbedder(self: *SparseEnricher, embedder: embedder_mod.DenseEmbedder, embedding_name: []const u8, dims: u32) !void {
+        const owned_name = try self.alloc.dupe(u8, embedding_name);
         if (self.chunk_embedder) |current| current.deinit(self.alloc);
         if (self.chunk_embedding_name) |name| self.alloc.free(name);
         self.chunk_embedder = embedder;
-        self.chunk_embedding_name = try self.alloc.dupe(u8, embedding_name);
+        self.chunk_embedding_name = owned_name;
         self.chunk_embedding_dims = dims;
     }
 
@@ -136,6 +143,7 @@ pub const SparseEnricher = struct {
     }
 
     pub fn runNamespaceWithConfig(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig) !EnrichmentRunStats {
+        try cfg.cancellation.check();
         const head = self.progress.getHead(namespace) catch |err| switch (err) {
             error.FileNotFound => return .{ .idle_namespaces = 1 },
             else => return err,
@@ -149,6 +157,7 @@ pub const SparseEnricher = struct {
 
         const docs = try self.loadPublishedDocsAlloc(manifest);
         defer query_mod.freeMaterializedDocuments(self.alloc, docs);
+        try cfg.cancellation.check();
 
         const stored_head = try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage);
         if (stored_head != head) {
@@ -167,7 +176,12 @@ pub const SparseEnricher = struct {
 
         var stats = EnrichmentRunStats{};
         var next_offset: usize = start_offset;
+        var canceled = false;
         for (docs[start_offset..], start_offset..) |doc, doc_index| {
+            if (cfg.cancellation.isCancelled()) {
+                canceled = true;
+                break;
+            }
             next_offset = doc_index + 1;
             const derived = buildDerivedBodyAlloc(self, cfg.stage, doc.body, cfg.pipeline_version, cfg.model_preference) catch |err| {
                 if (isRecoverableEnrichmentError(err)) {
@@ -189,6 +203,11 @@ pub const SparseEnricher = struct {
             };
             const encoded = try api_codec.encodeMutationAlloc(self.alloc, mutation);
             defer self.alloc.free(encoded);
+            if (cfg.cancellation.isCancelled()) {
+                canceled = true;
+                next_offset = doc_index;
+                break;
+            }
             _ = try self.wal.append(namespace, doc.last_timestamp_ns + 1, encoded);
             stats.enriched_documents += 1;
             stats.wal_appends += 1;
@@ -199,6 +218,7 @@ pub const SparseEnricher = struct {
 
         const previous_offset = (try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0;
         _ = try self.progress.compareAndSwapEnrichmentStageDocOffset(namespace, cfg.stage, previous_offset, @intCast(next_offset));
+        if (canceled) return error.Canceled;
         if (stats.enriched_documents == 0) {
             stats.idle_namespaces = 1;
         } else {
@@ -810,6 +830,70 @@ const FailingSparseEmbedder = struct {
         };
     }
 };
+
+const TrackingEmbedder = struct {
+    deinit_count: *usize,
+
+    fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+        return error.UnexpectedEmbeddingCall;
+    }
+
+    fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+        return error.UnexpectedEmbeddingCall;
+    }
+
+    fn deinit(ptr: *anyopaque, _: Allocator) void {
+        const self: *TrackingEmbedder = @ptrCast(@alignCast(ptr));
+        self.deinit_count.* += 1;
+    }
+
+    fn denseInterface(self: *TrackingEmbedder) embedder_mod.DenseEmbedder {
+        return .{ .ptr = self, .dense_embed_fn = embedDense, .deinit_fn = deinit };
+    }
+
+    fn sparseInterface(self: *TrackingEmbedder) embedder_mod.SparseEmbedder {
+        return .{ .ptr = self, .sparse_embed_fn = embedSparse, .deinit_fn = deinit };
+    }
+};
+
+test "serverless sparse enricher embedder replacement is transactional on allocation failure" {
+    var old_sparse_deinits: usize = 0;
+    var replacement_sparse_deinits: usize = 0;
+    var old_dense_deinits: usize = 0;
+    var replacement_dense_deinits: usize = 0;
+    var old_sparse = TrackingEmbedder{ .deinit_count = &old_sparse_deinits };
+    var replacement_sparse = TrackingEmbedder{ .deinit_count = &replacement_sparse_deinits };
+    var old_dense = TrackingEmbedder{ .deinit_count = &old_dense_deinits };
+    var replacement_dense = TrackingEmbedder{ .deinit_count = &replacement_dense_deinits };
+
+    var enricher = SparseEnricher.init(std.testing.allocator, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    try enricher.setSparseEmbedder(old_sparse.sparseInterface(), "old_sparse");
+    try enricher.setChunkEmbedder(old_dense.denseInterface(), "old_dense", 32);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    enricher.alloc = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, enricher.setSparseEmbedder(replacement_sparse.sparseInterface(), "new_sparse"));
+    replacement_sparse.sparseInterface().deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("old_sparse", enricher.sparse_embedding_name.?);
+    try std.testing.expectEqual(@as(usize, 0), old_sparse_deinits);
+
+    failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    enricher.alloc = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, enricher.setChunkEmbedder(replacement_dense.denseInterface(), "new_dense", 64));
+    replacement_dense.denseInterface().deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("old_dense", enricher.chunk_embedding_name.?);
+    try std.testing.expectEqual(@as(u32, 32), enricher.chunk_embedding_dims);
+    try std.testing.expectEqual(@as(usize, 0), old_dense_deinits);
+
+    enricher.alloc = std.testing.allocator;
+    enricher.clearSparseEmbedder();
+    enricher.clearChunkEmbedder();
+    try std.testing.expectEqual(@as(usize, 1), old_sparse_deinits);
+    try std.testing.expectEqual(@as(usize, 1), replacement_sparse_deinits);
+    try std.testing.expectEqual(@as(usize, 1), old_dense_deinits);
+    try std.testing.expectEqual(@as(usize, 1), replacement_dense_deinits);
+}
 
 fn buildDeterministicEmbeddingAlloc(alloc: Allocator, text: []const u8, dims: usize) ![]f32 {
     const embedding = try alloc.alloc(f32, dims);

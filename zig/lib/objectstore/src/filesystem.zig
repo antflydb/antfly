@@ -108,7 +108,7 @@ pub const FilesystemClient = struct {
         }
 
         try ensureParentDir(self.io, object_path);
-        const etag = try sha256HexAlloc(alloc, body);
+        const etag = try sha256HexAllocWithCancellation(alloc, body, opts.cancellation);
         errdefer alloc.free(etag);
         const staging_path = try stagingPathAlloc(alloc, self.root_dir, bucket);
         defer alloc.free(staging_path);
@@ -798,6 +798,7 @@ fn writeObjectFileAtomically(
     encodeObjectHeader(&placeholder, source_stat.size, content_type.len, etag);
     try output.writePositionalAll(io, &placeholder, 0);
     try output.sync(io);
+    if (cancellation) |token| try token.check();
     output.unlock(io);
     output_locked = false;
     output.close(io);
@@ -974,8 +975,21 @@ fn partCount(content_length: u64) usize {
 }
 
 fn sha256HexAlloc(alloc: Allocator, body: []const u8) ![]u8 {
+    return sha256HexAllocWithCancellation(alloc, body, null);
+}
+
+fn sha256HexAllocWithCancellation(alloc: Allocator, body: []const u8, cancellation: ?types.CancellationToken) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const chunk_bytes = 1024 * 1024;
+    var offset: usize = 0;
+    while (offset < body.len) {
+        if (cancellation) |token| try token.check();
+        const len = @min(chunk_bytes, body.len - offset);
+        hasher.update(body[offset..][0..len]);
+        offset += len;
+    }
+    hasher.final(&digest);
     return try digestHexAlloc(alloc, &digest);
 }
 

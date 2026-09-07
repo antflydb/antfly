@@ -1,0 +1,292 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License at https://www.antfly.io/licensing/ELv2-license.
+
+//! Serverless graph-metric admission and materializer compatibility policy.
+//! Keep this independent of persistence so configuration validation, builders,
+//! and reuse checks all enforce exactly the same bounded contract.
+
+const std = @import("std");
+const graph_mod = @import("../../graph/graph.zig");
+const metric_cost = @import("../../graph/metric_cost.zig");
+const bounded_decode = @import("../bounded_decode.zig");
+
+/// Increment whenever an implementation change can alter admission or output
+/// without changing the user-visible metric configuration.
+// Epoch 9 shares optional warm starts across lake and document publication.
+// Rebuild older sidecars so admission decisions and output remain tied to one
+// explicit materializer contract.
+pub const materializer_epoch: u32 = 10;
+const max_tracked_graph_indexes: usize = 16;
+
+pub const Limits = struct {
+    // Keep graph admission aligned with the decoder and query-runtime
+    // artifact contract. Larger topology artifacts cannot be served safely by
+    // this runtime and are represented by durable rejected metric sidecars.
+    max_graph_payload_bytes: usize = (bounded_decode.Limits{}).max_artifact_bytes,
+    // Unique topology payloads are charged once per table publication. Two
+    // maximum-sized graphs may be materialized in one run; additional graphs
+    // receive durable budget-rejection sidecars instead of consuming several
+    // GiB of background I/O and decode CPU.
+    max_total_graph_payload_bytes: usize = 512 * 1024 * 1024,
+    max_metric_payload_bytes: usize = 256 * 1024 * 1024,
+    max_total_metric_payload_bytes: usize = 512 * 1024 * 1024,
+    // Optional acceleration must not starve a later cold materialization.
+    // Zero disables warm starts. Charge every read, not just unique identities:
+    // seeds are not retained across materializations.
+    max_total_seed_payload_bytes: u64 = 64 * 1024 * 1024,
+    max_total_seed_work_items: u64 = 64 * 1024 * 1024,
+    // Bounds the decoded topology, compiled projection, dense kernel vectors,
+    // borrowed sortable score views, and encoded output that may coexist for one
+    // materialization. Work and payload limits alone do not bound this peak.
+    max_peak_memory_bytes: usize = 1024 * 1024 * 1024,
+    max_nodes: usize = 1_000_000,
+    max_edges: usize = 10_000_000,
+    max_work_items: u64 = 500_000_000,
+    max_total_work_items: u64 = 1_000_000_000,
+    max_graph_indexes: usize = 16,
+    max_metrics: usize = 16,
+    max_total_metrics: usize = 64,
+    max_graph_index_name_bytes: usize = 256,
+    max_edge_filter_types: usize = 64,
+    max_metric_name_bytes: usize = 128,
+    max_edge_type_bytes: usize = 256,
+};
+
+pub const Budget = struct {
+    limits: Limits,
+    work_items: u64 = 0,
+    metric_payload_bytes: usize = 0,
+    graph_payload_bytes: usize = 0,
+    seed_payload_bytes: u64 = 0,
+    seed_work_items: u64 = 0,
+    graph_identity_count: usize = 0,
+    graph_identities: [max_tracked_graph_indexes][32]u8 = undefined,
+
+    /// Reserve optional work atomically. One byte of prior input is a
+    /// conservative decode-work unit, including authentication and ID parsing;
+    /// mapping also visits the current vector. Rejection leaves the cold budget
+    /// and both seed counters untouched.
+    pub fn admitSeed(self: *Budget, byte_len: u64, node_count: usize) bool {
+        const bytes = std.math.add(u64, self.seed_payload_bytes, byte_len) catch return false;
+        const work = std.math.add(u64, byte_len, node_count) catch return false;
+        const total = std.math.add(u64, self.seed_work_items, work) catch return false;
+        if (bytes > self.limits.max_total_seed_payload_bytes or total > self.limits.max_total_seed_work_items) return false;
+        self.seed_payload_bytes = bytes;
+        self.seed_work_items = total;
+        return true;
+    }
+
+    /// Charges one immutable topology identity at most once. The digest is
+    /// bookkeeping only: artifact authentication remains the responsibility
+    /// of ArtifactStore before decoding.
+    pub fn chargeGraphPayload(self: *Budget, artifact_id: []const u8, checksum: []const u8, byte_len: u64) !void {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(artifact_id);
+        hasher.update(&.{0});
+        hasher.update(checksum);
+        var encoded_len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded_len, byte_len, .little);
+        hasher.update(&encoded_len);
+        var identity: [32]u8 = undefined;
+        hasher.final(&identity);
+        for (self.graph_identities[0..self.graph_identity_count]) |existing| {
+            if (std.mem.eql(u8, &existing, &identity)) return;
+        }
+        if (self.graph_identity_count >= self.limits.max_graph_indexes or
+            self.graph_identity_count >= self.graph_identities.len)
+        {
+            return error.GraphMetricBuildBudgetExceeded;
+        }
+        const admitted_bytes = std.math.cast(usize, byte_len) orelse return error.GraphMetricBuildBudgetExceeded;
+        const next = std.math.add(usize, self.graph_payload_bytes, admitted_bytes) catch
+            return error.GraphMetricBuildBudgetExceeded;
+        if (next > self.limits.max_total_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+        self.graph_identities[self.graph_identity_count] = identity;
+        self.graph_identity_count += 1;
+        self.graph_payload_bytes = next;
+    }
+
+    pub fn chargeWork(self: *Budget, amount: u64) !void {
+        const next = std.math.add(u64, self.work_items, amount) catch
+            return error.GraphMetricBuildBudgetExceeded;
+        if (next > self.limits.max_total_work_items) return error.GraphMetricBuildBudgetExceeded;
+        self.work_items = next;
+    }
+
+    pub fn chargePayload(self: *Budget, amount: usize) !void {
+        const next = std.math.add(usize, self.metric_payload_bytes, amount) catch
+            return error.GraphMetricBuildBudgetExceeded;
+        if (next > self.limits.max_total_metric_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+        self.metric_payload_bytes = next;
+    }
+};
+
+pub fn validateLimits(limits: Limits) !void {
+    if (limits.max_graph_payload_bytes == 0 or
+        limits.max_graph_payload_bytes > (bounded_decode.Limits{}).max_artifact_bytes or
+        limits.max_total_graph_payload_bytes == 0 or
+        limits.max_metric_payload_bytes == 0 or
+        limits.max_total_metric_payload_bytes == 0 or
+        limits.max_peak_memory_bytes == 0 or
+        limits.max_nodes == 0 or
+        limits.max_edges == 0 or
+        limits.max_work_items == 0 or
+        limits.max_total_work_items == 0 or
+        limits.max_graph_indexes == 0 or limits.max_graph_indexes > max_tracked_graph_indexes or
+        limits.max_metrics == 0 or
+        limits.max_total_metrics == 0 or
+        limits.max_graph_index_name_bytes == 0 or
+        limits.max_edge_filter_types == 0 or
+        limits.max_metric_name_bytes == 0 or
+        limits.max_edge_type_bytes == 0)
+    {
+        return error.InvalidGraphMetricBuildOptions;
+    }
+}
+
+pub fn validateCatalogFanout(graph_index_count: usize, metric_count: usize, limits: Limits) !void {
+    try validateLimits(limits);
+    if (graph_index_count > limits.max_graph_indexes or metric_count > limits.max_total_metrics) {
+        return error.GraphMetricConfigurationLimitExceeded;
+    }
+}
+
+pub fn validateConfigs(configs: []const graph_mod.GraphMetricConfig, limits: Limits) !void {
+    try validateLimits(limits);
+    if (configs.len > limits.max_metrics) return error.GraphMetricConfigurationLimitExceeded;
+    for (configs) |config| {
+        if (config.name.len == 0 or config.name.len > limits.max_metric_name_bytes or
+            config.edge_filter.types.len > limits.max_edge_filter_types)
+        {
+            return error.GraphMetricConfigurationLimitExceeded;
+        }
+        for (config.edge_filter.types) |edge_type| {
+            if (edge_type.len == 0 or edge_type.len > limits.max_edge_type_bytes) {
+                return error.GraphMetricConfigurationLimitExceeded;
+            }
+        }
+    }
+}
+
+pub fn workItems(node_count: usize, edge_count: usize, iterations: u32, passes: u64) !u64 {
+    const per_iteration = std.math.add(u64, @intCast(node_count), @intCast(edge_count)) catch
+        return error.GraphMetricBuildBudgetExceeded;
+    const iteration_work = std.math.mul(u64, per_iteration, passes) catch
+        return error.GraphMetricBuildBudgetExceeded;
+    return std.math.mul(u64, iteration_work, iterations) catch
+        return error.GraphMetricBuildBudgetExceeded;
+}
+
+pub fn metricWorkItems(kind: graph_mod.GraphMetricKind, node_count: usize, edge_count: usize, max_iterations: u32) !u64 {
+    const kernel_kind: metric_cost.Kind = switch (kind) {
+        .degree => .degree,
+        .pagerank => .pagerank,
+        .eigenvector => .eigenvector,
+        .hits_authority, .hits_hub => .hits,
+    };
+    return try metric_cost.kernelWorkItems(kernel_kind, node_count, edge_count, max_iterations);
+}
+
+pub fn projectionWorkItems(
+    source_node_count: usize,
+    source_edge_count: usize,
+    projected_node_count: usize,
+    projected_edge_count: usize,
+    projected_passes: u64,
+) !u64 {
+    if (projected_passes == 0 or projected_passes > 4) return error.InvalidGraphMetricBuildOptions;
+    const source_scan = try workItems(source_node_count, source_edge_count, 1, 1);
+    const indexed_projection = try workItems(projected_node_count, projected_edge_count, 1, projected_passes);
+    return std.math.add(u64, source_scan, indexed_projection) catch error.GraphMetricBuildBudgetExceeded;
+}
+
+/// Total work charged for one materialization. Projection scans every source
+/// node and outbound edge once before the metric kernel sees the filtered
+/// graph, so those passes must be included in admission as well.
+pub fn materializationWorkItems(
+    kind: graph_mod.GraphMetricKind,
+    source_node_count: usize,
+    source_edge_count: usize,
+    projected_node_count: usize,
+    projected_edge_count: usize,
+    max_iterations: u32,
+) !u64 {
+    // Active-set discovery, exact projection fill, and degree counts require
+    // three passes. Neighbor-bearing kernels add one adjacency fill pass.
+    const projection_passes: u64 = if (kind == .degree) 3 else 4;
+    const projection = try projectionWorkItems(source_node_count, source_edge_count, projected_node_count, projected_edge_count, projection_passes);
+    const kernel = try metricWorkItems(kind, projected_node_count, projected_edge_count, max_iterations);
+    return std.math.add(u64, projection, kernel) catch error.GraphMetricBuildBudgetExceeded;
+}
+
+pub fn materializerFingerprint(limits: Limits) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hash(&hasher, materializer_epoch);
+    inline for (std.meta.fields(Limits)) |field| hash(&hasher, @field(limits, field.name));
+    const value = hasher.final() & std.math.maxInt(i64);
+    return if (value == 0) 1 else value;
+}
+
+fn hash(hasher: *std.hash.Wyhash, value: anytype) void {
+    const normalized: u64 = @intCast(value);
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, normalized, .little);
+    hasher.update(&encoded);
+}
+
+test "serverless graph metric policy bounds aggregate work and configuration fanout" {
+    var seeds = Budget{ .limits = .{ .max_total_seed_payload_bytes = 100, .max_total_seed_work_items = 110 } };
+    try std.testing.expect(seeds.admitSeed(50, 5));
+    try std.testing.expect(!seeds.admitSeed(51, 5));
+    try std.testing.expect(!seeds.admitSeed(50, 6));
+    try std.testing.expect(seeds.admitSeed(50, 5));
+    try std.testing.expectEqual(@as(u64, 100), seeds.seed_payload_bytes);
+    try std.testing.expectEqual(@as(u64, 110), seeds.seed_work_items);
+    try std.testing.expectEqual(@as(u64, 0), seeds.work_items);
+    var budget = Budget{ .limits = .{ .max_work_items = 10, .max_total_work_items = 12 } };
+    try budget.chargeWork(10);
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, budget.chargeWork(3));
+
+    const configs = [_]graph_mod.GraphMetricConfig{
+        .{ .name = "a" },
+        .{ .name = "b" },
+    };
+    try std.testing.expectError(
+        error.GraphMetricConfigurationLimitExceeded,
+        validateConfigs(&configs, .{ .max_metrics = 1 }),
+    );
+    try std.testing.expectError(
+        error.GraphMetricConfigurationLimitExceeded,
+        validateCatalogFanout(2, 2, .{ .max_graph_indexes = 1 }),
+    );
+    try std.testing.expectError(
+        error.GraphMetricConfigurationLimitExceeded,
+        validateCatalogFanout(1, 2, .{ .max_total_metrics = 1 }),
+    );
+}
+
+test "serverless graph metric policy charges each unique topology once" {
+    var budget = Budget{ .limits = .{ .max_graph_payload_bytes = 10, .max_total_graph_payload_bytes = 12 } };
+    try budget.chargeGraphPayload("sha256:a", "a", 10);
+    try budget.chargeGraphPayload("sha256:a", "a", 10);
+    try std.testing.expectEqual(@as(usize, 10), budget.graph_payload_bytes);
+    try std.testing.expectEqual(@as(usize, 1), budget.graph_identity_count);
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, budget.chargeGraphPayload("sha256:b", "b", 3));
+}
+
+test "serverless graph metric policy fingerprint changes with materialization limits" {
+    const baseline = materializerFingerprint(.{});
+    try std.testing.expect(baseline != materializerFingerprint(.{ .max_nodes = 999_999 }));
+}
+
+test "serverless graph metric graph admission cannot exceed decoder capacity" {
+    const decoder_limit = (bounded_decode.Limits{}).max_artifact_bytes;
+    try std.testing.expectEqual(decoder_limit, (Limits{}).max_graph_payload_bytes);
+    try std.testing.expectError(
+        error.InvalidGraphMetricBuildOptions,
+        validateLimits(.{ .max_graph_payload_bytes = decoder_limit + 1 }),
+    );
+}

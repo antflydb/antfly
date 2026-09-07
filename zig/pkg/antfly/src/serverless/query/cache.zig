@@ -19,8 +19,12 @@ const Allocator = std.mem.Allocator;
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const fs_paths = @import("../../common/fs_paths.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
+const graph_metric_routing_cache = @import("graph_metric_routing_cache.zig");
 
-const cache_record_magic = "AFQCR001";
+// v2 invalidates range/block entries written before provider identities were
+// pinned across verification and fetch. Full entries remain cheap to rebuild
+// and sharing one record format keeps startup reconciliation fail-closed.
+const cache_record_magic = "AFQCR002";
 const cache_record_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 const cache_record_header_len = cache_record_magic.len + @sizeOf(u64) + cache_record_digest_len;
 const abandoned_cache_write_age_ns: i96 = 24 * std.time.ns_per_hour;
@@ -38,9 +42,30 @@ const abandoned_cache_write_suffix = ".abandoned";
 pub const QueryCacheConfig = struct {
     max_bytes: u64 = 0,
     max_payload_bytes: u64 = 0,
+    /// Independent process-memory budget; disk-cache capacity is unchanged.
+    max_graph_metric_routing_bytes: usize = 16 * 1024 * 1024,
+};
+
+pub const AuthenticatedSubrange = struct {
+    relative_offset: usize,
+    len: usize,
+    checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
+// Bound simultaneously held publication leases, not only payload memory.
+// A query may publish several transport responses concurrently.
+pub const max_authenticated_publication_blocks = 32;
+pub const AuthenticatedBlockPublication = struct {
+    block_id: []const u8,
+    offset: u64,
+    contents: []const u8,
+    checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 };
 
 pub const QueryCacheStats = struct {
+    decoded_graph_metric_routing_hits: u64 = 0,
+    decoded_graph_metric_routing_misses: u64 = 0,
+    decoded_graph_metric_routing_bytes: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
     writes: u64 = 0,
@@ -191,8 +216,12 @@ pub const QueryCache = struct {
     cfg: QueryCacheConfig,
     stats_mu: std.atomic.Mutex = .unlocked,
     maintenance_mu: std.atomic.Mutex = .unlocked,
+    // Batching must not multiply descriptor usage by concurrent queries.
+    // Saturation bypasses optional disk retention without delaying results.
+    publication_slots: std.atomic.Value(usize) = .init(0),
     usage: CacheUsage = .{},
     stats: QueryCacheStats = .{},
+    graph_metric_routing: graph_metric_routing_cache.Cache = .{},
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !QueryCache {
         return try initWithConfig(alloc, root_dir, .{});
@@ -251,6 +280,7 @@ pub const QueryCache = struct {
     }
 
     pub fn deinit(self: *QueryCache) void {
+        self.graph_metric_routing.deinit();
         var io_impl = threadedIo();
         defer io_impl.deinit();
         const coordination_locked = blk: {
@@ -276,7 +306,12 @@ pub const QueryCache = struct {
     pub fn statsSnapshot(self: *QueryCache) QueryCacheStats {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
-        return self.stats;
+        var stats = self.stats;
+        const routing = self.graph_metric_routing.snapshot();
+        stats.decoded_graph_metric_routing_hits = routing.hits;
+        stats.decoded_graph_metric_routing_misses = routing.misses;
+        stats.decoded_graph_metric_routing_bytes = routing.bytes;
+        return stats;
     }
 
     pub fn getOrFetchAlloc(self: *QueryCache, artifacts: *artifacts_mod.ArtifactStore, artifact_id: []const u8) ![]u8 {
@@ -464,7 +499,124 @@ pub const QueryCache = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getRangeOrFetchImplAlloc(
+            result_alloc,
+            artifacts,
+            artifact_id,
+            null,
+            offset,
+            len,
+            cancellation,
+        );
+    }
+
+    pub fn getVerifiedRangeOrFetchAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        return try self.getRangeOrFetchImplAlloc(
+            result_alloc,
+            artifacts,
+            artifact_id,
+            .{ .byte_len = expected_byte_len, .checksum = expected_checksum },
+            offset,
+            len,
+            cancellation,
+        );
+    }
+
+    /// Reads a bounded range whose independently authenticated subranges are
+    /// rooted in trusted manifest metadata. Cache hits are re-authenticated,
+    /// and misses are authenticated before publication so a transient bad
+    /// provider response cannot become a durable cache poison.
+    pub fn getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        subranges: []const AuthenticatedSubrange,
+        cancellation: CancellationToken,
+    ) ![]u8 {
         try cancellation.check();
+        try validateExpectedRange(artifact_id, .{
+            .byte_len = expected_byte_len,
+            .checksum = expected_checksum,
+        }, offset, len);
+        try validateAuthenticatedSubrangeLayout(len, subranges);
+
+        const range_path = try rangeCachePathAlloc(self.alloc, self.root_dir, artifact_id, offset, len);
+        defer self.alloc.free(range_path);
+        const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, range_path, len, cancellation) catch |err| switch (err) {
+            error.FileNotFound => null,
+            error.CacheEntryCorrupt => blk: {
+                try removeCorruptCacheEntry(self, range_path, cancellation);
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (cached) |value| {
+            if (authenticateSubranges(value, subranges, cancellation)) |_| {
+                touchFileNow(range_path) catch {};
+                recordRangeHit(self);
+                return value;
+            } else |err| {
+                result_alloc.free(value);
+                switch (err) {
+                    error.ArtifactIntegrityMismatch => try removeCorruptCacheEntry(self, range_path, cancellation),
+                    else => return err,
+                }
+            }
+        }
+
+        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(
+            result_alloc,
+            artifact_id,
+            offset,
+            len,
+            cancellation,
+        );
+        errdefer result_alloc.free(contents);
+        if (contents.len != len) {
+            recordIntegrityFailure(self);
+            return error.ArtifactIntegrityMismatch;
+        }
+        authenticateSubranges(contents, subranges, cancellation) catch |err| {
+            if (err == error.ArtifactIntegrityMismatch) recordIntegrityFailure(self);
+            return err;
+        };
+        const published = try publishCacheEntry(self, range_path, contents, .range, cancellation);
+        recordRangeMiss(self, published);
+        return contents;
+    }
+
+    const ExpectedArtifact = struct {
+        byte_len: u64,
+        checksum: []const u8,
+    };
+
+    fn getRangeOrFetchImplAlloc(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        expected: ?ExpectedArtifact,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        if (expected) |value| try validateExpectedRange(artifact_id, value, offset, len);
         const range_path = try rangeCachePathAlloc(self.alloc, self.root_dir, artifact_id, offset, len);
         defer self.alloc.free(range_path);
         const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, range_path, len, cancellation) catch |err| switch (err) {
@@ -482,7 +634,18 @@ pub const QueryCache = struct {
             return value;
         }
 
-        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+        const contents = if (expected) |value|
+            try artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                value.byte_len,
+                value.checksum,
+                offset,
+                len,
+                cancellation,
+            )
+        else
+            try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
         errdefer result_alloc.free(contents);
         if (contents.len != len) return error.ArtifactIntegrityMismatch;
         const published = try publishCacheEntry(self, range_path, contents, .range, cancellation);
@@ -523,7 +686,209 @@ pub const QueryCache = struct {
         len: usize,
         cancellation: CancellationToken,
     ) ![]u8 {
+        return try self.getBlockOrFetchRangeImplAlloc(
+            result_alloc,
+            artifacts,
+            artifact_id,
+            block_id,
+            null,
+            offset,
+            len,
+            cancellation,
+        );
+    }
+
+    pub fn getVerifiedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        return try self.getBlockOrFetchRangeImplAlloc(
+            result_alloc,
+            artifacts,
+            artifact_id,
+            block_id,
+            .{ .byte_len = expected_byte_len, .checksum = expected_checksum },
+            offset,
+            len,
+            cancellation,
+        );
+    }
+
+    /// Fetches one immutable logical block and authenticates it with the digest
+    /// published in the artifact's routing metadata. Unlike a generic range
+    /// cache entry, the block id is stable across candidate sets, so sparse
+    /// graph-metric reads do not fragment the cache or require large fixed
+    /// windows merely to obtain a reusable identity.
+    pub fn getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        block_checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        if (try self.readAuthenticatedBlockIfPresentAlloc(result_alloc, artifact_id, block_id, expected_byte_len, expected_checksum, block_checksum, offset, len, cancellation)) |cached| return cached;
+        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+        errdefer result_alloc.free(contents);
+        try self.publishAuthenticatedBlock(artifact_id, block_id, expected_byte_len, expected_checksum, block_checksum, offset, len, contents, cancellation);
+        return contents;
+    }
+
+    pub fn readAuthenticatedBlockIfPresentAlloc(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        block_checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) !?[]u8 {
         try cancellation.check();
+        try validateExpectedRange(artifact_id, .{
+            .byte_len = expected_byte_len,
+            .checksum = expected_checksum,
+        }, offset, len);
+        if (len == 0) return error.InvalidRange;
+
+        const block_class = classifyBlockId(block_id);
+        const payload_block_class = classifyPayloadBlockId(block_id);
+        const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
+        defer self.alloc.free(block_path);
+        const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, block_path, len, cancellation) catch |err| switch (err) {
+            error.FileNotFound => null,
+            error.CacheEntryCorrupt => blk: {
+                try removeCorruptCacheEntry(self, block_path, cancellation);
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (cached) |value| {
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(value, &actual, .{});
+            if (std.mem.eql(u8, &actual, block_checksum)) {
+                touchFileNow(block_path) catch {};
+                recordBlockHit(self, block_class, payload_block_class);
+                return value;
+            }
+            result_alloc.free(value);
+            try removeCorruptCacheEntry(self, block_path, cancellation);
+        }
+
+        return null;
+    }
+
+    /// Publish a canonical logical block after a coalesced transport read.
+    /// Authentication remains mandatory; transport shape is never cache identity.
+    pub fn publishAuthenticatedBlock(
+        self: *QueryCache,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        block_checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        offset: u64,
+        len: usize,
+        contents: []const u8,
+        cancellation: CancellationToken,
+    ) !void {
+        try cancellation.check();
+        try validateExpectedRange(artifact_id, .{ .byte_len = expected_byte_len, .checksum = expected_checksum }, offset, len);
+        if (len == 0 or contents.len != len) {
+            recordIntegrityFailure(self);
+            return error.ArtifactIntegrityMismatch;
+        }
+        var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(contents, &actual, .{});
+        if (!std.mem.eql(u8, &actual, block_checksum)) {
+            recordIntegrityFailure(self);
+            return error.ArtifactIntegrityMismatch;
+        }
+        const block_class = classifyBlockId(block_id);
+        const payload_block_class = classifyPayloadBlockId(block_id);
+        const path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
+        defer self.alloc.free(path);
+        const published = try publishCacheEntry(self, path, contents, switch (block_class) {
+            .routing => .routing_block,
+            .payload => .payload_block,
+        }, cancellation);
+        recordBlockMiss(self, block_class, payload_block_class, published);
+    }
+
+    /// Authenticate the complete batch before reserving capacity once. Logical
+    /// blocks keep independent identities and durable publication leases.
+    pub fn publishAuthenticatedBlocks(
+        self: *QueryCache,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        blocks: []const AuthenticatedBlockPublication,
+        cancellation: CancellationToken,
+    ) !void {
+        try cancellation.check();
+        if (blocks.len > max_authenticated_publication_blocks) return error.InvalidCacheBatch;
+        if (blocks.len == 0) return;
+        var entries: [max_authenticated_publication_blocks]BatchCacheEntry = @splat(.{});
+        defer for (entries[0..blocks.len]) |entry| if (entry.path) |path| self.alloc.free(path);
+        const lane: CacheWriteLane = switch (classifyBlockId(blocks[0].block_id)) {
+            .routing => .routing_block,
+            .payload => .payload_block,
+        };
+        var payload_bytes: usize = 0;
+        for (blocks, entries[0..blocks.len], 0..) |block, *entry, i| {
+            try validateExpectedRange(artifact_id, .{ .byte_len = expected_byte_len, .checksum = expected_checksum }, block.offset, block.contents.len);
+            if (block.contents.len == 0) return error.InvalidCacheBatch;
+            payload_bytes = std.math.add(usize, payload_bytes, block.contents.len) catch return error.InvalidCacheBatch;
+            if (payload_bytes > 8 * 1024 * 1024) return error.InvalidCacheBatch;
+            const block_class = classifyBlockId(block.block_id);
+            if ((lane == .routing_block) != (block_class == .routing)) return error.InvalidCacheBatch;
+            var actual: [cache_record_digest_len]u8 = undefined;
+            try sha256DigestWithCancellation(block.contents, &actual, cancellation);
+            if (!std.mem.eql(u8, &actual, &block.checksum)) {
+                recordIntegrityFailure(self);
+                return error.ArtifactIntegrityMismatch;
+            }
+            entry.path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block.block_id, block.offset, block.contents.len, block_class);
+            for (entries[0..i]) |prior| {
+                if (std.mem.eql(u8, prior.path.?, entry.path.?)) return error.InvalidCacheBatch;
+            }
+            entry.contents = block.contents;
+            entry.incoming_bytes = try storedCacheEntryBytes(block.contents.len, lane);
+        }
+        defer for (blocks, entries[0..blocks.len]) |block, entry| {
+            if (entry.finished) recordBlockMiss(self, classifyBlockId(block.block_id), classifyPayloadBlockId(block.block_id), entry.published);
+        };
+        try publishCacheEntries(self, entries[0..blocks.len], lane, cancellation);
+    }
+
+    fn getBlockOrFetchRangeImplAlloc(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected: ?ExpectedArtifact,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        if (expected) |value| try validateExpectedRange(artifact_id, value, offset, len);
         const block_class = classifyBlockId(block_id);
         const payload_block_class = classifyPayloadBlockId(block_id);
         const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
@@ -543,7 +908,18 @@ pub const QueryCache = struct {
             return value;
         }
 
-        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
+        const contents = if (expected) |value|
+            try artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                result_alloc,
+                artifact_id,
+                value.byte_len,
+                value.checksum,
+                offset,
+                len,
+                cancellation,
+            )
+        else
+            try artifacts.getRangeAllocWithCancellationUsingAllocator(result_alloc, artifact_id, offset, len, cancellation);
         errdefer result_alloc.free(contents);
         if (contents.len != len) return error.ArtifactIntegrityMismatch;
         const published = try publishCacheEntry(self, block_path, contents, switch (block_class) {
@@ -554,6 +930,42 @@ pub const QueryCache = struct {
         return contents;
     }
 };
+
+fn validateExpectedRange(artifact_id: []const u8, expected: QueryCache.ExpectedArtifact, offset: u64, len: usize) !void {
+    artifacts_mod.validateSha256ArtifactIdentity(artifact_id, expected.checksum) catch return error.ArtifactIntegrityMismatch;
+    const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch return error.InvalidRange;
+    if (end > expected.byte_len) return error.InvalidRange;
+}
+
+fn validateAuthenticatedSubrangeLayout(total_len: usize, subranges: []const AuthenticatedSubrange) !void {
+    if (total_len == 0 or subranges.len == 0) return error.InvalidRange;
+    var covered: usize = 0;
+    for (subranges) |subrange| {
+        if (subrange.len == 0 or subrange.relative_offset != covered) return error.InvalidRange;
+        covered = std.math.add(usize, covered, subrange.len) catch return error.InvalidRange;
+        if (covered > total_len) return error.InvalidRange;
+    }
+    if (covered != total_len) return error.InvalidRange;
+}
+
+fn authenticateSubranges(
+    contents: []const u8,
+    subranges: []const AuthenticatedSubrange,
+    cancellation: CancellationToken,
+) !void {
+    try validateAuthenticatedSubrangeLayout(contents.len, subranges);
+    for (subranges, 0..) |subrange, subrange_index| {
+        if (subrange_index % 64 == 0) try cancellation.check();
+        var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        try sha256DigestWithCancellation(
+            contents[subrange.relative_offset..][0..subrange.len],
+            &actual,
+            cancellation,
+        );
+        if (!std.mem.eql(u8, &actual, &subrange.checksum)) return error.ArtifactIntegrityMismatch;
+    }
+    try cancellation.check();
+}
 
 fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -939,9 +1351,38 @@ fn publishCacheEntry(
         recordBypass(self);
         return false;
     }
-    var publication_lease: ?CachePublicationLease = null;
-    defer if (publication_lease) |*lease| lease.release(self.alloc);
-    var tmp_path: []u8 = undefined;
+    var entries = [_]BatchCacheEntry{.{ .path = path, .contents = contents, .incoming_bytes = incoming_bytes }};
+    try publishCacheEntries(self, &entries, lane, cancellation);
+    return entries[0].published;
+}
+
+const BatchCacheEntry = struct {
+    path: ?[]const u8 = null,
+    contents: []const u8 = &.{},
+    incoming_bytes: u64 = 0,
+    lease: ?CachePublicationLease = null,
+    tmp_path: ?[]u8 = null,
+    reservation_active: bool = false,
+    finished: bool = false,
+    published: bool = false,
+    owns_publication_slot: bool = false,
+};
+
+fn tryAcquirePublicationSlot(self: *QueryCache) bool {
+    var current = self.publication_slots.load(.monotonic);
+    while (current < max_authenticated_publication_blocks) {
+        current = self.publication_slots.cmpxchgWeak(current, current + 1, .monotonic, .monotonic) orelse return true;
+    }
+    return false;
+}
+
+fn publishCacheEntries(self: *QueryCache, entries: []BatchCacheEntry, lane: CacheWriteLane, cancellation: CancellationToken) !void {
+    defer for (entries) |*entry| {
+        if (entry.reservation_active) discardCacheReservationBestEffort(self, entry.tmp_path.?, entry.incoming_bytes, lane);
+        if (entry.lease) |*lease| lease.release(self.alloc);
+        if (entry.owns_publication_slot) _ = self.publication_slots.fetchSub(1, .monotonic);
+        if (entry.tmp_path) |path| self.alloc.free(path);
+    };
     {
         try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
         defer self.maintenance_mu.unlock();
@@ -950,40 +1391,65 @@ fn publishCacheEntry(
         const io = coordination_io.io();
         try lockFileExclusiveWithCancellation(self.coordination_file, io, cancellation);
         defer self.coordination_file.unlock(io);
-
         const now_ns = platform_time.monotonicNs();
-        const periodic_reconcile_due = now_ns >= self.next_abandoned_write_sweep_ns;
-        try synchronizeCacheUsageUnderCoordinationLock(self, io, cancellation, periodic_reconcile_due);
-        if (periodic_reconcile_due) {
-            self.next_abandoned_write_sweep_ns = now_ns +| abandoned_cache_write_sweep_interval_ns;
-        }
-        if (fileExists(path)) return false;
+        const periodic = now_ns >= self.next_abandoned_write_sweep_ns;
+        try synchronizeCacheUsageUnderCoordinationLock(self, io, cancellation, periodic);
+        if (periodic) self.next_abandoned_write_sweep_ns = now_ns +| abandoned_cache_write_sweep_interval_ns;
         try reapAbandonedCacheWritesUnderCoordinationLock(self, io, cancellation);
-        // The caller already owns the fetched bytes, so waiting for another
-        // publisher would only add tail latency. Treat its durable reservation
-        // as a per-key publication lease and let this caller return its bytes
-        // without consuming budget or evicting unrelated entries.
-        publication_lease = (try tryAcquireCachePublicationLease(self.alloc, io, path)) orelse return false;
-
-        // Publish the mutation token before eviction or reservation creation.
-        // A process crash at any later instruction forces every overlapping
-        // writer to reconcile the filesystem before trusting local usage.
-        self.observed_coordination_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
-        if (!try ensureCapacityForWrite(self, incoming_bytes, lane, cancellation)) {
-            recordBypass(self);
-            publication_lease.?.releaseAndDeleteUnderCoordinationLock(self.alloc, io);
-            publication_lease = null;
-            return false;
+        var incoming: u64 = 0;
+        for (entries) |*entry| {
+            try cancellation.check();
+            if (fileExists(entry.path.?)) {
+                entry.finished = true;
+                continue;
+            }
+            const combined = std.math.add(u64, incoming, entry.incoming_bytes) catch return error.CacheEntryTooLarge;
+            // Small caches retain a fitting subset instead of bypassing the
+            // entire response or thrashing already published batch members.
+            if (!entryFitsEmptyCache(self.cfg, combined, lane)) {
+                recordBypass(self);
+                entry.finished = true;
+                continue;
+            }
+            if (!tryAcquirePublicationSlot(self)) {
+                recordBypass(self);
+                entry.finished = true;
+                continue;
+            }
+            entry.owns_publication_slot = true;
+            entry.lease = try tryAcquireCachePublicationLease(self.alloc, io, entry.path.?);
+            if (entry.lease == null) {
+                entry.finished = true;
+                continue;
+            }
+            incoming = combined;
         }
-        tmp_path = try reserveTempFile(self.alloc, path, self.instance_id, incoming_bytes);
-        addUsage(&self.usage, incoming_bytes, lane);
-        recordUsage(self);
+        if (incoming == 0) return;
+        // Advance before the first eviction/reservation mutation so a crash
+        // forces overlapping writers to reconcile their usage snapshots.
+        self.observed_coordination_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
+        if (!try ensureCapacityForWrite(self, incoming, lane, cancellation)) {
+            for (entries) |*entry| if (entry.lease) |*lease| {
+                recordBypass(self);
+                lease.releaseAndDeleteUnderCoordinationLock(self.alloc, io);
+                entry.lease = null;
+                entry.finished = true;
+            };
+            return;
+        }
+        defer recordUsage(self);
+        for (entries) |*entry| {
+            if (entry.lease == null) continue;
+            try cancellation.check();
+            entry.tmp_path = try reserveTempFile(self.alloc, entry.path.?, self.instance_id, entry.incoming_bytes);
+            addUsage(&self.usage, entry.incoming_bytes, lane);
+            entry.reservation_active = true;
+        }
     }
-    defer self.alloc.free(tmp_path);
-    var reservation_active = true;
-    defer if (reservation_active) discardCacheReservationBestEffort(self, tmp_path, incoming_bytes, lane);
-
-    try writeReservedTempFileWithCancellation(tmp_path, contents, lane, cancellation);
+    // File contents are written outside both global locks.
+    for (entries) |entry| {
+        if (entry.reservation_active) try writeReservedTempFileWithCancellation(entry.tmp_path.?, entry.contents, lane, cancellation);
+    }
     try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
     defer self.maintenance_mu.unlock();
     var coordination_io = threadedIo();
@@ -993,25 +1459,25 @@ fn publishCacheEntry(
     defer self.coordination_file.unlock(io);
     try synchronizeCacheUsageUnderCoordinationLock(self, io, cancellation, false);
     self.observed_coordination_generation = try advanceCacheCoordinationGeneration(self.coordination_file, io);
-    if (fileExists(path)) {
-        deleteFilePath(io, tmp_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        subtractUsage(&self.usage, incoming_bytes, lane);
-        recordUsage(self);
-        reservation_active = false;
-        publication_lease.?.releaseAndDeleteUnderCoordinationLock(self.alloc, io);
-        publication_lease = null;
-        return false;
+    defer recordUsage(self);
+    for (entries) |*entry| {
+        if (!entry.reservation_active) continue;
+        try cancellation.check();
+        if (fileExists(entry.path.?)) {
+            deleteFilePath(io, entry.tmp_path.?) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            subtractUsage(&self.usage, entry.incoming_bytes, lane);
+        } else {
+            try renameFilePath(io, entry.tmp_path.?, entry.path.?);
+            entry.published = true;
+        }
+        entry.reservation_active = false;
+        entry.finished = true;
+        entry.lease.?.releaseAndDeleteUnderCoordinationLock(self.alloc, io);
+        entry.lease = null;
     }
-    try cancellation.check();
-    try renameFilePath(io, tmp_path, path);
-    recordUsage(self);
-    reservation_active = false;
-    publication_lease.?.releaseAndDeleteUnderCoordinationLock(self.alloc, io);
-    publication_lease = null;
-    return true;
 }
 
 fn tryAcquireCachePublicationLease(alloc: Allocator, io: std.Io, path: []const u8) !?CachePublicationLease {
@@ -1737,6 +2203,12 @@ fn recordBypass(self: *QueryCache) void {
     self.stats.bypasses += 1;
 }
 
+fn recordIntegrityFailure(self: *QueryCache) void {
+    lockAtomic(&self.stats_mu);
+    defer self.stats_mu.unlock();
+    self.stats.integrity_failures +|= 1;
+}
+
 fn removeCorruptCacheEntry(self: *QueryCache, path: []const u8, cancellation: CancellationToken) !void {
     try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
     defer self.maintenance_mu.unlock();
@@ -2044,6 +2516,164 @@ test "serverless query cache cancels bounded positional reads without recording 
     try std.testing.expectEqual(@as(u64, 0), stats.range_hits);
 }
 
+test "serverless query cache authenticates ranges before publication and self heals poisoned hits" {
+    const alloc = std.testing.allocator;
+    var cache_root_buf: [256]u8 = undefined;
+    const cache_root = tmpPath(&cache_root_buf, "cache-authenticated-ranges");
+    defer cleanupTmp(cache_root);
+
+    const payload = "abcdefgh";
+    var payload_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
+    const checksum = std.fmt.bytesToHex(payload_digest, .lower);
+    var artifact_id: [artifacts_mod.store.sha256_artifact_id_prefix.len + checksum.len]u8 = undefined;
+    @memcpy(artifact_id[0..artifacts_mod.store.sha256_artifact_id_prefix.len], artifacts_mod.store.sha256_artifact_id_prefix);
+    @memcpy(artifact_id[artifacts_mod.store.sha256_artifact_id_prefix.len..], &checksum);
+
+    const State = struct {
+        payload: []const u8,
+        corrupt_next: bool = false,
+        range_calls: usize = 0,
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedPut;
+        }
+        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedFullRead;
+        }
+        fn getRangeAlloc(ptr: *anyopaque, result_alloc: Allocator, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.range_calls += 1;
+            const start = std.math.cast(usize, offset) orelse return error.InvalidRange;
+            if (start > self.payload.len or len > self.payload.len - start) return error.InvalidRange;
+            const result = try result_alloc.dupe(u8, self.payload[start..][0..len]);
+            if (self.corrupt_next and result.len > 0) {
+                result[0] ^= 0x01;
+                self.corrupt_next = false;
+            }
+            return result;
+        }
+        fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedStat;
+        }
+        fn delete(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedDelete;
+        }
+
+        const vtable = artifacts_mod.ArtifactStore.VTable{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = getAlloc,
+            .get_range_alloc = getRangeAlloc,
+            .stat = stat,
+            .delete = delete,
+        };
+    };
+    var state = State{ .payload = payload };
+    var artifacts = artifacts_mod.ArtifactStore{ .allocator = alloc, .ptr = &state, .vtable = &State.vtable };
+    defer artifacts.deinit();
+    var cache = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+
+    var first_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload[0..4], &first_digest, .{});
+    const first_subranges = [_]AuthenticatedSubrange{.{ .relative_offset = 0, .len = 4, .checksum = first_digest }};
+    state.corrupt_next = true;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        payload.len,
+        &checksum,
+        0,
+        4,
+        &first_subranges,
+        .none,
+    ));
+    const first_path = try rangeCachePathAlloc(alloc, std.mem.span(cache_root), &artifact_id, 0, 4);
+    defer alloc.free(first_path);
+    try std.testing.expect(!fileExists(first_path));
+    try std.testing.expectEqual(@as(u64, 1), cache.statsSnapshot().integrity_failures);
+
+    const first = try cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        payload.len,
+        &checksum,
+        0,
+        4,
+        &first_subranges,
+        .none,
+    );
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("abcd", first);
+    try std.testing.expect(fileExists(first_path));
+
+    state.corrupt_next = true;
+    const poisoned = try cache.getRangeOrFetchAlloc(&artifacts, &artifact_id, 4, 4);
+    alloc.free(poisoned);
+    var second_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload[4..8], &second_digest, .{});
+    const second_subranges = [_]AuthenticatedSubrange{.{ .relative_offset = 0, .len = 4, .checksum = second_digest }};
+    const healed = try cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        payload.len,
+        &checksum,
+        4,
+        4,
+        &second_subranges,
+        .none,
+    );
+    defer alloc.free(healed);
+    try std.testing.expectEqualStrings("efgh", healed);
+    try std.testing.expectEqual(@as(usize, 4), state.range_calls);
+    try std.testing.expectEqual(@as(u64, 2), cache.statsSnapshot().integrity_failures);
+
+    // Logical block identities are independently authenticated. A generic
+    // cache fill cannot poison one, and a healed block is reusable without
+    // another object-store range request.
+    state.corrupt_next = true;
+    const poisoned_block = try cache.getBlockOrFetchRangeAlloc(&artifacts, &artifact_id, "graph-metric-score-0-exact", 0, 4);
+    alloc.free(poisoned_block);
+    const healed_block = try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        "graph-metric-score-0-exact",
+        payload.len,
+        &checksum,
+        &first_digest,
+        0,
+        4,
+        .none,
+    );
+    defer alloc.free(healed_block);
+    try std.testing.expectEqualStrings("abcd", healed_block);
+    try std.testing.expectEqual(@as(usize, 6), state.range_calls);
+    try std.testing.expectEqual(@as(u64, 3), cache.statsSnapshot().integrity_failures);
+
+    state.corrupt_next = true;
+    const cached_block = try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        "graph-metric-score-0-exact",
+        payload.len,
+        &checksum,
+        &first_digest,
+        0,
+        4,
+        .none,
+    );
+    defer alloc.free(cached_block);
+    try std.testing.expectEqualStrings("abcd", cached_block);
+    try std.testing.expectEqual(@as(usize, 6), state.range_calls);
+}
+
 test "serverless query cache rejects unsafe artifact ids before filesystem access" {
     const alloc = std.testing.allocator;
     var artifact_root_buf: [256]u8 = undefined;
@@ -2093,6 +2723,158 @@ test "serverless query cache supports relative cache directories" {
     defer alloc.free(payload);
     try std.testing.expectEqualStrings("relative", payload);
     try std.testing.expectEqual(@as(u64, payload.len), cache.statsSnapshot().current_bytes);
+}
+
+test "serverless query cache batches authenticated publication with one eviction pass" {
+    const alloc = std.testing.allocator;
+    var root_buf: [256]u8 = undefined;
+    const root = tmpPath(&root_buf, "cache-authenticated-batch");
+    defer cleanupTmp(root);
+    const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const artifact_id = "sha256:" ++ checksum;
+    const capacity = 8 * (4 + cache_record_header_len);
+    const cfg = QueryCacheConfig{ .max_bytes = capacity, .max_payload_bytes = capacity };
+    var cache = try QueryCache.initWithConfig(alloc, std.mem.span(root), cfg);
+    defer cache.deinit();
+    var overlap = try QueryCache.initWithConfig(alloc, std.mem.span(root), cfg);
+    defer overlap.deinit();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+    var blocks: [8]AuthenticatedBlockPublication = undefined;
+    var ids: [8][64]u8 = undefined;
+    for (&blocks, &ids, 0..) |*block, *id, i| {
+        var old_buf: [64]u8 = undefined;
+        const old_id = try std.fmt.bufPrint(&old_buf, "old-{d}-exact", .{i});
+        try cache.publishAuthenticatedBlock(artifact_id, old_id, 32, checksum, &digest, i * 4, 4, "data", .none);
+        block.* = .{ .block_id = try std.fmt.bufPrint(id, "new-{d}-exact", .{i}), .offset = i * 4, .contents = "data", .checksum = digest };
+    }
+    const before = cache.statsSnapshot();
+    cache.publication_slots.store(max_authenticated_publication_blocks, .monotonic);
+    try cache.publishAuthenticatedBlocks(artifact_id, 32, checksum, &blocks, .none);
+    try std.testing.expectEqual(before.block_writes, cache.statsSnapshot().block_writes);
+    try std.testing.expectEqual(before.evictions, cache.statsSnapshot().evictions);
+    cache.publication_slots.store(0, .monotonic);
+    try cache.publishAuthenticatedBlocks(artifact_id, 32, checksum, &blocks, .none);
+    const after = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), after.evictions - before.evictions);
+    try std.testing.expectEqual(@as(u64, 8), after.block_writes - before.block_writes);
+    try std.testing.expectEqual(@as(u64, capacity), after.current_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.publication_slots.load(.monotonic));
+    // A handle opened before publication must reconcile without evicting or
+    // rewriting existing canonical keys.
+    try overlap.publishAuthenticatedBlocks(artifact_id, 32, checksum, &blocks, .none);
+    try std.testing.expectEqual(@as(u64, 0), overlap.statsSnapshot().block_writes);
+    try std.testing.expectEqual(@as(u64, 0), overlap.statsSnapshot().evictions);
+    try std.testing.expectEqual(@as(u64, capacity), overlap.statsSnapshot().current_bytes);
+    for (blocks) |block| {
+        const bytes = (try overlap.readAuthenticatedBlockIfPresentAlloc(alloc, artifact_id, block.block_id, 32, checksum, &block.checksum, block.offset, block.contents.len, .none)).?;
+        defer alloc.free(bytes);
+        try std.testing.expectEqualStrings(block.contents, bytes);
+    }
+}
+
+test "serverless query cache authenticates whole batches and retains fitting subsets" {
+    const alloc = std.testing.allocator;
+    var root_buf: [256]u8 = undefined;
+    const root = tmpPath(&root_buf, "cache-authenticated-batch-validation");
+    defer cleanupTmp(root);
+    const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const artifact_id = "sha256:" ++ checksum;
+    var cache = try QueryCache.initWithConfig(alloc, std.mem.span(root), .{ .max_bytes = 4 + cache_record_header_len });
+    defer cache.deinit();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+    var blocks = [_]AuthenticatedBlockPublication{
+        .{ .block_id = "first-exact", .offset = 0, .contents = "data", .checksum = digest },
+        .{ .block_id = "second-exact", .offset = 4, .contents = "data", .checksum = digest },
+    };
+    blocks[1].checksum[0] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, cache.publishAuthenticatedBlocks(artifact_id, 8, checksum, &blocks, .none));
+    try std.testing.expectEqual(@as(u64, 0), cache.statsSnapshot().current_bytes);
+    try std.testing.expectEqual(@as(u64, 0), cache.statsSnapshot().block_writes);
+    blocks[1].checksum = digest;
+    const Cancel = struct {
+        fn canceled(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.Canceled, cache.publishAuthenticatedBlocks(artifact_id, 8, checksum, &blocks, .{ .ptr = &blocks, .is_cancelled_fn = Cancel.canceled }));
+    try std.testing.expectError(error.InvalidCacheBatch, cache.publishAuthenticatedBlocks(artifact_id, 8, checksum, &.{ blocks[0], blocks[0] }, .none));
+    try cache.publishAuthenticatedBlocks(artifact_id, 8, checksum, &blocks, .none);
+    try std.testing.expectEqual(@as(u64, 1), cache.statsSnapshot().block_writes);
+    try std.testing.expectEqual(@as(u64, 1), cache.statsSnapshot().bypasses);
+    try std.testing.expectEqual(@as(u64, 4 + cache_record_header_len), cache.statsSnapshot().current_bytes);
+    const retained = (try cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact_id, blocks[0].block_id, 8, checksum, &digest, 0, 4, .none)).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("data", retained);
+}
+
+test "serverless query cache canceled batch releases partial reservations and publication leases" {
+    const alloc = std.testing.allocator;
+    var root_buf: [256]u8 = undefined;
+    const root = tmpPath(&root_buf, "cache-batch-cancel-reservation");
+    defer cleanupTmp(root);
+    const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const artifact_id = "sha256:" ++ checksum;
+    var cache = try QueryCache.init(alloc, std.mem.span(root));
+    defer cache.deinit();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+    const blocks = [_]AuthenticatedBlockPublication{
+        .{ .block_id = "first-exact", .offset = 0, .contents = "data", .checksum = digest },
+        .{ .block_id = "second-exact", .offset = 4, .contents = "data", .checksum = digest },
+    };
+    const Cancel = struct {
+        fn afterFirstReservation(ptr: *const anyopaque) bool {
+            const current: *const QueryCache = @ptrCast(@alignCast(ptr));
+            // Only this test thread mutates the cache.
+            return current.usage.payload_block_count > 0;
+        }
+    };
+    try std.testing.expectError(error.Canceled, cache.publishAuthenticatedBlocks(artifact_id, 8, checksum, &blocks, .{ .ptr = &cache, .is_cancelled_fn = Cancel.afterFirstReservation }));
+    try std.testing.expectEqual(@as(u64, 0), cache.statsSnapshot().current_bytes);
+    try std.testing.expectEqual(@as(u64, 0), cache.statsSnapshot().block_writes);
+    var reopened = try QueryCache.init(alloc, std.mem.span(root));
+    try std.testing.expectEqual(@as(usize, 0), cache.publication_slots.load(.monotonic));
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 0), reopened.statsSnapshot().current_bytes);
+    try reopened.publishAuthenticatedBlocks(artifact_id, 8, checksum, &blocks, .none);
+    try std.testing.expectEqual(@as(u64, 2), reopened.statsSnapshot().block_writes);
+    try std.testing.expectEqual(@as(u64, 2 * (4 + cache_record_header_len)), reopened.statsSnapshot().current_bytes);
+}
+
+test "serverless query cache batch publication releases allocations and reservations on failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var root_buf: [256]u8 = undefined;
+            const root = tmpPath(&root_buf, "cache-batch-allocation-failure");
+            defer cleanupTmp(root);
+            const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            const artifact_id = "sha256:" ++ checksum;
+            // Initialization is not the operation under test; replace only
+            // the allocator used by batch paths, leases, and reservations.
+            var cache = try QueryCache.init(std.testing.allocator, std.mem.span(root));
+            defer cache.deinit();
+            const owner_alloc = cache.alloc;
+            cache.alloc = alloc;
+            defer cache.alloc = owner_alloc;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+            const blocks = [_]AuthenticatedBlockPublication{
+                .{ .block_id = "first-exact", .offset = 0, .contents = "data", .checksum = digest },
+                .{ .block_id = "second-exact", .offset = 4, .contents = "data", .checksum = digest },
+            };
+            cache.publishAuthenticatedBlocks(artifact_id, 8, checksum, &blocks, .none) catch |err| {
+                // Reopening reaps abandoned writes even if allocation failed
+                // partway through reserving or committing the batch.
+                var reopened = try QueryCache.init(std.testing.allocator, std.mem.span(root));
+                defer reopened.deinit();
+                try std.testing.expect(reopened.statsSnapshot().current_bytes <= 2 * (4 + cache_record_header_len));
+                return err;
+            };
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless query cache bypasses oversized entries without evicting useful data" {

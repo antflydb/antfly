@@ -803,7 +803,20 @@ pub const ManagedEmbedder = struct {
         return try initFromIndexValueObjectWithOptions(alloc, root, .{});
     }
 
-    fn initFromIndexValueObjectWithOptions(alloc: std.mem.Allocator, root: std.json.Value, options: InitOptions) !ManagedEmbedder {
+    pub fn initFromIndexValueObjectWithOptions(alloc: std.mem.Allocator, root: std.json.Value, options: InitOptions) !ManagedEmbedder {
+        return try initFromIndexValueObjectWithOptionsAndKind(alloc, root, options, null);
+    }
+
+    pub fn initDenseFromIndexValueObjectWithOptions(alloc: std.mem.Allocator, root: std.json.Value, options: InitOptions) !ManagedEmbedder {
+        return try initFromIndexValueObjectWithOptionsAndKind(alloc, root, options, false);
+    }
+
+    fn initFromIndexValueObjectWithOptionsAndKind(
+        alloc: std.mem.Allocator,
+        root: std.json.Value,
+        options: InitOptions,
+        sparse_kind: ?bool,
+    ) !ManagedEmbedder {
         const object = switch (root) {
             .object => |object| object,
             else => return error.InvalidManagedEmbeddingIndex,
@@ -817,11 +830,11 @@ pub const ManagedEmbedder = struct {
 
         var it = object.iterator();
         while (it.next()) |entry| {
-            const managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options) orelse continue;
+            const managed = try parseManagedEmbeddingEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, options, sparse_kind) orelse continue;
             try entries.append(alloc, managed);
         }
-        try validateAllEmbeddingEnrichmentProducers(alloc, root, options, entries.items);
-        try addArtifactBackedManagedEmbeddingEntries(alloc, root, options, &entries);
+        try validateAllEmbeddingEnrichmentProducers(alloc, root, options, entries.items, sparse_kind);
+        try addArtifactBackedManagedEmbeddingEntries(alloc, root, options, &entries, sparse_kind);
         var vector_spaces = VectorSpaceMap.empty;
         defer vector_spaces.deinit(alloc);
         try collectEmbeddingVectorSpaces(root, &vector_spaces, alloc);
@@ -946,9 +959,19 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         options: InitOptions,
     ) !?db_embedder.DenseEmbedder {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+        defer parsed.deinit();
+        return try createDenseEmbedderFromIndexValueWithOptions(alloc, parsed.value, options);
+    }
+
+    pub fn createDenseEmbedderFromIndexValueWithOptions(
+        alloc: std.mem.Allocator,
+        root: std.json.Value,
+        options: InitOptions,
+    ) !?db_embedder.DenseEmbedder {
         const owned = try alloc.create(ManagedEmbedder);
         errdefer alloc.destroy(owned);
-        owned.* = try initFromIndexesJsonWithOptions(alloc, indexes_json, options);
+        owned.* = try initFromIndexValueObjectWithOptionsAndKind(alloc, root, options, false);
         if (!owned.hasDenseEntries()) {
             owned.deinit();
             alloc.destroy(owned);
@@ -974,9 +997,19 @@ pub const ManagedEmbedder = struct {
         indexes_json: []const u8,
         options: InitOptions,
     ) !?db_embedder.SparseEmbedder {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+        defer parsed.deinit();
+        return try createSparseEmbedderFromIndexValueWithOptions(alloc, parsed.value, options);
+    }
+
+    pub fn createSparseEmbedderFromIndexValueWithOptions(
+        alloc: std.mem.Allocator,
+        root: std.json.Value,
+        options: InitOptions,
+    ) !?db_embedder.SparseEmbedder {
         const owned = try alloc.create(ManagedEmbedder);
         errdefer alloc.destroy(owned);
-        owned.* = try initFromIndexesJsonWithOptions(alloc, indexes_json, options);
+        owned.* = try initFromIndexValueObjectWithOptionsAndKind(alloc, root, options, true);
         if (!owned.hasSparseEntries()) {
             owned.deinit();
             alloc.destroy(owned);
@@ -2663,9 +2696,14 @@ fn validateEmbeddingEnrichmentProducerValue(
     producer: std.json.Value,
     options: InitOptions,
     executable_entries: ?[]const ManagedEmbeddingEntry,
+    sparse_kind: ?bool,
 ) !void {
     const producer_sparse = try semanticProducerV2Sparse(producer);
     if (producer_sparse) |sparse| {
+        // Stage factories own only one executable registry. Do not mistake
+        // the other stage's deliberately omitted owner for an orphan.
+        // Unfiltered catalog admission still validates every producer.
+        if (sparse_kind) |selected| if (sparse != selected) return;
         if (sparse and enrichment_dims != null) return error.ConflictingEmbeddingArtifactDimensions;
         if (!sparse and enrichment_dims == null) return error.EmbeddingArtifactDimensionRequired;
     }
@@ -2709,6 +2747,7 @@ fn validateEmbeddingEnrichmentProducer(
     enrichment: std.json.Value,
     options: InitOptions,
     executable_entries: ?[]const ManagedEmbeddingEntry,
+    sparse_kind: ?bool,
 ) !void {
     const object = switch (enrichment) {
         .object => |object| object,
@@ -2752,6 +2791,7 @@ fn validateEmbeddingEnrichmentProducer(
                 producer.value,
                 options,
                 executable_entries,
+                sparse_kind,
             );
         },
         .object => try validateEmbeddingEnrichmentProducerValue(
@@ -2761,6 +2801,7 @@ fn validateEmbeddingEnrichmentProducer(
             producer_json,
             options,
             executable_entries,
+            sparse_kind,
         ),
         else => return error.InvalidEmbeddingArtifactProducer,
     }
@@ -2771,23 +2812,24 @@ fn validateAllEmbeddingEnrichmentProducers(
     value: std.json.Value,
     options: InitOptions,
     executable_entries: []const ManagedEmbeddingEntry,
+    sparse_kind: ?bool,
 ) !void {
     switch (value) {
         .object => |object| {
             if (object.get("enrichments")) |enrichments| {
                 if (enrichments != .array) return error.InvalidManagedEmbeddingIndex;
                 for (enrichments.array.items) |enrichment| {
-                    try validateEmbeddingEnrichmentProducer(alloc, enrichment, options, executable_entries);
+                    try validateEmbeddingEnrichmentProducer(alloc, enrichment, options, executable_entries, sparse_kind);
                 }
             }
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                try validateAllEmbeddingEnrichmentProducers(alloc, entry.value_ptr.*, options, executable_entries);
+                try validateAllEmbeddingEnrichmentProducers(alloc, entry.value_ptr.*, options, executable_entries, sparse_kind);
             }
         },
         .array => |array| for (array.items) |item|
-            try validateAllEmbeddingEnrichmentProducers(alloc, item, options, executable_entries),
+            try validateAllEmbeddingEnrichmentProducers(alloc, item, options, executable_entries, sparse_kind),
         else => {},
     }
 }
@@ -2802,7 +2844,7 @@ pub fn validateEmbeddingEnrichmentProducerJsonWithOptions(
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, enrichment_json, .{});
     defer parsed.deinit();
-    try validateEmbeddingEnrichmentProducer(alloc, parsed.value, options, null);
+    try validateEmbeddingEnrichmentProducer(alloc, parsed.value, options, null, null);
 }
 
 const CatalogProducerOwner = struct {
@@ -3202,6 +3244,7 @@ fn validateCatalogEmbeddingProducerOwnership(
                             producer,
                             .{},
                             null,
+                            null,
                         );
                     }
                 }
@@ -3437,6 +3480,7 @@ fn addArtifactBackedManagedEmbeddingEntries(
     root: std.json.Value,
     options: InitOptions,
     entries: *std.ArrayListUnmanaged(ManagedEmbeddingEntry),
+    sparse_kind: ?bool,
 ) !void {
     const object = root.object;
     var it = object.iterator();
@@ -3453,6 +3497,7 @@ fn addArtifactBackedManagedEmbeddingEntries(
         defer parsed_cfg.deinit();
         const cfg = parsed_cfg.value;
         if (cfg.external orelse false) continue;
+        if (sparse_kind) |selected| if ((cfg.sparse orelse false) != selected) continue;
 
         if (cfg.embedding_name) |artifact_name| {
             try registerArtifactManagedEmbeddingLookup(
@@ -3486,6 +3531,7 @@ fn parseManagedEmbeddingEntry(
     index_name: []const u8,
     value: std.json.Value,
     options: InitOptions,
+    sparse_kind: ?bool,
 ) !?ManagedEmbeddingEntry {
     const root = switch (value) {
         .object => |object| object,
@@ -3503,6 +3549,7 @@ fn parseManagedEmbeddingEntry(
     if (external) return null;
 
     const sparse = cfg.sparse orelse false;
+    if (sparse_kind) |expected_sparse| if (sparse != expected_sparse) return null;
 
     const embedder = root.get("embedder") orelse return null;
     const declared_dims = if (sparse) null else try resolveDeclaredEmbeddingDimensions(cfg);
@@ -5888,6 +5935,67 @@ test "managed embedder interface deinit uses owner allocator" {
         \\}
     , local.provider())) orelse return error.TestUnexpectedResult;
     dense.deinit(std.heap.page_allocator);
+}
+
+test "serverless managed embedder stage factories ignore unrelated provider construction" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+
+    var sparse_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{
+        \\  "sparse_idx":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"antflydb/splade"}},
+        \\  "broken_dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":""}}
+        \\}
+    , .{});
+    defer sparse_parsed.deinit();
+    const sparse = (try ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(
+        std.testing.allocator,
+        sparse_parsed.value,
+        .{ .antfly_provider = local.provider() },
+    )) orelse return error.TestUnexpectedResult;
+    sparse.deinit(std.testing.allocator);
+
+    var dense_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{
+        \\  "dense_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
+        \\  "broken_sparse":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"openai","model":""}}
+        \\}
+    , .{});
+    defer dense_parsed.deinit();
+    const dense = (try ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(
+        std.testing.allocator,
+        dense_parsed.value,
+        .{ .antfly_provider = local.provider() },
+    )) orelse return error.TestUnexpectedResult;
+    dense.deinit(std.testing.allocator);
+}
+
+test "serverless managed embedder stage selection includes producer validation and artifact consumers" {
+    const alloc = std.testing.allocator;
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{
+        \\  "dense_owner":{"type":"embeddings","field":"body","dimension":3,"embedding_name":"dense_v1","embedder":{"provider":"antfly","model":"test-model"}},
+        \\  "sparse_owner":{"type":"embeddings","field":"body","sparse":true,"embedding_name":"sparse_v1","embedder":{"provider":"antfly","model":"test-model"}},
+        \\  "dense_consumer":{"type":"embeddings","dimension":3,"sources":[{"artifact":"dense_v1"}]},
+        \\  "sparse_consumer":{"type":"embeddings","sparse":true,"sources":[{"artifact":"sparse_v1"}]},
+        \\  "enrichments":[
+        \\    {"name":"dense_v1","kind":"embedding","field":"body","expected_dims":3,"producer_json":{"version":2,"provider":"antfly","model":"test-model","endpoint":"antfly:embedded","sparse":false}},
+        \\    {"name":"sparse_v1","kind":"embedding","field":"body","producer_json":{"version":2,"provider":"antfly","model":"test-model","endpoint":"antfly:embedded","sparse":true}}
+        \\  ]
+        \\}
+    , .{});
+    defer parsed.deinit();
+    for ([_]?bool{ null, false, true }) |kind| {
+        var managed = try ManagedEmbedder.initFromIndexValueObjectWithOptionsAndKind(alloc, parsed.value, .{ .antfly_provider = local.provider() }, kind);
+        defer managed.deinit();
+        try std.testing.expectEqual(@as(usize, if (kind == null) 2 else 1), managed.entries.len);
+        try std.testing.expectEqual(kind == null or !kind.?, managed.hasDenseEntries());
+        try std.testing.expectEqual(kind == null or kind.?, managed.hasSparseEntries());
+    }
+    // In-stage validation must still reject an orphan; selecting a factory
+    // must not disable ownership validation altogether.
+    _ = parsed.value.object.swapRemove("dense_owner");
+    try std.testing.expectError(error.InvalidEmbeddingArtifactProducer, ManagedEmbedder.initDenseFromIndexValueObjectWithOptions(alloc, parsed.value, .{ .antfly_provider = local.provider() }));
 }
 
 test "managed embedder uses embedder dimensions metadata at runtime" {

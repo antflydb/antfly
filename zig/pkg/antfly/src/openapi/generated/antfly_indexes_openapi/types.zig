@@ -5307,6 +5307,7 @@ pub const GraphIndexStats = struct {
     promotion: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
+    graph_metric_runtime: ?GraphMetricRuntimeStats = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -5362,6 +5363,7 @@ pub const GraphIndexStats = struct {
         .{ "resolution", "resolution", true },
         .{ "promotion", "promotion", true },
         .{ "algebraic_graph", "algebraic_graph", true },
+        .{ "graph_metric_runtime", "graph_metric_runtime", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5578,6 +5580,10 @@ pub const GraphIndexStats = struct {
         }
         if (self.algebraic_graph) |value| {
             try jw.objectField("algebraic_graph");
+            try jw.write(value);
+        }
+        if (self.graph_metric_runtime) |value| {
+            try jw.objectField("graph_metric_runtime");
             try jw.write(value);
         }
         try jw.endObject();
@@ -5830,6 +5836,830 @@ pub const GraphMatchQuery = struct {
     @"return": GraphReturn,
 };
 
+pub const GraphMetricBuildPageStatus = struct {
+    phase: []const u8,
+    iteration: i64,
+    page_id: i64,
+    state: []const u8,
+    range_kind: []const u8,
+    /// Worker id that owns or last failed this page.
+    worker_id: ?[]const u8 = null,
+    /// Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+    lease_expires_at_ms: ?i64 = null,
+    /// Current attempt number for this page.
+    attempt: ?i64 = null,
+    /// Opaque resumable cursor for this page.
+    cursor: ?[]const u8 = null,
+    /// Completed work units for this page.
+    completed_units: ?i64 = null,
+    /// Estimated total work units for this page.
+    total_units: ?i64 = null,
+    /// Last page-level error.
+    last_error: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "phase", "phase", false },
+        .{ "iteration", "iteration", false },
+        .{ "page_id", "page_id", false },
+        .{ "state", "state", false },
+        .{ "range_kind", "range_kind", false },
+        .{ "worker_id", "worker_id", true },
+        .{ "lease_expires_at_ms", "lease_expires_at_ms", true },
+        .{ "attempt", "attempt", true },
+        .{ "cursor", "cursor", true },
+        .{ "completed_units", "completed_units", true },
+        .{ "total_units", "total_units", true },
+        .{ "last_error", "last_error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("iteration");
+        try jw.write(self.iteration);
+        try jw.objectField("page_id");
+        try jw.write(self.page_id);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("range_kind");
+        try jw.write(self.range_kind);
+        if (self.worker_id) |value| {
+            try jw.objectField("worker_id");
+            try jw.write(value);
+        }
+        if (self.lease_expires_at_ms) |value| {
+            try jw.objectField("lease_expires_at_ms");
+            try jw.write(value);
+        }
+        if (self.attempt) |value| {
+            try jw.objectField("attempt");
+            try jw.write(value);
+        }
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        if (self.completed_units) |value| {
+            try jw.objectField("completed_units");
+            try jw.write(value);
+        }
+        if (self.total_units) |value| {
+            try jw.objectField("total_units");
+            try jw.write(value);
+        }
+        if (self.last_error) |value| {
+            try jw.objectField("last_error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphMetricEdgeFilterStatus = struct {
+    mode: []const u8,
+    types: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", false },
+        .{ "types", "types", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.types) |value| {
+            try jw.objectField("types");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphMetricEvent = struct {
+    sequence: i64,
+    kind: []const u8,
+    at_ms: i64,
+    target_edge_generation: i64,
+    published_generation: i64,
+    score_count: i64,
+};
+
+pub const GraphMetricFilter = struct {
+    metric: []const u8,
+    /// Semantic comparison operator. Named values keep generated SDK enums portable and readable.
+    op: []const u8,
+    value: f64,
+};
+
+pub const GraphMetricOrder = struct {
+    metric: []const u8,
+    direction: ?[]const u8 = null,
+    nulls: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metric", "metric", false },
+        .{ "direction", "direction", true },
+        .{ "nulls", "nulls", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("metric");
+        try jw.write(self.metric);
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.nulls) |value| {
+            try jw.objectField("nulls");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
+pub const GraphMetricQuery = struct {
+    /// Optional result key. Defaults to the metric name.
+    name: ?[]const u8 = null,
+    /// Graph index that owns the published metric.
+    index: []const u8,
+    /// Graph metric to read.
+    metric: []const u8,
+    /// Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated metric snapshot.
+    top_k: ?i32 = null,
+    /// Whether the latest published generation may be stale or must match the graph edge generation.
+    metric_freshness: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", true },
+        .{ "index", "index", false },
+        .{ "metric", "metric", false },
+        .{ "top_k", "top_k", true },
+        .{ "metric_freshness", "metric_freshness", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("metric");
+        try jw.write(self.metric);
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.metric_freshness) |value| {
+            try jw.objectField("metric_freshness");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
+pub const GraphMetricRerank = struct {
+    /// Graph index that owns the published metric.
+    index: []const u8,
+    /// Graph metric name to blend into the search hit score.
+    metric: []const u8,
+    /// Bounded retrieval window scored by the graph metric before offset and limit are applied. When omitted, Antfly uses an adaptive four-times page window, capped at 10,000 candidates. An explicit value must cover offset plus limit. Larger windows improve promotion recall at predictable linear score-read cost.
+    candidate_count: ?i32 = null,
+    /// Multiplier applied to the existing hit score before adding the graph metric feature.
+    base_weight: ?f64 = null,
+    /// Multiplier applied to the graph metric score before it is added to the existing hit score.
+    weight: ?f64 = null,
+    /// Metric feature value to use for hits that do not have a score in the published metric generation.
+    missing_score: ?f64 = null,
+    /// Whether stale published generations are acceptable or the metric must be fresh.
+    metric_freshness: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "metric", "metric", false },
+        .{ "candidate_count", "candidate_count", true },
+        .{ "base_weight", "base_weight", true },
+        .{ "weight", "weight", true },
+        .{ "missing_score", "missing_score", true },
+        .{ "metric_freshness", "metric_freshness", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("metric");
+        try jw.write(self.metric);
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.base_weight) |value| {
+            try jw.objectField("base_weight");
+            try jw.write(value);
+        }
+        if (self.weight) |value| {
+            try jw.objectField("weight");
+            try jw.write(value);
+        }
+        if (self.missing_score) |value| {
+            try jw.objectField("missing_score");
+            try jw.write(value);
+        }
+        if (self.metric_freshness) |value| {
+            try jw.objectField("metric_freshness");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphMetricResult = struct {
+    index_name: []const u8,
+    metric: []const u8,
+    scores: []const GraphMetricScore,
+    status: GraphMetricStatus,
+};
+
+/// Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers.
+pub const GraphMetricRuntimeStats = struct {
+    enabled: ?bool = null,
+    role: ?[]const u8 = null,
+    runtime_id_hash: ?i64 = null,
+    owner_id_hash: ?i64 = null,
+    lease_key_hash: ?i64 = null,
+    worker_id_hash: ?i64 = null,
+    worker_count: ?i64 = null,
+    lease_owned: ?bool = null,
+    has_lease: ?bool = null,
+    acquisition_count: ?i64 = null,
+    takeover_count: ?i64 = null,
+    lease_acquire_failures: ?i64 = null,
+    lost_leases: ?i64 = null,
+    last_acquired_ms: ?i64 = null,
+    /// Cached expiry of the currently held maintenance lease, or zero when no lease is held.
+    lease_expires_at_ms: ?i64 = null,
+    /// Earliest time the runtime will renew its maintenance lease, or zero when no lease is held.
+    lease_renew_after_ms: ?i64 = null,
+    /// Number of durable maintenance lease renewals completed by this runtime.
+    renewal_count: ?i64 = null,
+    started: ?bool = null,
+    shutdown: ?bool = null,
+    notified: ?bool = null,
+    ticks_started: ?i64 = null,
+    ticks_completed: ?i64 = null,
+    durable_progress_ticks: ?i64 = null,
+    idle_ticks: ?i64 = null,
+    error_ticks: ?i64 = null,
+    last_error_name: ?[]const u8 = null,
+    total_metrics_scanned: ?i64 = null,
+    total_active_builds: ?i64 = null,
+    total_builds_started: ?i64 = null,
+    total_worker_steps: ?i64 = null,
+    total_coordinator_steps: ?i64 = null,
+    /// Consumed intermediate records retired at completed reduction barriers.
+    total_retired_input_records: ?i64 = null,
+    total_pages_claimed: ?i64 = null,
+    total_pages_completed: ?i64 = null,
+    total_phases_advanced: ?i64 = null,
+    total_published: ?i64 = null,
+    total_failed_builds: ?i64 = null,
+    last_metrics_scanned: ?i64 = null,
+    last_active_builds: ?i64 = null,
+    last_builds_started: ?i64 = null,
+    last_worker_steps: ?i64 = null,
+    last_coordinator_steps: ?i64 = null,
+    /// Consumed intermediate records retired in the latest maintenance tick.
+    last_retired_input_records: ?i64 = null,
+    last_pages_claimed: ?i64 = null,
+    last_pages_completed: ?i64 = null,
+    last_phases_advanced: ?i64 = null,
+    last_published: ?i64 = null,
+    last_failed_builds: ?i64 = null,
+    last_budget_exhausted: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "role", "role", true },
+        .{ "runtime_id_hash", "runtime_id_hash", true },
+        .{ "owner_id_hash", "owner_id_hash", true },
+        .{ "lease_key_hash", "lease_key_hash", true },
+        .{ "worker_id_hash", "worker_id_hash", true },
+        .{ "worker_count", "worker_count", true },
+        .{ "lease_owned", "lease_owned", true },
+        .{ "has_lease", "has_lease", true },
+        .{ "acquisition_count", "acquisition_count", true },
+        .{ "takeover_count", "takeover_count", true },
+        .{ "lease_acquire_failures", "lease_acquire_failures", true },
+        .{ "lost_leases", "lost_leases", true },
+        .{ "last_acquired_ms", "last_acquired_ms", true },
+        .{ "lease_expires_at_ms", "lease_expires_at_ms", true },
+        .{ "lease_renew_after_ms", "lease_renew_after_ms", true },
+        .{ "renewal_count", "renewal_count", true },
+        .{ "started", "started", true },
+        .{ "shutdown", "shutdown", true },
+        .{ "notified", "notified", true },
+        .{ "ticks_started", "ticks_started", true },
+        .{ "ticks_completed", "ticks_completed", true },
+        .{ "durable_progress_ticks", "durable_progress_ticks", true },
+        .{ "idle_ticks", "idle_ticks", true },
+        .{ "error_ticks", "error_ticks", true },
+        .{ "last_error_name", "last_error_name", true },
+        .{ "total_metrics_scanned", "total_metrics_scanned", true },
+        .{ "total_active_builds", "total_active_builds", true },
+        .{ "total_builds_started", "total_builds_started", true },
+        .{ "total_worker_steps", "total_worker_steps", true },
+        .{ "total_coordinator_steps", "total_coordinator_steps", true },
+        .{ "total_retired_input_records", "total_retired_input_records", true },
+        .{ "total_pages_claimed", "total_pages_claimed", true },
+        .{ "total_pages_completed", "total_pages_completed", true },
+        .{ "total_phases_advanced", "total_phases_advanced", true },
+        .{ "total_published", "total_published", true },
+        .{ "total_failed_builds", "total_failed_builds", true },
+        .{ "last_metrics_scanned", "last_metrics_scanned", true },
+        .{ "last_active_builds", "last_active_builds", true },
+        .{ "last_builds_started", "last_builds_started", true },
+        .{ "last_worker_steps", "last_worker_steps", true },
+        .{ "last_coordinator_steps", "last_coordinator_steps", true },
+        .{ "last_retired_input_records", "last_retired_input_records", true },
+        .{ "last_pages_claimed", "last_pages_claimed", true },
+        .{ "last_pages_completed", "last_pages_completed", true },
+        .{ "last_phases_advanced", "last_phases_advanced", true },
+        .{ "last_published", "last_published", true },
+        .{ "last_failed_builds", "last_failed_builds", true },
+        .{ "last_budget_exhausted", "last_budget_exhausted", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.role) |value| {
+            try jw.objectField("role");
+            try jw.write(value);
+        }
+        if (self.runtime_id_hash) |value| {
+            try jw.objectField("runtime_id_hash");
+            try jw.write(value);
+        }
+        if (self.owner_id_hash) |value| {
+            try jw.objectField("owner_id_hash");
+            try jw.write(value);
+        }
+        if (self.lease_key_hash) |value| {
+            try jw.objectField("lease_key_hash");
+            try jw.write(value);
+        }
+        if (self.worker_id_hash) |value| {
+            try jw.objectField("worker_id_hash");
+            try jw.write(value);
+        }
+        if (self.worker_count) |value| {
+            try jw.objectField("worker_count");
+            try jw.write(value);
+        }
+        if (self.lease_owned) |value| {
+            try jw.objectField("lease_owned");
+            try jw.write(value);
+        }
+        if (self.has_lease) |value| {
+            try jw.objectField("has_lease");
+            try jw.write(value);
+        }
+        if (self.acquisition_count) |value| {
+            try jw.objectField("acquisition_count");
+            try jw.write(value);
+        }
+        if (self.takeover_count) |value| {
+            try jw.objectField("takeover_count");
+            try jw.write(value);
+        }
+        if (self.lease_acquire_failures) |value| {
+            try jw.objectField("lease_acquire_failures");
+            try jw.write(value);
+        }
+        if (self.lost_leases) |value| {
+            try jw.objectField("lost_leases");
+            try jw.write(value);
+        }
+        if (self.last_acquired_ms) |value| {
+            try jw.objectField("last_acquired_ms");
+            try jw.write(value);
+        }
+        if (self.lease_expires_at_ms) |value| {
+            try jw.objectField("lease_expires_at_ms");
+            try jw.write(value);
+        }
+        if (self.lease_renew_after_ms) |value| {
+            try jw.objectField("lease_renew_after_ms");
+            try jw.write(value);
+        }
+        if (self.renewal_count) |value| {
+            try jw.objectField("renewal_count");
+            try jw.write(value);
+        }
+        if (self.started) |value| {
+            try jw.objectField("started");
+            try jw.write(value);
+        }
+        if (self.shutdown) |value| {
+            try jw.objectField("shutdown");
+            try jw.write(value);
+        }
+        if (self.notified) |value| {
+            try jw.objectField("notified");
+            try jw.write(value);
+        }
+        if (self.ticks_started) |value| {
+            try jw.objectField("ticks_started");
+            try jw.write(value);
+        }
+        if (self.ticks_completed) |value| {
+            try jw.objectField("ticks_completed");
+            try jw.write(value);
+        }
+        if (self.durable_progress_ticks) |value| {
+            try jw.objectField("durable_progress_ticks");
+            try jw.write(value);
+        }
+        if (self.idle_ticks) |value| {
+            try jw.objectField("idle_ticks");
+            try jw.write(value);
+        }
+        if (self.error_ticks) |value| {
+            try jw.objectField("error_ticks");
+            try jw.write(value);
+        }
+        if (self.last_error_name) |value| {
+            try jw.objectField("last_error_name");
+            try jw.write(value);
+        }
+        if (self.total_metrics_scanned) |value| {
+            try jw.objectField("total_metrics_scanned");
+            try jw.write(value);
+        }
+        if (self.total_active_builds) |value| {
+            try jw.objectField("total_active_builds");
+            try jw.write(value);
+        }
+        if (self.total_builds_started) |value| {
+            try jw.objectField("total_builds_started");
+            try jw.write(value);
+        }
+        if (self.total_worker_steps) |value| {
+            try jw.objectField("total_worker_steps");
+            try jw.write(value);
+        }
+        if (self.total_coordinator_steps) |value| {
+            try jw.objectField("total_coordinator_steps");
+            try jw.write(value);
+        }
+        if (self.total_retired_input_records) |value| {
+            try jw.objectField("total_retired_input_records");
+            try jw.write(value);
+        }
+        if (self.total_pages_claimed) |value| {
+            try jw.objectField("total_pages_claimed");
+            try jw.write(value);
+        }
+        if (self.total_pages_completed) |value| {
+            try jw.objectField("total_pages_completed");
+            try jw.write(value);
+        }
+        if (self.total_phases_advanced) |value| {
+            try jw.objectField("total_phases_advanced");
+            try jw.write(value);
+        }
+        if (self.total_published) |value| {
+            try jw.objectField("total_published");
+            try jw.write(value);
+        }
+        if (self.total_failed_builds) |value| {
+            try jw.objectField("total_failed_builds");
+            try jw.write(value);
+        }
+        if (self.last_metrics_scanned) |value| {
+            try jw.objectField("last_metrics_scanned");
+            try jw.write(value);
+        }
+        if (self.last_active_builds) |value| {
+            try jw.objectField("last_active_builds");
+            try jw.write(value);
+        }
+        if (self.last_builds_started) |value| {
+            try jw.objectField("last_builds_started");
+            try jw.write(value);
+        }
+        if (self.last_worker_steps) |value| {
+            try jw.objectField("last_worker_steps");
+            try jw.write(value);
+        }
+        if (self.last_coordinator_steps) |value| {
+            try jw.objectField("last_coordinator_steps");
+            try jw.write(value);
+        }
+        if (self.last_retired_input_records) |value| {
+            try jw.objectField("last_retired_input_records");
+            try jw.write(value);
+        }
+        if (self.last_pages_claimed) |value| {
+            try jw.objectField("last_pages_claimed");
+            try jw.write(value);
+        }
+        if (self.last_pages_completed) |value| {
+            try jw.objectField("last_pages_completed");
+            try jw.write(value);
+        }
+        if (self.last_phases_advanced) |value| {
+            try jw.objectField("last_phases_advanced");
+            try jw.write(value);
+        }
+        if (self.last_published) |value| {
+            try jw.objectField("last_published");
+            try jw.write(value);
+        }
+        if (self.last_failed_builds) |value| {
+            try jw.objectField("last_failed_builds");
+            try jw.write(value);
+        }
+        if (self.last_budget_exhausted) |value| {
+            try jw.objectField("last_budget_exhausted");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphMetricScore = struct {
+    node: []const u8,
+    score: f64,
+};
+
+pub const GraphMetricStatus = struct {
+    state: []const u8,
+    phase: []const u8,
+    edge_filter: ?GraphMetricEdgeFilterStatus = null,
+    /// Version of the published graph metric metadata schema.
+    metadata_version: ?i64 = null,
+    /// Deterministic configuration fingerprint encoded as fixed-width hexadecimal so every SDK preserves all 64 bits.
+    config_fingerprint: ?[]const u8 = null,
+    maintenance_paused: ?bool = null,
+    /// Whether a local or distributed build is queued after the currently published or building generation.
+    build_queued: bool,
+    published_generation: i64,
+    edge_generation: i64,
+    target_edge_generation: i64,
+    /// Pending edge generation waiting to build, or 0 when no build is queued.
+    queued_generation: ?i64 = null,
+    /// Edge generation currently held by an active build lease, or 0 when idle.
+    building_generation: ?i64 = null,
+    /// Durable identifier for the active graph metric build job, or 0 when idle.
+    build_job_id: ?i64 = null,
+    /// Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+    build_started_at_ms: ?i64 = null,
+    /// Iteration number reported by the active build lease, or 0 when idle or not iterative.
+    build_iteration: ?i64 = null,
+    /// Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+    build_lease_expires_at_ms: ?i64 = null,
+    /// Worker id that owns the active build lease. Local builds use `local`.
+    build_worker_id: ?[]const u8 = null,
+    /// Opaque resumable cursor for the active build phase. Empty or omitted when idle or when the phase has no cursor.
+    build_cursor: ?[]const u8 = null,
+    /// Completed work units for the active graph metric build, or 0 when idle or unknown.
+    build_completed_units: ?i64 = null,
+    /// Estimated total work units for the active graph metric build, or 0 when idle or unknown.
+    build_total_units: ?i64 = null,
+    /// Active leased or failed build pages for the current build phase, capped and ordered by durable page key.
+    build_pages: ?[]const GraphMetricBuildPageStatus = null,
+    /// Whether build_pages was capped before every active page could be included.
+    build_pages_truncated: ?bool = null,
+    /// Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
+    retry_count: ?i64 = null,
+    /// Last build error for the current failed target generation.
+    last_error: ?[]const u8 = null,
+    /// Build progress for the target edge generation, from 0.0 to 1.0
+    progress: f64,
+    converged: bool,
+    iterations_completed: i64,
+    delta: f64,
+    computed_at_ms: i64,
+    last_event: ?GraphMetricEvent = null,
+    /// Recent graph metric events, newest first.
+    recent_events: ?[]const GraphMetricEvent = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "state", "state", false },
+        .{ "phase", "phase", false },
+        .{ "edge_filter", "edge_filter", true },
+        .{ "metadata_version", "metadata_version", true },
+        .{ "config_fingerprint", "config_fingerprint", true },
+        .{ "maintenance_paused", "maintenance_paused", true },
+        .{ "build_queued", "build_queued", false },
+        .{ "published_generation", "published_generation", false },
+        .{ "edge_generation", "edge_generation", false },
+        .{ "target_edge_generation", "target_edge_generation", false },
+        .{ "queued_generation", "queued_generation", true },
+        .{ "building_generation", "building_generation", true },
+        .{ "build_job_id", "build_job_id", true },
+        .{ "build_started_at_ms", "build_started_at_ms", true },
+        .{ "build_iteration", "build_iteration", true },
+        .{ "build_lease_expires_at_ms", "build_lease_expires_at_ms", true },
+        .{ "build_worker_id", "build_worker_id", true },
+        .{ "build_cursor", "build_cursor", true },
+        .{ "build_completed_units", "build_completed_units", true },
+        .{ "build_total_units", "build_total_units", true },
+        .{ "build_pages", "build_pages", true },
+        .{ "build_pages_truncated", "build_pages_truncated", true },
+        .{ "retry_count", "retry_count", true },
+        .{ "last_error", "last_error", true },
+        .{ "progress", "progress", false },
+        .{ "converged", "converged", false },
+        .{ "iterations_completed", "iterations_completed", false },
+        .{ "delta", "delta", false },
+        .{ "computed_at_ms", "computed_at_ms", false },
+        .{ "last_event", "last_event", true },
+        .{ "recent_events", "recent_events", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        if (self.edge_filter) |value| {
+            try jw.objectField("edge_filter");
+            try jw.write(value);
+        }
+        if (self.metadata_version) |value| {
+            try jw.objectField("metadata_version");
+            try jw.write(value);
+        }
+        if (self.config_fingerprint) |value| {
+            try jw.objectField("config_fingerprint");
+            try jw.write(value);
+        }
+        if (self.maintenance_paused) |value| {
+            try jw.objectField("maintenance_paused");
+            try jw.write(value);
+        }
+        try jw.objectField("build_queued");
+        try jw.write(self.build_queued);
+        try jw.objectField("published_generation");
+        try jw.write(self.published_generation);
+        try jw.objectField("edge_generation");
+        try jw.write(self.edge_generation);
+        try jw.objectField("target_edge_generation");
+        try jw.write(self.target_edge_generation);
+        if (self.queued_generation) |value| {
+            try jw.objectField("queued_generation");
+            try jw.write(value);
+        }
+        if (self.building_generation) |value| {
+            try jw.objectField("building_generation");
+            try jw.write(value);
+        }
+        if (self.build_job_id) |value| {
+            try jw.objectField("build_job_id");
+            try jw.write(value);
+        }
+        if (self.build_started_at_ms) |value| {
+            try jw.objectField("build_started_at_ms");
+            try jw.write(value);
+        }
+        if (self.build_iteration) |value| {
+            try jw.objectField("build_iteration");
+            try jw.write(value);
+        }
+        if (self.build_lease_expires_at_ms) |value| {
+            try jw.objectField("build_lease_expires_at_ms");
+            try jw.write(value);
+        }
+        if (self.build_worker_id) |value| {
+            try jw.objectField("build_worker_id");
+            try jw.write(value);
+        }
+        if (self.build_cursor) |value| {
+            try jw.objectField("build_cursor");
+            try jw.write(value);
+        }
+        if (self.build_completed_units) |value| {
+            try jw.objectField("build_completed_units");
+            try jw.write(value);
+        }
+        if (self.build_total_units) |value| {
+            try jw.objectField("build_total_units");
+            try jw.write(value);
+        }
+        if (self.build_pages) |value| {
+            try jw.objectField("build_pages");
+            try jw.write(value);
+        }
+        if (self.build_pages_truncated) |value| {
+            try jw.objectField("build_pages_truncated");
+            try jw.write(value);
+        }
+        if (self.retry_count) |value| {
+            try jw.objectField("retry_count");
+            try jw.write(value);
+        }
+        if (self.last_error) |value| {
+            try jw.objectField("last_error");
+            try jw.write(value);
+        }
+        try jw.objectField("progress");
+        try jw.write(self.progress);
+        try jw.objectField("converged");
+        try jw.write(self.converged);
+        try jw.objectField("iterations_completed");
+        try jw.write(self.iterations_completed);
+        try jw.objectField("delta");
+        try jw.write(self.delta);
+        try jw.objectField("computed_at_ms");
+        try jw.write(self.computed_at_ms);
+        if (self.last_event) |value| {
+            try jw.objectField("last_event");
+            try jw.write(value);
+        }
+        if (self.recent_events) |value| {
+            try jw.objectField("recent_events");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Select graph nodes using exactly one explicit, exact selector form.
 pub const GraphNodeSelector = union(enum) {
     graph_result_ref_node_selector: *GraphResultRefNodeSelector,
@@ -5895,7 +6725,40 @@ pub const GraphNodesResult = struct {
     kind: []const u8,
     /// Traversal result nodes; requested paths are stored on each node.
     nodes: []const GraphResultNode,
+    /// Graph metric status metadata keyed by metric name when requested.
+    metric_status: ?std.json.ArrayHashMap(GraphMetricStatus) = null,
     stats: GraphResultStats,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "nodes", "nodes", false },
+        .{ "metric_status", "metric_status", true },
+        .{ "stats", "stats", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("nodes");
+        try jw.write(self.nodes);
+        if (self.metric_status) |value| {
+            try jw.objectField("metric_status");
+            try jw.write(value);
+        }
+        try jw.objectField("stats");
+        try jw.write(self.stats);
+        try jw.endObject();
+    }
 };
 
 pub const GraphNotEqualPredicate = struct {
@@ -6559,6 +7422,8 @@ pub const GraphResultNode = struct {
     path_edges: ?[]const GraphPathEdge = null,
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,
+    /// Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node.
+    metrics: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Parsed evidence envelope for provenance labels and edge metadata
     evidence: ?std.json.ArrayHashMap(std.json.Value) = null,
 
@@ -6571,6 +7436,7 @@ pub const GraphResultNode = struct {
         .{ "path", "path", true },
         .{ "path_edges", "path_edges", true },
         .{ "provenance", "provenance", true },
+        .{ "metrics", "metrics", true },
         .{ "evidence", "evidence", true },
     };
 
@@ -6606,6 +7472,10 @@ pub const GraphResultNode = struct {
         }
         if (self.provenance) |value| {
             try jw.objectField("provenance");
+            try jw.write(value);
+        }
+        if (self.metrics) |value| {
+            try jw.objectField("metrics");
             try jw.write(value);
         }
         if (self.evidence) |value| {
@@ -6854,6 +7724,16 @@ pub const GraphTraversal = struct {
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
+    /// Graph metric names to project onto returned traversal nodes.
+    metrics: ?[]const []const u8 = null,
+    /// Sort traversal candidates by graph metric score before applying limit.
+    order_by: ?[]const GraphMetricOrder = null,
+    /// Filter traversal candidates by graph metric score before applying limit.
+    where_metric: ?[]const GraphMetricFilter = null,
+    /// Freshness required for projected, ordered, and filtered graph metrics.
+    metric_freshness: ?[]const u8 = null,
+    /// Include graph metric status metadata in the traversal profile.
+    include_metric_status: ?bool = null,
     /// Non-scoring structured stored-document predicate for reached nodes.
     filter: ?GraphDocumentFilter = null,
 
@@ -6868,6 +7748,11 @@ pub const GraphTraversal = struct {
         .{ "include_paths", "include_paths", true },
         .{ "include_documents", "include_documents", true },
         .{ "fields", "fields", true },
+        .{ "metrics", "metrics", true },
+        .{ "order_by", "order_by", true },
+        .{ "where_metric", "where_metric", true },
+        .{ "metric_freshness", "metric_freshness", true },
+        .{ "include_metric_status", "include_metric_status", true },
         .{ "filter", "filter", true },
     };
 
@@ -6913,6 +7798,26 @@ pub const GraphTraversal = struct {
         }
         if (self.fields) |value| {
             try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.metrics) |value| {
+            try jw.objectField("metrics");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.where_metric) |value| {
+            try jw.objectField("where_metric");
+            try jw.write(value);
+        }
+        if (self.metric_freshness) |value| {
+            try jw.objectField("metric_freshness");
+            try jw.write(value);
+        }
+        if (self.include_metric_status) |value| {
+            try jw.objectField("include_metric_status");
             try jw.write(value);
         }
         if (self.filter) |value| {
@@ -7748,6 +8653,16 @@ pub const LegacyGraphQuery = struct {
     include_documents: ?bool = null,
     include_edges: ?bool = null,
     fields: ?[]const []const u8 = null,
+    /// Graph metric names to project onto legacy graph_searches result nodes.
+    metrics: ?[]const []const u8 = null,
+    /// Sort legacy graph_searches result nodes by graph metric score.
+    order_by: ?[]const GraphMetricOrder = null,
+    /// Filter legacy graph_searches result nodes by graph metric score.
+    where_metric: ?[]const GraphMetricFilter = null,
+    /// Freshness required for projected, ordered, and filtered graph metrics.
+    metric_freshness: ?[]const u8 = null,
+    /// Include graph metric status metadata in the legacy graph_searches result.
+    include_metric_status: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -7761,6 +8676,11 @@ pub const LegacyGraphQuery = struct {
         .{ "include_documents", "include_documents", true },
         .{ "include_edges", "include_edges", true },
         .{ "fields", "fields", true },
+        .{ "metrics", "metrics", true },
+        .{ "order_by", "order_by", true },
+        .{ "where_metric", "where_metric", true },
+        .{ "metric_freshness", "metric_freshness", true },
+        .{ "include_metric_status", "include_metric_status", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -7807,6 +8727,26 @@ pub const LegacyGraphQuery = struct {
         }
         if (self.fields) |value| {
             try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.metrics) |value| {
+            try jw.objectField("metrics");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.where_metric) |value| {
+            try jw.objectField("where_metric");
+            try jw.write(value);
+        }
+        if (self.metric_freshness) |value| {
+            try jw.objectField("metric_freshness");
+            try jw.write(value);
+        }
+        if (self.include_metric_status) |value| {
+            try jw.objectField("include_metric_status");
             try jw.write(value);
         }
         try jw.endObject();
@@ -7917,6 +8857,8 @@ pub const LegacyGraphSearchResult = struct {
     total: i64,
     /// Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field.
     took: ?i64 = null,
+    /// Graph metric status metadata keyed by metric name.
+    metric_status: ?std.json.ArrayHashMap(GraphMetricStatus) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -7927,6 +8869,7 @@ pub const LegacyGraphSearchResult = struct {
         .{ "matches", "matches", true },
         .{ "total", "total", false },
         .{ "took", "took", true },
+        .{ "metric_status", "metric_status", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -7961,6 +8904,10 @@ pub const LegacyGraphSearchResult = struct {
         try jw.write(self.total);
         if (self.took) |value| {
             try jw.objectField("took");
+            try jw.write(value);
+        }
+        if (self.metric_status) |value| {
+            try jw.objectField("metric_status");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8554,9 +9501,9 @@ pub const StatefulGraphQueryResults = std.json.ArrayHashMap(StatefulGraphResult)
 
 /// Graph result emitted by the stateful compatibility transport. Canonical graph_queries produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the compatibility window.
 pub const StatefulGraphResult = union(enum) {
+    graph_nodes_result: *GraphNodesResult,
     graph_aggregates_result: *GraphAggregatesResult,
     graph_bindings_result: *GraphBindingsResult,
-    graph_nodes_result: *GraphNodesResult,
     graph_paths_result: *GraphPathsResult,
     legacy_graph_search_result: *LegacyGraphSearchResult,
 
@@ -8598,9 +9545,9 @@ pub const StatefulGraphResult = union(enum) {
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
         switch (probe.kind) {
             .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
-                if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "paths")) return .{ .graph_paths_result = try parseStructuralVariantFromSlice(GraphPathsResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_search_result = try parseStructuralVariantFromSlice(LegacyGraphSearchResult, allocator, input, options) };
                 return error.UnexpectedToken;
@@ -8626,6 +9573,10 @@ pub const StatefulGraphResult = union(enum) {
             .string => |value| value,
             else => return error.UnexpectedToken,
         };
+        if (std.mem.eql(u8, disc_str, "nodes")) {
+            const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_nodes_result = parsed };
+        }
         if (std.mem.eql(u8, disc_str, "aggregates")) {
             const parsed = try parseStructuralVariant(GraphAggregatesResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_aggregates_result = parsed };
@@ -8633,10 +9584,6 @@ pub const StatefulGraphResult = union(enum) {
         if (std.mem.eql(u8, disc_str, "bindings")) {
             const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_bindings_result = parsed };
-        }
-        if (std.mem.eql(u8, disc_str, "nodes")) {
-            const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .graph_nodes_result = parsed };
         }
         if (std.mem.eql(u8, disc_str, "paths")) {
             const parsed = try parseStructuralVariant(GraphPathsResult, allocator, source, options) orelse return error.UnexpectedToken;
@@ -8651,9 +9598,9 @@ pub const StatefulGraphResult = union(enum) {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
+            .graph_nodes_result => |v| try jw.write(v.*),
             .graph_aggregates_result => |v| try jw.write(v.*),
             .graph_bindings_result => |v| try jw.write(v.*),
-            .graph_nodes_result => |v| try jw.write(v.*),
             .graph_paths_result => |v| try jw.write(v.*),
             .legacy_graph_search_result => |v| try jw.write(v.*),
         }

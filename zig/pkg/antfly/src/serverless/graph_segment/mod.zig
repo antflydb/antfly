@@ -28,6 +28,8 @@ pub const encodeAlloc = codec.encodeAlloc;
 pub const encodedSize = codec.encodedSize;
 pub const decodeAlloc = codec.decodeAlloc;
 pub const decodeAllocWithLimits = codec.decodeAllocWithLimits;
+pub const decodeAllocWithCancellation = codec.decodeAllocWithCancellation;
+pub const decodeAllocWithLimitsAndCancellation = codec.decodeAllocWithLimitsAndCancellation;
 pub const decodedRetainedBytes = codec.decodedRetainedBytes;
 
 test "serverless graph segment module compiles" {
@@ -42,5 +44,7 @@ test "serverless graph segment module compiles" {
     _ = encodedSize;
     _ = decodeAlloc;
     _ = decodeAllocWithLimits;
+    _ = decodeAllocWithCancellation;
+    _ = decodeAllocWithLimitsAndCancellation;
     _ = decodedRetainedBytes;
 }

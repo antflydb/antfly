@@ -44,6 +44,14 @@ pub const Clock = struct {
     pub fn sleepMs(self: Clock, ms: u64) void {
         self.sleep_ms_fn(self.ctx, ms);
     }
+
+    /// Returns whether this clock uses the process' wall clock. Runtime code
+    /// with an existing std.Io backend can use that backend for waits instead
+    /// of constructing a temporary threaded backend for every sleep.
+    pub fn isReal(self: Clock) bool {
+        return self.now_realtime_ns_fn == realNowRealtimeNs and
+            self.sleep_ms_fn == realSleepMs;
+    }
 };
 
 pub const ManualClock = struct {

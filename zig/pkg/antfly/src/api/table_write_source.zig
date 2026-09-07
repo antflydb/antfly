@@ -75,6 +75,30 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             index_name: []const u8,
         ) anyerror!?void = null,
+        graph_metric_action: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+        ) anyerror!?db_mod.types.GraphMetricStatus = null,
+        graph_metric_action_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!?db_mod.types.GraphMetricStatus = null,
+        graph_metric_maintenance_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            body: []const u8,
+        ) anyerror!?[]u8 = null,
         drop_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -542,6 +566,44 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.drop_index orelse return null;
         return try BoundaryAbi.call("drop_index", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
+    }
+
+    pub fn graphMetricAction(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        const fn_ptr = self.vtable.graph_metric_action orelse return null;
+        return try BoundaryAbi.call("graph_metric_action", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name, metric_name, action });
+    }
+
+    pub fn graphMetricActionWithCancellation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?db_mod.types.GraphMetricStatus {
+        if (cancellation.isCancelled()) return error.Canceled;
+        const fn_ptr = self.vtable.graph_metric_action_with_cancellation orelse
+            return try self.graphMetricAction(alloc, table_name, index_name, metric_name, action);
+        return try BoundaryAbi.call("graph_metric_action_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name, metric_name, action, cancellation });
+    }
+
+    pub fn graphMetricMaintenanceGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.graph_metric_maintenance_group_local orelse return null;
+        return try BoundaryAbi.call("graph_metric_maintenance_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn dropTable(

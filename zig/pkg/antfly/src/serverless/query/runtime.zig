@@ -19,11 +19,13 @@ const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
+const graph_metric_config = @import("../build/graph_metric_config.zig");
 const cache_mod = @import("cache.zig");
 const bounded_decode = @import("../bounded_decode.zig");
 const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const operation = @import("../../api/operation.zig");
+const CancellationToken = operation.CancellationToken;
 
 pub const QueryExecutionMetrics = struct {
     total_queries: u64 = 0,
@@ -46,6 +48,117 @@ pub const NamespaceQueryExecutionMetrics = struct {
         self.* = undefined;
     }
 };
+
+pub const AuthenticatedSubrange = cache_mod.AuthenticatedSubrange;
+pub const AuthenticatedBlockPublication = cache_mod.AuthenticatedBlockPublication;
+pub const max_authenticated_publication_blocks = cache_mod.max_authenticated_publication_blocks;
+
+pub const GraphMetricReadLimits = struct {
+    /// Shared by every graph-metric surface in one pinned request. These are
+    /// deliberately aggregate limits, not per metric.
+    max_range_requests: u64 = 128,
+    max_range_bytes: u64 = 256 * 1024 * 1024,
+    max_decoded_blocks: u64 = 16 * 1024,
+    max_work_items: u64 = 32 * 1024 * 1024,
+    max_retained_bytes: u64 = 128 * 1024 * 1024,
+};
+
+pub const GraphMetricRangeCapacity = struct { requests: u64, bytes: u64 };
+
+pub const GraphMetricReadBudget = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    limits: GraphMetricReadLimits = .{},
+    range_requests: u64 = 0,
+    range_bytes: u64 = 0,
+    decoded_blocks: u64 = 0,
+    work_items: u64 = 0,
+    retained_bytes: u64 = 0,
+
+    fn checkedCharge(current: u64, amount: u64, limit: u64) !u64 {
+        const next = std.math.add(u64, current, amount) catch return error.GraphMetricQueryBudgetExceeded;
+        if (next > limit) return error.GraphMetricQueryBudgetExceeded;
+        return next;
+    }
+
+    pub fn chargeRange(self: *@This(), bytes: usize) !void {
+        return self.reserveRanges(1, bytes);
+    }
+
+    pub fn reserveRanges(self: *@This(), requests: usize, bytes: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const next_requests = try checkedCharge(self.range_requests, @intCast(requests), self.limits.max_range_requests);
+        const next_bytes = try checkedCharge(self.range_bytes, @intCast(bytes), self.limits.max_range_bytes);
+        self.range_requests = next_requests;
+        self.range_bytes = next_bytes;
+    }
+
+    pub fn remainingRequests(self: *@This()) u64 {
+        return self.remainingRanges().requests;
+    }
+
+    pub fn remainingRanges(self: *@This()) GraphMetricRangeCapacity {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return .{ .requests = self.limits.max_range_requests -| self.range_requests, .bytes = self.limits.max_range_bytes -| self.range_bytes };
+    }
+
+    pub fn chargeDecode(self: *@This(), blocks: usize, work_items: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const next_blocks = try checkedCharge(self.decoded_blocks, @intCast(blocks), self.limits.max_decoded_blocks);
+        const next_items = try checkedCharge(self.work_items, @intCast(work_items), self.limits.max_work_items);
+        self.decoded_blocks = next_blocks;
+        self.work_items = next_items;
+    }
+
+    pub fn chargeRetained(self: *@This(), bytes: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.retained_bytes = try checkedCharge(self.retained_bytes, @intCast(bytes), self.limits.max_retained_bytes);
+    }
+};
+
+test "serverless graph metric request budget composes reads and rejects charges atomically" {
+    var budget = GraphMetricReadBudget{ .limits = .{
+        .max_range_requests = 2,
+        .max_range_bytes = 10,
+        .max_decoded_blocks = 2,
+        .max_work_items = 10,
+        .max_retained_bytes = 10,
+    } };
+
+    try budget.chargeRange(6);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRange(5));
+    try std.testing.expectEqual(@as(u64, 1), budget.range_requests);
+    try std.testing.expectEqual(@as(u64, 6), budget.range_bytes);
+    try budget.chargeRange(4);
+
+    try budget.chargeDecode(1, 6);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeDecode(2, 1));
+    try std.testing.expectEqual(@as(u64, 1), budget.decoded_blocks);
+    try std.testing.expectEqual(@as(u64, 6), budget.work_items);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeDecode(1, 5));
+    try std.testing.expectEqual(@as(u64, 1), budget.decoded_blocks);
+    try std.testing.expectEqual(@as(u64, 6), budget.work_items);
+
+    try budget.chargeRetained(10);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRetained(1));
+    try std.testing.expectEqual(@as(u64, 10), budget.retained_bytes);
+}
+
+test "serverless graph metric score-plan reservation is atomic across ranges and bytes" {
+    var budget = GraphMetricReadBudget{ .limits = .{ .max_range_requests = 3, .max_range_bytes = 10 } };
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.reserveRanges(2, 11));
+    try std.testing.expectEqual(@as(u64, 0), budget.range_requests);
+    try std.testing.expectEqual(@as(u64, 0), budget.range_bytes);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.reserveRanges(4, 5));
+    try std.testing.expectEqual(@as(u64, 3), budget.remainingRequests());
+    try budget.reserveRanges(3, 10);
+    try std.testing.expectEqual(@as(u64, 0), budget.remainingRequests());
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRange(1));
+    try std.testing.expectEqual(@as(u64, 10), budget.range_bytes);
+}
 
 pub const QueryRuntime = struct {
     alloc: Allocator,
@@ -164,11 +277,41 @@ pub const QuerySession = struct {
     artifacts: *artifacts_mod.ArtifactStore,
     cache: ?*cache_mod.QueryCache = null,
     manifest: manifest_mod.Manifest,
+    owns_manifest: bool = true,
+    io: ?std.Io = null,
     cancellation: CancellationToken = .none,
+    diagnostics: ?*operation.RequestDiagnostics = null,
+    graph_metric_specs: ?[]graph_metric_config.IndexSpec = null,
+    owns_graph_metric_specs: bool = true,
+    graph_metric_read_budget: GraphMetricReadBudget = .{},
+    graph_metric_read_budget_shared: ?*GraphMetricReadBudget = null,
 
     pub fn deinit(self: *QuerySession) void {
-        self.manifest.deinit(self.alloc);
+        if (self.owns_graph_metric_specs) self.clearGraphMetricSpecs();
+        if (self.owns_manifest) self.manifest.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Lazily parses graph metric configuration once for this pinned request.
+    /// QuerySession is request-owned and, like its other mutable caches, must
+    /// not be accessed concurrently without external synchronization.
+    pub fn graphMetricSpecs(self: *QuerySession) ![]const graph_metric_config.IndexSpec {
+        if (self.graph_metric_specs == null) {
+            self.graph_metric_specs = try graph_metric_config.parseIndexSpecsAlloc(
+                self.alloc,
+                self.manifest.stats.indexes_json,
+            );
+        }
+        return self.graph_metric_specs.?;
+    }
+
+    pub fn clearGraphMetricSpecs(self: *QuerySession) void {
+        if (!self.owns_graph_metric_specs) {
+            self.graph_metric_specs = null;
+            return;
+        }
+        if (self.graph_metric_specs) |specs| graph_metric_config.freeIndexSpecs(self.alloc, specs);
+        self.graph_metric_specs = null;
     }
 
     pub fn namespace(self: *const QuerySession) []const u8 {
@@ -192,8 +335,70 @@ pub const QuerySession = struct {
         self.cancellation = cancellation;
     }
 
+    pub fn setDiagnostics(self: *QuerySession, diagnostics: ?*operation.RequestDiagnostics) void {
+        self.diagnostics = diagnostics;
+    }
+
+    pub fn setIo(self: *QuerySession, io: ?std.Io) void {
+        self.io = io;
+    }
+
+    /// Create a non-owning view of the pinned request for a concurrent range
+    /// fetch. Callers provide a thread-safe allocator; the manifest, cache,
+    /// cancellation token, and aggregate graph budget remain shared.
+    pub fn forkGraphMetricRead(self: *QuerySession, alloc: Allocator) QuerySession {
+        return .{
+            .alloc = alloc,
+            .artifacts = self.artifacts,
+            .cache = self.cache,
+            .manifest = self.manifest,
+            .owns_manifest = false,
+            .io = self.io,
+            .cancellation = self.cancellation,
+            .diagnostics = null,
+            .graph_metric_specs = self.graph_metric_specs,
+            .owns_graph_metric_specs = false,
+            .graph_metric_read_budget_shared = self.effectiveGraphMetricReadBudget(),
+        };
+    }
+
+    fn effectiveGraphMetricReadBudget(self: *QuerySession) *GraphMetricReadBudget {
+        return self.graph_metric_read_budget_shared orelse &self.graph_metric_read_budget;
+    }
+
+    pub fn recordGraphMetricRejection(
+        self: *QuerySession,
+        graph_index_name: []const u8,
+        metric_name: []const u8,
+        materializer_fingerprint: u64,
+    ) void {
+        const diagnostics = self.diagnostics orelse return;
+        diagnostics.recordGraphMetricRejection(graph_index_name, metric_name, materializer_fingerprint);
+    }
+
     pub fn checkCancellation(self: *const QuerySession) !void {
         return self.cancellation.check();
+    }
+
+    pub fn chargeGraphMetricRange(self: *QuerySession, bytes: usize) !void {
+        return self.effectiveGraphMetricReadBudget().chargeRange(bytes);
+    }
+
+    pub fn graphMetricRangeBudget(self: *QuerySession) GraphMetricRangeCapacity {
+        return self.effectiveGraphMetricReadBudget().remainingRanges();
+    }
+
+    pub fn reserveGraphMetricRanges(self: *QuerySession, requests: usize, bytes: usize) !void {
+        try self.checkCancellation();
+        return self.effectiveGraphMetricReadBudget().reserveRanges(requests, bytes);
+    }
+
+    pub fn chargeGraphMetricDecode(self: *QuerySession, blocks: usize, work_items: usize) !void {
+        return self.effectiveGraphMetricReadBudget().chargeDecode(blocks, work_items);
+    }
+
+    pub fn chargeGraphMetricRetained(self: *QuerySession, bytes: usize) !void {
+        return self.effectiveGraphMetricReadBudget().chargeRetained(bytes);
     }
 
     pub fn findArtifactIndex(self: *const QuerySession, kind: manifest_mod.ArtifactKind) ?usize {
@@ -237,14 +442,48 @@ pub const QuerySession = struct {
         return result;
     }
 
+    /// Authenticates an artifact against the manifest without materializing it
+    /// in the query allocator. Object and filesystem backends use their
+    /// bounded identity caches after the first full verification.
+    pub fn verifyArtifact(self: *QuerySession, index: usize) !void {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactForQuery(artifact);
+        try self.artifacts.verifyContentWithCancellationUsingAllocator(
+            self.alloc,
+            artifact.artifact_id,
+            artifact.byte_len,
+            artifact.checksum,
+            self.cancellation,
+        );
+        try self.checkCancellation();
+    }
+
     pub fn fetchArtifactRangeAlloc(self: *QuerySession, index: usize, offset: u64, len: usize) ![]u8 {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
-            try cache.getRangeOrFetchAllocWithCancellationUsingAllocator(self.alloc, self.artifacts, artifact.artifact_id, offset, len, self.cancellation)
+            try cache.getVerifiedRangeOrFetchAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.cancellation,
+            )
         else
-            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(self.alloc, artifact.artifact_id, offset, len, self.cancellation);
+            try self.artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.cancellation,
+            );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
@@ -255,10 +494,157 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
-            try cache.getBlockOrFetchRangeAllocWithCancellationUsingAllocator(self.alloc, self.artifacts, artifact.artifact_id, block_id, offset, len, self.cancellation)
+            try cache.getVerifiedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                block_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.cancellation,
+            )
         else
-            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(self.alloc, artifact.artifact_id, offset, len, self.cancellation);
+            try self.artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.cancellation,
+            );
         errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
+    }
+
+    pub fn fetchArtifactAuthenticatedBlockAlloc(
+        self: *QuerySession,
+        index: usize,
+        block_id: []const u8,
+        offset: u64,
+        len: usize,
+        checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    ) ![]u8 {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        if (len == 0) return error.InvalidArtifactRange;
+        const result = if (self.cache) |cache|
+            try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                block_id,
+                artifact.byte_len,
+                artifact.checksum,
+                checksum,
+                offset,
+                len,
+                self.cancellation,
+            )
+        else blk: {
+            const bytes = try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                offset,
+                len,
+                self.cancellation,
+            );
+            errdefer self.alloc.free(bytes);
+            if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            if (!std.mem.eql(u8, &actual, checksum)) return error.ArtifactIntegrityMismatch;
+            break :blk bytes;
+        };
+        errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
+    }
+
+    pub fn readCachedAuthenticatedBlockAlloc(self: *QuerySession, alloc: Allocator, index: usize, block_id: []const u8, offset: u64, len: usize, checksum: *const [32]u8) !?[]u8 {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        const cache = self.cache orelse return null;
+        return cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.cancellation);
+    }
+
+    pub fn cacheAuthenticatedBlocks(self: *QuerySession, index: usize, blocks: []const AuthenticatedBlockPublication) !void {
+        const cache = self.cache orelse return;
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try cache.publishAuthenticatedBlocks(artifact.artifact_id, artifact.byte_len, artifact.checksum, blocks, self.cancellation);
+    }
+
+    /// Fetches a bounded range and authenticates every byte against digests
+    /// rooted in the published manifest or an already-authenticated routing
+    /// footer. Subranges must exactly and contiguously cover the response.
+    pub fn fetchArtifactAuthenticatedRangeAlloc(
+        self: *QuerySession,
+        index: usize,
+        offset: u64,
+        len: usize,
+        subranges: []const AuthenticatedSubrange,
+    ) ![]u8 {
+        return self.fetchAuthenticatedRangeAlloc(index, offset, len, subranges, true);
+    }
+
+    pub fn fetchArtifactAuthenticatedRangeUncachedAlloc(self: *QuerySession, index: usize, offset: u64, len: usize, subranges: []const AuthenticatedSubrange) ![]u8 {
+        return self.fetchAuthenticatedRangeAlloc(index, offset, len, subranges, false);
+    }
+
+    fn fetchAuthenticatedRangeAlloc(self: *QuerySession, index: usize, offset: u64, len: usize, subranges: []const AuthenticatedSubrange, retain_range: bool) ![]u8 {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        if (len == 0 or subranges.len == 0) return error.InvalidArtifactRange;
+        var covered: usize = 0;
+        for (subranges) |subrange| {
+            if (subrange.len == 0 or subrange.relative_offset != covered) return error.InvalidArtifactRange;
+            covered = std.math.add(usize, covered, subrange.len) catch return error.InvalidArtifactRange;
+            if (covered > len) return error.InvalidArtifactRange;
+        }
+        if (covered != len) return error.InvalidArtifactRange;
+
+        if (if (retain_range) self.cache else null) |cache| {
+            const result = try cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                subranges,
+                self.cancellation,
+            );
+            errdefer self.alloc.free(result);
+            try self.checkCancellation();
+            return result;
+        }
+
+        const result = try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
+            self.alloc,
+            artifact.artifact_id,
+            offset,
+            len,
+            self.cancellation,
+        );
+        errdefer self.alloc.free(result);
+        if (result.len != len) return error.ArtifactIntegrityMismatch;
+        for (subranges, 0..) |subrange, subrange_index| {
+            if (subrange_index % 64 == 0) try self.checkCancellation();
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(
+                result[subrange.relative_offset..][0..subrange.len],
+                &actual,
+                .{},
+            );
+            if (!std.mem.eql(u8, &actual, &subrange.checksum)) return error.ArtifactIntegrityMismatch;
+        }
         try self.checkCancellation();
         return result;
     }

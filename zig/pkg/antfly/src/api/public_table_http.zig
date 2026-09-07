@@ -106,6 +106,8 @@ pub const TableApi = struct {
     pub const ExecuteBatchError = error{
         InvalidBatchRequest,
         UnsupportedSyncLevel,
+        GraphMetricFeatureNotEnabled,
+        GraphMetricMaterializationRejected,
         NotFound,
         Conflict,
         MethodNotAllowed,
@@ -117,6 +119,7 @@ pub const TableApi = struct {
         OutcomeUnknown,
         CommittedPending,
         CommittedRepairRequired,
+        CommittedGraphMetricMaterializationRejected,
         WriteOutcomeUnknown,
         DocIdentityUnavailable,
         HAReadOnlyStandby,
@@ -143,6 +146,10 @@ pub const TableApi = struct {
         IndexRebuilding,
         ModelNotFound,
         UnsupportedExactSort,
+        GraphMetricGlobalMaterializationRequired,
+        GraphMetricFeatureNotEnabled,
+        GraphMetricMaterializationRejected,
+        GraphMetricQueryBudgetExceeded,
         QueryCandidateBudgetExceeded,
         RerankerCandidateLimitExceeded,
         GraphWorkBudgetExceeded,
@@ -278,6 +285,7 @@ pub const TableApi = struct {
         Conflict,
         MethodNotAllowed,
         InvalidIndexRequest,
+        GraphMetricConfigurationLimitExceeded,
         MissingEmbeddingArtifactEnrichment,
         MissingEmbeddingArtifactProducer,
         InvalidEmbeddingArtifactProducer,
@@ -299,6 +307,18 @@ pub const TableApi = struct {
         NotFound,
         Conflict,
         DependencyConflict,
+        MethodNotAllowed,
+        InternalFailure,
+    };
+
+    pub const ExecuteGraphMetricActionError = error{
+        Canceled,
+        DeadlineExceeded,
+        NotLeader,
+        Conflict,
+        Backpressured,
+        InvalidGraphMetricAction,
+        NotFound,
         MethodNotAllowed,
         InternalFailure,
     };
@@ -461,6 +481,15 @@ pub const TableApi = struct {
             index_name: []const u8,
             request: operation.RequestContext,
         ) ExecuteDeleteIndexError!void,
+        execute_table_graph_metric_action: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+            request: operation.RequestContext,
+        ) ExecuteGraphMetricActionError![]u8 = null,
         execute_put_artifact_enrichment: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -613,6 +642,19 @@ pub const TableApi = struct {
     ) ExecuteDeleteIndexError!void {
         try self.ensureActive();
         return try self.vtable.execute_table_delete_index(self.ptr, alloc, table_name, index_name, self.request);
+    }
+
+    pub fn executeTableGraphMetricAction(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) ExecuteGraphMetricActionError![]u8 {
+        try self.ensureActive();
+        const fn_ptr = self.vtable.execute_table_graph_metric_action orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action, self.request);
     }
 
     pub fn executePutArtifactEnrichment(
@@ -967,6 +1009,162 @@ fn unsupportedExactSortBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphMetricGlobalMaterializationRequiredBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_global_materialization_required",
+        .message = "graph metric scoring is unavailable for multi-shard tables until a globally coordinated metric snapshot is published",
+        .retryable = false,
+    }, .{});
+}
+
+pub fn graphMetricMaterializationRejectedBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_materialization_rejected",
+        .message = "graph metric materialization exceeded the serverless work budget; narrow the graph or metric edge filter, then update the metric configuration to rebuild",
+        .reason = "build_budget_exceeded",
+        .retryable = false,
+    }, .{});
+}
+
+pub fn graphMetricFeatureNotEnabledBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_feature_not_enabled",
+        .message = "graph metric publication is not enabled for this serverless deployment; an operator must complete the manifest writer rollout before graph metric queries or full_index synchronization can be used",
+        .retryable = false,
+    }, .{});
+}
+
+pub fn graphMetricMaterializationRejectedBodyWithContext(
+    alloc: std.mem.Allocator,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    materializer_fingerprint: u64,
+) ![]u8 {
+    const policy = try std.fmt.allocPrint(alloc, "{x:0>16}", .{materializer_fingerprint});
+    defer alloc.free(policy);
+    const message = try std.fmt.allocPrint(
+        alloc,
+        "graph metric '{s}' on index '{s}' exceeded the current serverless materialization policy; narrow the graph or edge filter, or change the metric configuration to rebuild",
+        .{ metric_name, graph_index_name },
+    );
+    defer alloc.free(message);
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "graph_metric_materialization_rejected",
+        .message = message,
+        .reason = "build_budget_exceeded",
+        .retryable = false,
+        .graph_index_name = graph_index_name,
+        .metric_name = metric_name,
+        .materializer_fingerprint = policy,
+    }, .{});
+}
+
+test "multi-shard graph metric rejection is actionable and non-retryable" {
+    const encoded = try graphMetricGlobalMaterializationRequiredBody(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+    }, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("graph_metric_global_materialization_required", parsed.value.code);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "globally coordinated metric snapshot") != null);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
+test "serverless graph metric build-budget rejection is actionable and non-retryable" {
+    const encoded = try graphMetricMaterializationRejectedBody(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        reason: []const u8,
+        retryable: bool,
+    }, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("graph_metric_materialization_rejected", parsed.value.code);
+    try std.testing.expectEqualStrings("build_budget_exceeded", parsed.value.reason);
+    try std.testing.expect(!parsed.value.retryable);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "narrow the graph") != null);
+
+    const contextual = try graphMetricMaterializationRejectedBodyWithContext(std.testing.allocator, "graph_idx", "pagerank", 0x1234);
+    defer std.testing.allocator.free(contextual);
+    const contextual_parsed = try std.json.parseFromSlice(struct {
+        graph_index_name: []const u8,
+        metric_name: []const u8,
+        materializer_fingerprint: []const u8,
+    }, std.testing.allocator, contextual, .{ .ignore_unknown_fields = true });
+    defer contextual_parsed.deinit();
+    try std.testing.expectEqualStrings("graph_idx", contextual_parsed.value.graph_index_name);
+    try std.testing.expectEqualStrings("pagerank", contextual_parsed.value.metric_name);
+    try std.testing.expectEqualStrings("0000000000001234", contextual_parsed.value.materializer_fingerprint);
+}
+
+test "serverless graph metric rollout rejection is explicit and non-retryable" {
+    const encoded = try graphMetricFeatureNotEnabledBody(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+    }, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("graph_metric_feature_not_enabled", parsed.value.code);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "manifest writer rollout") != null);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
+test "public table query maps multi-shard graph metric rejection" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.GraphMetricGlobalMaterializationRequired;
+        }
+    };
+
+    var response = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank"}}
+    , null, Backend.iface());
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    try std.testing.expect(response.json);
+
+    const parsed = try std.json.parseFromSlice(struct {
+        code: []const u8,
+        message: []const u8,
+        retryable: bool,
+    }, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("graph_metric_global_materialization_required", parsed.value.code);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "globally coordinated metric snapshot") != null);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
 fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
     const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
         .reason = "candidate_budget_exceeded",
@@ -1009,6 +1207,16 @@ pub fn graphWorkBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
         .dimension = dimension,
         .maximum = diagnostic.maximum,
         .remediation = "narrow the operation's anchor/filter, reduce path breadth or depth, or split the query",
+    }, .{});
+}
+
+pub fn graphMetricQueryBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_metric_query_budget_exceeded",
+        .message = "graph metric reads exceeded the request-wide I/O or memory budget",
+        .retryable = false,
+        .remediation = "request fewer graph metrics or candidates, reduce graph result breadth, or split the query",
     }, .{});
 }
 
@@ -1367,6 +1575,16 @@ pub fn handleTableBatch(
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
+        error.GraphMetricFeatureNotEnabled => return .{
+            .status = 422,
+            .body = try graphMetricFeatureNotEnabledBody(alloc),
+            .json = true,
+        },
+        error.GraphMetricMaterializationRejected => return .{
+            .status = 422,
+            .body = try graphMetricMaterializationRejectedBody(alloc),
+            .json = true,
+        },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
@@ -1410,6 +1628,16 @@ pub fn handleTableBatch(
         error.CommittedRepairRequired => return .{
             .status = 202,
             .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_repair_required")),
+            .json = true,
+        },
+        error.CommittedGraphMetricMaterializationRejected => return .{
+            .status = 202,
+            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithFailure(.{
+                .code = "graph_metric_materialization_rejected",
+                .message = "graph metric materialization exceeded the serverless work budget; narrow the graph or metric edge filter, then update the metric configuration to rebuild",
+                .reason = "build_budget_exceeded",
+                .retryable = false,
+            })),
             .json = true,
         },
         // Do not use a retryable 5xx: clients must reconcile an ambiguous
@@ -1541,6 +1769,10 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc), .json = true };
             },
+            error.GraphMetricQueryBudgetExceeded => {
+                std.log.warn("public table graph metric request budget exceeded table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMetricQueryBudgetExceededBody(alloc), .json = true };
+            },
             error.RerankerCandidateLimitExceeded => {
                 std.log.warn("public table query exceeds reranker provider candidate limit table={s}", .{table_name});
                 return .{ .status = 422, .body = try rerankerCandidateLimitExceededBody(alloc), .json = true };
@@ -1648,6 +1880,18 @@ pub fn handleTableQueryRequest(
             error.UnsupportedExactSort => {
                 std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
+            },
+            error.GraphMetricGlobalMaterializationRequired => {
+                std.log.info("public table query requires global graph metric materialization table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMetricGlobalMaterializationRequiredBody(alloc), .json = true };
+            },
+            error.GraphMetricFeatureNotEnabled => {
+                std.log.info("public table query graph metric publication is not enabled table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMetricFeatureNotEnabledBody(alloc), .json = true };
+            },
+            error.GraphMetricMaterializationRejected => {
+                std.log.info("public table query graph metric materialization rejected table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphMetricMaterializationRejectedBody(alloc), .json = true };
             },
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -2000,6 +2244,7 @@ pub fn handleTableCreateIndex(
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
+        error.GraphMetricConfigurationLimitExceeded => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"graph_metric_configuration_limit_exceeded\",\"message\":\"graph metric configuration exceeds serverless limits (maximum 16 graph metric indexes, 16 metrics per graph, 64 metrics total, 64 edge types per filter, 256-byte index names, 128-byte metric names, and 256-byte edge type names)\",\"retryable\":false}"), .json = true },
         error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"missing_embedding_artifact_enrichment\",\"message\":\"embedding index source has no matching embedding enrichment\",\"retryable\":false}"), .json = true },
         error.MissingEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"missing_embedding_artifact_producer\",\"message\":\"embedding enrichment has no producer configuration\",\"retryable\":false}"), .json = true },
         error.InvalidEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_embedding_artifact_producer\",\"message\":\"embedding enrichment producer is not runnable\",\"retryable\":false}"), .json = true },
@@ -2047,6 +2292,32 @@ pub fn handleTableDeleteIndex(
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "{\"error\":\"internal_error\",\"message\":\"index delete failed\",\"retryable\":false}"), .json = true },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
+}
+
+pub fn handleTableGraphMetricAction(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    metric_name: []const u8,
+    action: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    const response_body = api.executeTableGraphMetricAction(alloc, table_name, index_name, metric_name, action) catch |err| switch (err) {
+        error.Canceled, error.DeadlineExceeded => return err,
+        error.NotLeader => return err,
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
+        error.Backpressured => return .{
+            .status = 429,
+            .body = try alloc.dupe(u8, "{\"code\":\"storage_resource_exhausted\",\"message\":\"storage descriptors are temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
+        error.InvalidGraphMetricAction => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid graph metric action") },
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "graph metric action failed") },
+    };
+    return .{ .status = 200, .body = response_body, .json = true };
 }
 
 pub fn handlePutArtifactEnrichment(
@@ -3274,6 +3545,40 @@ test "public table batch handler identifies committed repair-required writes" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"committed_repair_required\"") != null);
 }
 
+test "serverless public table batch handler identifies committed graph metric rejections" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{ .ptr = undefined, .request = .{}, .vtable = &.{
+                .execute_table_batch = executeTableBatch,
+                .execute_table_query_request = unsupportedQueryRequest,
+                .execute_table_query_view = unsupportedQueryView,
+                .execute_table_backup = unsupportedBackup,
+                .execute_table_restore = unsupportedRestore,
+                .execute_table_list_indexes = unsupportedListIndexes,
+                .execute_table_get_index = unsupportedGetIndex,
+                .execute_table_create_index = unsupportedCreateIndex,
+                .execute_table_delete_index = unsupportedDeleteIndex,
+            } };
+        }
+
+        fn executeTableBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest, _: operation.RequestContext) TableApi.ExecuteBatchError!void {
+            return error.CommittedGraphMetricMaterializationRejected;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expect(resp.json);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"status\":\"committed_repair_required\",\"inserted\":1,\"deleted\":0,\"transformed\":0,\"failure\":{\"code\":\"graph_metric_materialization_rejected\",\"message\":\"graph metric materialization exceeded the serverless work budget; narrow the graph or metric edge filter, then update the metric configuration to rebuild\",\"reason\":\"build_budget_exceeded\",\"retryable\":false}}",
+        resp.body,
+    );
+}
+
 test "public table batch handler preserves ambiguous write outcomes" {
     const Backend = struct {
         fn iface() TableApi {
@@ -4161,6 +4466,60 @@ test "public table query handler maps candidate budget exhaustion" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+}
+
+test "serverless public table query handler maps aggregate graph metric budget exhaustion" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.GraphMetricQueryBudgetExceeded;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank"}}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
+    const parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        retryable: bool,
+        remediation: []const u8,
+    }, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("graph_metric_query_budget_exceeded", parsed.value.@"error");
+    try std.testing.expect(parsed.value.message.len > 0);
+    try std.testing.expect(!parsed.value.retryable);
+    try std.testing.expect(parsed.value.remediation.len > 0);
 }
 
 test "public table query handler maps exact graph execution failures" {
@@ -5894,4 +6253,54 @@ test "public document artifact range reprocess handler returns bounded summary" 
     try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].reprocessed);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.shard_cursors[0].failed);
     try std.testing.expectEqual(@as(u32, 10), parsed.value.shard_cursors[0].limit);
+}
+test "public table graph metric action handler returns status response" {
+    const Backend = struct {
+        called: bool = false,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                    .execute_table_graph_metric_action = executeGraphMetricAction,
+                },
+            };
+        }
+
+        fn executeGraphMetricAction(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteGraphMetricActionError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (!std.mem.eql(u8, index_name, "graph_idx")) return error.InternalFailure;
+            if (!std.mem.eql(u8, metric_name, "degree")) return error.InternalFailure;
+            if (!std.mem.eql(u8, action, "pause")) return error.InternalFailure;
+            self.called = true;
+            return alloc.dupe(u8, "{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}") catch return error.InternalFailure;
+        }
+    };
+
+    var backend = Backend{};
+    var resp = try handleTableGraphMetricAction(std.testing.allocator, "docs", "graph_idx", "degree", "pause", backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(backend.called);
+    try std.testing.expectEqualStrings("{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}", resp.body);
 }

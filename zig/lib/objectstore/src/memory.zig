@@ -107,11 +107,19 @@ pub const MemoryClient = struct {
             if (existing == null or !std.mem.eql(u8, existing.?.etag, expected)) return error.PreconditionFailed;
         }
 
-        const etag = try sha256HexAlloc(alloc, body);
+        const etag = try sha256HexAllocWithCancellation(alloc, body, opts.cancellation);
         errdefer alloc.free(etag);
 
-        const owned_body = try self.alloc.dupe(u8, body);
+        const owned_body = try self.alloc.alloc(u8, body.len);
         errdefer self.alloc.free(owned_body);
+        const cancellation_chunk_bytes = 1024 * 1024;
+        var copied: usize = 0;
+        while (copied < body.len) {
+            if (opts.cancellation) |token| try token.check();
+            const chunk_len = @min(cancellation_chunk_bytes, body.len - copied);
+            @memcpy(owned_body[copied..][0..chunk_len], body[copied..][0..chunk_len]);
+            copied += chunk_len;
+        }
         const owned_etag = try self.alloc.dupe(u8, etag);
         errdefer self.alloc.free(owned_etag);
         const owned_content_type = if (opts.content_type) |value| try self.alloc.dupe(u8, value) else null;
@@ -395,8 +403,21 @@ pub const MemoryClient = struct {
 };
 
 fn sha256HexAlloc(alloc: Allocator, body: []const u8) ![]u8 {
+    return sha256HexAllocWithCancellation(alloc, body, null);
+}
+
+fn sha256HexAllocWithCancellation(alloc: Allocator, body: []const u8, cancellation: ?types.CancellationToken) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const chunk_bytes = 1024 * 1024;
+    var offset: usize = 0;
+    while (offset < body.len) {
+        if (cancellation) |token| try token.check();
+        const len = @min(chunk_bytes, body.len - offset);
+        hasher.update(body[offset..][0..len]);
+        offset += len;
+    }
+    hasher.final(&digest);
     const out = try alloc.alloc(u8, 64);
     for (digest, 0..) |byte, idx| {
         out[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
@@ -482,6 +503,19 @@ test "memory get result construction cleans up every allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "memory put cancellation never publishes an object" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryClient.init(alloc);
+    var client = memory.client();
+    defer client.deinit();
+    try client.makeBucket("bucket");
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, client.putObject("bucket", "object", "payload", .{
+        .cancellation = types.CancellationToken.fromAtomic(&canceled),
+    }));
+    try std.testing.expectError(error.FileNotFound, client.statObject("bucket", "object"));
 }
 
 test "memory client supports non-recursive listing with common prefixes" {
