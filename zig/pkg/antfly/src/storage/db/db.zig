@@ -12787,6 +12787,11 @@ pub const DB = struct {
     }
 
     fn indexRepairIntentBlocksService(intent: index_repair_state.IndexRepairIntent) bool {
+        // Initial materialization has no validated predecessor to retain.
+        // Replay can reclassify its trigger while source artifacts arrive,
+        // but only the scoped canonical proof or validated cleanup may open
+        // admission; the ordinary replay-repair exception is not authority.
+        if (intent.work_class == .initial_build) return intent.phase != .cleanup;
         return switch (intent.trigger) {
             .incomplete_bulk_publish => intent.phase != .cleanup,
             // Only an operator-requested rebuild starts from a generation that
@@ -87958,11 +87963,15 @@ test "db status cannot reopen managed admission after shadow build handoff" {
     try testManagedGenerationRepairAdmission(.shadow_handoff);
 }
 
+test "db initial replay repair cannot reopen admission during shadow reconstruction" {
+    try testManagedGenerationRepairAdmission(.replay_handoff);
+}
+
 test "db repair preflight retains a canonical generation completed after scheduler selection" {
     try testManagedGenerationRepairAdmission(.late_completion);
 }
 
-fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, late_completion }) !void {
+fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion }) !void {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -88015,11 +88024,14 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
     var retained = try db.runtimeStatusStatsConsistent(alloc);
     defer types.freeDBStats(alloc, retained);
 
-    if (mode == .shadow_handoff) {
+    if (mode == .shadow_handoff or mode == .replay_handoff) {
         // A scheduler can select reconstruction before the canonical worker
         // finishes. The worker's later publication does not transfer ownership
         // back from that shadow build, even when all counters now match.
-        try db.updateIndexRepairIntent(alloc, admission_id, .{ .phase = .preflight });
+        try db.updateIndexRepairIntent(alloc, admission_id, .{
+            .phase = .preflight,
+            .trigger = if (mode == .replay_handoff) .replay_artifact_unavailable else null,
+        });
     } else {
         const completed = try db.advanceIndexRepairIntent(alloc, admission_id, .{});
         try std.testing.expect(completed.repaired);
