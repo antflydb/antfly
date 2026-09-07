@@ -50,6 +50,8 @@ pub const NamespaceQueryExecutionMetrics = struct {
 };
 
 pub const AuthenticatedSubrange = cache_mod.AuthenticatedSubrange;
+pub const AuthenticatedBlockPublication = cache_mod.AuthenticatedBlockPublication;
+pub const max_authenticated_publication_blocks = cache_mod.max_authenticated_publication_blocks;
 
 pub const GraphMetricReadLimits = struct {
     /// Shared by every graph-metric surface in one pinned request. These are
@@ -571,10 +573,10 @@ pub const QuerySession = struct {
         return cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.cancellation);
     }
 
-    pub fn cacheAuthenticatedBlock(self: *QuerySession, index: usize, block_id: []const u8, offset: u64, bytes: []const u8, checksum: *const [32]u8) !void {
+    pub fn cacheAuthenticatedBlocks(self: *QuerySession, index: usize, blocks: []const AuthenticatedBlockPublication) !void {
         const cache = self.cache orelse return;
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
-        try cache.publishAuthenticatedBlock(artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, bytes.len, bytes, self.cancellation);
+        try cache.publishAuthenticatedBlocks(artifact.artifact_id, artifact.byte_len, artifact.checksum, blocks, self.cancellation);
     }
 
     /// Fetches a bounded range and authenticates every byte against digests

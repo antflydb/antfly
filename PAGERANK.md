@@ -670,13 +670,16 @@ Only missing contiguous pages coalesce into authenticated ranges; independent ru
 use the same bounded parallel executor as score ranges (per column: eight reads and 32 MiB
 in flight, with each coalesced range capped at 8 MiB). A query prepares every
 column's control and routing, consuming authenticated cached score blocks before
-admitting score network reads. Exact miss plans share the remaining request budget
-without per-column quotas. When coalescing is necessary, a bounded dynamic program
-chooses the least-byte feasible combination of exact reads and coalesced windows
-across columns, checking both remaining requests and bytes. Its state is bounded
-by the public 128-request ceiling, not graph cardinality. Transport windows omit
-unused leading/trailing blocks and may bridge cached gaps when required to fit
-the request budget; partial cache warmth must not reduce admission feasibility.
+admitting score network reads. Contiguous misses form zero-overfetch runs capped
+at 8 MiB, sharing the remaining request budget without per-column quotas.
+When those runs exceed the request allowance, an exact bounded partition planner
+minimizes bytes across all columns. It considers partial merges, splits within
+miss runs, and ranges crossing former fixed-window boundaries. A monotone queue
+keeps planning work O(missed blocks × remaining requests); scratch memory and work
+are admitted against the shared query limits before allocation. Ranges omit unused
+boundary blocks and bridge authenticated cached gaps only when required to fit
+the request budget. They never bridge a discontinuity in authenticated extents;
+partial cache warmth must not reduce admission feasibility.
 The complete score request and byte totals are reserved atomically before
 bounded parallel execution. An uneven query therefore does not fail merely because
 one column needs more than an equal share. The shared budget remains authoritative
@@ -714,6 +717,15 @@ immutable artifact, global block ordinal, and exact extent, independent of the
 candidate set or transport batch. Readers probe those units before planning
 transport, authenticate the entire coalesced response before publishing any unit,
 and never retain candidate-specific combined routing or primary-score ranges.
+Publication groups at most 32 canonical blocks (and 8 MiB) per batch, bounding
+simultaneously open per-key leases. A cache-wide 32-publication admission limit
+also bounds descriptor use across parallel queries; saturation bypasses optional
+retention without waiting or evicting useful entries. Each batch
+reserves capacity and performs eviction once, writes payloads outside global
+maintenance/coordination locks, then commits independent canonical entries.
+Small caches retain a fitting subset instead of bypassing the entire batch.
+Existing per-block durable reservations, nonblocking publication ownership,
+cross-process usage reconciliation, and abandoned-write recovery remain intact.
 Overlapping candidate sets therefore reuse already-fetched blocks even when their
 routing-page sets or coalescing boundaries differ. Cached scores are decoded into
 the final result during preparation without retaining all cached payloads; they
