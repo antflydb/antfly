@@ -824,17 +824,27 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of images (raw JPEG/PNG bytes), returning [batch][projection_dim] embeddings.
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
-        if (images.len == 0) return try self.allocator.alloc([]f32, 0);
+        return (try self.embedImagesReported(images)).vectors;
+    }
+
+    pub const ImageBatchResult = struct {
+        vectors: [][]f32,
+        execution: enum { native_batch, serial, fallback },
+    };
+
+    pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
+        if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         // The batch primitive acquires the execution gate only after bounded
         // preprocessing. Fallback reuses that primitive for each item, so
         // taking the gate here would both serialize preprocessing and attempt
         // to re-enter the non-reentrant backend lock.
-        return self.embedImagesBatch(images) catch |err| {
+        const vectors = self.embedImagesBatch(images) catch |err| {
             if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
-                return self.embedImagesIndividually(images);
+                return .{ .vectors = try self.embedImagesIndividually(images), .execution = .fallback };
             }
             return err;
         };
+        return .{ .vectors = vectors, .execution = if (images.len > 1) .native_batch else .serial };
     }
 
     fn embedImagesBatch(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
@@ -970,8 +980,12 @@ pub const EmbeddingPipeline = struct {
         self: *EmbeddingPipeline,
         rasters: []const antfly_image.BorrowedRasterAttachment,
     ) anyerror![][]f32 {
-        if (rasters.len == 0) return try self.allocator.alloc([]f32, 0);
-        return self.embedBorrowedRastersBatch(rasters) catch |err| {
+        return (try self.embedBorrowedRastersReported(rasters)).vectors;
+    }
+
+    pub fn embedBorrowedRastersReported(self: *EmbeddingPipeline, rasters: []const antfly_image.BorrowedRasterAttachment) anyerror!ImageBatchResult {
+        if (rasters.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
+        const vectors = self.embedBorrowedRastersBatch(rasters) catch |err| {
             if (rasters.len > 1 and shouldFallbackBatchedImageError(err)) {
                 const embeddings = try self.allocator.alloc([]f32, rasters.len);
                 var initialized: usize = 0;
@@ -985,10 +999,11 @@ pub const EmbeddingPipeline = struct {
                     embeddings[index] = single[0];
                     initialized += 1;
                 }
-                return embeddings;
+                return .{ .vectors = embeddings, .execution = .fallback };
             }
             return err;
         };
+        return .{ .vectors = vectors, .execution = if (rasters.len > 1) .native_batch else .serial };
     }
 
     fn embedBorrowedRastersBatch(
@@ -3244,7 +3259,9 @@ test "embedImages uses one vision session run for an image batch" {
     };
 
     const images = [_][]const u8{ red_png_2x2[0..], red_png_2x2[0..] };
-    const embeddings = try pipeline.embedImages(&images);
+    const result = try pipeline.embedImagesReported(&images);
+    try std.testing.expectEqual(.native_batch, result.execution);
+    const embeddings = result.vectors;
     defer freeEmbeddingSlices(allocator, embeddings);
 
     try std.testing.expectEqual(@as(usize, 1), fake.run_count);
@@ -3269,7 +3286,9 @@ test "embedImages falls back to per-image runs when batched image shape collapse
     };
 
     const images = [_][]const u8{ red_png_2x2[0..], red_png_2x2[0..] };
-    const embeddings = try pipeline.embedImages(&images);
+    const result = try pipeline.embedImagesReported(&images);
+    try std.testing.expectEqual(.fallback, result.execution);
+    const embeddings = result.vectors;
     defer freeEmbeddingSlices(allocator, embeddings);
 
     try std.testing.expectEqual(@as(usize, 3), fake.run_count);
@@ -3279,6 +3298,106 @@ test "embedImages falls back to per-image runs when batched image shape collapse
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
     try std.testing.expect(execution_gate.tryLock());
     execution_gate.unlock();
+}
+
+test "image embedding broker fuses concurrent callers and transfers owned vectors" {
+    const microbatch = @import("../server/executor_microbatch.zig");
+    const shared = std.heap.smp_allocator;
+    var broker = microbatch.Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    const Executor = struct {
+        vision: FakeVisionBatchSession = .{},
+
+        fn run(ptr: *anyopaque, items: []const microbatch.ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.execute(items) catch |err| {
+                for (items) |item| item.slot.fail(err);
+            };
+        }
+
+        fn execute(self: *@This(), items: []const microbatch.ExecuteItem) !void {
+            const images = try shared.alloc([]const u8, items.len);
+            defer shared.free(images);
+            for (items, images) |item, *encoded| encoded.* = item.payloadAs([]const u8).*;
+            var pipeline = EmbeddingPipeline{
+                .allocator = shared,
+                .session = self.vision.session(),
+                .tok = undefined,
+                .config = .{ .normalize = false, .image_size = 2 },
+                .vision_session = self.vision.session(),
+            };
+            const batch = try pipeline.embedImagesReported(images);
+            defer shared.free(batch.vectors);
+            for (items, batch.vectors) |item, vector| item.slot.setValue([]f32, vector, switch (batch.execution) {
+                .native_batch => .native_batch,
+                .serial => .serial,
+                .fallback => .fallback,
+            });
+        }
+    };
+    const Submit = struct {
+        broker: *microbatch.Broker,
+        executor: *Executor,
+        result: ?microbatch.ItemResult([]f32) = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) std.Io.Cancelable!void {
+            const payload: []const u8 = &red_png_2x2;
+            const results = self.broker.submitBatchControlled([]const u8, []f32, std.testing.io, shared, .{ .model = "clip", .generation = 1, .task = .embed, .transform = "encoded-image", .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_wait_us = 500_000 }, &.{.{ .bytes = payload.len, .pixels = 4 }}, &.{.{}}, null, .{}, &.{payload}, self.executor, Executor.run) catch |err| {
+                self.err = err;
+                return;
+            };
+            self.result = results[0];
+            shared.free(results);
+        }
+        fn deinit(self: *@This()) void {
+            if (self.result) |result| switch (result.result) {
+                .value => |vector| shared.free(vector),
+                .item_error => {},
+            };
+        }
+    };
+    var executor = Executor{};
+    var first = Submit{ .broker = &broker, .executor = &executor };
+    defer first.deinit();
+    var second = Submit{ .broker = &broker, .executor = &executor };
+    defer second.deinit();
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    try group.concurrent(std.testing.io, Submit.run, .{&first});
+    try group.concurrent(std.testing.io, Submit.run, .{&second});
+    try group.await(std.testing.io);
+    if (first.err) |err| return err;
+    if (second.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), executor.vision.run_count);
+    try std.testing.expectEqual(@as(usize, 2), executor.vision.last_batch);
+    try std.testing.expectEqual(first.result.?.execution_id, second.result.?.execution_id);
+    try std.testing.expectEqual(.native_batch, first.result.?.execution);
+    const first_vector = first.result.?.result.value;
+    const second_vector = second.result.?.result.value;
+    try std.testing.expect(first_vector.ptr != second_vector.ptr);
+    try std.testing.expectEqual(@as(f32, 1), first_vector[0] + second_vector[0]);
+}
+
+test "borrowed image embeddings report native singleton and fallback execution" {
+    const allocator = std.testing.allocator;
+    var fake = FakeVisionBatchSession{};
+    var pipeline = EmbeddingPipeline{ .allocator = allocator, .session = fake.session(), .tok = undefined, .config = .{ .normalize = false, .image_size = 2 }, .vision_session = fake.session() };
+    const pixels = [_]u8{ 255, 0, 0, 255 } ** 4;
+    const rasters = [_]antfly_image.BorrowedRasterAttachment{.{ .bytes = &pixels, .width = 2, .height = 2, .stride_bytes = 8 }} ** 2;
+    const native = try pipeline.embedBorrowedRastersReported(&rasters);
+    defer freeEmbeddingSlices(allocator, native.vectors);
+    try std.testing.expectEqual(.native_batch, native.execution);
+    const singleton = try pipeline.embedBorrowedRastersReported(rasters[0..1]);
+    defer freeEmbeddingSlices(allocator, singleton.vectors);
+    try std.testing.expectEqual(.serial, singleton.execution);
+    var collapsing = FakeCollapsingVisionSession{};
+    pipeline.session = collapsing.session();
+    pipeline.vision_session = collapsing.session();
+    const fallback = try pipeline.embedBorrowedRastersReported(&rasters);
+    defer freeEmbeddingSlices(allocator, fallback.vectors);
+    try std.testing.expectEqual(.fallback, fallback.execution);
+    try std.testing.expectEqual(@as(usize, 3), collapsing.run_count);
 }
 
 test "embedAudioPcm falls back under the execution gate without re-entry" {

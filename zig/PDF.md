@@ -60,6 +60,57 @@ admission, batching, provenance, cancellation, and per-item result envelopes;
 they must not share task semantics merely because several can consume the same
 prepared asset.
 
+### Latest review fixes
+
+#### Review hardening: page outcomes, cache identity, and representation demand
+
+Admitted page preparation returns an ordered plan or a page-local geometry
+failure. Invalid boxes, rotations, and page numbers occupy result slots but
+consume no pixel budget and launch no render worker. Scratch estimation counts
+successful pages, even when failure slots separate them. Configuration,
+resource, cancellation, and document-reader failures still terminate the
+operation; they are not disguised as isolated bad pages.
+
+Page-image embedding identity is versioned (`antfly-pdf-page-embedding-v3`).
+It includes physical renderer byte/pixel ceilings and PDF decoder stream and
+working-set limits, alongside source, model, transform, and output geometry.
+Changing those limits therefore invalidates both staged and published vectors
+whose admitted render geometry may have changed. Older identities recompute
+through the ordinary durable update path.
+
+Shared raster windows resolve each consumer's durable pending-page mask before
+PNG materialization and reuse that mask during consumption, avoiding duplicate
+store probes and inconsistent page selection. All-cached consumers perform no
+encoding. A page-indexed window cache compresses only demanded pages, keeps successful PNGs borrowed for
+later compatible consumers, and releases them with the window. Metadata,
+retained earlier PNGs, and the active compressor's peak share one bounded
+budget; codec work shares one deadline. Partial demand cannot fragment a
+consumer's native inference batches or silently reduce its requested quality.
+
+#### Qualified image-embedding microbatches
+
+The inference Node's lazy task-neutral broker now has a dense image-embedding
+adapter in addition to reading. Homogeneous fail-fast encoded-image calls
+(including distributed `/embed`) and local borrowed page rasters can coalesce
+when the **loaded model** advertises native image batching. Group identity
+includes immutable loaded generation, task/instruction options, media
+representation, and backend resource class. Byte, pixel, and item limits remain
+authoritative; no new worker pool is created.
+
+Each caller retains its model handle and admitted input storage while waiting.
+Grouping happens before taking model asset or execution locks. The fused
+pipeline admits its realized preprocessing/compute shape, allocates temporary
+vectors with a thread-safe allocator, joins all consumers, then copies each
+result into its caller's allocator. Individual cancellation does not stop live
+peers. A corrupt compressed image is isolated with singleton fallback; resource
+and runtime failures do not cause retry amplification. Execution records report
+native, singleton serial, or fallback behavior actually used by the pipeline.
+
+Text/audio/mixed-modality embedding, traced HTTP requests, and per-item-error
+requests retain their existing executors and failure semantics. This adapter
+does not claim cross-request batching for every model family: additional native
+executors must qualify their own aggregate resource and typed-result contracts.
+
 ### Task-neutral document preparation
 
 A `PreparedDocument` owns source identity, MIME type, stable page metadata, and

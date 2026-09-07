@@ -380,7 +380,7 @@ pub const Broker = struct {
             .item = .{
                 .allocator = result_allocator,
                 .identity = identity,
-                .payload = payload,
+                .payload = @ptrCast(payload),
                 .slot = &slot,
             },
             .cancellation = cancellation,
@@ -553,9 +553,9 @@ pub const Broker = struct {
             // Initialize stable ticket storage before any leader can see it.
             for (0..count) |offset| {
                 const index = start + offset;
-                slots[offset] = .{ .output = &outputs[offset] };
+                slots[offset] = .{ .output = @ptrCast(&outputs[offset]) };
                 tickets[offset] = .{
-                    .item = .{ .allocator = result_allocator, .identity = identities[index], .payload = &payloads[index], .slot = &slots[offset] },
+                    .item = .{ .allocator = result_allocator, .identity = identities[index], .payload = @ptrCast(&payloads[index]), .slot = &slots[offset] },
                     .deadline = deadline,
                     .cancellation = cancellation,
                 };

@@ -6572,20 +6572,40 @@ const SharedPdfWindowScheduler = struct {
                     !std.meta.eql(source.config.ocr_quality, consumer.config.ocr_quality) or
                     (consumer.config.content_type.len > 0 and !std.mem.eql(u8, source.content_type, consumer.config.content_type))) continue;
             }
+            var pending_mask: ?[]bool = null;
+            defer if (pending_mask) |mask| self.runtime.alloc.free(mask);
             const media = if (rendered == .raster and !consumer.transform.raster) blk: {
-                const encoded = png_window.get(self.runtime, rendered.raster, window_lease, transform.render_bytes) catch |err| {
+                const demand = self.pendingPngPages(consumer, index, request, source_sha, rendered, text_source) catch |err| {
+                    if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
+                    if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                    consumer.err = err;
+                    continue;
+                };
+                pending_mask = demand;
+                var pending_count: usize = 0;
+                for (demand) |needed| if (needed) {
+                    pending_count += 1;
+                };
+                if (pending_count == 0) continue;
+                if (!consumer.text and window_items != page_count and pending_count % consumer.max_items != 0) {
+                    consumer.enabled = false;
+                    continue;
+                }
+                const encoded = png_window.getDemand(self.runtime, rendered.raster, window_lease, transform.render_bytes, demand) catch |err| {
                     if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
                     return err;
                 } orelse continue;
                 // Never resize a shared representation or silently lower a
                 // peer's quality to satisfy a different wire-byte contract.
-                if (!SharedPdfPngWindow.fits(encoded, consumer.transform.output_bytes)) continue;
-                break :blk PdfEmbeddingRenderedWindow{ .encoded = encoded };
+                for (encoded.results, demand) |page, needed| {
+                    if (needed) if (page.rendered) |image| if (image.png.len > consumer.transform.output_bytes) break;
+                } else break :blk PdfEmbeddingRenderedWindow{ .encoded = encoded };
+                continue;
             } else rendered;
             const result = if (consumer.text)
-                self.consumeText(consumer, index, text_source.?, media, window_lease)
+                self.consumeText(consumer, index, text_source.?, media, window_lease, pending_mask)
             else
-                self.consumeEmbedding(consumer, request, source_sha, media, page_count, window_lease);
+                self.consumeEmbedding(consumer, request, source_sha, media, page_count, window_lease, pending_mask);
             result catch |err| {
                 // An optional consumer lease may not fit beside this retained
                 // window. Its ordinary execution later keeps the baseline
@@ -6815,16 +6835,16 @@ const SharedPdfWindowScheduler = struct {
         }, source.config.credentials, source, window.lease);
     }
 
-    fn consumeText(self: *@This(), consumer: *Consumer, index: usize, source: TextSource, rendered: PdfEmbeddingRenderedWindow, window_lease: ?*PdfWindowCompositeLease) !void {
+    fn consumeText(self: *@This(), consumer: *Consumer, index: usize, source: TextSource, rendered: PdfEmbeddingRenderedWindow, window_lease: ?*PdfWindowCompositeLease, pending_mask: ?[]const bool) !void {
         // Unit clones and serialized result rows are bounded independently of
         // the owner's borrowed media. A denied optional lease falls back to the
         // consumer's normal traversal without retaining a second render window.
         var segment = try PdfWindowConsumerLease.init(self.runtime.alloc, self.runtime.config.resource_manager orelse self.runtime.index_manager.resource_manager, window_lease, runtime_document_replay_segment_memory_bytes);
         defer segment.deinit();
-        self.consumeTextWithAllocator(segment.allocator(), consumer, index, source, rendered, window_lease) catch |err| return segment.mapError(err);
+        self.consumeTextWithAllocator(segment.allocator(), consumer, index, source, rendered, window_lease, pending_mask) catch |err| return segment.mapError(err);
     }
 
-    fn consumeTextWithAllocator(self: *@This(), alloc: Allocator, consumer: *Consumer, index: usize, source: TextSource, rendered: PdfEmbeddingRenderedWindow, window_lease: ?*PdfWindowCompositeLease) !void {
+    fn consumeTextWithAllocator(self: *@This(), alloc: Allocator, consumer: *Consumer, index: usize, source: TextSource, rendered: PdfEmbeddingRenderedWindow, window_lease: ?*PdfWindowCompositeLease, pending_mask: ?[]const bool) !void {
         const runtime = self.runtime;
         const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
         var cancellation: AssetInvocationCancellation = undefined;
@@ -6855,9 +6875,12 @@ const SharedPdfWindowScheduler = struct {
             var pixels: u64 = 0;
             while (cursor < source.indices.len and requests.items.len < consumer.max_items) {
                 const unit = source.units[source.indices[cursor]];
-                const existing_key = try self.textKey(alloc, index, unit.page_number orelse return error.InvalidPdfRenderWindow);
-                defer alloc.free(existing_key);
-                if (try self.textStageExists(existing_key)) {
+                const pending = if (pending_mask) |mask| mask[cursor] else blk: {
+                    const existing_key = try self.textKey(alloc, index, unit.page_number orelse return error.InvalidPdfRenderWindow);
+                    defer alloc.free(existing_key);
+                    break :blk !try self.textStageExists(existing_key);
+                };
+                if (!pending) {
                     cursor += 1;
                     continue;
                 }
@@ -6980,9 +7003,22 @@ const SharedPdfWindowScheduler = struct {
         return true;
     }
 
-    fn consumeEmbedding(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow, page_count: usize, window_lease: ?*PdfWindowCompositeLease) !void {
+    fn pendingPngPages(self: *@This(), consumer: *Consumer, index: usize, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow, text_source: ?TextSource) ![]bool {
+        if (!consumer.text) return self.pendingEmbeddingPages(consumer, request, source_sha, window);
+        const source = text_source orelse return error.InvalidPdfRenderWindow;
+        const pending = try self.runtime.alloc.alloc(bool, source.indices.len);
+        errdefer self.runtime.alloc.free(pending);
+        for (source.indices, pending) |unit_index, *needed| {
+            const unit = source.units[unit_index];
+            const key = try self.textKey(self.runtime.alloc, index, unit.page_number orelse return error.InvalidPdfRenderWindow);
+            defer self.runtime.alloc.free(key);
+            needed.* = !try self.textStageExists(key);
+        }
+        return pending;
+    }
+
+    fn pendingEmbeddingPages(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow) ![]bool {
         const runtime = self.runtime;
-        const embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
         const embedding_name = requestEmbeddingName(request);
         const pixel_cap = consumer.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
@@ -6995,7 +7031,7 @@ const SharedPdfWindowScheduler = struct {
             inline else => |batch| batch.results.len,
         };
         const pending = try runtime.alloc.alloc(bool, total);
-        defer runtime.alloc.free(pending);
+        errdefer runtime.alloc.free(pending);
         {
             var txn: ?backend_erased.ReadTxn = runtime.store.beginRead() catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -7019,6 +7055,26 @@ const SharedPdfWindowScheduler = struct {
                 needed.* = !try shouldSkipEmbeddingArtifactInTxn(runtime, read, final_key, hash) and !try shouldSkipEmbeddingArtifactInTxn(runtime, read, stage_key, hash);
             }
         }
+        return pending;
+    }
+
+    fn consumeEmbedding(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow, page_count: usize, window_lease: ?*PdfWindowCompositeLease, pending_mask: ?[]const bool) !void {
+        const runtime = self.runtime;
+        const embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
+        const embedding_name = requestEmbeddingName(request);
+        const pixel_cap = consumer.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+        const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
+        const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
+        const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
+            if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
+        });
+        defer runtime.alloc.free(stage_id);
+        const total = switch (window) {
+            inline else => |batch| batch.results.len,
+        };
+        const owned_pending = if (pending_mask == null) try self.pendingEmbeddingPages(consumer, request, source_sha, window) else null;
+        defer if (owned_pending) |mask| runtime.alloc.free(mask);
+        const pending = pending_mask orelse owned_pending.?;
         // Compact descriptors, never page buffers. Cache hits must not split
         // compatible pending pages into singleton provider invocations.
         const rendered: PdfEmbeddingRenderedWindow = switch (window) {
@@ -7863,6 +7919,17 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             try std.testing.expectEqual(@as(usize, 1), downscaled.count);
             const small = downscaled.rendered.encoded.results[0].rendered.?;
             try std.testing.expect(@as(u64, small.width) * small.height <= physical_limit.render_config.pdf_render_max_inflight_pixels);
+            var mixed = preparer;
+            mixed.pending_pages = &.{ 1, 3 };
+            var isolated = try mixed.prepare(0);
+            defer isolated.deinit();
+            try std.testing.expect(isolated.rendered.encoded.results[0].rendered != null);
+            try std.testing.expectEqual(error.InvalidPageNumber, isolated.rendered.encoded.results[1].failure.?);
+            mixed.pending_pages = &.{3};
+            mixed.use_borrowed_rasters = true;
+            var failed_only = try mixed.prepare(0);
+            defer failed_only.deinit();
+            try std.testing.expectEqual(error.InvalidPageNumber, failed_only.rendered.raster.results[0].failure.?);
         }
         {
             harness.largest_memory_request = 0;
@@ -11064,8 +11131,9 @@ const PdfEmbeddingRenderedWindow = union(enum) {
 /// Invocation-scoped, lazy lossless representation of a borrowed raster
 /// window. Encoding and retained PNGs use a separate, non-reclaiming lease;
 /// the parent raster allocator stays frozen until every consumer finishes.
-const SharedPdfPngWindow = struct {
+const SharedPdfPngPage = struct {
     attempted: bool = false,
+    deadline_ns: u64 = std.math.maxInt(u64),
     lease: ?PdfWindowConsumerLease = null,
     batch: ?document_extraction_mod.RenderedPdfPageBatch = null,
 
@@ -11122,7 +11190,7 @@ const SharedPdfPngWindow = struct {
         }
         const cancellation = Cancellation{
             .runtime = runtime,
-            .deadline = std.math.add(u64, platform_time.monotonicNs(), @as(u64, runtime.config.sync_wait_timeout_ms) *| std.time.ns_per_ms) catch std.math.maxInt(u64),
+            .deadline = @min(self.deadline_ns, std.math.add(u64, platform_time.monotonicNs(), @as(u64, runtime.config.sync_wait_timeout_ms) *| std.time.ns_per_ms) catch std.math.maxInt(u64)),
         };
         for (raster.results, results) |input, *output| {
             output.* = .{ .page_number = input.page_number, .failure = input.failure, .render_elapsed_ns = input.render_elapsed_ns };
@@ -11150,6 +11218,94 @@ const SharedPdfPngWindow = struct {
         };
         self.lease.?.retainLiveBytes();
         return self.batch;
+    }
+};
+
+/// Stable, page-indexed representations. Consumers resolve durable demand
+/// first; only missing requested pages acquire codec/retention leases. Earlier
+/// PNGs stay borrowed and never need to be compressed a second time.
+const SharedPdfPngWindow = struct {
+    metadata: ?PdfWindowConsumerLease = null,
+    pages: []SharedPdfPngPage = &.{},
+    batch: ?document_extraction_mod.RenderedPdfPageBatch = null,
+    disabled: bool = false,
+    deadline_ns: u64 = 0,
+
+    fn deinit(self: *@This()) void {
+        for (self.pages) |*page| page.deinit();
+        if (self.metadata) |*lease| {
+            lease.allocator().free(self.batch.?.results);
+            lease.allocator().free(self.pages);
+            lease.deinit();
+        }
+        self.* = .{};
+    }
+
+    fn residentBytes(self: *const @This()) usize {
+        var bytes: usize = if (self.metadata) |lease| lease.limit.live_bytes else 0;
+        for (self.pages) |page| if (page.lease) |lease| {
+            bytes +|= lease.limit.live_bytes;
+        };
+        return bytes;
+    }
+
+    fn fits(batch: document_extraction_mod.RenderedPdfPageBatch, limit: usize) bool {
+        return SharedPdfPngPage.fits(batch, limit);
+    }
+
+    fn get(self: *@This(), runtime: *EnrichmentRuntime, raster: document_extraction_mod.RenderedPdfPageRasterBatch, parent: ?*PdfWindowCompositeLease, ceiling: usize) !?document_extraction_mod.RenderedPdfPageBatch {
+        return self.getDemand(runtime, raster, parent, ceiling, null);
+    }
+
+    fn getDemand(self: *@This(), runtime: *EnrichmentRuntime, raster: document_extraction_mod.RenderedPdfPageRasterBatch, parent: ?*PdfWindowCompositeLease, ceiling: usize, demand: ?[]const bool) !?document_extraction_mod.RenderedPdfPageBatch {
+        if (self.disabled) return null;
+        if (demand) |needed| {
+            if (needed.len != raster.results.len) return error.InvalidPdfRenderWindow;
+            if (std.mem.indexOfScalar(bool, needed, true) == null) return null;
+        }
+        if (self.batch == null) {
+            self.disabled = true;
+            const Page = std.meta.Child(@FieldType(document_extraction_mod.RenderedPdfPageBatch, "results"));
+            const bytes = std.math.mul(usize, raster.results.len, @sizeOf(Page) + @sizeOf(SharedPdfPngPage)) catch return error.OutOfMemory;
+            if (bytes > ceiling) return error.OutOfMemory;
+            self.metadata = try PdfWindowConsumerLease.init(runtime.alloc, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, bytes);
+            errdefer {
+                self.metadata.?.deinit();
+                self.metadata = null;
+            }
+            const alloc = self.metadata.?.allocator();
+            const pages = try alloc.alloc(SharedPdfPngPage, raster.results.len);
+            errdefer alloc.free(pages);
+            @memset(pages, .{});
+            const results = try alloc.alloc(Page, raster.results.len);
+            for (raster.results, results) |input, *output| output.* = .{ .page_number = input.page_number, .failure = input.failure, .render_elapsed_ns = input.render_elapsed_ns };
+            self.pages = pages;
+            self.batch = .{ .results = results, .requested_parallelism = raster.requested_parallelism, .peak_launched_workers = raster.peak_launched_workers, .peak_parallelism = raster.peak_parallelism, .peak_admitted_pixels = raster.peak_admitted_pixels, .peak_admitted_bytes = raster.peak_admitted_bytes, .thread_spawn_fallbacks = raster.thread_spawn_fallbacks };
+            self.deadline_ns = platform_time.monotonicNs() +| (runtime.config.sync_wait_timeout_ms *| std.time.ns_per_ms);
+            self.metadata.?.retainLiveBytes();
+            self.disabled = false;
+        }
+        for (raster.results, 0..) |input, i| {
+            if (demand) |needed| if (!needed[i]) continue;
+            if (input.rendered == null or self.batch.?.results[i].rendered != null) continue;
+            var singleton = raster;
+            singleton.results = raster.results[i..][0..1];
+            self.pages[i].deadline_ns = self.deadline_ns;
+            const page = self.pages[i].get(runtime, singleton, parent, ceiling -| self.residentBytes()) catch |err| {
+                self.abandonEmpty();
+                return err;
+            } orelse return null;
+            self.batch.?.results[i] = page.results[0];
+        }
+        return self.batch;
+    }
+
+    fn abandonEmpty(self: *@This()) void {
+        if (self.batch) |batch| for (batch.results) |page| {
+            if (page.rendered != null) return;
+        };
+        self.deinit();
+        self.disabled = true;
     }
 };
 
@@ -11192,10 +11348,27 @@ test "shared PDF PNG representation is lazy bounded and reused without resizing"
         const decoded = try antfly_image.png.decodeRgba(alloc, png.png);
         defer alloc.free(decoded.rgba);
         try std.testing.expectEqualSlices(u8, bytes, decoded.rgba);
-        try std.testing.expectEqual(cache.lease.?.limit.live_bytes, parent.consumer_credit);
+        try std.testing.expectEqual(cache.residentBytes(), parent.consumer_credit);
         try std.testing.expect(parent.consumer_credit < 1024 * 1024);
     }
     try std.testing.expectEqual(@as(usize, 0), parent.consumer_credit);
+    {
+        var requested_pages = [_]Page{ pages[0], pages[0] };
+        requested_pages[1].page_number = 8;
+        var requested = raster;
+        requested.results = &requested_pages;
+        var cache = SharedPdfPngWindow{};
+        defer cache.deinit();
+        try std.testing.expect(try cache.getDemand(&runtime, requested, parent, 1024 * 1024, &.{ false, false }) == null);
+        try std.testing.expect(cache.batch == null);
+        const first = (try cache.getDemand(&runtime, requested, parent, 1024 * 1024, &.{ true, false })).?;
+        const first_png = first.results[0].rendered.?.png.ptr;
+        try std.testing.expect(first.results[1].rendered == null);
+        try std.testing.expect(!cache.pages[1].attempted);
+        const second = (try cache.getDemand(&runtime, requested, parent, 1024 * 1024, &.{ false, true })).?;
+        try std.testing.expect(second.results[0].rendered.?.png.ptr == first_png);
+        try std.testing.expect(second.results[1].rendered != null);
+    }
     {
         var denied = SharedPdfPngWindow{};
         defer denied.deinit();
@@ -12544,7 +12717,7 @@ fn renderRuntimePdfWindow(
         );
         for (singleton_allowances, prepared_plans[0..requests.items.len], 0..) |*allowance, plan, i| {
             allowance.* = if (use_borrowed_rasters)
-                try pdfRgbaBytesForPixels(plan.geometry().pixels)
+                @max(1, try pdfRgbaBytesForPixels(plan.geometry().pixels))
             else
                 @min(
                     maximum_pdf_page_inline_png_bytes,
@@ -18621,7 +18794,7 @@ fn appendFullTextDeleteDocumentToWindow(
     });
 }
 
-const pdf_page_embedding_identity_version = "antfly-pdf-page-embedding-v2";
+const pdf_page_embedding_identity_version = "antfly-pdf-page-embedding-v3";
 
 fn updatePdfPageEmbeddingHashInt(hasher: *std.hash.XxHash64, comptime T: type, value: T) void {
     var encoded: [@sizeOf(T)]u8 = undefined;
@@ -18653,6 +18826,10 @@ fn pdfPageEmbeddingSourceHash(
     updatePdfPageEmbeddingHashInt(&hasher, u16, render_config.ocr_render_dpi);
     updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.ocr_max_rendered_pixels);
     updatePdfPageEmbeddingHashInt(&hasher, u32, render_config.ocr_max_rendered_dimension);
+    updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.pdf_render_max_inflight_pixels);
+    updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(render_config.pdf_render_max_inflight_bytes));
+    updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(render_config.pdf_decode_limits.max_decoded_stream_bytes));
+    updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(render_config.pdf_decode_limits.max_working_set_bytes));
     updatePdfPageEmbeddingHashInt(&hasher, u32, @intCast(minimum_pdf_page_render_dimension));
     updatePdfPageEmbeddingHashInt(&hasher, u32, @intCast(maximum_pdf_page_render_attempts));
     updatePdfPageEmbeddingHashInt(&hasher, u64, model_pixel_cap);
@@ -18849,7 +19026,7 @@ const PdfEmbeddingWindowPreparer = struct {
         retained_prefix[0] = 0;
         for (prepared_plans[0..count], 0..) |plan, i| {
             const page_bytes = if (self.use_borrowed_rasters)
-                try pdfRgbaBytesForPixels(plan.geometry().pixels)
+                @max(1, try pdfRgbaBytesForPixels(plan.geometry().pixels))
             else
                 per_page_bytes;
             retained_prefix[i + 1] = std.math.add(usize, retained_prefix[i], page_bytes) catch
@@ -20148,6 +20325,17 @@ test "PDF page embedding identity covers source page transform and transport" {
     const digest_b = [_]u8{0x22} ** std.crypto.hash.sha2.Sha256.digest_length;
     const config = document_extraction_mod.Config{};
     const baseline = pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null);
+    for (0..4) |limit| {
+        var changed = config;
+        switch (limit) {
+            0 => changed.pdf_render_max_inflight_pixels /= 2,
+            1 => changed.pdf_render_max_inflight_bytes /= 2,
+            2 => changed.pdf_decode_limits.max_decoded_stream_bytes /= 2,
+            3 => changed.pdf_decode_limits.max_working_set_bytes /= 2,
+            else => unreachable,
+        }
+        try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", changed, 10_000_000, 4 * 1024 * 1024, true, 768, null));
+    }
     try std.testing.expectEqual(baseline, pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null));
     try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_b, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null));
     try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 2, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null));

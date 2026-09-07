@@ -24,6 +24,7 @@ const api = @import("inference_api");
 const generating_api = @import("antfly_generating_openapi");
 const extraction_api = @import("antfly_extraction_openapi");
 const readers_api = @import("antfly_readers");
+const antfly_image = @import("antfly_image");
 const transcribing_api = @import("antfly_transcribing");
 const extracting_api = @import("antfly_extracting");
 const scraping = @import("antfly_scraping");
@@ -5927,10 +5928,17 @@ pub const Node = struct {
             allocator: std.mem.Allocator,
             deadline_ns: ?u64,
             rasters: []const readers_api.RasterImage,
+            node: *Node,
+            io: std.Io,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                const control = attempt.node.bindExecutionControl(attempt.io, .{ .deadline_ns = attempt.deadline_ns });
+                if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, attempt.io, model, &.{}, attempt.rasters, control, .RETRIEVAL_DOCUMENT, null)) |vectors| {
+                    attempt.vectors = vectors;
+                    return;
+                }
                 var asset_lease = model.acquireEmbeddingAssetLease(false);
                 defer asset_lease.release();
                 try model.ensureEmbeddingAssets(false, true, false);
@@ -5947,9 +5955,170 @@ pub const Node = struct {
             .allocator = allocator,
             .deadline_ns = deadline_ns,
             .rasters = rasters,
+            .node = self,
+            .io = io,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
         return attempt.vectors.?;
+    }
+
+    const ImageEmbedTicket = struct {
+        model: *model_manager_mod.LoadedModel,
+        encoded: ?[]const u8 = null,
+        raster: ?antfly_image.BorrowedRasterAttachment = null,
+        task_type: EmbeddingTaskType,
+        instruction: ?[]const u8,
+    };
+
+    /// Invoked while each caller owns its loaded-generation handle and media
+    /// admission, but before any model asset/execution lock is taken. Only
+    /// qualified homogeneous image batches opt in; mixed/partial requests keep
+    /// their existing task-specific executor and failure semantics.
+    fn tryEmbedImagesViaBroker(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: *model_manager_mod.LoadedModel,
+        encoded: []const ParsedBinaryEmbedInput,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        control: InferenceExecutionControl,
+        task_type: EmbeddingTaskType,
+        instruction: ?[]const u8,
+    ) !?[][]f32 {
+        const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+        if (contract.batch.mode != .native or contract.batch.max_items <= 1 or !contract.accepts_image or model.manifest.hasCapability("sparse")) return null;
+        const raw = rasters.len > 0;
+        if (raw and !contract.accepts_borrowed_rasters) return null;
+        const count = if (raw) rasters.len else encoded.len;
+        if (count == 0 or (raw and encoded.len != 0)) return null;
+        const shared = std.heap.smp_allocator;
+        const payloads = try allocator.alloc(ImageEmbedTicket, count);
+        defer allocator.free(payloads);
+        const shapes = try allocator.alloc(executor_microbatch.Shape, count);
+        defer allocator.free(shapes);
+        const identities = try allocator.alloc(executor_microbatch.Identity, count);
+        defer allocator.free(identities);
+        var total_bytes: usize = 0;
+        var total_pixels: u64 = 0;
+        for (0..count) |i| {
+            payloads[i] = .{ .model = model, .encoded = if (raw) null else encoded[i].bytes, .raster = if (raw) rasters[i] else null, .task_type = task_type, .instruction = instruction };
+            shapes[i] = .{
+                .bytes = if (raw) rasters[i].bytes.len else encoded[i].bytes.len,
+                .pixels = if (raw) try rasters[i].pixels() else try measureExecutorDecodedImages(&model.manifest, &.{encoded[i].bytes}),
+            };
+            identities[i] = if (raw) .{ .item_id = rasters[i].item_id, .source_fingerprint = rasters[i].source_fingerprint, .page_number = rasters[i].page_number } else .{};
+            total_bytes = std.math.add(usize, total_bytes, shapes[i].bytes) catch return error.InferenceEncodedBytesExceeded;
+            total_pixels = std.math.add(u64, total_pixels, shapes[i].pixels) catch return error.InferenceDecodedPixelsExceeded;
+        }
+        try validateInferenceExecutorInvocation(contract, .{ .item_count = count, .encoded_media_bytes = if (raw) 0 else total_bytes, .decoded_pixels = total_pixels, .media_parts_per_item = 1, .has_image = true });
+        const Probe = struct {
+            fn canceled(ptr: *const anyopaque) bool {
+                const c: *const InferenceExecutionControl = @ptrCast(@alignCast(ptr));
+                c.check() catch return true;
+                return false;
+            }
+        };
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(
+            ImageEmbedTicket,
+            []f32,
+            io,
+            shared,
+            .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .embed, .schema = instruction orelse "", .option_key = @as(u64, @intFromEnum(task_type)) * 2 + @intFromBool(instruction != null), .transform = if (raw) "rgba8" else "encoded-image", .resource_class = executorMicrobatchResourceClass(model.session.backend()) },
+            .{ .mode = .native, .preferred_items = contract.batch.preferred_items, .max_items = contract.batch.max_items, .max_bytes = if (raw) std.math.maxInt(usize) else contract.batch.max_encoded_media_bytes, .max_pixels = contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), .max_wait_us = self.config.executor_microbatch_max_wait_us },
+            shapes,
+            identities,
+            try directExecutorDeadline(io, control.deadline_ns),
+            .{ .ptr = &control, .is_cancelled_fn = Probe.canceled },
+            payloads,
+            self,
+            executeImageEmbedMicrobatch,
+        );
+        defer {
+            for (results) |result| switch (result.result) {
+                .value => |vector| shared.free(vector),
+                .item_error => {},
+            };
+            shared.free(results);
+        }
+        try control.check();
+        const vectors = try allocator.alloc([]f32, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (vectors[0..initialized]) |vector| allocator.free(vector);
+            allocator.free(vectors);
+        }
+        for (results, vectors) |result, *vector| {
+            vector.* = switch (result.result) {
+                .value => |value| try allocator.dupe(f32, value),
+                .item_error => |failure| return failure.cause,
+            };
+            initialized += 1;
+        }
+        return vectors;
+    }
+
+    fn executeImageEmbedMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runImageEmbedMicrobatch(items, false) catch |err| {
+            // Header admission cannot detect every corrupt compressed payload.
+            // A bad caller must not turn other callers' images into failures.
+            // Resource/runtime/control failures are never amplified by retries.
+            if (err == error.ImageDecodeFailed and items.len > 1) {
+                for (items, 0..) |_, i| self.runImageEmbedMicrobatch(items[i .. i + 1], true) catch |item_err| {
+                    items[i].slot.fail(item_err);
+                };
+                return;
+            }
+            for (items) |item| item.slot.fail(err);
+        };
+    }
+
+    fn runImageEmbedMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem, fallback: bool) !void {
+        if (items.len == 0) return;
+        const first = items[0].payloadAs(ImageEmbedTicket);
+        const model = first.model;
+        const alloc = std.heap.smp_allocator;
+        var group_control = executor_microbatch.ExecutionControl{ .items = items };
+        const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group_control, .check_fn = executor_microbatch.ExecutionControl.check });
+        try control.check();
+        var asset_lease = model.acquireEmbeddingAssetLease(false);
+        defer asset_lease.release();
+        var pipeline = blk: {
+            try model.lockEmbeddingAssetsWithControl(control);
+            defer model.unlockEmbeddingAssets();
+            try model.ensurePrimaryEmbeddingAssetsLockedWithControl(false, true, control);
+            break :blk model.embeddingPipelineLocked(alloc);
+        };
+        pipeline.execution_control = control;
+        const prefix = try applyDenseEmbeddingRequestOptions(alloc, &pipeline, &model.manifest, .{ .model = "", .input = .null, .encoding_format = null, .dimensions = null, .task_type = first.task_type, .instruction = first.instruction });
+        defer if (prefix) |value| alloc.free(value);
+        const batch = if (first.raster != null) blk: {
+            const rasters = try alloc.alloc(antfly_image.BorrowedRasterAttachment, items.len);
+            defer alloc.free(rasters);
+            for (items, rasters) |item, *raster| raster.* = item.payloadAs(ImageEmbedTicket).raster.?;
+            break :blk try pipeline.embedBorrowedRastersReported(rasters);
+        } else blk: {
+            const images = try alloc.alloc([]const u8, items.len);
+            defer alloc.free(images);
+            for (items, images) |item, *image| image.* = item.payloadAs(ImageEmbedTicket).encoded.?;
+            break :blk try pipeline.embedImagesReported(images);
+        };
+        const vectors = batch.vectors;
+        errdefer freeDirectDenseVectors(alloc, vectors);
+        if (vectors.len != items.len) return error.InvalidEmbeddingResultCount;
+        for (items, vectors) |item, vector| {
+            item.control.check() catch |err| {
+                alloc.free(vector);
+                item.slot.fail(err);
+                continue;
+            };
+            item.slot.setValue([]f32, vector, if (fallback) .fallback else switch (batch.execution) {
+                .native_batch => .native_batch,
+                .serial => .serial,
+                .fallback => .fallback,
+            });
+        }
+        alloc.free(vectors);
     }
 
     fn embedParsedDenseInputsDirect(
@@ -5995,6 +6164,7 @@ pub const Node = struct {
             allocator: std.mem.Allocator,
             io: std.Io,
             parsed: *ParsedDenseEmbedInputs,
+            node: *Node,
             audio_decode_working_bytes: usize,
             executor_contract: ResolvedInferenceExecutorContract,
             control: InferenceExecutionControl,
@@ -6023,6 +6193,12 @@ pub const Node = struct {
                     attempt.parsed,
                     max_input_tokens,
                 );
+                if (attempt.parsed.images.items.len == attempt.parsed.total_count and attempt.parsed.parse_errors.items.len == 0) {
+                    if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, attempt.io, model, attempt.parsed.images.items, &.{}, attempt.control, attempt.task_type, attempt.instruction)) |vectors| {
+                        attempt.vectors = vectors;
+                        return;
+                    }
+                }
                 var asset_lease = model.acquireEmbeddingAssetLease(attempt.parsed.audio.items.len > 0);
                 defer asset_lease.release();
                 try attempt.control.check();
@@ -6061,6 +6237,7 @@ pub const Node = struct {
             .allocator = allocator,
             .io = io,
             .parsed = parsed,
+            .node = self,
             .audio_decode_working_bytes = audio_decode_working_bytes,
             .executor_contract = executor_contract,
             .control = control,
@@ -8809,6 +8986,7 @@ pub const Node = struct {
             io: ?std.Io,
             inputs: *ParsedDenseEmbedInputs,
             request: ParsedEmbedRequest,
+            node: *Node,
             audio_decode_working_bytes: usize,
             trace: ?*embedding_trace.Trace,
             execution_control: InferenceExecutionControl,
@@ -8820,6 +8998,18 @@ pub const Node = struct {
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                // Keep traced, mixed-modality and per-item requests on their
+                // established executor; homogeneous fail-fast image requests
+                // may share native calls with other callers of this generation.
+                if (attempt.request.error_policy == .fail_fast and attempt.trace == null and attempt.inputs.images.items.len == attempt.inputs.total_count and attempt.inputs.parse_errors.items.len == 0) {
+                    if (attempt.io) |io| {
+                        if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, io, model, attempt.inputs.images.items, &.{}, attempt.execution_control, attempt.request.task_type orelse .RETRIEVAL_DOCUMENT, attempt.request.instruction)) |vectors| {
+                            attempt.prompt_tokens = estimateParsedDenseEmbedPromptTokens(attempt.inputs);
+                            attempt.result = .{ .fail_fast = vectors };
+                            return;
+                        }
+                    }
+                }
                 const asset_started = if (attempt.trace != null) embedding_trace.now() else 0;
                 var asset_lease = model.acquireEmbeddingAssetLease(attempt.inputs.audio.items.len > 0);
                 defer asset_lease.release();
@@ -8885,6 +9075,7 @@ pub const Node = struct {
             .io = self.session_manager.io,
             .inputs = &inputs,
             .request = request,
+            .node = self,
             .audio_decode_working_bytes = audio_decode_working_bytes,
             .executor_contract = executor_contract,
             .admission_manifest = &admission_manifest,

@@ -92,6 +92,29 @@ When `error_policy` is `per_item`, malformed content parts, failed media fetches
 
 This keeps the fast path fast while giving ingestion callers a way to isolate poisoned media without forcing DB batch rollback.
 
+### Cross-request image embedding
+
+The Node-owned microbatch broker also coalesces homogeneous image-only,
+fail-fast requests for loaded models advertising native image batching. Local
+encoded inputs and distributed `/embed` share the adapter; borrowed PDF page
+rasters use a distinct representation group. Keys include loaded generation,
+task/instruction options, representation, and backend resource class. Each
+caller retains its model handle and admitted media until the synchronous join;
+model locks are taken only after grouping. Aggregate preprocessing and compute
+retain the pipeline's resource admission.
+
+Fused vectors use thread-safe temporary allocation and transfer to each caller's
+allocator after joining. Cancellation is per caller. Corrupt compressed images
+trigger item isolation without poisoning other callers; capacity, cancellation,
+and runtime failures do not fan out into retries. The pipeline reports native,
+serial, and fallback execution explicitly. A deterministic concurrent regression
+verifies that two callers produce one vision-session invocation and independent
+owned vectors. This is not a hardware throughput benchmark.
+
+Mixed inputs, text/audio, per-item-error requests, and traced HTTP requests keep
+their existing executors; native cross-request support is not inferred merely
+from sharing a model family or provider.
+
 ## Synchronous generation batch endpoint
 
 Generative LLM batching should start with a synchronous `/generate/batch`

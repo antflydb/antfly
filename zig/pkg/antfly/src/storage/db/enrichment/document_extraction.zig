@@ -186,6 +186,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         pub const PreparedPageRenderPlan = struct {
             request_value: PageRenderRequest,
             geometry_value: PageRenderGeometry,
+            failure: ?anyerror = null,
 
             pub fn request(self: @This()) PageRenderRequest {
                 return self.request_value;

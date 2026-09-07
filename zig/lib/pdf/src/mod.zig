@@ -845,12 +845,16 @@ pub const PreparedPageRenderPlan = struct {
     _geometry: AdaptiveRenderGeometry,
     _source_ptr: [*]const u8,
     _source_len: usize,
+    /// Ordered page-local preparation failure. Such entries occupy an output
+    /// slot but never launch a renderer or consume pixel admission.
+    failure: ?anyerror = null,
 
     pub fn request(self: @This()) PageRenderRequest {
         return self._request;
     }
 
     pub fn geometry(self: @This()) PageRenderGeometry {
+        if (self.failure != null) return .{ .effective_dpi = 0, .width = 0, .height = 0, .pixels = 0 };
         return .{
             .effective_dpi = self._geometry.effective_dpi,
             .width = self._geometry.width,
@@ -900,8 +904,19 @@ pub fn prepareAdmittedPageRenderPlan(
 ) !PreparedPageRenderPlan {
     if (options.bytes_per_pixel_reserve < 4 or options.max_inflight_pixels == 0)
         return error.InvalidRenderBatchOptions;
-    const admitted = try prepareRenderPageForAdmission(parsed, request, null, options, output_kind, 0);
     const source = parsed.sourceBytes();
+    const admitted = prepareRenderPageForAdmission(parsed, request, null, options, output_kind, 0) catch |err| switch (err) {
+        // Configuration, resource admission, cancellation and document-reader
+        // failures still escape. Only deterministic page geometry is local.
+        error.InvalidPageBox, error.InvalidPageRotation, error.InvalidPageNumber => return .{
+            ._request = request,
+            ._geometry = undefined,
+            ._source_ptr = source.ptr,
+            ._source_len = source.len,
+            .failure = err,
+        },
+        else => return err,
+    };
     return .{
         ._request = admitted.request,
         ._geometry = admitted.geometry,
@@ -930,8 +945,11 @@ pub fn estimatePreparedPageRenderWaveScratchBytes(
     const wave_width = @min(max_parallel_pages, plans.len);
     var wave_bytes: usize = 0;
     var peak_bytes: usize = 0;
-    for (plans, 0..) |plan, index| {
+    var first: usize = 0;
+    var live: usize = 0;
+    for (plans) |plan| {
         if (!plan.matchesSource(parsed)) return error.PreparedPageRenderSourceMismatch;
+        if (plan.failure != null) continue;
         const raster_bytes = std.math.mul(
             usize,
             std.math.cast(usize, plan._geometry.pixels) orelse
@@ -942,8 +960,12 @@ pub fn estimatePreparedPageRenderWaveScratchBytes(
             return error.RenderBatchAdmissionExceeded;
         wave_bytes = std.math.add(usize, wave_bytes, raster_bytes) catch
             return error.RenderBatchAdmissionExceeded;
-        if (index >= wave_width) {
-            const expired = plans[index - wave_width];
+        live += 1;
+        if (live > wave_width) {
+            while (plans[first].failure != null) first += 1;
+            const expired = plans[first];
+            first += 1;
+            live -= 1;
             const expired_raster_bytes = std.math.mul(
                 usize,
                 std.math.cast(usize, expired._geometry.pixels) orelse
@@ -955,7 +977,9 @@ pub fn estimatePreparedPageRenderWaveScratchBytes(
         }
         peak_bytes = @max(peak_bytes, wave_bytes);
     }
-    return peak_bytes;
+    // A failure-only window still needs a nonzero coordinator lease, but no
+    // render lane or decode working set. Result descriptors use output credit.
+    return @max(peak_bytes, 1);
 }
 
 /// Resolve the raster geometry for a page using the exact same adaptive rules
@@ -1790,6 +1814,10 @@ fn renderParsedPageWorkBatchAlloc(
     @memset(prepared, null);
     for (0..request_count) |i| {
         const request = if (prepared_plans) |plans| plans[i]._request else requests[i];
+        if (prepared_plans) |plans| if (plans[i].failure) |err| {
+            results[i].failure = err;
+            continue;
+        };
         const geometry = if (prepared_plans) |plans| plans[i]._geometry else null;
         prepared[i] = prepareRenderPageForAdmission(parsed, request, geometry, options, output_kind, i) catch |err| {
             results[i].failure = err;
@@ -5445,6 +5473,34 @@ test "admitted prepared geometry is identical at execution under pixel and scrat
     const plan = try prepareAdmittedPageRenderPlan(&parsed, raw, .{}, .raster);
     try std.testing.expect(plan.geometry().pixels <= 40_000);
     try std.testing.expectError(error.InvalidRenderBatchOptions, prepareAdmittedPageRenderPlan(&parsed, request, .{ .bytes_per_pixel_reserve = 0 }, .png));
+}
+
+test "prepared windows retain page geometry failures and compact successful scratch waves" {
+    const alloc = std.testing.allocator;
+    const source = try alloc.dupe(u8, @embedFile("../testdata/two_page_text_fixture.pdf"));
+    defer alloc.free(source);
+    const marker = "/MediaBox [0 0 200 100]";
+    const first = std.mem.indexOf(u8, source, marker).?;
+    const second = std.mem.indexOfPos(u8, source, first + marker.len, marker).?;
+    source[second + "/MediaBox [0 0 ".len] = '0';
+    var parsed = try reader.Reader.init(alloc, source);
+    defer parsed.deinit();
+    const good = try prepareAdmittedPageRenderPlan(&parsed, .{ .page_number = 1 }, .{}, .png);
+    const bad = try prepareAdmittedPageRenderPlan(&parsed, .{ .page_number = 2 }, .{}, .png);
+    try std.testing.expectEqual(error.InvalidPageBox, bad.failure.?);
+    try std.testing.expectEqual(@as(u64, 0), bad.geometry().pixels);
+    const plans = [_]PreparedPageRenderPlan{ good, bad, good };
+    const scratch = try estimatePreparedPageRenderWaveScratchBytes(&parsed, &plans, 2, default_render_bytes_per_pixel_reserve);
+    try std.testing.expectEqual(2 * try estimatePreparedPageRenderWaveScratchBytes(&parsed, &.{good}, 1, default_render_bytes_per_pixel_reserve), scratch);
+    var batch = try renderPreparedPagesBatchAlloc(alloc, &parsed, &plans, .{ .max_parallel_pages = 2, .max_inflight_bytes = scratch });
+    defer batch.deinit(alloc);
+    try std.testing.expect(batch.results[0].rendered != null and batch.results[2].rendered != null);
+    try std.testing.expectEqual(error.InvalidPageBox, batch.results[1].failure.?);
+    var only_bad = try renderPreparedPagesRasterBatchAlloc(alloc, &parsed, &.{bad}, .{ .max_inflight_bytes = 1 });
+    defer only_bad.deinit(alloc);
+    try std.testing.expectEqual(error.InvalidPageBox, only_bad.results[0].failure.?);
+    try std.testing.expectEqual(@as(usize, 0), only_bad.peak_parallelism);
+    try std.testing.expectError(error.RenderBatchAdmissionExceeded, prepareAdmittedPageRenderPlan(&parsed, .{ .page_number = 1 }, .{ .max_inflight_bytes = 1 }, .png));
 }
 
 test "reader ignores stale positive page-tree Count hints" {
