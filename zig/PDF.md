@@ -244,6 +244,22 @@ encoding scratch is released before inference and only the actual PNG bytes
 stay reserved. A separate bounded, non-reclaiming consumer lease accounts for
 compression growth and retention alongside the pinned raster. Cancellation and
 deadlines bound compression work. No representation survives the window.
+Demanded pages may encode concurrently on the BackendRuntime-owned PDF CPU
+lane (at most eight jobs and no more than the lane capacity). The coordinator
+admits every codec peak before launching a wave, joins it, then releases unused
+scratch credit. A narrow byte grant reduces concurrency without reducing image
+quality. There is no additional encoder pool.
+
+Context-aware embedding peers may run concurrently with text consumers of the
+same window. At most four embedding invocations are retained, further bounded
+by the lazy inference lane and jointly admitted memory. Each job owns its
+allocator, cancellation/deadline, descriptors and result; image bytes remain
+borrowed. Embedding jobs launch before text consumers, independent of their
+declaration order. Only the coordinator attributes failures and publishes
+fenced stages. Early exit cancels and joins all jobs before releasing media.
+Legacy embedding callbacks remain synchronous. This overlaps independent
+embedding peers with reader/generator consumers; it does not parallelize all
+text consumers or change the owner's traversal.
 If a PNG exceeds a consumer's singleton output allowance, or the representation
 cannot be admitted, that consumer retains its ordinary bounded traversal. The
 shared cache never resizes pixels to fit another consumer's wire policy.
@@ -3316,6 +3332,32 @@ The hardening above follows these long-term rules:
     and WASM build graphs. Embedded API and database surfaces therefore compile
     from their declared module graph instead of relying on a transitive import
     present only in the full server build.
+
+149. **Implemented after batch isolation and workspace review:** encoded image
+    preprocessing records deterministic media and per-image scratch failures
+    by input index. Healthy normalized rows compact in place into one model
+    tensor, and results scatter back to original slots without retrying whole
+    model calls for invalid media. Scratch-exhausted preprocessing waves retain
+    their bounded grow/split adaptation. The broker sizes model batches
+    against permanent encoder and known projection workspace limits before
+    materializing tensors. Live pressure remains admission failure, not an
+    unbounded retry trigger. All subdivision is planned before slot publication
+    and recursive waves do not retain the parent's model asset gate.
+150. **Implemented after cancellation review:** image preprocessing installs
+    invocation-local control in a synchronous worker scope. Codec and resize
+    checkpoints propagate cancellation through PNG inflation/rows, JPEG MCU
+    and progressive scans, GIF/BMP/WebP hot loops, and normalized tensor
+    production. Worker scopes restore prior control and never cross asynchronous
+    suspension. Shared jobs are joined on every exit.
+151. **Implemented after shared-window throughput review:** demanded lossless
+    PNG pages encode in jointly admitted waves on the existing PDF lane;
+    context-aware embedding consumers use isolated jobs on the existing
+    inference lane. Immutable model configuration and synchronized HTTP/model
+    capability owners are borrowed, while mutable invocation credentials,
+    progress, cancellation, allocations and outputs are not shared. Publication
+    remains coordinator-owned. Regressions cover lane use, credit release,
+    independent typed output, and embedding/OCR overlap; hardware throughput
+    qualification remains separate.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

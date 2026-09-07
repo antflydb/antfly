@@ -297,6 +297,7 @@ fn drawFrame(
     var src_index: usize = 0;
     if (!descriptor.interlaced) {
         for (0..frame_height) |row| {
+            try @import("work_control.zig").check();
             for (0..frame_width) |col| {
                 const color = palette[indices[src_index]];
                 src_index += 1;
@@ -316,6 +317,7 @@ fn drawFrame(
     for (starts, steps) |start, step| {
         var row = start;
         while (row < frame_height) : (row += step) {
+            try @import("work_control.zig").check();
             for (0..frame_width) |col| {
                 const color = palette[indices[src_index]];
                 src_index += 1;
@@ -391,6 +393,7 @@ fn decodeImageIndicesAlloc(alloc: Allocator, compressed: []const u8, min_code_si
 
     while (true) {
         const code = try readCode(compressed, &bit_index, code_size);
+        if (bit_index % 4096 < code_size) try @import("work_control.zig").check();
         if (code == clear_code) {
             next_code = end_code + 1;
             code_size = min_code_size + 1;

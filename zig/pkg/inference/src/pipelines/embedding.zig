@@ -847,7 +847,70 @@ pub const EmbeddingPipeline = struct {
         return .{ .vectors = vectors, .execution = if (images.len > 1) .native_batch else .serial };
     }
 
+    fn imageWorkControl(self: *EmbeddingPipeline) antfly_image.work_control.Control {
+        const Probe = struct {
+            fn check(ptr: ?*const anyopaque) !void {
+                const pipeline: *const EmbeddingPipeline = @ptrCast(@alignCast(ptr.?));
+                if (pipeline.execution_control) |control| try control.check();
+            }
+        };
+        return .{ .context = self, .check_fn = Probe.check };
+    }
+
+    /// Native broker entry point: invalid media occupies an indexed error slot
+    /// and never enters the encoder. Healthy rows retain their original order.
+    pub fn embedImagesIndexed(self: *EmbeddingPipeline, images: []const []const u8, errors: []?anyerror) !ImageBatchResult {
+        if (errors.len != images.len) return error.InvalidInputShape;
+        if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
+        const vectors = self.embedImagesBatchIndexed(images, errors) catch |err| {
+            if (images.len <= 1 or !shouldFallbackBatchedImageError(err)) return err;
+            const outputs = try self.allocator.alloc([]f32, images.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (outputs[0..initialized]) |vector| self.allocator.free(vector);
+                self.allocator.free(outputs);
+            }
+            for (images, 0..) |_, i| {
+                const single = try self.embedImagesBatchIndexed(images[i..][0..1], errors[i..][0..1]);
+                outputs[i] = single[0];
+                self.allocator.free(single);
+                initialized += 1;
+            }
+            return .{ .vectors = outputs, .execution = .fallback };
+        };
+        var valid: usize = 0;
+        for (errors) |err| if (err == null) {
+            valid += 1;
+        };
+        return .{ .vectors = vectors, .execution = if (valid > 1) .native_batch else .serial };
+    }
+
+    /// Size an image wave before allocating normalized tensors. Permanent
+    /// session limits are monotone in this shape; current pressure is left to
+    /// the real reservation, never converted into singleton retry storms.
+    pub fn imageBatchPrefix(self: *EmbeddingPipeline, media_bytes: []const usize) !usize {
+        const vs = self.vision_session orelse self.session;
+        const row_bytes = try std.math.mul(usize, try std.math.mul(usize, self.config.image_size, self.config.image_size), 3 * @sizeOf(f32));
+        var retained: usize = 0;
+        for (media_bytes, 0..) |bytes, i| {
+            retained = try std.math.add(usize, retained, bytes);
+            if (!try vs.fitsRun(.{ .batch = i + 1, .input_bytes = try std.math.mul(usize, i + 1, row_bytes), .host_preprocess_bytes = retained })) return i;
+            if (self.visual_projection) |projection| {
+                if (projectionInputDim(projection)) |dim| {
+                    const packed_bytes = try std.math.mul(usize, try std.math.mul(usize, i + 1, dim), @sizeOf(f32));
+                    if (!try projection.fitsRun(.{ .batch = i + 1, .sequence = 1, .input_bytes = packed_bytes, .host_preprocess_bytes = packed_bytes })) return i;
+                }
+            }
+        }
+        return media_bytes.len;
+    }
+
     fn embedImagesBatch(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
+        return self.embedImagesBatchIndexed(images, null);
+    }
+
+    fn embedImagesBatchIndexed(self: *EmbeddingPipeline, images: []const []const u8, item_errors: ?[]?anyerror) anyerror![][]f32 {
+        if (self.execution_control) |control| try control.check();
         const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
 
         const alloc = self.allocator;
@@ -875,6 +938,8 @@ pub const EmbeddingPipeline = struct {
         const preprocess_options = image.BatchPreprocessOptions{
             .io = self.config.preprocess_io,
             .scratch_admission = scratch_admission.descriptor(),
+            .control = self.imageWorkControl(),
+            .item_errors = item_errors,
         };
         const preprocess_resident_bytes = std.math.add(usize, encoded_bytes, pixel_bytes) catch
             return error.ResourceLimitExceeded;
@@ -910,12 +975,30 @@ pub const EmbeddingPipeline = struct {
         logEmbedTiming("image.preprocess", batch, preprocess_start);
         scratch_admission.deinit();
 
+        var valid_count = batch;
+        if (item_errors) |errors| {
+            valid_count = 0;
+            const row_len = pixel_elements / batch;
+            for (errors, 0..) |err, index| {
+                if (err != null) continue;
+                if (valid_count != index) std.mem.copyForwards(f32, pixel_values[valid_count * row_len ..][0..row_len], pixel_values[index * row_len ..][0..row_len]);
+                valid_count += 1;
+            }
+            if (valid_count == 0) {
+                const empty = try alloc.alloc([]f32, batch);
+                @memset(empty, &.{});
+                return empty;
+            }
+        }
+
         // Build input tensor
         const sz: i64 = @intCast(img_size);
-        const pv_shape = [_]i64{ @intCast(batch), 3, sz, sz };
+        const pv_shape = [_]i64{ @intCast(valid_count), 3, sz, sz };
         var pv_tensor = try Tensor.initFloat32Owned(alloc, "pixel_values", &pv_shape, pixel_values);
         pixel_values_owned = false;
         defer pv_tensor.deinit();
+        var input_tensor = pv_tensor.borrowedView("pixel_values");
+        input_tensor.data = pv_tensor.data[0 .. valid_count * 3 * img_size * img_size * @sizeOf(f32)];
 
         const retained_host_bytes = std.math.add(usize, encoded_bytes, pixel_bytes) catch
             return error.ResourceLimitExceeded;
@@ -932,7 +1015,7 @@ pub const EmbeddingPipeline = struct {
         try self.lockExecution();
         defer self.unlockExecution();
         var run_permit = try vs.admit(.{
-            .batch = batch,
+            .batch = valid_count,
             .sequence = 1,
             .input_bytes = pixel_bytes,
             .host_preprocess_bytes = encoded_bytes,
@@ -942,10 +1025,10 @@ pub const EmbeddingPipeline = struct {
 
         if (self.visual_projection) |proj| {
             const resident = self.tryEmbedResidentProjection(
-                &.{pv_tensor},
+                &.{input_tensor},
                 proj,
                 .image,
-                batch,
+                valid_count,
                 "image.encoder.resident",
                 "image.projection.resident",
                 &run_permit,
@@ -953,12 +1036,12 @@ pub const EmbeddingPipeline = struct {
                 if (self.residentProjectionRequired()) return err;
                 return err;
             };
-            if (resident) |embeddings| return embeddings;
+            if (resident) |embeddings| return self.expandIndexedImageVectors(embeddings, item_errors);
         }
 
         // Run vision encoder
         const encoder_start = embedTimingStart(self.print_timing);
-        const outputs = run_permit.runWithControl(&.{pv_tensor}, alloc, self.execution_control) catch |err| {
+        const outputs = run_permit.runWithControl(&.{input_tensor}, alloc, self.execution_control) catch |err| {
             return err;
         };
         logEmbedTiming("image.encoder", batch, encoder_start);
@@ -967,10 +1050,27 @@ pub const EmbeddingPipeline = struct {
             alloc.free(outputs);
         }
 
-        const embeddings = self.imageEmbeddingsFromOutputs(outputs, batch) catch |err| {
+        const embeddings = self.imageEmbeddingsFromOutputs(outputs, valid_count) catch |err| {
             return err;
         };
-        return embeddings;
+        return self.expandIndexedImageVectors(embeddings, item_errors);
+    }
+
+    fn expandIndexedImageVectors(self: *EmbeddingPipeline, vectors: [][]f32, errors: ?[]?anyerror) ![][]f32 {
+        const indexed = errors orelse return vectors;
+        errdefer freeEmbeddingSlices(self.allocator, vectors);
+        const expanded = try self.allocator.alloc([]f32, indexed.len);
+        var cursor: usize = 0;
+        for (indexed, expanded) |err, *output| {
+            if (err != null) {
+                output.* = &.{};
+                continue;
+            }
+            output.* = vectors[cursor];
+            cursor += 1;
+        }
+        self.allocator.free(vectors);
+        return expanded;
     }
 
     /// Embed renderer-owned decoded rasters without an encode/decode round
@@ -1010,6 +1110,7 @@ pub const EmbeddingPipeline = struct {
         self: *EmbeddingPipeline,
         rasters: []const antfly_image.BorrowedRasterAttachment,
     ) anyerror![][]f32 {
+        if (self.execution_control) |control| try control.check();
         const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
         const alloc = self.allocator;
         const img_size = self.config.image_size;
@@ -1036,6 +1137,7 @@ pub const EmbeddingPipeline = struct {
         const preprocess_options = image.BatchPreprocessOptions{
             .io = self.config.preprocess_io,
             .scratch_admission = scratch_admission.descriptor(),
+            .control = self.imageWorkControl(),
         };
         const preprocess_resident_bytes = std.math.add(usize, raster_bytes, pixel_bytes) catch
             return error.ResourceLimitExceeded;
@@ -3269,6 +3371,41 @@ test "embedImages uses one vision session run for an image batch" {
     try std.testing.expectEqual(@as(usize, 2), embeddings.len);
     try std.testing.expectEqualSlices(f32, &.{ 0.0, 1.0 }, embeddings[0]);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
+}
+
+test "indexed image embedding compacts healthy rows into one backend run" {
+    const alloc = std.testing.allocator;
+    var fake = FakeVisionBatchSession{};
+    var pipeline = EmbeddingPipeline{ .allocator = alloc, .session = fake.session(), .tok = undefined, .vision_session = fake.session(), .config = .{ .normalize = false, .image_size = 2 } };
+    var errors: [3]?anyerror = undefined;
+    const result = try pipeline.embedImagesIndexed(&.{ &red_png_2x2, "broken", &red_png_2x2 }, &errors);
+    defer freeEmbeddingSlices(alloc, result.vectors);
+    try std.testing.expectEqual(.native_batch, result.execution);
+    try std.testing.expectEqual(@as(usize, 1), fake.run_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.last_batch);
+    try std.testing.expect(errors[0] == null and errors[2] == null);
+    try std.testing.expectEqual(error.ImageDecodeFailed, errors[1].?);
+    try std.testing.expectEqual(@as(usize, 0), result.vectors[1].len);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, result.vectors[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.vectors[2]);
+    const empty = try pipeline.embedImagesIndexed(&.{"broken"}, errors[0..1]);
+    defer freeEmbeddingSlices(alloc, empty.vectors);
+    try std.testing.expectEqual(@as(usize, 1), fake.run_count);
+    try std.testing.expectEqual(error.ImageDecodeFailed, errors[0].?);
+}
+
+test "image batch planning respects permanent workspace limits without reserving" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    var fake = FakeVisionBatchSession{};
+    var session = fake.session();
+    session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 700 }, .static_workspace_bytes = 1, .check_live_memory = false };
+    var pipeline = EmbeddingPipeline{ .allocator = std.testing.allocator, .session = session, .tok = undefined, .vision_session = session, .config = .{ .image_size = 2 } };
+    const single = try session.fitsRun(.{ .batch = 1, .input_bytes = 48, .host_preprocess_bytes = 64 });
+    try std.testing.expect(single);
+    try std.testing.expectEqual(@as(usize, 1), try pipeline.imageBatchPrefix(&.{ 64, 64, 64 }));
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), fake.run_count);
 }
 
 test "embedImages falls back to per-image runs when batched image shape collapses" {

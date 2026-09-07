@@ -35,6 +35,10 @@ pub const DenseEmbedPartsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embe
 /// page rather than an implicit document-level pool.
 pub const DenseEmbedPartItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const template_mod.ContentPart, dims: u32) anyerror![]const []const f32;
 pub const DenseEmbedRasterItemsFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, items: []const antfly_image.BorrowedRasterAttachment, dims: u32) anyerror![]const []const f32;
+/// These callbacks are invocation-local and safe for concurrent calls. They
+/// must not mutate shared cancellation/progress fields on the provider.
+pub const DenseEmbedPartItemsWithContextFn = *const fn (*anyopaque, Allocator, []const u8, []const template_mod.ContentPart, u32, RequestContext) anyerror![]const []const f32;
+pub const DenseEmbedRasterItemsWithContextFn = *const fn (*anyopaque, Allocator, []const u8, []const antfly_image.BorrowedRasterAttachment, u32, RequestContext) anyerror![]const []const f32;
 pub const DenseEmbedWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32, context: RequestContext) anyerror![]f32;
 pub const DenseEmbedBatchWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32, context: RequestContext) anyerror![]const []const f32;
 pub const DenseEmbedPartsWithContextFn = *const fn (ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, parts: []const template_mod.ContentPart, dims: u32, context: RequestContext) anyerror![]f32;
@@ -95,6 +99,9 @@ pub const DenseEmbedder = struct {
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
     dense_embed_part_items_fn: ?DenseEmbedPartItemsFn = null,
     dense_embed_raster_items_fn: ?DenseEmbedRasterItemsFn = null,
+    dense_embed_part_items_with_context_fn: ?DenseEmbedPartItemsWithContextFn = null,
+    dense_embed_raster_items_with_context_fn: ?DenseEmbedRasterItemsWithContextFn = null,
+    part_request_context: ?RequestContext = null,
     dense_embed_with_context_fn: ?DenseEmbedWithContextFn = null,
     dense_embed_batch_with_context_fn: ?DenseEmbedBatchWithContextFn = null,
     dense_embed_parts_with_context_fn: ?DenseEmbedPartsWithContextFn = null,
@@ -294,7 +301,11 @@ pub const DenseEmbedder = struct {
         };
         defer sanitized.deinit(invocation_alloc);
         const safe_items = sanitized.partsSlice();
-        const vectors = embed_items(self.ptr, invocation_alloc, embedding_name, safe_items, dims) catch |err| {
+        const vectors = (if (self.part_request_context) |context| blk: {
+            try context.check();
+            const call = self.dense_embed_part_items_with_context_fn orelse return error.UncancellableInferenceProvider;
+            break :blk call(self.ptr, invocation_alloc, embedding_name, safe_items, dims, context);
+        } else embed_items(self.ptr, invocation_alloc, embedding_name, safe_items, dims)) catch |err| {
             if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
             return err;
         };
@@ -302,6 +313,10 @@ pub const DenseEmbedder = struct {
             freeDenseEmbeddingBatch(alloc, vectors);
             return error.InvalidEmbeddingResponse;
         }
+        if (self.part_request_context) |context| context.check() catch |err| {
+            freeDenseEmbeddingBatch(alloc, vectors);
+            return err;
+        };
         var actual_values: usize = 0;
         for (vectors) |vector| {
             if (vector.len != dims) {
@@ -346,8 +361,13 @@ pub const DenseEmbedder = struct {
         const embed_items = self.dense_embed_raster_items_fn orelse
             return error.UnsupportedEmbeddingProvider;
         for (items) |item| try item.validate();
-        const vectors = try embed_items(self.ptr, alloc, embedding_name, items, dims);
+        const vectors = if (self.part_request_context) |context| blk: {
+            try context.check();
+            const call = self.dense_embed_raster_items_with_context_fn orelse return error.UncancellableInferenceProvider;
+            break :blk try call(self.ptr, alloc, embedding_name, items, dims, context);
+        } else try embed_items(self.ptr, alloc, embedding_name, items, dims);
         errdefer freeDenseEmbeddingBatch(alloc, vectors);
+        if (self.part_request_context) |context| try context.check();
         if (vectors.len != items.len) return error.InvalidEmbeddingResponse;
         for (vectors) |vector| {
             if (vector.len != dims) return error.InvalidEmbeddingDimensions;

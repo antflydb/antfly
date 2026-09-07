@@ -1188,6 +1188,8 @@ pub const ManagedEmbedder = struct {
             .dense_embed_parts_fn = embedDenseParts,
             .dense_embed_part_items_fn = embedDensePartItems,
             .dense_embed_raster_items_fn = embedDenseRasterItems,
+            .dense_embed_part_items_with_context_fn = embedDensePartItemsWithContext,
+            .dense_embed_raster_items_with_context_fn = embedDenseRasterItemsWithContext,
             .dense_embed_with_context_fn = embedDenseWithContext,
             .dense_embed_batch_with_context_fn = embedDenseBatchWithContext,
             .dense_embed_parts_with_context_fn = embedDensePartsWithContext,
@@ -1510,10 +1512,42 @@ pub const ManagedEmbedder = struct {
         items: []const template_mod.ContentPart,
         dims: u32,
     ) ![]const []const f32 {
+        return embedDensePartItemsControlled(ptr, alloc, embedding_name, items, dims, null);
+    }
+
+    fn embedDensePartItemsWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        items: []const template_mod.ContentPart,
+        dims: u32,
+        context: RequestContext,
+    ) ![]const []const f32 {
+        return embedDensePartItemsControlled(ptr, alloc, embedding_name, items, dims, context);
+    }
+
+    fn embedDensePartItemsControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        items: []const template_mod.ContentPart,
+        dims: u32,
+        context: ?RequestContext,
+    ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
-        const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        var local_entry = configured.requestOverlay();
+        local_entry.alloc = alloc;
+        local_entry.auth_header_cache = .{};
+        defer local_entry.auth_header_cache.deinit(alloc);
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&local_entry, value, &cancellation);
+        }
+        const entry = &local_entry;
         if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
-        const capabilities = try denseCapabilities(ptr, alloc, embedding_name);
+        const capabilities = try denseCapabilitiesForEntry(entry, alloc);
         const attachment_transport: inference_work.AttachmentTransport = if (entry.antfly_provider != null)
             .borrowed_binary
         else if (entry.provider == .antfly and capabilities.framed_attachments)
@@ -1555,23 +1589,55 @@ pub const ManagedEmbedder = struct {
         items: []const antfly_image.BorrowedRasterAttachment,
         dims: u32,
     ) ![]const []const f32 {
+        return embedDenseRasterItemsControlled(ptr, alloc, embedding_name, items, dims, null);
+    }
+
+    fn embedDenseRasterItemsWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        items: []const antfly_image.BorrowedRasterAttachment,
+        dims: u32,
+        context: RequestContext,
+    ) ![]const []const f32 {
+        return embedDenseRasterItemsControlled(ptr, alloc, embedding_name, items, dims, context);
+    }
+
+    fn embedDenseRasterItemsControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        embedding_name: []const u8,
+        items: []const antfly_image.BorrowedRasterAttachment,
+        dims: u32,
+        context: ?RequestContext,
+    ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
-        const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        var local_entry = configured.requestOverlay();
+        local_entry.alloc = alloc;
+        local_entry.auth_header_cache = .{};
+        defer local_entry.auth_header_cache.deinit(alloc);
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&local_entry, value, &cancellation);
+        }
+        const entry = &local_entry;
         if (entry.sparse or !entry.multimodal) return error.UnsupportedEmbeddingProvider;
         const local = entry.antfly_provider orelse return error.UnsupportedEmbeddingProvider;
         const embed_rasters = local.embed_dense_rasters orelse return error.UnsupportedEmbeddingProvider;
         if (items.len == 0) return try alloc.alloc([]const f32, 0);
         try checkEntryDispatchDeadline(entry);
-        const context = embeddingRequestContext(entry, .retrieval_document);
-        try context.check();
+        const invocation_context = embeddingRequestContext(entry, .retrieval_document);
+        try invocation_context.check();
         const vectors = AntflyProviderBoundary.call(
             "embed_dense_rasters",
             local.boundary_dispatch,
             embed_rasters,
-            .{ local.ptr, alloc, entry.model, items, context },
+            .{ local.ptr, alloc, entry.model, items, invocation_context },
         ) catch |err| return normalizeLocalEmbeddingError(err);
         errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-        try context.check();
+        try invocation_context.check();
         try validateDenseBatch(vectors, items.len, dims);
         return vectors;
     }
@@ -1696,6 +1762,10 @@ pub const ManagedEmbedder = struct {
     fn denseCapabilities(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8) !inference_work.InferenceCapabilities {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const entry = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
+        return denseCapabilitiesForEntry(entry, alloc);
+    }
+
+    fn denseCapabilitiesForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.InferenceCapabilities {
         if (entry.sparse) return error.UnsupportedEmbeddingProvider;
         if (entry.antfly_provider) |local| {
             if (local.model_capabilities) |resolve| {

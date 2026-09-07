@@ -113,7 +113,7 @@ fn decodePng(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
 
 fn decodeJpeg(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
     const decoded = antfly_image.jpeg.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
-        error.JpegDecodeFailed => return error.ImageDecodeFailed,
+        error.JpegDecodeFailed, error.UnsupportedJpegFormat => return error.ImageDecodeFailed,
         else => return err,
     };
     errdefer allocator.free(decoded.rgba);
@@ -181,7 +181,7 @@ fn decodeRgba(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
         },
         .jpeg => {
             const decoded = antfly_image.jpeg.decodeRgba(allocator, image_bytes) catch |err| switch (err) {
-                error.JpegDecodeFailed => return error.ImageDecodeFailed,
+                error.JpegDecodeFailed, error.UnsupportedJpegFormat => return error.ImageDecodeFailed,
                 else => return err,
             };
             return try imageFromOwnedRgba(allocator, decoded.rgba, decoded.width, decoded.height);
@@ -410,7 +410,7 @@ test "clip preprocessing resizes short edge before center crop" {
     };
     var out: [12]f32 = undefined;
 
-    preprocessDecodedClip(
+    try preprocessDecodedClip(
         img,
         &out,
         2,
@@ -466,7 +466,7 @@ test "clip preprocessing uses resize source coordinates" {
     };
     var out: [48]f32 = undefined;
 
-    preprocessDecodedClip(
+    try preprocessDecodedClip(
         img,
         &out,
         4,
@@ -513,14 +513,14 @@ test "clip preprocessing accepts decoded rgba without changing rgb result" {
     var rgb_out: [12]f32 = undefined;
     var rgba_out: [12]f32 = undefined;
 
-    preprocessDecodedClip(
+    try preprocessDecodedClip(
         rgb_img,
         &rgb_out,
         2,
         .{ 0.0, 0.0, 0.0 },
         .{ 1.0, 1.0, 1.0 },
     );
-    preprocessDecodedClip(
+    try preprocessDecodedClip(
         rgba_img,
         &rgba_out,
         2,
@@ -791,6 +791,48 @@ test "bounded batch preprocessing rejects a decoded image above its wave budget"
             .{ .max_workers = 2, .max_inflight_decoded_bytes = 15 },
         ),
     );
+}
+
+test "indexed preprocessing isolates oversized and corrupt media without dropping healthy rows" {
+    const alloc = std.testing.allocator;
+    const pixels = [_]u8{255} ** (64 * 64 * 4);
+    const large = try antfly_image.png.encodeRgba(alloc, 64, 64, &pixels);
+    defer alloc.free(large);
+    var output: [48]f32 = undefined;
+    var errors: [4]?anyerror = undefined;
+    // The first ceiling rejects by header, the second only after the codec
+    // exhausts its singleton slab (raw scanlines coexist with final RGBA).
+    for ([_]usize{ 4096, 32 * 1024 }) |ceiling| {
+        _ = try preprocessBatchIntoBounded(&output, &.{ &red_png_2x2, large, "broken", &red_png_2x2 }, 2, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .bilinear, .{ .max_workers = 2, .max_inflight_decoded_bytes = ceiling, .item_errors = &errors });
+        try std.testing.expect(errors[0] == null and errors[3] == null);
+        try std.testing.expectEqual(error.ImagePreprocessDecodedBytesExceeded, errors[1].?);
+        try std.testing.expectEqual(error.ImageDecodeFailed, errors[2].?);
+        try std.testing.expectEqualSlices(f32, output[0..12], output[36..48]);
+    }
+}
+
+test "image kernel cancellation interrupts PNG decode and restores nested controls" {
+    const Probe = struct {
+        checks: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.checks += 1;
+            if (self.checks == 2) return error.Canceled;
+        }
+    };
+    var probe = Probe{};
+    {
+        const scope = antfly_image.work_control.Scope.enter(.{ .context = &probe, .check_fn = Probe.check });
+        defer scope.deinit();
+        try std.testing.expectError(error.Canceled, decode(std.testing.allocator, &red_png_2x2));
+        try std.testing.expectEqual(@as(usize, 2), probe.checks);
+        const nested = antfly_image.work_control.Scope.enter(.{});
+        defer nested.deinit();
+        const decoded = try decode(std.testing.allocator, &red_png_2x2);
+        decoded.deinit(std.testing.allocator);
+    }
+    try antfly_image.work_control.check();
+    try std.testing.expectEqual(@as(usize, 2), probe.checks);
 }
 
 fn readPipelineImageFixture(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
@@ -1516,6 +1558,10 @@ pub const BatchPreprocessOptions = struct {
     /// and test callers may omit it and use the synchronous linalg fallback.
     io: ?std.Io = null,
     scratch_admission: ?ScratchAdmission = null,
+    control: antfly_image.work_control.Control = .{},
+    /// When present, deterministic media failures are indexed rather than
+    /// aborting healthy peers. Failed output rows must never enter a model.
+    item_errors: ?[]?anyerror = null,
 };
 
 /// Decode and preprocess directly into a caller-owned batch tensor. Output
@@ -1974,8 +2020,16 @@ const BatchPreprocessTask = struct {
     output: []f32,
     operation: BatchPreprocessOperation,
     err: ?anyerror = null,
+    control: antfly_image.work_control.Control = .{},
 
     fn run(self: *BatchPreprocessTask) void {
+        if (self.err != null) return;
+        const scope = antfly_image.work_control.Scope.enter(self.control);
+        defer scope.deinit();
+        self.control.check() catch |err| {
+            self.err = err;
+            return;
+        };
         switch (self.operation) {
             .square => |square| {
                 const decoded = decodeRgba(self.allocator, self.image_bytes) catch |err| {
@@ -2020,8 +2074,15 @@ const BorrowedRasterPreprocessTask = struct {
     output: []f32,
     operation: BatchPreprocessOperation,
     err: ?anyerror = null,
+    control: antfly_image.work_control.Control = .{},
 
     fn run(self: *@This()) void {
+        const scope = antfly_image.work_control.Scope.enter(self.control);
+        defer scope.deinit();
+        self.control.check() catch |err| {
+            self.err = err;
+            return;
+        };
         const view = self.raster.imageView() catch |err| {
             self.err = err;
             return;
@@ -2049,7 +2110,9 @@ const BorrowedRasterPreprocessTask = struct {
                     clip.target_size,
                     clip.mean,
                     clip.std_dev,
-                );
+                ) catch |err| {
+                    self.err = err;
+                };
             },
         }
     }
@@ -2089,6 +2152,7 @@ fn runBorrowedRasterPreprocessBatch(
     var first: usize = 0;
     var adaptive_worker_limit: usize = worker_limit;
     while (first < rasters.len) {
+        try options.control.check();
         const wave_len = @min(adaptive_worker_limit, rasters.len - first);
         scratch_budget.limit_exceeded.store(false, .release);
         for (tasks[0..wave_len], 0..) |*task, offset| {
@@ -2096,6 +2160,7 @@ fn runBorrowedRasterPreprocessBatch(
             task.* = .{
                 .allocator = scratch_allocator,
                 .raster = rasters[index],
+                .control = options.control,
                 .output = result[index * per_image ..][0..per_image],
                 .operation = operation,
             };
@@ -2140,20 +2205,39 @@ fn runBoundedPreprocessBatch(
     if (options.max_workers == 0 or options.max_inflight_decoded_bytes == 0)
         return error.InvalidBatchPreprocessOptions;
     if (image_list.len == 0) return;
+    try options.control.check();
+    if (options.item_errors) |errors| {
+        if (errors.len != image_list.len) return error.InvalidBatchPreprocessOptions;
+        @memset(errors, null);
+    }
 
     const decoded_bytes = try std.heap.page_allocator.alloc(usize, image_list.len);
     defer std.heap.page_allocator.free(decoded_bytes);
-    for (image_list, decoded_bytes) |image_bytes, *bytes| {
+    for (image_list, decoded_bytes, 0..) |image_bytes, *bytes, index| {
+        try options.control.check();
         const info = inspectEncodedForInference(image_bytes, null) catch |err| switch (err) {
             // Preserve the public preprocess/decode error contract while the
             // new batch-only aggregate ceiling remains separately observable.
-            error.ImageTooLarge => return error.ImageDecodeFailed,
-            else => return err,
+            error.ImageTooLarge, error.ImageDecodeFailed => {
+                if (options.item_errors) |errors| {
+                    errors[index] = error.ImageDecodeFailed;
+                    bytes.* = 0;
+                    continue;
+                }
+                return error.ImageDecodeFailed;
+            },
         };
         const pixels = try info.pixels();
         const rgba_bytes_u64 = std.math.mul(u64, pixels, 4) catch return error.ImagePreprocessDecodedBytesExceeded;
         bytes.* = std.math.cast(usize, rgba_bytes_u64) orelse return error.ImagePreprocessDecodedBytesExceeded;
-        if (bytes.* > options.max_inflight_decoded_bytes) return error.ImagePreprocessDecodedBytesExceeded;
+        if (bytes.* > options.max_inflight_decoded_bytes) {
+            if (options.item_errors) |errors| {
+                errors[index] = error.ImagePreprocessDecodedBytesExceeded;
+                bytes.* = 0;
+                continue;
+            }
+            return error.ImagePreprocessDecodedBytesExceeded;
+        }
     }
 
     const cpu_count = linalg.pool.cachedCpuCount();
@@ -2178,6 +2262,7 @@ fn runBoundedPreprocessBatch(
     defer wave_budget.deinit();
     const wave_allocator = wave_budget.allocator();
     while (first < image_list.len) {
+        try options.control.check();
         const wave_len = planPreprocessWaveLength(decoded_bytes, first, adaptive_worker_limit, options.max_inflight_decoded_bytes);
         const wave_decoded_bytes = preprocessWaveDecodedBytes(decoded_bytes[first..][0..wave_len]);
         std.debug.assert(wave_len > 0);
@@ -2194,6 +2279,8 @@ fn runBoundedPreprocessBatch(
             task.* = .{
                 .allocator = wave_allocator,
                 .image_bytes = image_list[index],
+                .control = options.control,
+                .err = if (options.item_errors) |errors| errors[index] else null,
                 .output = result[index * per_image ..][0..per_image],
                 .operation = operation,
             };
@@ -2211,9 +2298,16 @@ fn runBoundedPreprocessBatch(
             job.fn_ptr(job.ctx);
         // Error selection is input-index deterministic rather than completion
         // order dependent.
+        try options.control.check();
         var first_error: ?anyerror = null;
-        for (tasks[0..wave_len]) |task| {
+        for (tasks[0..wave_len], 0..) |task, offset| {
             if (task.err) |err| {
+                if (options.item_errors) |errors| {
+                    if (err == error.ImageDecodeFailed or err == error.ImagePreprocessDecodedBytesExceeded) {
+                        errors[first + offset] = err;
+                        continue;
+                    }
+                }
                 first_error = err;
                 break;
             }
@@ -2230,6 +2324,11 @@ fn runBoundedPreprocessBatch(
                 // not rejected merely because peers occupied the shared cap.
                 if (wave_len > 1) {
                     adaptive_worker_limit = reduceAdaptivePreprocessWorkers(adaptive_worker_limit, wave_len);
+                    continue;
+                }
+                if (options.item_errors) |errors| {
+                    errors[first] = error.ImagePreprocessDecodedBytesExceeded;
+                    first += 1;
                     continue;
                 }
                 return error.ImagePreprocessDecodedBytesExceeded;
@@ -2279,7 +2378,7 @@ fn preprocessClipImage(
 
     const img = try decodeRgba(allocator, image_bytes);
     defer img.deinit(allocator);
-    preprocessDecodedClip(img, result, target_size, mean, std_dev);
+    try preprocessDecodedClip(img, result, target_size, mean, std_dev);
 }
 
 fn preprocessClipJpegChwInto(
@@ -2311,8 +2410,8 @@ fn preprocessDecodedClip(
     target_size: u32,
     mean: [3]f32,
     std_dev: [3]f32,
-) void {
-    preprocessImageViewClip(toSharedImage(img), result, target_size, mean, std_dev);
+) !void {
+    try preprocessImageViewClip(toSharedImage(img), result, target_size, mean, std_dev);
 }
 
 fn preprocessImageViewClip(
@@ -2321,7 +2420,7 @@ fn preprocessImageViewClip(
     target_size: u32,
     mean: [3]f32,
     std_dev: [3]f32,
-) void {
+) !void {
     std.debug.assert(target_size > 0);
     std.debug.assert(img.width > 0 and img.height > 0);
 
@@ -2337,11 +2436,12 @@ fn preprocessImageViewClip(
     const scale_y = @as(f32, @floatFromInt(img.height)) / @as(f32, @floatFromInt(resized_h));
 
     if (img.width == target_size and img.height == target_size) {
-        preprocessClipCenterCropNoResizeView(img, result, ts, 0, 0, mean, std_dev);
+        try preprocessClipCenterCropNoResizeView(img, result, ts, 0, 0, mean, std_dev);
         return;
     }
 
     for (0..ts) |y| {
+        try antfly_image.work_control.check();
         const src_y = @as(f32, @floatFromInt(crop_top + @as(u32, @intCast(y)))) * scale_y;
         const y0: u32 = @intFromFloat(@floor(src_y));
         const y1: u32 = @min(y0 + 1, img.height - 1);
@@ -2399,8 +2499,8 @@ fn preprocessClipCenterCropNoResize(
     crop_top: u32,
     mean: [3]f32,
     std_dev: [3]f32,
-) void {
-    preprocessClipCenterCropNoResizeView(toSharedImage(img), result, target_size, crop_left, crop_top, mean, std_dev);
+) !void {
+    try preprocessClipCenterCropNoResizeView(toSharedImage(img), result, target_size, crop_left, crop_top, mean, std_dev);
 }
 
 fn preprocessClipCenterCropNoResizeView(
@@ -2411,7 +2511,7 @@ fn preprocessClipCenterCropNoResizeView(
     crop_top: u32,
     mean: [3]f32,
     std_dev: [3]f32,
-) void {
+) !void {
     const channels = img.channels();
     const stride = img.rowStride() catch unreachable;
     const left: usize = @intCast(crop_left);
@@ -2426,6 +2526,7 @@ fn preprocessClipCenterCropNoResizeView(
     const inv_255 = 1.0 / 255.0;
 
     for (0..target_size) |y| {
+        try antfly_image.work_control.check();
         const row_base = (top + y) * stride + left * channels;
         const dst_row = y * target_size;
         for (0..target_size) |x| {

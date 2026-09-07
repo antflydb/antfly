@@ -830,6 +830,7 @@ fn vp8PlanesToRgbaAlloc(alloc: Allocator, planes: Vp8FramePlanes) !DecodedImage 
 
     var y_pos: usize = 0;
     while (y_pos < height) : (y_pos += 1) {
+        try @import("work_control.zig").check();
         var x: usize = 0;
         while (x < width) : (x += 1) {
             const y_index = y_pos * planes.y_stride + x;
@@ -1107,6 +1108,7 @@ fn vp8ApplyLoopFilter(planes: *Vp8FramePlanes, syntax: Vp8FirstPartitionSyntax, 
 
     var mb_y: usize = 0;
     while (mb_y < grid_height) : (mb_y += 1) {
+        try @import("work_control.zig").check();
         var mb_x: usize = 0;
         while (mb_x < grid_width) : (mb_x += 1) {
             const info = infos[mb_y * grid_width + mb_x];
@@ -1161,6 +1163,7 @@ fn assembleVp8KeyframeRgba(
 
     var mb_y: usize = 0;
     while (mb_y < grid_height) : (mb_y += 1) {
+        try @import("work_control.zig").check();
         const row_partition = try vp8TokenPartitionForRow(@intCast(mb_y), control.syntax.token_partition_count);
         var left_luma4_modes = [_]Vp8Luma4Mode{.dc} ** 4;
         var left_token_context = Vp8MacroblockTokenContext{};
@@ -3213,7 +3216,12 @@ fn decodeVp8lEntropyImage(alloc: Allocator, reader: *BitReader, width: u32, heig
     errdefer alloc.free(rgba);
 
     var pixel_index: usize = 0;
+    var next_control_pixel: usize = 0;
     while (pixel_index < pixel_count) {
+        if (pixel_index >= next_control_pixel) {
+            try @import("work_control.zig").check();
+            next_control_pixel = pixel_index +| 4096;
+        }
         const group = try prefix_groups.groupForPixel(pixel_index, width);
         const green = try group.green.readSymbol(reader);
         if (green >= vp8l_literal_count + vp8l_length_code_count) {

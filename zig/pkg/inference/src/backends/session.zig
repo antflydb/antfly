@@ -442,6 +442,17 @@ pub const Session = struct {
         };
     }
 
+    /// Allocation-free planning against permanent session limits. This is not
+    /// a reservation: live pressure is still checked by admit at execution.
+    /// Callers must include all retained input storage, without lease credits.
+    pub fn fitsRun(self: Session, request: RunRequest) !bool {
+        const admission = self.run_admission orelse return true;
+        var uncredited = request;
+        uncredited.pre_admitted_host_bytes = 0;
+        const amounts = try admission.estimateRequest(uncredited, self.outputInfo());
+        return amounts.fitsLimits(admission.limits);
+    }
+
     /// Reserve tokenizer/preprocessing memory independently from the backend
     /// execution workspace. Dynamic text encoders can hold this lease while
     /// discovering the actual padded sequence length, then admit the backend

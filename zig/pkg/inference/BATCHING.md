@@ -103,10 +103,24 @@ caller retains its model handle and admitted media until the synchronous join;
 model locks are taken only after grouping. Aggregate preprocessing and compute
 retain the pipeline's resource admission.
 
+Before tensor materialization, the broker partitions an oversized group using
+the resolved session's permanent workspace limits (including a known visual
+projection input shape). Planning does not reserve memory or treat transient
+process pressure as a reason to retry. Normal execution still acquires live
+admission. Media/decoded-byte/item limits remain independently enforced.
+
 Fused vectors use thread-safe temporary allocation and transfer to each caller's
-allocator after joining. Cancellation is per caller. Corrupt compressed images
-trigger item isolation without poisoning other callers; capacity, cancellation,
-and runtime failures do not fan out into retries. The pipeline reports native,
+allocator after joining. Cancellation is per caller and reaches decode/resize
+workers and synchronous codec kernels. Corrupt compressed images and individual
+preprocessing-ceiling failures are recorded at their original indexes. Healthy
+normalized rows compact in place for one backend batch and scatter back to
+their caller slots, without a second decode just to isolate bad media.
+Scratch-exhausted preprocessing waves may still grow their slab or reduce
+worker width within the hard ceiling; that bounded adaptation is separate
+from retrying model batches for item isolation.
+Capacity, cancellation, and runtime failures do not fan out into retries.
+Known unsupported backend batch shapes retain explicit compatibility fallback.
+The pipeline reports native,
 serial, and fallback execution explicitly. A deterministic concurrent regression
 verifies that two callers produce one vision-session invocation and independent
 owned vectors. This is not a hardware throughput benchmark.

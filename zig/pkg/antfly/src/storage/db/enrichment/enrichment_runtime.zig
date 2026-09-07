@@ -6529,96 +6529,256 @@ const SharedPdfWindowScheduler = struct {
         try self.ensureConsumers();
         var png_window = SharedPdfPngWindow{};
         defer png_window.deinit();
+        var embedding_jobs = EmbeddingJobs{ .scheduler = self };
+        defer embedding_jobs.deinit();
         const previous_fingerprint = self.runtime.active_failure_fingerprint;
         const previous_retry_identity = self.runtime.retry_error_has_request_identity;
         defer {
             setActiveFailureFingerprint(self.runtime, previous_fingerprint);
             self.runtime.retry_error_has_request_identity = previous_retry_identity;
         }
-        for (self.current + 1..self.requests.len) |index| {
-            const consumer = &self.consumers.?[index];
-            if (consumer.err != null) continue;
-            var request = self.requests[index];
-            request.sequence = self.sequence;
-            // Repair debt is resolved by the ordinary request path. Do not
-            // speculatively invoke a consumer that may be durably terminal.
-            if (terminalFailureEnvelopeIntersects(terminalFailureEnvelopeSnapshot(self.runtime), request.sequence, request.sequence)) continue;
-            setActiveFailureFingerprint(self.runtime, requestFailureFingerprint(request));
-            if (!consumer.prepared) self.prepareConsumer(consumer, request, raw) catch |err| {
-                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-                // Discovery is speculative. The ordinary path may skip this
-                // consumer by its completed state without needing a provider.
-                consumer.enabled = false;
-                continue;
-            };
-            if (!consumer.enabled or !std.meta.eql(source_identity, consumer.source_identity.?) or
-                !std.mem.eql(u8, credentials, consumer.config.credentials) or
-                !transform.canSupply(consumer.transform) or page_count > consumer.max_pages) continue;
-            const window_items = switch (rendered) {
-                inline else => |batch| batch.results.len,
-            };
-            if (!sharedPdfWindowPreservesBatching(window_items, page_count, consumer.max_items)) {
-                // Never stage singleton tails after declining the earlier
-                // windows: that can fragment the consumer's eventual batch.
-                // No page buffers survive this callback to fill a wider batch.
-                consumer.enabled = false;
-                continue;
-            }
-            if (consumer.text) {
-                const source = text_source orelse continue;
-                // Sharing images must not change which pages auto-OCR selects
-                // or which embedded text is retained by its quality policy.
-                if (source.config.ocr_mode != consumer.config.ocr_mode or
-                    !std.meta.eql(source.config.ocr_quality, consumer.config.ocr_quality) or
-                    (consumer.config.content_type.len > 0 and !std.mem.eql(u8, source.content_type, consumer.config.content_type))) continue;
-            }
-            var pending_mask: ?[]bool = null;
-            defer if (pending_mask) |mask| self.runtime.alloc.free(mask);
-            const media = if (rendered == .raster and !consumer.transform.raster) blk: {
-                const demand = self.pendingPngPages(consumer, index, request, source_sha, rendered, text_source) catch |err| {
-                    if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
+        // Launch independent embedding jobs first, so their inference can
+        // overlap text consumers regardless of producer declaration order.
+        for ([_]bool{ false, true }) |text_pass| {
+            for (self.current + 1..self.requests.len) |index| {
+                const consumer = &self.consumers.?[index];
+                if (consumer.err != null) continue;
+                var request = self.requests[index];
+                request.sequence = self.sequence;
+                // Repair debt is resolved by the ordinary request path. Do not
+                // speculatively invoke a consumer that may be durably terminal.
+                if (terminalFailureEnvelopeIntersects(terminalFailureEnvelopeSnapshot(self.runtime), request.sequence, request.sequence)) continue;
+                setActiveFailureFingerprint(self.runtime, requestFailureFingerprint(request));
+                if (!consumer.prepared) self.prepareConsumer(consumer, request, raw) catch |err| {
+                    if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                    // Discovery is speculative. The ordinary path may skip this
+                    // consumer by its completed state without needing a provider.
+                    consumer.enabled = false;
+                    continue;
+                };
+                if (consumer.text != text_pass) continue;
+                if (!consumer.enabled or !std.meta.eql(source_identity, consumer.source_identity.?) or
+                    !std.mem.eql(u8, credentials, consumer.config.credentials) or
+                    !transform.canSupply(consumer.transform) or page_count > consumer.max_pages) continue;
+                const window_items = switch (rendered) {
+                    inline else => |batch| batch.results.len,
+                };
+                if (!sharedPdfWindowPreservesBatching(window_items, page_count, consumer.max_items)) {
+                    // Never stage singleton tails after declining the earlier
+                    // windows: that can fragment the consumer's eventual batch.
+                    // No page buffers survive this callback to fill a wider batch.
+                    consumer.enabled = false;
+                    continue;
+                }
+                if (consumer.text) {
+                    const source = text_source orelse continue;
+                    // Sharing images must not change which pages auto-OCR selects
+                    // or which embedded text is retained by its quality policy.
+                    if (source.config.ocr_mode != consumer.config.ocr_mode or
+                        !std.meta.eql(source.config.ocr_quality, consumer.config.ocr_quality) or
+                        (consumer.config.content_type.len > 0 and !std.mem.eql(u8, source.content_type, consumer.config.content_type))) continue;
+                }
+                var pending_mask: ?[]bool = null;
+                defer if (pending_mask) |mask| self.runtime.alloc.free(mask);
+                const media = if (rendered == .raster and !consumer.transform.raster) blk: {
+                    const demand = self.pendingPngPages(consumer, index, request, source_sha, rendered, text_source) catch |err| {
+                        if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
+                        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                        consumer.err = err;
+                        continue;
+                    };
+                    pending_mask = demand;
+                    var pending_count: usize = 0;
+                    for (demand) |needed| if (needed) {
+                        pending_count += 1;
+                    };
+                    if (pending_count == 0) continue;
+                    if (!consumer.text and window_items != page_count and pending_count % consumer.max_items != 0) {
+                        consumer.enabled = false;
+                        continue;
+                    }
+                    const encoded = png_window.getDemand(self.runtime, rendered.raster, window_lease, transform.render_bytes, demand) catch |err| {
+                        if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
+                        return err;
+                    } orelse continue;
+                    // Never resize a shared representation or silently lower a
+                    // peer's quality to satisfy a different wire-byte contract.
+                    for (encoded.results, demand) |page, needed| {
+                        if (needed) if (page.rendered) |image| if (image.png.len > consumer.transform.output_bytes) break;
+                    } else break :blk PdfEmbeddingRenderedWindow{ .encoded = encoded };
+                    continue;
+                } else rendered;
+                const result = if (consumer.text)
+                    self.consumeText(consumer, index, text_source.?, media, window_lease, pending_mask)
+                else
+                    self.consumeEmbedding(consumer, request, source_sha, media, page_count, window_lease, pending_mask, &embedding_jobs);
+                result catch |err| {
+                    // An optional consumer lease may not fit beside this retained
+                    // window. Its ordinary execution later keeps the baseline
+                    // admission behavior and can reuse already staged pages.
+                    if (err == error.DocumentExtractionWorkingSetTooLarge or err == error.OutOfMemory) {
+                        consumer.enabled = false;
+                        continue;
+                    }
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                     consumer.err = err;
-                    continue;
                 };
-                pending_mask = demand;
-                var pending_count: usize = 0;
-                for (demand) |needed| if (needed) {
-                    pending_count += 1;
-                };
-                if (pending_count == 0) continue;
-                if (!consumer.text and window_items != page_count and pending_count % consumer.max_items != 0) {
-                    consumer.enabled = false;
-                    continue;
-                }
-                const encoded = png_window.getDemand(self.runtime, rendered.raster, window_lease, transform.render_bytes, demand) catch |err| {
-                    if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
-                    return err;
-                } orelse continue;
-                // Never resize a shared representation or silently lower a
-                // peer's quality to satisfy a different wire-byte contract.
-                for (encoded.results, demand) |page, needed| {
-                    if (needed) if (page.rendered) |image| if (image.png.len > consumer.transform.output_bytes) break;
-                } else break :blk PdfEmbeddingRenderedWindow{ .encoded = encoded };
-                continue;
-            } else rendered;
-            const result = if (consumer.text)
-                self.consumeText(consumer, index, text_source.?, media, window_lease, pending_mask)
-            else
-                self.consumeEmbedding(consumer, request, source_sha, media, page_count, window_lease, pending_mask);
-            result catch |err| {
-                // An optional consumer lease may not fit beside this retained
-                // window. Its ordinary execution later keeps the baseline
-                // admission behavior and can reuse already staged pages.
-                if (err == error.DocumentExtractionWorkingSetTooLarge or err == error.OutOfMemory) {
-                    consumer.enabled = false;
-                    continue;
-                }
-                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-                consumer.err = err;
-            };
+            }
         }
+        try embedding_jobs.flush();
     }
+
+    /// Only external inference runs concurrently. Planning, admission, failure
+    /// attribution and fenced publication remain on the replay coordinator.
+    const EmbeddingJobs = struct {
+        scheduler: *SharedPdfWindowScheduler,
+        lane: ?background_runtime_mod.BackendRuntime.InferenceLaneLease = null,
+        jobs: [4]?*Job = .{null} ** 4,
+        count: usize = 0,
+
+        const Job = struct {
+            embedder: embedder_mod.DenseEmbedder,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            consumer: *Consumer,
+            source_sha: []const u8,
+            stage_id: []const u8,
+            rendered: PdfEmbeddingRenderedWindow,
+            invocation: PdfWindowConsumerLease,
+            guard: ForegroundCatchUpGuard,
+            cancellation: CancellationToken,
+            canceled: std.atomic.Value(bool) = .init(false),
+            future: ?std.Io.Future(void) = null,
+            output: ?PdfPageEmbeddingBatch = null,
+            err: ?anyerror = null,
+
+            fn isCanceled(raw: *const anyopaque) bool {
+                const job: *const @This() = @ptrCast(@alignCast(raw));
+                return job.canceled.load(.acquire) or job.cancellation.isCancelled() or job.guard.cancellation.isCancelled();
+            }
+
+            fn progress(_: ?*anyopaque, _: inference_request_context.Progress) void {
+                // A worker must not write the coordinator's current-consumer
+                // status. Publication and errors are attributed after join.
+            }
+
+            fn run(self: *@This()) void {
+                self.output = switch (self.rendered) {
+                    .encoded => |batch| embedRenderedPdfPageBatch(self.invocation.allocator(), self.embedder, requestEmbeddingName(self.request), batch, self.request.expected_dims),
+                    .raster => |batch| embedRenderedPdfPageRasterBatch(self.invocation.allocator(), self.embedder, requestEmbeddingName(self.request), batch, self.request.expected_dims),
+                } catch |err| {
+                    self.err = self.invocation.mapError(err);
+                    return;
+                };
+            }
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                if (self.output) |*output| output.deinit(self.invocation.allocator());
+                switch (self.rendered) {
+                    inline else => |batch| self.invocation.allocator().free(batch.results),
+                }
+                self.invocation.allocator().free(self.stage_id);
+                self.invocation.deinit();
+                alloc.destroy(self);
+            }
+        };
+
+        fn submit(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, sha: []const u8, stage_id: []const u8, rendered: PdfEmbeddingRenderedWindow, parent: ?*PdfWindowCompositeLease, required: usize) !bool {
+            const runtime = self.scheduler.runtime;
+            const provider = runtime.config.dense_embedder orelse return false;
+            if (rendered == .raster) {
+                if (provider.dense_embed_raster_items_with_context_fn == null) return false;
+            } else if (provider.dense_embed_part_items_with_context_fn == null) return false;
+            const backend = runtime.backend_runtime orelse return false;
+            if (self.lane == null) self.lane = backend.acquireInferenceLane() catch |err| switch (err) {
+                error.BackendRuntimeUnavailable => return false,
+                else => return err,
+            };
+            if (self.count >= @min(self.jobs.len, self.lane.?.concurrentCapacity())) try self.flush();
+            // A preceding wave may have disabled this consumer. Its ordinary
+            // replay path owns retry; do not enqueue another speculative call.
+            if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
+            if (consumer.err) |err| return err;
+            const job = try runtime.alloc.create(Job);
+            errdefer runtime.alloc.destroy(job);
+            job.* = .{
+                .embedder = provider,
+                .consumer = consumer,
+                .request = request,
+                .source_sha = sha,
+                .stage_id = &.{},
+                .rendered = rendered,
+                .invocation = try PdfWindowConsumerLease.init(std.heap.smp_allocator, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, required +| stage_id.len),
+                .guard = runtime.active_provider_guard,
+                .cancellation = runtime.config.cancellation,
+            };
+            errdefer job.invocation.deinit();
+            const alloc = job.invocation.allocator();
+            job.stage_id = try alloc.dupe(u8, stage_id);
+            errdefer alloc.free(job.stage_id);
+            job.rendered = switch (rendered) {
+                inline else => |batch, tag| blk: {
+                    var owned = batch;
+                    owned.results = try alloc.dupe(std.meta.Elem(@TypeOf(batch.results)), batch.results);
+                    break :blk @unionInit(PdfEmbeddingRenderedWindow, @tagName(tag), owned);
+                },
+            };
+            const io = self.lane.?.io();
+            job.embedder.part_request_context = .{ .io = io, .deadline_ns = job.guard.deadline_ns, .cancellation = .{ .ptr = job, .is_cancelled_fn = Job.isCanceled }, .progress = .{ .ptr = job, .update_fn = Job.progress } };
+            // A saturated executor keeps the same isolated job/context and
+            // executes it inline; it never creates another thread pool.
+            job.future = io.concurrent(Job.run, .{job}) catch blk: {
+                job.run();
+                break :blk null;
+            };
+            self.jobs[self.count] = job;
+            self.count += 1;
+            return true;
+        }
+
+        fn flush(self: *@This()) !void {
+            const runtime = self.scheduler.runtime;
+            const fingerprint = runtime.active_failure_fingerprint;
+            const retry_identity = runtime.retry_error_has_request_identity;
+            defer {
+                setActiveFailureFingerprint(runtime, fingerprint);
+                runtime.retry_error_has_request_identity = retry_identity;
+            }
+            var first_fatal: ?anyerror = null;
+            for (self.jobs[0..self.count]) |*slot| {
+                const job = slot.*.?;
+                defer {
+                    job.deinit(runtime.alloc);
+                    slot.* = null;
+                }
+                if (job.future) |*future| future.await(self.lane.?.io());
+                setActiveFailureFingerprint(runtime, requestFailureFingerprint(job.request));
+                if (first_fatal == null) if (job.output) |output| self.scheduler.commitEmbeddingOutput(job.invocation.allocator(), job.consumer, job.request, job.source_sha, job.stage_id, output) catch |err| {
+                    job.err = err;
+                };
+                if (job.err) |err| {
+                    if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) {
+                        if (first_fatal == null) {
+                            first_fatal = err;
+                            for (self.jobs[0..self.count]) |pending| if (pending) |other| other.canceled.store(true, .release);
+                        }
+                    } else if (err == error.DocumentExtractionWorkingSetTooLarge or err == error.OutOfMemory) job.consumer.enabled = false else job.consumer.err = err;
+                }
+            }
+            self.count = 0;
+            if (first_fatal) |err| return err;
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.jobs[0..self.count]) |entry| if (entry) |job| {
+                job.canceled.store(true, .release);
+            };
+            for (self.jobs[0..self.count]) |entry| if (entry) |job| {
+                if (job.future) |*future| future.await(self.lane.?.io());
+                job.deinit(self.scheduler.runtime.alloc);
+            };
+            if (self.lane) |*lane| lane.release();
+        }
+    };
 
     fn prepareTextConsumer(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !void {
         const alloc = self.runtime.alloc;
@@ -7003,6 +7163,38 @@ const SharedPdfWindowScheduler = struct {
         return true;
     }
 
+    fn commitEmbeddingOutput(self: *@This(), alloc: Allocator, consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, stage_id: []const u8, output: PdfPageEmbeddingBatch) !void {
+        const runtime = self.runtime;
+        const embedding_name = requestEmbeddingName(request);
+        const pixel_cap = consumer.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+        const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
+        var first_error: ?anyerror = null;
+        var writes = std.ArrayListUnmanaged(KVPair).empty;
+        defer {
+            for (writes.items) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (output.results) |result| {
+            if (result.failure) |err| {
+                if (first_error == null) first_error = err;
+                continue;
+            }
+            const unit_id = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{result.page_number});
+            defer alloc.free(unit_id);
+            const key = try pdfPageEmbeddingStageKeyAlloc(alloc, request.doc_key, requestArtifactName(request), embedding_name, stage_id, unit_id);
+            errdefer alloc.free(key);
+            const hash = pdfPageEmbeddingSourceHash(source_sha, result.page_number, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
+            const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, result.vector orelse return error.MissingPdfPageEmbedding);
+            errdefer alloc.free(value);
+            try writes.append(alloc, .{ .key = key, .value = value });
+        }
+        if (writes.items.len > 0) try storePutPrivateBatchWithRetry(runtime, &runtime.store, writes.items, &.{});
+        if (first_error) |err| return err;
+    }
+
     fn pendingPngPages(self: *@This(), consumer: *Consumer, index: usize, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow, text_source: ?TextSource) ![]bool {
         if (!consumer.text) return self.pendingEmbeddingPages(consumer, request, source_sha, window);
         const source = text_source orelse return error.InvalidPdfRenderWindow;
@@ -7058,7 +7250,7 @@ const SharedPdfWindowScheduler = struct {
         return pending;
     }
 
-    fn consumeEmbedding(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow, page_count: usize, window_lease: ?*PdfWindowCompositeLease, pending_mask: ?[]const bool) !void {
+    fn consumeEmbedding(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow, page_count: usize, window_lease: ?*PdfWindowCompositeLease, pending_mask: ?[]const bool, jobs: *EmbeddingJobs) !void {
         const runtime = self.runtime;
         const embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
         const embedding_name = requestEmbeddingName(request);
@@ -7125,6 +7317,17 @@ const SharedPdfWindowScheduler = struct {
             const metadata_bytes = std.math.mul(usize, end - start, addUsizeSaturating(key_bytes, 4096)) catch return error.DocumentExtractionWorkingSetTooLarge;
             const required = std.math.add(usize, extra, addUsizeSaturating(result_bytes, metadata_bytes)) catch return error.DocumentExtractionWorkingSetTooLarge;
             const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
+            const job_window: PdfEmbeddingRenderedWindow = switch (rendered) {
+                inline else => |batch, tag| blk: {
+                    var slice = batch;
+                    slice.results = batch.results[start..end];
+                    break :blk @unionInit(PdfEmbeddingRenderedWindow, @tagName(tag), slice);
+                },
+            };
+            if (try jobs.submit(consumer, request, source_sha, stage_id, job_window, window_lease, required)) {
+                start = end;
+                continue;
+            }
             var invocation = try PdfWindowConsumerLease.init(runtime.alloc, manager, window_lease, required);
             defer invocation.deinit();
             const alloc = invocation.allocator();
@@ -7141,31 +7344,7 @@ const SharedPdfWindowScheduler = struct {
                 },
             };
             defer output.deinit(alloc);
-            var first_error: ?anyerror = null;
-            var writes = std.ArrayListUnmanaged(KVPair).empty;
-            defer {
-                for (writes.items) |write| {
-                    alloc.free(@constCast(write.key));
-                    alloc.free(@constCast(write.value));
-                }
-                writes.deinit(alloc);
-            }
-            for (output.results) |result| {
-                if (result.failure) |err| {
-                    if (first_error == null) first_error = err;
-                    continue;
-                }
-                const unit_id = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{result.page_number});
-                defer alloc.free(unit_id);
-                const key = try pdfPageEmbeddingStageKeyAlloc(alloc, request.doc_key, requestArtifactName(request), embedding_name, stage_id, unit_id);
-                errdefer alloc.free(key);
-                const hash = pdfPageEmbeddingSourceHash(source_sha, result.page_number, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
-                const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, result.vector orelse return error.MissingPdfPageEmbedding);
-                errdefer alloc.free(value);
-                try writes.append(alloc, .{ .key = key, .value = value });
-            }
-            if (writes.items.len > 0) try storePutPrivateBatchWithRetry(runtime, &runtime.store, writes.items, &.{});
-            if (first_error) |err| return err;
+            try self.commitEmbeddingOutput(alloc, consumer, request, source_sha, stage_id, output);
             start = end;
         }
     }
@@ -7536,6 +7715,10 @@ test "shared PDF consumers borrow one window and retain independent typed result
 fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_mod.RenderedPdfPageBatch, window_lease: ?*PdfWindowCompositeLease, text_session: ?*document_extraction_mod.PdfRenderSession) !void {
     const Harness = struct {
         pages: document_extraction_mod.RenderedPdfPageBatch,
+        mutex: std.atomic.Mutex = .unlocked,
+        overlap_test: bool = false,
+        embedding_started: std.atomic.Value(bool) = .init(false),
+        overlap_observed: std.atomic.Value(bool) = .init(false),
         text_calls: usize = 0,
         embed_calls: usize = 0,
         last_embed_items: usize = 0,
@@ -7561,6 +7744,16 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         }
         fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.overlap_test) {
+                const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+                while (!self.embedding_started.load(.acquire)) {
+                    if (@import("antfly_platform").time.monotonicNs() > deadline) return error.SharedConsumerDidNotOverlap;
+                    std.Thread.yield() catch {};
+                }
+                self.overlap_observed.store(true, .release);
+            }
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.mutex.unlock();
             try self.borrowed(request.media[0].bytes);
             self.text_calls += 1;
             return a.dupe(u8, if (request.producer_type == .generator) "Generator independently recognized the entire document page." else "Reader independently recognized the entire document page.");
@@ -7581,6 +7774,8 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         }
         fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, parts: []const template.ContentPart, _: u32) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.mutex.unlock();
             if (std.mem.eql(u8, name, "blocked")) {
                 self.failed_calls += 1;
                 return error.EmbedRateLimited;
@@ -7599,6 +7794,18 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 initialized += 1;
             }
             return vectors;
+        }
+        fn embedWithContext(ptr: *anyopaque, a: Allocator, name: []const u8, parts: []const template.ContentPart, dims: u32, context: inference_request_context.RequestContext) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            self.embedding_started.store(true, .release);
+            const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+            while (!self.overlap_observed.load(.acquire)) {
+                try context.check();
+                if (@import("antfly_platform").time.monotonicNs() > deadline) return error.SharedConsumerDidNotOverlap;
+                std.Thread.yield() catch {};
+            }
+            return embed(ptr, a, name, parts, dims);
         }
     };
     var backend = mem_backend.Backend.init(alloc, .{});
@@ -7719,6 +7926,56 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     try scheduler.restoreTextUnit(alloc, &units[0]);
     try std.testing.expect(std.mem.startsWith(u8, units[0].text, "Generator"));
     try std.testing.expectEqual(@as(usize, 4), harness.text_calls);
+
+    {
+        // Independent, invocation-context-aware embedding overlaps OCR even
+        // when the text consumer is declared first. Legacy callbacks above
+        // still follow the synchronous path.
+        try scheduler.cleanupSpool();
+        var backend_handle = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+        defer backend_handle.deinit();
+        runtime.backend_runtime = backend_handle.ptr();
+        defer runtime.backend_runtime = null;
+        runtime.config.dense_embedder.?.dense_embed_part_items_with_context_fn = Harness.embedWithContext;
+        defer runtime.config.dense_embedder.?.dense_embed_part_items_with_context_fn = null;
+        harness.overlap_test = true;
+        defer harness.overlap_test = false;
+        const saved_text_calls = harness.text_calls;
+        const saved_embed_calls = harness.embed_calls;
+        defer {
+            harness.text_calls = saved_text_calls;
+            harness.embed_calls = saved_embed_calls;
+        }
+        scheduler.current = 0;
+        var parallel_source = source;
+        parallel_source.fingerprint = "parallel-content";
+        var parallel_units = [_]document_extraction_mod.Unit{
+            try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }),
+            try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") }),
+        };
+        defer for (&parallel_units) |*unit| unit.deinit(alloc);
+        parallel_source.units = &parallel_units;
+        const parallel_digest = [_]u8{8} ** 32;
+        try scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &parallel_digest, "{}", 2, transform, .{ .encoded = batch }, "", parallel_source, window_lease);
+        try std.testing.expect(harness.overlap_observed.load(.acquire));
+        try std.testing.expect(scheduler.failure(4) == null);
+        try std.testing.expectEqual(saved_embed_calls + 2, harness.embed_calls);
+        try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), backend_handle.ptr().laneStats().inference_active_leases);
+        // Leaving a window before publication cancels and joins borrowed-media
+        // jobs, including jobs that have not started on the executor yet.
+        harness.overlap_observed.store(false, .release);
+        const canceled_digest = [_]u8{9} ** 32;
+        {
+            var jobs = SharedPdfWindowScheduler.EmbeddingJobs{ .scheduler = &scheduler };
+            defer jobs.deinit();
+            try scheduler.consumeEmbedding(&scheduler.consumers.?[4], requests[4], &canceled_digest, .{ .encoded = batch }, 2, window_lease, null, &jobs);
+            try std.testing.expect(jobs.count > 0);
+        }
+        try std.testing.expectEqual(saved_embed_calls + 2, harness.embed_calls);
+        try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), backend_handle.ptr().laneStats().inference_active_leases);
+    }
 
     // A wide consumer must not be invoked through a singleton owner's window,
     // nor through a later short tail once independent traversal was selected.
@@ -11181,6 +11438,15 @@ const SharedPdfPngPage = struct {
             self.lease.?.deinit();
             self.lease = null;
         }
+        try self.encodeAdmitted(runtime, raster);
+        self.lease.?.retainLiveBytes();
+        return self.batch;
+    }
+
+    /// Pure worker phase. Lease acquisition, shrinking and release belong to
+    /// the coordinator; this worker owns only its independent allocator/data.
+    fn encodeAdmitted(self: *@This(), runtime: *EnrichmentRuntime, raster: document_extraction_mod.RenderedPdfPageRasterBatch) !void {
+        const Page = std.meta.Child(@FieldType(document_extraction_mod.RenderedPdfPageBatch, "results"));
         const alloc = self.lease.?.allocator();
         const results = try alloc.alloc(Page, raster.results.len);
         @memset(results, .{ .page_number = 0 });
@@ -11216,8 +11482,6 @@ const SharedPdfPngPage = struct {
             .peak_admitted_bytes = raster.peak_admitted_bytes,
             .thread_spawn_fallbacks = raster.thread_spawn_fallbacks,
         };
-        self.lease.?.retainLiveBytes();
-        return self.batch;
     }
 };
 
@@ -11230,6 +11494,87 @@ const SharedPdfPngWindow = struct {
     batch: ?document_extraction_mod.RenderedPdfPageBatch = null,
     disabled: bool = false,
     deadline_ns: u64 = 0,
+    peak_encoding_workers: usize = 0,
+
+    const EncodeJob = struct {
+        owner: *SharedPdfPngPage,
+        runtime: *EnrichmentRuntime,
+        raster: document_extraction_mod.RenderedPdfPageRasterBatch,
+        index: usize,
+        err: ?anyerror = null,
+
+        fn run(ptr: *anyopaque, _: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.owner.encodeAdmitted(self.runtime, self.raster) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+
+    fn encodeParallel(self: *@This(), runtime: *EnrichmentRuntime, raster: document_extraction_mod.RenderedPdfPageRasterBatch, parent: ?*PdfWindowCompositeLease, ceiling: usize, demand: ?[]const bool) !void {
+        const backend = runtime.backend_runtime orelse return;
+        var lane = backend.acquirePdfRenderLane() catch |err| switch (err) {
+            error.BackendRuntimeUnavailable => return,
+            else => return err,
+        };
+        defer lane.release();
+        const width = @min(lane.concurrentCapacity(), 8);
+        if (width <= 1) return;
+        var jobs: [8]EncodeJob = undefined;
+        var contexts: [8]*anyopaque = undefined;
+        var cursor: usize = 0;
+        while (cursor < raster.results.len) {
+            var count: usize = 0;
+            var reserved = self.residentBytes();
+            while (cursor < raster.results.len and count < width) {
+                const i = cursor;
+                if ((if (demand) |mask| !mask[i] else false) or raster.results[i].rendered == null or self.pages[i].attempted) {
+                    cursor += 1;
+                    continue;
+                }
+                const raw = raster.results[i].rendered.?;
+                const Page = std.meta.Child(@FieldType(document_extraction_mod.RenderedPdfPageBatch, "results"));
+                const peak = raw.bytes.len *| 6 +| (1088 * 1024 + @sizeOf(Page));
+                const available = ceiling -| reserved;
+                // Do not reduce a page's scratch allowance merely to add a
+                // worker. Finish this wave, then admit the page independently.
+                if (count > 0 and peak > available) break;
+                const grant = @min(peak, available);
+                if (grant == 0) return;
+                self.pages[i].lease = PdfWindowConsumerLease.init(std.heap.smp_allocator, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, grant) catch break;
+                self.pages[i].attempted = true;
+                self.pages[i].deadline_ns = self.deadline_ns;
+                var singleton = raster;
+                singleton.results = raster.results[i..][0..1];
+                jobs[count] = .{ .owner = &self.pages[i], .runtime = runtime, .raster = singleton, .index = i };
+                contexts[count] = &jobs[count];
+                count += 1;
+                cursor += 1;
+                reserved +|= grant;
+            }
+            if (count == 0) return;
+            var first_error: ?anyerror = null;
+            const stats = lane.executor().runBatch(contexts[0..count], EncodeJob.run, 1) catch |err| blk: {
+                first_error = err;
+                break :blk null;
+            };
+            if (stats) |value| self.peak_encoding_workers = @max(self.peak_encoding_workers, value.peak_parallelism);
+            for (jobs[0..count]) |job| {
+                if (job.owner.batch) |batch| {
+                    self.batch.?.results[job.index] = batch.results[0];
+                    job.owner.lease.?.retainLiveBytes();
+                } else {
+                    job.owner.lease.?.deinit();
+                    job.owner.lease = null;
+                    if (first_error == null) first_error = job.err orelse error.DocumentExtractionWorkingSetTooLarge;
+                }
+            }
+            if (first_error) |err| {
+                self.abandonEmpty();
+                return err;
+            }
+        }
+    }
 
     fn deinit(self: *@This()) void {
         for (self.pages) |*page| page.deinit();
@@ -11285,6 +11630,7 @@ const SharedPdfPngWindow = struct {
             self.metadata.?.retainLiveBytes();
             self.disabled = false;
         }
+        try self.encodeParallel(runtime, raster, parent, ceiling, demand);
         for (raster.results, 0..) |input, i| {
             if (demand) |needed| if (!needed[i]) continue;
             if (input.rendered == null or self.batch.?.results[i].rendered != null) continue;
@@ -11315,6 +11661,7 @@ test "shared PDF PNG representation is lazy bounded and reused without resizing"
     defer manager.deinit(alloc);
     var runtime: EnrichmentRuntime = undefined;
     runtime.alloc = alloc;
+    runtime.backend_runtime = null;
     runtime.config = .{ .resource_manager = &manager };
     runtime.active_provider_guard = .{};
     const parent = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 1024, 4 * 1024 * 1024, 1);
@@ -11402,6 +11749,33 @@ test "shared PDF PNG representation is lazy bounded and reused without resizing"
         defer expired.deinit();
         try std.testing.expectError(error.EnrichmentWaitTimeout, expired.get(&runtime, raster, parent, 1024 * 1024));
         try std.testing.expectEqual(@as(usize, 0), parent.consumer_count);
+    }
+    {
+        var backend_handle = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+        defer backend_handle.deinit();
+        runtime.backend_runtime = backend_handle.ptr();
+        defer runtime.backend_runtime = null;
+        var concurrent_pages = [_]Page{ pages[0], pages[0] };
+        concurrent_pages[1].page_number = 8;
+        var concurrent_raster = raster;
+        concurrent_raster.results = &concurrent_pages;
+        {
+            var cache = SharedPdfPngWindow{};
+            defer cache.deinit();
+            const result = (try cache.get(&runtime, concurrent_raster, parent, 4 * 1024 * 1024)).?;
+            for (result.results) |page| {
+                const decoded = try antfly_image.png.decodeRgba(alloc, page.rendered.?.png);
+                defer alloc.free(decoded.rgba);
+                try std.testing.expectEqualSlices(u8, bytes, decoded.rgba);
+            }
+            try std.testing.expectEqual(cache.residentBytes(), parent.consumer_credit);
+            const stats = backend_handle.ptr().laneStats();
+            try std.testing.expectEqual(@as(usize, 0), stats.pdf_render_active_leases);
+            if ((std.Thread.getCpuCount() catch 1) > 1)
+                try std.testing.expectEqual(@as(u64, 2), stats.pdf_render_executor.?.completed_jobs);
+        }
+        try std.testing.expectEqual(@as(usize, 0), parent.consumer_count);
+        try std.testing.expectEqual(@as(usize, 0), parent.consumer_credit);
     }
 }
 

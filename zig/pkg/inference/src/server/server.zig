@@ -6059,21 +6059,14 @@ pub const Node = struct {
 
     fn executeImageEmbedMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
         const self: *Node = @ptrCast(@alignCast(raw));
-        self.runImageEmbedMicrobatch(items, false) catch |err| {
-            // Header admission cannot detect every corrupt compressed payload.
-            // A bad caller must not turn other callers' images into failures.
-            // Resource/runtime/control failures are never amplified by retries.
-            if (err == error.ImageDecodeFailed and items.len > 1) {
-                for (items, 0..) |_, i| self.runImageEmbedMicrobatch(items[i .. i + 1], true) catch |item_err| {
-                    items[i].slot.fail(item_err);
-                };
-                return;
-            }
+        self.runImageEmbedMicrobatch(items) catch |err| {
+            // Deterministic media failures are returned per item by the
+            // preprocessor. Runtime/control failures are never retried here.
             for (items) |item| item.slot.fail(err);
         };
     }
 
-    fn runImageEmbedMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem, fallback: bool) !void {
+    fn runImageEmbedMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) !void {
         if (items.len == 0) return;
         const first = items[0].payloadAs(ImageEmbedTicket);
         const model = first.model;
@@ -6092,6 +6085,44 @@ pub const Node = struct {
         pipeline.execution_control = control;
         const prefix = try applyDenseEmbeddingRequestOptions(alloc, &pipeline, &model.manifest, .{ .model = "", .input = .null, .encoding_format = null, .dimensions = null, .task_type = first.task_type, .instruction = first.instruction });
         defer if (prefix) |value| alloc.free(value);
+        const media_bytes = try alloc.alloc(usize, items.len);
+        defer alloc.free(media_bytes);
+        for (items, media_bytes) |item, *bytes| {
+            const ticket = item.payloadAs(ImageEmbedTicket);
+            bytes.* = if (ticket.raster) |raster| raster.bytes.len else ticket.encoded.?.len;
+        }
+        const capacity = try pipeline.imageBatchPrefix(media_bytes);
+        if (capacity < items.len) {
+            // Finish planning before publishing any slots, and release the
+            // shared asset gate before re-entering it for a child wave. A
+            // queued exclusive asset load must not deadlock recursive readers.
+            const widths = try alloc.alloc(usize, items.len);
+            defer alloc.free(widths);
+            var start: usize = 0;
+            while (start < items.len) {
+                const count = try pipeline.imageBatchPrefix(media_bytes[start..]);
+                widths[start] = count;
+                start += @max(1, count);
+            }
+            asset_lease.release();
+            start = 0;
+            while (start < items.len) {
+                const count = widths[start];
+                if (count == 0) {
+                    items[start].slot.fail(error.ResourceLimitExceeded);
+                    start += 1;
+                    continue;
+                }
+                self.runImageEmbedMicrobatch(items[start..][0..count]) catch |err| {
+                    for (items[start..][0..count]) |item| item.slot.fail(err);
+                };
+                start += count;
+            }
+            return;
+        }
+        const item_errors = try alloc.alloc(?anyerror, items.len);
+        defer alloc.free(item_errors);
+        @memset(item_errors, null);
         const batch = if (first.raster != null) blk: {
             const rasters = try alloc.alloc(antfly_image.BorrowedRasterAttachment, items.len);
             defer alloc.free(rasters);
@@ -6101,18 +6132,23 @@ pub const Node = struct {
             const images = try alloc.alloc([]const u8, items.len);
             defer alloc.free(images);
             for (items, images) |item, *image| image.* = item.payloadAs(ImageEmbedTicket).encoded.?;
-            break :blk try pipeline.embedImagesReported(images);
+            break :blk try pipeline.embedImagesIndexed(images, item_errors);
         };
         const vectors = batch.vectors;
         errdefer freeDirectDenseVectors(alloc, vectors);
         if (vectors.len != items.len) return error.InvalidEmbeddingResultCount;
-        for (items, vectors) |item, vector| {
+        for (items, vectors, item_errors) |item, vector, item_error| {
+            if (item_error) |err| {
+                alloc.free(vector);
+                item.slot.fail(err);
+                continue;
+            }
             item.control.check() catch |err| {
                 alloc.free(vector);
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, vector, if (fallback) .fallback else switch (batch.execution) {
+            item.slot.setValue([]f32, vector, switch (batch.execution) {
                 .native_batch => .native_batch,
                 .serial => .serial,
                 .fallback => .fallback,

@@ -24,6 +24,7 @@ pub const bmp = @import("bmp.zig");
 pub const webp = @import("webp.zig");
 pub const ccitt = @import("ccitt.zig");
 pub const processing = @import("processing.zig");
+pub const work_control = @import("work_control.zig");
 pub const conformance = conformance_impl;
 
 pub const Format = enum { png, jpeg, jpeg2000_jp2, jpeg2000_j2k, gif, bmp, webp, unknown };

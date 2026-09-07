@@ -200,7 +200,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
         return error.InvalidImageBuffer;
     if (result.len != output_len) return error.InvalidImageBuffer;
 
-    if (solidRgb(resolved_img)) |rgb| {
+    if (try solidRgb(resolved_img)) |rgb| {
         fillSolidChw(result, tw, th, rgb, mean, std_dev, rescale_factor);
         return;
     }
@@ -211,7 +211,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
     const scale_y = src_h / @as(f32, @floatFromInt(th));
 
     if (resample == .bilinear) {
-        preprocessDecodedRectBilinearInterleaved(resolved_img, result, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
+        try preprocessDecodedRectBilinearInterleaved(resolved_img, result, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
         return;
     }
 
@@ -230,6 +230,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
     }
 
     for (0..th) |y| {
+        try @import("work_control.zig").check();
         for (0..tw) |x| {
             for (0..3) |ch| {
                 const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample);
@@ -317,6 +318,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     }
 
     for (0..th) |y| {
+        try @import("work_control.zig").check();
         for (0..cw) |x| {
             for (0..3) |ch| {
                 const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample);
@@ -350,6 +352,7 @@ fn preprocessDecodedRectKeepAspectPadRightBilinearSimd(
         const plane = result[ch * th * tw .. (ch + 1) * th * tw];
 
         for (0..th) |y| {
+            try @import("work_control.zig").check();
             const row_offset = y * tw;
             var x: usize = 0;
             while (x + lanes <= content_width) : (x += lanes) {
@@ -388,6 +391,7 @@ fn preprocessDecodedRectBilinearSimd(
         const plane = result[ch * th * tw .. (ch + 1) * th * tw];
 
         for (0..th) |y| {
+            try @import("work_control.zig").check();
             const row_offset = y * tw;
             var x: usize = 0;
             while (x + lanes <= tw) : (x += lanes) {
@@ -416,7 +420,7 @@ fn preprocessDecodedRectBilinearInterleaved(
     rescale_factor: f32,
     scale_x: f32,
     scale_y: f32,
-) void {
+) !void {
     const channels = img.channels();
     const plane_size = tw * th;
     const norm_scale = [3]f32{
@@ -431,6 +435,7 @@ fn preprocessDecodedRectBilinearInterleaved(
     };
 
     for (0..th) |y| {
+        try @import("work_control.zig").check();
         const src_y = (@as(f32, @floatFromInt(y)) + 0.5) * scale_y - 0.5;
         const y0 = clampIndex(@intFromFloat(@floor(src_y)), img.height);
         const y1 = clampIndex(@as(i32, @intCast(y0)) + 1, img.height);
@@ -467,7 +472,7 @@ fn preprocessDecodedRectBilinearInterleaved(
     }
 }
 
-fn solidRgb(img: ImageU8) ?[3]u8 {
+fn solidRgb(img: ImageU8) !?[3]u8 {
     const channels = img.channels();
     img.validate() catch return null;
     const stride = img.row_stride_bytes;
@@ -475,6 +480,7 @@ fn solidRgb(img: ImageU8) ?[3]u8 {
 
     const rgb = [3]u8{ img.data[0], img.data[1], img.data[2] };
     for (0..@as(usize, img.height)) |y| {
+        try @import("work_control.zig").check();
         for (0..@as(usize, img.width)) |x| {
             if (x == 0 and y == 0) continue;
             const idx = y * stride + x * channels;
@@ -732,6 +738,7 @@ fn preprocessDecodedRectPillowBicubic(
     const horizontal = try allocator.alloc(u8, horizontal_len);
     defer allocator.free(horizontal);
     for (0..img.height) |source_y| {
+        try @import("work_control.zig").check();
         for (0..target_width) |target_x| {
             const start = horizontal_axis.starts[target_x];
             const begin = horizontal_axis.offsets[target_x];
@@ -747,6 +754,7 @@ fn preprocessDecodedRectPillowBicubic(
     }
 
     for (0..target_height) |target_y| {
+        try @import("work_control.zig").check();
         const start = vertical_axis.starts[target_y];
         const begin = vertical_axis.offsets[target_y];
         const end = vertical_axis.offsets[target_y + 1];
