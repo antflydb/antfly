@@ -1919,54 +1919,30 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
         }
         try retireBlock(&publish, &read, scratch, manifest.generation, old_range.block);
     }
-    if (builder.directory.items.len == 0 and range.start.len != 0) {
-        var previous_cursor = try read.openCursor();
-        defer previous_cursor.close();
-        _ = try previous_cursor.seekAtOrBefore(range.key);
-        const previous = (try previous_cursor.prev()) orelse return error.InvalidColumnSegment;
-        if (!std.mem.startsWith(u8, previous.key, directory.prefix)) return error.InvalidColumnSegment;
-        const previous_value = try verified(previous.value);
-        if (previous_value.len < 12 or !std.mem.eql(u8, previous_value[12..], range.start)) return error.InvalidColumnSegment;
-        try publish.put(previous.key, try directoryValue(scratch, std.mem.readInt(u64, previous_value[0..8], .little), builder.continuation orelse range.end));
-    }
     for (builder.directory.items) |entry| try publish.put(entry.key, entry.value);
     for (builder.candidates.items) |entry| {
         try publish.put(entry.key, entry.value);
         try publish.put(try mergeQueueKey(scratch, manifest.generation, entry.key[directory_prefix_len..]), "");
     }
-    var empty_prefix: u64 = 0;
-    if (builder.directory.items.len == 0 and range.start.len == 0 and builder.continuation != null) {
-        // A bounded all-deleted prefix still needs its own empty block. Using
-        // the old suffix's block here would resurrect its retired prefix rows.
+    var empty_range: u64 = 0;
+    if (builder.directory.items.len == 0) {
+        // Keep empty coverage explicit. A neighboring block may contain
+        // physically retained rows outside its current directory bounds;
+        // widening either neighbor would resurrect those retired rows.
         var meta: [24]u8 = @splat(0);
         @memcpy(meta[0..4], "ACB8");
         std.mem.writeInt(u32, meta[4..8], version, .little);
         try publish.put(try blockKey(scratch, manifest.generation, builder.blocks, null), try checked(scratch, &meta));
-        try publish.put(range.key, try directoryValue(scratch, builder.blocks, builder.continuation.?));
-        try publish.put(try candidateKey(scratch, manifest.generation, ""), try directoryValue(scratch, builder.blocks, ""));
-        try publish.put(try mergeQueueKey(scratch, manifest.generation, ""), "");
+        try publish.put(range.key, try directoryValue(scratch, builder.blocks, builder.continuation orelse range.end));
+        try publish.put(try candidateKey(scratch, manifest.generation, range.start), try directoryValue(scratch, builder.blocks, ""));
+        try publish.put(try mergeQueueKey(scratch, manifest.generation, range.start), "");
         builder.blocks += 1;
-        empty_prefix = 1;
-    }
-    // Preserve a zero boundary even if the first range became empty, so a
-    // later insertion preceding all remaining rows cannot escape the directory.
-    if (builder.directory.items.len == 0 and range.start.len == 0 and range.end.len != 0 and builder.continuation == null) {
-        var next_directory = try Directory.init(alloc, &read, manifest.generation, range.end);
-        defer next_directory.deinit();
-        const next_range = (try next_directory.next(scratch)).?;
-        try publish.delete(next_range.key);
-        try deleteIfPresent(&publish, try candidateKey(scratch, manifest.generation, next_range.start));
-        try deleteIfPresent(&publish, try mergeQueueKey(scratch, manifest.generation, next_range.start));
-        if (try mergeCandidate(&read, scratch, manifest.generation, next_range)) {
-            try publish.put(try candidateKey(scratch, manifest.generation, ""), next_range.value);
-            try publish.put(try mergeQueueKey(scratch, manifest.generation, ""), "");
-        }
-        try publish.put(range.key, next_range.value);
+        empty_range = 1;
     }
     var next_manifest = manifest;
     if (bootstrap != null) next_manifest.initializing = builder.continuation != null;
     next_manifest.blocks = builder.blocks;
-    next_manifest.ranges = manifest.ranges - removed_ranges + builder.directory.items.len + retained_suffix + empty_prefix;
+    next_manifest.ranges = manifest.ranges - removed_ranges + builder.directory.items.len + retained_suffix + empty_range;
     const ready = next_manifest.encode();
     try publish.put(manifest_key, &ready);
     if (adaptive and bootstrap == null and has_dirty and !selection.timed) try publish.put(discovery_key, try directoryValue(scratch, manifest.generation, range.end));
@@ -1986,10 +1962,10 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     db.core.unlockApplyShared();
     locked = false;
     try finishCleanupQuantum(db, alloc, manifest.generation, namespace);
-    if (empty_prefix != 0) _ = db.relational_column_maintenance.blocks_written.fetchAdd(empty_prefix, .monotonic);
+    if (empty_range != 0) _ = db.relational_column_maintenance.blocks_written.fetchAdd(empty_range, .monotonic);
     _ = db.relational_column_maintenance.ranges_compacted.fetchAdd(1, .monotonic);
-    if (removed_ranges > builder.directory.items.len + retained_suffix + empty_prefix)
-        _ = db.relational_column_maintenance.ranges_merged.fetchAdd(removed_ranges - builder.directory.items.len - retained_suffix - empty_prefix, .monotonic);
+    if (removed_ranges > builder.directory.items.len + retained_suffix + empty_range)
+        _ = db.relational_column_maintenance.ranges_merged.fetchAdd(removed_ranges - builder.directory.items.len - retained_suffix - empty_range, .monotonic);
     return true;
 }
 

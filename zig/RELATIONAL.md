@@ -470,6 +470,8 @@ page averages at least 128 encoded bytes per row; complete pages can always be
 reused. Descriptors remain bounded by the 256-row block limit.
 Decoded source pages outlive destination flushes; copied cells are owned by
 the writer and reused descriptors own no borrowed source memory.
+Empty output ranges publish explicit empty roots; publication never widens a
+neighbor's live bounds over physically retained but retired rows.
 Publication, dirty-token compare-clear, retained
 suffixes, cancellation, and restart use the same existing commit fences.
 Maintenance exposes `covered_rows_read` and `primary_rows_read` separately so

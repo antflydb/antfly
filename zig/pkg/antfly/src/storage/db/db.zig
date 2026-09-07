@@ -64399,6 +64399,11 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     while (try db.rebuildRelationalColumns()) {
         passes += 1;
         try std.testing.expect(passes < 30);
+        // Every publication must preserve empty logical coverage, including
+        // neighbors whose physical roots retain rows outside their live bounds.
+        var empty = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"} });
+        defer empty.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), empty.documents.len);
     }
     try db.batch(.{ .writes = &.{.{ .key = "", .value = "{\"n\":42}" }} });
     var inserted = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"} });
@@ -79863,12 +79868,15 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
         chunk_cache.deinit(alloc);
     }
 
+    var consumer_name = embedding_name.*;
+    var consumer_indexes = [_][]u8{consumer_name[0..]};
     const request = enrichment_types.GeneratedEnrichmentRequest{
         .kind = if (is_sparse) .sparse_embedding else .dense_embedding,
         .index_name = embedding_name,
         .artifact_name = "document_chunks_v1",
         .embedding_name = embedding_name,
         .input_kind = .materialized_chunks,
+        .consumer_indexes = &consumer_indexes,
         .doc_key = "doc:a",
         .source_field = "text",
         .expected_dims = if (is_sparse) 0 else 3,
@@ -79879,7 +79887,11 @@ fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_den
         .derived_dense => computeDenseRequestDerived,
         .sparse => computeSparseRequestDerived,
     };
-    try compute(alloc, &db, "{}", request, &artifact_writes, &embeddings, &chunk_cache);
+    if (mode == .dense) {
+        try compute(alloc, &db, "{}", request, &artifact_writes, &embeddings, &chunk_cache);
+    } else {
+        try compute(alloc, &db, "{}", request, &artifact_writes, &embeddings, &chunk_cache, null);
+    }
 
     // Guard the test's relocation precondition, not just the successful no-growth path.
     try std.testing.expect(original_write_pointer != artifact_writes.items.ptr);
