@@ -329,6 +329,19 @@ components:
           embeddings: "#/components/schemas/CreateEmbeddingsIndexRequest"
           graph: "#/components/schemas/CreateGraphIndexRequest"
           algebraic: "#/components/schemas/CreateAlgebraicIndexRequest"
+    IndexMutationConflictError:
+      type: object
+      additionalProperties: false
+      description: An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the mutation may already have committed and callers must observe index state before deciding whether to issue another mutation.
+      required: [error, message, retryable]
+      properties:
+        error:
+          type: string
+          enum: [table_mutation_conflict, artifact_dependency_conflict, metadata_mutation_outcome_unknown]
+        message:
+          type: string
+        retryable:
+          type: boolean
     CreatedIndexCommon:
       type: object
       description: "Fields returned for every newly created index. Provider credentials are write-only and are never returned."

@@ -220,6 +220,8 @@ fn waitForRequestCancellationOrTimeout(
         // A futex keeps the ordinary no-cancellation path parked until its
         // actual deadline, while request completion can wake it immediately.
         // Callback-backed cancellation still gets the bounded poll interval.
+        // Cancellation is the only futex error. Do not inspect the runtime-local
+        // error tag returned by a borrowed I/O executor from another archive.
         Io.futexWaitTimeout(
             io,
             u32,
@@ -229,9 +231,7 @@ fn waitForRequestCancellationOrTimeout(
                 .clock = .awake,
                 .raw = .fromMilliseconds(@intCast(wait_ms)),
             } },
-        ) catch |err| switch (err) {
-            error.Canceled => return .stopped,
-        };
+        ) catch return .stopped;
     }
 }
 

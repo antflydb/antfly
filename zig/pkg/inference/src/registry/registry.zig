@@ -18,6 +18,9 @@ const std = @import("std");
 const Io = std.Io;
 const Dir = Io.Dir;
 const build_options = @import("build_options");
+const projector_format = @import("../architectures/projector_format.zig");
+const gguf_format = @import("../gguf/format.zig");
+const gguf_writer = @import("../gguf/writer.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const managed_receipt = @import("managed_receipt.zig");
 pub const download = @import("download.zig");
@@ -1098,15 +1101,38 @@ fn appendInferredInputs(
     effective_type: manifest_mod.ModelType,
     inputs: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    const gguf_projector_kind = if (manifest.gguf_projector_path) |projector_path|
+        projector_format.detectPath(allocator, projector_path) catch .unknown
+    else
+        .unknown;
+    const gguf_projector_has_image = switch (gguf_projector_kind) {
+        .antfly_gemma3, .clip_qwen3vl_image, .clip_gemma4_image, .clip_gemma4_image_audio => true,
+        else => false,
+    };
+    const gguf_projector_has_audio = switch (gguf_projector_kind) {
+        .clip_gemma4_audio, .clip_gemma4_image_audio => true,
+        else => false,
+    };
+
     if (manifest.inputs.len > 0 and effective_type == manifest.model_type) {
         for (manifest.inputs) |input| try appendUniqueOwnedString(allocator, inputs, input);
+        // Refresh manifests synthesized by older Antfly versions, which
+        // treated every GGUF projector as image-only. Recognized projector
+        // metadata is authoritative about the modalities it can serve.
+        if (effective_type == .embedder or effective_type == .generator) {
+            if (gguf_projector_has_image) try appendUniqueOwnedString(allocator, inputs, "image");
+            if (gguf_projector_has_audio) try appendUniqueOwnedString(allocator, inputs, "audio");
+        }
         return;
     }
 
     const has_visual = manifest.visual_model_path != null or
         manifest.visual_projection_path != null or
-        manifest.gguf_projector_path != null;
-    const has_audio = manifest.audio_model_path != null or manifest.audio_projection_path != null;
+        gguf_projector_has_image or
+        (manifest.gguf_projector_path != null and gguf_projector_kind == .unknown);
+    const has_audio = manifest.audio_model_path != null or
+        manifest.audio_projection_path != null or
+        gguf_projector_has_audio;
 
     switch (effective_type) {
         .embedder => {
@@ -1690,6 +1716,59 @@ test "synthesized pulled manifest keeps generate read gguf as generator" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"generate\",\"read\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\":[\"text\",\"image\",\"audio\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"text\",\"image\"]") != null);
+}
+
+test "synthesized pulled manifest infers a multimodal decoder GGUF as generator" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/ggml-org/gemma-4-E4B-it-GGUF");
+    const metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
+    };
+    var layout = try gguf_writer.buildLayout(allocator, &metadata, &.{});
+    defer layout.deinit(allocator);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/ggml-org/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_0.gguf",
+        .data = layout.header_bytes,
+    });
+    const projector_metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+        .{ .key = "clip.vision.projector_type", .value = .{ .string = "gemma4v" } },
+        .{ .key = "clip.audio.projector_type", .value = .{ .string = "gemma4a" } },
+    };
+    var projector_layout = try gguf_writer.buildLayout(allocator, &projector_metadata, &.{});
+    defer projector_layout.deinit(allocator);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/ggml-org/gemma-4-E4B-it-GGUF/mmproj-gemma-4-E4B-it-Q8_0.gguf",
+        .data = projector_layout.header_bytes,
+    });
+
+    const model_dir = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "models/ggml-org/gemma-4-E4B-it-GGUF",
+    });
+    defer allocator.free(model_dir);
+
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, null, null);
+    defer allocator.free(manifest_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"generator\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"generate\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"text\",\"image\",\"audio\"]") != null);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/ggml-org/gemma-4-E4B-it-GGUF/model_manifest.json",
+        .data = "{\"type\":\"generator\",\"tasks\":[\"generate\"],\"inputs\":[\"text\",\"image\"]}",
+    });
+    const upgraded_json = try synthesizePulledModelManifestJson(allocator, model_dir, "generate", null);
+    defer allocator.free(upgraded_json);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_json, "\"inputs\":[\"text\",\"image\",\"audio\"]") != null);
 }
 
 test "synthesized pulled manifest treats rerank-named sequence classifiers as rerankers" {

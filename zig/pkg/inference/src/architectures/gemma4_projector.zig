@@ -1410,11 +1410,16 @@ fn parseAudioConfig(file: *const gguf_format.File) !AudioConfig {
     const block_count: usize = @intCast(view.getU64("clip.audio.block_count") orelse return error.InvalidGgufProjector);
     const direct_unified = std.mem.eql(u8, projector_type, "gemma4ua") or
         (std.mem.eql(u8, projector_type, "gemma4uv") and block_count == 0);
+    const text_hidden: usize = @intCast(view.getU64("clip.audio.projection_dim") orelse return error.InvalidGgufProjector);
+    const output_hidden = if (direct_unified)
+        text_hidden
+    else
+        try audioProjectionInputWidth(file, text_hidden);
 
     return .{
-        .text_hidden = @intCast(view.getU64("clip.audio.projection_dim") orelse return error.InvalidGgufProjector),
+        .text_hidden = text_hidden,
         .audio_hidden = @intCast(view.getU64("clip.audio.embedding_length") orelse return error.InvalidGgufProjector),
-        .output_hidden = @intCast(view.getU64("clip.audio.projection_dim") orelse return error.InvalidGgufProjector),
+        .output_hidden = output_hidden,
         .intermediate_size = @intCast(view.getU64("clip.audio.feed_forward_length") orelse return error.InvalidGgufProjector),
         .block_count = block_count,
         .head_count = @intCast(view.getU64("clip.audio.attention.head_count") orelse return error.InvalidGgufProjector),
@@ -1424,6 +1429,24 @@ fn parseAudioConfig(file: *const gguf_format.File) !AudioConfig {
         .mel_bins = @intCast(view.getU64("clip.audio.num_mel_bins") orelse 128),
         .layer_norm_eps = view.getF32("clip.audio.attention.layer_norm_epsilon") orelse 1e-5,
     };
+}
+
+fn audioProjectionInputWidth(file: *const gguf_format.File, text_hidden: usize) !usize {
+    for (file.tensors) |tensor| {
+        if (!std.mem.eql(u8, tensor.name, "mm.a.input_projection.weight")) continue;
+        if (tensor.dimensions.len != 2) return error.InvalidGgufProjector;
+        const first = std.math.cast(usize, tensor.dimensions[0]) orelse return error.InvalidGgufProjector;
+        const second = std.math.cast(usize, tensor.dimensions[1]) orelse return error.InvalidGgufProjector;
+        const input = if (first == text_hidden)
+            second
+        else if (second == text_hidden)
+            first
+        else
+            return error.InvalidGgufProjector;
+        if (input == 0) return error.InvalidGgufProjector;
+        return input;
+    }
+    return error.InvalidGgufProjector;
 }
 
 test "gemma4 unified projector metadata parses image and audio configs" {
@@ -1478,6 +1501,35 @@ test "gemma4 unified projector metadata parses image and audio configs" {
     try std.testing.expectEqual(@as(usize, 640), audio_cfg.audio_hidden);
     try std.testing.expectEqual(@as(usize, 640), audio_cfg.raw_samples_per_token);
     try std.testing.expect(audio_cfg.direct_unified);
+}
+
+test "regular gemma4 audio config derives its projection input width from GGUF" {
+    const allocator = std.testing.allocator;
+    const metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "clip" } },
+        .{ .key = "clip.audio.projector_type", .value = .{ .string = "gemma4a" } },
+        .{ .key = "clip.audio.projection_dim", .value = .{ .u32 = 6 } },
+        .{ .key = "clip.audio.embedding_length", .value = .{ .u32 = 4 } },
+        .{ .key = "clip.audio.feed_forward_length", .value = .{ .u32 = 8 } },
+        .{ .key = "clip.audio.block_count", .value = .{ .u32 = 1 } },
+        .{ .key = "clip.audio.attention.head_count", .value = .{ .u32 = 2 } },
+    };
+    const projection_dims = [_]u64{ 6, 5 };
+    const tensors = [_]@import("../gguf/writer.zig").TensorSpec{.{
+        .name = "mm.a.input_projection.weight",
+        .dimensions = &projection_dims,
+        .tensor_type = .{ .known = .F32 },
+    }};
+    var layout = try @import("../gguf/writer.zig").buildLayout(allocator, &metadata, &tensors);
+    defer layout.deinit(allocator);
+    var parsed = try gguf_format.parse(allocator, layout.header_bytes);
+    defer parsed.deinit(allocator);
+
+    const cfg = try parseAudioConfig(&parsed);
+    try std.testing.expectEqual(@as(usize, 4), cfg.audio_hidden);
+    try std.testing.expectEqual(@as(usize, 5), cfg.output_hidden);
+    try std.testing.expectEqual(@as(usize, 6), cfg.text_hidden);
+    try std.testing.expect(!cfg.direct_unified);
 }
 
 test "gemma4 unified projector rejects invalid effective patch geometry" {

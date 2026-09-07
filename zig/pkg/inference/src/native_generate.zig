@@ -287,6 +287,10 @@ fn validateCacheCompactionOption(ratio: ?f32) !void {
 }
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (generateHelpRequested(args)) {
+        printUsage();
+        return;
+    }
     const opts = try parseArgs(args);
     const jit_config = try validateKernelJitOptions(opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
@@ -2449,6 +2453,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             draft_cuda_generate_stats,
         );
     }
+}
+
+fn generateHelpRequested(args: []const []const u8) bool {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
 }
 
 fn warmInitCudaBeforeLargeModelScan(backend: BackendChoice) !void {
@@ -8941,6 +8953,14 @@ test "generate CLI rejects unsupported cache compaction before model loading" {
     try validateCacheCompactionOption(null);
     try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionOption(0.0));
     try std.testing.expectError(error.KvStorageCompactionNotSupported, validateCacheCompactionOption(0.5));
+}
+
+test "generate CLI recognizes help before required positional arguments" {
+    try std.testing.expect(generateHelpRequested(&.{"--help"}));
+    try std.testing.expect(generateHelpRequested(&.{"-h"}));
+    try std.testing.expect(generateHelpRequested(&.{"help"}));
+    try std.testing.expect(generateHelpRequested(&.{ "model", "prompt", "--help" }));
+    try std.testing.expect(!generateHelpRequested(&.{ "model", "help" }));
 }
 
 test "parseArgs accepts artifact dir" {

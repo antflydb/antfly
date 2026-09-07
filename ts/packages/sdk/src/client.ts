@@ -8,6 +8,7 @@ import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import { validateGraphQueryResponses } from "./graph-results.js";
 import { validateCreateIndexRequestRelationships } from "./index-config.js";
 import type { paths } from "./public-api.js";
+import { parseSSEFrames } from "./sse.js";
 import type {
   AntflyAuth,
   AntflyConfig,
@@ -736,130 +737,89 @@ export class AntflyClient {
       return result;
     }
 
-    // Handle SSE streaming response
-    if (callbacks) {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let currentEvent = "";
+    if (contentType.split(";", 1)[0]?.trim().toLowerCase() !== "text/event-stream") {
+      await response.body.cancel();
+      throw new Error("Retrieval agent returned an unsupported content type");
+    }
 
-      // Start reading the stream in the background
-      (async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+    // A JSON caller must not leave an unexpected stream open.
+    if (!callbacks) {
+      await response.body.cancel();
+      return abortController;
+    }
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
-              if (!line.trim()) {
-                currentEvent = "";
-                continue;
+    const stream = response.body;
+    // The controller is returned immediately; terminal failures are delivered
+    // through onError, including read errors, malformed frames, and early EOF.
+    void (async () => {
+      try {
+        for await (const frame of parseSSEFrames(stream, "Retrieval agent")) {
+          if (abortController.signal.aborted) return;
+          switch (frame.event) {
+            case "classification":
+              callbacks.onClassification?.(JSON.parse(frame.data));
+              break;
+            case "reasoning":
+              callbacks.onReasoning?.(JSON.parse(frame.data));
+              break;
+            case "hit":
+              callbacks.onHit?.(JSON.parse(frame.data));
+              break;
+            case "generation":
+              callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "step_started":
+              callbacks.onStepStarted?.(JSON.parse(frame.data));
+              break;
+            case "step_progress":
+              callbacks.onStepProgress?.(JSON.parse(frame.data));
+              break;
+            case "step_completed":
+              callbacks.onStepCompleted?.(JSON.parse(frame.data));
+              break;
+            case "tool_mode":
+              callbacks.onToolMode?.(JSON.parse(frame.data));
+              break;
+            case "followup":
+              callbacks.onFollowup?.(JSON.parse(frame.data));
+              break;
+            case "eval":
+              callbacks.onEvalResult?.(JSON.parse(frame.data));
+              break;
+            case "done": {
+              const result = JSON.parse(frame.data);
+              if (result === null || typeof result !== "object" || Array.isArray(result)) {
+                throw new Error("Retrieval agent returned an invalid done result");
               }
-
-              if (line.startsWith("event: ")) {
-                currentEvent = line.slice(7).trim();
-              } else if (line.startsWith("data: ")) {
-                const data = line.slice(6).trim();
-
-                let sseError: Error | undefined;
-                try {
-                  switch (currentEvent) {
-                    case "classification":
-                      if (callbacks.onClassification) {
-                        callbacks.onClassification(JSON.parse(data));
-                      }
-                      break;
-                    case "reasoning":
-                      if (callbacks.onReasoning) {
-                        callbacks.onReasoning(JSON.parse(data));
-                      }
-                      break;
-                    case "hit":
-                      if (callbacks.onHit) {
-                        callbacks.onHit(JSON.parse(data));
-                      }
-                      break;
-                    case "generation":
-                      if (callbacks.onGeneration) {
-                        callbacks.onGeneration(JSON.parse(data));
-                      }
-                      break;
-                    case "step_started":
-                      if (callbacks.onStepStarted) {
-                        callbacks.onStepStarted(JSON.parse(data));
-                      }
-                      break;
-                    case "step_progress":
-                      if (callbacks.onStepProgress) {
-                        callbacks.onStepProgress(JSON.parse(data));
-                      }
-                      break;
-                    case "step_completed":
-                      if (callbacks.onStepCompleted) {
-                        callbacks.onStepCompleted(JSON.parse(data));
-                      }
-                      break;
-                    case "tool_mode":
-                      if (callbacks.onToolMode) {
-                        callbacks.onToolMode(JSON.parse(data));
-                      }
-                      break;
-                    case "followup":
-                      if (callbacks.onFollowup) {
-                        callbacks.onFollowup(JSON.parse(data));
-                      }
-                      break;
-                    case "eval":
-                      if (callbacks.onEvalResult) {
-                        callbacks.onEvalResult(JSON.parse(data));
-                      }
-                      break;
-                    case "done": {
-                      const result = JSON.parse(data);
-                      if (
-                        callbacks.onConfidence &&
-                        typeof result.generation_confidence === "number" &&
-                        typeof result.context_relevance === "number"
-                      ) {
-                        callbacks.onConfidence({
-                          generation_confidence: result.generation_confidence,
-                          context_relevance: result.context_relevance,
-                        });
-                      }
-                      if (callbacks.onDone) {
-                        callbacks.onDone(result);
-                      }
-                      return;
-                    }
-                    case "error": {
-                      const parsed = JSON.parse(data);
-                      const message =
-                        typeof parsed === "object" && parsed.error ? parsed.error : String(parsed);
-                      if (callbacks.onError) {
-                        callbacks.onError(message);
-                      }
-                      sseError = new Error(message);
-                      break;
-                    }
-                  }
-                } catch (e) {
-                  console.warn("Failed to parse SSE data:", currentEvent, data, e);
-                }
-                if (sseError) throw sseError;
+              if (
+                typeof result.generation_confidence === "number" &&
+                typeof result.context_relevance === "number"
+              ) {
+                callbacks.onConfidence?.({
+                  generation_confidence: result.generation_confidence,
+                  context_relevance: result.context_relevance,
+                });
               }
+              callbacks.onDone?.(result);
+              return;
+            }
+            case "error": {
+              const parsed = JSON.parse(frame.data);
+              const message =
+                parsed !== null && typeof parsed === "object" && parsed.error
+                  ? String(parsed.error)
+                  : String(parsed);
+              throw new Error(message);
             }
           }
-        } catch (error) {
-          if ((error as Error).name !== "AbortError") {
-            console.error("Retrieval agent streaming error:", error);
-          }
         }
-      })();
-    }
+        throw new Error("Retrieval agent stream ended before done");
+      } catch (error) {
+        if (!abortController.signal.aborted) {
+          callbacks.onError?.(error instanceof Error ? error.message : String(error));
+        }
+      }
+    })();
 
     return abortController;
   }

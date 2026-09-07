@@ -4544,7 +4544,7 @@ fn recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes: u64) runtime.tier.me
     // those source views alive while preparing reusable F16 projection slots
     // (or the explicit F32 rollback), so the host cache must be able to account
     // for the complete artifact. The ordinary GPU defaults already cover the
-    // prepared projections and persistent embedding table on supported
+    // prepared projections and the persistent embedding table on supported
     // machines; these are minimums, not an override of an explicit limit.
     const host_floor = clampBytes(total_bytes +| mib(256), gib(2), gib(4));
     const backend_floor = clampBytes((total_bytes *| 3) / 4 +| gib(1), gib(3), gib(6));
@@ -4835,11 +4835,11 @@ fn sharedGpuHostedBudgetPolicy(
     else
         runtime.tier.cache.Budget{};
     const budget_floor = widenLimits(
-        widenLimits(lazy_quant_budget_floor, gemma_budget_floor),
         widenLimits(
+            widenLimits(lazy_quant_budget_floor, gemma_budget_floor),
             widenLimits(dense_safetensors_budget_floor, qwen3vl_reranker_gguf_budget_floor),
-            bge_m3_budget_floor,
         ),
+        bge_m3_budget_floor,
     );
     const shared_cache_floor = runtime.tier.cache.Budget{
         .host_limit_bytes = @max(
@@ -7456,7 +7456,7 @@ fn archRunImpl(
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
 
-            if (self.task == .classifier and cfg.family == .qwen3_vl) {
+            if (self.task == .classifier and (cfg.family == .qwen3_vl or cfg.family == .qwen3)) {
                 if (inputs.len < 2 or !std.mem.eql(u8, inputs[1].name, "attention_mask")) {
                     return error.MissingInputs;
                 }

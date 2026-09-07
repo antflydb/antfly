@@ -17,6 +17,7 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
+const threaded_connect_io = @import("../common/threaded_connect_io.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 
 const Allocator = std.mem.Allocator;
@@ -727,6 +728,11 @@ pub const BackendRuntime = struct {
     native_storage_pool: *storage_io.NativeStoragePool,
     lsm_owner_clone_registry: LsmOwnerCloneRegistry,
     borrowed_filesystem_io: ?Io = null,
+    /// One immutable network-only view is shared by purpose-bound outbound
+    /// transports. General filesystem, storage, scheduling, and randomness
+    /// users retain Threaded's native vtable; a partially decorated `Io` must
+    /// not become the process-wide authority for unrelated operations.
+    threaded_network_io_vtable: ?*Io.VTable = null,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
@@ -793,6 +799,8 @@ pub const BackendRuntime = struct {
                 errdefer deinitIoLane(alloc, inference_io_impl);
                 const control_io_impl = try initIoLane(alloc, threaded_io_limits.service);
                 errdefer deinitIoLane(alloc, control_io_impl);
+                const threaded_network_io_vtable = try threaded_connect_io.createVTable(alloc, io_impl);
+                errdefer alloc.destroy(threaded_network_io_vtable);
 
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
@@ -801,6 +809,7 @@ pub const BackendRuntime = struct {
                 errdefer threaded_jobs.deinit();
 
                 runtime.io_impl = io_impl;
+                runtime.threaded_network_io_vtable = threaded_network_io_vtable;
                 runtime.raft_inbound_io_impl = raft_inbound_io_impl;
                 runtime.raft_outbound_io_impl = raft_outbound_io_impl;
                 runtime.api_io_impl = api_io_impl;
@@ -856,6 +865,10 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
             self.io_impl = null;
         }
+        if (self.threaded_network_io_vtable) |vtable| {
+            self.alloc.destroy(vtable);
+            self.threaded_network_io_vtable = null;
+        }
         self.native_storage_pool.deinit();
         self.alloc.destroy(self.native_storage_pool);
         self.lsm_owner_clone_registry.deinit();
@@ -869,10 +882,16 @@ pub const BackendRuntime = struct {
         return if (self.io_impl) |io_impl| io_impl.io() else null;
     }
 
+    fn threadedNetworkIo(self: *BackendRuntime, io_impl: *IoImpl) Io {
+        const vtable = self.threaded_network_io_vtable orelse return io_impl.io();
+        return threaded_connect_io.io(io_impl, vtable);
+    }
+
     /// I/O authority for synchronous storage work. Unlike `io`, this may be
     /// caller-owned and does not imply that background scheduling is enabled.
     pub fn filesystemIo(self: *BackendRuntime) ?Io {
-        return self.io() orelse self.borrowed_filesystem_io;
+        if (comptime builtin.os.tag == .freestanding) return self.borrowed_filesystem_io;
+        return if (self.io_impl) |io_impl| io_impl.io() else self.borrowed_filesystem_io;
     }
 
     pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
@@ -954,7 +973,7 @@ pub const BackendRuntime = struct {
 
     pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return if (self.raft_outbound_io_impl) |io_impl| io_impl.io() else self.io();
+        return if (self.raft_outbound_io_impl) |io_impl| self.threadedNetworkIo(io_impl) else self.io();
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
@@ -971,6 +990,25 @@ pub const BackendRuntime = struct {
     /// Components own and await the tasks they submit; BackendRuntime only owns
     /// the executor lane and must outlive every borrower.
     pub fn apiIo(self: *BackendRuntime) ?Io {
+        const io_impl = self.apiIoImpl() orelse return null;
+        return io_impl.io();
+    }
+
+    /// Outbound-network view of the API lane. This is deliberately separate
+    /// from `apiIo`: filesystem backup work and scheduler primitives require
+    /// the native Threaded contract, while HTTP transports require bounded,
+    /// cancellation-safe connect completion.
+    pub fn apiNetworkIo(self: *BackendRuntime) ?Io {
+        const io_impl = self.apiIoImpl() orelse return null;
+        return self.threadedNetworkIo(io_impl);
+    }
+
+    /// Native API-lane I/O for local filesystem repository operations. The
+    /// connector vtable is intentionally scoped to network transport work;
+    /// substituting it across a request-owned filesystem syscall can surface
+    /// the transport reader's `ReadFailed` classification instead of the OS
+    /// path error.
+    pub fn apiFilesystemIo(self: *BackendRuntime) ?Io {
         const io_impl = self.apiIoImpl() orelse return null;
         return io_impl.io();
     }
@@ -1026,7 +1064,7 @@ pub const BackendRuntime = struct {
     pub fn inferenceIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = self.inference_io_impl orelse self.io_impl orelse return null;
-        return io_impl.io();
+        return self.threadedNetworkIo(io_impl);
     }
 
     pub const InferenceLaneLease = struct {
@@ -2127,7 +2165,7 @@ test "backend runtime inference lane has an isolated bounded executor" {
 
     var inference = try handle.ptr().acquireInferenceLane();
     defer inference.release();
-    _ = inference.io();
+    const inference_io = inference.io();
     try std.testing.expectEqual(@as(usize, 1), handle.ptr().outstandingInferenceLeases());
     const stats = handle.ptr().laneStats();
     try std.testing.expectEqual(@as(usize, 1), stats.inference_peak_leases);
@@ -2136,6 +2174,75 @@ test "backend runtime inference lane has an isolated bounded executor" {
     try std.testing.expectEqual(
         std.Io.Limit.limited(threaded_io_limits.inference),
         handle.ptr().inference_io_impl.?.concurrent_limit,
+    );
+    try std.testing.expect(inference_io.vtable == handle.ptr().threaded_network_io_vtable.?);
+    try std.testing.expect(
+        inference_io.vtable.netConnectIp != handle.ptr().inference_io_impl.?.io().vtable.netConnectIp,
+    );
+}
+
+test "backend runtime separates native operation IO from outbound network IO" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    const runtime = handle.ptr();
+    const native_vtable = runtime.io_impl.?.io().vtable;
+    const network_vtable = runtime.threaded_network_io_vtable.?;
+    const native_lanes = [_]Io{
+        runtime.io().?,
+        runtime.raftInboundIo().?,
+        runtime.apiIo().?,
+        runtime.controlIo().?,
+    };
+    for (native_lanes) |lane| try std.testing.expect(lane.vtable == native_vtable);
+
+    const network_lanes = [_]Io{
+        runtime.raftOutboundIo().?,
+        runtime.apiNetworkIo().?,
+        runtime.inferenceIo().?,
+    };
+    for (network_lanes) |lane| try std.testing.expect(lane.vtable == network_vtable);
+    try std.testing.expect(network_vtable.netConnectIp != native_vtable.netConnectIp);
+}
+
+test "backend runtime native API lane preserves filesystem errors across executors" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    const api_io = handle.ptr().apiIo().?;
+    const Probe = struct {
+        fn run(io: Io) !void {
+            try std.testing.expectError(
+                error.FileNotFound,
+                std.Io.Dir.cwd().statFile(io, "/antfly-backend-runtime-missing-manifest", .{}),
+            );
+        }
+    };
+    const control_io = handle.ptr().controlIo().?;
+    var future = try control_io.concurrent(Probe.run, .{api_io});
+    try future.await(control_io);
+}
+
+test "backend runtime exposes native API filesystem IO separately" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    const api_io = handle.ptr().apiFilesystemIo().?;
+    try std.testing.expect(api_io.vtable == handle.ptr().api_io_impl.?.io().vtable);
+    try std.testing.expect(api_io.vtable == handle.ptr().apiIo().?.vtable);
+    try std.testing.expect(api_io.vtable != handle.ptr().apiNetworkIo().?.vtable);
+    try std.testing.expect(handle.ptr().filesystemIo().?.vtable == handle.ptr().io_impl.?.io().vtable);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(api_io, "missing", .{}),
     );
 }
 

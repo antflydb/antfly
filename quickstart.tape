@@ -47,9 +47,9 @@ Sleep 2s
 
 # Wait for a meaningful, query-visible slice of the embedding corpus. The
 # remaining source documents continue indexing after the threshold is reached.
-Type@75ms `antfly index wait -t wikipedia -i title_body --until source-covered=10% --timeout 20m`
+Type@75ms `antfly index wait -t wikipedia -i title_body --until source-covered=10% --timeout 45m`
 Enter
-Wait@1200s /reached source-covered=10%:/
+Wait@2700s /reached source-covered=10%:/
 Sleep 1s
 
 # --- Full-text search ---

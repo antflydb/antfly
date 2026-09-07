@@ -16,7 +16,7 @@ const posix = std.posix;
 
 /// Installs Antfly's cancellation-safe POSIX connector over a Threaded I/O
 /// runtime. The vtable is separately allocated so the returned I/O remains
-/// stable when its owning executor moves.
+/// stable when its owning runtime moves and can be shared by runtime lanes.
 pub fn createVTable(alloc: std.mem.Allocator, threaded: *std.Io.Threaded) !*std.Io.VTable {
     const vtable = try alloc.create(std.Io.VTable);
     vtable.* = threaded.io().vtable.*;

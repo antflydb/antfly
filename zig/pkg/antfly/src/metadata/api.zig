@@ -29,6 +29,23 @@ const reallocation_request = @import("reallocation_request.zig");
 pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
 pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
+/// Authoritative ordering stamp for one consensus-committed catalog mutation.
+/// The Raft log index is comparable only inside the same metadata namespace;
+/// carrying that namespace with the receipt prevents delayed callbacks from a
+/// replaced metadata group from superseding current control-plane work.
+pub const CatalogMutationStamp = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: MetadataClusterIncarnation,
+    term: u64,
+    index: u64,
+
+    pub fn eql(lhs: CatalogMutationStamp, rhs: CatalogMutationStamp) bool {
+        return lhs.metadata_group_id == rhs.metadata_group_id and
+            std.mem.eql(u8, &lhs.metadata_incarnation, &rhs.metadata_incarnation) and
+            lhs.term == rhs.term and lhs.index == rhs.index;
+    }
+};
+
 /// Allocation-free subset of `/status` used by rolling-upgrade admission
 /// probes. Keeping this separate from MetadataStatus avoids parsing and
 /// retaining unrelated status strings on every table DDL operation.

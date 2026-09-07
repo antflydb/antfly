@@ -3232,7 +3232,7 @@ fn qwen3VlTextMropePositions(
     return positions;
 }
 
-/// Exact Qwen3-VL-Reranker head: select the final active hidden row and keep
+/// Qwen3 and Qwen3-VL reranker head: select the final active hidden row and keep
 /// only `(W_yes - W_no)` on the backend. This avoids materializing the full
 /// vocabulary logits and preserves the official pointwise scoring contract.
 pub fn qwen3VlRerankerLogits(
@@ -3244,7 +3244,7 @@ pub fn qwen3VlRerankerLogits(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
-    if (config.family != .qwen3_vl or
+    if ((config.family != .qwen3_vl and config.family != .qwen3) or
         qwen3vl_reranker.yes_token_id >= config.vocab_size or
         qwen3vl_reranker.no_token_id >= config.vocab_size)
     {
@@ -3256,13 +3256,13 @@ pub fn qwen3VlRerankerLogits(
 
     const active_rows = try activeFinalRowIndices(allocator, attention_mask, batch, seq_len);
     defer allocator.free(active_rows);
-    const mrope_positions = try qwen3VlTextMropePositions(
+    const mrope_positions = if (config.family == .qwen3_vl) try qwen3VlTextMropePositions(
         allocator,
         attention_mask,
         batch,
         seq_len,
-    );
-    defer allocator.free(mrope_positions);
+    ) else null;
+    defer if (mrope_positions) |positions| allocator.free(positions);
 
     const decode_context = DecodeContext{
         .attention_mode = .full_recompute,

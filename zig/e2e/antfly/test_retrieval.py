@@ -1223,6 +1223,22 @@ def test_retrieval_agent_streaming_probe_progress(backup_api):
     assert '"phase":"probe"' in body
     assert '"selection_source":"probe"' in body
     assert '"probe_relevance":' in body
+    events = _parse_sse_events(body)
+    probes = [
+        data
+        for name, data in events
+        if name == "step_progress" and data.get("phase") == "probe"
+    ]
+    assert probes, events
+    assert all(probe["details"]["selection_source"] == "probe" for probe in probes)
+    assert any(
+        "probe_relevance" in candidate
+        for probe in probes
+        for candidate in probe["details"]["candidate_scores"]
+    )
+    assert sum(name == "done" for name, _ in events) == 1
+    assert events[-1][0] == "done"
+    assert not any(name == "error" for name, _ in events)
     assert "event: reasoning" in body
     assert "event: tool_mode" in body
     assert '"mode":"structured_output"' in body

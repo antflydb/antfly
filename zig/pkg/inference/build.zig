@@ -1741,6 +1741,26 @@ pub fn build(b: *std.Build) void {
         quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);
     }
     const test_step = b.step("test", "Run unit tests");
+    const cancellation_e2e_step = b.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
+    if (targetRunsOnBuildHost(b, target) and (target.result.os.tag == .linux or target.result.os.tag == .macos)) {
+        const fixture = b.addExecutable(.{
+            .name = "inference-cancellation-fixture",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/cancellation_fixture.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        fixture.root_module.addImport("inference", runtime_graph.inference_mod);
+        fixture.root_module.addImport("httpx", httpx_mod);
+        fixture.root_module.addImport("antfly_platform", platform_mod);
+        fixture.root_module.link_libc = true;
+        const integration = b.addSystemCommand(&.{"python3"});
+        integration.addFileArg(b.path("tests/test_cancellation_e2e.py"));
+        integration.addArtifactArg(fixture);
+        cancellation_e2e_step.dependOn(&integration.step);
+        if (selected_test_filters.len == 0) test_step.dependOn(cancellation_e2e_step);
+    }
     test_step.dependOn(&quant_kernel_codegen_test_check.step);
     test_step.dependOn(&cuda_artifact_source_policy_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);

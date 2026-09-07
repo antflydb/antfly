@@ -974,7 +974,7 @@ fn indexesJsonSource(indexes_json: []const u8) []const u8 {
     return if (indexes_json.len > 0) indexes_json else tables_api.default_indexes_json;
 }
 
-fn isReservedIndexMetadataEntry(name: []const u8) bool {
+pub fn isReservedIndexMetadataEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
 
@@ -2500,8 +2500,12 @@ fn classifyIndexObservation(
         item.coverage_summary_ready
     else
         true;
+    const index_target_observation_complete = if (@hasField(Item, "runtime_target_observation_complete"))
+        item.runtime_target_observation_complete
+    else
+        true;
     const target_observation_complete = if (metadata) |value|
-        value.target_observation_complete
+        value.target_observation_complete and index_target_observation_complete
     else if (@hasField(Item, "target_observation_group_count") and @hasField(Item, "expected_group_count"))
         item.expected_group_count == 0 or item.target_observation_group_count == item.expected_group_count
     else
@@ -2664,7 +2668,7 @@ fn aggregateIndexStatusIndexed(
         // Target observation is a group-level convergence watermark, separate
         // from this index's incarnation match. A stale incarnation should
         // report config_mismatch without fabricating a second target gap.
-        if (runtime.metadata.target_observation_complete)
+        if (authority.convergence_authoritative)
             aggregate.target_observation_group_count += 1;
         const index_observation_fresh = authority.freshness_authoritative;
         if (index_observation_fresh) {
@@ -4469,6 +4473,49 @@ test "cached owner observation preserves serving authority without convergence a
     try std.testing.expectEqual(@as(u64, 0), fenced.fact_group_count);
     try std.testing.expectEqual(@as(u64, 1), fenced.stale_group_count);
     try std.testing.expectEqual(@as(u64, 0), fenced.doc_count);
+}
+
+test "index-local convergence fence does not revoke a completed sibling" {
+    var indexes = [_]db_mod.types.DBIndexStats{
+        .{
+            .name = "title_body",
+            .kind = .dense_vector,
+            .runtime_target_observation_complete = false,
+            .serving_snapshot_ready = true,
+            .doc_count = 5,
+            .coverage_produced_count = 5,
+            .coverage_generation = 10,
+            .coverage_config_hash = 100,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        },
+        .{
+            .name = "thumbnail",
+            .kind = .dense_vector,
+            .runtime_target_observation_complete = true,
+            .serving_snapshot_ready = true,
+            .doc_count = 3,
+            .coverage_produced_count = 3,
+            .coverage_generation = 20,
+            .coverage_config_hash = 200,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        },
+    };
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .target_observation_complete = true,
+        },
+        .stats = .{ .source_doc_count = 5, .index_count = 2, .indexes = indexes[0..] },
+    }};
+    const title = aggregateIndexStatusIndexed(&runtimes, "title_body", &.{7}, 10, 100, null).?;
+    const thumbnail = aggregateIndexStatusIndexed(&runtimes, "thumbnail", &.{7}, 20, 200, null).?;
+    try std.testing.expectEqual(@as(u64, 0), title.target_observation_group_count);
+    try std.testing.expectEqual(@as(u64, 1), thumbnail.target_observation_group_count);
+    try std.testing.expectEqual(@as(u64, 3), thumbnail.doc_count);
 }
 
 test "target-scoped stale full text observation cannot publish old readiness" {

@@ -25,6 +25,63 @@ pub const ChatMessageContent = generating.ChatMessageContent;
 pub const ToolCall = generating.ToolCall;
 pub const ChatMessage = generating.ChatMessage;
 
+/// Request-scoped local generation controls. Keep these in the provider
+/// request (including its serialized bridge), never in shared model state.
+pub const GenerationOptions = struct {
+    max_tokens: i32 = 256,
+
+    pub fn fromMaxTokens(value: i64) !GenerationOptions {
+        if (value <= 0) return error.InvalidGeneratorConfig;
+        return .{ .max_tokens = std.math.cast(i32, value) orelse return error.InvalidGeneratorConfig };
+    }
+};
+
+/// Shared request schemas for the independently compiled inference bridge.
+/// Defaults retain the historical budget for older internal callers only.
+pub const GenerateTextRequest = struct {
+    model: []const u8,
+    roles: []const []const u8,
+    contents: []const []const u8,
+    options: GenerationOptions = .{},
+};
+
+pub const GenerateMessagesRequest = struct {
+    model: []const u8,
+    messages: []const ChatMessage,
+    options: GenerationOptions = .{},
+};
+
+test "local generation budgets preserve explicit limits and reject overflow" {
+    try std.testing.expectEqual(@as(i32, 128), (try GenerationOptions.fromMaxTokens(128)).max_tokens);
+    try std.testing.expectEqual(@as(i32, 256), (GenerationOptions{}).max_tokens);
+    try std.testing.expectError(error.InvalidGeneratorConfig, GenerationOptions.fromMaxTokens(0));
+    try std.testing.expectError(error.InvalidGeneratorConfig, GenerationOptions.fromMaxTokens(-1));
+    try std.testing.expectError(error.InvalidGeneratorConfig, GenerationOptions.fromMaxTokens(std.math.maxInt(i64)));
+}
+
+test "local generation bridge round trips request budgets" {
+    const alloc = std.testing.allocator;
+    const encoded = try std.json.Stringify.valueAlloc(alloc, GenerateMessagesRequest{
+        .model = "gemma",
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hello" } }},
+        .options = try GenerationOptions.fromMaxTokens(128),
+    }, .{});
+    defer alloc.free(encoded);
+    var decoded = try std.json.parseFromSlice(GenerateMessagesRequest, alloc, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(i32, 128), decoded.value.options.max_tokens);
+    var text = try std.json.parseFromSlice(GenerateTextRequest, alloc,
+        \\{"model":"gemma","roles":["user"],"contents":["hello"],"options":{"max_tokens":37}}
+    , .{});
+    defer text.deinit();
+    try std.testing.expectEqual(@as(i32, 37), text.value.options.max_tokens);
+    var legacy = try std.json.parseFromSlice(GenerateMessagesRequest, alloc,
+        \\{"model":"gemma","messages":[]}
+    , .{});
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(i32, 256), legacy.value.options.max_tokens);
+}
+
 pub const ChatWireFlavor = enum {
     openai_compatible,
     termite_native,
