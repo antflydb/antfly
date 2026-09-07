@@ -1498,6 +1498,11 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
+    ), json.dumps(
+        {
+            "index": stateful_api.get_index(table_name, index_name),
+            "logs": stateful_api.debug_logs(),
+        }
     )
 
     batch = stateful_api.batch_write(

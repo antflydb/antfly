@@ -28652,7 +28652,7 @@ pub const DB = struct {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
 
-        const primary_doc_count = try range_cardinality.load(alloc, self.core.store);
+        const primary_doc_count = try range_cardinality.loadOrProveEmpty(alloc, self.core.store);
         if (primary_doc_count != null and primary_doc_count.? == 0)
             return try alloc.alloc(types.IndexConfig, 0);
         const managed_indexes = try self.core.managedIndexes(alloc);
@@ -81350,7 +81350,8 @@ test "idle generated coverage gap becomes durable paged recovery debt" {
     try std.testing.expectEqual(index_repair_state.WorkClass.initial_build, entry.intent.work_class);
     try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, entry.intent.source_replay_state);
     try std.testing.expectEqual(index_repair_state.Phase.detected, entry.intent.phase);
-    try std.testing.expect(!db.core.index_manager.repairUnavailable("semantic"));
+    // This initial generation has no published outcomes to serve yet.
+    try std.testing.expect(db.core.index_manager.repairUnavailable("semantic"));
 }
 
 test "db catch-up defers artifact dense target advance without durable counter" {
@@ -88062,6 +88063,43 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 } },
         .limit = 1,
     }));
+}
+
+test "db empty managed index does not invent generated coverage recovery debt" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    try std.testing.expectEqual(@as(?u64, null), try range_cardinality.load(alloc, db.core.store));
+    _ = try db.admitManagedIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"body","dims":3,"metric":"cosine","embedding_name":"semantic_idx","publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic_idx"}}
+        ,
+        .coverage_generation = 42,
+    });
+    // No primary mutation has created the range counter. The empty user-key
+    // namespace nevertheless proves there are no missing source outcomes;
+    // repeated idle audits must not create replacement work.
+    try std.testing.expect(!try db.generatedCoverageReplayNeeded(alloc));
+    try std.testing.expectEqual(@as(usize, 0), try db.ensureGeneratedCoverageRecoveryIntents(alloc));
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+
+    // A legacy primary record can lack both local cardinality and identity
+    // metadata. It must remain unknown even when identity counters look empty.
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"body\":\"alpha\"}");
+    try std.testing.expect(try db.generatedCoverageReplayNeeded(alloc));
 }
 
 test "db completed partial managed admission serves and retires redundant repair" {
