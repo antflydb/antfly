@@ -3621,7 +3621,7 @@ pub fn build(b: *std.Build) void {
     secret_store_abi_test_mod.linkLibrary(secret_store_abi_provider);
     const secret_store_abi_tests = b.addTest(.{
         .root_module = secret_store_abi_test_mod,
-        .filters = &.{"secret store operations retain their IO owner across runtime archives"},
+        .filters = &.{ "secret store operations retain their IO owner across runtime archives", "secret store archive boundary" },
     });
     const run_secret_store_abi_tests = b.addRunArtifact(secret_store_abi_tests);
     const secret_store_abi_test_step = b.step("lib-common-secrets-abi-test", "Run secret store tests across independently compiled runtime archives");

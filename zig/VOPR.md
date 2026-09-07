@@ -2357,7 +2357,9 @@ VOPR work has found concrete production and harness defects:
   mutations now execute in the creating archive through the existing stable
   callback error transport. `lib-common-secrets-abi-test` compiles a separate
   provider archive and verifies missing-file handling, typed errors, publication,
-  rotation, retained values, and deletion. It runs in `lib-common-secrets-test`
+  rotation, retained values, deletion, layered precedence, malformed/missing
+  replacement retention, and injected cancellation through every dispatched
+  operation. It runs in `lib-common-secrets-test`
   and `unit-test`; production semantic E2E tests cover the assembled executable.
   Matching `std.Io` layouts/toolchains alone does not make error-returning
   vtable calls safe across independent Zig compilation units.
@@ -2976,11 +2978,67 @@ scenarios and operational tooling rather than missing foundational
 infrastructure. They are not a second numbered phase plan and are not
 dependencies of the already implemented domain suites.
 
+### Open Runtime Correctness Review (2026-09-06)
+
+The focused review at `6fe629d2e` found the following unresolved correctness
+defects. These take priority over expanding scenario breadth. Passing existing
+replay tests does not establish std.Io contract conformance; a wrong runtime
+behavior can replay exactly. The review did not certify the entire branch.
+
+1. **P1 — Raw cross-archive executor borrows still transport local errors.**
+   `runtime_native_abi.IoBorrow.get` validates layout and copies the original
+   `std.Io` vtable. `api/kernel_exports.zig` and
+   `standalone/inference_host.zig` consume that executor in independent runtime
+   archives. A separate provider/consumer diagnostic using the real `IoBorrow`
+   reproduced `FileNotFound` becoming `WriteFailed` (provider error number 1,
+   consumer `FileNotFound` number 33). The secret-store owner dispatcher fixes
+   that store, not arbitrary executor borrows. Keep error-returning I/O and
+   task completion in the executor's owning compilation unit, or implement an
+   explicit error-safe executor bridge, with independent-archive regressions
+   for cancellation, file/network failures, and task results. Same-unit layout
+   tests are insufficient. The API HTTP body/stream callbacks already use
+   explicit status enums; their status transport is not the raw-I/O defect.
+2. **P1 — Group cancellation drops callbacks that own cleanup.**
+   `vopr_io_task.Kernel.groupCancel` calls `discardUnstartedGroupTasks`.
+   Submitting a callback with a cleanup defer and cancelling before its first
+   transition leaves that cleanup unexecuted. Zig 0.16 Threaded instead enters
+   the callback with cancellation pending; cancellation is delivered at an I/O
+   cancellation point. Remove the discard behavior and drain queued callbacks
+   as well as entered fibers. Replace the existing test that expects queued
+   work never to run with ownership-release and cancellation-point tests.
+3. **P2 — Group argument alignment is ignored.**
+   `vopr_io_task.Kernel.groupConcurrentInternal` discards `context_alignment`
+   and packs the payload directly after its wrapper. A diagnostic requesting
+   64-byte alignment received a pointer with offset 16 modulo 64. Honor the
+   requested alignment and padding, or reject unsupported concurrent work
+   before accepting ownership and use the documented eager async fallback.
+   Check both group entry points and differently aligned arguments/results.
+4. **P1 — Cancellation can complete protected sleeps early.**
+   `Task.requestCancel` makes sleeping tasks runnable even when cancellation
+   protection is blocked. `sleepCurrent` resumes and returns success because
+   `checkCancel` suppresses the error. A task sleeping for 100 virtual
+   nanoseconds inside a protected region completed before that deadline when
+   cancellation was requested. Preserve the blocked wait until its real wake
+   condition, then deliver pending cancellation after protection is removed.
+   Cover timed sleep and protected synchronization/external waits separately.
+
+Verification in this review: the reusable library's existing 155 tests passed
+in Debug and ReleaseSafe, while independent targeted diagnostics reproduced
+the defects above. The secret-store archive gate was expanded from one to
+three tests, covering layered rotation, retained reader values, malformed and
+missing replacements, and injected cancellation without mutation. The recent
+extension fixture now owns its committed projection; the merge-adjusted
+DataServer fixtures explicitly retain a host-filesystem differential boundary.
+Neither is evidence of fully virtual storage coverage. No additional replay
+algorithm defect was confirmed in the reviewed enabled-set, choice-consumption,
+canonical-artifact, checkpoint-prefix, and teardown paths.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and
 Antithesis-class features to add; no, the complete roadmap is not
-implemented**. The reusable deterministic runtime is no longer the main gap.
+implemented**. The open runtime correctness findings above must be resolved
+before treating the reusable deterministic runtime as complete.
 The highest-value work is composing more production owners, workflows, and
 fault domains in the same replayable history.
 
