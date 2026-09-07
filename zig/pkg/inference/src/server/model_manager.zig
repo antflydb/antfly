@@ -20,6 +20,7 @@
 const std = @import("std");
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -544,7 +545,7 @@ pub fn compatibilitySummaryForBackend(
         return .{
             .level = .incompatible,
             .code = .unsupported_backend,
-            .message = "production-qualified Qwen3-VL bundles require Metal, except the integrated BF16 generation bundle which also supports CUDA",
+            .message = "the split Qwen3-VL decoder/projector route requires Metal; the integrated safetensors generation route also supports CUDA",
         };
     }
     if (man.embedding_style == .qwen3_embedding and
@@ -554,7 +555,7 @@ pub fn compatibilitySummaryForBackend(
         return .{
             .level = .incompatible,
             .code = .unsupported_backend,
-            .message = "production-qualified Qwen3-Embedding GGUF bundles require Metal, native CPU, or CUDA",
+            .message = "Qwen3 GGUF embedding requires Metal, native CPU, or CUDA",
         };
     }
 
@@ -567,21 +568,6 @@ pub fn compatibilitySummaryForBackend(
     defer inspection.deinit(allocator);
     const assessment = model_compatibility.assessInspection(&candidate_manifest, inspection);
     if (assessment.level == .incompatible) return summaryFromAssessment(assessment);
-    if (!qwen3VlPromotionSupportsBackend(inspection.qwen3vl_promotion, backend)) {
-        return .{
-            .level = .incompatible,
-            .code = .unsupported_backend,
-            .message = "production-qualified Qwen3-VL bundles require the Metal backend",
-        };
-    }
-    if (!qwen3EmbeddingPromotionSupportsBackend(inspection.qwen3_embedding_promotion, backend)) {
-        return .{
-            .level = .incompatible,
-            .code = .unsupported_backend,
-            .message = "this production-qualified Qwen3-Embedding variant is not qualified on the selected backend",
-        };
-    }
-
     var projector_decoder = ProjectorDecoderContract{
         .family = projectorDecoderFamilyForArchitecture(man.config_model_arch),
         .hidden_size = man.hidden_size,
@@ -716,36 +702,6 @@ test "Qwen3 embedding production backends include native CPU and CUDA" {
     try std.testing.expect(qwen3EmbeddingSupportsBackend(.metal));
     try std.testing.expect(qwen3EmbeddingSupportsBackend(.native));
     try std.testing.expect(qwen3EmbeddingSupportsBackend(.cuda));
-}
-
-fn qwen3EmbeddingPromotionSupportsBackend(
-    promotion: model_compatibility.Qwen3EmbeddingPromotion,
-    backend: backends.BackendType,
-) bool {
-    return switch (promotion) {
-        .none => true,
-        .q8_0 => backend == .metal or backend == .native or backend == .cuda,
-        .f16 => backend == .metal,
-        .bf16_safetensors => backend == .metal or backend == .cuda,
-    };
-}
-
-test "Qwen3 embedding promotion backend qualification is variant-specific" {
-    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .native));
-    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .metal));
-    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.q8_0, .cuda));
-    try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.f16, .native));
-    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.f16, .metal));
-    try std.testing.expect(!qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .native));
-    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .metal));
-    try std.testing.expect(qwen3EmbeddingPromotionSupportsBackend(.bf16_safetensors, .cuda));
-}
-
-fn qwen3VlPromotionSupportsBackend(
-    promotion: model_compatibility.Qwen3VlPromotion,
-    backend: backends.BackendType,
-) bool {
-    return promotion == .none or backend == .metal;
 }
 
 /// Aggregate candidate compatibility as an OR: a model bundle is usable when
@@ -3838,6 +3794,7 @@ pub const ModelManager = struct {
     /// Lazily allocated at a stable address for offline/direct callers. Never
     /// borrow a request's Io: shared loads and resident sessions outlive it.
     owned_load_runtime: ?*std.Io.Threaded = null,
+    owned_load_watchdog: ?*HardCancellationWatchdog = null,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
     whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperCompositeAssets) = .empty,
     in_flight_whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperAssetsLoadFlight) = .empty,
@@ -5603,6 +5560,7 @@ pub const ModelManager = struct {
             owned.deinit();
             self.allocator.destroy(owned);
         };
+        defer if (self.owned_load_watchdog) |watchdog| watchdog.destroy();
         if (self.load_io) |io| self.load_group.cancel(io);
         if (self.eviction_io) |io| self.eviction_group.cancel(io);
         std.debug.assert(self.in_flight_loads.count() == 0);
@@ -6444,6 +6402,17 @@ pub const ModelManager = struct {
         return io;
     }
 
+    fn offlineLoadBoundaryLocked(self: *ModelManager, io: std.Io) !?execution_control_mod.HardCancellationBoundary {
+        if (!self.session_manager.process_isolation_available) return null;
+        if (self.owned_load_watchdog == null) {
+            const watchdog = try HardCancellationWatchdog.create(self.allocator);
+            errdefer watchdog.destroy();
+            try watchdog.start(io);
+            self.owned_load_watchdog = watchdog;
+        }
+        return self.owned_load_watchdog.?.boundary();
+    }
+
     fn loadFromDirCoordinated(
         self: *ModelManager,
         model_dir: []const u8,
@@ -6496,13 +6465,20 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return err;
         };
+        // Offline CLI loads also run in a cancellable manager-owned task.
+        // Their process is disposable, but the task still needs a real monitor
+        // for a driver call that cannot observe its final waiter's cancellation.
+        const hard_cancellation = if (control) |active| active.hard_cancellation else self.offlineLoadBoundaryLocked(coordination_io) catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
         const flight = self.allocator.create(LoadFlight) catch |err| {
             self.unlockLoadedModels();
             return err;
         };
         flight.* = .{
             .io = coordination_io,
-            .hard_cancellation = if (control) |active| active.hard_cancellation else null,
+            .hard_cancellation = hard_cancellation,
         };
         const owned_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
             self.allocator.destroy(flight);
@@ -9612,23 +9588,6 @@ test "safetensors compatibility rejects a missing referenced shard" {
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
 }
 
-test "production-qualified Qwen3-VL promotions are Metal only" {
-    try std.testing.expect(qwen3VlPromotionSupportsBackend(.none, .native));
-    try std.testing.expect(qwen3VlPromotionSupportsBackend(.none, .onnx));
-    try std.testing.expect(qwen3VlPromotionSupportsBackend(.none, .metal));
-    try std.testing.expect(qwen3VlPromotionSupportsBackend(.none, .cuda));
-
-    inline for (.{
-        model_compatibility.Qwen3VlPromotion.generation_2b_q4_k_m,
-        model_compatibility.Qwen3VlPromotion.reranker_2b_q8_0,
-    }) |promotion| {
-        try std.testing.expect(!qwen3VlPromotionSupportsBackend(promotion, .native));
-        try std.testing.expect(!qwen3VlPromotionSupportsBackend(promotion, .onnx));
-        try std.testing.expect(qwen3VlPromotionSupportsBackend(promotion, .metal));
-        try std.testing.expect(!qwen3VlPromotionSupportsBackend(promotion, .cuda));
-    }
-}
-
 test "native compatibility rejects a missing lazy GGUF companion" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
@@ -10660,7 +10619,34 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     try std.testing.expectError(error.MissingSpecialTokenIds, pipeline.recognizeBatch(&.{"hello"}, &.{"person"}));
 }
 
-test "ModelManager serving policy fails closed before loading generator weights" {
+test "ModelManager strict serving policy rejects unknown generator architectures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "model_manifest.json",
+        .data = "{\"type\":\"generator\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"brand_new_decoder\"}",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{.native},
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = false });
+
+    try std.testing.expectError(error.UnknownModelCompatibility, manager.loadFromDir(dir_path));
+}
+
+test "ModelManager default serving policy still rejects a generator without a loadable artifact" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10684,37 +10670,10 @@ test "ModelManager serving policy fails closed before loading generator weights"
     defer manager.deinit();
     manager.configureServingPolicy(.{});
 
-    try std.testing.expectError(error.UnknownModelCompatibility, manager.loadFromDir(dir_path));
-}
-
-test "unknown opt in still rejects a generator without a loadable artifact" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"generator\"}",
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "config.json",
-        .data = "{\"model_type\":\"brand_new_decoder\"}",
-    });
-
-    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(dir_path);
-
-    var manager = ModelManager.init(allocator, .{
-        .allocator = allocator,
-        .preferred_backends = &.{.native},
-    });
-    defer manager.deinit();
-    manager.configureServingPolicy(.{ .allow_unknown = true });
-
     try std.testing.expectError(error.IncompatibleModel, manager.loadFromDir(dir_path));
 }
 
-test "unknown opt in does not enable a known incompatible generator" {
+test "ModelManager default serving policy does not enable a known incompatible generator" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10736,7 +10695,7 @@ test "unknown opt in does not enable a known incompatible generator" {
         .preferred_backends = &.{.native},
     });
     defer manager.deinit();
-    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureServingPolicy(.{});
 
     try std.testing.expectError(error.IncompatibleModel, manager.loadFromDir(dir_path));
 }
@@ -11480,4 +11439,20 @@ fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
+}
+
+test "offline load runtime supplies a real hard cancellation boundary only for disposable processes" {
+    const alloc = std.testing.allocator;
+    var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.metal}, .process_isolation_available = false });
+    defer manager.deinit();
+    try std.testing.expect(try manager.offlineLoadBoundaryLocked(std.testing.io) == null);
+    try std.testing.expect(manager.owned_load_watchdog == null);
+    manager.session_manager.process_isolation_available = true;
+    const boundary = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
+    const again = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
+    try std.testing.expectEqual(boundary.ptr, again.ptr);
+    const control = InferenceExecutionControl{ .hard_cancellation = boundary };
+    var guard = try control.enterUninterruptible(.process_required);
+    guard.deinit();
+    try std.testing.expectEqual(@as(usize, 0), manager.owned_load_watchdog.?.entries.items.len);
 }
