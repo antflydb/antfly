@@ -11,11 +11,121 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 )
+
+func TestFramedRejectionFinalizesUploadBeforeAndAfterRoutingPrefix(t *testing.T) {
+	for _, invalidPrefix := range []bool{false, true} {
+		t.Run(fmt.Sprintf("invalid-prefix=%v", invalidPrefix), func(t *testing.T) {
+			body := testProxyAttachmentEnvelope([]byte(`{"images":[{"url":"attachment:0"}]}`), testProxyAttachment{mime: "image/png", data: []byte{1}})
+			prefix, _, err := readProxyAttachmentRoutingPrefix(bytes.NewReader(body), int64(len(body)), int64(len(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if invalidPrefix {
+				prefix[0] ^= 0xff
+			}
+			p := NewProxy(Config{Logger: zap.NewNop()})
+			settled := make(chan struct{})
+			var once sync.Once
+			server := httptest.NewUnstartedServer(http.HandlerFunc(p.handleRead))
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateIdle || state == http.StateClosed {
+					once.Do(func() { close(settled) })
+				}
+			}
+			server.Start()
+			defer server.Close()
+			conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+			if _, err := fmt.Fprintf(conn, "POST /ai/v1/read HTTP/1.1\r\nHost: localhost\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n", proxyAttachmentEnvelopeContentType, len(body)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Write(prefix); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			data, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%q error=%v", resp.StatusCode, data, err)
+			}
+			select {
+			case <-settled:
+			case <-time.After(time.Second):
+				t.Fatal("server is still draining the unsent attachment after rejecting the request")
+			}
+		})
+	}
+}
+
+func TestIncomingUploadFinalizationPreservesFullyReadConnections(t *testing.T) {
+	interrupts := 0
+	upload := &proxyIncomingUpload{reader: strings.NewReader("body"), total: 4, interruptRead: func() { interrupts++ }}
+	if _, err := io.Copy(io.Discard, upload); err != nil {
+		t.Fatal(err)
+	}
+	upload.finish()
+	if interrupts != 0 {
+		t.Fatal("complete upload must retain keep-alive")
+	}
+	upload.interrupt()
+	upload.interrupt()
+	if interrupts != 1 {
+		t.Fatal("interruption must be idempotent")
+	}
+}
+
+func TestFramedCompleteUploadsReuseDownstreamConnection(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://reader.internal", "cpu", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://reader.internal", "read", "owner/reader")
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if _, err := io.Copy(io.Discard, req.Body); err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: req}, nil
+	})}
+	var connections atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(p.handleRead))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+	client := server.Client()
+	client.Timeout = 3 * time.Second
+	defer client.CloseIdleConnections()
+	body := testProxyAttachmentEnvelope([]byte(`{"model":"owner/reader","images":[{"url":"attachment:0"}]}`), testProxyAttachment{mime: "image/png", data: []byte{1}})
+	for range 2 {
+		resp, err := client.Post(server.URL+"/ai/v1/read", proxyAttachmentEnvelopeContentType, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK || string(data) != "ok" {
+			t.Fatalf("status=%d body=%q error=%v", resp.StatusCode, data, err)
+		}
+	}
+	if connections.Load() != 1 {
+		t.Fatalf("complete uploads opened %d connections", connections.Load())
+	}
+}
 
 func TestFramedEarlyResponseBodySurvivesUploadInterrupt(t *testing.T) {
 	metadata := []byte(`{"model":"owner/reader","images":[{"url":"attachment:0"}]}`)

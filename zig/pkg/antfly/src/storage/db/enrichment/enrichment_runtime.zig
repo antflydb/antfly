@@ -7768,16 +7768,18 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, std.heap.smp_allocator, null, 30_000, config, session);
             defer coordinator.destroy();
             const single = try Harness.partMemory(&harness, "visual", .{ .item_count = 1 }, 2);
-            var double = single;
-            try addPdfWindowInvocationMemory(&double, single);
-            const plans = [_]inference_work.InvocationMemoryPlan{ undefined, single, double };
+            const plans = [_]inference_work.InvocationMemoryPlan{ undefined, single, single };
+            var pixel_caps = scheduler.consumers.?[4].capabilities;
+            const first_page = batch.results[0].rendered.?;
+            const second_page = batch.results[1].rendered.?;
+            pixel_caps.batch.max_decoded_pixels = @max(@as(u64, first_page.width) * first_page.height, @as(u64, second_page.width) * second_page.height);
             const canceled = std.atomic.Value(bool).init(false);
             const preparer = PdfEmbeddingWindowPreparer{
                 .runtime = &runtime,
                 .coordinator = coordinator,
                 .resource_manager = null,
                 .render_config = config,
-                .capabilities = scheduler.consumers.?[4].capabilities,
+                .capabilities = pixel_caps,
                 .batch_items = 1,
                 .render_items = 2,
                 .batch_bytes = 64 * 1024 * 1024,
@@ -7790,7 +7792,13 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             var rendered = try preparer.prepare(0);
             defer rendered.deinit();
             try std.testing.expectEqual(@as(usize, 2), rendered.count);
-            try std.testing.expectEqual(@as(usize, 1), try pdfEmbeddingWindowBatchEnd(rendered.rendered, 0, 1, 64 * 1024 * 1024, std.math.maxInt(u64), single.attachment_transport));
+            try std.testing.expectEqual(@as(usize, 1), try pdfEmbeddingWindowBatchEnd(rendered.rendered, 0, 2, 64 * 1024 * 1024, pixel_caps.batch.max_decoded_pixels.?, single.attachment_transport));
+            try std.testing.expectEqual(@as(usize, 2), try pdfEmbeddingWindowBatchEnd(rendered.rendered, 1, 2, 64 * 1024 * 1024, pixel_caps.batch.max_decoded_pixels.?, single.attachment_transport));
+            var physical_limit = preparer;
+            physical_limit.render_config.pdf_render_max_inflight_pixels = pixel_caps.batch.max_decoded_pixels.?;
+            var clipped = try physical_limit.prepare(0);
+            defer clipped.deinit();
+            try std.testing.expectEqual(@as(usize, 1), clipped.count);
         }
         {
             harness.largest_memory_request = 0;
@@ -7808,7 +7816,55 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") },
             }, 0, false, .{});
             defer limited.deinit();
-            try std.testing.expectEqual(@as(usize, 1), limited.unit_indices.len);
+            try std.testing.expectEqual(@as(usize, 2), limited.unit_indices.len);
+        }
+        {
+            // Exercise the actual OCR owner loop: two pages are retained in
+            // one window, but the model admits only one page's pixels per call.
+            const PixelOwner = struct {
+                calls: usize = 0,
+                rejected_oversize: bool = false,
+                fn one(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+                    return error.UnexpectedSingleInvocation;
+                }
+                fn can(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+                    return true;
+                }
+                fn memory(_: *anyopaque, _: Allocator, items: []const asset_producer_mod.Request) !inference_work.InvocationMemoryPlan {
+                    return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 1024 * 1024, .allocator_limit_bytes = 1024 * 1024, .max_result_bytes_per_item = 4096, .max_result_bytes = 4096 * items.len };
+                }
+                fn produceMany(ptr: *anyopaque, a: Allocator, items: []const asset_producer_mod.Request) ![][]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (items.len != 1) {
+                        self.rejected_oversize = true;
+                        return error.InferenceDecodedPixelsExceeded;
+                    }
+                    self.calls += 1;
+                    const out = try a.alloc([]u8, 1);
+                    errdefer a.free(out);
+                    out[0] = try a.dupe(u8, "The OCR model independently recognized meaningful text on this page.");
+                    return out;
+                }
+            };
+            var owner = PixelOwner{};
+            const bounded_producer = asset_producer_mod.Producer{ .ptr = &owner, .vtable = &.{ .produce = PixelOwner.one, .produce_batch = PixelOwner.produceMany, .can_produce_batch = PixelOwner.can, .invocation_memory_for_requests = PixelOwner.memory } };
+            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, std.heap.smp_allocator, null, 30_000, config, session);
+            defer coordinator.destroy();
+            var pending = [_]document_extraction_mod.Unit{
+                try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }),
+                try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") }),
+            };
+            defer for (&pending) |*unit| unit.deinit(alloc);
+            const previous_shared = runtime.shared_pdf_windows;
+            runtime.shared_pdf_windows = null;
+            defer runtime.shared_pdf_windows = previous_shared;
+            const first_page = batch.results[0].rendered.?;
+            const second_page = batch.results[1].rendered.?;
+            const pixels = @max(@as(u64, first_page.width) * first_page.height, @as(u64, second_page.width) * second_page.height);
+            try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, bounded_producer, config, .{ .max_items = 2, .render_items = 2, .max_bytes = 64 * 1024 * 1024, .max_pixels = pixels }, "source.pdf", "pixel-owner", "pdf", "application/pdf", &pending, .ocr, coordinator);
+            try std.testing.expectEqual(@as(usize, 2), owner.calls);
+            try std.testing.expect(!owner.rejected_oversize);
+            for (pending) |unit| try std.testing.expectEqualStrings("completed", unit.extraction_status.?);
         }
         const Sink = struct {
             alloc: Allocator,
@@ -11636,9 +11692,10 @@ fn pdfOutputAllowancesFit(retained_bytes: usize, allowances: []const usize) bool
     return true;
 }
 
-/// Prepare the largest non-empty page prefix whose decoded rasters fit one
-/// inference invocation. Renderer wave limits are intentionally separate:
-/// rendered pages remain retained after each wave and therefore all count.
+/// Prepare the largest non-empty prefix within the retained window's pixel
+/// budget. This is independent of a model invocation: executors partition the
+/// retained pages again by their own limits. Renderer waves obey the same
+/// physical pixel ceiling plus separate scratch-byte and worker bounds.
 /// The returned prefix of `plans` retains the exact geometry used here so the
 /// renderer does not repeat page-tree and page-box discovery.
 fn preparePdfPixelPrefix(
@@ -12031,6 +12088,39 @@ fn addPdfWindowInvocationMemory(total: *inference_work.InvocationMemoryPlan, nex
     total.max_result_bytes_per_item = @max(total.max_result_bytes_per_item, next.max_result_bytes_per_item);
 }
 
+/// Admission envelope for sequential invocations whose results are staged and
+/// released between calls. Retained page buffers are reserved separately by
+/// the window. This is never sent to a model as a larger invocation contract.
+/// Include all legal item counts, not only the largest: provider plans need
+/// not have monotonic allocator ceilings.
+const PdfWindowInvocationPeak = struct {
+    memory: inference_work.InvocationMemoryPlan,
+
+    fn include(self: *@This(), next: inference_work.InvocationMemoryPlan) !void {
+        if (self.memory.attachment_transport != next.attachment_transport or
+            self.memory.allocator_owner != next.allocator_owner) return error.InferenceInvocationMemoryUnavailable;
+        inline for (.{ "fixed_bytes", "allocator_limit_bytes", "max_result_bytes", "max_result_bytes_per_item" }) |field|
+            @field(self.memory, field) = @max(@field(self.memory, field), @field(next, field));
+    }
+};
+
+test "shared PDF window invocation peaks follow allocation lifetimes" {
+    const single = inference_work.InvocationMemoryPlan{ .attachment_transport = .framed_binary, .fixed_bytes = 100, .allocator_limit_bytes = 80, .max_result_bytes = 20, .max_result_bytes_per_item = 20 };
+    const batch = inference_work.InvocationMemoryPlan{ .attachment_transport = .framed_binary, .fixed_bytes = 90, .allocator_limit_bytes = 60, .max_result_bytes = 40, .max_result_bytes_per_item = 20 };
+    var peak = PdfWindowInvocationPeak{ .memory = single };
+    for (0..4) |_| try peak.include(batch);
+    try peak.memory.validate();
+    try std.testing.expectEqual(@as(usize, 80), peak.memory.allocator_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 100), peak.memory.fixed_bytes);
+    try std.testing.expectEqual(@as(usize, 40), peak.memory.max_result_bytes);
+    var different = single;
+    different.attachment_transport = .data_uri;
+    try std.testing.expectError(error.InferenceInvocationMemoryUnavailable, peak.include(different));
+    different = single;
+    different.allocator_owner = .executor;
+    try std.testing.expectError(error.InferenceInvocationMemoryUnavailable, peak.include(different));
+}
+
 fn renderRuntimePdfWindow(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -12093,7 +12183,7 @@ fn renderRuntimePdfWindow(
         session,
         requests.items,
         prepared_plans,
-        batch_policy.max_pixels,
+        config.pdf_render_max_inflight_pixels,
     );
     if (pixel_count < requests.items.len and pixel_count > batch_policy.max_items and pixel_count % batch_policy.max_items != 0)
         pixel_count = nextPdfWindowCandidate(pixel_count, batch_policy.max_items);
@@ -12300,7 +12390,7 @@ fn renderRuntimePdfWindow(
         .{ .raster = try renderPreparedPdfRasterWindowBatchAlloc(runtime, session, lease.allocator(), prepared_plans[0..requests.items.len], .{
             .max_batch_pages = max_pages,
             .max_parallel_pages = parallel_pages,
-            .max_inflight_pixels = @min(config.pdf_render_max_inflight_pixels, batch_policy.max_pixels),
+            .max_inflight_pixels = config.pdf_render_max_inflight_pixels,
             .max_inflight_bytes = memory_budget.scratch_bytes,
             .max_retained_raster_bytes = memory_budget.retained_bytes,
             .profile = .ocr,
@@ -12311,7 +12401,7 @@ fn renderRuntimePdfWindow(
         .{ .encoded = try renderPreparedPdfWindowBatchAlloc(runtime, session, lease.allocator(), prepared_plans[0..requests.items.len], .{
             .max_batch_pages = max_pages,
             .max_parallel_pages = parallel_pages,
-            .max_inflight_pixels = @min(config.pdf_render_max_inflight_pixels, batch_policy.max_pixels),
+            .max_inflight_pixels = config.pdf_render_max_inflight_pixels,
             .max_inflight_bytes = memory_budget.scratch_bytes,
             .max_retained_png_bytes = memory_budget.retained_bytes,
             .profile = .ocr,
@@ -12527,6 +12617,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     }
 
     var batch_bytes: usize = 0;
+    var batch_pixels: u64 = 0;
     var pdf_render_window: ?RuntimePdfRenderWindow = null;
     var pdf_prefetch_cancel_requested: std.atomic.Value(bool) = .init(false);
     var pdf_window_preparer: ?RuntimePdfRenderWindowPreparer = null;
@@ -12590,6 +12681,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                         requests.clearRetainingCapacity();
                         unit_indices.clearRetainingCapacity();
                         batch_bytes = 0;
+                        batch_pixels = 0;
                         window.deinit();
                         pdf_render_window = null;
                     }
@@ -12732,6 +12824,11 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             runtimeGeneratedTextRequestBytes(request),
             if (rendered_raster) |raster| raster.bytes.len else 0,
         );
+        const request_pixels: u64 = if (has_rendered_media)
+            @as(u64, units[idx].ocr_rendered_width orelse 0) * (units[idx].ocr_rendered_height orelse 0)
+        else
+            0;
+        if (request_pixels > admitted_batch_policy.max_pixels) return error.InferenceDecodedPixelsExceeded;
         if (request_bytes > admitted_batch_policy.max_bytes) {
             try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "request");
             try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
@@ -12741,13 +12838,14 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             }
             continue;
         }
-        if (requests.items.len > 0 and (requests.items.len >= admitted_batch_policy.max_items or batch_bytes + request_bytes > admitted_batch_policy.max_bytes)) {
+        if (requests.items.len > 0 and (requests.items.len >= admitted_batch_policy.max_items or batch_bytes + request_bytes > admitted_batch_policy.max_bytes or batch_pixels +| request_pixels > admitted_batch_policy.max_pixels)) {
             try flushRuntimeGeneratedTextBatch(runtime, alloc, item_alloc, invocation_producer, requests.items, if (raster_values.items.len > 0) raster_values.items else null, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
             clearRuntimeGeneratedTextBatchMedia(item_alloc, &rendered_values, &media_values);
             clearRuntimeGeneratedTextBatchRasters(item_alloc, &rendered_raster_values, &raster_values);
             requests.clearRetainingCapacity();
             unit_indices.clearRetainingCapacity();
             batch_bytes = 0;
+            batch_pixels = 0;
         }
         if (rendered) |png| {
             const media_index = media_values.items.len;
@@ -12780,6 +12878,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         try unit_indices.append(working_alloc, idx);
         try requests.append(working_alloc, request);
         batch_bytes = addUsizeSaturating(batch_bytes, request_bytes);
+        batch_pixels += request_pixels;
     }
     if (requests.items.len > 0) {
         const item_alloc = if (pdf_render_window) |*window| window.allocator() else working_alloc;
@@ -18440,7 +18539,7 @@ const PdfEmbeddingWindowPreparer = struct {
             &self.coordinator.session,
             requests[0..count],
             prepared_plans,
-            model_pixel_cap,
+            self.render_config.pdf_render_max_inflight_pixels,
         );
         if (count < requested_count and count > self.batch_items and count % self.batch_items != 0)
             count = nextPdfWindowCandidate(count, self.batch_items);
@@ -18566,7 +18665,7 @@ const PdfEmbeddingWindowPreparer = struct {
         const render_options = document_extraction_mod.PdfPageRenderBatchOptions{
             .max_batch_pages = count,
             .max_parallel_pages = render_parallel_pages,
-            .max_inflight_pixels = @min(self.render_config.pdf_render_max_inflight_pixels, model_pixel_cap),
+            .max_inflight_pixels = self.render_config.pdf_render_max_inflight_pixels,
             .max_inflight_bytes = admitted_memory.scratch_bytes,
             .max_retained_png_bytes = admitted_memory.retained_bytes,
             .max_retained_raster_bytes = admitted_memory.retained_bytes,
@@ -18941,9 +19040,9 @@ fn processPdfPageImageEmbeddingWithAllocator(
     defer metadata_alloc.free(invocation_memory_by_count);
     for (1..invocation_memory_by_count.len) |item_count| {
         if (item_count > batch_items) {
-            var combined = invocation_memory_by_count[batch_items];
-            try addPdfWindowInvocationMemory(&combined, invocation_memory_by_count[item_count - batch_items]);
-            invocation_memory_by_count[item_count] = combined;
+            // Only one legal model batch is live at a time; vectors are
+            // durably staged and freed before the next invocation starts.
+            invocation_memory_by_count[item_count] = invocation_memory_by_count[batch_items];
             continue;
         }
         invocation_memory_by_count[item_count] = try dense_embedder.partInvocationMemoryForMime(
@@ -18952,6 +19051,11 @@ fn processPdfPageImageEmbeddingWithAllocator(
             "image/png",
             request.expected_dims,
         );
+        if (item_count > 1) {
+            var peak = PdfWindowInvocationPeak{ .memory = invocation_memory_by_count[item_count - 1] };
+            try peak.include(invocation_memory_by_count[item_count]);
+            invocation_memory_by_count[item_count] = peak.memory;
+        }
     }
     const page_output_bytes_cap = if (use_borrowed_rasters)
         1

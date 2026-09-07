@@ -4537,19 +4537,56 @@ func (b *proxyStreamingReplayBody) Close() error {
 	return closeErr
 }
 
+// The handler owns the incoming upload even when metadata validation, routing,
+// or admission rejects it before an outgoing attempt exists. Attempt cleanup
+// joins transport reads; this final guard also covers those pre-attempt exits.
+type proxyIncomingUpload struct {
+	reader        io.Reader
+	total         int64
+	readBytes     atomic.Int64
+	interruptOnce sync.Once
+	interruptRead func()
+}
+
+func (b *proxyIncomingUpload) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	b.readBytes.Add(int64(n))
+	return n, err
+}
+
+func (b *proxyIncomingUpload) interrupt() {
+	b.interruptOnce.Do(b.interruptRead)
+}
+
+func (b *proxyIncomingUpload) finish() {
+	if b.readBytes.Load() != b.total {
+		b.interrupt()
+	}
+}
+
 func (p *Proxy) proxyFramedRequest(w http.ResponseWriter, r *http.Request, operation string, start time.Time, routing RoutingContext) {
 	// A terminal upstream response may arrive before its upload completes.
 	// Forward that response without net/http draining the incoming body first;
 	// the response owner interrupts and joins upload reads after response copy.
 	// HTTP/2 is already full duplex and may report ErrNotSupported here.
 	_ = http.NewResponseController(w).EnableFullDuplex()
+	upload := &proxyIncomingUpload{
+		reader: r.Body,
+		total:  r.ContentLength,
+		interruptRead: func() {
+			if err := http.NewResponseController(w).SetReadDeadline(time.Now()); err != nil {
+				_ = r.Body.Close() // custom handlers must supply an interruptible body
+			}
+		},
+	}
+	defer upload.finish()
 	// The bounded metadata prefix is the only request-sized allocation retained
 	// by the routing proxy. Media stays on the socket for a single attempt; a
 	// retry-enabled route uses a bounded temporary replay file.
 	var routingReservation byteAdmissionLease
 	defer routingReservation.Release()
 	prefix, routingPayload, err := readProxyAttachmentRoutingPrefixAdmitted(
-		r.Body,
+		upload,
 		r.ContentLength,
 		p.maxRequestBodyBytes,
 		func(prefixBytes int64) error {
@@ -4569,17 +4606,11 @@ func (p *Proxy) proxyFramedRequest(w http.ResponseWriter, r *http.Request, opera
 		return
 	}
 	replay := &proxyStreamingReplayBody{
-		prefix:   prefix,
-		tail:     r.Body,
-		total:    r.ContentLength,
-		spillDir: p.spoolDir,
-		interrupt: func() {
-			// Closing net/http's incoming body can itself wait on a socket
-			// read. A read deadline actively wakes it without blocking here.
-			if err := http.NewResponseController(w).SetReadDeadline(time.Now()); err != nil {
-				_ = r.Body.Close() // custom handlers must supply an interruptible body
-			}
-		},
+		prefix:    prefix,
+		tail:      upload,
+		total:     r.ContentLength,
+		spillDir:  p.spoolDir,
+		interrupt: upload.interrupt,
 	}
 	defer replay.Close()
 	p.proxyRequestWithReplayBody(w, r, operation, start, routing, routingPayload, replay)

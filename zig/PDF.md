@@ -152,13 +152,23 @@ Collection remains byte-bounded and flushes its current prefix if lookahead
 allocation is denied. Generated units transfer ownership into the execution
 slice rather than duplicating all retained text and regions. Renderer geometry,
 pixel ceilings, and composite memory admission can shorten any planned window.
+The retained window uses the renderer's `pdf_render_max_inflight_pixels`, not
+one model invocation's pixel ceiling. Per-page geometry still fits the model;
+OCR and embedding executors independently partition the window by their own
+item, byte, and aggregate pixel limits. Renderer waves keep their thread,
+scratch-byte, and pixel bounds independently of those executor partitions.
 After a widening denial, candidates descend through whole owner batch widths
 before trying sub-batch prefixes. Pixel-limited prefixes follow the same rule.
 This preserves native owner batches when a wider consumer cannot be enrolled.
 Embedding owners partition borrowed descriptors by their own item/byte/pixel
 limits and stage each successful sub-batch before moving to the next one.
-Memory contracts are requested only for legal model sub-batches; their summed
-ceilings conservatively account for the larger retained render window.
+Memory contracts are requested only for legal model sub-batches. Embedding
+windows retain the page buffers plus the maximum sequential invocation peak,
+not the sum of invocation peaks: vectors are staged and freed between calls.
+The envelope includes every legal item count so smaller provider invocations
+with larger memory requirements remain covered. OCR's request-specific
+contracts retain their conservative composite allowance; its persistent typed
+document results remain on the independently accounted document allocator.
 Remote reader, generator, and extractor memory plans use the same task/model/
 authentication-scoped capability cache as execution to select framed versus
 legacy transport. Compatible remote singleton generators use the batch media
@@ -3158,7 +3168,12 @@ The hardening above follows these long-term rules:
     context and must not invalidate a response still being forwarded. Genuine
     cancellation remains attached throughout forwarding. Cancellation and
     terminal cleanup interrupt incomplete socket reads using a read deadline;
-    they never drain the remaining upload. Custom response
+    they never drain the remaining upload. The handler owns an additional
+    upload finalizer from entry, before metadata parsing or routing: rejected
+    requests must interrupt unread bodies even when no forwarding attempt was
+    created. Physical bytes read include the routing prefix and any retry-seal
+    reads; a complete upload keeps its connection reusable. Interruption is
+    idempotent across handler and attempt cleanup. Custom response
     writers without deadline support must expose an interruptible request body.
     Cancellation callbacks and active reads join before replay storage is freed.
     Opening a retry is read-only and cannot restart a failed or incomplete seal.
