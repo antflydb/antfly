@@ -103,7 +103,7 @@ extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callco
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
-fn runRuntimeUnit(
+pub fn runRuntimeUnit(
     comptime role: RuntimeRole,
     command: []const u8,
     init: std.process.Init,
