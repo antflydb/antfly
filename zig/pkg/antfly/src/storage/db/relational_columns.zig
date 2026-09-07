@@ -13,8 +13,8 @@
 // limitations.
 
 //! Table-owned immutable column blocks and a transactionally maintained dirty
-//! key directory. Clean ranges use typed blocks; dirty ranges use primary rows
-//! in the same read snapshot. Bounded range compaction publishes replacements
+//! key directory. Scans merge typed blocks with authoritative row deltas in
+//! one read snapshot. Bounded range compaction publishes replacements
 //! atomically and compare-clears only the dirty images covered by its snapshot.
 const std = @import("std");
 const store_mod = @import("../docstore.zig");
@@ -34,6 +34,8 @@ const counter_key = "\x00\x00__columnar__:next";
 const manifest_key = keys.relational_columnar_manifest_key;
 const building_key = "\x00\x00__columnar__:building";
 const maintenance_cursor_key = "\x00\x00__columnar__:maintenance_cursor";
+const maintenance_turn_key = "\x00\x00__columnar__:maintenance_turn";
+const merge_cursor_key = "\x00\x00__columnar__:merge_cursor";
 const cleanup_key = "\x00\x00__columnar__:cleanup";
 const garbage_key = "\x00\x00__columnar__:garbage";
 const dirty_prefix = keys.relational_columnar_dirty_prefix;
@@ -134,6 +136,10 @@ fn blockKey(alloc: alloc_type, generation: u64, block: u64, ordinal: ?u32) ![]u8
         try std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:m", .{ prefix, generation, block });
 }
 
+fn columnMetaKey(alloc: alloc_type, generation: u64, block: u64, ordinal: u32) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:p{x:0>8}", .{ prefix, generation, block, ordinal });
+}
+
 fn appendInt(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, comptime T: type, value: T) !void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .little);
@@ -172,21 +178,38 @@ fn ColumnBuilder(comptime DBType: type) type {
             if (self.rows.items.len == 0) return;
             const scratch = self.arena.allocator();
             var meta = std.ArrayListUnmanaged(u8).empty;
-            try meta.appendSlice(scratch, "ACB3");
+            try meta.appendSlice(scratch, "ACB4");
             try appendInt(&meta, scratch, u32, self.view.?.version());
             try appendInt(&meta, scratch, u32, @intCast(self.rows.items.len));
-            try appendInt(&meta, scratch, u32, self.columns.count());
+            const ordinals = try scratch.alloc(u32, self.columns.count());
+            var ordinal_it = self.columns.keyIterator();
+            for (ordinals) |*ordinal| ordinal.* = (ordinal_it.next()).?.*;
+            std.mem.sort(u32, ordinals, {}, std.sort.asc(u32));
+            var pages: u32 = 0;
+            for (ordinals, 0..) |ordinal, i| if (i == 0 or ordinal / 64 != ordinals[i - 1] / 64) {
+                pages += 1;
+            };
+            try appendInt(&meta, scratch, u32, pages);
+            var pos: usize = 0;
+            while (pos < ordinals.len) {
+                const page = ordinals[pos] / 64;
+                var mask: u64 = 0;
+                while (pos < ordinals.len and ordinals[pos] / 64 == page) : (pos += 1) mask |= @as(u64, 1) << @intCast(ordinals[pos] % 64);
+                try appendInt(&meta, scratch, u32, page);
+                try appendInt(&meta, scratch, u64, mask);
+            }
             var writes = std.ArrayListUnmanaged(store_mod.KVPair).empty;
             var columns = self.columns.iterator();
             while (columns.next()) |entry| {
                 const ordinal = entry.key_ptr.*;
-                try appendInt(&meta, scratch, u32, ordinal);
+                var column_meta = std.ArrayListUnmanaged(u8).empty;
                 const bounds = entry.value_ptr.bounds;
-                try meta.append(scratch, @intFromBool(bounds.present));
-                try appendInt(&meta, scratch, u64, @bitCast(bounds.minimum));
-                try appendInt(&meta, scratch, u64, @bitCast(bounds.maximum));
-                try meta.appendSlice(scratch, &entry.value_ptr.presence);
-                try meta.appendSlice(scratch, &entry.value_ptr.nulls);
+                try column_meta.append(scratch, @intFromBool(bounds.present));
+                try appendInt(&column_meta, scratch, u64, @bitCast(bounds.minimum));
+                try appendInt(&column_meta, scratch, u64, @bitCast(bounds.maximum));
+                try column_meta.appendSlice(scratch, &entry.value_ptr.presence);
+                try column_meta.appendSlice(scratch, &entry.value_ptr.nulls);
+                try writes.append(scratch, .{ .key = try columnMetaKey(scratch, self.generation, self.blocks, ordinal), .value = try checked(scratch, column_meta.items) });
                 const values = try entry.value_ptr.writer.build();
                 try writes.append(scratch, .{ .key = try blockKey(scratch, self.generation, self.blocks, ordinal), .value = try checked(scratch, values) });
             }
@@ -486,7 +509,7 @@ fn clearPage(txn: *store_mod.DocStore.Txn, page: []const u8) !u64 {
     var cleared: u64 = 0;
     while (decoder.bytes.len != 0) {
         const key = try decoder.take(try decoder.int(u32));
-        const expected = try decoder.take(33);
+        const expected = try decoder.take(@sizeOf(keys.ColumnarMutationToken));
         if (!std.mem.startsWith(u8, key, dirty_prefix)) return error.InvalidColumnSegment;
         if (try sameValue(txn, key, expected)) {
             try txn.delete(key);
@@ -517,7 +540,7 @@ fn stageCleanup(db: anytype, alloc: alloc_type, read: *store_mod.DocStore.Txn, f
         const limit = if (@import("builtin").is_test) test_cleanup_page_limit orelse maintenance_records else maintenance_records;
         while (entry) |item| {
             if (!std.mem.startsWith(u8, item.key, dirty_prefix) or (to.len != 0 and std.mem.order(u8, item.key[dirty_prefix.len..], to) != .lt)) break;
-            if (item.value.len != 33) return error.InvalidColumnSegment;
+            if (item.value.len != @sizeOf(keys.ColumnarMutationToken)) return error.InvalidColumnSegment;
             try appendInt(&page, scratch, u32, std.math.cast(u32, item.key.len) orelse return error.InvalidColumnSegment);
             try page.appendSlice(scratch, item.key);
             try page.appendSlice(scratch, item.value);
@@ -617,7 +640,7 @@ fn mergeCandidate(read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: 
 
 fn blockVersion(read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, block: u64) !u32 {
     const meta = try verified(try read.get(try blockKey(alloc, generation, block, null)));
-    if (meta.len < 16 or !std.mem.eql(u8, meta[0..4], "ACB3")) return error.InvalidColumnSegment;
+    if (meta.len < 16 or !std.mem.eql(u8, meta[0..4], "ACB4")) return error.InvalidColumnSegment;
     return std.mem.readInt(u32, meta[4..8], .little);
 }
 
@@ -627,9 +650,15 @@ fn retireBlock(txn: *store_mod.DocStore.Txn, read: *store_mod.DocStore.Txn, allo
     _ = try decoder.take(12);
     const count = try decoder.int(u32);
     for (0..count) |_| {
-        const ordinal = try decoder.int(u32);
-        _ = try decoder.take(17 + 2 * null_bytes);
-        try txn.delete(try blockKey(alloc, generation, block, ordinal));
+        const page = try decoder.int(u32);
+        var mask = try decoder.int(u64);
+        if (page > std.math.maxInt(u32) / 64) return error.InvalidColumnSegment;
+        while (mask != 0) {
+            const ordinal = page * 64 + @as(u32, @intCast(@ctz(mask)));
+            mask &= mask - 1;
+            try txn.delete(try blockKey(alloc, generation, block, ordinal));
+            try txn.delete(try columnMetaKey(alloc, generation, block, ordinal));
+        }
     }
     try txn.delete(key);
 }
@@ -704,7 +733,108 @@ const DirtyRanges = struct {
         }
         return to.len == 0 or std.mem.order(u8, key[dirty_prefix.len..], to) == .lt;
     }
+
+    /// Merge authoritative mutations up to a base-row key (inclusive), or to a
+    /// range end (exclusive). The cursor streams arbitrarily large deltas with
+    /// one row arena/read scope; no dirty-range materialization is needed.
+    fn emitThrough(self: *@This(), db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, end: []const u8, inclusive: bool, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, filter: ?*const graph.PreparedPatternFilter) !bool {
+        var replaced = false;
+        while (self.pending) |key| {
+            if (!std.mem.startsWith(u8, key, dirty_prefix)) break;
+            const raw = key[dirty_prefix.len..];
+            if ((to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, raw, to) != .lt else std.mem.order(u8, raw, to) == .gt)) or
+                (byte_range.end.len != 0 and std.mem.order(u8, raw, byte_range.end) != .lt))
+            {
+                self.pending = null;
+                break;
+            }
+            if (end.len != 0 or inclusive) {
+                const order = std.mem.order(u8, raw, end);
+                if (order == .gt or (order == .eq and !inclusive)) break;
+                replaced = order == .eq;
+            }
+            if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (opts.limit > 0 and progress.delivered >= opts.limit) return replaced;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const id = try scratch.dupe(u8, raw);
+            const next = try self.cursor.next();
+            self.pending = if (next) |entry| entry.key else null;
+            if (!eligibleRow(.{ .key = id, .hash = undefined, .timestamp = 0 }, from, to, byte_range, opts, 0, now_ns)) continue;
+            var scope = try txn.openReadScope(scratch);
+            defer scope.close();
+            if (opts.columnar_stats) |stats| stats.overlay_rows_read += 1;
+            const packed_key = try keys.relationalRowKeyAlloc(scratch, id);
+            const bytes = scope.get(packed_key) catch |err| switch (err) {
+                error.NotFound => continue, // Tombstone still masks the base row.
+                else => return err,
+            };
+            if (opts.columnar_stats) |stats| stats.primary_rows_read += 1;
+            const version = try codec.rowSchemaVersion(bytes);
+            var view = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+            defer view.release();
+            const typed = if (db.core.store.valuesAreAuthenticated()) try codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout()) else try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+            const row = Row{ .key = id, .hash = typed.semanticHash(), .timestamp = typed.writeTimestampNs() };
+            if (!eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns)) continue;
+            if (filter) |compiled| {
+                const matches = (try compiled.compiled.matchesOrdinal(scratch, id, typed)) orelse blk: {
+                    var logical = try typed.materializeRootAlloc(scratch);
+                    defer logical.deinit(scratch);
+                    break :blk try compiled.compiled.matches(scratch, id, logical.root);
+                };
+                if (!matches) continue;
+            }
+            const projected = if (opts.include_documents) try codec.projectOrdinalFieldsTrustedWithLayoutAlloc(scratch, bytes, view.tableSchema().*, view.physicalLayout(), opts.fields) else null;
+            try deliver(alloc, row, projected, opts, visitor, progress);
+        }
+        return replaced;
+    }
 };
+
+fn rangeClean(read: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range) !bool {
+    var dirty = try DirtyRanges.init(read, alloc, range.start);
+    defer dirty.cursor.close();
+    return !try dirty.overlaps(alloc, range.start, range.end);
+}
+
+fn scheduleMaintenance(txn: *store_mod.DocStore.Txn, alloc: alloc_type, turn: u64, selected: ?[]const u8) !void {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, turn +% 1, .little);
+    try txn.put(maintenance_turn_key, &encoded);
+    if (selected) |key| try txn.put(merge_cursor_key, try checked(alloc, key));
+}
+
+/// Dense insert/update bursts favor a sequential primary scan over hundreds of
+/// individual point reads. Probe only a bounded number of dirty keys; small
+/// LIMIT queries retain the streaming overlay's early exit.
+fn preferPrimaryScan(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, base_rows: usize) !bool {
+    if (opts.limit > 0 and opts.limit <= 16) return false;
+    const threshold = @max(@as(usize, 64), base_rows);
+    var lower = range.start;
+    if (std.mem.order(u8, lower, from) == .lt) lower = from;
+    if (std.mem.order(u8, lower, byte_range.start) == .lt) lower = byte_range.start;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const key = try std.mem.concat(alloc, u8, &.{ dirty_prefix, lower });
+    defer alloc.free(key);
+    var entry = try cursor.seekAtOrAfter(key);
+    var count: usize = 0;
+    while (entry) |item| {
+        if (!std.mem.startsWith(u8, item.key, dirty_prefix)) break;
+        const id = item.key[dirty_prefix.len..];
+        if ((range.end.len != 0 and std.mem.order(u8, id, range.end) != .lt) or
+            (byte_range.end.len != 0 and std.mem.order(u8, id, byte_range.end) != .lt) or
+            (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, id, to) != .lt else std.mem.order(u8, id, to) == .gt))) break;
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+        if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        count += 1;
+        if (count >= threshold) return true;
+        entry = try cursor.next();
+    }
+    return false;
+}
 
 /// Compact one dirty key range per maintenance pass. Large insertion bursts
 /// split at 64 blocks; the old base retains the uncovered suffix and its dirty
@@ -738,9 +868,28 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64) !bool {
     const resume_key = try std.mem.concat(scratch, u8, &.{ dirty_prefix, resume_id });
     var pending_entry = try dirty.seekAtOrAfter(resume_key);
     if (pending_entry == null or !std.mem.startsWith(u8, pending_entry.?.key, dirty_prefix)) pending_entry = try dirty.seekAtOrAfter(dirty_prefix);
-    const has_dirty = if (pending_entry) |entry| std.mem.startsWith(u8, entry.key, dirty_prefix) else false;
+    const any_dirty = if (pending_entry) |entry| std.mem.startsWith(u8, entry.key, dirty_prefix) else false;
     const candidate_prefix = try mergeQueueKey(scratch, manifest.generation, "");
-    if (!has_dirty) pending_entry = try dirty.seekAtOrAfter(candidate_prefix);
+    const turn_bytes = read.get(maintenance_turn_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const turn: u64 = if (turn_bytes) |bytes| if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .little) else 0 else 0;
+    var candidate_cursor = try read.openCursor();
+    defer candidate_cursor.close();
+    const saved_merge = read.get(merge_cursor_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const merge_resume = if (saved_merge) |bytes| verified(bytes) catch "" else "";
+    const candidate_lower = if (std.mem.startsWith(u8, merge_resume, candidate_prefix)) try std.mem.concat(scratch, u8, &.{ merge_resume, "\x00" }) else candidate_prefix;
+    var queued_candidate = try candidate_cursor.seekAtOrAfter(candidate_lower);
+    if (queued_candidate == null or !std.mem.startsWith(u8, queued_candidate.?.key, candidate_prefix)) queued_candidate = try candidate_cursor.seekAtOrAfter(candidate_prefix);
+    const has_candidate = if (queued_candidate) |entry| std.mem.startsWith(u8, entry.key, candidate_prefix) else false;
+    const merge_turn = has_candidate and (!any_dirty or turn % 4 == 3);
+    const has_dirty = any_dirty and !merge_turn;
+    if (merge_turn) pending_entry = queued_candidate;
+    if (!any_dirty and !has_candidate) return false;
     const first = pending_entry orelse return false;
     if (!has_dirty and !std.mem.startsWith(u8, first.key, candidate_prefix)) return false;
     const selected_candidate = if (!has_dirty) try scratch.dupe(u8, first.key) else null;
@@ -768,6 +917,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64) !bool {
             defer previous_directory.deinit();
             const previous_range = (try previous_directory.next(scratch)).?;
             if (try mergeCandidate(&read, scratch, manifest.generation, previous_range) and
+                try rangeClean(&read, scratch, previous_range) and
                 try blockVersion(&read, scratch, manifest.generation, previous_range.block) == version)
                 try ranges.append(scratch, previous_range);
         };
@@ -776,14 +926,16 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64) !bool {
     while (ranges.items.len < 8) {
         const next = (try directory.next(scratch)) orelse break;
         if (!try mergeCandidate(&read, scratch, manifest.generation, next) or
+            (!has_dirty and !try rangeClean(&read, scratch, next)) or
             try blockVersion(&read, scratch, manifest.generation, next.block) != version) break;
         try ranges.append(scratch, next);
     }
     if (selected_candidate) |candidate| {
-        if (!std.mem.eql(u8, selected.start, dirty_id) or !try mergeCandidate(&read, scratch, manifest.generation, selected) or ranges.items.len == 1) {
+        if (!std.mem.eql(u8, selected.start, dirty_id) or !try mergeCandidate(&read, scratch, manifest.generation, selected) or ranges.items.len == 1 or !try rangeClean(&read, scratch, selected)) {
             var discard = try db.core.store.beginWriteTxn();
             var discard_live = true;
             defer if (discard_live) discard.abort();
+            try scheduleMaintenance(&discard, scratch, turn, selected_candidate);
             try discard.delete(candidate);
             try discard.commit();
             discard_live = false;
@@ -815,6 +967,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64) !bool {
     var start_live = true;
     defer if (start_live) start.abort();
     if (!try sameValue(&start, manifest_key, manifest_bytes)) return false;
+    try scheduleMaintenance(&start, scratch, turn, selected_candidate);
     const old_counter = try start.get(counter_key);
     if (old_counter.len != 8) return error.InvalidColumnSegment;
     const build_id = std.math.add(u64, std.mem.readInt(u64, old_counter[0..8], .little), 1) catch return error.InvalidColumnSegment;
@@ -905,7 +1058,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64) !bool {
         // A bounded all-deleted prefix still needs its own empty block. Using
         // the old suffix's block here would resurrect its retired prefix rows.
         var meta: [16]u8 = @splat(0);
-        @memcpy(meta[0..4], "ACB3");
+        @memcpy(meta[0..4], "ACB4");
         std.mem.writeInt(u32, meta[4..8], version, .little);
         try publish.put(try blockKey(scratch, manifest.generation, builder.blocks, null), try checked(scratch, &meta));
         try publish.put(range.key, try directoryValue(scratch, builder.blocks, builder.continuation.?));
@@ -1066,13 +1219,12 @@ const Block = struct {
     table: schema.TableSchema,
     layout: *const codec.PhysicalLayout,
     rows: []Row,
-    ordinals: []u32,
-    bounds: []Bounds,
-    bitmaps: []const []const u8,
+    ordinal_pages: []const u8,
     values: std.AutoHashMapUnmanaged(u32, *ColumnView) = .empty,
     stats: ?*types.ColumnarScanStats = null,
 
     const ColumnView = struct {
+        bounds: Bounds = .{},
         bitmaps: []const u8 = &.{},
         cells: ?[]?codec.Cell = null,
         logical: [max_rows]?std.json.Value = @splat(null),
@@ -1085,7 +1237,33 @@ const Block = struct {
         if (self.values.get(ordinal)) |value| return value;
         const value = try self.alloc.create(ColumnView);
         value.* = .{};
-        if (std.mem.indexOfScalar(u32, self.ordinals, ordinal)) |index| value.bitmaps = self.bitmaps[index];
+        var low: usize = 0;
+        var high = self.ordinal_pages.len / 12;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const page = self.ordinal_pages[mid * 12 ..][0..12];
+            const id = std.mem.readInt(u32, page[0..4], .little);
+            if (id < ordinal / 64) low = mid + 1 else high = mid;
+        }
+        if (low < self.ordinal_pages.len / 12) {
+            const page = self.ordinal_pages[low * 12 ..][0..12];
+            if (std.mem.readInt(u32, page[0..4], .little) == ordinal / 64 and
+                std.mem.readInt(u64, page[4..12], .little) & (@as(u64, 1) << @intCast(ordinal % 64)) != 0)
+            {
+                const meta = try verified(try self.scope.get(try columnMetaKey(self.alloc, self.generation, self.index, ordinal)));
+                if (meta.len != 17 + 2 * null_bytes or meta[0] > 1) return error.InvalidColumnSegment;
+                value.bounds = .{ .present = meta[0] == 1, .minimum = @bitCast(std.mem.readInt(u64, meta[1..9], .little)), .maximum = @bitCast(std.mem.readInt(u64, meta[9..17], .little)) };
+                if (!std.math.isFinite(value.bounds.minimum) or !std.math.isFinite(value.bounds.maximum) or value.bounds.minimum > value.bounds.maximum) return error.InvalidColumnSegment;
+                value.bitmaps = meta[17..];
+                for (value.bitmaps[0..null_bytes], value.bitmaps[null_bytes..]) |presence, nulls| if (nulls & ~presence != 0) return error.InvalidColumnSegment;
+                for (self.rows.len..max_rows) |row| if (value.bitmaps[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return error.InvalidColumnSegment;
+                if (self.stats) |stats| {
+                    stats.metadata_bytes_read += meta.len + 4;
+                    stats.encoded_bytes_read += meta.len + 4;
+                    stats.column_metadata_reads += 1;
+                }
+            }
+        }
         try self.values.put(self.alloc, ordinal, value);
         return value;
     }
@@ -1168,20 +1346,14 @@ const Block = struct {
             },
             .field_matcher => |matcher| {
                 const name = flatPath(matcher.path).?;
-                if (self.layout.ordinalForName(self.table.relational_columns, name)) |ordinal|
-                    if (std.mem.indexOfScalar(u32, self.ordinals, @intCast(ordinal))) |index| {
-                        const bounds = self.bounds[index];
-                        if (bounds.present and !try matcher.predicate.mayMatchNumericBounds(bounds.minimum, bounds.maximum)) {
-                            @memset(out, false);
-                            return;
-                        }
-                    };
                 const ordinal: u32 = @intCast(self.layout.ordinalForName(self.table.relational_columns, name) orelse {
                     const missing = try matcher.predicate.matches(self.alloc, &.{});
                     for (out, candidates) |*matched, candidate| matched.* = candidate and missing;
                     return;
                 });
                 const column_view = try self.column(ordinal);
+                const bounds = column_view.bounds;
+                if (bounds.present and !try matcher.predicate.mayMatchNumericBounds(bounds.minimum, bounds.maximum)) return;
                 const values = if (matcher.predicate == .exists) null else try self.cells(ordinal);
                 for (out, 0..) |*matched, i| {
                     if (!candidates[i]) continue;
@@ -1282,13 +1454,11 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         const index = range.block;
         if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
         if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
-        if (to.len != 0 and std.mem.order(u8, range.start, to) == .gt) return true;
+        if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, range.start, to) != .lt else std.mem.order(u8, range.start, to) == .gt)) return true;
         if (byte_range.end.len != 0 and std.mem.order(u8, range.start, byte_range.end) != .lt) return true;
-        if (try dirty_ranges.overlaps(alloc, range.start, range.end)) {
+        const dirty_range = try dirty_ranges.overlaps(alloc, range.start, range.end);
+        if (dirty_range) {
             if (opts.columnar_stats) |stats| stats.dirty_ranges_read += 1;
-            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
-            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
-            continue;
         }
         const scratch = arena.allocator();
         var scope = try txn.openReadScope(scratch);
@@ -1301,26 +1471,19 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
             stats.metadata_bytes_read += meta.len + 4;
         }
         var decoder = Decoder{ .bytes = meta };
-        if (!std.mem.eql(u8, try decoder.take(4), "ACB3")) return error.InvalidColumnSegment;
+        if (!std.mem.eql(u8, try decoder.take(4), "ACB4")) return error.InvalidColumnSegment;
         const version = try decoder.int(u32);
         const rows_len = try decoder.int(u32);
         if (rows_len > max_rows) return error.InvalidColumnSegment;
-        const columns_len = try decoder.int(u32);
-        if (rows_len == 0 and columns_len != 0) return error.InvalidColumnSegment;
-        if (columns_len > decoder.bytes.len / (21 + 2 * null_bytes)) return error.InvalidColumnSegment;
-        const ordinals = try scratch.alloc(u32, columns_len);
-        const bounds = try scratch.alloc(Bounds, columns_len);
-        const bitmaps = try scratch.alloc([]const u8, columns_len);
-        for (ordinals, bounds, bitmaps) |*ordinal, *bound, *bits| {
-            ordinal.* = try decoder.int(u32);
-            const present = try decoder.int(u8);
-            if (present > 1) return error.InvalidColumnSegment;
-            bound.* = .{ .present = present == 1, .minimum = @bitCast(try decoder.int(u64)), .maximum = @bitCast(try decoder.int(u64)) };
-            if (!std.math.isFinite(bound.minimum) or !std.math.isFinite(bound.maximum) or bound.minimum > bound.maximum) return error.InvalidColumnSegment;
-            bits.* = try decoder.take(2 * null_bytes);
-            for (bits.*[0..null_bytes], bits.*[null_bytes..]) |presence, nulls| if (nulls & ~presence != 0) return error.InvalidColumnSegment;
-            for (rows_len..max_rows) |row| if (bits.*[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return error.InvalidColumnSegment;
+        if (dirty_range and try preferPrimaryScan(txn, scratch, range, from, to, byte_range, opts, rows_len)) {
+            if (opts.columnar_stats) |stats| stats.dense_delta_scans += 1;
+            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+            continue;
         }
+        const pages_len = try decoder.int(u32);
+        if (pages_len > decoder.bytes.len / 12 or (rows_len == 0 and pages_len != 0)) return error.InvalidColumnSegment;
+        const ordinal_pages = try decoder.take(@as(usize, pages_len) * 12);
         const rows = try scratch.alloc(Row, rows_len);
         for (rows) |*row| {
             row.key = try decoder.take(try decoder.int(u32));
@@ -1330,8 +1493,14 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         if (decoder.bytes.len != 0) return error.InvalidColumnSegment;
         var view = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
         defer view.release();
-        for (ordinals) |ordinal| if (ordinal >= view.tableSchema().relational_columns.len) return error.InvalidColumnSegment;
-        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinals = ordinals, .bounds = bounds, .bitmaps = bitmaps, .stats = opts.columnar_stats };
+        for (0..pages_len) |i| {
+            const page = ordinal_pages[i * 12 ..][0..12];
+            const id = std.mem.readInt(u32, page[0..4], .little);
+            const mask = std.mem.readInt(u64, page[4..12], .little);
+            if (mask == 0 or @as(u64, id) * 64 + 63 - @clz(mask) >= view.tableSchema().relational_columns.len) return error.InvalidColumnSegment;
+            if (i > 0 and id <= std.mem.readInt(u32, ordinal_pages[(i - 1) * 12 ..][0..4], .little)) return error.InvalidColumnSegment;
+        }
+        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats };
         var matched: [max_rows]bool = @splat(true);
         var candidates: [max_rows]bool = @splat(false);
         for (rows, 0..) |row, i| candidates[i] = std.mem.order(u8, row.key, range.start) != .lt and (range.end.len == 0 or std.mem.order(u8, row.key, range.end) == .lt) and eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns);
@@ -1343,6 +1512,12 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         for (rows, 0..) |row, i| {
             if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
             if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            // A retained suffix block may contain retired prefix rows. Never
+            // merge across the current directory range's boundary.
+            if (std.mem.order(u8, row.key, range.start) == .lt or (range.end.len != 0 and std.mem.order(u8, row.key, range.end) != .lt)) continue;
+            const replaced = try dirty_ranges.emitThrough(db, alloc, txn, row.key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+            if (replaced) continue;
             if (!matched[i] or !byte_range.contains(row.key) or std.mem.order(u8, row.key, from) == .lt or
                 (from.len != 0 and !opts.inclusive_from and std.mem.eql(u8, row.key, from))) continue;
             if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, row.key, to) != .lt else std.mem.order(u8, row.key, to) == .gt)) continue;
@@ -1359,6 +1534,8 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
             try deliver(alloc, row, projected, opts, visitor, progress);
             if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
         }
+        _ = try dirty_ranges.emitThrough(db, alloc, txn, range.end, false, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+        if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
     }
     if (!had_range) {
         if (manifest.ranges != 0) return error.InvalidColumnSegment;

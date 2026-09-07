@@ -353,16 +353,33 @@ primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
 1 MiB of source rows (an individual large row remains subject to the request
 budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
 alongside presence and null bitmaps; no JSON projection or reparsing belongs in
-this build path. ACL3/ACB3 keeps these bitmaps in separately checksummed block
-metadata. Existence predicates and null projections need neither payload I/O
+this build path. ACB4 separates row metadata from independently addressed,
+checksummed per-column metadata. The root contains a sorted sparse directory
+of 64-ordinal presence pages (12 bytes per populated page); binary search
+locates only the columns a predicate/projection requests, without allocating or
+decoding every column's bounds and bitmaps. Missing declared metadata is
+corruption, not a missing field. Existence predicates and null projections need neither payload I/O
 nor value-stream decoding, even for large vector/JSON columns.
 
 Column segments carry schema epochs, null state, and numeric min/max summaries.
 A manifest records the schema-bound generation and its initial replay coverage.
-Each primary put/delete atomically records a dirty-key image token, including
-raw recovery writes that do not append replay. A snapshot reader uses column
-blocks for clean ranges and AROW for dirty ranges; it never combines old base
-values with current primary values for the same range. Ordinary row-count
+Each primary put/delete atomically records an eight-byte mutation version,
+including raw recovery writes that do not append replay. One durable counter
+increment is shared by all row mutations in a store transaction. Counter,
+primary and dirty records commit together; aborts cannot expose identities,
+overflow is rejected, and identical rewrites still get new committed identities.
+No physical-row hashing is performed for dirty marking. Physical checksums and
+semantic content hashes retain their independent integrity contracts.
+A snapshot reader streams an ordered merge of immutable column rows and dirty
+AROW point reads. Inserts and updates come from the pinned snapshot's primary
+row; deletes and changed rows mask the corresponding old base row, even when
+the new row fails the predicate or expires. Delta evaluation is independent of
+base zone-map pruning. One changed row no longer forces primary reads for the
+whole range, and arbitrarily large deltas retain only one row read scope/arena.
+A bounded density probe switches large dirty bursts to sequential primary scans
+instead of issuing hundreds of point reads. Small LIMIT queries keep the
+overlay's early exit. Scan statistics expose this choice as `dense_delta_scans`.
+Ordinary row-count
 updates leave the accelerator live. Schema changes invalidate the generation.
 Bulk-capable backends append dirty tokens in the same ingest arena as primary
 rows, preserving direct ingestion without per-row sorted-map insertion.
@@ -400,8 +417,11 @@ its observed age, backoff state, pass duration, failures, compacted ranges and
 written blocks without a catalog scan.
 
 Underfilled blocks (fewer than 128 rows and less than 512 KiB of source rows)
-retain durable occupancy markers. A separate merge queue is consumed when no
-dirty range needs service; reaching idle does not discard occupancy information.
+retain durable occupancy markers. A separate merge queue receives every fourth
+compaction scheduling turn even while dirty work remains, and all otherwise
+idle turns. Its durable round-robin cursor prevents a hot first candidate from
+starving later candidates. Only selected clean neighbors must be clean, not the
+whole table; reaching idle does not discard occupancy information.
 Later delete waves can merge with earlier underfilled neighbors. Coalescing
 uses compatible schema epochs, the same bounded builder and atomic directory
 publication as dirty compaction. GC deletes at most 256 records or 256 KiB of
@@ -452,12 +472,13 @@ Covered scans evaluate flat-field predicates column-at-a-time, prune disjoint
 numeric ranges using block summaries, and fetch projection columns only for
 blocks with surviving rows. A sparse row-key directory lets resumed and bounded
 scans seek directly to their starting block. Positive top-level projections and hash-only scans
-avoid primary-row reads. Nested/special/full-document selections retain AROW
+avoid primary-row reads for unchanged rows. Nested/special/full-document selections retain AROW
 fallback. Checked directory boundary links detect missing range entries; block
 and manifest checksums protect derived bytes. Corruption resumes
 the same snapshot's primary scan after the last delivered key and requests a
 rebuild. Request-local `ColumnarScanStats` exposes blocks read/pruned, columns and
-encoded bytes read, selected rows, dirty ranges read, and logical values
+encoded bytes read, selected column-metadata reads, overlay point reads,
+selected rows, dirty ranges read, and logical values
 materialized. Typed scalar kernels and direct vector membership do not build
 JSON trees. Candidate masks short-circuit resolved blocks/rows, inexpensive
 predicates precede composite payloads, and projected values are materialized
@@ -466,7 +487,8 @@ only for surviving rows. JSON composite values are cached per block/row.
 The scan retains one immutable storage snapshot but opens a read scope per
 columnar block. LSM scopes own and release their own cached-block pins/copied
 values; they never accumulate in the parent transaction. LMDB borrows from its
-snapshot, and other backends use bounded cursor-owned copies. Dirty-range
+snapshot, and other backends use bounded cursor-owned copies. Dirty overlays
+check query/shard bounds before opening a row read scope. Primary
 fallback intersects directory, query and shard bounds before opening its
 cursor, and checks keys before schema lookup or row decoding. Scan counters
 separate metadata bytes, payload bytes and primary rows decoded.

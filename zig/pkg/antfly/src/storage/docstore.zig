@@ -373,6 +373,25 @@ pub const DocStoreOptions = struct {
     read_only: bool = false,
 };
 
+fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationToken) !internal_keys.ColumnarMutationToken {
+    if (cached.*) |token| return token;
+    const old = txn.get(internal_keys.relational_columnar_mutation_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const previous = if (old) |bytes| blk: {
+        if (bytes.len != 8) return error.InvalidColumnMutationVersion;
+        break :blk std.mem.readInt(u64, bytes[0..8], .little);
+    } else 0;
+    const version = std.math.add(u64, previous, 1) catch return error.ColumnMutationVersionExhausted;
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, version, .little);
+    try txn.put(internal_keys.relational_columnar_mutation_key, &bytes);
+    const token = internal_keys.relationalColumnarMutationToken(version);
+    cached.* = token;
+    return token;
+}
+
 pub const DocStore = struct {
     alloc: Allocator,
     kind: Kind,
@@ -429,6 +448,7 @@ pub const DocStore = struct {
         write: ?backend_erased.WriteTxn = null,
         portable_import_reader_owner: ?*DocStore = null,
         columns_invalidated: bool = false,
+        columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
 
         pub const CursorAdapter = backend_erased.Cursor;
         pub const ReadAdapter = backend_adapter.ReadTxn(Txn, CursorAdapter, .{
@@ -569,11 +589,11 @@ pub const DocStore = struct {
             try self.write.?.delete(key);
         }
 
-        fn markColumnarDirty(self: *Txn, key: []const u8, value: ?[]const u8) anyerror!void {
+        fn markColumnarDirty(self: *Txn, key: []const u8, _: ?[]const u8) anyerror!void {
             if (!internal_keys.isRelationalRowKey(key)) return;
             const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
             defer self.alloc.free(dirty);
-            const token = internal_keys.relationalColumnarDirtyToken(value);
+            const token = try columnarMutationToken(self, &self.columnar_mutation);
             try self.put(dirty, &token);
         }
 
@@ -624,6 +644,7 @@ pub const DocStore = struct {
     pub const Batch = struct {
         alloc: Allocator,
         columns_invalidated: bool = false,
+        columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
         unordered_bulk_append_puts: bool = false,
         raw: ?LmdbBatch = null,
         dbi: LmdbDbi = undefined,
@@ -632,6 +653,7 @@ pub const DocStore = struct {
         pub const BatchTxn = struct {
             alloc: Allocator,
             columns_invalidated: *bool,
+            columnar_mutation: *?internal_keys.ColumnarMutationToken,
             unordered_bulk_append_puts: bool = false,
             raw: ?*LmdbTransaction = null,
             dbi: LmdbDbi = undefined,
@@ -680,7 +702,7 @@ pub const DocStore = struct {
                     // quadratic insertion when dirty keys precede every row.
                     const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
                     defer self.alloc.free(dirty);
-                    const token = internal_keys.relationalColumnarDirtyToken(value);
+                    const token = try columnarMutationToken(self, self.columnar_mutation);
                     try self.runtime.?.appendPut(dirty, &token);
                 } else {
                     try self.markColumnarDirty(key, value);
@@ -704,11 +726,11 @@ pub const DocStore = struct {
                 try self.runtime.?.delete(key);
             }
 
-            fn markColumnarDirty(self: @This(), key: []const u8, value: ?[]const u8) anyerror!void {
+            fn markColumnarDirty(self: @This(), key: []const u8, _: ?[]const u8) anyerror!void {
                 if (!internal_keys.isRelationalRowKey(key)) return;
                 const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
                 defer self.alloc.free(dirty);
-                const token = internal_keys.relationalColumnarDirtyToken(value);
+                const token = try columnarMutationToken(self, self.columnar_mutation);
                 try self.put(dirty, &token);
             }
 
@@ -776,6 +798,7 @@ pub const DocStore = struct {
                 .alloc = self.alloc,
                 .raw = if (supports_lmdb) if (self.raw) |*raw| raw.asTransaction() else null else null,
                 .columns_invalidated = &self.columns_invalidated,
+                .columnar_mutation = &self.columnar_mutation,
                 .unordered_bulk_append_puts = self.unordered_bulk_append_puts,
                 .dbi = self.dbi,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
@@ -3278,7 +3301,7 @@ test "docstore relational bulk appends retain direct ingest and atomic dirty tok
         defer alloc.free(dirty);
         const token = try store.get(alloc, dirty);
         defer alloc.free(token);
-        try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyToken(id), token);
+        try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarMutationToken(1), token);
     }
     const key = try internal_keys.relationalRowKeyAlloc(alloc, "row:0000");
     defer alloc.free(key);
@@ -3302,7 +3325,23 @@ test "docstore relational bulk appends retain direct ingest and atomic dirty tok
     try std.testing.expectEqualStrings("last", value);
     const token = try store.get(alloc, dirty);
     defer alloc.free(token);
-    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyToken("last"), token);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarMutationToken(2), token);
+    try store.put(key, "last");
+    const rewritten = try store.get(alloc, dirty);
+    defer alloc.free(rewritten);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarMutationToken(3), rewritten);
+    try store.delete(key);
+    const deleted = try store.get(alloc, dirty);
+    defer alloc.free(deleted);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarMutationToken(4), deleted);
+    var exhausted: [8]u8 = undefined;
+    std.mem.writeInt(u64, &exhausted, std.math.maxInt(u64), .little);
+    try store.put(internal_keys.relational_columnar_mutation_key, &exhausted);
+    try std.testing.expectError(error.ColumnMutationVersionExhausted, store.put(key, "must not commit"));
+    try std.testing.expectError(error.NotFound, store.get(alloc, key));
+    const still_deleted = try store.get(alloc, dirty);
+    defer alloc.free(still_deleted);
+    try std.testing.expectEqualSlices(u8, deleted, still_deleted);
 }
 
 test "docstore runtime point get does not clone mutable snapshot" {

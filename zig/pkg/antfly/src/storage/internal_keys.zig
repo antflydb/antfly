@@ -26,6 +26,7 @@ pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
 pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
 pub const relational_columnar_dirty_prefix = "\x00\x00__columnar__:dirty:";
+pub const relational_columnar_mutation_key = "\x00\x00__columnar__:mutation";
 
 pub fn relationalColumnarDirtyKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {
     const raw = (try decodeStoredDocumentRowKeyAlloc(alloc, row_key)) orelse return error.InvalidInternalUserKey;
@@ -33,14 +34,13 @@ pub fn relationalColumnarDirtyKeyAlloc(alloc: Allocator, row_key: []const u8) ![
     return std.mem.concat(alloc, u8, &.{ relational_columnar_dirty_prefix, raw });
 }
 
-/// Exact-image token for compare-and-clear compaction. A put/delete/put ABA
-/// with identical bytes is safe: the base snapshot contains that same image.
-pub fn relationalColumnarDirtyToken(value: ?[]const u8) [33]u8 {
-    var token: [33]u8 = @splat(0);
-    if (value) |bytes| {
-        token[0] = 1;
-        std.crypto.hash.Blake3.hash(bytes, token[1..33], .{});
-    }
+/// Opaque committed mutation identity. The counter and all primary/dirty writes
+/// share one store transaction; aborted identities are never visible to readers.
+pub const ColumnarMutationToken = [8]u8;
+
+pub fn relationalColumnarMutationToken(version: u64) ColumnarMutationToken {
+    var token: ColumnarMutationToken = undefined;
+    std.mem.writeInt(u64, &token, version, .little);
     return token;
 }
 
