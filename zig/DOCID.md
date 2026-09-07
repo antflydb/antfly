@@ -1502,30 +1502,32 @@ Status as of 2026-05-19:
   timestamped evidence under `bench/results/docid-lifecycle-matrix/`; it
   defaults to smoke-sized query evidence and can be expanded with
   `DOCID_LIFECYCLE_MATRIX_SMOKE=0`.
-  `scripts/run_docid_operational_hardening_matrix.sh` combines the owning
-  integration/DB/Raft suites with metadata split/merge restart/partition chaos,
-  public split/merge traffic chaos, and LSM backend compaction chaos.
-  It records timestamped logs under
-  `bench/results/docid-operational-hardening/`; set
-  `DOCID_OPERATIONAL_MATRIX_RUN_SCALE=1` to add the large public-query
-  performance matrix, and set `DOCID_OPERATIONAL_MATRIX_RUN_FULL_TARGET=1` when
-  a single build-step invocation is preferred over per-bucket logs. A local
-  operational pass at
+  Run the owning suites and optional chaos campaigns directly from `zig/`:
+
+  ```sh
+  zig build integration-test lib-db-test raft-test \
+    lib-metadata-transition-chaos-test lib-metadata-public-chaos-test \
+    lib-lsm-backend-chaos-test
+  ```
+
+  A local operational pass at
   `bench/results/docid-operational-hardening/20260525T173023Z/` completed all
   four buckets: focused DOCID lifecycle, metadata split/merge transition chaos,
   public split/merge traffic chaos, and LSM backend compaction chaos.
-  `scripts/run_docid_production_readiness_matrix.sh` is the release-evidence
-  wrapper for the remaining production-readiness questions. It always runs the
-  focused lifecycle and operational hardening gates, can add a 300k-scale DOCID
-  performance matrix with `DOCID_PRODUCTION_MATRIX_RUN_SCALE=1`, can run the
-  current auth e2e guard with `DOCID_PRODUCTION_MATRIX_RUN_E2E=1`, and can run
-  old/new binary compatibility smoke checks with
-  `DOCID_PRODUCTION_MATRIX_RUN_OLD_NEW=1` plus explicit
-  `DOCID_PRODUCTION_MATRIX_OLD_ANTFLY_BIN` and
-  `DOCID_PRODUCTION_MATRIX_NEW_ANTFLY_BIN` paths. It records environment,
-  commands, status, and per-case logs under
-  `bench/results/docid-production-readiness/`.
-  The scripted cases cover the existing medium baseline, a selective
+  Performance evidence and auth checks can be invoked independently from the
+  repository root:
+
+  ```sh
+  DOCID_PERF_MATRIX_DOCS=300000 scripts/run_docid_perf_matrix.sh
+  ANTFLY_BIN=/absolute/path/to/antfly \
+    uv run --project zig/e2e/antfly pytest -q -x -s zig/e2e/antfly/test_auth.py \
+    -k 'stateful_auth_enforces_table_permissions or stateful_auth_enforces_row_filters_on_lookup_and_scan'
+  ```
+
+  For old/new binary auth smoke checks, repeat the auth command with each
+  binary's absolute path. The performance matrix retains its own timestamped
+  evidence logs under `bench/results/docid-perf-matrix/`.
+  The query-matrix cases cover the existing medium baseline, a selective
   small-filter shape, and a broad large-filter shape so future evidence is not
   limited to one favorable filter size. A local smoke matrix passed all three
   cases and produced 9 summary rows: the tiny and selective cases stayed below
@@ -2383,10 +2385,10 @@ Status as of 2026-05-19:
   reopen;
   DB-level capacity tests cover the final allocatable `u32` ordinal with dense,
   sparse, full-text, graph, and algebraic indexes present before rejecting new
-  documents at exhaustion; and the focused DOCID gate names mixed-version
-  lifecycle classification plus stale-namespace range validation. The extended
-  operational hardening gate now makes restart/partition chaos and compaction
-  chaos part of the explicit DOCID evidence path. A follow-on focused hardening
+  documents at exhaustion; and the owning suites cover mixed-version
+  lifecycle classification plus stale-namespace range validation. The optional
+  metadata and LSM chaos suites cover restart/partition and compaction
+  hardening. A follow-on focused hardening
   pass adds deterministic interleaved split handoff coverage with writes,
   query-summary checks, crash, and reopen; snapshot-generation reassignment
   coverage that proves stale namespace writers reject and old generation
@@ -2418,7 +2420,7 @@ The hard parts are operational rather than syntactic:
 
 - production-scale ordinal stability coverage across async/background
   compaction beyond the explicit LSM/full-text chaos gates and deterministic
-  cache invalidation fixtures and the opt-in production readiness matrix
+  cache invalidation fixtures
 - production multi-node split/merge/reassignment chaos with sustained
   concurrent query/write pressure beyond deterministic split handoff,
   metadata restart/partition, and public traffic simulations
