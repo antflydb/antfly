@@ -4057,6 +4057,12 @@ fn preserveArtifactVisibilityUsingLookup(
         else
             false;
         const derived_index = dst.kind == .dense_vector or dst.kind == .sparse_vector;
+        // A live owner's closed repair gate supersedes retained publication
+        // continuity. Physical vectors can survive while their generation is
+        // quarantined or awaiting replacement validation.
+        if (derived_index and incoming.metadata.source == .live_writer_publish and
+            dst.index_repair_id != null and !dst.serving_snapshot_ready and
+            !dst.index_repair_active_generation_serviceable) continue;
         const same_runtime_root = incoming.metadata.lsm_root_generation == previous.metadata.lsm_root_generation;
         const same_derived_incarnation = derived_index and
             dst.coverage_identity_ready and
@@ -10033,6 +10039,40 @@ test "live writer artifact regression keeps authoritative source deletions" {
     try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.doc_count);
+}
+
+test "live repair admission supersedes cached vector serviceability" {
+    for ([_]db_mod.types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        var old_rows = [_]db_mod.types.DBIndexStats{.{
+            .name = "semantic_idx",
+            .kind = kind,
+            .serving_snapshot_ready = true,
+            .doc_count = 2,
+            .coverage_config_hash = 77,
+            .coverage_generation = 42,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        }};
+        const previous = LocalTableRuntimeStatus{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = &old_rows },
+        };
+        var new_rows = old_rows;
+        new_rows[0].serving_snapshot_ready = false;
+        new_rows[0].index_repair_id = 123;
+        new_rows[0].index_lifecycle_work_class = .initial_build;
+        new_rows[0].index_repair_phase = "validating";
+        var incoming = LocalTableRuntimeStatus{
+            .group_id = 7,
+            .metadata = previous.metadata,
+            .stats = .{ .index_count = 1, .indexes = &new_rows },
+        };
+        try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
+        try std.testing.expect(!new_rows[0].serving_snapshot_ready);
+        try std.testing.expect(!new_rows[0].runtime_observation_serviceable);
+        try std.testing.expectEqualStrings("validating", new_rows[0].index_repair_phase);
+    }
 }
 
 test "catching up observation preserves same-incarnation published visibility" {

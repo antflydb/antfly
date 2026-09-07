@@ -6656,6 +6656,7 @@ pub fn build(b: *std.Build) void {
     const lib_api_derived_coverage_tests = b.addTest(.{
         .root_module = api_derived_coverage_test_mod,
         .filters = &.{
+            "live repair admission supersedes cached vector serviceability",
             "coverage policy accepts only the public embeddings contract",
             "index configs receive persistent private incarnations across index kinds",
             "create table parser preserves supported metadata fields",

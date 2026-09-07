@@ -27235,6 +27235,8 @@ pub const DB = struct {
         runtime_stats.source_doc_count = identity_stats.live_ordinals;
         runtime_stats.doc_identity = dbDocIdentityStats(identity_stats, self.core.identity_namespace);
         try self.hydrateDerivedCoverageIdentities(stats_alloc, runtime_stats.indexes);
+        var repairs = try self.loadIndexRepairStateForStats(stats_alloc);
+        defer if (repairs) |*state| state.deinit(stats_alloc);
         var visible_doc_count = runtime_stats.doc_count;
         for (runtime_stats.indexes) |*item| {
             switch (item.kind) {
@@ -27326,6 +27328,20 @@ pub const DB = struct {
                         item.algebraic_recommendation_count = status_value.recommendation_count;
                     }
                 },
+            }
+            if (item.kind == .dense_vector or item.kind == .sparse_vector) {
+                // Live cardinality and cached readiness are not one observation.
+                // A shadow may now be installed but still gated by validation.
+                // Refresh durable lifecycle and the query gate with the counts.
+                if (item.index_repair_last_error) |value| stats_alloc.free(value);
+                item.index_repair_last_error = null;
+                try self.applyDurableIndexRepairStats(
+                    stats_alloc,
+                    if (repairs) |*state| state else null,
+                    self.async_context.index_repair_state_corrupt.load(.acquire),
+                    item,
+                );
+                item.serving_snapshot_ready = self.vectorServingSnapshotReady(stats_alloc, item.kind, item.name, if (repairs) |*state| state else null);
             }
             for (item.source_replay) |*source| {
                 source.target_sequence = try self.artifactSourceTargetSequence(
@@ -87996,6 +88012,9 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         return;
     }
 
+    var retained = try db.runtimeStatusStatsConsistent(alloc);
+    defer types.freeDBStats(alloc, retained);
+
     if (mode == .shadow_handoff) {
         // A scheduler can select reconstruction before the canonical worker
         // finishes. The worker's later publication does not transfer ownership
@@ -88014,6 +88033,11 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
     try db.refreshIndexRepairAvailabilityForIndex(alloc, cfg.name);
     try std.testing.expect(db.core.index_manager.repairUnavailable(cfg.name));
 
+    try std.testing.expect(db.overlayRuntimeStatusBestEffort(alloc, &retained));
+    for (retained.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, cfg.name)) continue;
+        try std.testing.expect(!item.serving_snapshot_ready);
+    }
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     for (stats.indexes) |item| {
