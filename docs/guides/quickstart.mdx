@@ -1024,13 +1024,14 @@ antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 \
 `--projector auto` includes image and audio support. Try a local file with
 `antfly inference generate <model-dir> "Describe this input" --image ./photo.jpg`
 or `--audio ./clip.wav`. Use `--projector none` for a smaller, text-only download.
-The RAG example below uses text and limits output to 128 tokens.
+The RAG example below uses text and limits output to 512 tokens per model turn.
 For other providers, see the [next step](#rag-with-alternative-providers).
 </Callout>
 
-### Generate an answer
+### Build a query and generate an answer
 
-Use Gemma to generate an answer from search results:
+Give Gemma an intent and a table. The retrieval agent delegates query planning
+to the query builder, searches, and answers from the results.
 
 <Tabs defaultValue="cli">
   <TabsList>
@@ -1045,24 +1046,16 @@ Use Gemma to generate an answer from search results:
   <TabsContent value="cli">
 ```bash
 antfly agents retrieval --table wikipedia \
-  --semantic-search "What are the major events in Korean history?" \
-  --indexes "title_body" \
+  --intent "What are the major events in Korean history?" \
   --fields "title,body" \
   --limit 5 \
-  --reranker '{
-      "provider": "antfly",
-      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
-      "field": "body"
-    }' \
-  --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{
     "provider": "antfly",
     "model": "ggml-org/gemma-4-E4B-it-GGUF",
-    "max_tokens": 128
+    "max_tokens": 512
   }' \
-  --max-context-tokens 512 \
-  --streaming \
-  --generate
+  --max-internal-iterations 8 \
+  --streaming
 ```
   </TabsContent>
 
@@ -1075,23 +1068,15 @@ curl -N -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
     "query": "What are the major events in Korean history?",
     "queries": [{
       "table": "wikipedia",
-      "semantic_search": "What are the major events in Korean history?",
-      "indexes": ["title_body"],
       "fields": ["title", "body"],
-      "limit": 5,
-      "reranker": {
-        "provider": "antfly",
-        "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
-        "field": "body"
-      },
-      "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
+      "limit": 5
     }],
     "generator": {
       "provider": "antfly",
       "model": "ggml-org/gemma-4-E4B-it-GGUF",
-      "max_tokens": 128
+      "max_tokens": 512
     },
-    "max_context_tokens": 512,
+    "max_internal_iterations": 8,
     "stream": true,
     "steps": {
       "generation": {"enabled": true}
@@ -1106,23 +1091,15 @@ const result = await client.agents.retrieval({
   query: 'What are the major events in Korean history?',
   queries: [{
     table: 'wikipedia',
-    semantic_search: 'What are the major events in Korean history?',
-    indexes: ['title_body'],
     fields: ['title', 'body'],
     limit: 5,
-    reranker: {
-      provider: 'antfly',
-      model: 'ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0',
-      field: 'body',
-    },
-    pruner: { min_score_ratio: 0.6, max_score_gap_percent: 40 },
   }],
   generator: {
     provider: 'antfly',
     model: 'ggml-org/gemma-4-E4B-it-GGUF',
-    max_tokens: 128,
+    max_tokens: 512,
   },
-  max_context_tokens: 512,
+  max_internal_iterations: 8,
   stream: false,
   steps: {
     generation: { enabled: true },
@@ -1137,23 +1114,15 @@ result = client.agents.retrieval(
     query='What are the major events in Korean history?',
     queries=[{
         'table': 'wikipedia',
-        'semantic_search': 'What are the major events in Korean history?',
-        'indexes': ['title_body'],
         'fields': ['title', 'body'],
         'limit': 5,
-        'reranker': {
-            'provider': 'antfly',
-            'model': 'ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0',
-            'field': 'body',
-        },
-        'pruner': {'min_score_ratio': 0.6, 'max_score_gap_percent': 40},
     }],
     generator={
         'provider': 'antfly',
         'model': 'ggml-org/gemma-4-E4B-it-GGUF',
-        'max_tokens': 128,
+        'max_tokens': 512,
     },
-    max_context_tokens=512,
+    max_internal_iterations=8,
     stream=False,
     steps={
         'generation': {'enabled': True},
@@ -1166,7 +1135,7 @@ result = client.agents.retrieval(
 ```go
 generator, err := antfly.NewGeneratorConfig(antfly.AntflyGeneratorConfig{
 	Model: "ggml-org/gemma-4-E4B-it-GGUF",
-	MaxTokens: 128,
+	MaxTokens: 512,
 })
 if err != nil { log.Fatal(err) }
 fields := []string{"title", "body"}
@@ -1174,18 +1143,11 @@ result, err := client.RetrievalAgent(ctx, antfly.RetrievalAgentRequest{
 	Query: "What are the major events in Korean history?",
 	Queries: []antfly.RetrievalQueryRequest{{
 		Table:          "wikipedia",
-		SemanticSearch: "What are the major events in Korean history?",
-		Indexes:        []string{"title_body"},
 		Fields:         &fields,
 		Limit:          5,
-		Reranker:       reranker,
-		Pruner: antfly.Pruner{
-			MinScoreRatio:      0.6,
-			MaxScoreGapPercent: 40,
-		},
 	}},
 	Generator:        *generator,
-	MaxContextTokens: 512,
+	MaxInternalIterations: 8,
 	Steps: antfly.RetrievalAgentSteps{
 		Generation:     antfly.GenerationStepConfig{Enabled: true},
 	},
@@ -1202,23 +1164,15 @@ let resp = client
         "query": "What are the major events in Korean history?",
         "queries": [{
             "table": "wikipedia",
-            "semantic_search": "What are the major events in Korean history?",
-            "indexes": ["title_body"],
             "fields": ["title", "body"],
-            "limit": 5,
-            "reranker": {
-                "provider": "antfly",
-                "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
-                "field": "body"
-            },
-            "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
+            "limit": 5
         }],
         "generator": {
             "provider": "antfly",
             "model": "ggml-org/gemma-4-E4B-it-GGUF",
-            "max_tokens": 128
+            "max_tokens": 512
         },
-        "max_context_tokens": 512,
+        "max_internal_iterations": 8,
         "stream": false,
         "steps": {
             "generation": {"enabled": true}
@@ -1232,13 +1186,21 @@ let resp = client
 The CLI and cURL commands stream Server-Sent Events as each step completes. A
 terminal `event: done` marks success; an error or incomplete stream makes the
 CLI exit nonzero. The SDK examples request structured JSON instead. Each
-example searches for semantically similar articles, reranks and prunes results
-with Qwen3, and uses Gemma to generate a capped answer from the retrieved context.
-The example keeps the original retrieval query and requests only an answer.
+example uses bounded, read-only tool calls and requests only a grounded answer.
+Use `--no-streaming` for JSON from the CLI.
 
-<Callout type="tip">
-**Pruning for RAG:** Score-based pruning (`--pruner`) filters out marginally relevant documents, while token-based pruning (`--max-context-tokens`) ensures the context fits within the model's limits.
-</Callout>
+### Inspect a query plan (optional)
+
+To build a query without retrieving documents:
+
+```bash
+antfly agents query-builder --table wikipedia \
+  --intent "Find articles about anatomy" \
+  --generator '{"provider":"antfly","model":"ggml-org/gemma-4-E4B-it-GGUF","max_tokens":512,"temperature":0}' \
+  --max-internal-iterations 8
+```
+
+Add `--execute` to run the same composed retrieval workflow shown above.
 
 ### RAG with alternative providers
 

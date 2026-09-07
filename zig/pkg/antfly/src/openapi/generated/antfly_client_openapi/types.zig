@@ -24682,7 +24682,7 @@ pub const QueryBuilderRequest = struct {
     decisions: ?[]const AgentDecision = null,
     /// If true, the agent may return clarification questions when needed.
     interactive: ?bool = null,
-    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
+    /// Maximum planning tool calls (0-20). Zero uses the compatibility planner. A positive value enables model-directed table inspection and complete QueryRequest submission using the canonical DSL parser and runtime preflight, with validation feedback for repair. It requires an Antfly or OpenAI tool-capable generator and never executes database searches.
     max_internal_iterations: ?i64 = null,
     /// Maximum number of clarification turns the agent may request from the user.
     max_user_clarifications: ?i64 = null,
@@ -27107,7 +27107,7 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
@@ -27125,7 +27125,7 @@ pub const RetrievalAgentRequest = struct {
     decisions: ?[]const AgentDecision = null,
     /// If true, the agent may return clarification questions when needed.
     interactive: ?bool = null,
-    /// Maximum number of internal tool-calling rounds. - 0: Pipeline mode — execute provided queries directly, no LLM loop - 1+: Agentic mode — LLM decides which tools to call
+    /// Maximum number of model-generation rounds across retrieval and any delegated query-builder calls. All calls share the request deadline and cancellation. Tool calls are additionally capped at 20 overall. - 0: Pipeline mode — execute provided queries directly, no LLM loop - 1+: Agentic mode — LLM decides which tools to call
     max_internal_iterations: ?i64 = null,
     /// Maximum number of clarification turns the agent may request from the user.
     max_user_clarifications: ?i64 = null,

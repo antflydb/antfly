@@ -56,13 +56,25 @@ fn mainImpl(init: std.process.Init) anyerror!void {
     defer args.deinit();
     _ = args.next();
 
-    const command = if (comptime role_options.role == .cli)
+    var command: []const u8 = if (comptime role_options.role == .cli)
         args.next() orelse return error.InvalidArguments
     else
         @tagName(role_options.role);
     var argument_views: std.ArrayListUnmanaged(bridge.Bytes) = .empty;
     defer argument_views.deinit(init.gpa);
     while (args.next()) |arg| try argument_views.append(init.gpa, .init(arg));
+
+    // The standalone artifact re-executes itself with the same private worker
+    // invocation as the full CLI. Dispatch across the existing inference ABI
+    // before standalone parsing; this worker is supervised by its RPC pipes.
+    const worker_invocation = if (comptime role_options.role == .standalone)
+        argument_views.items.len == 2 and
+            std.mem.eql(u8, argument_views.items[0].slice(), "inference") and
+            std.mem.eql(u8, argument_views.items[1].slice(), "_worker")
+    else
+        false;
+    if (worker_invocation) command = "inference";
+    const runtime_arguments = if (worker_invocation) argument_views.items[1..] else argument_views.items;
 
     const environment_names = init.environ_map.keys();
     const environment_values = init.environ_map.values();
@@ -75,8 +87,8 @@ fn mainImpl(init: std.process.Init) anyerror!void {
 
     const context = bridge.Context{
         .command = .init(command),
-        .arguments_ptr = if (argument_views.items.len == 0) null else argument_views.items.ptr,
-        .arguments_len = argument_views.items.len,
+        .arguments_ptr = if (runtime_arguments.len == 0) null else runtime_arguments.ptr,
+        .arguments_len = runtime_arguments.len,
         .environment_ptr = if (environment.len == 0) null else environment.ptr,
         .environment_len = environment.len,
     };
@@ -85,7 +97,7 @@ fn mainImpl(init: std.process.Init) anyerror!void {
         .data => antfly_runtime_data(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
-        .standalone => antfly_runtime_standalone(&context),
+        .standalone => if (worker_invocation) antfly_runtime_inference(&context) else antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
 }

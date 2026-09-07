@@ -389,6 +389,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
     source: table_reads.TableReadSource,
     table_name: []const u8,
     authenticated_identity: ?AuthenticatedIdentity = null,
+    request_context: ?managed_embedder.RequestContext = null,
     query_embedding_security_scope: ApiHttpServer.QueryEmbeddingSecurityScope = .{ .domain = .internal, .value = "" },
 
     pub fn iface(self: *@This()) query_builder_agent.QueryBuilderRuntimeQueryRequestValidator {
@@ -408,7 +409,12 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
     ) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var semantic_resolver = self.server.semanticStatusResolver(self.query_embedding_security_scope.domain, self.query_embedding_security_scope.value);
-        const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
+        if (self.request_context) |context| {
+            try context.check();
+            semantic_resolver.query_embedding_deadline_ns = context.deadline_ns;
+            semantic_resolver.query_cancellation = context.cancellation;
+        }
+        const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| {
             if (query_api.isPublicQueryValidationError(err)) {
@@ -421,9 +427,16 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             return err;
         };
         defer parsed.deinit(alloc);
+        if (self.request_context) |context| {
+            if (context.deadline_ns) |deadline| parsed.req.execution_deadline_ns = if (parsed.req.execution_deadline_ns) |existing| @min(existing, deadline) else deadline;
+            parsed.req.cancellation = context.cancellation;
+        }
         try self.applyMandatoryRowFilter(alloc, &parsed.req);
 
-        var summary = (try self.source.preflightQuery(alloc, self.table_name, parsed.req, .read_index, 0)) orelse return null;
+        var summary = (self.source.preflightQuery(alloc, self.table_name, parsed.req, .read_index, 0) catch |err| switch (err) {
+            error.InvalidArgument, error.IndexNotFound, error.UnsupportedQueryRequest => return try std.fmt.allocPrint(alloc, "query_request failed runtime preflight: {s}", .{@errorName(err)}),
+            else => return err,
+        }) orelse return null;
         summary.deinit(alloc);
         return null;
     }
@@ -445,13 +458,22 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         var semantic_resolver = self.server.semanticStatusResolver(self.query_embedding_security_scope.domain, self.query_embedding_security_scope.value);
-        const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
+        if (self.request_context) |context| {
+            try context.check();
+            semantic_resolver.query_embedding_deadline_ns = context.deadline_ns;
+            semantic_resolver.query_cancellation = context.cancellation;
+        }
+        const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
         var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| {
             if (query_api.isPublicQueryValidationError(err)) return null;
             return err;
         };
         defer parsed.deinit(alloc);
+        if (self.request_context) |context| {
+            if (context.deadline_ns) |deadline| parsed.req.execution_deadline_ns = if (parsed.req.execution_deadline_ns) |existing| @min(existing, deadline) else deadline;
+            parsed.req.cancellation = context.cancellation;
+        }
         try self.applyMandatoryRowFilter(alloc, &parsed.req);
 
         return self.source.preflightQuery(alloc, self.table_name, parsed.req, .read_index, max_work) catch |err| switch (err) {
@@ -6491,6 +6513,19 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        return self.executeQueryBuilderAgentWithContext(body, authenticated_identity, .{
+            .io = self.inferenceIo(),
+            .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+        });
+    }
+
+    pub fn executeQueryBuilderAgentWithContext(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        request_context: managed_embedder.RequestContext,
+    ) !contextual_operations.OwnedResponse {
+        try request_context.check();
         var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
             return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
         defer parsed.deinit();
@@ -6519,6 +6554,7 @@ pub const ApiHttpServer = struct {
                     .table_name = table_name,
                     .authenticated_identity = authenticated_identity,
                     .query_embedding_security_scope = queryEmbeddingSecurityScope(authenticated_identity),
+                    .request_context = request_context,
                 };
                 table_context.?.runtime_query_request_validator = runtime_validator_context.?.iface();
             }
@@ -6531,6 +6567,7 @@ pub const ApiHttpServer = struct {
             secret_store: ?*common_secrets.FileStore,
             inference_api_key: ?[]const u8,
             io: std.Io,
+            request_context: managed_embedder.RequestContext,
 
             fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                 return .{ .ptr = runner, .vtable = &.{ .execute_chain = executeChain } };
@@ -6549,6 +6586,7 @@ pub const ApiHttpServer = struct {
                     .antfly_provider = runner.antfly_provider,
                     .secret_store = runner.secret_store,
                     .inference_api_key = runner.inference_api_key,
+                    .request_context = runner.request_context,
                 }, messages);
             }
         };
@@ -6557,6 +6595,7 @@ pub const ApiHttpServer = struct {
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
             .io = self.inferenceIo(),
+            .request_context = request_context,
         };
         var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
         const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(
@@ -6566,6 +6605,12 @@ pub const ApiHttpServer = struct {
             generation_runner.iface(),
         ) catch |err| return switch (err) {
             error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request"),
+            error.InvalidQueryBuilderGeneration, error.InvalidAgentToolCall => try contextual_operations.jsonErrorAlloc(self.alloc, 422, "generator did not submit a valid query tool call"),
+            error.AgentToolLimitExceeded => try contextual_operations.jsonErrorAlloc(self.alloc, 422, "query planning tool budget exhausted"),
+            error.AgentContextLimitExceeded => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query planning context limit exceeded"),
+            error.UnsupportedAgentToolProvider, error.UnsupportedQueryBuilderGeneration => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "query planning requires a tool-capable generator"),
+            error.GenerateRequestFailed => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query generation failed"),
+            error.EmptyResponse => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "generator returned no answer or tool calls"),
             error.DocIdentityNamespaceMismatch => try contextual_operations.jsonErrorAlloc(self.alloc, 503, "doc identity unavailable"),
             error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query embedding input too large"),
             error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
@@ -6573,12 +6618,38 @@ pub const ApiHttpServer = struct {
             error.EmbedTransientFailure => try contextualRetryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
             error.EmbedUpstreamFailure => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query embedding provider failed"),
             error.Timeout => try contextual_operations.jsonErrorAlloc(self.alloc, 504, "query embedding timed out"),
-            else => return err,
+            else => {
+                std.log.warn("query builder failed err={s}", .{@errorName(err)});
+                return err;
+            },
         };
         return contextual_operations.json(
-            try std.fmt.allocPrint(self.alloc, "{f}", .{std.json.fmt(response, .{})}),
+            // Imported optional query components must be omitted when absent,
+            // not emitted as null: the public request schema is non-nullable.
+            try std.json.Stringify.valueAlloc(self.alloc, response, .{ .emit_null_optional_fields = false }),
             false,
         );
+    }
+
+    /// Shared, in-process query-builder delegation. The caller retains its
+    /// admission lease, cancellation/deadline and generation budget.
+    pub fn buildRetrievalQuery(self: *ApiHttpServer, alloc: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, identity: ?AuthenticatedIdentity, request_context: managed_embedder.RequestContext, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {
+        try request_context.check();
+        const table = request.table orelse return error.InvalidQueryBuilderRequest;
+        if (identity) |subject| if (!permissionsAllow(subject.permissions, .table, table, .read)) return error.Forbidden;
+        const context = try self.loadQueryBuilderTableContext(table);
+        defer freeQueryBuilderTableContext(self.alloc, context);
+        var validator = QueryBuilderRuntimeQueryRequestValidatorContext{
+            .server = self,
+            .source = self.table_reads orelse return error.TableNotFound,
+            .table_name = table,
+            .authenticated_identity = identity,
+            .query_embedding_security_scope = queryEmbeddingSecurityScope(identity),
+            .request_context = request_context,
+        };
+        var effective = context;
+        effective.runtime_query_request_validator = validator.iface();
+        return query_builder_agent.buildQueryBuilderResponseWithContext(alloc, request, effective, generator);
     }
 
     fn internalQueryPlanningContext(self: *ApiHttpServer) ?internal_query_operations.QueryPlanningContext {
@@ -6644,6 +6715,7 @@ pub const ApiHttpServer = struct {
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
+            deadline_ns: u64,
             source: table_reads.TableReadSource,
             query_embedding_security_scope: QueryEmbeddingSecurityScope,
             authenticated_identity: ?AuthenticatedIdentity,
@@ -6653,6 +6725,7 @@ pub const ApiHttpServer = struct {
                     .ptr = runner,
                     .vtable = &.{
                         .authorize_query = authorizeQuery,
+                        .build_query = buildQuery,
                         .run_query = runQuery,
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
@@ -6675,6 +6748,11 @@ pub const ApiHttpServer = struct {
                     return error.Forbidden;
             }
 
+            fn buildQuery(ptr: *anyopaque, a: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return runner.server.buildRetrievalQuery(a, request, runner.authenticated_identity, .{ .io = runner.server.inferenceIo(), .deadline_ns = runner.deadline_ns }, generator);
+            }
+
             fn runQuery(
                 ptr_inner: *anyopaque,
                 inner_alloc: std.mem.Allocator,
@@ -6690,6 +6768,7 @@ pub const ApiHttpServer = struct {
                     runner.query_embedding_security_scope.domain,
                     runner.query_embedding_security_scope.value,
                 );
+                semantic_resolver.query_embedding_deadline_ns = runner.deadline_ns;
                 var query_req = query_api.parsePublicQueryRequest(inner_alloc, semantic_resolver.iface(), table_name, query_json) catch |err| {
                     if (err == error.RerankerCandidateLimitExceeded) return err;
                     if (query_api.isPublicQueryValidationError(err)) {
@@ -6698,6 +6777,7 @@ pub const ApiHttpServer = struct {
                     return err;
                 };
                 defer query_req.deinit(inner_alloc);
+                query_req.req.execution_deadline_ns = if (query_req.req.execution_deadline_ns) |deadline| @min(deadline, runner.deadline_ns) else runner.deadline_ns;
                 runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
                     error.TableNotFound => return err,
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
@@ -6783,6 +6863,7 @@ pub const ApiHttpServer = struct {
             secret_store: ?*common_secrets.FileStore,
             inference_api_key: ?[]const u8,
             io: std.Io,
+            deadline_ns: u64,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -6800,7 +6881,7 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(runner_ptr));
                 var client = httpx.Client.initWithConfig(inner_alloc, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
+                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = .{ .io = runner.io, .deadline_ns = runner.deadline_ns } }, messages);
             }
         };
         var generation_runner = RetrievalGenerationRunner{
@@ -6808,10 +6889,12 @@ pub const ApiHttpServer = struct {
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
             .io = self.inferenceIo(),
+            .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
         };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
+            .deadline_ns = generation_runner.deadline_ns,
             .source = source,
             .query_embedding_security_scope = query_embedding_security_scope,
             .authenticated_identity = authenticated_identity,
@@ -6924,17 +7007,24 @@ pub const ApiHttpServer = struct {
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
+            deadline_ns: u64,
             source: table_reads.TableReadSource,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
                     .ptr = runner,
                     .vtable = &.{
+                        .build_query = buildQuery,
                         .run_query = runQuery,
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn buildQuery(ptr: *anyopaque, a: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return runner.server.buildRetrievalQuery(a, request, null, .{ .io = runner.server.inferenceIo(), .deadline_ns = runner.deadline_ns }, generator);
             }
 
             fn runQuery(
@@ -6945,11 +7035,13 @@ pub const ApiHttpServer = struct {
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
                 var semantic_resolver = runner.server.semanticStatusResolver(.internal, "");
+                semantic_resolver.query_embedding_deadline_ns = runner.deadline_ns;
                 var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
                 };
                 defer query_req.deinit(alloc);
+                query_req.req.execution_deadline_ns = if (query_req.req.execution_deadline_ns) |deadline| @min(deadline, runner.deadline_ns) else runner.deadline_ns;
                 runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
                     error.TableNotFound => return err,
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
@@ -7012,6 +7104,7 @@ pub const ApiHttpServer = struct {
             secret_store: ?*common_secrets.FileStore,
             inference_api_key: ?[]const u8,
             io: std.Io,
+            deadline_ns: u64,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
@@ -7029,7 +7122,7 @@ pub const ApiHttpServer = struct {
                 const runner: *@This() = @ptrCast(@alignCast(runner_ptr));
                 var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = .{ .io = runner.io, .deadline_ns = runner.deadline_ns } }, messages);
             }
         };
         var generation_runner = RetrievalGenerationRunner{
@@ -7037,10 +7130,12 @@ pub const ApiHttpServer = struct {
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
             .io = self.inferenceIo(),
+            .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
         };
 
         var query_runner = RetrievalQueryRunner{
             .server = self,
+            .deadline_ns = generation_runner.deadline_ns,
             .source = source,
         };
         return retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), body);
@@ -30563,7 +30658,7 @@ test "api http server serves query builder response envelope" {
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
     const query_builder_body =
-        \\{"table":"docs","intent":"find published raft articles","mode":"auto","output":"query_request","constraints":{"limit":7},"max_internal_iterations":3,"max_user_clarifications":2}
+        \\{"table":"docs","intent":"find published raft articles","mode":"auto","output":"query_request","constraints":{"limit":7},"max_internal_iterations":0,"max_user_clarifications":2}
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -30579,7 +30674,7 @@ test "api http server serves query builder response envelope" {
     try std.testing.expect(parsed.value.session_id != null);
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, parsed.value.status.?);
     try std.testing.expectEqual(@as(i64, 1), parsed.value.iteration.?);
-    try std.testing.expectEqual(@as(i64, 2), parsed.value.remaining_internal_iterations.?);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.remaining_internal_iterations.?);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.remaining_user_clarifications.?);
     try std.testing.expect(parsed.value.steps != null);
     try std.testing.expectEqualStrings("query_builder", parsed.value.steps.?[0].name);
@@ -30592,6 +30687,29 @@ test "api http server serves query builder response envelope" {
     try std.testing.expectEqualStrings("full_text", parsed.value.specialist.?);
     try std.testing.expect(parsed.value.plan != null);
     try std.testing.expect(parsed.value.explanation != null);
+
+    // Positive budgets opt into model-directed planning, not the compatibility
+    // planner above. Without a generator they must fail, never silently fall
+    // back to a deterministic plan or claim successful tool execution.
+    for ([_]i64{ 1, 3, 20 }) |iterations| {
+        const tool_body = try std.json.Stringify.valueAlloc(alloc, .{
+            .table = "docs",
+            .intent = "find published raft articles",
+            .max_internal_iterations = iterations,
+        }, .{});
+        defer alloc.free(tool_body);
+        var tool_resp = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = routes.Routes.agents_query_builder,
+            .body = tool_body,
+        });
+        defer tool_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), tool_resp.status);
+        try std.testing.expectEqualStrings("application/json", tool_resp.content_type.?);
+        var failure = try std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, tool_resp.body, .{});
+        defer failure.deinit();
+        try std.testing.expectEqualStrings("query planning requires a tool-capable generator", failure.value.@"error");
+    }
 }
 
 test "api http server query builder infers semantic indexes from table metadata" {

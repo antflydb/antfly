@@ -139,6 +139,7 @@ pub const Node = union(enum) {
     if_stmt: IfStmt,
     for_stmt: ForStmt,
     set_stmt: SetStmt,
+    capture_stmt: CaptureStmt,
     macro_stmt: MacroStmt,
 };
 
@@ -181,6 +182,15 @@ pub const SetStmt = struct {
     value: *Expr,
     strip_left: bool = false,
     strip_right: bool = false,
+};
+
+pub const CaptureStmt = struct {
+    name: []const u8,
+    body: []const *Node,
+    open_strip_left: bool,
+    open_strip_right: bool,
+    close_strip_left: bool,
+    close_strip_right: bool,
 };
 
 pub const MacroStmt = struct {
