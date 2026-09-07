@@ -62813,6 +62813,7 @@ test "relational columnar existence and null projection do not fetch payload rec
     defer null_row.deinit(alloc);
     try std.testing.expectEqualStrings("{\"payload\":null}", null_row.documents[0].json);
     try std.testing.expect(stats.used);
+    try std.testing.expectEqual(@as(u64, 0), stats.logical_slots_initialized);
     try std.testing.expectEqual(@as(u64, 0), stats.payload_bytes_read);
     try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
     // A consumer that actually needs the missing payload still falls back.
@@ -63780,6 +63781,196 @@ test "relational columnar overlays merge mutations in order without scanning cle
         try std.testing.expectEqual(@as(usize, 2), short.hashes.len);
         try std.testing.expectEqual(@as(u64, 0), dense_stats.dense_delta_scans);
     }
+}
+
+test "relational columnar decoded cache preserves snapshots and releases visitor failures" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .string }};
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const writes = try scratch.alloc(types.BatchWrite, 1024);
+        for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = "{\"payload\":\"original\"}" };
+        try db.batch(.{ .writes = writes });
+        try drainTestRelationalMaintenance(&db);
+        const Visitor = struct {
+            db: *DB,
+            seen: usize = 0,
+            mutate: bool = false,
+            fail: bool = false,
+            cancel: ?*std.atomic.Value(bool) = null,
+            fn visit(ptr: ?*anyopaque, row: types.ScanVisitEntry) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr.?));
+                if (self.mutate and self.seen == 0) {
+                    try self.db.batch(.{ .writes = &.{.{ .key = "k1023", .value = "{\"payload\":\"changed\"}" }} });
+                    try drainTestRelationalMaintenance(self.db);
+                }
+                try std.testing.expectEqualStrings("{\"payload\":\"original\"}", row.document_json.?);
+                self.seen += 1;
+                if (self.fail and self.seen == 257) return error.TestVisitorFailed;
+                if (self.seen == 257) if (self.cancel) |flag| flag.store(true, .release);
+            }
+        };
+        var measured = std.testing.FailingAllocator.init(alloc, .{});
+        var stats: types.ColumnarScanStats = .{};
+        var visitor: Visitor = .{ .db = &db, .mutate = true };
+        try db.scanVisit(measured.allocator(), "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .columnar_stats = &stats }, .{ .context = &visitor, .visit = Visitor.visit });
+        try std.testing.expectEqual(@as(usize, 1024), visitor.seen);
+        try std.testing.expectEqual(@as(u64, 3), stats.decoded_cache_hits);
+        try std.testing.expectEqual(@as(u64, 1), stats.payload_pages_read);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+        // The next snapshot must observe the replacement, not the old cache.
+        var latest = try db.scan(alloc, "k1023", "k1023", .{ .inclusive_from = true, .include_documents = true, .include_all_fields = false, .fields = &.{"payload"} });
+        defer latest.deinit(alloc);
+        try std.testing.expectEqualStrings("{\"payload\":\"changed\"}", latest.documents[0].json);
+        visitor = .{ .db = &db, .fail = true };
+        stats = .{};
+        try std.testing.expectError(error.TestVisitorFailed, db.scanVisit(measured.allocator(), "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .columnar_stats = &stats }, .{ .context = &visitor, .visit = Visitor.visit }));
+        try std.testing.expectEqual(@as(usize, 257), visitor.seen);
+        try std.testing.expect(stats.decoded_cache_hits > 0);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+        var cancelled = std.atomic.Value(bool).init(false);
+        visitor = .{ .db = &db, .cancel = &cancelled };
+        stats = .{};
+        try std.testing.expectError(error.Canceled, db.scanVisit(measured.allocator(), "", "", .{
+            .include_documents = true,
+            .include_all_fields = false,
+            .fields = &.{"payload"},
+            .columnar_stats = &stats,
+            .cancellation = types.CancellationToken.fromAtomic(&cancelled),
+        }, .{ .context = &visitor, .visit = Visitor.visit }));
+        try std.testing.expectEqual(@as(usize, 257), visitor.seen);
+        try std.testing.expect(stats.decoded_cache_hits > 0);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+    }
+}
+
+test "relational columnar decoded reuse benchmark" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        for ([_]bool{ true, false }) |shared| {
+            var path_buf: [256]u8 = undefined;
+            const path = tempPath(&path_buf);
+            defer cleanupTempDir(path);
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+            defer db.close();
+            const columns = [_]schema_mod.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .string }};
+            try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var random = std.Random.DefaultPrng.init(73);
+            const bytes = try scratch.alloc(u8, 64 * 1024);
+            for (bytes) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+            const writes = try scratch.alloc(types.BatchWrite, 128);
+            for (writes, 0..) |*write, i| {
+                if (!shared) _ = try std.fmt.bufPrint(bytes[0..8], "{d:0>8}", .{i});
+                write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = try std.fmt.allocPrint(scratch, "{{\"payload\":\"{s}\"}}", .{bytes}) };
+            }
+            try db.batch(.{ .writes = writes });
+            try drainTestRelationalMaintenance(&db);
+            var elapsed: [2][9]u64 = undefined;
+            var allocated: [2]usize = @splat(0);
+            var counters: [2]types.ColumnarScanStats = @splat(.{});
+            // Alternate cache-off/on order; warm both paths before timing.
+            for (0..10) |round| for (0..2) |step| {
+                const mode = (round + step) % 2;
+                var measured = std.testing.FailingAllocator.init(alloc, .{});
+                var stats: types.ColumnarScanStats = .{};
+                const started = platform_time.monotonicNs();
+                var result = try db.scan(measured.allocator(), "", "", .{
+                    .filter_query_json = "{\"term\":{\"payload\":\"not present\"}}",
+                    .columnar_decoded_cache_bytes = if (mode == 0) 0 else 512 * 1024,
+                    .columnar_stats = &stats,
+                });
+                result.deinit(measured.allocator());
+                const ns = platform_time.monotonicNs() - started;
+                try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+                try std.testing.expect(stats.used);
+                try std.testing.expect(stats.blocks_read >= 8);
+                try std.testing.expectEqual(@as(u64, 0), stats.rows_selected);
+                try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
+                try std.testing.expect(stats.decoded_cache_peak_bytes <= 512 * 1024);
+                if (mode == 0) {
+                    try std.testing.expectEqual(@as(u64, 0), stats.decoded_cache_hits);
+                    try std.testing.expectEqual(@as(u64, 0), stats.decoded_cache_peak_bytes);
+                } else if (shared) {
+                    try std.testing.expectEqual(@as(u64, 1), stats.payload_pages_read);
+                    try std.testing.expectEqual(stats.blocks_read - 1, stats.decoded_cache_hits);
+                } else try std.testing.expectEqual(@as(u64, 0), stats.decoded_cache_hits);
+                if (round > 0) elapsed[mode][round - 1] = ns;
+                allocated[mode] = measured.allocated_bytes;
+                counters[mode] = stats;
+            };
+            for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+            std.debug.print("\ncolumnar decoded reuse: backend={s}, shared={}, median ns off/on={d}/{d}, allocated bytes={d}/{d}, decodes={d}/{d}, hits={d}, peak={d}\n", .{
+                @tagName(backend), shared, elapsed[0][4], elapsed[1][4], allocated[0], allocated[1], counters[0].payload_pages_read, counters[1].payload_pages_read, counters[1].decoded_cache_hits, counters[1].decoded_cache_peak_bytes,
+            });
+        }
+    }
+}
+
+test "relational columnar wide metadata allocation benchmark" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const columns = try scratch.alloc(schema_mod.RelationalColumn, 1024);
+    var object = std.json.ObjectMap.empty;
+    var predicates = std.array_list.Managed(std.json.Value).init(scratch);
+    for (columns, 0..) |*column, i| {
+        const name = try std.fmt.allocPrint(scratch, "f{d:0>4}", .{i});
+        column.* = .{ .name = name, .path = name, .column_type = .integer };
+        try object.put(scratch, name, .{ .integer = @intCast(i) });
+        var exists = std.json.ObjectMap.empty;
+        try exists.put(scratch, "field", .{ .string = name });
+        var predicate = std.json.ObjectMap.empty;
+        try predicate.put(scratch, "exists", .{ .object = exists });
+        try predicates.append(.{ .object = predicate });
+    }
+    var conjunction = std.json.ObjectMap.empty;
+    try conjunction.put(scratch, "conjuncts", .{ .array = predicates });
+    const filter = try std.json.Stringify.valueAlloc(scratch, std.json.Value{ .object = conjunction }, .{});
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = columns });
+    const json = try std.json.Stringify.valueAlloc(scratch, std.json.Value{ .object = object }, .{});
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = json }} });
+    try drainTestRelationalMaintenance(&db);
+    var measured = std.testing.FailingAllocator.init(alloc, .{});
+    const started = platform_time.monotonicNs();
+    for (0..12) |_| {
+        var stats: types.ColumnarScanStats = .{};
+        var result = try db.scan(measured.allocator(), "", "", .{ .filter_query_json = filter, .columnar_stats = &stats });
+        defer result.deinit(measured.allocator());
+        try std.testing.expectEqual(@as(usize, 1), result.hashes.len);
+        try std.testing.expect(stats.used);
+        try std.testing.expectEqual(@as(u64, 1024), stats.column_metadata_reads);
+        try std.testing.expectEqual(@as(u64, 0), stats.payload_pages_read);
+        try std.testing.expectEqual(@as(u64, 0), stats.values_materialized);
+        try std.testing.expectEqual(@as(u64, 0), stats.logical_slots_initialized);
+        try std.testing.expect(stats.column_view_bytes <= 256 * 1024);
+        try std.testing.expectEqual(@as(u64, 0), stats.decoded_cache_peak_bytes);
+    }
+    std.debug.print("\ncolumnar wide metadata: ns/scan={d}, allocated bytes/scan={d}\n", .{ (platform_time.monotonicNs() - started) / 12, measured.allocated_bytes / 12 });
+    try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+    // Keep metadata-only scans independent of max_rows-sized value caches.
+    try std.testing.expect(measured.allocated_bytes / 12 < 4 * 1024 * 1024);
 }
 
 test "relational columnar narrow projections load only selected metadata on wide rows" {

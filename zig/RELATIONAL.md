@@ -395,6 +395,60 @@ per column/block. `cell_slots_initialized` and `cell_cache_hits` expose this CPU
 work independently of payload I/O. There is no per-projected-row bitmap/page
 rescan, and no compatibility decoder for previous PR-only column formats.
 
+Column read metadata is separate from decoded/materialized values. Metadata
+views use a compact loaded-page bitmap and allocate no JSON slots. Logical
+slots are allocated only on first materialization, sized to the actual block
+row count; scalar and existence predicates never allocate them.
+`column_view_bytes` and `logical_slots_initialized` expose these costs.
+
+Each scan also owns a lazy, byte-budgeted cache of verified typed payloads,
+shared across its block read scopes. Payloads own decompressed byte buffers;
+scalar payloads discard their decompression buffers after decoding. Neither
+backend-borrowed bytes nor schema-dependent cells/JSON enter this cache.
+The cache is confined to one snapshot and manifest generation, so no global
+lock, cross-query invalidation, or schema-lifetime coupling is needed.
+Active blocks pin entries until their cells and visitor callbacks are finished.
+Four-way set-associative lookup and 64 total slots bound lookup work and metadata;
+LRU replacement skips pinned entries. Admission accounts for the slot table,
+payload headers, typed arrays, and owned decompression buffers. The default
+budget is 1 MiB per scan (`ScanOptions.columnar_decoded_cache_bytes`, internal
+only); zero disables cross-block reuse. Oversized values, pinned pressure, and
+cache-metadata allocation failure bypass admission without failing the scan.
+This bounds retained cache memory, not the active block's decode workspace,
+caller-retained output, or allocator bookkeeping. Memory is released on every
+exit, including cancellation, visitor failure, and primary fallback.
+`decoded_cache_{hits,misses,admissions,evictions,bypasses,peak_bytes}` report
+reuse and pressure; payload-read counters count actual misses, not cache hits.
+A process-wide cache is intentionally not enabled: cross-query reuse must
+justify a separate global admission/memory policy with concurrency benchmarks.
+
+Reproducible focused benchmarks (Zig 0.16, ReleaseFast, arm64 macOS):
+
+```sh
+zig build lib-storage-test -Doptimize=ReleaseFast -- \
+  --test-filter 'relational columnar wide metadata allocation benchmark' \
+  --test-filter 'relational columnar decoded reuse benchmark'
+```
+
+The payload fixture scans 128 rows containing 64 KiB strings, with either one
+shared value or 128 distinct values. Both variants use a nonmatching typed term
+predicate, no document materialization, and a 512 KiB cache budget. Nine measured
+rounds follow a warmup, alternating cache-off/on order. One local run measured:
+
+| Backend / values | Median ms, off → on | Payload decodes, off → on |
+| --- | ---: | ---: |
+| LMDB / shared | 1.780 → 0.431 | 8 → 1 |
+| LSM / shared | 3.136 → 1.604 | 8 → 1 |
+| LMDB / distinct | 23.936 → 23.842 | 128 → 128 |
+| LSM / distinct | 50.211 → 50.145 | 128 → 128 |
+
+Peak retained cache bytes were 68,756 for shared values and 462,860 for distinct
+values. The one-row, 1,024-column existence-filter fixture allocated 3,337,310
+bytes/scan after lazy read state, versus 20,308,708 with the same fixture before
+the change. Timings are workload-specific and sensitive to machine load; CI
+asserts exact results, allocation budgets, reuse counts, and ownership cleanup,
+not latency thresholds. These are not disk-cold or concurrent-query benchmarks.
+
 Scan planning is metadata-first. Access-path admission happens before predicate
 payload decoding, and dirty markers remove replaced/deleted base candidates
 before evaluation. Bounded marker probes feed admission; execution completes

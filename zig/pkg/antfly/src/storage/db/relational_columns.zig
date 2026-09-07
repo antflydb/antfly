@@ -25,6 +25,7 @@ const schema = @import("../schema.zig");
 const registry = @import("schema_registry.zig");
 const dv = @import("../../section/typed_doc_values.zig");
 const payloads = @import("column_payloads.zig");
+const read_cache = @import("column_read_cache.zig");
 const graph = @import("query/graph_exec.zig");
 const types = @import("types.zig");
 const platform_time = @import("antfly_platform").time;
@@ -50,7 +51,7 @@ pub var test_cleanup_page_limit: ?usize = null;
 pub var test_now_ns: ?u64 = null;
 const maintenance_records = 256;
 const maintenance_bytes = 256 * 1024;
-const max_rows = 256;
+const max_rows = read_cache.max_rows;
 const null_bytes = max_rows / 8;
 
 /// Process-local observations, sampled without taking the maintenance lock.
@@ -250,13 +251,7 @@ const Column = struct { writer: dv.TypedDocValuesWriter, presence: [null_bytes]u
 /// Exact uncompressed cell bytes in typed doc values, including its doc ID.
 /// Byte utilization (rather than row density) preserves useful skewed pages.
 fn payloadCellBytes(value: dv.TypedValue) u64 {
-    return 4 + switch (value) {
-        .bytes_val => |bytes| @as(u64, bytes.len) + 4,
-        .bool_val => @as(u64, 1),
-        .geo_point => @as(u64, 16),
-        .numeric_val => @as(u64, 9),
-        else => @as(u64, 8),
-    };
+    return read_cache.cellBytes(value);
 }
 
 const max_partial_fragments = 8;
@@ -655,6 +650,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             defer view.release();
             try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
             var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.artifact_repair_metadata_stop };
+            defer block.deinit();
             var dirty = try read.openCursor();
             defer dirty.close();
             var pending = try dirty.seekAtOrAfter(try std.mem.concat(scratch, u8, &.{ dirty_prefix, range.start }));
@@ -2185,6 +2181,24 @@ fn validateOrdinalPages(pages: []const u8, rows: usize, columns: usize) !void {
     }
 }
 
+test "relational columnar metadata state is compact and logical slots are lazy" {
+    try std.testing.expect(@sizeOf(Block.ColumnView) <= 256);
+    var measured = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var value: Block.ColumnView = .{};
+    try std.testing.expect(value.logical == null);
+    try std.testing.expectEqual(@as(usize, 0), measured.allocated_bytes);
+    const slots = try value.logicalSlots(measured.allocator(), 1);
+    defer measured.allocator().free(slots);
+    try std.testing.expectEqual(@as(usize, 1), slots.len);
+    try std.testing.expect(slots[0] == null);
+    try std.testing.expectEqual(@sizeOf(?std.json.Value), measured.allocated_bytes);
+    try std.testing.expectEqual(slots.ptr, (try value.logicalSlots(measured.allocator(), 1)).ptr);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var fresh: Block.ColumnView = .{};
+    try std.testing.expectError(error.OutOfMemory, fresh.logicalSlots(failing.allocator(), 1));
+    try std.testing.expect(fresh.logical == null);
+}
+
 const Block = struct {
     alloc: alloc_type,
     scope: *backend_erased.ReadScope,
@@ -2196,12 +2210,17 @@ const Block = struct {
     ordinal_pages: []const u8,
     values: std.AutoHashMapUnmanaged(u32, *ColumnView) = .empty,
     orders: std.AutoHashMapUnmanaged(usize, []const usize) = .empty,
-    decoded_payloads: std.AutoHashMapUnmanaged([32]u8, *DecodedPayload) = .empty,
+    decoded_payloads: std.AutoHashMapUnmanaged([32]u8, *read_cache.Payload) = .empty,
+    payload_cache: ?*read_cache.Cache = null,
     stats: ?*types.ColumnarScanStats = null,
     scan_options: ?types.ScanOptions = null,
     stop: ?*const std.atomic.Value(bool) = null,
 
-    const DecodedPayload = struct { value_type: dv.ValueType, values: []?dv.TypedValue, encoded_bytes: u64, logical_bytes: u64 };
+    fn deinit(self: *@This()) void {
+        var it = self.decoded_payloads.valueIterator();
+        while (it.next()) |payload| payload.*.release();
+        self.decoded_payloads.deinit(self.alloc);
+    }
 
     fn checkWork(self: *@This()) !void {
         if (self.stop) |stop| if (stop.load(.acquire)) return error.Canceled;
@@ -2217,9 +2236,18 @@ const Block = struct {
         bitmaps: []const u8 = &.{},
         cells: ?[]?codec.Cell = null,
         pages: ?ColumnPages = null,
-        loaded_pages: [max_rows]bool = @splat(false),
+        loaded_pages: std.StaticBitSet(max_rows) = .initEmpty(),
         read_payload: bool = false,
-        logical: [max_rows]?std.json.Value = @splat(null),
+        logical: ?[]?std.json.Value = null,
+
+        fn logicalSlots(self: *@This(), alloc: alloc_type, rows: usize) ![]?std.json.Value {
+            if (self.logical == null) {
+                const slots = try alloc.alloc(?std.json.Value, rows);
+                @memset(slots, null);
+                self.logical = slots;
+            }
+            return self.logical.?;
+        }
         fn present(self: @This(), row: usize) bool {
             return self.bitmaps.len != 0 and self.bitmaps[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0;
         }
@@ -2229,6 +2257,7 @@ const Block = struct {
         if (self.values.get(ordinal)) |value| return value;
         const value = try self.alloc.create(ColumnView);
         value.* = .{};
+        if (self.stats) |stats| stats.column_view_bytes += @sizeOf(ColumnView);
         var low: usize = 0;
         var high = self.ordinal_pages.len / 12;
         while (low < high) {
@@ -2292,7 +2321,7 @@ const Block = struct {
         const column_view = try self.column(ordinal);
         if (column_view.pages) |pages| {
             for (0..pages.count()) |page| {
-                if (column_view.loaded_pages[page] or pages.size(page) == 0) continue;
+                if (column_view.loaded_pages.isSet(page) or pages.size(page) == 0) continue;
                 for (pages.first(page)..pages.end(page)) |i| {
                     if (candidates[i] and column_view.present(i) and values[i] == null) {
                         try self.loadPage(ordinal, page);
@@ -2308,38 +2337,24 @@ const Block = struct {
         try self.checkWork();
         const values = try self.initCells(ordinal);
         const column_view = try self.column(ordinal);
-        if (column_view.loaded_pages[page]) return;
+        if (column_view.loaded_pages.isSet(page)) return;
         const pages = column_view.pages.?;
         const first = pages.first(page);
         const end = pages.end(page);
         const ref = pages.reference(page);
         const decoded = self.decoded_payloads.get(ref.digest) orelse blk: {
-            const encoded = try self.scope.get(try payloads.key(self.alloc, self.generation, ref.digest, false));
-            try ref.validate(encoded);
-            const bytes = encoded[0 .. encoded.len - 4];
-            if (self.stats) |stats| {
-                stats.payload_pages_read += 1;
-                stats.encoded_bytes_read += encoded.len;
-                stats.payload_bytes_read += encoded.len;
-            }
-            var reader = try dv.TypedDocValuesReader.init(self.alloc, bytes);
-            var decoded_values: [max_rows]?dv.TypedValue = @splat(null);
-            var extent: usize = 0;
-            var logical_bytes: u64 = 0;
-            for (0..reader.num_chunks) |chunk_index| {
-                var chunk = try reader.decodeChunk(@intCast(chunk_index));
-                var it = chunk.iterator();
-                while (try it.next()) |entry| {
-                    if (entry.doc_id >= ref.source_rows or decoded_values[entry.doc_id] != null) return error.InvalidColumnSegment;
-                    decoded_values[entry.doc_id] = entry.value;
-                    logical_bytes += payloadCellBytes(entry.value);
-                    extent = @max(extent, entry.doc_id + 1);
+            const result = (if (self.payload_cache) |cache| cache.get(ref.digest) else null) orelse decode: {
+                const encoded = try self.scope.get(try payloads.key(self.alloc, self.generation, ref.digest, false));
+                if (self.stats) |stats| {
+                    stats.payload_pages_read += 1;
+                    stats.encoded_bytes_read += encoded.len;
+                    stats.payload_bytes_read += encoded.len;
                 }
-            }
-            const digest = payloads.identity(reader.value_type, decoded_values[0..extent]);
-            if (!std.mem.eql(u8, &digest, &ref.digest)) return error.InvalidColumnSegment;
-            const result = try self.alloc.create(DecodedPayload);
-            result.* = .{ .value_type = reader.value_type, .values = try self.alloc.dupe(?dv.TypedValue, decoded_values[0..extent]), .encoded_bytes = encoded.len, .logical_bytes = logical_bytes };
+                const result = try read_cache.Payload.decode(if (self.payload_cache) |cache| cache.alloc else self.alloc, encoded, ref);
+                if (self.payload_cache) |cache| cache.admit(ref.digest, result);
+                break :decode result;
+            };
+            errdefer result.release();
             try self.decoded_payloads.put(self.alloc, ref.digest, result);
             break :blk result;
         };
@@ -2357,24 +2372,28 @@ const Block = struct {
             values[row] = .{ .ordinal = ordinal, .path = col.path, .value_type = decoded.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .value = cell_value };
         }
         for (first..end) |i| if ((values[i] != null) != column_view.present(i)) return error.InvalidColumnSegment;
-        column_view.loaded_pages[page] = true;
+        column_view.loaded_pages.set(page);
     }
 
     fn logicalValue(self: *@This(), ordinal: u32, row: usize) !?std.json.Value {
         const value = try self.column(ordinal);
         if (!value.present(row)) return null;
-        if (value.logical[row]) |logical| return logical;
-        if (value.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) {
-            value.logical[row] = .null;
-            return .null;
-        }
+        // Nulls are already represented in metadata; even a projected null
+        // needs no decoded cells or materialized-value cache.
+        if (value.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return .null;
+        const had_slots = value.logical != null;
+        const logical_slots = try value.logicalSlots(self.alloc, self.rows.len);
+        if (!had_slots) if (self.stats) |stats| {
+            stats.logical_slots_initialized += logical_slots.len;
+        };
+        if (logical_slots[row]) |logical| return logical;
         const cells_view = try self.initCells(ordinal);
         if (cells_view[row] != null) {
             if (self.stats) |stats| stats.cell_cache_hits += 1;
         } else try self.loadPage(ordinal, value.pages.?.containing(row));
         const cell = cells_view[row] orelse return error.InvalidColumnSegment;
         const logical = try codec.ownedJsonValueFromCellAlloc(self.alloc, self.table.relational_columns[ordinal], cell);
-        value.logical[row] = logical;
+        logical_slots[row] = logical;
         if (self.stats) |stats| stats.values_materialized += 1;
         return logical;
     }
@@ -2486,9 +2505,10 @@ const Block = struct {
         defer seen.deinit(self.alloc);
         if (column_view.pages) |pages| {
             for (0..pages.count()) |page| {
-                if (column_view.loaded_pages[page]) continue;
+                if (column_view.loaded_pages.isSet(page)) continue;
                 const ref = pages.reference(page);
                 if (ref.bytes == 0 or self.decoded_payloads.contains(ref.digest) or seen.contains(ref.digest)) continue;
+                if (self.payload_cache) |cache| if (cache.contains(ref.digest)) continue;
                 for (pages.first(page)..pages.end(page)) |row| {
                     if (candidates[row] and column_view.present(row) and column_view.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) == 0) {
                         cost +|= pages.size(page);
@@ -2612,6 +2632,18 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
     defer dirty_ranges.cursor.close();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
+    var payload_cache = read_cache.Cache.init(alloc, opts.columnar_decoded_cache_bytes);
+    defer {
+        if (opts.columnar_stats) |stats| {
+            stats.decoded_cache_hits += payload_cache.stats.hits;
+            stats.decoded_cache_misses += payload_cache.stats.misses;
+            stats.decoded_cache_admissions += payload_cache.stats.admissions;
+            stats.decoded_cache_evictions += payload_cache.stats.evictions;
+            stats.decoded_cache_bypasses += payload_cache.stats.bypasses;
+            stats.decoded_cache_peak_bytes = @max(stats.decoded_cache_peak_bytes, payload_cache.stats.peak_bytes);
+        }
+        payload_cache.deinit();
+    }
     var had_range = false;
     while (try directory.next(arena.allocator())) |range| {
         defer _ = arena.reset(.free_all);
@@ -2663,7 +2695,8 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         var view = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
         defer view.release();
         try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
-        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats, .scan_options = opts };
+        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats, .scan_options = opts, .payload_cache = &payload_cache };
+        defer block.deinit();
         var matched: [max_rows]bool = @splat(true);
         var candidates: [max_rows]bool = @splat(false);
         for (rows, 0..) |row, i| candidates[i] = std.mem.order(u8, row.key, range.start) != .lt and (range.end.len == 0 or std.mem.order(u8, row.key, range.end) == .lt) and eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns);

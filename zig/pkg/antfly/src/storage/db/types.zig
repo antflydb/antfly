@@ -1120,6 +1120,14 @@ pub const LookupResult = struct {
 };
 
 pub const ColumnarScanStats = struct {
+    column_view_bytes: u64 = 0,
+    logical_slots_initialized: u64 = 0,
+    decoded_cache_hits: u64 = 0,
+    decoded_cache_misses: u64 = 0,
+    decoded_cache_admissions: u64 = 0,
+    decoded_cache_evictions: u64 = 0,
+    decoded_cache_bypasses: u64 = 0,
+    decoded_cache_peak_bytes: u64 = 0,
     overlay_tombstones_skipped: u64 = 0,
     cell_slots_initialized: u64 = 0,
     cell_cache_hits: u64 = 0,
@@ -1146,6 +1154,10 @@ pub const ColumnarScanStats = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Internal request-local decoded payload reuse budget. Includes retained
+    /// payload allocations and cache metadata; excludes active block workspace.
+    /// Zero disables cross-block reuse. Never serialized on the wire.
+    columnar_decoded_cache_bytes: usize = 1024 * 1024,
     /// Optional request-local instrumentation; never part of the wire format.
     columnar_stats: ?*ColumnarScanStats = null,
     inclusive_from: bool = false,
