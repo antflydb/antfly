@@ -589,12 +589,12 @@ pub const DocStore = struct {
             try self.write.?.delete(key);
         }
 
-        fn markColumnarDirty(self: *Txn, key: []const u8, _: ?[]const u8) anyerror!void {
+        fn markColumnarDirty(self: *Txn, key: []const u8, value: ?[]const u8) anyerror!void {
             if (!internal_keys.isRelationalRowKey(key)) return;
             const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
             defer self.alloc.free(dirty);
             const token = try columnarMutationToken(self, &self.columnar_mutation);
-            try self.put(dirty, &token);
+            try self.put(dirty, &internal_keys.relationalColumnarDirtyRecord(token, if (value) |bytes| bytes.len else 0));
         }
 
         fn invalidateColumns(self: *Txn, key: []const u8) anyerror!void {
@@ -703,7 +703,7 @@ pub const DocStore = struct {
                     const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
                     defer self.alloc.free(dirty);
                     const token = try columnarMutationToken(self, self.columnar_mutation);
-                    try self.runtime.?.appendPut(dirty, &token);
+                    try self.runtime.?.appendPut(dirty, &internal_keys.relationalColumnarDirtyRecord(token, value.len));
                 } else {
                     try self.markColumnarDirty(key, value);
                 }
@@ -726,12 +726,12 @@ pub const DocStore = struct {
                 try self.runtime.?.delete(key);
             }
 
-            fn markColumnarDirty(self: @This(), key: []const u8, _: ?[]const u8) anyerror!void {
+            fn markColumnarDirty(self: @This(), key: []const u8, value: ?[]const u8) anyerror!void {
                 if (!internal_keys.isRelationalRowKey(key)) return;
                 const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
                 defer self.alloc.free(dirty);
                 const token = try columnarMutationToken(self, self.columnar_mutation);
-                try self.put(dirty, &token);
+                try self.put(dirty, &internal_keys.relationalColumnarDirtyRecord(token, if (value) |bytes| bytes.len else 0));
             }
 
             fn invalidateColumns(self: @This(), key: []const u8) anyerror!void {
@@ -3301,7 +3301,7 @@ test "docstore relational bulk appends retain direct ingest and atomic dirty tok
         defer alloc.free(dirty);
         const token = try store.get(alloc, dirty);
         defer alloc.free(token);
-        try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarMutationToken(1), token);
+        try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(1), id.len), token);
     }
     const key = try internal_keys.relationalRowKeyAlloc(alloc, "row:0000");
     defer alloc.free(key);
@@ -3325,15 +3325,15 @@ test "docstore relational bulk appends retain direct ingest and atomic dirty tok
     try std.testing.expectEqualStrings("last", value);
     const token = try store.get(alloc, dirty);
     defer alloc.free(token);
-    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarMutationToken(2), token);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(2), 4), token);
     try store.put(key, "last");
     const rewritten = try store.get(alloc, dirty);
     defer alloc.free(rewritten);
-    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarMutationToken(3), rewritten);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(3), 4), rewritten);
     try store.delete(key);
     const deleted = try store.get(alloc, dirty);
     defer alloc.free(deleted);
-    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarMutationToken(4), deleted);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(4), 0), deleted);
     var exhausted: [8]u8 = undefined;
     std.mem.writeInt(u64, &exhausted, std.math.maxInt(u64), .little);
     try store.put(internal_keys.relational_columnar_mutation_key, &exhausted);

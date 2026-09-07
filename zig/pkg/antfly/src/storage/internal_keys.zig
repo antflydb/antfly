@@ -44,6 +44,16 @@ pub fn relationalColumnarMutationToken(version: u64) ColumnarMutationToken {
     return token;
 }
 
+/// Mutation identity plus current packed-row size (zero denotes a tombstone).
+/// Cost metadata shares the primary commit; it needs no primary read or hash.
+pub const ColumnarDirtyRecord = [16]u8;
+pub fn relationalColumnarDirtyRecord(token: ColumnarMutationToken, bytes: usize) ColumnarDirtyRecord {
+    var record: ColumnarDirtyRecord = undefined;
+    @memcpy(record[0..8], &token);
+    std.mem.writeInt(u64, record[8..16], bytes, .little);
+    return record;
+}
+
 pub fn invalidatesRelationalColumns(key: []const u8) bool {
     // Row-count catalog updates do not alter a layout. Schema publication
     // writes this key atomically with its catalog and invalidates the epoch.

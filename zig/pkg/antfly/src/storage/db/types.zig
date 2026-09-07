@@ -1129,6 +1129,10 @@ pub const ColumnarScanStats = struct {
     column_metadata_reads: u64 = 0,
     overlay_rows_read: u64 = 0,
     dense_delta_scans: u64 = 0,
+    costed_dirty_records: u64 = 0,
+    estimated_overlay_bytes: u64 = 0,
+    estimated_primary_bytes: u64 = 0,
+    uncovered_ranges_read: u64 = 0,
     payload_bytes_read: u64 = 0,
     rows_selected: u64 = 0,
     values_materialized: u64 = 0,
@@ -2563,6 +2567,9 @@ pub const VisibilityStats = struct {
 };
 
 pub const ColumnarMaintenanceStats = struct {
+    ranges_deferred: u64 = 0,
+    bootstrap_quanta: u64 = 0,
+    bytes_written: u64 = 0,
     pending: bool = false,
     backing_off: bool = false,
     /// Age since this process observed pending work, not the row's write time.

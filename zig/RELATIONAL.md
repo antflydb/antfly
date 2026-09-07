@@ -353,7 +353,7 @@ primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
 1 MiB of source rows (an individual large row remains subject to the request
 budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
 alongside presence and null bitmaps; no JSON projection or reparsing belongs in
-this build path. ACB4 separates row metadata from independently addressed,
+this build path. ACB5 separates row metadata from independently addressed,
 checksummed per-column metadata. The root contains a sorted sparse directory
 of 64-ordinal presence pages (12 bytes per populated page); binary search
 locates only the columns a predicate/projection requests, without allocating or
@@ -362,8 +362,9 @@ corruption, not a missing field. Existence predicates and null projections need 
 nor value-stream decoding, even for large vector/JSON columns.
 
 Column segments carry schema epochs, null state, and numeric min/max summaries.
-A manifest records the schema-bound generation and its initial replay coverage.
-Each primary put/delete atomically records an eight-byte mutation version,
+A manifest records the schema-bound generation and directory state.
+Each primary put/delete atomically records an eight-byte mutation version and
+an eight-byte packed-row size (zero for tombstones),
 including raw recovery writes that do not append replay. One durable counter
 increment is shared by all row mutations in a store transaction. Counter,
 primary and dirty records commit together; aborts cannot expose identities,
@@ -376,17 +377,28 @@ row; deletes and changed rows mask the corresponding old base row, even when
 the new row fails the predicate or expires. Delta evaluation is independent of
 base zone-map pruning. One changed row no longer forces primary reads for the
 whole range, and arbitrarily large deltas retain only one row read scope/arena.
-A bounded density probe switches large dirty bursts to sequential primary scans
-instead of issuing hundreds of point reads. Small LIMIT queries keep the
-overlay's early exit. Scan statistics expose this choice as `dense_delta_scans`.
+A bounded cost probe compares unchanged primary bytes plus live delta bytes
+against selected-column payload bytes plus delta point-read costs. Root metadata
+records packed bytes per row; selected column metadata records payload sizes.
+Replaced base rows are subtracted, while expired primary rows still count toward
+I/O. The estimate charges 4 KiB per random read and 64 bytes per sequential row,
+requiring a 25% margin and at least 16 deltas before switching to primary scans.
+It inspects at most 1,024 dirty records or 256 KiB without fetching primary values;
+incomplete estimates omit projection costs and use the observed point-read cost
+as an overlay lower bound, so very large insertion bursts can still choose a
+sequential scan without walking every marker first. Small LIMIT queries (up to 16) skip the
+probe and preserve early exit. These conservative cost weights are tuning
+parameters, not measured device latency claims. Scan statistics expose estimated
+costs, probe records, and the choice as `dense_delta_scans`.
 Ordinary row-count
 updates leave the accelerator live. Schema changes invalidate the generation.
 Bulk-capable backends append dirty tokens in the same ingest arena as primary
 rows, preserving direct ingestion without per-row sorted-map insertion.
 
 Maintenance compacts a dirty range and up to seven eligible neighbors, staging
-at most 64 replacement blocks per pass and yielding at block boundaries after
-50 ms. Dirty-image capture is independently capped at 1,024 records or 256 KiB;
+at most 64 replacement blocks per pass and yielding after 8 MiB of source rows
+or 50 ms, checked between rows after the first block (an individual row/block can exceed the byte or
+time target). Dirty-image capture is independently capped at 1,024 records or 256 KiB;
 large delete bursts therefore yield even when there are no live output rows.
 Large insertion bursts split into bounded passes while the
 uncovered suffix retains its old block and dirty markers. Publication replaces
@@ -399,12 +411,18 @@ both a journal write and a separate cleanup commit.
 Each cleanup transaction compare-clears at most 256 images (or a 256 KiB page)
 and deletes that page atomically. Restart resumes at the first remaining page
 without rebuilding published rows or retaining their source snapshot. Initial
-generation creation still streams the full primary snapshot and cleanup journal;
-its post-publication cleanup is incremental. A durable build token fences concurrent builders
+generation creation uses the same bounded builder. A checksummed, generation-bound
+bootstrap cursor advances atomically with each published prefix and cleanup job.
+The manifest explicitly marks initialization in progress: a missing checkpoint
+is corruption and triggers primary fallback/rebuild, never false full coverage.
+Every quantum takes a fresh snapshot; unfinished suffixes use primary scans even
+when their rows have no dirty records. A restart resumes the unpublished suffix,
+and racing changes in published prefixes retain their dirty markers. No table-wide
+snapshot or all-at-once final publication is required. A durable build token fences concurrent builders
 and makes canceled/crashed staging reclaimable on restart. Whole-store namespace
 replacement is fenced separately. Retired blocks remain available to pinned
-MVCC readers. Only initial creation, schema replacement, or corrupt-derived-data
-repair requires a full generation build. This keeps one row authority,
+MVCC readers. Initial creation, schema replacement, and corrupt-derived-data repair
+all use incremental coverage construction. This keeps one row authority,
 makes schema changes and crash recovery explicit, and prevents a user-visible
 index configuration from controlling SQL/relational scan performance.
 
@@ -415,6 +433,18 @@ bounded range builds), using a 100 ms active cadence while work remains and a
 five-second idle/resource-pressure backoff. DB statistics expose pending work,
 its observed age, backoff state, pass duration, failures, compacted ranges and
 written blocks without a catalog scan.
+
+The background worker admits dirty compaction when at least one quarter of the
+base rows changed, delta bytes reach one eighth of source bytes, accumulated read
+cost reaches the source size (at least 64 KiB), or the oldest observed deferral
+reaches ten seconds. First-observation timestamps are durable and do not reset on
+hot rewrites or restart; backwards wall-clock jumps admit work. Read pressure is
+a bounded 256-slot atomic hint table: collisions may compact a range early, never
+change visibility. A deferred turn advances the fairness cursor and yields rather
+than immediately looping over the same range. Explicit maintenance drains bypass
+admission, but retain all quantum limits. Statistics expose deferred ranges,
+bootstrap quanta and actual staged key/value bytes written. Age is an admission
+deadline, not a completion SLA under resource pressure or a large backlog.
 
 Underfilled blocks (fewer than 128 rows and less than 512 KiB of source rows)
 retain durable occupancy markers. A separate merge queue receives every fourth
