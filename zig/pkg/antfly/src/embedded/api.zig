@@ -1213,6 +1213,11 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
 
         try std.testing.expectError(error.Truncated, malformed_target.importPortable(alloc, malformed.items));
 
+        // A valid archive must not overlay a live target: relational restores
+        // can change the physical row namespace, so preserving old keys would
+        // make them silently unreachable after publication.
+        try std.testing.expectError(error.LiteImportTargetNotEmpty, malformed_target.importPortable(alloc, backup.items));
+
         const target_lookup = try malformed_target.lookupJson(alloc, "doc:malformed-target", "{}");
         defer alloc.free(target_lookup);
         try std.testing.expect(std.mem.indexOf(u8, target_lookup, "\"target survives malformed embedded import\"") != null);

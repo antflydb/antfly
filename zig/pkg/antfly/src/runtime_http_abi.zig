@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Versioned, C-layout HTTP values shared by independently generated runtime
 //! units. All byte slices are borrowed for the duration of a call. Response
@@ -106,11 +117,11 @@ pub const CancellationView = extern struct {
 };
 
 /// Transport-owned response sink used by independently generated handlers.
-/// `start` publishes SSE response headers, `write` transfers one body chunk,
+/// `start` publishes streaming response headers, `write` transfers one body chunk,
 /// and `close` commits the terminating frame. Callbacks are request-scoped.
 pub const StreamSink = extern struct {
     context: ?*anyopaque = null,
-    start: ?*const fn (?*anyopaque, u16) callconv(.c) CallbackStatus = null,
+    start: ?*const fn (?*anyopaque, u16, Bytes) callconv(.c) CallbackStatus = null,
     write: ?*const fn (?*anyopaque, Bytes) callconv(.c) CallbackStatus = null,
     close: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
 };

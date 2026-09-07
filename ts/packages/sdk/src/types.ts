@@ -155,6 +155,7 @@ export interface WriteOptions {
 
 // Table types
 export type Table = components["schemas"]["Table"];
+export type CommittedMutationOutcome = components["schemas"]["CommittedMutationOutcome"];
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
 export type TableMigration = components["schemas"]["TableMigration"];

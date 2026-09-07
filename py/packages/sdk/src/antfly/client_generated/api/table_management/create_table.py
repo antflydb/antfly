@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.committed_mutation_outcome import CommittedMutationOutcome
 from ...models.create_table_request import CreateTableRequest
 from ...models.error import Error
 from ...models.index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
@@ -38,11 +39,25 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table | None:
+) -> (
+    CommittedMutationOutcome
+    | Error
+    | Error
+    | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
+    | Table
+    | None
+):
     if response.status_code == 200:
         response_200 = Table.from_dict(response.json())
 
         return response_200
+
+    if response.status_code == 202:
+        response_202 = CommittedMutationOutcome.from_dict(response.json())
+
+        return response_202
 
     if response.status_code == 400:
 
@@ -99,7 +114,15 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table]:
+) -> Response[
+    CommittedMutationOutcome
+    | Error
+    | Error
+    | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
+    | Table
+]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -113,7 +136,15 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateTableRequest,
-) -> Response[Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table]:
+) -> Response[
+    CommittedMutationOutcome
+    | Error
+    | Error
+    | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
+    | Table
+]:
     r"""Create a new table
 
      Creates a new table with optional schema definition, indexes, and configuration.
@@ -228,7 +259,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table]
+        Response[CommittedMutationOutcome | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table]
     """
 
     kwargs = _get_kwargs(
@@ -248,7 +279,16 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: CreateTableRequest,
-) -> Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table | None:
+) -> (
+    CommittedMutationOutcome
+    | Error
+    | Error
+    | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
+    | Table
+    | None
+):
     r"""Create a new table
 
      Creates a new table with optional schema definition, indexes, and configuration.
@@ -363,7 +403,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table
+        CommittedMutationOutcome | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table
     """
 
     return sync_detailed(
@@ -378,7 +418,15 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateTableRequest,
-) -> Response[Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table]:
+) -> Response[
+    CommittedMutationOutcome
+    | Error
+    | Error
+    | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
+    | Table
+]:
     r"""Create a new table
 
      Creates a new table with optional schema definition, indexes, and configuration.
@@ -493,7 +541,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table]
+        Response[CommittedMutationOutcome | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table]
     """
 
     kwargs = _get_kwargs(
@@ -511,7 +559,16 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: CreateTableRequest,
-) -> Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table | None:
+) -> (
+    CommittedMutationOutcome
+    | Error
+    | Error
+    | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
+    | Table
+    | None
+):
     r"""Create a new table
 
      Creates a new table with optional schema definition, indexes, and configuration.
@@ -626,7 +683,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table
+        CommittedMutationOutcome | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | Table
     """
 
     return (

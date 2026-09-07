@@ -373,8 +373,30 @@ pub const DocStoreOptions = struct {
     read_only: bool = false,
 };
 
+fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationToken) !internal_keys.ColumnarMutationToken {
+    if (cached.*) |token| return token;
+    const old = txn.get(internal_keys.relational_columnar_mutation_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const previous = if (old) |bytes| blk: {
+        if (bytes.len != 8) return error.InvalidColumnMutationVersion;
+        break :blk std.mem.readInt(u64, bytes[0..8], .little);
+    } else 0;
+    const version = std.math.add(u64, previous, 1) catch return error.ColumnMutationVersionExhausted;
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, version, .little);
+    try txn.put(internal_keys.relational_columnar_mutation_key, &bytes);
+    const token = internal_keys.relationalColumnarMutationToken(version);
+    cached.* = token;
+    return token;
+}
+
 pub const DocStore = struct {
     alloc: Allocator,
+    /// Process-local wake hint, published only after successful row/schema
+    /// commits. Durable mutation IDs and timers remain the restart authority.
+    columnar_revision: std.atomic.Value(u64) = .init(0),
     kind: Kind,
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
@@ -384,10 +406,26 @@ pub const DocStore = struct {
     lmdb_user_db_kind: LmdbUserDbKind,
     replay_index_state: std.atomic.Value(u8),
     next_replay_sequence_cached: AtomicU64,
+    // A failed portable-import rollback leaves a durable recovery marker. Once
+    // fenced, this handle must not expose the partial generation or accept
+    // writes that restart recovery would later erase. Reopening constructs a
+    // fresh handle and completes marker recovery before returning it.
+    portable_import_recovery_required: std.atomic.Value(bool) = .init(false),
+    // Directory publication and native generation adoption have a durable
+    // commit point followed by an in-memory schema/catalog rebind. Normal
+    // readers must observe neither an incremental copy nor a new keyspace
+    // through the old runtime schema. Bounded atomic admission remains
+    // substantially cheaper than taking DB's global apply lock on hot reads.
+    // The high bit closes admission and the remaining bits count admitted
+    // transactions. Packing both into one atomic makes reader admission versus
+    // publication closure a single indivisible transition.
+    portable_import_reader_state: std.atomic.Value(usize) = .init(0),
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
     const replay_index_available: u8 = 2;
+    const portable_import_publication_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const portable_import_reader_count_mask: usize = ~portable_import_publication_bit;
 
     const Kind = enum {
         lmdb,
@@ -411,6 +449,10 @@ pub const DocStore = struct {
         probe: ?backend_erased.ProbeTxn = null,
         current_scan: ?backend_erased.CurrentScanTxn = null,
         write: ?backend_erased.WriteTxn = null,
+        portable_import_reader_owner: ?*DocStore = null,
+        columns_invalidated: bool = false,
+        columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
+        columnar_owner: ?*DocStore = null,
 
         pub const CursorAdapter = backend_erased.Cursor;
         pub const ReadAdapter = backend_adapter.ReadTxn(Txn, CursorAdapter, .{
@@ -428,10 +470,12 @@ pub const DocStore = struct {
         });
 
         pub fn abort(self: *Txn) void {
+            const reader_owner = self.portable_import_reader_owner;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     raw.abort();
                     self.* = undefined;
+                    if (reader_owner) |owner| owner.releasePortableImportReader();
                     return;
                 }
             }
@@ -445,13 +489,18 @@ pub const DocStore = struct {
                 read.abort();
             }
             self.* = undefined;
+            if (reader_owner) |owner| owner.releasePortableImportReader();
         }
 
         pub fn commit(self: *Txn) !void {
+            const reader_owner = self.portable_import_reader_owner;
+            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
+                    if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                     self.* = undefined;
+                    if (reader_owner) |owner| owner.releasePortableImportReader();
                     return;
                 }
             }
@@ -461,6 +510,8 @@ pub const DocStore = struct {
                 return error.ReadOnly;
             }
             self.* = undefined;
+            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+            if (reader_owner) |owner| owner.releasePortableImportReader();
         }
 
         pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -471,6 +522,24 @@ pub const DocStore = struct {
             if (self.probe) |*probe| return try probe.get(key);
             if (self.current_scan != null) return error.Unsupported;
             return try self.read.?.get(key);
+        }
+
+        /// Block-scoped values from this exact snapshot. Close scopes before
+        /// aborting the transaction (which also owns the portable-import fence).
+        pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {
+            if (supports_lmdb) if (self.raw) |*raw| {
+                const Scope = struct {
+                    raw: *LmdbTransaction,
+                    dbi: LmdbDbi,
+                    pub fn get(scope: *@This(), key: []const u8) ![]const u8 {
+                        return scope.raw.get(scope.dbi, key);
+                    }
+                    pub fn close(_: *@This()) void {}
+                };
+                return backend_erased.readScopeFrom(alloc, Scope{ .raw = raw, .dbi = self.dbi });
+            };
+            if (self.read) |*read| return read.openReadScope(alloc);
+            return error.ReadOnly;
         }
 
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
@@ -504,6 +573,8 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+            try self.markColumnarDirty(key, value);
+            try self.invalidateColumns(key);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.put(self.dbi, key, value, .{});
@@ -514,6 +585,8 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
+            try self.markColumnarDirty(key, null);
+            try self.invalidateColumns(key);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.delete(self.dbi, key);
@@ -521,6 +594,23 @@ pub const DocStore = struct {
                 }
             }
             try self.write.?.delete(key);
+        }
+
+        fn markColumnarDirty(self: *Txn, key: []const u8, value: ?[]const u8) anyerror!void {
+            if (!internal_keys.isRelationalRowKey(key)) return;
+            const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+            defer self.alloc.free(dirty);
+            const token = try columnarMutationToken(self, &self.columnar_mutation);
+            try self.put(dirty, &internal_keys.relationalColumnarDirtyRecord(token, if (value) |bytes| bytes.len else 0));
+        }
+
+        fn invalidateColumns(self: *Txn, key: []const u8) anyerror!void {
+            if (self.columns_invalidated or !internal_keys.invalidatesRelationalColumns(key)) return;
+            self.delete(internal_keys.relational_columnar_manifest_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.columns_invalidated = true;
         }
 
         pub fn cursor(self: *Txn) !LmdbCursor {
@@ -559,13 +649,20 @@ pub const DocStore = struct {
     };
 
     pub const Batch = struct {
+        columnar_owner: ?*DocStore = null,
         alloc: Allocator,
+        columns_invalidated: bool = false,
+        columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
+        unordered_bulk_append_puts: bool = false,
         raw: ?LmdbBatch = null,
         dbi: LmdbDbi = undefined,
         runtime: ?backend_erased.Batch = null,
 
         pub const BatchTxn = struct {
             alloc: Allocator,
+            columns_invalidated: *bool,
+            columnar_mutation: *?internal_keys.ColumnarMutationToken,
+            unordered_bulk_append_puts: bool = false,
             raw: ?*LmdbTransaction = null,
             dbi: LmdbDbi = undefined,
             runtime: ?*backend_erased.Batch = null,
@@ -595,6 +692,8 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.markColumnarDirty(key, value);
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         try raw.put(self.dbi, key, value, .{});
@@ -605,6 +704,18 @@ pub const DocStore = struct {
             }
 
             pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
+                    // Keep auxiliary records in the bulk arena too. A regular
+                    // put drains that arena into a sorted mutable map, causing
+                    // quadratic insertion when dirty keys precede every row.
+                    const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+                    defer self.alloc.free(dirty);
+                    const token = try columnarMutationToken(self, self.columnar_mutation);
+                    try self.runtime.?.appendPut(dirty, &internal_keys.relationalColumnarDirtyRecord(token, value.len));
+                } else {
+                    try self.markColumnarDirty(key, value);
+                }
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw != null) return error.Unsupported;
                 }
@@ -612,6 +723,8 @@ pub const DocStore = struct {
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
+                try self.markColumnarDirty(key, null);
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         try raw.delete(self.dbi, key);
@@ -619,6 +732,23 @@ pub const DocStore = struct {
                     }
                 }
                 try self.runtime.?.delete(key);
+            }
+
+            fn markColumnarDirty(self: @This(), key: []const u8, value: ?[]const u8) anyerror!void {
+                if (!internal_keys.isRelationalRowKey(key)) return;
+                const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+                defer self.alloc.free(dirty);
+                const token = try columnarMutationToken(self, self.columnar_mutation);
+                try self.put(dirty, &internal_keys.relationalColumnarDirtyRecord(token, if (value) |bytes| bytes.len else 0));
+            }
+
+            fn invalidateColumns(self: @This(), key: []const u8) anyerror!void {
+                if (self.columns_invalidated.* or !internal_keys.invalidatesRelationalColumns(key)) return;
+                self.delete(internal_keys.relational_columnar_manifest_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.columns_invalidated.* = true;
             }
 
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
@@ -658,9 +788,11 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Batch) !void {
+            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
+                    if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                     self.* = undefined;
                     return;
                 }
@@ -669,12 +801,16 @@ pub const DocStore = struct {
                 try runtime.commit();
             }
             self.* = undefined;
+            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
             return .{
                 .alloc = self.alloc,
                 .raw = if (supports_lmdb) if (self.raw) |*raw| raw.asTransaction() else null else null,
+                .columns_invalidated = &self.columns_invalidated,
+                .columnar_mutation = &self.columnar_mutation,
+                .unordered_bulk_append_puts = self.unordered_bulk_append_puts,
                 .dbi = self.dbi,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
             };
@@ -836,6 +972,7 @@ pub const DocStore = struct {
     }
 
     pub fn sync(self: *DocStore, force: bool) !void {
+        try self.ensurePortableImportOperational();
         switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(force),
             .runtime => try self.runtime_store.sync(force),
@@ -843,6 +980,7 @@ pub const DocStore = struct {
     }
 
     pub fn syncReplayState(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
         switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(false),
             .runtime => try self.runtime_store.syncReplayState(),
@@ -850,6 +988,7 @@ pub const DocStore = struct {
     }
 
     pub fn splitRightToDir(self: *DocStore, split_key: []const u8, dest_dir: []const u8) anyerror!bool {
+        try self.ensurePortableImportOperational();
         if (!supports_lmdb) return error.UnsupportedPlatform;
         if (self.kind != .lmdb) return error.Unsupported;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -861,6 +1000,7 @@ pub const DocStore = struct {
     }
 
     pub fn rewriteLeftInPlace(self: *DocStore, split_key: []const u8) anyerror!bool {
+        try self.ensurePortableImportOperational();
         if (!supports_lmdb) return error.UnsupportedPlatform;
         if (self.kind != .lmdb) return error.Unsupported;
         var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -901,7 +1041,30 @@ pub const DocStore = struct {
         return try self.beginReadTxnWithBlockCacheAdmission(.retain);
     }
 
+    /// Runtime namespaces authenticate persisted blocks before exposing value
+    /// slices (and memory namespaces are process-owned). LMDB values require an
+    /// AROW checksum at the relational boundary because its page contract does
+    /// not provide an application-visible per-value integrity witness.
+    pub fn valuesAreAuthenticated(self: *const DocStore) bool {
+        return self.kind == .runtime;
+    }
+
     pub fn beginReadTxnWithBlockCacheAdmission(
+        self: *DocStore,
+        admission: backend_types.Namespace.BlockCacheAdmission,
+    ) !Txn {
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
+        txn.portable_import_reader_owner = self;
+        return txn;
+    }
+
+    fn beginReadTxnUnchecked(self: *DocStore) !Txn {
+        return try self.beginReadTxnUncheckedWithBlockCacheAdmission(.retain);
+    }
+
+    fn beginReadTxnUncheckedWithBlockCacheAdmission(
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
@@ -937,13 +1100,20 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
-        return switch (self.kind) {
-            .lmdb => try self.beginReadTxnWithBlockCacheAdmission(admission),
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        var txn: Txn = switch (self.kind) {
+            // The outer probe transaction already owns the portable-import
+            // reader fence; use the unchecked LMDB path to avoid double
+            // accounting the same reader.
+            .lmdb => try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission),
             .runtime => .{
                 .alloc = self.alloc,
                 .probe = try self.runtime_store.beginProbeWithBlockCacheAdmission(admission),
             },
         };
+        txn.portable_import_reader_owner = self;
+        return txn;
     }
 
     /// Open a current-tip replay scan transaction for ordered replay walks.
@@ -952,16 +1122,21 @@ pub const DocStore = struct {
     /// append-only lanes without widening the point-probe API. LMDB keeps the
     /// normal read-only transaction because its snapshot semantics are cheap.
     pub fn beginCurrentScanTxn(self: *DocStore) !Txn {
-        return switch (self.kind) {
-            .lmdb => try self.beginReadTxn(),
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        var txn: Txn = switch (self.kind) {
+            .lmdb => try self.beginReadTxnUnchecked(),
             .runtime => .{
                 .alloc = self.alloc,
                 .current_scan = try self.runtime_store.beginCurrentScan(),
             },
         };
+        txn.portable_import_reader_owner = self;
+        return txn;
     }
 
     pub fn beginWriteTxn(self: *DocStore) !Txn {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{});
@@ -969,12 +1144,14 @@ pub const DocStore = struct {
                 const dbi = try openConfiguredLmdbUserDbTxn(self.alloc, &txn, self.lmdb_user_db_kind, true);
                 break :blk .{
                     .alloc = self.alloc,
+                    .columnar_owner = self,
                     .raw = txn,
                     .dbi = dbi,
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
                 .alloc = self.alloc,
+                .columnar_owner = self,
                 .write = try self.runtime_store.beginWrite(),
             },
         };
@@ -985,6 +1162,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var batch = try self.env.beginBatch();
@@ -992,18 +1170,22 @@ pub const DocStore = struct {
                 const dbi = try openConfiguredLmdbUserDbBatch(self.alloc, &batch, self.lmdb_user_db_kind, true);
                 break :blk .{
                     .alloc = self.alloc,
+                    .columnar_owner = self,
                     .raw = batch,
                     .dbi = dbi,
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
                 .alloc = self.alloc,
+                .columnar_owner = self,
                 .runtime = try self.runtime_store.beginBatchWithOptions(options),
+                .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
             },
         };
     }
 
     pub fn beginBulkIngestSession(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => {},
             .runtime => try self.runtime_store.beginBulkIngestSession(),
@@ -1011,6 +1193,7 @@ pub const DocStore = struct {
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DocStore, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => {},
             .runtime => try self.runtime_store.finishBulkIngestSessionWithOptions(options),
@@ -1018,6 +1201,7 @@ pub const DocStore = struct {
     }
 
     pub fn flushBufferedWritesWithOptions(self: *DocStore, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(false),
             .runtime => try self.runtime_store.flushBufferedWritesWithOptions(options),
@@ -1029,6 +1213,71 @@ pub const DocStore = struct {
             .lmdb => {},
             .runtime => self.runtime_store.abortBulkIngestSession(),
         }
+    }
+
+    fn ensurePortableImportOperational(self: *const DocStore) !void {
+        if (self.portable_import_recovery_required.load(.acquire)) {
+            return error.PortableImportRecoveryRequired;
+        }
+    }
+
+    fn acquirePortableImportReader(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
+        var state = self.portable_import_reader_state.load(.acquire);
+        while (true) {
+            if (state & portable_import_publication_bit != 0) return error.PortableImportPublicationInProgress;
+            if (state == portable_import_reader_count_mask) return error.PortableImportReaderLimitReached;
+            state = self.portable_import_reader_state.cmpxchgWeak(state, state + 1, .acquire, .monotonic) orelse break;
+        }
+        if (self.portable_import_recovery_required.load(.acquire)) {
+            self.releasePortableImportReader();
+            return error.PortableImportRecoveryRequired;
+        }
+    }
+
+    fn releasePortableImportReader(self: *DocStore) void {
+        const previous = self.portable_import_reader_state.fetchSub(1, .release);
+        std.debug.assert(previous & portable_import_reader_count_mask > 0);
+    }
+
+    /// Enter the short reader-visible publication fence. DB's exclusive apply
+    /// lock serializes publishers and ordinary writers; this atomic closes the
+    /// remaining lock-free read path without penalizing reads with a mutex.
+    pub fn beginPortableImportPublication(self: *DocStore, io: std.Io) !void {
+        try self.ensurePortableImportOperational();
+        var state = self.portable_import_reader_state.load(.acquire);
+        while (true) {
+            if (state & portable_import_publication_bit != 0) return error.PortableImportPublicationInProgress;
+            state = self.portable_import_reader_state.cmpxchgWeak(
+                state,
+                state | portable_import_publication_bit,
+                .acq_rel,
+                .acquire,
+            ) orelse break;
+        }
+        while (self.portable_import_reader_state.load(.acquire) & portable_import_reader_count_mask != 0) {
+            // Publication is rare, but an admitted reader may be an std.Io
+            // fiber. Yield through that same scheduler rather than blocking an
+            // executor thread while the reader drains.
+            io.sleep(.fromNanoseconds(1), .awake) catch {};
+        }
+    }
+
+    pub fn finishPortableImportPublication(self: *DocStore) void {
+        std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
+        self.portable_import_reader_state.store(0, .release);
+    }
+
+    pub fn portableImportPublicationInProgress(self: *const DocStore) bool {
+        return self.portable_import_reader_state.load(.acquire) & portable_import_publication_bit != 0;
+    }
+
+    pub fn requirePortableImportRecovery(self: *DocStore) void {
+        self.portable_import_recovery_required.store(true, .release);
+    }
+
+    pub fn portableImportRecoveryRequired(self: *const DocStore) bool {
+        return self.portable_import_recovery_required.load(.acquire);
     }
 
     pub fn put(self: *DocStore, key: []const u8, value: []const u8) !void {
@@ -1056,6 +1305,20 @@ pub const DocStore = struct {
                 error.NotFound => return error.NotFound,
                 else => return err,
             };
+        return try alloc.dupe(u8, val);
+    }
+
+    /// Privileged point read paired with scanPortableImportRollbackWithContext.
+    /// It keeps recovery-required fencing intact while allowing the publisher
+    /// to consult its durable rollback marker and bounded baseline journal.
+    pub fn getPortableImportRollback(self: *DocStore, alloc: Allocator, key: []const u8) ![]u8 {
+        try self.ensurePortableImportOperational();
+        var txn = try self.beginReadTxnUnchecked();
+        defer txn.abort();
+        const val = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return error.NotFound,
+            else => return err,
+        };
         return try alloc.dupe(u8, val);
     }
 
@@ -1797,6 +2060,72 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
         try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
+    }
+
+    /// Privileged scan used only to roll back a publication while ordinary
+    /// readers remain fenced. Recovery-required still blocks this handle.
+    pub fn scanPortableImportRollbackWithContext(
+        self: *DocStore,
+        lower: []const u8,
+        upper: []const u8,
+        options: ScanOptions,
+        ctx: ?*anyopaque,
+        callback: ScanWithContextCallback,
+    ) !void {
+        try self.ensurePortableImportOperational();
+        var txn = try self.beginReadTxnUnchecked();
+        defer txn.abort();
+        try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
+    }
+
+    /// Row-only owner traversal. Never advance through an owner's artifact
+    /// tail: seek directly to the next encoded document prefix. Checkpoints
+    /// run once per owner, including artifact-only owners, so cancellation and
+    /// maintenance budgets do not depend on finding another live row.
+    pub fn scanRelationalRowsReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
+        cursor.setUpperBound(end);
+        const owner_start = &[_]u8{internal_keys.user_namespace};
+        const start = if (std.mem.order(u8, lower, owner_start) == .lt) owner_start else lower;
+        if (std.mem.order(u8, start, end) != .lt) return;
+        var candidate = std.ArrayListUnmanaged(u8).empty;
+        defer candidate.deinit(self.alloc);
+        var entry = try cursor.seekAtOrAfter(start);
+        while (entry) |item| {
+            if (std.mem.order(u8, item.key, end) != .lt or !internal_keys.isInternalUserKey(item.key)) return;
+            const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
+            candidate.clearRetainingCapacity();
+            try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
+            try candidate.append(self.alloc, internal_keys.relational_row_kind);
+            if (try checkpoint(ctx, candidate.items) == .stop) return;
+            var current = item;
+            if (std.mem.order(u8, current.key, candidate.items) == .lt) {
+                current = (try cursor.seekAtOrAfter(candidate.items)) orelse return;
+                if (!std.mem.startsWith(u8, current.key, candidate.items[0 .. term + 2])) {
+                    entry = current;
+                    continue;
+                }
+            }
+            if (std.mem.eql(u8, current.key, candidate.items)) {
+                if (try callback(ctx, current.key, current.value) == .stop) return;
+            }
+            // The final byte of the escaped owner's terminator is zero.
+            // Its successor skips this owner, not documents extending its ID.
+            candidate.items.len = term + 2;
+            candidate.items[term + 1] = 1;
+            if (std.mem.order(u8, candidate.items, end) != .lt) return;
+            entry = try cursor.seekAtOrAfter(candidate.items);
+        }
     }
 
     pub fn scanReadTxnWithContext(
@@ -2996,6 +3325,91 @@ test "docstore indexes replay rows by hint and truncates them" {
         alloc.free(after);
     }
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "docstore relational bulk appends retain direct ingest and atomic dirty tokens" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        try std.testing.expect(txn.unordered_bulk_append_puts);
+        for (0..256) |i| {
+            var id_buf: [16]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buf, "row:{d:0>4}", .{i});
+            const key = try internal_keys.relationalRowKeyAlloc(alloc, id);
+            defer alloc.free(key);
+            try txn.appendPut(key, id);
+        }
+        try batch.commit();
+    }
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 1), store.columnar_revision.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
+    for (0..256) |i| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "row:{d:0>4}", .{i});
+        const key = try internal_keys.relationalRowKeyAlloc(alloc, id);
+        defer alloc.free(key);
+        const value = try store.get(alloc, key);
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings(id, value);
+        const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(alloc, key);
+        defer alloc.free(dirty);
+        const token = try store.get(alloc, dirty);
+        defer alloc.free(token);
+        try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(1), id.len), token);
+    }
+    const key = try internal_keys.relationalRowKeyAlloc(alloc, "row:0000");
+    defer alloc.free(key);
+    const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(alloc, key);
+    defer alloc.free(dirty);
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        try txn.appendPut(key, "first");
+        try txn.appendPut(key, "last");
+        try batch.commit();
+    }
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        defer batch.abort();
+        try batch.asTxn().appendPut(key, "aborted");
+    }
+    const value = try store.get(alloc, key);
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("last", value);
+    try std.testing.expectEqual(@as(u64, 2), store.columnar_revision.load(.acquire));
+    const token = try store.get(alloc, dirty);
+    defer alloc.free(token);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(2), 4), token);
+    try store.put(key, "last");
+    const rewritten = try store.get(alloc, dirty);
+    defer alloc.free(rewritten);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(3), 4), rewritten);
+    try store.delete(key);
+    const deleted = try store.get(alloc, dirty);
+    defer alloc.free(deleted);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(4), 0), deleted);
+    var exhausted: [8]u8 = undefined;
+    std.mem.writeInt(u64, &exhausted, std.math.maxInt(u64), .little);
+    try store.put(internal_keys.relational_columnar_mutation_key, &exhausted);
+    try std.testing.expectError(error.ColumnMutationVersionExhausted, store.put(key, "must not commit"));
+    try std.testing.expectError(error.NotFound, store.get(alloc, key));
+    const still_deleted = try store.get(alloc, dirty);
+    defer alloc.free(still_deleted);
+    try std.testing.expectEqualSlices(u8, deleted, still_deleted);
+    try std.testing.expectEqual(@as(u64, 4), store.columnar_revision.load(.acquire));
 }
 
 test "docstore runtime point get does not clone mutable snapshot" {

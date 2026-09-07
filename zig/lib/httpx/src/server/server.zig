@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! HTTP Server Implementation for httpx.zig
 //!
 //! Production-ready HTTP server with comprehensive features:
@@ -366,7 +380,7 @@ pub const Context = struct {
 
     pub const StreamDelegate = struct {
         ptr: ?*anyopaque,
-        start: *const fn (?*anyopaque, u16) anyerror!void,
+        start: *const fn (?*anyopaque, u16, []const u8) anyerror!void,
         write: *const fn (?*anyopaque, []const u8) anyerror!void,
         close: *const fn (?*anyopaque) anyerror!void,
     };
@@ -960,18 +974,26 @@ pub const Context = struct {
     /// return ctx.response.build(); // return value is ignored for streams
     /// ```
     pub fn streamResponse(self: *Self, status_code: u16) !StreamWriter {
+        return try self.streamResponseWithContentType(status_code, "text/event-stream; charset=utf-8");
+    }
+
+    /// Starts a transport-native streaming response with an explicit media
+    /// type. This is the general body-streaming primitive; `streamResponse`
+    /// remains the SSE convenience wrapper.
+    pub fn streamResponseWithContentType(self: *Self, status_code: u16, content_type: []const u8) !StreamWriter {
         if (self.stream_delegate) |delegate| {
-            try delegate.start(delegate.ptr, status_code);
+            _ = try self.response.header(HeaderName.CONTENT_TYPE, content_type);
+            try delegate.start(delegate.ptr, status_code, content_type);
             return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
         }
         // Middleware has already established response policy (e.g. CORS).
-        // Copy it before committing headers, then let the transport own SSE
+        // Copy it before committing headers, then let the transport own the
         // content type and framing. Never reuse a buffered Content-Length.
         var headers = try self.response.headers.clone(self.allocator);
         defer headers.deinit();
         _ = headers.remove(HeaderName.CONTENT_LENGTH);
         _ = headers.remove(HeaderName.TRANSFER_ENCODING);
-        try headers.set(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
+        try headers.set(HeaderName.CONTENT_TYPE, content_type);
         if (!headers.contains(HeaderName.CACHE_CONTROL)) try headers.set(HeaderName.CACHE_CONTROL, "no-cache");
         if (self.h2 != null) {
             var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
@@ -3959,11 +3981,11 @@ test "H1 oversized content length returns 413 before handler admission" {
 
 test "HTTP streaming headers and automatic preflight preserve middleware policy" {
     const State = struct {
-        fn request(alloc: Allocator, io: Io, address: Address, http2: bool, method: types.Method, origin: ?[]const u8) !Response {
+        fn request(alloc: Allocator, io: Io, address: Address, http2: bool, method: types.Method, origin: ?[]const u8, path: []const u8) !Response {
             if (!http2) {
                 var client = @import("../client/client.zig").Client.initWithConfig(alloc, io, .{ .keep_alive = false, .timeouts = .uniform(5000) });
                 defer client.deinit();
-                const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/stream", .{address.getPort()});
+                const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}{s}", .{ address.getPort(), path });
                 defer alloc.free(url);
                 const headers = [_][2][]const u8{.{ "Origin", origin orelse "" }};
                 return client.request(method, url, .{ .headers = if (origin != null) &headers else null });
@@ -3979,7 +4001,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
             try h2.sendClientPreface(&socket);
             const stream = try h2.stream_manager.createStream();
             const extra = [_]hpack.HeaderEntry{.{ .name = "origin", .value = origin orelse "" }};
-            const headers = try H2Connection.buildRequestHeaders(method.toString(), "/stream", "http", "localhost", if (origin != null) &extra else &.{}, alloc);
+            const headers = try H2Connection.buildRequestHeaders(method.toString(), path, "http", "localhost", if (origin != null) &extra else &.{}, alloc);
             defer alloc.free(headers);
             try h2.sendHeaders(&socket, stream.id, headers, true);
             while (!stream.completed) _ = try h2.processOneFrame(&socket, &socket);
@@ -4018,8 +4040,9 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
             try ctx.setHeader("Content-Type", "application/json");
             try ctx.response.headers.append("Set-Cookie", "one=1");
             try ctx.response.headers.append("Set-Cookie", "two=2");
-            var writer = try ctx.streamResponse(200);
-            try writer.writeEvent("done", "{}");
+            const rows = mem.eql(u8, ctx.request.uri.path, "/rows");
+            var writer = if (rows) try ctx.streamResponseWithContentType(200, "application/x-ndjson") else try ctx.streamResponse(200);
+            if (rows) try writer.write("{}\n") else try writer.writeEvent("done", "{}");
             try writer.close();
             return ctx.response.build();
         }
@@ -4031,6 +4054,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
     defer server.deinit();
     try server.use(.{ .name = "policy", .handler = State.policy });
     try server.get("/stream", State.handler);
+    try server.get("/rows", State.handler);
     try server.bind();
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(s: *Server) void {
@@ -4043,7 +4067,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
     }
     while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
     for ([_]bool{ false, true }) |http2| {
-        var stream = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example");
+        var stream = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example", "/stream");
         defer stream.deinit();
         try std.testing.expectEqualStrings("https://allowed.example", stream.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings("true", stream.headers.get("Access-Control-Allow-Credentials").?);
@@ -4056,15 +4080,21 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
             if (std.ascii.eqlIgnoreCase(header.name, "Set-Cookie")) cookies += 1;
         }
         try std.testing.expectEqual(@as(usize, 2), cookies);
-        var preflight = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://allowed.example");
+        var rows = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example", "/rows");
+        defer rows.deinit();
+        try std.testing.expectEqualStrings("application/x-ndjson", rows.contentType().?);
+        try std.testing.expectEqualStrings("{}\n", rows.body.?);
+        try std.testing.expectEqualStrings("https://allowed.example", rows.headers.get("Access-Control-Allow-Origin").?);
+        try std.testing.expectEqualStrings("stream-request", rows.headers.get("X-Request-ID").?);
+        var preflight = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://allowed.example", "/stream");
         defer preflight.deinit();
         try std.testing.expectEqual(@as(u16, 204), preflight.status.code);
         try std.testing.expectEqualStrings("GET", preflight.headers.get("Access-Control-Allow-Methods").?);
-        var denied = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://denied.example");
+        var denied = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://denied.example", "/stream");
         defer denied.deinit();
         try std.testing.expectEqual(@as(u16, 403), denied.status.code);
         try std.testing.expect(denied.headers.get("Access-Control-Allow-Origin") == null);
-        var automatic = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, null);
+        var automatic = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, null, "/stream");
         defer automatic.deinit();
         try std.testing.expectEqual(@as(u16, 204), automatic.status.code);
         try std.testing.expectEqualStrings("GET, OPTIONS", automatic.headers.get("Allow").?);

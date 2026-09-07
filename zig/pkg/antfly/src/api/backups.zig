@@ -13566,6 +13566,7 @@ pub fn isInvalidBackupManifestError(err: anyerror) bool {
         error.InvalidBackupRequest,
         error.IncompleteClusterBackup,
         error.BackupManifestTooLarge,
+        error.BackupSchemaHistoryTooLarge,
         => true,
         else => false,
     };

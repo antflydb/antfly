@@ -1,7 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0.
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Transport-neutral operations for internal group coordination.
 
@@ -38,6 +47,7 @@ pub const Error = operation.ApiError || error{
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
     TransactionConflict,
+    TransactionTooLarge,
     EnrichmentWaitCanceled,
     EnrichmentWaitTimeout,
     EnrichmentRetryInProgress,
@@ -427,6 +437,8 @@ pub const Operations = struct {
             .deadline_ns = request.deadline_ns,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
+            error.TransactionTooLarge => return error.TransactionTooLarge,
+            error.InvalidBatchRequest => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -762,6 +774,26 @@ pub const Operations = struct {
         const reads = try self.routedReads(alloc, request, group_id);
         return (reads.scanGroupLocal(alloc, group_id, table_name, from, to, options, .read_index) catch |err|
             return mapCommonReadError(err) orelse error.Internal) orelse error.NotFound;
+    }
+
+    /// Stream group-local NDJSON with transport backpressure. The source starts
+    /// the sink only after route/table admission succeeds, so callers can still
+    /// return a normal error response for a missing table.
+    pub fn scanStream(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        from: []const u8,
+        to: []const u8,
+        options: db_mod.types.ScanOptions,
+        sink: table_reads.ScanStreamSink,
+    ) Error!bool {
+        try request.ensureActive();
+        const reads = try self.routedReads(alloc, request, group_id);
+        return reads.scanGroupLocalStream(alloc, group_id, table_name, from, to, options, .read_index, sink) catch |err|
+            return mapCommonReadError(err) orelse error.Internal;
     }
 
     /// Execute a schema-routed group-local query. The returned response owns

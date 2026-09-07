@@ -15,13 +15,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.Crc32;
+const Blake3 = std.crypto.hash.Blake3;
 const ArrayList = std.ArrayList;
 
 /// AFB file magic bytes: "ANTFLYB\n"
 pub const magic = [8]u8{ 'A', 'N', 'T', 'F', 'L', 'Y', 'B', '\n' };
 
 /// AFB1 remains readable. AFB2 is the common transport envelope for portable
-/// logical streams and native physical generations.
+/// logical streams and native physical generations, including self-describing
+/// relational-row document entries.
 pub const legacy_format_version: u32 = 1;
 pub const format_version: u32 = 2;
 
@@ -66,8 +68,10 @@ pub const BlockType = enum(u8) {
 
 pub const block_flag_compressed: u8 = 1 << 0;
 
-/// Document value flag: value is zstd-compressed JSON.
-pub const doc_value_flag_compressed: u8 = 1;
+/// Document value flags.
+pub const doc_value_flag_compressed: u8 = 1 << 0;
+pub const doc_value_flag_relational_row: u8 = 1 << 1;
+pub const doc_value_known_flags: u8 = doc_value_flag_compressed | doc_value_flag_relational_row;
 
 // --- File Header ---
 
@@ -193,18 +197,29 @@ pub fn writeHeaderTo(writer: *std.Io.Writer, h: FileHeader) !void {
 }
 
 pub fn writeBlockTo(writer: *std.Io.Writer, block_type: BlockType, payload: []const u8) !void {
-    if (payload.len > max_block_payload_bytes) return error.BackupBlockTooLarge;
+    return try writeBlockPartsTo(writer, block_type, &.{payload});
+}
+
+/// Write one framed block from discontiguous borrowed parts. Large streaming
+/// payloads use this to prepend compact metadata without allocating and copying
+/// a second payload-sized buffer merely to calculate the common block CRC.
+pub fn writeBlockPartsTo(writer: *std.Io.Writer, block_type: BlockType, parts: []const []const u8) !void {
+    var payload_len: usize = 0;
+    for (parts) |part| payload_len = std.math.add(usize, payload_len, part.len) catch
+        return error.BackupBlockTooLarge;
+    if (payload_len > max_block_payload_bytes or payload_len > std.math.maxInt(u32))
+        return error.BackupBlockTooLarge;
     var env_header: [6]u8 = undefined;
     env_header[0] = @intFromEnum(block_type);
     env_header[1] = 0;
-    std.mem.writeInt(u32, env_header[2..6], @intCast(payload.len), .little);
+    std.mem.writeInt(u32, env_header[2..6], @intCast(payload_len), .little);
     var crc = Crc32.init();
     crc.update(&env_header);
-    crc.update(payload);
+    for (parts) |part| crc.update(part);
     var crc_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &crc_buf, crc.final(), .little);
     try writer.writeAll(&env_header);
-    try writer.writeAll(payload);
+    for (parts) |part| try writer.writeAll(part);
     try writer.writeAll(&crc_buf);
 }
 
@@ -217,6 +232,10 @@ pub const SliceReader = struct {
 
     pub fn init(data: []const u8) SliceReader {
         return .{ .data = data, .pos = 0 };
+    }
+
+    pub fn reset(self: *SliceReader) void {
+        self.pos = 0;
     }
 
     fn readExact(self: *SliceReader, n: usize) ![]const u8 {
@@ -293,13 +312,33 @@ pub const SliceReader = struct {
 /// borrowed and may be shared by multiple sequential passes because reads do
 /// not mutate its descriptor offset.
 pub const FileReader = struct {
+    pub const Fingerprint = [Blake3.digest_length]u8;
+
     io: std.Io,
     file: std.Io.File,
     size: u64,
     pos: u64 = 0,
+    hasher: Blake3 = Blake3.init(.{}),
+    completed_pass_fingerprint: ?Fingerprint = null,
+    generation_changed: bool = false,
 
     pub fn init(io: std.Io, file: std.Io.File, size: u64) FileReader {
         return .{ .io = io, .file = file, .size = size };
+    }
+
+    pub fn reset(self: *FileReader) void {
+        if (self.pos != self.size) {
+            self.generation_changed = true;
+        } else {
+            const fingerprint = self.currentFingerprint();
+            if (self.completed_pass_fingerprint) |expected| {
+                if (!std.mem.eql(u8, &expected, &fingerprint)) self.generation_changed = true;
+            } else {
+                self.completed_pass_fingerprint = fingerprint;
+            }
+        }
+        self.pos = 0;
+        self.hasher = Blake3.init(.{});
     }
 
     fn readExact(self: *FileReader, out: []u8) !void {
@@ -307,6 +346,33 @@ pub const FileReader = struct {
         const n = try self.file.readPositionalAll(self.io, out, self.pos);
         if (n != out.len) return error.EndOfStream;
         self.pos += out.len;
+        self.hasher.update(out);
+    }
+
+    fn currentFingerprint(self: *const FileReader) Fingerprint {
+        var fingerprint: Fingerprint = undefined;
+        self.hasher.final(&fingerprint);
+        return fingerprint;
+    }
+
+    /// Returns the fingerprint for a complete pass, rejecting a different
+    /// generation observed by any earlier pass through this reader.
+    pub fn verifiedFingerprint(self: *const FileReader) !Fingerprint {
+        if (self.pos != self.size) return error.EndOfStream;
+        if (self.generation_changed) return error.SourceFileChanged;
+        const fingerprint = self.currentFingerprint();
+        if (self.completed_pass_fingerprint) |expected| {
+            if (!std.mem.eql(u8, &expected, &fingerprint)) return error.SourceFileChanged;
+            return expected;
+        }
+        return fingerprint;
+    }
+
+    /// Verifies that this complete pass read exactly the same file bytes as a
+    /// prior reader, without another file scan or archive-sized allocation.
+    pub fn verifyFingerprint(self: *const FileReader, expected: Fingerprint) !void {
+        const actual = try self.verifiedFingerprint();
+        if (!std.mem.eql(u8, &expected, &actual)) return error.SourceFileChanged;
     }
 
     pub fn readHeader(self: *FileReader) !FileHeader {
@@ -365,6 +431,33 @@ pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     var window_buf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
     var decomp = std.compress.zstd.Decompress.init(&input, &window_buf, .{});
     return decomp.reader.allocRemaining(alloc, .limited(max_block_payload_bytes));
+}
+
+test "file reader detects same-size archive replacement between passes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/generation.afb", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, "generation-a", 0);
+
+    var reader = FileReader.init(io, file, "generation-a".len);
+    var first: ["generation-a".len]u8 = undefined;
+    try reader.readExact(&first);
+    reader.reset();
+
+    // Preserve the length so metadata-only generation checks cannot provide
+    // the content guarantee on filesystems with coarse timestamp resolution.
+    try file.writePositionalAll(io, "generation-b", 0);
+    var second: ["generation-b".len]u8 = undefined;
+    try reader.readExact(&second);
+    try std.testing.expectError(error.SourceFileChanged, reader.verifiedFingerprint());
 }
 
 // --- Batch Encoding helpers ---
@@ -515,6 +608,51 @@ pub fn decodeDocumentBatch(alloc: Allocator, data: []const u8) ![]DocumentEntry 
     }
 
     return entries.toOwnedSlice(alloc);
+}
+
+/// Decode only the entry directory while borrowing key/value bytes from the
+/// verified block payload. The minimum encoded entry size bounds `count` before
+/// allocation, so malformed input cannot turn a tiny block into a large
+/// allocation request. Restore can then validate and commit each block without
+/// duplicating its complete contents in memory.
+pub fn decodeDocumentBatchBorrowed(alloc: Allocator, data: []const u8) ![]DocumentEntry {
+    if (data.len < 4) return error.BatchTooShort;
+    const count = std.mem.readInt(u32, data[0..4], .little);
+    const minimum_entry_len = 4 + 1 + 4 + 8;
+    if (count > (data.len - 4) / minimum_entry_len) return error.Truncated;
+    const entries = try alloc.alloc(DocumentEntry, count);
+    errdefer alloc.free(entries);
+
+    var off: usize = 4;
+    for (entries) |*entry| {
+        if (data.len - off < 4) return error.Truncated;
+        const key_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+        if (key_len > data.len - off) return error.Truncated;
+        const key = data[off..][0..key_len];
+        off += key_len;
+
+        if (data.len - off < 1 + 4) return error.Truncated;
+        const value_flags = data[off];
+        off += 1;
+        const value_len = std.mem.readInt(u32, data[off..][0..4], .little);
+        off += 4;
+        if (value_len > data.len - off) return error.Truncated;
+        const value = data[off..][0..value_len];
+        off += value_len;
+
+        if (data.len - off < 8) return error.Truncated;
+        const timestamp_ns = std.mem.readInt(u64, data[off..][0..8], .little);
+        off += 8;
+        entry.* = .{
+            .key = key,
+            .value_flags = value_flags,
+            .value = value,
+            .timestamp_ns = timestamp_ns,
+        };
+    }
+    if (off != data.len) return error.TrailingData;
+    return entries;
 }
 
 /// Validates a document batch and returns its entry count without allocating.
@@ -937,6 +1075,7 @@ test "document batch round-trip" {
     const entries = [_]DocumentEntry{
         .{ .key = "doc1", .value_flags = 0, .value = "{\"title\":\"Hello\"}", .timestamp_ns = 0 },
         .{ .key = "doc2", .value_flags = doc_value_flag_compressed, .value = &.{ 0x28, 0xb5, 0x2f, 0xfd }, .timestamp_ns = 1234567890 },
+        .{ .key = "row3", .value_flags = doc_value_flag_relational_row, .value = "AROW-payload", .timestamp_ns = 42 },
     };
 
     const encoded = try encodeDocumentBatch(alloc, &entries);
@@ -951,7 +1090,7 @@ test "document batch round-trip" {
         alloc.free(decoded);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), decoded.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.len);
     try std.testing.expectEqualStrings("doc1", decoded[0].key);
     try std.testing.expectEqual(@as(u8, 0), decoded[0].value_flags);
     try std.testing.expectEqualStrings("{\"title\":\"Hello\"}", decoded[0].value);
@@ -961,13 +1100,31 @@ test "document batch round-trip" {
     try std.testing.expectEqual(doc_value_flag_compressed, decoded[1].value_flags);
     try std.testing.expectEqual(@as(u64, 1234567890), decoded[1].timestamp_ns);
 
-    try std.testing.expectEqual(@as(u32, 2), try documentBatchEntryCount(encoded));
+    try std.testing.expectEqualStrings("row3", decoded[2].key);
+    try std.testing.expectEqual(doc_value_flag_relational_row, decoded[2].value_flags);
+    try std.testing.expectEqualStrings("AROW-payload", decoded[2].value);
+    try std.testing.expectEqual(@as(u64, 42), decoded[2].timestamp_ns);
+
+    const borrowed = try decodeDocumentBatchBorrowed(alloc, encoded);
+    defer alloc.free(borrowed);
+    try std.testing.expectEqual(@as(usize, 3), borrowed.len);
+    try std.testing.expectEqualStrings("doc1", borrowed[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"Hello\"}", borrowed[0].value);
+    try std.testing.expectEqual(@as(u64, 1234567890), borrowed[1].timestamp_ns);
+    try std.testing.expectEqualStrings("AROW-payload", borrowed[2].value);
+
+    try std.testing.expectEqual(@as(u32, 3), try documentBatchEntryCount(encoded));
     try std.testing.expectError(error.Truncated, documentBatchEntryCount(encoded[0 .. encoded.len - 1]));
     const with_trailing = try alloc.alloc(u8, encoded.len + 1);
     defer alloc.free(with_trailing);
     @memcpy(with_trailing[0..encoded.len], encoded);
     with_trailing[encoded.len] = 0;
     try std.testing.expectError(error.TrailingData, documentBatchEntryCount(with_trailing));
+    try std.testing.expectError(error.TrailingData, decodeDocumentBatchBorrowed(alloc, with_trailing));
+
+    var impossible_count = [_]u8{0} ** 4;
+    std.mem.writeInt(u32, &impossible_count, std.math.maxInt(u32), .little);
+    try std.testing.expectError(error.Truncated, decodeDocumentBatchBorrowed(alloc, &impossible_count));
 
     const AllocationRunner = struct {
         fn run(failing_alloc: Allocator, input: []const u8) !void {

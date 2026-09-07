@@ -365,6 +365,7 @@ pub fn BoundStore(comptime BackendType: type) type {
                 .reverse_ranges = true,
                 .cursors = true,
                 .ordered_append_puts = true,
+                .unordered_bulk_append_puts = true,
                 .native_namespaces = false,
                 .write_batches = .atomic,
                 .single_writer = true,
@@ -2559,6 +2560,31 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         read_hint: ?BorrowedReadHint = null,
         held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
+
+        pub const ReadScope = struct {
+            parent: *BoundReadTxn(BackendType),
+            allocator: Allocator,
+            held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+            held_values: std.ArrayListUnmanaged([]u8) = .empty,
+            read_hint: ?BorrowedReadHint = null,
+            last_l0_group_index: ?usize = null,
+
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                const p = self.parent;
+                p.backend.recordPointGet();
+                return getFromSnapshotRuns(p.backend, p.mutable_snapshot, p.immutable_memtables, p.runs, p.l0_groups, p.levels, &self.last_l0_group_index, &self.read_hint, &self.held_blocks, &self.held_values, self.allocator, p.namespace, key, false, null);
+            }
+
+            pub fn close(self: *@This()) void {
+                releaseHeldBlocks(&self.held_blocks, self.parent.backend.allocator);
+                releaseHeldValues(&self.held_values, self.allocator);
+                self.* = undefined;
+            }
+        };
+
+        pub fn openReadScope(self: *@This(), allocator: Allocator) !ReadScope {
+            return .{ .parent = self, .allocator = allocator };
+        }
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
             const locked = lockBackend(BackendType, backend);

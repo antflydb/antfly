@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Authoritative storage-test discovery surface.
 //!
@@ -35,6 +46,7 @@ comptime {
     _ = @import("db/algebraic/path.zig");
     _ = @import("db/algebraic/pathfact.zig");
     _ = @import("db/algebraic/planner.zig");
+    _ = @import("db/algebraic/relational_row_codec.zig");
     _ = @import("db/algebraic/schema_capability.zig");
     _ = @import("db/algebraic/symbol.zig");
     _ = @import("db/algebraic/tensor.zig");
@@ -99,10 +111,15 @@ comptime {
     _ = @import("db/publication.zig");
     _ = @import("db/query/graph_exec.zig");
     _ = @import("db/query/projection.zig");
+    _ = @import("db/query/relational_projection.zig");
     _ = @import("db/query/result_shape.zig");
     _ = @import("db/query/search_exec.zig");
     _ = @import("db/query_metrics.zig");
     _ = @import("db/range_state.zig");
+    _ = @import("db/relational_store.zig");
+    _ = @import("db/schema_cache_admission.zig");
+    _ = @import("db/schema_registry.zig");
+    _ = @import("db/table_catalog.zig");
     _ = @import("db/resolution_handoff.zig");
     _ = @import("db/resolution_runtime.zig");
     _ = @import("db/root_identity.zig");

@@ -1808,7 +1808,7 @@ test "inference connection invocation forwards streaming and deadline through st
             self.invoked = true;
             self.saw_deadline = context.deadline_ns != 0;
             const stream = context.stream;
-            if (stream.start.?(stream.context, 200) != .ok or
+            if (stream.start.?(stream.context, 200, runtime_http_abi.Bytes.init("text/event-stream; charset=utf-8")) != .ok or
                 stream.write.?(stream.context, runtime_http_abi.Bytes.init("data: linked\n\n")) != .ok or
                 stream.close.?(stream.context) != .ok)
             {
@@ -1824,7 +1824,7 @@ test "inference connection invocation forwards streaming and deadline through st
         started: bool = false,
         closed: bool = false,
 
-        fn start(raw: ?*anyopaque, status: u16) callconv(.c) runtime_http_abi.CallbackStatus {
+        fn start(raw: ?*anyopaque, status: u16, _: runtime_http_abi.Bytes) callconv(.c) runtime_http_abi.CallbackStatus {
             const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
             self.started = status == 200;
             return .ok;

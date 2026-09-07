@@ -16,6 +16,15 @@ const std = @import("std");
 const storage_schema = @import("../storage/schema.zig");
 const impl = @import("table_schema_impl.zig");
 
+/// Durable public-schema generations. The singleton remains the active schema
+/// pointer for compatibility; versioned entries make historical relational
+/// rows independently decodable and validatable.
+pub const versioned_schema_key_prefix = "\x00\x00__metadata__:schema_json_v";
+
+pub fn versionedSchemaKeyAlloc(alloc: std.mem.Allocator, version: u32) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{d}", .{ versioned_schema_key_prefix, version });
+}
+
 pub const ParsedTableSchema = impl.TableSchema;
 pub const DocumentSchema = impl.DocumentSchema;
 pub const DocumentProperty = impl.DocumentProperty;
@@ -48,9 +57,153 @@ pub fn validateWritesAgainstTableSchema(
     schema: ParsedTableSchema,
     writes: anytype,
 ) !void {
-    const physical_fields = try derivePhysicalFieldValidations(alloc, schema);
-    defer freePhysicalFieldValidations(alloc, physical_fields);
-    try impl.validateWritesAgainstSchemaWithPhysicalFields(alloc, schema, writes, physical_fields);
+    var compiled = try CompiledTableValidator.initParsed(alloc, schema);
+    defer compiled.deinit(alloc);
+    try compiled.validateWrites(alloc, writes);
+}
+
+/// Immutable, generation-scoped public-schema validator.
+///
+/// Physical field mappings are derived once when a schema is installed rather
+/// than rebuilt for every batch while the DB apply lock is held. `schema` is
+/// owned when constructed with `init`; `initParsed` borrows it so compatibility
+/// callers can retain their existing ownership convention.
+pub const CompiledTableValidator = struct {
+    schema: ParsedTableSchema,
+    physical_fields: []impl.PhysicalFieldValidation,
+    execution: impl.CompiledValidationPlan,
+    restore: impl.RelationalRestorePlan,
+    owns_schema: bool,
+
+    pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
+        var schema = try parseValidatedTableSchema(alloc, schema_json);
+        errdefer schema.deinit(alloc);
+        return takeParsed(alloc, schema);
+    }
+
+    pub fn initParsed(alloc: std.mem.Allocator, schema: ParsedTableSchema) !CompiledTableValidator {
+        const physical_fields = try derivePhysicalFieldValidations(alloc, schema);
+        errdefer freePhysicalFieldValidations(alloc, physical_fields);
+        var restore = try impl.RelationalRestorePlan.init(alloc, schema, physical_fields);
+        errdefer restore.deinit(alloc);
+        return .{
+            .schema = schema,
+            .physical_fields = physical_fields,
+            .execution = try impl.CompiledValidationPlan.init(alloc, schema),
+            .restore = restore,
+            .owns_schema = false,
+        };
+    }
+
+    pub fn takeParsed(alloc: std.mem.Allocator, schema: ParsedTableSchema) !CompiledTableValidator {
+        var compiled = try initParsed(alloc, schema);
+        compiled.owns_schema = true;
+        return compiled;
+    }
+
+    pub fn deinit(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
+        self.execution.deinit(alloc);
+        self.restore.deinit(alloc);
+        freePhysicalFieldValidations(alloc, self.physical_fields);
+        if (self.owns_schema) self.schema.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn validateWrites(self: CompiledTableValidator, alloc: std.mem.Allocator, writes: anytype) !void {
+        try impl.validateWritesWithPlan(alloc, self.schema, writes, self.physical_fields, &self.execution);
+    }
+
+    pub fn validateValue(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
+        try impl.validateDocumentValueWithPlan(alloc, self.schema, value, self.physical_fields, &self.execution);
+    }
+
+    /// The caller must first validate canonical bytes/hash against the runtime
+    /// layout. Its binding to this public schema must be verified before any
+    /// validated rows are published (archive finish checks staged restores).
+    pub fn validateRelationalRestoreFields(self: *const CompiledTableValidator, alloc: std.mem.Allocator, row: anytype) !void {
+        std.debug.assert(!self.restore.full_root);
+        for (self.restore.properties) |index| {
+            const property = self.schema.document_schemas[0].properties[index];
+            const ordinal = row.ordinalForName(property.name) orelse return error.InvalidBatchRequest;
+            const cell = (try row.findCell(ordinal)) orelse continue;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try row.materializeCellAlloc(arena.allocator(), cell);
+            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution);
+        }
+    }
+};
+
+const compiled_validator_fixture =
+    \\{"default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"string","pattern":"^(ab|cd)+$"},"b":{"type":"integer"},"c":{"type":"boolean"},"d":{"type":"string"},"e":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"},"c":{"type":"integer"},"d":{"type":"integer"},"e":{"type":"string","pattern":"^x$"}},"additionalProperties":false}},"patternProperties":{"^tag_":{"type":"string","pattern":"^x$"}},"additionalProperties":false}}}}
+;
+
+test "compiled validator reuses wide nested property dispatch and deduplicates patterns" {
+    const alloc = std.testing.allocator;
+    var compiled = try CompiledTableValidator.init(alloc, compiled_validator_fixture);
+    defer compiled.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), compiled.execution.properties.count());
+    try std.testing.expectEqual(@as(u32, 3), compiled.execution.patterns.count());
+    const cases = [_]struct { json: []const u8, valid: bool }{
+        .{ .json = "{\"a\":\"abcd\",\"b\":1,\"c\":true,\"d\":\"ok\",\"e\":{\"a\":1,\"e\":\"x\"},\"tag_1\":\"x\"}", .valid = true },
+        .{ .json = "{\"a\":\"ac\"}", .valid = false },
+        .{ .json = "{\"e\":{\"e\":\"y\"}}", .valid = false },
+        .{ .json = "{\"e\":{\"unknown\":1}}", .valid = false },
+        .{ .json = "{\"tag_1\":\"y\"}", .valid = false },
+        .{ .json = "{\"unknown\":1}", .valid = false },
+    };
+    for (0..3) |_| for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        if (case.valid) {
+            try compiled.validateValue(alloc, &parsed.value);
+            try impl.validateDocumentValueWithPhysicalFields(alloc, compiled.schema, &parsed.value, compiled.physical_fields);
+        } else {
+            try std.testing.expectError(error.InvalidBatchRequest, compiled.validateValue(alloc, &parsed.value));
+            try std.testing.expectError(error.InvalidBatchRequest, impl.validateDocumentValueWithPhysicalFields(alloc, compiled.schema, &parsed.value, compiled.physical_fields));
+        }
+    };
+}
+
+test "compiled table validates a declared pattern exactly once" {
+    const alloc = std.testing.allocator;
+    var compiled = try CompiledTableValidator.init(alloc,
+        \\{"default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"value":{"type":"string","pattern":"^[a-z]+$"}},"required":["value"],"additionalProperties":false}}}}
+    );
+    defer compiled.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"value\":\"abc\"}", .{});
+    defer parsed.deinit();
+    var once = std.testing.FailingAllocator.init(alloc, .{});
+    const pattern = compiled.execution.patterns.getPtr("^[a-z]+$").?;
+    try std.testing.expect(try pattern.matches(once.allocator(), "abc"));
+    var validation = std.testing.FailingAllocator.init(alloc, .{});
+    try compiled.validateValue(validation.allocator(), &parsed.value);
+    try std.testing.expectEqual(once.allocations, validation.allocations);
+    try std.testing.expectEqual(once.allocated_bytes, validation.allocated_bytes);
+}
+
+test "single declared-member validation preserves closed document root policies" {
+    const alloc = std.testing.allocator;
+    var compiled = try CompiledTableValidator.init(alloc,
+        \\{"default_type":"doc","ttl_duration_ns":1,"ttl_field":"expires_at","document_schemas":{"doc":{"schema":{"type":"object","properties":{"value":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    defer compiled.deinit(alloc);
+    // TTL dispatch must not bypass the document root's closed-object check.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"value\":\"ok\",\"expires_at\":1}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, compiled.validateValue(alloc, &parsed.value));
+}
+
+test "compiled validator construction cleans up allocation failures without consuming borrowed schema" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator, schema: ParsedTableSchema) !void {
+            var compiled = try CompiledTableValidator.initParsed(alloc, schema);
+            defer compiled.deinit(alloc);
+        }
+    };
+    var schema = try parseValidatedTableSchema(std.testing.allocator, compiled_validator_fixture);
+    defer schema.deinit(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{schema});
 }
 
 fn derivePhysicalFieldValidations(
@@ -176,6 +329,18 @@ fn freePhysicalFieldValidationItems(alloc: std.mem.Allocator, fields: []impl.Phy
     for (fields) |field| alloc.free(field.source_field);
 }
 
+pub fn documentPropertyAllowsNull(property: impl.DocumentProperty) bool {
+    return impl.documentPropertyAllowsNull(property);
+}
+
+pub fn documentPropertyUsesJsonEncoding(property: impl.DocumentProperty) bool {
+    return impl.documentPropertyUsesJsonEncoding(property);
+}
+
+pub const documentDateTimeToNs = impl.documentDateTimeToNs;
+pub const documentIntegerToI64 = impl.documentIntegerToI64;
+pub const documentNumberToF64 = impl.documentNumberToF64;
+
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
     const exact_fields = try deriveRuntimeExactDocumentFields(alloc, schema);
     errdefer freeRuntimeExactFields(alloc, exact_fields);
@@ -200,6 +365,9 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
 
+    const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
+    errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
+
     const index_sort = try deriveRuntimeIndexSort(alloc, schema.index_sort, exact_fields, dynamic_templates);
     errdefer freeRuntimeIndexSort(alloc, index_sort);
 
@@ -209,12 +377,108 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = try alloc.dupe(u8, schema.ttl_field),
         .enforce_types = schema.enforce_types,
+        .requires_public_schema = schema.storage_mode == .relational,
+        .storage_mode = switch (schema.storage_mode) {
+            .document => .document,
+            .relational => .relational,
+        },
         .exact_fields = exact_fields,
         .dynamic_templates = dynamic_templates,
         .declared_fields = declared_fields,
         .full_text_documents = full_text_documents,
+        .relational_columns = relational_columns,
         .index_sort = index_sort,
     };
+}
+
+fn deriveRuntimeRelationalColumns(
+    alloc: std.mem.Allocator,
+    schema: ParsedTableSchema,
+) ![]storage_schema.RelationalColumn {
+    var columns = std.ArrayListUnmanaged(storage_schema.RelationalColumn).empty;
+    errdefer {
+        for (columns.items) |column| {
+            alloc.free(column.name);
+            alloc.free(column.path);
+        }
+        columns.deinit(alloc);
+    }
+
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            const column_type = runtimeRelationalColumnType(property) orelse continue;
+            var name: ?[]u8 = try alloc.dupe(u8, property.name);
+            errdefer if (name) |owned_name| alloc.free(owned_name);
+            var path: ?[]u8 = try alloc.dupe(u8, property.name);
+            errdefer if (path) |owned_path| alloc.free(owned_path);
+            const uses_json = documentPropertyUsesJsonEncoding(property);
+            try columns.append(alloc, .{
+                .name = name.?,
+                .path = path.?,
+                .column_type = column_type,
+                .required = requiredFieldsContain(document_schema.required_fields, property.name),
+                .allows_null = documentPropertyAllowsNull(property),
+                .is_json = uses_json,
+                .json_kind = runtimeRelationalJsonKind(property),
+            });
+            name = null;
+            path = null;
+        }
+    }
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn freeRuntimeRelationalColumns(
+    alloc: std.mem.Allocator,
+    columns: []storage_schema.RelationalColumn,
+) void {
+    for (columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+    }
+    if (columns.len > 0) alloc.free(columns);
+}
+
+fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
+    for (required_fields) |field| {
+        if (std.mem.eql(u8, field, name)) return true;
+    }
+    return false;
+}
+
+fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_schema.RelationalColumnType {
+    if (documentPropertyUsesJsonEncoding(property)) return .json;
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "embedding")) return .dense_vector;
+        if (std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string") or
+            std.mem.eql(u8, field_type, "text") or
+            std.mem.eql(u8, field_type, "html") or
+            std.mem.eql(u8, field_type, "search_as_you_type")) return .string;
+        if (std.mem.eql(u8, field_type, "blob")) return .blob;
+        if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
+        if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
+        if (std.mem.eql(u8, field_type, "integer")) return .integer;
+        if (std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "number")) return .number;
+        if (std.mem.eql(u8, field_type, "geopoint")) return .geopoint;
+        if (std.mem.eql(u8, field_type, "geoshape")) return .geoshape;
+    }
+    if (property.integer_only) return .integer;
+    if (property.const_value != null or property.enum_values.len > 0) return .string;
+    return null;
+}
+
+fn runtimeRelationalJsonKind(property: impl.DocumentProperty) storage_schema.RelationalJsonKind {
+    if (!documentPropertyUsesJsonEncoding(property)) return .none;
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "object")) return .object;
+        if (std.mem.eql(u8, field_type, "array")) return .array;
+        if (std.mem.eql(u8, field_type, "json")) return .any;
+    }
+    if (property.properties.len > 0) return .object;
+    if (property.item != null or property.prefix_items.len > 0) return .array;
+    return .any;
 }
 
 fn freeRuntimeExactFields(alloc: std.mem.Allocator, fields: []storage_schema.ExactField) void {
@@ -1436,6 +1700,28 @@ test "runtime schema materializes default-analyzed search-as-you-type root prefi
     }
     try std.testing.expect(html_index_prefix);
     try std.testing.expect(!html_root_prefix);
+}
+
+test "runtime schema derives authoritative relational columns" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"score":{"type":["number","null"]},"payload":{"type":"json"},"embedding":{"type":"embedding"}},"required":["id","count"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 5), runtime.relational_columns.len);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.string, runtime.relational_columns[0].column_type);
+    try std.testing.expect(runtime.relational_columns[0].required);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.integer, runtime.relational_columns[1].column_type);
+    try std.testing.expect(runtime.relational_columns[2].allows_null);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.json, runtime.relational_columns[3].column_type);
+    try std.testing.expect(runtime.relational_columns[3].is_json);
+    try std.testing.expectEqual(storage_schema.RelationalJsonKind.any, runtime.relational_columns[3].json_kind);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.dense_vector, runtime.relational_columns[4].column_type);
+    try std.testing.expect(!runtime.relational_columns[4].is_json);
 }
 
 test "runtime schema derives internal doc values from sortable scalar mappings" {

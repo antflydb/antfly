@@ -15,7 +15,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const index_mod = @import("index.zig");
+const relational_row_codec = @import("relational_row_codec.zig");
 const schema_mod = @import("../../../schema/mod.zig");
+const geo_mod = @import("../../../search/geo.zig");
 
 pub const FieldRole = enum {
     group,
@@ -1002,15 +1004,36 @@ fn appendCapability(
     scalar_type_value: []const u8,
     role: FieldRole,
 ) !void {
+    const owned_document_type = try alloc.dupe(u8, document_type);
+    errdefer alloc.free(owned_document_type);
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+    const owned_scalar_type = try alloc.dupe(u8, scalar_type_value);
+    errdefer alloc.free(owned_scalar_type);
     try fields.append(alloc, .{
-        .document_type = try alloc.dupe(u8, document_type),
-        .name = try alloc.dupe(u8, name),
-        .path = try alloc.dupe(u8, path),
-        .scalar_type = try alloc.dupe(u8, scalar_type_value),
+        .document_type = owned_document_type,
+        .name = owned_name,
+        .path = owned_path,
+        .scalar_type = owned_scalar_type,
         .role = role,
         .bounded = true,
         .dynamic_source = false,
     });
+}
+
+fn exerciseAppendCapabilityAllocation(alloc: Allocator) !void {
+    var fields = std.ArrayListUnmanaged(FieldCapability).empty;
+    defer {
+        for (fields.items) |*field| field.deinit(alloc);
+        fields.deinit(alloc);
+    }
+    try appendCapability(alloc, &fields, "document", "field", "nested.field", "string", .group);
+}
+
+test "capability construction is failure atomic" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseAppendCapabilityAllocation, .{});
 }
 
 fn scalarType(property: anytype) ?[]const u8 {
@@ -1496,6 +1519,1171 @@ fn expectCapability(
         return;
     }
     return error.MissingCapability;
+}
+
+// ---------------------------------------------------------------------------
+// Relational column catalog (see zig/RELATIONAL.md)
+//
+// The algebraic Plan above projects a schema into group/measure/time *fact*
+// roles (a field may appear under several roles). A relational table instead
+// needs a flat physical column catalog: exactly one typed column per declared
+// property. relationalColumnPlanAlloc compiles a closed TableSchema into that
+// catalog. Nested objects, arrays, and `json`-typed fields collapse to a single
+// `json` column at their path (stored as bytes, indexed like a document
+// subtree) rather than recursing.
+// ---------------------------------------------------------------------------
+
+pub const RelationalJsonKind = enum {
+    none,
+    any,
+    object,
+    array,
+};
+
+pub const RelationalColumn = struct {
+    document_type: []u8,
+    name: []u8,
+    path: []u8,
+    column_type: []u8,
+    physical: []u8,
+    required: bool = false,
+    allows_null: bool = false,
+    nullable: bool = true,
+    indexed: bool = true,
+    is_json: bool = false,
+    json_kind: RelationalJsonKind = .none,
+
+    pub fn deinit(self: *RelationalColumn, alloc: Allocator) void {
+        alloc.free(self.document_type);
+        alloc.free(self.name);
+        alloc.free(self.path);
+        alloc.free(self.column_type);
+        alloc.free(self.physical);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalPlan = struct {
+    schema_version: u32 = 0,
+    relational: bool = false,
+    columns: []RelationalColumn = &.{},
+    column_indexes: std.StringHashMapUnmanaged(usize) = .empty,
+    skipped_complex_fields: u32 = 0,
+    skipped_dynamic_fields: u32 = 0,
+
+    pub fn deinit(self: *RelationalPlan, alloc: Allocator) void {
+        self.column_indexes.deinit(alloc);
+        for (self.columns) |*column| column.deinit(alloc);
+        if (self.columns.len > 0) alloc.free(self.columns);
+        self.* = undefined;
+    }
+};
+
+pub fn relationalColumnPlanAlloc(alloc: Allocator, schema: schema_mod.ParsedTableSchema) !RelationalPlan {
+    var columns = std.ArrayListUnmanaged(RelationalColumn).empty;
+    errdefer {
+        for (columns.items) |*column| column.deinit(alloc);
+        columns.deinit(alloc);
+    }
+    var skipped_complex_fields: u32 = 0;
+    var skipped_dynamic_fields: u32 = 0;
+
+    for (schema.document_schemas) |document_schema| {
+        if (document_schema.additional_properties_allowed orelse false) skipped_dynamic_fields += 1;
+        if (document_schema.additional_properties_schema != null or document_schema.pattern_properties.len > 0 or document_schema.dynamic_infer_types) skipped_dynamic_fields += 1;
+        for (document_schema.properties) |property| {
+            const required = isRequiredField(document_schema.required_fields, property.name);
+            try collectRelationalColumn(
+                alloc,
+                document_schema.name,
+                property,
+                required,
+                &columns,
+                &skipped_complex_fields,
+            );
+        }
+    }
+
+    var column_indexes = std.StringHashMapUnmanaged(usize).empty;
+    errdefer column_indexes.deinit(alloc);
+    try column_indexes.ensureTotalCapacity(alloc, @intCast(columns.items.len));
+    for (columns.items, 0..) |column, index| {
+        column_indexes.putAssumeCapacity(column.name, index);
+    }
+
+    return .{
+        .schema_version = schema.version,
+        .relational = schema.storage_mode == .relational,
+        .columns = try columns.toOwnedSlice(alloc),
+        .column_indexes = column_indexes,
+        .skipped_complex_fields = skipped_complex_fields,
+        .skipped_dynamic_fields = skipped_dynamic_fields,
+    };
+}
+
+pub fn relationalColumnsJsonAlloc(alloc: Allocator, table_name: []const u8, plan: RelationalPlan) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, &out, "table");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, &out, table_name);
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, &out, "schema_version");
+    try appendFmt(alloc, &out, ":{d}", .{plan.schema_version});
+    try out.append(alloc, ',');
+    try appendJsonString(alloc, &out, "relational");
+    try out.appendSlice(alloc, if (plan.relational) ":true," else ":false,");
+    try appendJsonString(alloc, &out, "columns");
+    try out.appendSlice(alloc, ":[");
+    for (plan.columns, 0..) |column, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, &out, "document_type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.document_type);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "name");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.name);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "path");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.path);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "type");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.column_type);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "physical");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, column.physical);
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, "nullable");
+        try out.appendSlice(alloc, if (column.nullable) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "required");
+        try out.appendSlice(alloc, if (column.required) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "allows_null");
+        try out.appendSlice(alloc, if (column.allows_null) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "indexed");
+        try out.appendSlice(alloc, if (column.indexed) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "is_json");
+        try out.appendSlice(alloc, if (column.is_json) ":true," else ":false,");
+        try appendJsonString(alloc, &out, "json_kind");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, &out, @tagName(column.json_kind));
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "]}");
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectRelationalColumn(
+    alloc: Allocator,
+    document_type: []const u8,
+    property: anytype,
+    required: bool,
+    columns: *std.ArrayListUnmanaged(RelationalColumn),
+    skipped_complex_fields: *u32,
+) !void {
+    const column_type = relationalColumnType(property) orelse {
+        skipped_complex_fields.* += 1;
+        return;
+    };
+    const indexed = if (property.antfly_index) |value| value else true;
+    const is_json = std.mem.eql(u8, column_type, "json");
+    const json_kind = relationalJsonKind(property);
+    const owned_document_type = try alloc.dupe(u8, document_type);
+    errdefer alloc.free(owned_document_type);
+    const owned_name = try alloc.dupe(u8, property.name);
+    errdefer alloc.free(owned_name);
+    const owned_path = try alloc.dupe(u8, property.name);
+    errdefer alloc.free(owned_path);
+    const owned_column_type = try alloc.dupe(u8, column_type);
+    errdefer alloc.free(owned_column_type);
+    const owned_physical = try alloc.dupe(u8, physicalForColumnType(column_type));
+    errdefer alloc.free(owned_physical);
+    const allows_null = schema_mod.documentPropertyAllowsNull(property);
+    try columns.append(alloc, .{
+        .document_type = owned_document_type,
+        .name = owned_name,
+        .path = owned_path,
+        .column_type = owned_column_type,
+        .physical = owned_physical,
+        .required = required,
+        .allows_null = allows_null,
+        .nullable = !required or allows_null,
+        .indexed = indexed,
+        .is_json = is_json,
+        .json_kind = json_kind,
+    });
+}
+
+fn relationalJsonKind(property: anytype) RelationalJsonKind {
+    if (!schema_mod.documentPropertyUsesJsonEncoding(property)) return .none;
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "object")) return .object;
+        if (std.mem.eql(u8, field_type, "array")) return .array;
+        if (std.mem.eql(u8, field_type, "json")) return .any;
+    }
+    if (property.properties.len > 0) return .object;
+    if (property.item != null or property.prefix_items.len > 0) return .array;
+    return .any;
+}
+
+fn relationalColumnType(property: anytype) ?[]const u8 {
+    if (property.field_type) |field_type| {
+        if (schema_mod.documentPropertyUsesJsonEncoding(property)) return "json";
+        if (std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string") or
+            std.mem.eql(u8, field_type, "text") or
+            std.mem.eql(u8, field_type, "html") or
+            std.mem.eql(u8, field_type, "search_as_you_type")) return "string";
+        if (std.mem.eql(u8, field_type, "blob")) return "blob";
+        if (std.mem.eql(u8, field_type, "boolean")) return "boolean";
+        if (std.mem.eql(u8, field_type, "datetime")) return "datetime";
+        if (std.mem.eql(u8, field_type, "integer")) return "integer";
+        if (std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "number")) return "number";
+        if (std.mem.eql(u8, field_type, "geopoint")) return "geopoint";
+        if (std.mem.eql(u8, field_type, "geoshape")) return "geoshape";
+        if (property.integer_only) return "integer";
+        return null;
+    }
+    if (property.integer_only) return "integer";
+    if (schema_mod.documentPropertyUsesJsonEncoding(property)) return "json";
+    if (property.const_value != null or property.enum_values.len > 0) return "string";
+    return null;
+}
+
+fn physicalForColumnType(column_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, column_type, "integer")) return "i64_val";
+    if (std.mem.eql(u8, column_type, "datetime")) return "u64_val";
+    if (std.mem.eql(u8, column_type, "number")) return "f64_val";
+    if (std.mem.eql(u8, column_type, "boolean")) return "bool_val";
+    if (std.mem.eql(u8, column_type, "geopoint")) return "geo_point";
+    return "bytes_val";
+}
+
+fn isRequiredField(required_fields: []const []const u8, name: []const u8) bool {
+    for (required_fields) |field_name| {
+        if (std.mem.eql(u8, field_name, name)) return true;
+    }
+    return false;
+}
+
+test "relational column plan emits one typed column per declared property" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"qty":{"type":"integer"},"created_at":{"type":"datetime"},"active":{"type":"boolean"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"tags":{"type":"array","items":{"type":"keyword"}},"payload":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    try std.testing.expect(plan.relational);
+    try std.testing.expectEqual(@as(u32, 4), plan.schema_version);
+    try std.testing.expectEqual(@as(usize, 8), plan.columns.len);
+    try std.testing.expectEqual(@as(u32, 0), plan.skipped_complex_fields);
+    try std.testing.expectEqual(@as(u32, 0), plan.skipped_dynamic_fields);
+
+    try expectRelationalColumn(plan, "row", "id", "string", "bytes_val", false, false);
+    try expectRelationalColumn(plan, "row", "amount", "number", "f64_val", false, false);
+    try expectRelationalColumn(plan, "row", "qty", "integer", "i64_val", true, false);
+    try expectRelationalColumn(plan, "row", "created_at", "datetime", "u64_val", true, false);
+    try expectRelationalColumn(plan, "row", "active", "boolean", "bool_val", true, false);
+    try expectRelationalColumn(plan, "row", "attrs", "json", "bytes_val", true, true);
+    try expectRelationalColumn(plan, "row", "tags", "json", "bytes_val", true, true);
+    try expectRelationalColumn(plan, "row", "payload", "json", "bytes_val", true, true);
+    try std.testing.expectEqual(RelationalJsonKind.object, plan.columns[relationalColumnIndex(plan, "attrs").?].json_kind);
+    try std.testing.expectEqual(RelationalJsonKind.array, plan.columns[relationalColumnIndex(plan, "tags").?].json_kind);
+    try std.testing.expectEqual(RelationalJsonKind.any, plan.columns[relationalColumnIndex(plan, "payload").?].json_kind);
+}
+
+test "relational column plan defaults to document storage mode" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    try std.testing.expect(!plan.relational);
+    try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+    try expectRelationalColumn(plan, "doc", "id", "string", "bytes_val", true, false);
+}
+
+fn exerciseRelationalColumnPlanAllocation(alloc: Allocator, schema: schema_mod.ParsedTableSchema) !void {
+    var plan = try relationalColumnPlanAlloc(alloc, schema);
+    defer plan.deinit(alloc);
+}
+
+test "relational column plan construction is failure atomic" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.checkAllAllocationFailures(alloc, exerciseRelationalColumnPlanAllocation, .{parsed});
+}
+
+test "relational column plan serializes a column catalog" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":9,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const catalog_json = try relationalColumnsJsonAlloc(alloc, "rows", plan);
+    defer alloc.free(catalog_json);
+
+    var parsed_catalog = try std.json.parseFromSlice(std.json.Value, alloc, catalog_json, .{});
+    defer parsed_catalog.deinit();
+    const root = parsed_catalog.value.object;
+    try std.testing.expectEqualStrings("rows", root.get("table").?.string);
+    try std.testing.expectEqual(@as(i64, 9), root.get("schema_version").?.integer);
+    try std.testing.expect(root.get("relational").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), root.get("columns").?.array.items.len);
+    try std.testing.expectEqualStrings("none", root.get("columns").?.array.items[0].object.get("json_kind").?.string);
+}
+
+fn expectRelationalColumn(
+    plan: RelationalPlan,
+    document_type: []const u8,
+    name: []const u8,
+    column_type: []const u8,
+    physical: []const u8,
+    nullable: bool,
+    is_json: bool,
+) !void {
+    for (plan.columns) |column| {
+        if (!std.mem.eql(u8, column.document_type, document_type)) continue;
+        if (!std.mem.eql(u8, column.name, name)) continue;
+        if (!std.mem.eql(u8, column.column_type, column_type)) continue;
+        if (!std.mem.eql(u8, column.physical, physical)) continue;
+        if (column.nullable != nullable) continue;
+        if (column.is_json != is_json) continue;
+        return;
+    }
+    return error.MissingColumn;
+}
+
+// ---------------------------------------------------------------------------
+// Relational write-path projection (Phase 2, see zig/RELATIONAL.md)
+//
+// projectRelationalRowJsonAlloc parses a document losslessly and turns it into
+// one typed cell per declared column, ready to hand to
+// section/typed_doc_values.zig at segment-build time:
+//   - a missing required value -> error.MissingRequiredColumn
+//   - an explicit null not admitted by the JSON Schema -> error.InvalidColumnValue
+//   - an undeclared non-metadata field -> error.UnknownColumn
+//   - value that does not match the declared column type -> error.InvalidColumnValue
+//   - json columns are stringified to bytes (and flagged is_json so the caller
+//     can additionally index the subtree like a document)
+//
+// Numeric physical encoding matches typed_doc_values:
+//   - number   -> f64 (native)
+//   - integer  -> i64 (exact signed round-trip from the original JSON lexeme)
+//   - datetime -> u64 epoch nanoseconds (epoch integers/integer-strings,
+//                 date-only strings, and the documented RFC 3339 profile)
+//   - boolean  -> bool, geopoint -> packed lat/lon, string/blob/geoshape -> bytes
+// ---------------------------------------------------------------------------
+
+const typed_doc_values = @import("../../../section/typed_doc_values.zig");
+
+pub const PhysicalType = enum { u64_val, i64_val, f64_val, bytes_val, bool_val, geo_point };
+
+pub const GeoPoint = struct { lat: f64, lon: f64 };
+
+pub const ColumnValue = union(PhysicalType) {
+    u64_val: u64,
+    i64_val: i64,
+    f64_val: f64,
+    bytes_val: []const u8,
+    bool_val: bool,
+    geo_point: GeoPoint,
+};
+
+pub const RelationalCell = struct {
+    column: usize,
+    present: bool = false,
+    is_null: bool = false,
+    is_json: bool = false,
+    value: ColumnValue = .{ .bool_val = false },
+};
+
+pub const RelationalRow = struct {
+    cells: []RelationalCell = &.{},
+    bytes_pool: [][]u8 = &.{},
+
+    pub fn deinit(self: *RelationalRow, alloc: Allocator) void {
+        for (self.bytes_pool) |buffer| alloc.free(buffer);
+        if (self.bytes_pool.len > 0) alloc.free(self.bytes_pool);
+        if (self.cells.len > 0) alloc.free(self.cells);
+        self.* = undefined;
+    }
+
+    pub fn cell(self: RelationalRow, column_index: usize) ?RelationalCell {
+        if (column_index >= self.cells.len) return null;
+        const candidate = self.cells[column_index];
+        if (candidate.column != column_index or !candidate.present) return null;
+        return candidate;
+    }
+};
+
+pub fn typedValue(value: ColumnValue) typed_doc_values.TypedValue {
+    return switch (value) {
+        .u64_val => |v| .{ .u64_val = v },
+        .i64_val => |v| .{ .i64_val = v },
+        .f64_val => |v| .{ .f64_val = v },
+        .bytes_val => |v| .{ .bytes_val = v },
+        .bool_val => |v| .{ .bool_val = v },
+        .geo_point => |v| .{ .geo_point = .{ .lat = v.lat, .lon = v.lon } },
+    };
+}
+
+/// Parse and project a relational document without allowing std.json to round
+/// decimal or exponent-form numbers through f64 first. This is the public
+/// projection boundary; accepting an arbitrary Value would make it impossible
+/// to prove that its numeric tokens had not already been rounded.
+pub fn projectRelationalRowJsonAlloc(alloc: Allocator, plan: RelationalPlan, document_json: []const u8) !RelationalRow {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, document_json, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    return projectRelationalRowAlloc(alloc, plan, parsed.value);
+}
+
+fn projectRelationalRowAlloc(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !RelationalRow {
+    if (root != .object) return error.NotAnObject;
+
+    var fields = root.object.iterator();
+    while (fields.next()) |entry| {
+        if (!plan.column_indexes.contains(entry.key_ptr.*)) return error.UnknownColumn;
+    }
+
+    const cells = try alloc.alloc(RelationalCell, plan.columns.len);
+    errdefer alloc.free(cells);
+    var pool = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (pool.items) |buffer| alloc.free(buffer);
+        pool.deinit(alloc);
+    }
+
+    for (plan.columns, 0..) |column, i| {
+        cells[i] = .{ .column = i, .present = false, .is_json = column.is_json };
+        const found = root.object.get(column.name);
+        if (found == null) {
+            if (column.required) return error.MissingRequiredColumn;
+            continue;
+        }
+        if (found.? == .null) {
+            if (!column.allows_null) return error.InvalidColumnValue;
+            cells[i] = .{ .column = i, .present = true, .is_null = true, .is_json = column.is_json };
+            continue;
+        }
+        const coerced = (try coerceColumnValue(alloc, column, found.?)) orelse return error.InvalidColumnValue;
+        if (coerced.owned) |buffer| {
+            pool.append(alloc, buffer) catch |err| {
+                alloc.free(buffer);
+                return err;
+            };
+        }
+        cells[i] = .{ .column = i, .present = true, .is_json = column.is_json, .value = coerced.value };
+    }
+
+    return .{ .cells = cells, .bytes_pool = try pool.toOwnedSlice(alloc) };
+}
+
+const Coerced = struct { value: ColumnValue, owned: ?[]u8 = null };
+
+fn coerceColumnValue(alloc: Allocator, column: RelationalColumn, json_value: std.json.Value) !?Coerced {
+    if (std.mem.eql(u8, column.column_type, "json")) {
+        switch (column.json_kind) {
+            .object => if (json_value != .object) return null,
+            .array => if (json_value != .array) return null,
+            .any => {},
+            .none => return null,
+        }
+        const bytes = try stringifyJsonValueAlloc(alloc, json_value);
+        return Coerced{ .value = .{ .bytes_val = bytes }, .owned = bytes };
+    }
+    if (std.mem.eql(u8, column.column_type, "string") or
+        std.mem.eql(u8, column.column_type, "blob") or
+        std.mem.eql(u8, column.column_type, "geoshape"))
+    {
+        switch (json_value) {
+            .string => |text| {
+                const bytes = try alloc.dupe(u8, text);
+                return Coerced{ .value = .{ .bytes_val = bytes }, .owned = bytes };
+            },
+            else => return null,
+        }
+    }
+    if (std.mem.eql(u8, column.column_type, "boolean")) {
+        switch (json_value) {
+            .bool => |flag| return Coerced{ .value = .{ .bool_val = flag } },
+            else => return null,
+        }
+    }
+    if (std.mem.eql(u8, column.column_type, "number")) {
+        const number = schema_mod.documentNumberToF64(json_value) orelse return null;
+        return Coerced{ .value = .{ .f64_val = number } };
+    }
+    if (std.mem.eql(u8, column.column_type, "integer")) {
+        const number = schema_mod.documentIntegerToI64(json_value) orelse return null;
+        return Coerced{ .value = .{ .i64_val = number } };
+    }
+    if (std.mem.eql(u8, column.column_type, "datetime")) {
+        const timestamp = schema_mod.documentDateTimeToNs(json_value) orelse return null;
+        return Coerced{ .value = .{ .u64_val = timestamp } };
+    }
+    if (std.mem.eql(u8, column.column_type, "geopoint")) {
+        const point = geoPointFromJson(json_value) orelse return null;
+        return Coerced{ .value = .{ .geo_point = point } };
+    }
+    return null;
+}
+
+fn geoPointFromJson(json_value: std.json.Value) ?GeoPoint {
+    switch (json_value) {
+        .object => |object| {
+            if (object.count() != 2) return null;
+            const lat = schema_mod.documentNumberToF64(object.get("lat") orelse return null) orelse return null;
+            const lon = schema_mod.documentNumberToF64(object.get("lon") orelse return null) orelse return null;
+            if (!geo_mod.latitudeIsValid(lat) or !geo_mod.longitudeIsValid(lon)) return null;
+            return GeoPoint{ .lat = lat, .lon = lon };
+        },
+        else => return null,
+    }
+}
+
+fn stringifyJsonValueAlloc(alloc: Allocator, json_value: std.json.Value) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(json_value, .{})});
+}
+
+fn relationalTestPlanAlloc(alloc: Allocator) !RelationalPlan {
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"qty":{"type":"integer"},"ts":{"type":"datetime"},"active":{"type":"boolean"},"location":{"type":"geopoint"},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    return try relationalColumnPlanAlloc(alloc, parsed);
+}
+
+fn relationalColumnIndex(plan: RelationalPlan, name: []const u8) ?usize {
+    for (plan.columns, 0..) |column, i| {
+        if (std.mem.eql(u8, column.name, name)) return i;
+    }
+    return null;
+}
+
+test "relational projection enforces required columns and types" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    // Missing a required column.
+    var missing = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a"}
+    , .{});
+    defer missing.deinit();
+    try std.testing.expectError(error.MissingRequiredColumn, projectRelationalRowAlloc(alloc, plan, missing.value));
+
+    // Required column present but wrong type (string column given a number).
+    var wrong = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":5,"amount":1.0}
+    , .{});
+    defer wrong.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, wrong.value));
+
+    var invalid_latitude = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":1.0,"location":{"lat":91,"lon":0}}
+    , .{});
+    defer invalid_latitude.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_latitude.value));
+
+    var invalid_longitude = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":1.0,"location":{"lat":0,"lon":181}}
+    , .{});
+    defer invalid_longitude.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_longitude.value));
+
+    var lossy_extra_member = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":1.0,"location":{"lat":0,"lon":0,"altitude":10}}
+    , .{});
+    defer lossy_extra_member.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, lossy_extra_member.value));
+
+    var undeclared = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":1.0,"undeclared":true}
+    , .{});
+    defer undeclared.deinit();
+    try std.testing.expectError(error.UnknownColumn, projectRelationalRowAlloc(alloc, plan, undeclared.value));
+
+    // Relational rows cannot silently discard metadata that has no declared
+    // physical column.
+    var metadata = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"_id":"row-a","id":"a","amount":1.0}
+    , .{});
+    defer metadata.deinit();
+    try std.testing.expectError(error.UnknownColumn, projectRelationalRowAlloc(alloc, plan, metadata.value));
+}
+
+test "relational projection enforces json-backed logical container types" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"attrs":{"type":"object","properties":{"k":{"type":"keyword"}},"additionalProperties":false},"tags":{"type":"array","items":{"type":"keyword"}},"payload":{"type":"json"}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const accepted = [_][]const u8{
+        "{\"attrs\":{\"k\":\"v\"},\"tags\":[\"a\"],\"payload\":42}",
+        "{\"payload\":[1,2,3]}",
+        "{\"payload\":{\"nested\":true}}",
+    };
+    for (accepted) |document| {
+        try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }});
+        var row = try projectRelationalRowJsonAlloc(alloc, plan, document);
+        row.deinit(alloc);
+    }
+
+    const rejected = [_][]const u8{
+        "{\"attrs\":[]}",
+        "{\"attrs\":\"not-an-object\"}",
+        "{\"tags\":{}}",
+        "{\"tags\":1}",
+    };
+    for (rejected) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, document));
+    }
+}
+
+test "relational integer validation and projection share exact i64 conversion" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer","maximum":9007199254740992.0,"multipleOf":2.0}},"required":["qty"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+    const qty_index = relationalColumnIndex(plan, "qty").?;
+
+    const accepted =
+        \\{"qty":9007199254740992.0}
+    ;
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = accepted }});
+    var row = try projectRelationalRowJsonAlloc(alloc, plan, accepted);
+    defer row.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 9_007_199_254_740_992), row.cell(qty_index).?.value.i64_val);
+
+    const constraint_violations = [_][]const u8{
+        // Both values collapse onto adjacent f64 representations, so these
+        // checks must use the exact relational i64 value and schema token.
+        "{\"qty\":9007199254740993.0}",
+        "{\"qty\":9007199254740991.0}",
+    };
+    for (constraint_violations) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+    }
+
+    const invalid_documents = [_][]const u8{
+        "{\"qty\":\"5\"}",
+        "{\"qty\":5.5}",
+        "{\"qty\":9223372036854775808.0}",
+    };
+    for (invalid_documents) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, document));
+    }
+
+    // Callers that already discarded the number token cannot safely recover an
+    // exact integer. Rejecting the rounded f64 prevents storing a different row
+    // value than the client sent.
+    var rounded = try std.json.parseFromSlice(std.json.Value, alloc, "{\"qty\":9007199254740993.0}", .{});
+    defer rounded.deinit();
+    try std.testing.expect(rounded.value.object.get("qty").? == .float);
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, rounded.value));
+
+    var unconstrained = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"qty":{"type":"integer"}},"required":["qty"],"additionalProperties":false}}}}
+    );
+    defer unconstrained.deinit(alloc);
+    var unconstrained_plan = try relationalColumnPlanAlloc(alloc, unconstrained);
+    defer unconstrained_plan.deinit(alloc);
+    const exact_document = "{\"qty\":9007199254740993.0}";
+    try schema_mod.validateWritesAgainstTableSchema(alloc, unconstrained, &.{.{ .value = exact_document }});
+    var exact_row = try projectRelationalRowJsonAlloc(alloc, unconstrained_plan, exact_document);
+    defer exact_row.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(i64, 9_007_199_254_740_993),
+        exact_row.cell(relationalColumnIndex(unconstrained_plan, "qty").?).?.value.i64_val,
+    );
+}
+
+test "relational number validation rejects values the row codec cannot preserve" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"numeric"}},"required":["amount"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const invalid_numbers = [_][]const u8{
+        "{\"amount\":1e5000}", // overflows f64
+        "{\"amount\":1e-5000}", // non-zero value underflows to zero
+        "{\"amount\":9007199254740993}", // rounds to the adjacent f64 integer
+    };
+    for (invalid_numbers) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, document));
+    }
+
+    const preserved = "{\"amount\":0.1}";
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = preserved }});
+    var preserved_row = try projectRelationalRowJsonAlloc(alloc, plan, preserved);
+    defer preserved_row.deinit(alloc);
+    try std.testing.expectEqual(@as(f64, 0.1), preserved_row.cell(relationalColumnIndex(plan, "amount").?).?.value.f64_val);
+}
+
+test "relational geopoint validation and projection share lossless f64 conversion" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"location":{"type":"geopoint"}},"required":["location"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const invalid_documents = [_][]const u8{
+        "{\"location\":{\"lat\":0.10000000000000001,\"lon\":0}}",
+        "{\"location\":{\"lat\":0,\"lon\":0.10000000000000001}}",
+    };
+    for (invalid_documents) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, document));
+    }
+
+    const preserved = "{\"location\":{\"lat\":0.1,\"lon\":-0.1}}";
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = preserved }});
+    var row = try projectRelationalRowJsonAlloc(alloc, plan, preserved);
+    defer row.deinit(alloc);
+    const location = row.cell(relationalColumnIndex(plan, "location").?).?.value.geo_point;
+    try std.testing.expectEqual(@as(f64, 0.1), location.lat);
+    try std.testing.expectEqual(@as(f64, -0.1), location.lon);
+}
+
+test "relational json columns preserve nested numeric domains" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"attrs":{"type":"object","properties":{"counter":{"type":"integer","minimum":9223372036854775808},"amount":{"type":"numeric"}},"required":["counter","amount"],"additionalProperties":false},"samples":{"type":"array","items":{"type":"integer","minimum":9223372036854775808}},"qty":{"type":"integer"}},"required":["attrs","samples"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const document =
+        \\{"attrs":{"counter":9223372036854775808,"amount":9007199254740993},"samples":[9223372036854775808]}
+    ;
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }});
+    var row = try projectRelationalRowJsonAlloc(alloc, plan, document);
+    defer row.deinit(alloc);
+    const attrs = row.cell(relationalColumnIndex(plan, "attrs").?).?;
+    try std.testing.expect(attrs.is_json);
+    try std.testing.expectEqualStrings(
+        "{\"counter\":9223372036854775808,\"amount\":9007199254740993}",
+        attrs.value.bytes_val,
+    );
+    const samples = row.cell(relationalColumnIndex(plan, "samples").?).?;
+    try std.testing.expect(samples.is_json);
+    try std.testing.expectEqualStrings("[9223372036854775808]", samples.value.bytes_val);
+
+    // Nested JSON constraints still apply even though their integer domain is
+    // not limited by the physical relational i64 encoding.
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        schema_mod.validateWritesAgainstTableSchema(
+            alloc,
+            parsed,
+            &.{.{ .value = "{\"attrs\":{\"counter\":1,\"amount\":1},\"samples\":[9223372036854775808]}" }},
+        ),
+    );
+
+    // A true physical integer column remains bounded by i64.
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        schema_mod.validateWritesAgainstTableSchema(
+            alloc,
+            parsed,
+            &.{.{ .value = "{\"attrs\":{\"counter\":9223372036854775808,\"amount\":1},\"samples\":[9223372036854775808],\"qty\":9223372036854775808}" }},
+        ),
+    );
+}
+
+test "relational projection preserves explicit null separately from absence" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"required_nullable":{"type":["keyword","null"]},"optional_nullable":{"type":["keyword","null"]},"optional_nonnull":{"type":"keyword"}},"required":["required_nullable"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const required_index = relationalColumnIndex(plan, "required_nullable").?;
+    const optional_index = relationalColumnIndex(plan, "optional_nullable").?;
+    try std.testing.expect(plan.columns[required_index].required);
+    try std.testing.expect(plan.columns[required_index].allows_null);
+    try std.testing.expect(plan.columns[required_index].nullable);
+
+    var explicit_nulls = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"required_nullable":null,"optional_nullable":null}
+    , .{});
+    defer explicit_nulls.deinit();
+    var row = try projectRelationalRowAlloc(alloc, plan, explicit_nulls.value);
+    defer row.deinit(alloc);
+    try std.testing.expect(row.cell(required_index).?.is_null);
+    try std.testing.expect(row.cell(optional_index).?.is_null);
+
+    var absent_optional = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"required_nullable":"present"}
+    , .{});
+    defer absent_optional.deinit();
+    var sparse_row = try projectRelationalRowAlloc(alloc, plan, absent_optional.value);
+    defer sparse_row.deinit(alloc);
+    try std.testing.expect(sparse_row.cell(optional_index) == null);
+
+    var missing_required = try std.json.parseFromSlice(std.json.Value, alloc, "{}", .{});
+    defer missing_required.deinit();
+    try std.testing.expectError(error.MissingRequiredColumn, projectRelationalRowAlloc(alloc, plan, missing_required.value));
+
+    var forbidden_null = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"required_nullable":"present","optional_nonnull":null}
+    , .{});
+    defer forbidden_null.deinit();
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, forbidden_null.value));
+}
+
+test "relational projection shares composed null semantics with schema validation" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"enum_nullable":{"type":["keyword","null"],"enum":["ready",null]},"const_nullable":{"type":["keyword","null"],"const":null},"any_nullable":{"type":["keyword","null"],"anyOf":[{"const":null},{"const":"ready"}]},"one_nullable":{"type":["keyword","null"],"oneOf":[{"const":null},{"const":"ready"}]},"any_not_forbidden":{"type":["keyword","null"],"anyOf":[{"const":null},{"const":"ready"}],"not":{"const":null}},"conditional_forbidden":{"type":["keyword","null"],"if":{"const":null},"then":{"const":"ready"}}},"required":["enum_nullable","const_nullable","any_nullable","one_nullable"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const accepted =
+        \\{"enum_nullable":null,"const_nullable":null,"any_nullable":null,"one_nullable":null}
+    ;
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = accepted }});
+    var accepted_value = try std.json.parseFromSlice(std.json.Value, alloc, accepted, .{});
+    defer accepted_value.deinit();
+    var row = try projectRelationalRowAlloc(alloc, plan, accepted_value.value);
+    defer row.deinit(alloc);
+
+    for ([_][]const u8{ "enum_nullable", "const_nullable", "any_nullable", "one_nullable" }) |name| {
+        const column_index = relationalColumnIndex(plan, name).?;
+        try std.testing.expect(plan.columns[column_index].allows_null);
+        try std.testing.expect(row.cell(column_index).?.is_null);
+    }
+
+    for ([_][]const u8{ "any_not_forbidden", "conditional_forbidden" }) |name| {
+        const column_index = relationalColumnIndex(plan, name).?;
+        try std.testing.expect(!plan.columns[column_index].allows_null);
+
+        const rejected = try std.fmt.allocPrint(alloc,
+            \\{{"enum_nullable":null,"const_nullable":null,"any_nullable":null,"one_nullable":null,"{s}":null}}
+        , .{name});
+        defer alloc.free(rejected);
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = rejected }}),
+        );
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowJsonAlloc(alloc, plan, rejected));
+    }
+}
+
+test "relational projection preserves literal top-level property names" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"first.name":{"type":"keyword"}},"required":["first.name"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const accepted =
+        \\{"first.name":"Ada"}
+    ;
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = accepted }});
+    var accepted_value = try std.json.parseFromSlice(std.json.Value, alloc, accepted, .{});
+    defer accepted_value.deinit();
+    var row = try projectRelationalRowAlloc(alloc, plan, accepted_value.value);
+    defer row.deinit(alloc);
+
+    const column_index = relationalColumnIndex(plan, "first.name").?;
+    try std.testing.expectEqualStrings("Ada", row.cell(column_index).?.value.bytes_val);
+    try std.testing.expect(row.cell(plan.columns.len) == null);
+
+    var nested = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"first":{"name":"Ada"}}
+    , .{});
+    defer nested.deinit();
+    try std.testing.expectError(error.UnknownColumn, projectRelationalRowAlloc(alloc, plan, nested.value));
+}
+
+test "relational projection yields typed cells" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":12.5,"qty":7,"ts":1000,"active":true,"attrs":{"k":"v"},"payload":[1,2,3]}
+    , .{});
+    defer doc.deinit();
+
+    var row = try projectRelationalRowAlloc(alloc, plan, doc.value);
+    defer row.deinit(alloc);
+
+    const id = row.cell(relationalColumnIndex(plan, "id").?).?;
+    try std.testing.expectEqualStrings("abc", id.value.bytes_val);
+    const amount = row.cell(relationalColumnIndex(plan, "amount").?).?;
+    try std.testing.expectEqual(@as(f64, 12.5), amount.value.f64_val);
+    const qty = row.cell(relationalColumnIndex(plan, "qty").?).?;
+    try std.testing.expectEqual(@as(i64, 7), qty.value.i64_val);
+    const ts = row.cell(relationalColumnIndex(plan, "ts").?).?;
+    try std.testing.expectEqual(@as(u64, 1000), ts.value.u64_val);
+    const active = row.cell(relationalColumnIndex(plan, "active").?).?;
+    try std.testing.expect(active.value.bool_val);
+
+    // A nullable column omitted from the document yields no cell.
+    var sparse = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"x","amount":0.0}
+    , .{});
+    defer sparse.deinit();
+    var sparse_row = try projectRelationalRowAlloc(alloc, plan, sparse.value);
+    defer sparse_row.deinit(alloc);
+    try std.testing.expect(sparse_row.cell(relationalColumnIndex(plan, "qty").?) == null);
+
+    // json columns are stringified and flagged.
+    const attrs = row.cell(relationalColumnIndex(plan, "attrs").?).?;
+    try std.testing.expect(attrs.is_json);
+    var attrs_parsed = try std.json.parseFromSlice(std.json.Value, alloc, attrs.value.bytes_val, .{});
+    defer attrs_parsed.deinit();
+    try std.testing.expectEqualStrings("v", attrs_parsed.value.object.get("k").?.string);
+    const payload = row.cell(relationalColumnIndex(plan, "payload").?).?;
+    try std.testing.expect(payload.is_json);
+    var payload_parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload.value.bytes_val, .{});
+    defer payload_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), payload_parsed.value.array.items.len);
+}
+
+fn exerciseRelationalProjectionAllocation(alloc: Allocator, plan: RelationalPlan, root: std.json.Value) !void {
+    var row = try projectRelationalRowAlloc(alloc, plan, root);
+    defer row.deinit(alloc);
+}
+
+test "relational row projection is failure atomic" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":12.5,"attrs":{"k":"v"},"payload":[1,2,3]}
+    , .{});
+    defer doc.deinit();
+    try std.testing.checkAllAllocationFailures(alloc, exerciseRelationalProjectionAllocation, .{ plan, doc.value });
+}
+
+test "relational integer and datetime columns preserve their logical values" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+    const qty_index = relationalColumnIndex(plan, "qty").?;
+
+    var negative = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"a","amount":0.0,"qty":-5}
+    , .{});
+    defer negative.deinit();
+    var positive = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"b","amount":0.0,"qty":5,"ts":"1970-01-01T00:00:00.000000015Z"}
+    , .{});
+    defer positive.deinit();
+    var date_only = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"c","amount":0.0,"ts":"1970-01-01"}
+    , .{});
+    defer date_only.deinit();
+    const offset_json =
+        \\{"id":"offset","amount":0.0,"ts":"1970-01-01T01:00:00.000000015+01:00"}
+    ;
+    var offset = try std.json.parseFromSlice(std.json.Value, alloc, offset_json, .{});
+    defer offset.deinit();
+    var invalid_text = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"d","amount":0.0,"ts":"not-a-date"}
+    , .{});
+    defer invalid_text.deinit();
+    var invalid_negative = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"e","amount":0.0,"ts":-1}
+    , .{});
+    defer invalid_negative.deinit();
+
+    var negative_row = try projectRelationalRowAlloc(alloc, plan, negative.value);
+    defer negative_row.deinit(alloc);
+    var positive_row = try projectRelationalRowAlloc(alloc, plan, positive.value);
+    defer positive_row.deinit(alloc);
+    var date_only_row = try projectRelationalRowAlloc(alloc, plan, date_only.value);
+    defer date_only_row.deinit(alloc);
+    var offset_row = try projectRelationalRowAlloc(alloc, plan, offset.value);
+    defer offset_row.deinit(alloc);
+
+    try std.testing.expectEqual(@as(i64, -5), negative_row.cell(qty_index).?.value.i64_val);
+    try std.testing.expectEqual(@as(i64, 5), positive_row.cell(qty_index).?.value.i64_val);
+    try std.testing.expectEqual(
+        @as(u64, 15),
+        positive_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        date_only_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 15),
+        offset_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val,
+    );
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_text.value));
+    try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, invalid_negative.value));
+}
+
+test "relational datetime validation and projection reject invalid or unencodable values" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"ts":{"type":"datetime"}},"required":["ts"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const offset_document = "{\"ts\":\"1970-01-01T01:00:00.000000015+01:00\"}";
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = offset_document }});
+    var offset_row = try projectRelationalRowJsonAlloc(alloc, plan, offset_document);
+    defer offset_row.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 15), offset_row.cell(relationalColumnIndex(plan, "ts").?).?.value.u64_val);
+
+    const invalid_documents = [_][]const u8{
+        "{\"ts\":\"2023-02-29\"}",
+        "{\"ts\":\"2024-13-01\"}",
+        "{\"ts\":\"2024-01-01T24:00:00Z\"}",
+        "{\"ts\":\"2024-01-01T00:00:00+24:00\"}",
+        "{\"ts\":\"9999-12-31\"}",
+    };
+    for (invalid_documents) |document| {
+        try std.testing.expectError(
+            error.InvalidBatchRequest,
+            schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }}),
+        );
+        var value = try std.json.parseFromSlice(std.json.Value, alloc, document, .{});
+        defer value.deinit();
+        try std.testing.expectError(error.InvalidColumnValue, projectRelationalRowAlloc(alloc, plan, value.value));
+    }
+}
+
+test "relational custom ttl column validates and projects" {
+    const alloc = std.testing.allocator;
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc,
+        \\{"storage_mode":"relational","ttl_duration_ns":1,"ttl_field":"_expires_at","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"_expires_at":{"type":"datetime"}},"required":["id","_expires_at"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    var plan = try relationalColumnPlanAlloc(alloc, parsed);
+    defer plan.deinit(alloc);
+
+    const document =
+        \\{"id":"a","_expires_at":"1970-01-01T00:00:00Z"}
+    ;
+    try schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value = document }});
+    var value = try std.json.parseFromSlice(std.json.Value, alloc, document, .{});
+    defer value.deinit();
+    var row = try projectRelationalRowAlloc(alloc, plan, value.value);
+    defer row.deinit(alloc);
+
+    const ttl_index = relationalColumnIndex(plan, "_expires_at") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0), row.cell(ttl_index).?.value.u64_val);
+
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        schema_mod.validateWritesAgainstTableSchema(alloc, parsed, &.{.{ .value =
+            \\{"id":"a","_expires_at":"1970-01-01T00:00:00Z","_private":true}
+        }}),
+    );
+    try std.testing.expectError(
+        error.UnknownColumn,
+        projectRelationalRowJsonAlloc(alloc, plan,
+            \\{"id":"a","_expires_at":"1970-01-01T00:00:00Z","_private":true}
+        ),
+    );
+}
+
+test "relational cells round-trip through typed_doc_values storage" {
+    const alloc = std.testing.allocator;
+    var plan = try relationalTestPlanAlloc(alloc);
+    defer plan.deinit(alloc);
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"abc","amount":2.5,"qty":42,"ts":1000,"active":true,"payload":1}
+    , .{});
+    defer doc.deinit();
+
+    var row = try projectRelationalRowAlloc(alloc, plan, doc.value);
+    defer row.deinit(alloc);
+
+    // Drive the real typed_doc_values writer/reader for each typed-scan column.
+    try expectTypedColumnRoundTrip(alloc, .i64_val, typedValue(row.cell(relationalColumnIndex(plan, "qty").?).?.value));
+    try expectTypedColumnRoundTrip(alloc, .u64_val, typedValue(row.cell(relationalColumnIndex(plan, "ts").?).?.value));
+    try expectTypedColumnRoundTrip(alloc, .f64_val, typedValue(row.cell(relationalColumnIndex(plan, "amount").?).?.value));
+    try expectTypedColumnRoundTrip(alloc, .bool_val, typedValue(row.cell(relationalColumnIndex(plan, "active").?).?.value));
+}
+
+fn expectTypedColumnRoundTrip(
+    alloc: Allocator,
+    value_type: typed_doc_values.ValueType,
+    value: typed_doc_values.TypedValue,
+) !void {
+    var writer = typed_doc_values.TypedDocValuesWriter.init(alloc, value_type, typed_doc_values.default_chunk_size);
+    defer writer.deinit();
+    try writer.add(0, value);
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    const reader = try typed_doc_values.TypedDocValuesReader.init(alloc, bytes);
+    switch (value_type) {
+        .u64_val => try std.testing.expectEqual(value.u64_val, (try reader.getU64(0)).?),
+        .i64_val => try std.testing.expectEqual(value.i64_val, (try reader.getI64(0)).?),
+        .f64_val => try std.testing.expectEqual(value.f64_val, (try reader.getF64(0)).?),
+        .bool_val => try std.testing.expectEqual(value.bool_val, (try reader.getBool(0)).?),
+        else => unreachable,
+    }
 }
 
 fn expectNoCapabilityPath(plan: Plan, path: []const u8) !void {

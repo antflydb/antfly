@@ -106,6 +106,7 @@ pub const Slice = enum(u8) {
     inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
+    relational_preparation_working_set,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -139,6 +140,7 @@ pub const Slice = enum(u8) {
             .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
+            .relational_preparation_working_set => "relational.preparation_working_set",
         };
     }
 };
@@ -364,6 +366,7 @@ pub const Options = struct {
             .{},
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
         };
     }
 
@@ -399,6 +402,7 @@ pub const Options = struct {
             .{ .soft_action = .report, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .reject_work },
         };
     }
 };
@@ -2171,6 +2175,19 @@ pub const ResourceManager = struct {
         return sliceStatsFromState(slice, state);
     }
 
+    /// Stable capacity, not momentary free space: durable transaction admission
+    /// must not turn unrelated concurrent requests into permanent size limits.
+    /// Zero means neither the node nor this slice has a hard limit.
+    pub fn memoryHardLimitForSlice(self: *ResourceManager, slice: Slice) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const node = self.memory.budget.hard_limit_bytes;
+        const local = self.slices[sliceIndex(slice)].budget.hard_limit_bytes;
+        if (node == 0) return local;
+        if (local == 0) return node;
+        return @min(node, local);
+    }
+
     /// Returns the configured response for the slice's current pressure. Usage
     /// observed outside ResourceManager (for example allocator-backed LSM
     /// state) must consult this decision at its admission boundary; observing
@@ -2698,6 +2715,16 @@ pub const BudgetedAllocator = struct {
         self.releaseBytes(memory.len);
     }
 };
+
+test "durable admission capacity honors both node and slice limits" {
+    for ([_][3]u64{ .{ 0, 0, 0 }, .{ 1024, 0, 1024 }, .{ 0, 2048, 2048 }, .{ 1024, 2048, 1024 }, .{ 4096, 2048, 2048 } }) |limits| {
+        var options = Options{ .identity_allocator = std.testing.allocator, .memory_budget = .{ .hard_limit_bytes = limits[0] } };
+        options.budgets[sliceIndex(.relational_preparation_working_set)] = .{ .hard_limit_bytes = limits[1] };
+        var manager = ResourceManager.init(options);
+        defer manager.deinit(std.testing.allocator);
+        try std.testing.expectEqual(limits[2], manager.memoryHardLimitForSlice(.relational_preparation_working_set));
+    }
+}
 
 test "default tokenizer cache budget is aligned with its resource slice" {
     const budgets = Options.defaultBudgets();

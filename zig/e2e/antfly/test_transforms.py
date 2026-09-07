@@ -393,17 +393,20 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
         ],
     )
 
+    initial_build = serverless_api.build_table(table_name)
     # Publication is coordinated asynchronously. The explicit request may win
-    # and publish, or it may correctly report a no-op after the coordinator has
-    # already consumed the WAL. Assert the durable state rather than which
-    # builder won that race.
-    serverless_api.build_table(table_name)
+    # or report a truthful no-op after the coordinator consumed the WAL, so
+    # assert both the response shape and the durable user-visible outcome.
+    assert isinstance(initial_build.get("published"), bool), initial_build
     initial_published = wait_until(
         initial_snapshot_published,
         timeout_s=10.0,
         interval_s=0.1,
     )
-    assert initial_published is not None
+    assert initial_published is not None, (
+        f"initial publication did not become queryable; build_result={initial_build}; "
+        f"build_status={serverless_api.table_build_status(table_name)}"
+    )
 
     transformed = serverless_api.batch_table(
         table_name,

@@ -31,6 +31,8 @@ const wildcard_mod = @import("../../../search/wildcard.zig");
 const rfc3339 = @import("../../../common/rfc3339.zig");
 const doc_set = @import("../doc_set.zig");
 const pathfact_mod = @import("../algebraic/pathfact.zig");
+const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
+const runtime_schema = @import("../../schema.zig");
 
 const graph_document_hydration_batch_size: usize = 4096;
 
@@ -2561,7 +2563,100 @@ pub const PreparedPatternFilter = struct {
     ) !bool {
         return try self.compiled.matches(scratch_alloc, key, doc);
     }
+
+    pub fn matchesOrdinal(
+        self: *const PreparedPatternFilter,
+        scratch_alloc: Allocator,
+        key: []const u8,
+        row: relational_row_codec.OrdinalRowView,
+    ) !?bool {
+        return try self.compiled.matchesOrdinal(scratch_alloc, key, row);
+    }
 };
+
+/// A schema-epoch-specific companion to `PreparedPatternFilter`. Field names
+/// are resolved to stable column ordinals once per request and schema version,
+/// instead of once per predicate for every row in a scan.
+pub const PreparedOrdinalPatternFilter = struct {
+    arena: std.heap.ArenaAllocator,
+    source: *const PreparedPatternFilter,
+    ordinals: std.StringHashMapUnmanaged(?u32) = .empty,
+
+    pub fn init(
+        backing_alloc: Allocator,
+        source: *const PreparedPatternFilter,
+        table_schema: runtime_schema.TableSchema,
+        layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedOrdinalPatternFilter {
+        var out = PreparedOrdinalPatternFilter{
+            .arena = std.heap.ArenaAllocator.init(backing_alloc),
+            .source = source,
+        };
+        errdefer out.arena.deinit();
+        try bindOrdinalFields(
+            out.arena.allocator(),
+            &out.ordinals,
+            source.compiled,
+            table_schema,
+            layout,
+        );
+        return out;
+    }
+
+    pub fn deinit(self: *PreparedOrdinalPatternFilter) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn matches(
+        self: *const PreparedOrdinalPatternFilter,
+        scratch_alloc: Allocator,
+        key: []const u8,
+        row: relational_row_codec.OrdinalRowView,
+    ) !?bool {
+        var evaluation = OrdinalEvaluation{ .alloc = scratch_alloc, .row = row };
+        defer evaluation.deinit();
+        return try self.source.compiled.matchesOrdinalPrepared(
+            scratch_alloc,
+            key,
+            &evaluation,
+            &self.ordinals,
+        );
+    }
+};
+
+fn bindOrdinalFields(
+    alloc: Allocator,
+    ordinals: *std.StringHashMapUnmanaged(?u32),
+    filter: CompiledPatternFilter,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const relational_row_codec.PhysicalLayout,
+) !void {
+    switch (filter) {
+        .match_all, .match_none, .doc_id => {},
+        .conjuncts, .disjuncts => |items| for (items) |item|
+            try bindOrdinalFields(alloc, ordinals, item, table_schema, layout),
+        .bool_query => |query| {
+            for (query.must) |item| try bindOrdinalFields(alloc, ordinals, item, table_schema, layout);
+            for (query.should) |item| try bindOrdinalFields(alloc, ordinals, item, table_schema, layout);
+            for (query.must_not) |item| try bindOrdinalFields(alloc, ordinals, item, table_schema, layout);
+        },
+        .field_matcher => |matcher| {
+            const top = switch (matcher.path) {
+                .single => |segment| segment,
+                .dotted => |segments| segments[0],
+                .json_pointer => |segments| if (segments.len == 0) return else segments[0],
+            };
+            const gop = try ordinals.getOrPut(alloc, top);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = if (layout.ordinalForName(table_schema.relational_columns, top)) |ordinal|
+                    @intCast(ordinal)
+                else
+                    null;
+            }
+        },
+    }
+}
 
 test "prepared pattern filters own source JSON" {
     const alloc = std.testing.allocator;
@@ -2597,6 +2692,133 @@ test "prepared pattern filters own source JSON" {
         "doc-1",
         stored,
     ));
+}
+
+test "prepared pattern filters address large authenticated payloads without scratch allocations" {
+    const alloc = std.testing.allocator;
+    const json = try alloc.alloc(u8, 1024 * 1024 + 2);
+    defer alloc.free(json);
+    @memset(json, 'x');
+    json[0] = '"';
+    json[json.len - 1] = '"';
+    const vector = try alloc.alloc(u8, 4096 * 4);
+    defer alloc.free(vector);
+    @memset(vector, 0);
+    std.mem.writeInt(u32, vector[vector.len - 4 ..][0..4], @bitCast(@as(f32, 7)), .little);
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true },
+        .{ .name = "embedding", .path = "embedding", .column_type = .dense_vector },
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    const cells = [_]relational_row_codec.Cell{
+        .{ .ordinal = 0, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = json } },
+        .{ .ordinal = 1, .path = "embedding", .value_type = .bytes_val, .is_dense_vector = true, .value = .{ .bytes_val = vector } },
+    };
+    const encoded = try relational_row_codec.serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0} ** relational_row_codec.semantic_hash_len);
+    defer alloc.free(encoded);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    const row = try relational_row_codec.ordinalRowViewTrusted(encoded, schema, &layout);
+    const queries = [_][]const u8{ "{\"exists\":{\"field\":\"payload\"}}", "{\"term\":{\"embedding.4095\":7}}" };
+    for (queries) |query| {
+        var filter = try PreparedPatternFilter.init(alloc, query);
+        defer filter.deinit();
+        var bound = try PreparedOrdinalPatternFilter.init(alloc, &filter, schema, &layout);
+        defer bound.deinit();
+        var no_allocations = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        for (0..100) |_| try std.testing.expect((try bound.matches(no_allocations.allocator(), "row", row)).?);
+        try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
+    }
+}
+
+test "prepared pattern filters preserve dense vector logical array semantics" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "embedding", .path = "embedding", .column_type = .dense_vector },
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 3, .storage_mode = .relational, .relational_columns = &columns };
+    const bytes = [_]u8{ 0, 0, 128, 63, 0, 0, 0, 64 };
+    const cells = [_]relational_row_codec.Cell{
+        .{ .ordinal = 0, .path = "embedding", .value_type = .bytes_val, .is_dense_vector = true, .value = .{ .bytes_val = &bytes } },
+    };
+    const encoded = try relational_row_codec.serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0} ** relational_row_codec.semantic_hash_len);
+    defer alloc.free(encoded);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    const row = try relational_row_codec.ordinalRowView(encoded, schema, &layout);
+    const logical = try row.reconstructValueAlloc(alloc);
+    defer alloc.free(logical);
+    const queries = [_][]const u8{
+        "{\"term\":{\"embedding\":1}}",
+        "{\"term\":{\"embedding\":3}}",
+        "{\"exists\":{\"field\":\"embedding.0\"}}",
+        "{\"exists\":{\"field\":\"embedding.2\"}}",
+        "{\"term\":{\"/embedding/0\":1}}",
+        "{\"term\":{\"/embedding/01\":2}}",
+        "{\"numeric_range\":{\"field\":\"embedding\",\"min\":1.5}}",
+        "{\"bool\":{\"must\":[{\"term\":{\"embedding\":1}},{\"term\":{\"embedding\":2}}]}}",
+    };
+    for (queries) |query| {
+        var filter = try PreparedPatternFilter.init(alloc, query);
+        defer filter.deinit();
+        var bound = try PreparedOrdinalPatternFilter.init(alloc, &filter, schema, &layout);
+        defer bound.deinit();
+        const expected = try filter.matchesStored(alloc, "row", logical);
+        try std.testing.expectEqual(expected, (try filter.matchesOrdinal(alloc, "row", row)).?);
+        try std.testing.expectEqual(expected, (try bound.matches(alloc, "row", row)).?);
+        const trusted = try relational_row_codec.ordinalRowViewTrusted(encoded, schema, &layout);
+        try std.testing.expectEqual(expected, (try bound.matches(alloc, "row", trusted)).?);
+    }
+    var allocating = try PreparedPatternFilter.init(alloc, "{\"numeric_range\":{\"field\":\"embedding\",\"min\":1.5}}");
+    defer allocating.deinit();
+    const Check = struct {
+        fn run(scratch: Allocator, filter: *const PreparedPatternFilter, typed_row: relational_row_codec.OrdinalRowView) !void {
+            try std.testing.expect((try filter.matchesOrdinal(scratch, "row", typed_row)).?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &allocating, row });
+}
+
+test "prepared pattern filters evaluate scalar and nested ordinal cells" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "tenant", .path = "tenant", .column_type = .string, .required = true },
+        .{ .name = "count", .path = "count", .column_type = .integer, .required = true },
+        .{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true },
+    };
+    const schema: runtime_schema.TableSchema = .{
+        .version = 3,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    const cells = [_]relational_row_codec.Cell{
+        .{ .ordinal = 0, .path = "tenant", .value_type = .bytes_val, .value = .{ .bytes_val = "acme" } },
+        .{ .ordinal = 1, .path = "count", .value_type = .i64_val, .value = .{ .i64_val = 42 } },
+        .{ .ordinal = 2, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"tier\":\"gold\"}" } },
+    };
+    const encoded = try relational_row_codec.serializeOrdinal(
+        alloc,
+        schema.version,
+        &columns,
+        &cells,
+        [_]u8{0x7a} ** relational_row_codec.semantic_hash_len,
+    );
+    defer alloc.free(encoded);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    const row = try relational_row_codec.ordinalRowView(encoded, schema, &layout);
+
+    var scalar = try PreparedPatternFilter.init(alloc, "{\"term\":{\"tenant\":\"acme\"}}");
+    defer scalar.deinit();
+    try std.testing.expect((try scalar.matchesOrdinal(alloc, "doc-1", row)).?);
+
+    var nested = try PreparedPatternFilter.init(alloc, "{\"term\":{\"payload.tier\":\"gold\"}}");
+    defer nested.deinit();
+    try std.testing.expect((try nested.matchesOrdinal(alloc, "doc-1", row)).?);
+
+    var missing = try PreparedPatternFilter.init(alloc, "{\"exists\":{\"field\":\"absent\"}}");
+    defer missing.deinit();
+    try std.testing.expect(!(try missing.matchesOrdinal(alloc, "doc-1", row)).?);
 }
 
 /// Lazily prepares each distinct graph-node filter at most once per traversal.
@@ -2753,7 +2975,21 @@ pub const CompiledPatternFilter = union(enum) {
         geo_bbox: std.json.Value,
         geo_shape: std.json.Value,
 
-        fn matches(self: FieldPredicate, alloc: Allocator, values: []const std.json.Value) !bool {
+        /// Conservative zone-map test in the same numeric domain as the row
+        /// predicate. Equality is retained at exclusive boundaries so pruning
+        /// can never remove a matching row through floating-point rounding.
+        pub fn mayMatchNumericBounds(self: FieldPredicate, minimum: f64, maximum: f64) !bool {
+            if (self != .numeric_range) return true;
+            const range = self.numeric_range;
+            _ = try jsonValuesContainNumericRange(&.{}, range);
+            if (range.object.get("min")) |value|
+                if (maximum < try jsonNumberFromValue(value)) return false;
+            if (range.object.get("max")) |value|
+                if (minimum > try jsonNumberFromValue(value)) return false;
+            return true;
+        }
+
+        pub fn matches(self: FieldPredicate, alloc: Allocator, values: []const std.json.Value) !bool {
             return switch (self) {
                 .term => |value| jsonValuesContainTerm(values, value),
                 .terms => |terms| jsonValuesContainAnyTerm(values, terms),
@@ -2772,6 +3008,34 @@ pub const CompiledPatternFilter = union(enum) {
                 .geo_bbox => |value| try jsonValuesContainGeoBBox(values, value),
                 .geo_shape => |value| try jsonValuesContainGeoShape(alloc, values, value),
             };
+        }
+
+        /// Shared typed leaf kernel. Scalars borrow their payload; existence
+        /// and vector membership do not construct logical composite values.
+        pub fn matchesCell(self: FieldPredicate, alloc: Allocator, column: @import("../../schema.zig").RelationalColumn, cell: ?relational_row_codec.Cell) !bool {
+            const value = cell orelse return self.matches(alloc, &.{});
+            if (self == .exists) return true;
+            if (value.is_null) return self.matches(alloc, &.{.null});
+            if (value.is_dense_vector and (self == .term or self == .terms)) {
+                const bytes = value.value.bytes_val;
+                if (bytes.len % 4 != 0) return error.InvalidData;
+                var pos: usize = 0;
+                while (pos < bytes.len) : (pos += 4) {
+                    const number: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
+                    if (try self.matches(alloc, &.{.{ .float = number }})) return true;
+                }
+                return false;
+            }
+            var number_buf: [32]u8 = undefined;
+            const logical: std.json.Value = switch (value.value) {
+                .i64_val => |n| .{ .integer = n },
+                .u64_val => |n| if (n <= std.math.maxInt(i64)) .{ .integer = @intCast(n) } else .{ .number_string = try std.fmt.bufPrint(&number_buf, "{d}", .{n}) },
+                .f64_val => |n| .{ .float = n },
+                .bool_val => |v| .{ .bool = v },
+                .bytes_val => |bytes| if (!value.is_json and !value.is_dense_vector) .{ .string = bytes } else try relational_row_codec.ownedJsonValueFromCellAlloc(alloc, column, value),
+                else => try relational_row_codec.ownedJsonValueFromCellAlloc(alloc, column, value),
+            };
+            return self.matches(alloc, &.{logical});
         }
     };
 
@@ -2850,7 +3114,229 @@ pub const CompiledPatternFilter = union(enum) {
             },
         };
     }
+
+    /// Evaluate directly against one parsed AROW. A null result means the
+    /// query addresses the JSON root in a way that cannot be represented by a
+    /// column ordinal; callers may then use the general JSON materializer.
+    pub fn matchesOrdinal(
+        self: CompiledPatternFilter,
+        alloc: Allocator,
+        key: []const u8,
+        row: relational_row_codec.OrdinalRowView,
+    ) !?bool {
+        var evaluation = OrdinalEvaluation{ .alloc = alloc, .row = row };
+        defer evaluation.deinit();
+        return try self.matchesOrdinalPrepared(alloc, key, &evaluation, null);
+    }
+
+    fn matchesOrdinalPrepared(
+        self: CompiledPatternFilter,
+        alloc: Allocator,
+        key: []const u8,
+        evaluation: *OrdinalEvaluation,
+        ordinal_bindings: ?*const std.StringHashMapUnmanaged(?u32),
+    ) !?bool {
+        return switch (self) {
+            .match_all => true,
+            .match_none => false,
+            .doc_id => |ids| blk: {
+                for (ids) |id| if (std.mem.eql(u8, key, id)) break :blk true;
+                break :blk false;
+            },
+            .conjuncts => |items| blk: {
+                for (items) |item| {
+                    const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                    if (!matched) break :blk false;
+                }
+                break :blk true;
+            },
+            .disjuncts => |items| blk: {
+                for (items) |item| {
+                    const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                    if (matched) break :blk true;
+                }
+                break :blk false;
+            },
+            .bool_query => |bool_query| blk: {
+                for (bool_query.must) |item| {
+                    const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                    if (!matched) break :blk false;
+                }
+                if (bool_query.min_should > 0) {
+                    var matched_count: usize = 0;
+                    for (bool_query.should) |item| {
+                        const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                        if (matched) matched_count += 1;
+                    }
+                    if (matched_count < bool_query.min_should) break :blk false;
+                }
+                for (bool_query.must_not) |item| {
+                    const matched = (try item.matchesOrdinalPrepared(alloc, key, evaluation, ordinal_bindings)) orelse break :blk null;
+                    if (matched) break :blk false;
+                }
+                break :blk true;
+            },
+            .field_matcher => |matcher| try matcherMatchesOrdinal(alloc, matcher, evaluation, ordinal_bindings),
+        };
+    }
 };
+
+const OrdinalEvaluation = struct {
+    alloc: Allocator,
+    row: relational_row_codec.OrdinalRowView,
+    parsed_json_cells: std.AutoHashMapUnmanaged(usize, std.json.Parsed(std.json.Value)) = .empty,
+    logical_arena: ?std.heap.ArenaAllocator = null,
+    logical_cells: std.AutoHashMapUnmanaged(usize, std.json.Value) = .empty,
+
+    fn deinit(self: *@This()) void {
+        var values = self.parsed_json_cells.valueIterator();
+        while (values.next()) |parsed| parsed.deinit();
+        self.parsed_json_cells.deinit(self.alloc);
+        if (self.logical_arena) |*arena| arena.deinit();
+        self.* = undefined;
+    }
+
+    fn logicalCell(self: *@This(), cell: relational_row_codec.Cell) !std.json.Value {
+        if (self.logical_cells.get(cell.ordinal)) |value| return value;
+        if (self.logical_arena == null) self.logical_arena = std.heap.ArenaAllocator.init(self.alloc);
+        const arena = self.logical_arena.?.allocator();
+        const value = try self.row.materializeCellAlloc(arena, cell);
+        try self.logical_cells.put(arena, cell.ordinal, value);
+        return value;
+    }
+
+    fn parsedJsonCell(self: *@This(), ordinal: usize, bytes: []const u8) !std.json.Value {
+        if (self.parsed_json_cells.getPtr(ordinal)) |parsed| return parsed.value;
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{});
+        errdefer parsed.deinit();
+        const gop = try self.parsed_json_cells.getOrPut(self.alloc, ordinal);
+        if (gop.found_existing) {
+            parsed.deinit();
+            return gop.value_ptr.value;
+        }
+        gop.value_ptr.* = parsed;
+        return parsed.value;
+    }
+};
+
+fn matcherMatchesOrdinal(
+    alloc: Allocator,
+    matcher: CompiledPatternFilter.FieldMatcher,
+    evaluation: *OrdinalEvaluation,
+    ordinal_bindings: ?*const std.StringHashMapUnmanaged(?u32),
+) !?bool {
+    const row = evaluation.row;
+    const Path = struct {
+        top: []const u8,
+        remaining: []const []const u8,
+        pointer: bool,
+    };
+    const path: Path = switch (matcher.path) {
+        .single => |top| .{ .top = top, .remaining = &.{}, .pointer = false },
+        .dotted => |segments| .{
+            .top = segments[0],
+            .remaining = segments[1..],
+            .pointer = false,
+        },
+        .json_pointer => |segments| if (segments.len == 0)
+            return null
+        else
+            .{
+                .top = segments[0],
+                .remaining = segments[1..],
+                .pointer = true,
+            },
+    };
+
+    const ordinal = if (ordinal_bindings) |bindings| blk: {
+        const bound = bindings.getPtr(path.top) orelse return error.InvalidArgument;
+        break :blk bound.* orelse return try matcher.predicate.matches(alloc, &.{});
+    } else row.ordinalForName(path.top) orelse
+        return try matcher.predicate.matches(alloc, &.{});
+    const maybe_cell = try row.findCell(ordinal);
+    const cell = maybe_cell orelse return try matcher.predicate.matches(alloc, &.{});
+
+    if (cell.is_null) {
+        if (path.remaining.len == 0) {
+            const values = [_]std.json.Value{.null};
+            return try matcher.predicate.matches(alloc, &values);
+        }
+        return try matcher.predicate.matches(alloc, &.{});
+    }
+
+    // Existence of a top-level non-null cell is already conclusive and avoids
+    // parsing JSON-valued columns for the overwhelmingly common predicate.
+    if (path.remaining.len == 0) switch (matcher.predicate) {
+        .exists => return true,
+        else => {},
+    };
+
+    if (cell.is_dense_vector) {
+        const bytes = cell.value.bytes_val;
+        if (path.remaining.len > 0) {
+            // A vector is a flat logical array. Selecting one element should
+            // not allocate a JSON array proportional to the vector dimension.
+            const segment = path.remaining[0];
+            if (path.remaining.len != 1 or (path.pointer and !isCanonicalJsonPointerArrayIndex(segment)))
+                return try matcher.predicate.matches(alloc, &.{});
+            const index = std.fmt.parseInt(usize, segment, 10) catch
+                return try matcher.predicate.matches(alloc, &.{});
+            if (index >= bytes.len / @sizeOf(f32)) return try matcher.predicate.matches(alloc, &.{});
+            const number: f32 = @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
+            return try matcher.predicate.matches(alloc, &.{.{ .float = number }});
+        }
+        switch (matcher.predicate) {
+            .term, .terms => {
+                var offset: usize = 0;
+                while (offset < bytes.len) : (offset += 4) {
+                    const number: f32 = @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
+                    if (try matcher.predicate.matches(alloc, &.{.{ .float = number }})) return true;
+                }
+                return false;
+            },
+            else => {},
+        }
+    }
+
+    var number_buf: [64]u8 = undefined;
+    const root: std.json.Value = switch (cell.value) {
+        .u64_val => |value| if (value <= std.math.maxInt(i64))
+            .{ .integer = @intCast(value) }
+        else
+            .{ .number_string = try std.fmt.bufPrint(&number_buf, "{d}", .{value}) },
+        .i64_val => |value| .{ .integer = value },
+        .f64_val => |value| .{ .float = value },
+        .bool_val => |value| .{ .bool = value },
+        .numeric_val => |value| switch (value) {
+            .u64_val => |number| if (number <= std.math.maxInt(i64))
+                .{ .integer = @intCast(number) }
+            else
+                .{ .number_string = try std.fmt.bufPrint(&number_buf, "{d}", .{number}) },
+            .i64_val => |number| .{ .integer = number },
+            .f64_val => |number| .{ .float = number },
+        },
+        .bytes_val => |bytes| if (cell.is_dense_vector)
+            try evaluation.logicalCell(cell)
+        else if (cell.is_json)
+            try evaluation.parsedJsonCell(ordinal, bytes)
+        else
+            .{ .string = bytes },
+        // Keep shape-specific predicates on the existing general evaluator.
+        .geo_point => return null,
+    };
+    if (path.remaining.len == 0) {
+        const values = [_]std.json.Value{root};
+        return try matcher.predicate.matches(alloc, &values);
+    }
+    var values = std.ArrayListUnmanaged(std.json.Value).empty;
+    defer values.deinit(alloc);
+    if (path.pointer) {
+        try collectJsonValueAtPointer(alloc, root, path.remaining, &values);
+    } else {
+        try collectJsonValuesAtPath(alloc, root, path.remaining, 0, &values);
+    }
+    return try matcher.predicate.matches(alloc, values.items);
+}
 
 const pattern_filter_max_tree_depth: u8 = 64;
 const pattern_filter_max_tree_nodes: usize = 16_384;

@@ -3097,6 +3097,7 @@ pub const Backend = struct {
             .reverse_ranges = true,
             .cursors = true,
             .ordered_append_puts = true,
+            .unordered_bulk_append_puts = true,
             .native_namespaces = false,
             .write_batches = .atomic,
             .single_writer = true,
@@ -9501,6 +9502,58 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
     try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
     try std.testing.expectEqualStrings("C", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:c"));
+}
+
+test "lsm scoped reads bound retained values and preserve one disk snapshot" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var backend = try Backend.open(alloc, path, .{ .flush_threshold = 1 });
+    defer backend.close();
+    const payload = [_]u8{'v'} ** 8192;
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        for (0..128) |i| {
+            var key_buf: [16]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "row:{d:0>4}", .{i});
+            try write.put(.{}, key, &payload);
+        }
+        try write.commit();
+    }
+    try backend.sync(true);
+    try std.testing.expect(backend.runs.items.len > 0);
+    var read = try Backend.BoundReadTxn.open(&backend, .{});
+    defer read.abort();
+    for (0..128) |i| {
+        var scope = try read.openReadScope(alloc);
+        defer scope.close();
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "row:{d:0>4}", .{i});
+        try std.testing.expectEqualSlices(u8, &payload, try scope.get(key));
+        try std.testing.expect(scope.held_blocks.items.len + scope.held_values.items.len > 0);
+        try std.testing.expectEqual(@as(usize, 0), read.held_blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 0), read.held_values.items.len);
+    }
+
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var erased = try runtime.beginRead();
+    var first = try erased.openReadScope(alloc);
+    defer first.close();
+    var second = try erased.openReadScope(alloc);
+    defer second.close();
+    erased.abort(); // Both scopes retain the same parent snapshot.
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row:0000", "new");
+        try write.commit();
+    }
+    try std.testing.expectEqualSlices(u8, &payload, try first.get("row:0000"));
+    try std.testing.expectEqualSlices(u8, &payload, try second.get("row:0000"));
 }
 
 test "lsm backend direct-ingests threshold-sized bulk batches" {

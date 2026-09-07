@@ -248,7 +248,10 @@ pub fn reconcileReplicaRootWithOptions(
         defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
         var open_options = provisioningDbOpenOptions();
         open_options.backend_runtime = options.backend_runtime;
-        open_options.schema_before_index_load = runtime_schema;
+        open_options.schema_before_index_load = if (runtime_schema) |schema| .{
+            .runtime_schema = schema,
+            .public_schema_json = table.schema_json,
+        } else null;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;

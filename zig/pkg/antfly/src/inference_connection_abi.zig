@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Stable host callback used by the API kernel for the runtime-reserved local
 //! inference connection. The callback is synchronous: request views and the
@@ -11,7 +22,7 @@ const error_abi = @import("runtime_error_abi.zig");
 const http_abi = @import("runtime_http_abi.zig");
 const memory_abi = @import("runtime_memory_abi.zig");
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 pub const Status = error_abi.Status;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;

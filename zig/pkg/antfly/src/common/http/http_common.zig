@@ -244,6 +244,10 @@ pub const RequestExecutor = struct {
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse,
+        /// Optional zero-copy response path. Returning false means this
+        /// executor cannot stream this request and the caller may use its
+        /// bounded buffered fallback; true means the response was consumed.
+        execute_stream: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest, writer: StreamWriter) anyerror!bool = null,
         /// True only when independent calls may run concurrently. Executors
         /// that omit this capability retain the conservative serialized
         /// contract used by test doubles and foreign callback boundaries.
@@ -264,6 +268,17 @@ pub const RequestExecutor = struct {
     pub fn supportsConcurrentRequests(self: RequestExecutor) bool {
         const supports = self.vtable.supports_concurrent_requests orelse return false;
         return supports(self.ptr);
+    }
+
+    pub fn executeStream(
+        self: RequestExecutor,
+        alloc: std.mem.Allocator,
+        req: HttpRequest,
+        writer: StreamWriter,
+    ) !?bool {
+        const execute_stream = self.vtable.execute_stream orelse return null;
+        if (req.delivery_tracker) |tracker| tracker.markUnknown();
+        return try BoundaryAbi.call("execute_stream", self.boundary_dispatch, execute_stream, .{ self.ptr, alloc, req, writer });
     }
 };
 

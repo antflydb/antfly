@@ -346,6 +346,8 @@ pub const Detail = enum(c_int) {
     unsupported_generator_provider,
     generate_request_failed,
     generation_rate_limit,
+    schema_in_use,
+    transaction_too_large,
 };
 
 pub const Status = extern struct {
@@ -390,6 +392,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.Conflict => status(.conflict, .conflict),
         error.DecisionConflict => status(.conflict, .decision_conflict),
         error.TableTransitionActive => status(.conflict, .table_transition_active),
+        error.SchemaInUse => status(.conflict, .schema_in_use),
+        error.TransactionTooLarge => status(.invalid_argument, .transaction_too_large),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -488,6 +492,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidEmbeddingDimensions => status(.invalid_argument, .invalid_embedding_dimensions),
         error.BackupAlreadyExists => status(.already_exists, .backup_already_exists),
         error.BackupManifestTooLarge => status(.invalid_argument, .backup_manifest_too_large),
+        // Reuse the stable wire detail: both errors tell a remote caller that
+        // the archive's metadata exceeds the accepted manifest envelope.
+        error.BackupSchemaHistoryTooLarge => status(.invalid_argument, .backup_manifest_too_large),
         error.BackupIntegrityFailure => status(.corrupt, .backup_integrity_failure),
         error.BackupArtifactIntegrityMismatch => status(.corrupt, .backup_artifact_integrity_mismatch),
         error.BackupRepositoryBusy => status(.retryable, .backup_repository_busy),
@@ -739,6 +746,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .conflict => "Conflict",
         .decision_conflict => "DecisionConflict",
         .table_transition_active => "TableTransitionActive",
+        .schema_in_use => "SchemaInUse",
+        .transaction_too_large => "TransactionTooLarge",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1011,6 +1020,18 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
     };
 }
 
+test "schema epoch conflicts retain a retryable public status" {
+    const value = statusFromError(error.SchemaInUse);
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
+    try std.testing.expectEqual(error.SchemaInUse, errorFromStatus(value));
+}
+
+test "transaction capacity rejection retains a permanent public status" {
+    const value = statusFromError(error.TransactionTooLarge);
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), value.code);
+    try std.testing.expectEqual(error.TransactionTooLarge, errorFromStatus(value));
+}
+
 test "stable status preserves public boundary semantics" {
     try std.testing.expect(Status.ok.isOk());
     try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
@@ -1043,6 +1064,10 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.RateLimit, errorFromStatus(statusFromError(error.RateLimit)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
+    const schema_history_status = statusFromError(error.BackupSchemaHistoryTooLarge);
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), schema_history_status.code);
+    try std.testing.expectEqual(@intFromEnum(Detail.backup_manifest_too_large), schema_history_status.detail);
+    try std.testing.expectEqual(error.BackupManifestTooLarge, errorFromStatus(schema_history_status));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
     try std.testing.expectEqual(error.PersistentDescriptorAdmissionExhausted, errorFromStatus(statusFromError(error.PersistentDescriptorAdmissionExhausted)));
     try std.testing.expectEqual(error.CommitVisibilityNotSatisfied, errorFromStatus(statusFromError(error.CommitVisibilityNotSatisfied)));

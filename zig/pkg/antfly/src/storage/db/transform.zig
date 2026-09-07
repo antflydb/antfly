@@ -21,20 +21,24 @@ pub fn resolveDocumentTransform(
     existing_json: ?[]const u8,
     transform: types.DocumentTransform,
 ) !?[]u8 {
-    var prepared = try prepareDocumentTransform(alloc, transform);
-    defer prepared.deinit(alloc);
+    // The mutable tree and operands share one request-budgeted scratch region.
+    // Parse the base directly into it instead of cloning a second full DOM.
+    // Only the final encoded document escapes this scope.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const scratch_alloc = scratch.allocator();
+    var prepared = try prepareDocumentTransform(scratch_alloc, transform);
+    defer prepared.deinit(scratch_alloc);
     if (existing_json == null and !transform.upsert) return null;
     const is_insert = existing_json == null;
 
     var root = if (existing_json) |body| blk: {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidArgument;
-        break :blk try cloneJsonValue(alloc, parsed.value);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch_alloc, body, .{ .allocate = .alloc_always });
+        if (parsed != .object) return error.InvalidArgument;
+        break :blk parsed;
     } else std.json.Value{ .object = std.json.ObjectMap.empty };
-    defer freeJsonValue(alloc, &root);
 
-    for (prepared.operations) |*op| try applyPreparedTransformOp(alloc, &root, op, is_insert);
+    for (prepared.operations) |*op| try applyPreparedTransformOp(scratch_alloc, &root, op, is_insert);
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
 }
@@ -589,7 +593,11 @@ fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
                 for (cloned.items) |*item| freeJsonValue(alloc, item);
                 cloned.deinit();
             }
-            for (arr.items) |item| try cloned.append(try cloneJsonValue(alloc, item));
+            for (arr.items) |item| {
+                var child = try cloneJsonValue(alloc, item);
+                errdefer freeJsonValue(alloc, &child);
+                try cloned.append(child);
+            }
             break :blk .{ .array = cloned };
         },
         .object => |obj| blk: {
@@ -604,11 +612,28 @@ fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
             }
             var it = obj.iterator();
             while (it.next()) |entry| {
-                try cloned.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValue(alloc, entry.value_ptr.*));
+                const key = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(key);
+                var child = try cloneJsonValue(alloc, entry.value_ptr.*);
+                errdefer freeJsonValue(alloc, &child);
+                try cloned.put(alloc, key, child);
             }
             break :blk .{ .object = cloned };
         },
     };
+}
+
+test "transform JSON cloning releases partially inserted children on allocation failure" {
+    const alloc = std.testing.allocator;
+    var source = try std.json.parseFromSlice(std.json.Value, alloc, "{\"items\":[{\"name\":\"first\"},[\"second\"]]}", .{});
+    defer source.deinit();
+    const Check = struct {
+        fn run(failing: Allocator, value: std.json.Value) !void {
+            var cloned = try cloneJsonValue(failing, value);
+            defer freeJsonValue(failing, &cloned);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{source.value});
 }
 
 fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {

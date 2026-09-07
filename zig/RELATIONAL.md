@@ -1,0 +1,666 @@
+# Relational Mode
+
+Antfly tables are document-first by default: a document is a single
+zstd-compressed JSON blob, and every index (`full_text`, `embeddings`,
+`graph`, `algebraic`) is *derived* from that blob. Schema is optional and
+soft.
+
+**Relational mode** is the second table profile on the same engine. This
+document describes the contract and runtime integration. The current runtime
+establishes schema validation, column planning, projection, an authoritative
+packed-row codec, and the complete base-row lifecycle. It keeps
+every piece of the existing machinery — shards, Raft, indexes, enrichers, the
+join planner, and the algebraic fold runtime — but changes two things:
+
+1. **Schema is required and closed.** Documents in a relational table must
+   match a declared document type; unknown/unbounded fields are rejected
+   rather than dynamically indexed.
+2. **Typed columns are first-class.** Every declared scalar property maps to a
+   typed column (`section/typed_doc_values.zig`) so predicates, sorts, and
+   aggregations can be served columnar instead of reconstructed from JSON.
+
+`json` is itself a column type: a `json` column stores an opaque subtree and is
+indexed exactly the way documents are indexed today (path-fact projection plus
+dynamic templates over that subtree). That gives relational tables typed
+columns *and* the schemaless document behaviour where it is wanted.
+
+Relational mode is **not** a separate engine. Internally it is represented by a
+`storage_mode` on the parsed `TableSchema`, and relational rows occupy a
+dedicated internal key kind so packed values can never be mistaken for JSON.
+Schema mutations admit `storage_mode: "relational"`; document-mode tables keep
+their existing key and value format.
+
+## Why this fits
+
+The substrate already exists:
+
+- **Typed scalars** — `storage/db/algebraic/value.zig` (`Kind`:
+  string/integer/number/boolean/datetime/bytes, canonical encodings).
+- **Typed column store** — `section/typed_doc_values.zig`
+  (`u64`/`i64`/`f64`/`bytes`/`bool`/`geo_point`, chunked, SIMD bulk reads, range
+  scans).
+- **Per-field columnar blob with projection pushdown and null backfill** —
+  `columnar.zig`.
+- **Schema → indexable-field analysis** —
+  `storage/db/algebraic/schema_capability.zig` already walks a parsed schema and
+  classifies bounded scalar fields vs. skipped dynamic/complex/unbounded ones.
+- **Schema evolution detection** — `schema_capability.classifyChange`
+  (added / removed / type-changed → `requires_rebuild`).
+- **Joins** — relational join planner + distributed executor
+  (`api/join_model.zig`, `api/distributed_join.zig`) for row-producing joins,
+  and the algebraic fold planner (`algebraic/planner.zig`, `distributed.zig`)
+  for distributive aggregations over joins.
+
+Relational mode is therefore mostly *wiring and a required-schema contract*
+over things that are already built, plus one genuinely new query operator
+(the columnar table scan).
+
+## The pivotal decision: schema-bound authoritative rows
+
+The base store uses one `AROW v2` row per document, bound to an immutable schema
+epoch. Declared scalars are stored by stable column ordinal in physical typed
+representation; nullable absence and explicit null remain distinct; `json`
+columns retain their canonical JSON subtree bytes. Paths and physical types
+live once in the epoch's `PhysicalLayout`, not in every row. The legacy zstd
+whole-document blob is not double-written.
+
+Each row carries its schema version, a semantic content hash, and a physical
+checksum. The semantic hash is computed from canonical typed logical values and
+therefore survives equivalent storage-format migrations. The checksum covers
+the encoded bytes and detects corruption. Each row deterministically uses the
+smaller of two canonical bodies: dense presence/null bitmaps, fixed-width slots,
+and a variable offset table for populated schemas; or a sorted ordinal/payload
+directory whose ordinal word carries the null bit for wide sparse schemas. The
+sparse representation has no schema-width section. Both support direct
+projection without reconstructing the whole document.
+
+Segment-level typed columns remain a derived acceleration structure. They can
+be added for scans, predicates, sorts, and aggregations without changing point
+lookup, transaction, backup, or recovery semantics because the packed base row
+is already the durable authority.
+
+## Contract rollout
+
+Public create and update requests admit `relational` only after the schema has
+passed the closed-row and physical-encoding checks below. Base-row writes,
+reads, transactions, replay, recovery, TTL cleanup, split handoff, indexing,
+and portable backup all preserve the packed-row contract end-to-end.
+
+In `relational` mode the following are implied/enforced:
+
+- `enforce_types = true` (documents must match a declared type).
+- Exactly one non-empty document schema is required; its name must match
+  `default_type` when a default is supplied.
+- Each document type is treated as closed (`additionalProperties: false`)
+  unless a field is explicitly typed `json`.
+- Underscore-prefixed fields are not an implicit metadata escape hatch: any
+  such value carried in the document must have a declared column. The document
+  key remains out-of-band and must not be copied into the value as `_id`.
+- `required_fields` requires column presence. A required column is `NOT NULL`
+  only when its property schema also excludes `null`.
+- A configured TTL field, including the default `_timestamp`, must be declared
+  as a `datetime` column so authoritative-row reconstruction cannot drop it.
+- Table-level `dynamic_templates` are rejected by the core contract. Scoped
+  dynamic rules inside `json` columns require the later JSON-subdocument
+  lifecycle integration.
+
+The active public schema is compiled once per immutable write generation inside
+the DB. Historical cache misses load only the immutable runtime decode layout;
+they are single-flight and never compile a validator that cannot participate in
+a write. Every storage entry point validates its final post-transform rows
+against the active cached contract, including embedded batches, transaction
+prepares, replicated callers, and recovery resolution. API validation remains
+an early feedback optimization rather than the only integrity boundary.
+
+Each durable epoch explicitly records whether it requires a public schema.
+API-derived relational epochs require their matching immutable public contract;
+missing metadata is rejected on open and restore. Runtime-only embedded schemas
+instead declare that their physical column contract is complete. Both kinds can
+coexist in a table's history and round-trip through portable backup without
+inferring intent from absent metadata or dropping public constraints.
+
+The validator's immutable execution plan includes hashed property dispatch for
+wide objects (including nested and composed schemas) and deduplicated Thompson
+regex programs. Small objects keep linear lookup to avoid hash-table overhead.
+Pattern execution uses O(program size) request-local scratch and
+O(input length × program size) work, including unanchored substring searches.
+Compilation is limited to 4096 states, 16384 parse nodes/lowering steps, and 128 nesting levels;
+over-complex patterns are rejected as invalid schema patterns. Concurrent
+preparation and restore never mutate shared matcher state. Root constraints
+and root members are dispatched separately so ordinary declared fields are
+validated once; composition retains its branch-specific checks.
+
+The raw JSON Schema type `json` is accepted for a relational property. It is
+not a dynamic-template `AntflyType`: a `json` column is stored as a `bytes`
+column and later indexed like a document subtree (path facts + dynamic
+templates). It is the escape hatch for semi-structured data inside an
+otherwise typed row.
+
+Constraints in scope for v1: primary key is the existing document key; required
+column presence via `required_fields`; and `NOT NULL` when a required property's
+schema excludes `null`. **Out of scope for v1:** cross-document unique
+constraints, multi-document transactions, foreign-key enforcement (use the
+`graph` index / join planner for relationships).
+
+## Runtime model
+
+### Column plan
+
+`schema_capability.relationalColumnPlanAlloc` compiles a closed `TableSchema`
+into a `RelationalPlan`: one `RelationalColumn` per declared property, each
+carrying
+
+- `document_type`, `name`, dotted `path`
+- `column_type` — `string` / `integer` / `number` / `boolean` / `datetime` /
+  `geopoint` / `geoshape` / `json`
+- `physical` — the `typed_doc_values` value type it lands in
+  (`bytes_val` / `i64_val` / `u64_val` / `f64_val` / `bool_val` / `geo_point`)
+- `nullable` — `true` when the field is optional or its schema explicitly
+  permits `null`
+- `indexed` — whether to maintain an inverted/typed index for the column
+- `is_json` — nested objects, arrays, and `json`-typed fields collapse to a
+  single `json` column at their path instead of recursing
+- `json_kind` — retains whether a JSON-backed column was declared as an
+  `object`, `array`, or unconstrained `json`, so projection can enforce the
+  logical container type without reparsing the schema
+
+This reuses the existing `schema_capability` traversal. Unlike the algebraic
+`Plan` (which emits group/measure/time *fact* roles and may emit a field under
+multiple roles), the relational plan emits exactly one physical column per
+property — it is the column catalog.
+
+First-cut physical mapping:
+
+| `column_type` | `physical`  | notes                                 |
+| ------------- | ----------- | ------------------------------------- |
+| string        | `bytes_val` | keyword / link / text-as-keyword      |
+| integer       | `i64_val`   | exact signed integer                  |
+| number        | `f64_val`   |                                       |
+| boolean       | `bool_val`  |                                       |
+| datetime      | `u64_val`   | epoch nanoseconds                     |
+| geopoint      | `geo_point` | packed lat/lon                        |
+| geoshape      | `bytes_val` | encoded shape                         |
+| json          | `bytes_val` | indexed as a document subtree         |
+
+### Write path
+
+Dense preparation gathers cells through recycled worker-local ordinal scratch,
+then hashes and emits them in linear time, including rows with optional holes.
+The scratch uses four bytes per schema column, with width at most twice the
+number of present cells. Genuinely
+sparse rows retain present-cell sorting without schema-width allocation.
+
+Retained row regions, worker scratch, and prepared mutation effects charge the
+shared `relational.preparation_working_set` resource slice before allocating.
+The limit applies across requests (and provisioned groups sharing a manager),
+not merely to each request's worker count. Admission denial releases the entire
+attempt and returns retryable `ResourceBudgetExceeded`; no preparer waits for
+memory while retaining a partial batch. Slice usage and limits are observable
+through the standard resource metrics.
+
+Direct transaction intents use this same admission ledger and validate before
+the exclusive apply fence. The first prepare atomically persists a schema-epoch
+lease with the intents and prepare vote. Later prepares, commit, and recovery
+use that immutable epoch and its public validator, even after a newer schema
+is published or the participant restarts. Historical write validators are
+request-owned and budgeted; the normal read cache remains layout-only. The
+lease is retired atomically with intent resolution. Choosing relational mode
+on a previously schemaless table is fenced while document intents remain.
+API preflight defers to the durable contract for prepared and terminal retries;
+it must not reject an accepted transaction using the latest catalog schema.
+
+Commit's intent snapshot and prepared rows share one admission ledger across
+retries. Snapshot rows borrow their owned intent envelopes, avoiding a second
+payload copy. Once the intent revision is checked under the apply fence,
+relational commit retires only the known intent/lock keys without rereading
+payloads. Schema and index generation checks still apply to ordinary writes;
+index-plan checks also apply to transactions pinned to an older schema.
+
+Prepare persists the canonical AROW alongside a sidecar containing only
+API-only `_edges`/`_embeddings` fields in a tagged intent envelope. Ordinary
+columns are stored once, not duplicated as JSON. Physical representability
+(including finite f32 embeddings) is checked before the durable vote. Commit reuses that row instead
+of repeating schema validation, semantic hashing, and physical encoding. The
+commit root comes directly from typed cells; only JSON-typed columns and the
+special-field sidecar require JSON parsing. Legacy index consumers receive a
+logical rendering, while ordinal consumers use the typed view. Transaction
+preparation uses bounded `std.Io` tasks and resettable worker scratch. Recovery
+copies the verified AROW and
+finalizes its timestamp without parsing JSON. Both paths own a single intent
+snapshot through revision-fenced resolution and charge the same resource slice.
+The recovery-context mutex uses `std.Io` and protects only a short context copy,
+not intent loading, validation, or encoding.
+
+Transaction admission is cumulative and durable. Each intent has a point-read
+membership/credit record; a fixed 16-byte header stores count and total credits.
+A prepare updates only touched members and the header in the same atomic batch
+as the vote. Replacements subtract the previous credits; repeated prepares do
+not double-charge. This removes whole-manifest rewrites across incremental
+prepares. Released document transactions with the previous manifest pay one
+conversion pass; there is no compatibility format for earlier PR-only rows.
+
+Credits conservatively allow 64 bytes of working space per retained sidecar/AROW
+byte, 16 per key byte, and 4096 per row. The logical ceiling is persisted in the
+table catalog (128 MiB of credits by default), independent of each replica's
+memory configuration. Replacements and duplicate keys are coalesced before
+payload envelopes are allocated, and those allocations share the request's
+tracked preparation budget. Oversized additions fail
+before voting with `TransactionTooLarge` (HTTP 413); shrinking and identical
+retries remain allowed after a limit reduction. Temporary contention still
+returns retryable `ResourceBudgetExceeded`; it cannot change the replicated
+transaction decision. Raft records `TransactionTooLarge` as a command result
+and continues applying subsequent entries, including the coordinator's abort.
+These are conservative admission
+credits, not a guarantee against arbitrary generated-index expansion or a
+subsequent reduction of the node memory limit. Larger transactions require a
+larger execution envelope within the catalog's logical ceiling; spillable atomic
+commit remains future work.
+
+Field-backed dense indexes consume the prepared row's typed ordinal view.
+Decimal vector elements round directly to f32 once, so foreground indexing,
+row projection, semantic hashing, and index rebuilds use identical values.
+JSON-backed vectors retain the document extraction path.
+
+Every request pins one immutable `SchemaView`. JSON is parsed once into an owned
+`PreparedRelationalWrite`; one schema-guided preparation fills ordinal logical
+values for public-schema validation, special-field and index extraction, the
+canonical semantic hash, TTL resolution, and `AROW v2` encoding. Ordinary rows
+borrow the request body for derived consumers instead of copying it; rows with
+reserved fields clone and stringify one stripped logical tree. Large batches
+prepare on the bounded runtime worker pool into one ref-counted arena per
+worker, so allocator synchronization occurs at page granularity without one
+allocator/page chain per row. Parsed trees survive preparation only when a
+synchronous base-document text consumer or split shadow needs them. Vector-only
+and artifact-only `full_index` writes recycle parse scratch per row rather than
+retaining all batch JSON trees. Store keys, timestamps, and derived write effects
+are prepared from a ref-counted immutable
+`WritePlanSnapshot`. Graph/vector extraction and generated-enrichment templates
+are compiled once per durable catalog generation, so foreground work does not
+hold a live catalog lease per row. Slow embedding and asset provider calls run
+before the exclusive DB apply fence, allowing ordinary commits to continue. A
+bounded optimistic retry rebuilds preparation if either pinned generation
+changes; the exclusive apply section checks only the schema epoch and write-plan
+generation before committing primary rows, identity metadata, catalog state,
+indexes/outboxes, and transaction markers atomically.
+
+Ordered transforms use the same prepared-row path. Their durable base values
+and versions are captured under the shared apply fence, the effective rows are
+coalesced and prepared without the exclusive fence, and commit revalidates the
+pinned read set before applying. A changed base causes a bounded retry rather
+than a stale transform. Per-row generated-enrichment plans borrow strings from
+the pinned immutable write plan and allocate only their filtered consumer
+vectors, avoiding configuration-sized allocation and copying per document.
+
+The durable table catalog records storage mode, active schema version, format
+capabilities, index build state, and whether user data exists. Exact cardinality
+remains in transactional identity metadata, so ordinary writes update the
+catalog only on meaningful state transitions. First-schema admission is O(1)
+after a one-time streaming reconciliation of legacy stores.
+
+Portable backup uses a manifest-first `AFB2` stream. Runtime and public schemas
+are persisted by version before row blocks. Restore validates each row with its
+declared immutable layout, recomputes its logical hash directly from typed
+ordinal cells, canonical-checks JSON subcolumns, and invokes the matching
+compiled public validator only for higher-order schema constraints. Per-row
+scratch arenas are recycled, and block/footer checksums are verified while the
+archive streams into an unpublished staging database. Each decoded AFB2 block
+is validated and imported in the same pass; it is not parsed once for validation
+and again for application. Only a completely validated stage is atomically
+published, giving bounded memory, cancellation safety, and no partially visible
+restore.
+
+`schema_capability.projectRelationalRowJsonAlloc` parses and turns a document into one typed
+cell per declared column (`RelationalRow` / `RelationalCell` / `ColumnValue`),
+ready to hand to `section/typed_doc_values.zig` at segment-build time:
+
+- a missing required column is rejected with `error.MissingRequiredColumn`;
+- an explicit null that the property schema does not admit is rejected with
+  `error.InvalidColumnValue` — together with required presence, this enforces
+  `NOT NULL`;
+- a value that does not match the declared column type is rejected
+  (`error.InvalidColumnValue`) — relational columns are strict;
+- nullable columns absent from a document produce no cell (the typed column is
+  sparse, matching `typed_doc_values` doc-id semantics);
+- an explicit null produces a cell with `is_null = true`; segment storage must
+  preserve that state separately from a sparse/absent value;
+- `json` columns are stringified to bytes and flagged `is_json` so the write
+  path can additionally project the subtree via `pathfact` + dynamic templates.
+
+Numeric physical encoding matches `typed_doc_values` and is order-preserving so
+range scans work directly on the packed column:
+
+- `number` → `f64` (native);
+- `integer` → `i64` for exact signed round-tripping and native signed reads;
+- `datetime` → `u64` epoch nanoseconds from a non-negative epoch integer,
+  integer-string, or date-only string; timestamp strings use the RFC 3339
+  profile representable by this encoding (at most nine fractional-second
+  digits and no leap-second `:60` values), with numeric offsets normalized to
+  UTC;
+- `boolean` → `bool`, `geopoint` → packed lat/lon, `string`/`blob`/`geoshape`
+  → `bytes`.
+
+Numeric schema literals that govern a physical `number` column (bounds,
+`multipleOf`, `const`, and `enum`) must round-trip through that same `f64`
+representation without changing their mathematical value. Schemas containing
+an unrepresentable literal are rejected up front. `multipleOf` is evaluated in
+the canonical decimal domain without a floating-point tolerance.
+
+Round-trip through the real `TypedDocValuesWriter`/`TypedDocValuesReader` is
+covered by unit tests.
+
+**Table-owned column accelerator:** `relational_columns.zig` streams a pinned
+primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
+1 MiB of source rows (an individual large row remains subject to the request
+budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
+alongside presence and null bitmaps; no JSON projection or reparsing belongs in
+this build path. ACB6 separates row metadata from independently addressed,
+checksummed per-column metadata. The root contains a sorted sparse directory
+of 64-ordinal presence pages (12 bytes per populated page); binary search
+locates only the columns a predicate/projection requests, without allocating or
+decoding every column's bounds and bitmaps. Missing declared metadata is
+corruption, not a missing field. Existence predicates and null projections need neither payload I/O
+nor value-stream decoding, even for large vector/JSON columns.
+
+Payloads have independently checksummed row-group pages. The builder chooses
+a power-of-two row-group size targeting about 16 KiB of uncompressed values:
+compact scalar columns stay in one page, while wide columns get finer-grained
+pages. A single large value may exceed that target. Column metadata declares
+the group size and exact encoded bytes for every page, including zero-byte
+absent/null-only groups. Predicates load pages intersecting their surviving
+candidate mask; projections load only the pages containing delivered rows.
+Repeated predicates share decoded pages. The cost model charges only still-
+unread pages containing surviving values, and `payload_pages_read` exposes the
+actual I/O alongside bytes read. Publication retires every declared page
+atomically; generation reclamation also covers canceled or obsolete pages.
+
+Column segments carry schema epochs, null state, and numeric min/max summaries.
+A manifest records the schema-bound generation and directory state.
+Each primary put/delete atomically records an eight-byte mutation version and
+an eight-byte packed-row size (zero for tombstones),
+including raw recovery writes that do not append replay. One durable counter
+increment is shared by all row mutations in a store transaction. Counter,
+primary and dirty records commit together; aborts cannot expose identities,
+overflow is rejected, and identical rewrites still get new committed identities.
+No physical-row hashing is performed for dirty marking. Physical checksums and
+semantic content hashes retain their independent integrity contracts.
+A snapshot reader streams an ordered merge of immutable column rows and dirty
+AROW point reads. Inserts and updates come from the pinned snapshot's primary
+row; deletes and changed rows mask the corresponding old base row, even when
+the new row fails the predicate or expires. Delta evaluation is independent of
+base zone-map pruning. One changed row no longer forces primary reads for the
+whole range, and arbitrarily large deltas retain only one row read scope/arena.
+A bounded cost probe compares unchanged primary bytes plus live delta bytes
+against selected-column payload bytes plus delta point-read costs. Root metadata
+records packed bytes per row; selected column metadata records payload sizes.
+Replaced base rows are subtracted, while expired primary rows still count toward
+I/O. The estimate charges 4 KiB per random read and 64 bytes per sequential row,
+requiring a 25% margin and at least 16 deltas before switching to primary scans.
+It inspects at most 1,024 dirty records or 256 KiB without fetching primary values;
+incomplete estimates omit projection costs and use the observed point-read cost
+as an overlay lower bound, so very large insertion bursts can still choose a
+sequential scan without walking every marker first. Small LIMIT queries (up to 16) skip the
+probe and preserve early exit. These conservative cost weights are tuning
+parameters, not measured device latency claims. Scan statistics expose estimated
+costs, probe records, and the choice as `dense_delta_scans`.
+Ordinary row-count
+updates leave the accelerator live. Schema changes invalidate the generation.
+Relational scans, including full-document fallback and maintenance, use a
+row-only owner cursor. It seeks directly past each encoded owner's child prefix
+instead of stepping through artifact, vector, or TTL records. Escaped binary IDs,
+empty IDs, and prefix-related IDs retain their ordering and range semantics.
+There is no duplicate primary-row copy or secondary row-directory index to keep
+in sync. The backend-neutral cursor is the boundary for any future physical
+row-keyspace change. An artifact-only owner may require reading its first record,
+but child fanout does not multiply cursor steps. Owner checkpoints enforce query
+cancellation/deadlines and let builds yield after 1,024 owners or their time
+budget even without a live row. Owner-visit counters expose that work separately
+from rows read or written. Clean-range coalescing fetches known rows directly
+from the same snapshot's immutable block directory, without rescanning gaps.
+Thus neither an empty prefix nor an orphan-heavy gap after a live row can
+repeatedly consume the budget before the worker reaches its successor. Dirty
+and uncovered ranges continue to use the bounded owner cursor.
+
+Bulk-capable backends append dirty tokens in the same ingest arena as primary
+rows, preserving direct ingestion without per-row sorted-map insertion.
+
+Maintenance compacts a dirty range and up to seven eligible neighbors, staging
+at most 64 replacement blocks per pass and yielding after 8 MiB of source rows
+or 50 ms, checked between rows after the first block (an individual row/block can exceed the byte or
+time target). Dirty-image capture is independently capped at 1,024 records or 256 KiB;
+large delete bursts therefore yield even when there are no live output rows.
+Large insertion bursts split into bounded passes while the
+uncovered suffix retains its old block and dirty markers. Publication replaces
+the affected directory entries and retires old blocks atomically. Compare-and-
+clear removes only dirty images represented by the published snapshot: a
+racing write keeps its marker. Checksummed cleanup pages are staged before
+publication; the directory and cleanup job become visible in one transaction.
+The common one-page case compare-clears within publication itself, avoiding
+both a journal write and a separate cleanup commit.
+Each cleanup transaction compare-clears at most 256 images (or a 256 KiB page)
+and deletes that page atomically. Restart resumes at the first remaining page
+without rebuilding published rows or retaining their source snapshot. Initial
+generation creation uses the same bounded builder. A checksummed, generation-bound
+bootstrap cursor advances atomically with each published prefix and cleanup job.
+The manifest explicitly marks initialization in progress: a missing checkpoint
+is corruption and triggers primary fallback/rebuild, never false full coverage.
+Every quantum takes a fresh snapshot; unfinished suffixes use primary scans even
+when their rows have no dirty records. A restart resumes the unpublished suffix,
+and racing changes in published prefixes retain their dirty markers. No table-wide
+snapshot or all-at-once final publication is required. A durable build token fences concurrent builders
+and makes canceled/crashed staging reclaimable on restart. Whole-store namespace
+replacement is fenced separately. Retired blocks remain available to pinned
+MVCC readers. Initial creation, schema replacement, and corrupt-derived-data repair
+all use incremental coverage construction. This keeps one row authority,
+makes schema changes and crash recovery explicit, and prevents a user-visible
+index configuration from controlling SQL/relational scan performance.
+
+A generation-bound durable round-robin cursor advances before staging, so hot
+keys, failed builds and process restarts cannot starve later dirty ranges. The
+owner worker drains up to eight ranges or 50 ms per turn (checked between
+bounded range builds), using a 100 ms active cadence while work remains and a
+five-second idle/resource-pressure backoff. DB statistics expose pending work,
+its observed age, backoff state, pass duration, failures, compacted ranges and
+written blocks without a catalog scan.
+
+The background worker admits dirty compaction when at least one quarter of the
+base rows changed, delta bytes reach one eighth of source bytes, accumulated read
+cost reaches the source size (at least 64 KiB), or the oldest observed deferral
+reaches ten seconds. First-observation timestamps are durable and do not reset on
+hot rewrites or restart; backwards wall-clock jumps admit work. Read pressure is
+a bounded 256-slot atomic hint table: collisions may compact a range early, never
+change visibility. Deferred ranges have checksummed state and a durable,
+generation-bound due-time index. Discovery examines up to 128 candidates or
+50 ms per batch and commits all new deferrals and cursor progress together.
+Deferral state caches immutable block row counts and source bytes. Subsequent
+wakes inspect bounded dirty-marker prefixes and use their maximum committed
+mutation token as a range-local revision: a write elsewhere does not reread
+the block root or rewrite unchanged deferrals. This avoids a new range-index
+lookup/update in foreground transactions and preserves bulk append ingestion.
+It still performs small dirty-marker probes on table-wide wakes; statistics
+separate `admission_root_reads` and `admission_dirty_probes`. Restart reuses the
+durable admission facts. Empty completed coverage re-enters bootstrap when a
+new row arrives, rather than attempting admission against a missing directory.
+Due timers are considered first; ready work discovered behind deferred ranges
+can run in the same worker turn. A merge turn cannot lose a selected ready range,
+and merge/cleanup work prevents entering a deferred-only wait. Publication retires
+the old block's timer atomically and repoints retained suffix timers after a
+partial build; stale timer entries are reclaimed in bounded batches. Timer and
+merge-queue keys use separate namespaces. Restart retains the original due times.
+
+When only future timers remain, unchanged idle checks perform no storage reads
+or scheduling commits. A process-local revision advances only after successful
+row/schema commits; together with read-pressure and namespace revisions, it wakes
+discovery on the next active poll (100 ms maximum polling interval, excluding
+resource pressure). Polling remains cooperative `std.Io` sleep, and timer expiry
+or a backwards clock correction also resumes discovery. The durable mutation
+counter and timer index, not process-local hints, govern restart behavior.
+Explicit maintenance drains bypass
+admission, but retain all quantum limits. Statistics expose deferred ranges,
+bootstrap quanta, candidate checks, scheduling commits, next due time and actual
+staged key/value bytes written. Age is an admission
+deadline, not a completion SLA under resource pressure or a large backlog.
+
+Underfilled blocks (fewer than 128 rows and less than 512 KiB of source rows)
+retain durable occupancy markers. A separate merge queue receives every fourth
+compaction scheduling turn even while dirty work remains, and all otherwise
+idle turns. Its durable round-robin cursor prevents a hot first candidate from
+starving later candidates. Only selected clean neighbors must be clean, not the
+whole table; reaching idle does not discard occupancy information.
+Later delete waves can merge with earlier underfilled neighbors. Coalescing
+uses compatible schema epochs, the same bounded builder and atomic directory
+publication as dirty compaction. GC deletes at most 256 records or 256 KiB of
+keys per quantum; revoked staging tokens remain in a durable garbage job until
+their entire prefix is reclaimed. The deletion itself is the resumable cursor.
+
+Artifact metadata repair and column maintenance have independent failure and
+backoff handling behind the shared portable-runtime activation gate. An artifact
+decode failure cannot starve column maintenance or create a hot retry loop.
+Maintenance statistics additionally expose rows written, ranges merged, dirty
+markers cleared and GC records deleted; rows/blocks written measure output
+occupancy and can be compared with mutation volume to assess write amplification.
+Durable transaction preparation includes packed AROW bytes, not just reserved
+JSON sidecars, when sizing its bounded `std.Io` task group.
+
+### Query path
+
+The relational base-row path compiles exact scalar and nested-JSON predicates
+to stable ordinals. A scan authenticates and parses the AROW directory once,
+then evaluates those predicates without reconstructing the document; unsupported
+predicate shapes fall back to logical JSON for correctness. Projection uses the
+same compiled ordinal layout. TTL reads the physical write timestamp directly
+from the authenticated row header, and vector rebuilds decode only their target
+ordinal. Joins and `GROUP BY`-over-join are unchanged — they already exist (see
+`JOINS.md`, `ALGEBRAIC.md`).
+
+Positive nested projections compile their root ordinals and path segments once
+per epoch. Only referenced columns are materialized, then the existing document
+projection operators run on that partial typed root. Unselected vectors and JSON
+columns are not expanded; exact top-level selections retain the direct encoder.
+Exclusions, wildcard selections, and special fields keep their general fallback.
+
+Dense-vector membership and indexed element predicates run directly on binary
+f32 payloads without constructing a JSON array. Other composite predicates use
+the same logical-cell conversion as projection, cached once per referenced
+column for the row's evaluation.
+
+First-party cross-node scans use one response-streamed request per shard. The
+remote shard therefore holds one read transaction for the requested range and
+the caller applies byte-level backpressure while decoding rows. Custom request
+executors that do not implement streaming retain the bounded row-paged fallback.
+
+Table-owned `typed_doc_values` remain a complementary accelerator for broad
+range scans and aggregations. They are not required for direct AROW projection
+or filtering and never become a second row authority.
+
+Covered scans evaluate flat-field predicates column-at-a-time, prune disjoint
+numeric ranges using block summaries, and fetch projection columns only for
+blocks with surviving rows. A sparse row-key directory lets resumed and bounded
+scans seek directly to their starting block. Positive top-level projections and hash-only scans
+avoid primary-row reads for unchanged rows. Nested/special/full-document selections retain AROW
+fallback. Checked directory boundary links detect missing range entries; block
+and manifest checksums protect derived bytes. Corruption resumes
+the same snapshot's primary scan after the last delivered key and requests a
+rebuild. Request-local `ColumnarScanStats` exposes blocks read/pruned, columns and
+encoded bytes read, selected column-metadata reads, overlay point reads,
+selected rows, dirty ranges read, and logical values
+materialized. Typed scalar kernels and direct vector membership do not build
+JSON trees. Candidate masks short-circuit resolved blocks/rows, inexpensive
+predicates precede composite payloads, and projected values are materialized
+only for surviving rows. JSON composite values are cached per block/row.
+
+The scan retains one immutable storage snapshot but opens a read scope per
+columnar block. LSM scopes own and release their own cached-block pins/copied
+values; they never accumulate in the parent transaction. LMDB borrows from its
+snapshot, and other backends use bounded cursor-owned copies. Dirty overlays
+check query/shard bounds before opening a row read scope. Primary
+fallback intersects directory, query and shard bounds before opening its
+cursor, and checks keys before schema lookup or row decoding. Scan counters
+separate metadata bytes, payload bytes and primary rows decoded.
+
+Durable intent application keeps AROW as the logical authority. The immutable
+write plan requests only the graph/sparse/TTL/text fields actually consumed;
+direct vectors use binary ordinals. Selected-field text indexes retain only
+their required roots. JSON-only consumers opt into a request-owned lazy source:
+field-based enrichment inputs project their own ordinal, while root templates,
+document-extraction metadata, and whole-document text consumers explicitly
+request broader materialization. Renderings are cached, and merely persisting a
+typed row never forces JSON reconstruction. Dedicated columnar aggregate/sort
+operators remain separate query-engine work, not part of scan publication.
+
+Relational JSON, special-field, and physical validation failures are normalized
+at the input boundary. Raft records `InvalidBatchRequest` and the durable
+`TransactionTooLarge` policy rejection as terminal command outcomes, then
+advances to later entries. Corruption and local resource pressure remain
+execution failures rather than being silently converted into rejected writes.
+
+API-bound and Raft portable restores select the unpublished, one-pass importer.
+The request's semantic cancellation token reaches the block loop, and bound
+restore plans can report transport-neutral block/row/byte progress. Cancellation
+discards staging rather than publishing partial state. Complete-image identity
+and public-contract checks still run before publication.
+
+### Schema evolution
+
+Schema changes durably write an immutable runtime layout and public validator,
+then atomically switch the catalog's active version. Requests keep their pinned
+epoch alive through reference counting; point reads use an RCU acquisition fast
+path, and historical versions load lazily when old rows are encountered.
+
+Historical caches use an aging frequency sketch for admission. An interleaved
+scan spanning more than 32 epochs must not flush every resident query plan or
+layout on each row. Scan, search, index-backfill, and shared-registry caches
+apply that policy; a request-owned transient entry serves non-admitted epochs.
+Repeated hits reuse that transient plan without faulting or compiling it again.
+Sixteen `std.Io` fault lanes coalesce same-version misses while unrelated
+versions can load concurrently. Whole-store replacement acquires all lanes
+before replacing the registry namespace.
+
+Portable export and restore share a 16 MiB decoded historical-epoch budget
+(configurable through `ImportOptions.schema_cache_bytes` for restore). Export
+faults serialized layouts from its immutable snapshot. Staged restore faults
+from its unpublished metadata store; validation-only paths spill serialized
+history to a private host file. A compact version/offset/digest directory remains
+in memory. Archives are not rejected based on total schema-history size.
+Arena capacity accounts for decoded layouts and validators; one transient or
+oversized epoch and the active schema are additional working memory. The compact
+directory remains O(schema versions), and validation-only freestanding calls
+without a filesystem retain the serialized spool in memory. Canonical row and cross-schema
+validation still run before staging publication. Export uses compiled physical
+offsets, keeping dense-row column traversal linear in schema width.
+
+`schema_capability.classifyChange` already distinguishes additive changes
+(new algebraic field → no rebuild) from breaking algebraic changes (removed or
+type-changed field → rebuild). A relational-specific lifecycle classifier is a
+later integration seam: it must treat nullable → `NOT NULL` as breaking and
+only classify widening (for example integer → number) as additive when the
+physical representation and backfill plan are compatible.
+
+## Phased plan
+
+- **Phase 1 — contract + catalog (complete).** `storage_mode` parsing,
+  raw-schema `json` columns, and `relationalColumnPlanAlloc` produce the static
+  typed-column catalog.
+- **Phase 2A — authoritative packed base rows (complete).** Writes,
+  transactions, recovery, replay, scans, indexing, TTL, split handoff, and
+  portable backup operate on dedicated packed-row keys while returning logical
+  JSON at API boundaries.
+- **Phase 2B — immutable epochs, prepared rows, and staged restore (complete).**
+  Versioned layouts/validators, ordinal AROW v2, transactional catalog/outbox,
+  bounded concurrent preparation, and manifest-first staged restore.
+- **Phase 3 — ordinal execution (complete).** Compiled predicate/projection
+  plans, physical-header TTL, and direct-ordinal vector extraction avoid full
+  document reconstruction on the relational hot paths.
+- **Phase 4 — table-owned typed-column persistence (implemented).** Bounded,
+  staged generations, null bitmaps, checksums, coverage fences, and reclamation.
+- **Phase 5 — columnar scan and predicate pushdown (implemented for flat fields).**
+  Column-at-a-time evaluation, numeric zone maps, and late projection loading.
+- **Phase 6 — unified reads (implemented for positive top-level projections).**
+  Covered scans use columns; unsupported selections and uncovered generations
+  use authoritative AROW. Incremental maintenance and specialized aggregate/sort
+  execution can extend this without introducing another row authority.
+
+## Related docs
+
+- [SCHEMA.md](SCHEMA.md) — schema contract and compiled runtime schema
+- [ALGEBRAIC.md](ALGEBRAIC.md) — fact projection, materializations, folds
+- [JOINS.md](JOINS.md) — relational join planner and distributed execution

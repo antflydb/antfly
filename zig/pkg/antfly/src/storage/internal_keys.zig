@@ -23,6 +23,42 @@ pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
+pub const relational_row_kind: u8 = 0x12;
+pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
+pub const relational_columnar_dirty_prefix = "\x00\x00__columnar__:dirty:";
+pub const relational_columnar_mutation_key = "\x00\x00__columnar__:mutation";
+
+pub fn relationalColumnarDirtyKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {
+    const raw = (try decodeStoredDocumentRowKeyAlloc(alloc, row_key)) orelse return error.InvalidInternalUserKey;
+    defer alloc.free(raw);
+    return std.mem.concat(alloc, u8, &.{ relational_columnar_dirty_prefix, raw });
+}
+
+/// Opaque committed mutation identity. The counter and all primary/dirty writes
+/// share one store transaction; aborted identities are never visible to readers.
+pub const ColumnarMutationToken = [8]u8;
+
+pub fn relationalColumnarMutationToken(version: u64) ColumnarMutationToken {
+    var token: ColumnarMutationToken = undefined;
+    std.mem.writeInt(u64, &token, version, .little);
+    return token;
+}
+
+/// Mutation identity plus current packed-row size (zero denotes a tombstone).
+/// Cost metadata shares the primary commit; it needs no primary read or hash.
+pub const ColumnarDirtyRecord = [16]u8;
+pub fn relationalColumnarDirtyRecord(token: ColumnarMutationToken, bytes: usize) ColumnarDirtyRecord {
+    var record: ColumnarDirtyRecord = undefined;
+    @memcpy(record[0..8], &token);
+    std.mem.writeInt(u64, record[8..16], bytes, .little);
+    return record;
+}
+
+pub fn invalidatesRelationalColumns(key: []const u8) bool {
+    // Row-count catalog updates do not alter a layout. Schema publication
+    // writes this key atomically with its catalog and invalidates the epoch.
+    return std.mem.eql(u8, key, "\x00\x00__metadata__:schema");
+}
 pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;
@@ -229,6 +265,33 @@ pub fn decodeBodyView(body: []const u8) !?[]const u8 {
     return body;
 }
 
+pub fn decodeBodyIntoList(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    body: []const u8,
+) ![]const u8 {
+    out.clearRetainingCapacity();
+    try out.resize(alloc, maxDecodedLen(body));
+    var in_pos: usize = 0;
+    var out_pos: usize = 0;
+    while (in_pos < body.len) {
+        const byte = body[in_pos];
+        if (byte != 0) {
+            out.items[out_pos] = byte;
+            in_pos += 1;
+            out_pos += 1;
+            continue;
+        }
+        if (in_pos + 1 >= body.len or body[in_pos + 1] != 0xff)
+            return error.InvalidInternalUserKey;
+        out.items[out_pos] = 0;
+        in_pos += 2;
+        out_pos += 1;
+    }
+    out.shrinkRetainingCapacity(out_pos);
+    return out.items;
+}
+
 fn maxDecodedLen(body: []const u8) usize {
     return body.len;
 }
@@ -250,6 +313,14 @@ pub fn documentKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     key[0] = user_namespace;
     const pos = 1 + encodeComponent(key[1..], doc_key);
     key[pos] = primary_kind;
+    return key;
+}
+
+pub fn relationalRowKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var key = try alloc.alloc(u8, 1 + encodedComponentLen(doc_key) + 1);
+    key[0] = user_namespace;
+    const pos = 1 + encodeComponent(key[1..], doc_key);
+    key[pos] = relational_row_kind;
     return key;
 }
 
@@ -1270,6 +1341,16 @@ pub fn isPrimaryDocumentKey(key: []const u8) bool {
     return term + 3 == key.len and key[term + 2] == primary_kind;
 }
 
+pub fn isRelationalRowKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == relational_row_kind;
+}
+
+pub fn isStoredDocumentRowKey(key: []const u8) bool {
+    return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
 pub fn isTtlKey(key: []const u8) bool {
     if (!isInternalUserKey(key)) return false;
     const term = findComponentTerminator(key, 1) orelse return false;
@@ -1280,6 +1361,25 @@ pub fn decodePrimaryDocumentKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
     if (!isPrimaryDocumentKey(key)) return null;
     const term = findComponentTerminator(key, 1).?;
     return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+pub fn decodeStoredDocumentRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isStoredDocumentRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+/// Decode a primary-row identity without allocating in the common case. Keys
+/// containing escaped NUL bytes reuse caller-owned scratch across scan rows.
+pub fn decodeStoredDocumentRowKeyScratch(
+    scratch: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    key: []const u8,
+) !?[]const u8 {
+    if (!isStoredDocumentRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    const body = key[1..term];
+    return (try decodeBodyView(body)) orelse try decodeBodyIntoList(scratch, alloc, body);
 }
 
 pub fn decodeDocumentComponentAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
@@ -2567,4 +2667,24 @@ test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {
     defer alloc.free(asset);
     try std.testing.expect(!isPrimaryDocumentKey(asset));
     try std.testing.expect((try decodePrimaryDocumentKeyAlloc(alloc, asset)) == null);
+}
+
+test "stored document row keys round trip document and relational keyspaces" {
+    const alloc = std.testing.allocator;
+    const document_id = "person/ada\x00lovelace";
+    const primary = try documentKeyAlloc(alloc, document_id);
+    defer alloc.free(primary);
+    const relational = try relationalRowKeyAlloc(alloc, document_id);
+    defer alloc.free(relational);
+
+    try std.testing.expect(isStoredDocumentRowKey(primary));
+    try std.testing.expect(isStoredDocumentRowKey(relational));
+    try std.testing.expect(!std.mem.eql(u8, primary, relational));
+
+    const decoded_primary = (try decodeStoredDocumentRowKeyAlloc(alloc, primary)).?;
+    defer alloc.free(decoded_primary);
+    const decoded_relational = (try decodeStoredDocumentRowKeyAlloc(alloc, relational)).?;
+    defer alloc.free(decoded_relational);
+    try std.testing.expectEqualStrings(document_id, decoded_primary);
+    try std.testing.expectEqualStrings(document_id, decoded_relational);
 }

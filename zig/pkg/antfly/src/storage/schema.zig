@@ -168,6 +168,48 @@ pub const FullTextDocument = struct {
     infer_type_dynamic_paths: []const []const u8 = &.{},
 };
 
+/// Storage profile for a table. Relational mode stores a self-describing packed
+/// row as the authoritative document value instead of retaining a JSON blob.
+pub const StorageMode = enum(u8) {
+    document = 0,
+    relational = 1,
+};
+
+/// Logical column type retained by the runtime schema. This remains separate
+/// from AntflyType so signed integers do not collapse into the f64-backed
+/// numeric representation used by legacy document indexes.
+pub const RelationalColumnType = enum(u8) {
+    string = 0,
+    blob = 1,
+    boolean = 2,
+    datetime = 3,
+    integer = 4,
+    number = 5,
+    geopoint = 6,
+    geoshape = 7,
+    json = 8,
+    /// Canonical little-endian IEEE-754 f32 payload. The vector length is
+    /// derived from the payload and index contracts validate their dimensions.
+    dense_vector = 9,
+};
+
+pub const RelationalJsonKind = enum(u8) {
+    none = 0,
+    any = 1,
+    object = 2,
+    array = 3,
+};
+
+pub const RelationalColumn = struct {
+    name: []const u8,
+    path: []const u8,
+    column_type: RelationalColumnType,
+    required: bool = false,
+    allows_null: bool = false,
+    is_json: bool = false,
+    json_kind: RelationalJsonKind = .none,
+};
+
 pub const IndexSortField = struct {
     field: []const u8,
     desc: bool = false,
@@ -179,10 +221,16 @@ pub const TableSchema = struct {
     ttl_duration_ns: u64 = 0,
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
+    storage_mode: StorageMode = .document,
+    /// Immutable provenance of the validation contract, persisted per epoch.
+    /// Runtime-only embedders have no public constraints to restore. A schema
+    /// derived from the public API must never silently lose those constraints.
+    requires_public_schema: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
     full_text_documents: []const FullTextDocument = &.{},
+    relational_columns: []const RelationalColumn = &.{},
     index_sort: []const IndexSortField = &.{},
 };
 
@@ -197,9 +245,26 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 // Serialization
 // ============================================================================
 
+/// Current durable runtime-schema format. Catalog compatibility checks use the
+/// same exported constant so a writer can never silently drift from the format
+/// it advertises in transactional table metadata.
+pub const storage_format_version: u32 = 13;
+
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
-    return serializeSchemaFormat(alloc, schema, 12);
+    return serializeSchemaFormat(alloc, schema, storage_format_version);
+}
+
+/// Compare complete runtime schemas through their canonical durable encoding.
+/// This is intended for cold control-plane paths such as startup and restore,
+/// where accepting a partially matching public/runtime schema pair would make
+/// subsequent reads and index maintenance depend on which representation won.
+pub fn schemasEqual(alloc: Allocator, a: TableSchema, b: TableSchema) !bool {
+    const encoded_a = try serializeSchema(alloc, a);
+    defer alloc.free(encoded_a);
+    const encoded_b = try serializeSchema(alloc, b);
+    defer alloc.free(encoded_b);
+    return std.mem.eql(u8, encoded_a, encoded_b);
 }
 
 /// Serialize only the schema state that changes a full-text generation's
@@ -211,14 +276,22 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
     var projection_schema = schema;
     projection_schema.declared_fields = &.{};
+    projection_schema.storage_mode = .document;
+    projection_schema.relational_columns = &.{};
     const projection_format_version: u32 = if (projection_schema.exact_fields.len == 0) 11 else 12;
     return serializeSchemaFormat(alloc, projection_schema, projection_format_version);
 }
 
 fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: u32) ![]u8 {
-    std.debug.assert(format_version == 11 or format_version == 12);
+    std.debug.assert(format_version == 11 or format_version == 12 or format_version == 13);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
+    try validateRelationalSchema(alloc, schema);
     if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
+        return error.InvalidSchema;
+    }
+    if (format_version < 13 and
+        (schema.storage_mode != .document or schema.relational_columns.len != 0))
+    {
         return error.InvalidSchema;
     }
 
@@ -321,6 +394,21 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         try buf.append(alloc, if (field.desc) 1 else 0);
     }
 
+    if (format_version >= 13) {
+        try buf.append(alloc, @intFromEnum(schema.storage_mode));
+        try buf.append(alloc, @intFromBool(schema.requires_public_schema));
+        try appendU32(&buf, alloc, @intCast(schema.relational_columns.len));
+        for (schema.relational_columns) |column| {
+            try appendStr(&buf, alloc, column.name);
+            try appendStr(&buf, alloc, column.path);
+            try buf.append(alloc, @intFromEnum(column.column_type));
+            try buf.append(alloc, if (column.required) 1 else 0);
+            try buf.append(alloc, if (column.allows_null) 1 else 0);
+            try buf.append(alloc, if (column.is_json) 1 else 0);
+            try buf.append(alloc, @intFromEnum(column.json_kind));
+        }
+    }
+
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);
     return result;
@@ -329,12 +417,16 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
 /// Deserialize a TableSchema from bytes. Dupes all string data so the result
 /// is independent of the source buffer. Call `freeSchema` to release.
 pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
+    // Persisted schemas are also accepted from portable backups and HA logs.
+    // Validate the complete byte stream before any unchecked legacy decoding
+    // or input-sized allocation so corruption is always a typed error.
+    try validateSerializedSchema(data);
     if (data.len < 4) return error.InvalidFormat;
     if (!std.mem.eql(u8, data[0..4], "ASCH")) return error.InvalidFormat;
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 12) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 13) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -734,18 +826,323 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk fields;
     } else &.{};
 
-    return .{
+    if (fmt_version >= 13 and pos >= data.len) return error.InvalidFormat;
+    const storage_mode: StorageMode = if (fmt_version >= 13) switch (data[pos]) {
+        0 => .document,
+        1 => .relational,
+        else => return error.InvalidSchema,
+    } else .document;
+    if (fmt_version >= 13) pos += 1;
+    const requires_public_schema = if (fmt_version >= 13) data[pos] == 1 else false;
+    if (fmt_version >= 13) pos += 1;
+
+    const relational_columns: []RelationalColumn = if (fmt_version >= 13) blk: {
+        const column_count = readU32(data, &pos);
+        const columns = try alloc.alloc(RelationalColumn, column_count);
+        var columns_initialized: usize = 0;
+        errdefer {
+            for (columns[0..columns_initialized]) |column| {
+                alloc.free(column.name);
+                alloc.free(column.path);
+            }
+            alloc.free(columns);
+        }
+        for (columns) |*column| {
+            var name: ?[]u8 = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer if (name) |owned_name| alloc.free(owned_name);
+            var path: ?[]u8 = try alloc.dupe(u8, readStr(data, &pos));
+            errdefer if (path) |owned_path| alloc.free(owned_path);
+            if (pos + 5 > data.len) return error.InvalidFormat;
+            const column_type: RelationalColumnType = switch (data[pos]) {
+                0 => .string,
+                1 => .blob,
+                2 => .boolean,
+                3 => .datetime,
+                4 => .integer,
+                5 => .number,
+                6 => .geopoint,
+                7 => .geoshape,
+                8 => .json,
+                9 => .dense_vector,
+                else => return error.InvalidSchema,
+            };
+            pos += 1;
+            const required = data[pos] == 1;
+            pos += 1;
+            const allows_null = data[pos] == 1;
+            pos += 1;
+            const is_json = data[pos] == 1;
+            pos += 1;
+            const json_kind: RelationalJsonKind = switch (data[pos]) {
+                0 => .none,
+                1 => .any,
+                2 => .object,
+                3 => .array,
+                else => return error.InvalidSchema,
+            };
+            pos += 1;
+            column.* = .{
+                .name = name.?,
+                .path = path.?,
+                .column_type = column_type,
+                .required = required,
+                .allows_null = allows_null,
+                .is_json = is_json,
+                .json_kind = json_kind,
+            };
+            columns_initialized += 1;
+            name = null;
+            path = null;
+        }
+        break :blk columns;
+    } else &.{};
+
+    const result: TableSchema = .{
         .version = version,
         .default_type = default_type,
         .ttl_duration_ns = ttl_duration_ns,
         .ttl_field = ttl_field,
         .enforce_types = enforce_types,
+        .storage_mode = storage_mode,
+        .requires_public_schema = requires_public_schema,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
         .full_text_documents = full_text_documents,
+        .relational_columns = relational_columns,
         .index_sort = index_sort,
     };
+    errdefer freeSchema(alloc, result);
+    try validateRelationalSchema(alloc, result);
+    return result;
+}
+
+const SchemaValidationCursor = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    fn remaining(self: *const @This()) usize {
+        return self.data.len - self.pos;
+    }
+
+    fn ensure(self: *const @This(), len: usize) !void {
+        if (len > self.remaining()) return error.InvalidFormat;
+    }
+
+    fn readU8(self: *@This()) !u8 {
+        try self.ensure(1);
+        const value = self.data[self.pos];
+        self.pos += 1;
+        return value;
+    }
+
+    fn readBool(self: *@This()) !void {
+        switch (try self.readU8()) {
+            0, 1 => {},
+            else => return error.InvalidSchema,
+        }
+    }
+
+    fn readU32(self: *@This()) !u32 {
+        try self.ensure(4);
+        const value = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
+        self.pos += 4;
+        return value;
+    }
+
+    fn readU64(self: *@This()) !void {
+        try self.ensure(8);
+        self.pos += 8;
+    }
+
+    fn readStr(self: *@This()) !void {
+        const len = try self.readU32();
+        try self.ensure(len);
+        self.pos += len;
+    }
+
+    fn readOptStr(self: *@This()) !void {
+        switch (try self.readU8()) {
+            0 => {},
+            1 => try self.readStr(),
+            else => return error.InvalidSchema,
+        }
+    }
+
+    fn ensureCount(self: *const @This(), count: u32, minimum_encoded_size: usize) !void {
+        if (@as(usize, count) > self.remaining() / minimum_encoded_size) return error.InvalidFormat;
+    }
+
+    fn finish(self: *const @This()) !void {
+        if (self.pos != self.data.len) return error.InvalidFormat;
+    }
+};
+
+fn validateSerializedSchema(data: []const u8) !void {
+    var cursor: SchemaValidationCursor = .{ .data = data };
+    try cursor.ensure(4);
+    if (!std.mem.eql(u8, data[0..4], "ASCH")) return error.InvalidFormat;
+    cursor.pos = 4;
+
+    const format_version = try cursor.readU32();
+    if (format_version < 1 or format_version > 13) return error.UnsupportedVersion;
+    _ = try cursor.readU32(); // logical schema version
+    try cursor.readStr(); // default type
+    try cursor.readU64(); // TTL duration
+    try cursor.readStr(); // TTL field
+    try cursor.readBool(); // enforce types
+
+    const template_count = try cursor.readU32();
+    const minimum_template_size: usize = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 4 +
+        @as(usize, @intFromBool(format_version >= 7)) * 3 +
+        @as(usize, @intFromBool(format_version >= 9)) +
+        @as(usize, @intFromBool(format_version >= 11));
+    try cursor.ensureCount(template_count, minimum_template_size);
+    for (0..template_count) |_| {
+        try cursor.readStr();
+        try cursor.readOptStr();
+        if (format_version >= 7) try cursor.readOptStr();
+        try cursor.readOptStr();
+        if (format_version >= 7) try cursor.readOptStr();
+        if (format_version >= 7) try cursor.readOptStr();
+        if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+        try cursor.readBool();
+        try cursor.readBool();
+        try cursor.readBool();
+        if (format_version >= 9) try cursor.readBool();
+        if (format_version >= 11 and (try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected))
+            return error.InvalidSchema;
+        try cursor.readBool();
+        try cursor.readStr();
+    }
+
+    if (format_version >= 12) {
+        const declared_count = try cursor.readU32();
+        try cursor.ensureCount(declared_count, 15);
+        for (0..declared_count) |_| {
+            try cursor.readStr();
+            if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+            inline for (0..4) |_| try cursor.readBool();
+            if ((try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            try cursor.readBool();
+            try cursor.readStr();
+        }
+
+        const exact_count = try cursor.readU32();
+        try cursor.ensureCount(exact_count, 19);
+        for (0..exact_count) |_| {
+            try cursor.readStr();
+            try cursor.readStr();
+            if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+            inline for (0..4) |_| try cursor.readBool();
+            if ((try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            try cursor.readBool();
+            try cursor.readStr();
+        }
+    }
+
+    if (format_version >= 2) {
+        const document_count = try cursor.readU32();
+        var minimum_document_size: usize = 8;
+        if (format_version >= 3) minimum_document_size += 4;
+        if (format_version >= 6) minimum_document_size += 4;
+        if (format_version >= 8) minimum_document_size += 4;
+        try cursor.ensureCount(document_count, minimum_document_size);
+        for (0..document_count) |_| {
+            try cursor.readStr();
+            const field_count = try cursor.readU32();
+            try cursor.ensureCount(field_count, 13);
+            for (0..field_count) |_| {
+                try cursor.readStr();
+                try cursor.readStr();
+                try cursor.readStr();
+                try cursor.readBool();
+            }
+            if (format_version >= 3) {
+                const rule_count = try cursor.readU32();
+                const minimum_rule_size: usize = 8 +
+                    @as(usize, @intFromBool(format_version >= 4)) * 4 +
+                    @as(usize, @intFromBool(format_version >= 5));
+                try cursor.ensureCount(rule_count, minimum_rule_size);
+                for (0..rule_count) |_| {
+                    try cursor.readStr();
+                    if (format_version >= 5) try cursor.readOptStr();
+                    if (format_version >= 4) try cursor.readStr();
+                    const variant_count = try cursor.readU32();
+                    try cursor.ensureCount(variant_count, 9);
+                    for (0..variant_count) |_| {
+                        try cursor.readStr();
+                        try cursor.readStr();
+                        try cursor.readBool();
+                    }
+                }
+            }
+            if (format_version >= 6) {
+                const open_path_count = try cursor.readU32();
+                try cursor.ensureCount(open_path_count, 4);
+                for (0..open_path_count) |_| try cursor.readStr();
+            }
+            if (format_version >= 8) {
+                const infer_path_count = try cursor.readU32();
+                try cursor.ensureCount(infer_path_count, 4);
+                for (0..infer_path_count) |_| try cursor.readStr();
+            }
+        }
+    }
+
+    if (format_version >= 10) {
+        const sort_count = try cursor.readU32();
+        try cursor.ensureCount(sort_count, 5);
+        for (0..sort_count) |_| {
+            try cursor.readStr();
+            try cursor.readBool();
+        }
+    }
+
+    if (format_version >= 13) {
+        switch (try cursor.readU8()) {
+            @intFromEnum(StorageMode.document), @intFromEnum(StorageMode.relational) => {},
+            else => return error.InvalidSchema,
+        }
+        try cursor.readBool(); // immutable public-validation provenance
+        const column_count = try cursor.readU32();
+        try cursor.ensureCount(column_count, 13);
+        for (0..column_count) |_| {
+            try cursor.readStr();
+            try cursor.readStr();
+            if ((try cursor.readU8()) >= std.meta.fields(RelationalColumnType).len) return error.InvalidSchema;
+            try cursor.readBool();
+            try cursor.readBool();
+            try cursor.readBool();
+            if ((try cursor.readU8()) >= std.meta.fields(RelationalJsonKind).len) return error.InvalidSchema;
+        }
+    }
+    try cursor.finish();
+}
+
+fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    // Document-mode schemas retain derived column capability metadata for
+    // planning, but only relational mode uses this catalog as the physical row
+    // contract and therefore requires uniqueness/encoding invariants.
+    if (schema.storage_mode == .document) return;
+
+    var names = std.StringHashMapUnmanaged(void).empty;
+    defer names.deinit(alloc);
+    var paths = std.StringHashMapUnmanaged(void).empty;
+    defer paths.deinit(alloc);
+    const capacity = std.math.cast(u32, schema.relational_columns.len) orelse return error.InvalidSchema;
+    try names.ensureTotalCapacity(alloc, capacity);
+    try paths.ensureTotalCapacity(alloc, capacity);
+
+    for (schema.relational_columns) |column| {
+        if (column.name.len == 0 or column.path.len == 0 or
+            !std.unicode.utf8ValidateSlice(column.name) or
+            !std.unicode.utf8ValidateSlice(column.path)) return error.InvalidSchema;
+        if ((column.column_type == .json) != column.is_json) return error.InvalidSchema;
+        if (column.is_json != (column.json_kind != .none)) return error.InvalidSchema;
+        if ((try names.getOrPut(alloc, column.name)).found_existing) return error.InvalidSchema;
+        if ((try paths.getOrPut(alloc, column.path)).found_existing) return error.InvalidSchema;
+    }
 }
 
 /// Free a schema returned by deserializeSchema.
@@ -798,58 +1195,119 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
     }
     if (s.full_text_documents.len > 0) alloc.free(s.full_text_documents);
+    for (s.relational_columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+    }
+    if (s.relational_columns.len > 0) alloc.free(s.relational_columns);
     for (s.index_sort) |field| alloc.free(field.field);
     if (s.index_sort.len > 0) alloc.free(s.index_sort);
 }
 
 /// Save a schema to DocStore. Returns whether durable state changed.
 pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !bool {
+    return try saveSchemaWithMetadata(store, alloc, schema, &.{}, &.{});
+}
+
+/// Save the runtime schema and caller-owned metadata in one store transaction.
+///
+/// The extra writes/deletes are deliberately part of the same transaction as
+/// the active and versioned runtime schema keys. Public schema validators and
+/// other schema-generation metadata must never become observable from a
+/// different durable generation than the physical schema they describe.
+pub fn saveSchemaWithMetadata(
+    store: anytype,
+    alloc: Allocator,
+    schema: TableSchema,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+) !bool {
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
-    if (try activeSchemaDataMatches(store, alloc, data)) return false;
+    return try saveEncodedSchemaWithMetadata(
+        store,
+        alloc,
+        schema.version,
+        data,
+        metadata_writes,
+        metadata_deletes,
+    );
+}
 
-    const versioned_key = try schemaVersionKeyAlloc(alloc, schema.version);
-    defer alloc.free(versioned_key);
-    const previous_schema = try loadSchema(store, alloc);
-    defer if (previous_schema) |loaded| freeSchema(alloc, loaded);
-
-    const previous_versioned_data = blk: {
-        const loaded = previous_schema orelse break :blk null;
-        if (loaded.version == schema.version) break :blk null;
-        const existing_version = try loadSchemaVersion(store, alloc, loaded.version);
-        defer if (existing_version) |existing| freeSchema(alloc, existing);
-        if (existing_version != null) break :blk null;
-        break :blk try serializeSchema(alloc, loaded);
-    };
-    defer if (previous_versioned_data) |encoded| alloc.free(encoded);
-
+/// Commit a schema which was serialized and validated before entering the
+/// caller's mutation fence. Runtime schema bytes begin with format and logical
+/// version u32 values, so immutable-version checks need no deserialization.
+pub fn saveEncodedSchemaWithMetadata(
+    store: anytype,
+    alloc: Allocator,
+    schema_version: u32,
+    data: []const u8,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+) !bool {
+    if (data.len < 12 or !std.mem.eql(u8, data[0..4], "ASCH") or
+        std.mem.readInt(u32, data[8..12], .little) != schema_version)
+        return error.InvalidSchema;
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
+    const versioned_key = try schemaVersionKeyAlloc(alloc, schema_version);
+    defer alloc.free(versioned_key);
+    var previous_version: ?u32 = null;
+    var previous_versioned_data: ?[]u8 = null;
+    defer if (previous_versioned_data) |encoded| alloc.free(encoded);
+    const schema_changed = changed_blk: {
+        var probe = try runtime.store.beginProbe();
+        defer probe.abort();
+        const previous_data = probe.get(schema_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const changed = if (previous_data) |loaded| !std.mem.eql(u8, loaded, data) else true;
+        if (!changed) break :changed_blk false;
+
+        if (previous_data) |loaded| {
+            if (loaded.len < 12 or !std.mem.eql(u8, loaded[0..4], "ASCH")) return error.InvalidSchema;
+            previous_version = std.mem.readInt(u32, loaded[8..12], .little);
+            if (schema_version < previous_version.?) return error.SchemaVersionRegression;
+        }
+        const existing_version = probe.get(versioned_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing_version) |existing|
+            if (!std.mem.eql(u8, existing, data)) return error.ImmutableSchemaVersionConflict;
+
+        if (previous_data) |loaded| if (previous_version.? != schema_version) {
+            const previous_versioned_key = try schemaVersionKeyAlloc(alloc, previous_version.?);
+            defer alloc.free(previous_versioned_key);
+            const existing_previous = probe.get(previous_versioned_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (existing_previous == null) previous_versioned_data = try alloc.dupe(u8, loaded);
+        };
+        break :changed_blk true;
+    };
+    if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
-    if (previous_schema) |loaded| {
+    if (schema_changed) {
         if (previous_versioned_data) |encoded| {
-            const previous_versioned_key = try schemaVersionKeyAlloc(alloc, loaded.version);
+            const previous_versioned_key = try schemaVersionKeyAlloc(alloc, previous_version.?);
             defer alloc.free(previous_versioned_key);
             try txn.put(previous_versioned_key, encoded);
         }
+        try txn.put(schema_key, data);
+        try txn.put(versioned_key, data);
     }
-    try txn.put(schema_key, data);
-    try txn.put(versioned_key, data);
-    try txn.commit();
-    return true;
-}
-
-fn activeSchemaDataMatches(store: anytype, alloc: Allocator, expected: []const u8) !bool {
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginProbe();
-    defer txn.abort();
-    const raw = txn.get(schema_key) catch |err| switch (err) {
-        error.NotFound => return false,
+    for (metadata_writes) |write| try txn.put(write.key, write.value);
+    for (metadata_deletes) |key| txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
         else => return err,
     };
-    return std.mem.eql(u8, raw, expected);
+    try txn.commit();
+    return schema_changed;
 }
 
 /// Load a schema from DocStore. Returns null if no schema exists.
@@ -881,6 +1339,42 @@ pub fn loadSchemaVersion(store: anytype, alloc: Allocator, version: u32) !?Table
     const data = try alloc.dupe(u8, raw);
     defer alloc.free(data);
     return try deserializeSchema(alloc, data);
+}
+
+/// Load every immutable schema layout stored for row decoding. The returned
+/// schemas and slice are owned by the caller. This is intentionally performed
+/// once at open/publication time so row scans never perform metadata I/O.
+pub fn loadSchemaHistory(store: anytype, alloc: Allocator) ![]TableSchema {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    const entries = try backend_scan.scanPrefixCurrent(alloc, &runtime.store, schema_version_prefix);
+    defer backend_scan.freeResults(alloc, entries);
+    const schemas = try alloc.alloc(TableSchema, entries.len);
+    var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer seen.deinit(alloc);
+    var initialized: usize = 0;
+    errdefer {
+        for (schemas[0..initialized]) |schema| freeSchema(alloc, schema);
+        alloc.free(schemas);
+    }
+    for (entries) |entry| {
+        const schema = try deserializeSchema(alloc, entry.value);
+        var schema_owned = true;
+        errdefer if (schema_owned) freeSchema(alloc, schema);
+        const key_version = std.fmt.parseInt(u32, entry.key[schema_version_prefix.len..], 10) catch return error.InvalidSchema;
+        if (key_version != schema.version) return error.InvalidSchema;
+        const inserted = try seen.getOrPut(alloc, schema.version);
+        if (inserted.found_existing) return error.InvalidSchema;
+        schemas[initialized] = schema;
+        schema_owned = false;
+        initialized += 1;
+    }
+    return schemas;
+}
+
+pub fn freeSchemaHistory(alloc: Allocator, schemas: []TableSchema) void {
+    for (schemas) |schema| freeSchema(alloc, schema);
+    alloc.free(schemas);
 }
 
 pub fn copySchemas(source_store: anytype, dest_store: anytype, alloc: Allocator) !void {
@@ -946,7 +1440,7 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
     };
 }
 
-fn schemaVersionKeyAlloc(alloc: Allocator, version: u32) ![]u8 {
+pub fn schemaVersionKeyAlloc(alloc: Allocator, version: u32) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{d}", .{ schema_version_prefix, version });
 }
 
@@ -1698,9 +2192,11 @@ pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
     });
 }
 
-fn parseRfc3339ToNs(text: []const u8) ?u64 {
+pub fn parseRfc3339ToNs(text: []const u8) ?u64 {
     if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
+    if (text[4] != '-' or text[7] != '-' or
+        (text[10] != 'T' and text[10] != 't') or
+        text[13] != ':' or text[16] != ':') return null;
 
     const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
     const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
@@ -1722,27 +2218,72 @@ fn parseRfc3339ToNs(text: []const u8) ?u64 {
         while (scale < 9) : (scale += 1) frac_ns *= 10;
         nanos = frac_ns;
     }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
+    if (idx >= text.len) return null;
+    var offset_seconds: i64 = 0;
+    if (text[idx] == 'Z' or text[idx] == 'z') {
+        idx += 1;
+    } else if (text[idx] == '+' or text[idx] == '-') {
+        if (idx + 6 > text.len or text[idx + 3] != ':') return null;
+        const offset_hour = std.fmt.parseInt(i64, text[idx + 1 .. idx + 3], 10) catch return null;
+        const offset_minute = std.fmt.parseInt(i64, text[idx + 4 .. idx + 6], 10) catch return null;
+        if (offset_hour > 23 or offset_minute > 59) return null;
+        offset_seconds = offset_hour * 3_600 + offset_minute * 60;
+        if (text[idx] == '-') offset_seconds = -offset_seconds;
+        idx += 6;
+    } else {
+        return null;
+    }
+    if (idx != text.len) return null;
 
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
+    const local_ns = civilDateTimeToSignedNs(year, month, day, hour, minute, second, nanos) orelse return null;
+    const offset_ns = @as(i128, offset_seconds) * std.time.ns_per_s;
+    return std.math.cast(u64, local_ns - offset_ns);
 }
 
-fn parseDateToNs(value: []const u8) ?u64 {
+pub fn parseDateToNs(value: []const u8) ?u64 {
     if (value.len != 10 or value[4] != '-' or value[7] != '-') return null;
     const year = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
     const month = std.fmt.parseInt(i64, value[5..7], 10) catch return null;
     const day = std.fmt.parseInt(i64, value[8..10], 10) catch return null;
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    return @as(u64, @intCast(days * 86_400)) * std.time.ns_per_s;
+    return civilDateTimeToNs(year, month, day, 0, 0, 0, 0);
 }
 
 fn isValidDate(value: []const u8) bool {
     return parseDateToNs(value) != null;
+}
+
+fn civilDateTimeToNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?u64 {
+    return std.math.cast(u64, civilDateTimeToSignedNs(year, month, day, hour, minute, second, nanos) orelse return null);
+}
+
+fn civilDateTimeToSignedNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?i128 {
+    if (month < 1 or month > 12) return null;
+    const max_day = daysInMonth(year, month) orelse return null;
+    if (day < 1 or day > max_day) return null;
+    if (hour < 0 or hour > 23) return null;
+    if (minute < 0 or minute > 59) return null;
+    // Leap-second validation requires an up-to-date leap-second table. Reject
+    // `:60` instead of accepting it at arbitrary minutes and silently
+    // normalizing it to the following minute.
+    if (second < 0 or second > 59) return null;
+    if (nanos >= std.time.ns_per_s) return null;
+
+    const days = daysFromCivil(year, month, day);
+    const seconds = @as(i128, days) * 86_400 + hour * 3_600 + minute * 60 + second;
+    return seconds * std.time.ns_per_s + nanos;
+}
+
+fn daysInMonth(year: i64, month: i64) ?i64 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => null,
+    };
+}
+
+fn isLeapYear(year: i64) bool {
+    return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
 }
 
 const CivilDate = struct {
@@ -1954,7 +2495,7 @@ test "schema serialize/deserialize round-trip" {
     defer alloc.free(data);
 
     var format_pos: usize = 4;
-    try std.testing.expectEqual(@as(u32, 12), readU32(data, &format_pos));
+    try std.testing.expectEqual(@as(u32, 13), readU32(data, &format_pos));
 
     const loaded = try deserializeSchema(alloc, data);
     defer freeSchema(alloc, loaded);
@@ -2009,6 +2550,109 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(loaded.index_sort[0].desc);
     try std.testing.expectEqualStrings("_id", loaded.index_sort[1].field);
     try std.testing.expect(!loaded.index_sort[1].desc);
+}
+
+test "schema round trips relational storage catalog and reads version 11 defaults" {
+    const alloc = std.testing.allocator;
+    const columns = [_]RelationalColumn{
+        .{
+            .name = "count",
+            .path = "count",
+            .column_type = .integer,
+            .required = true,
+            .allows_null = true,
+        },
+        .{
+            .name = "payload",
+            .path = "payload",
+            .column_type = .json,
+            .is_json = true,
+            .json_kind = .object,
+        },
+    };
+    const encoded = try serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .requires_public_schema = true,
+        .relational_columns = &columns,
+    });
+    defer alloc.free(encoded);
+    const loaded = try deserializeSchema(alloc, encoded);
+    defer freeSchema(alloc, loaded);
+    try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
+    try std.testing.expect(loaded.requires_public_schema);
+    try std.testing.expectEqual(@as(usize, 2), loaded.relational_columns.len);
+    try std.testing.expectEqual(RelationalColumnType.integer, loaded.relational_columns[0].column_type);
+    try std.testing.expect(loaded.relational_columns[0].required);
+    try std.testing.expect(loaded.relational_columns[0].allows_null);
+    try std.testing.expectEqual(RelationalJsonKind.object, loaded.relational_columns[1].json_kind);
+
+    const legacy = try serializeSchemaFormat(alloc, .{}, 11);
+    defer alloc.free(legacy);
+    const loaded_legacy = try deserializeSchema(alloc, legacy);
+    defer freeSchema(alloc, loaded_legacy);
+    try std.testing.expectEqual(StorageMode.document, loaded_legacy.storage_mode);
+    try std.testing.expect(!loaded_legacy.requires_public_schema);
+    try std.testing.expectEqual(@as(usize, 0), loaded_legacy.relational_columns.len);
+}
+
+test "schema decoder rejects truncated trailing and noncanonical relational data" {
+    const alloc = std.testing.allocator;
+    const columns = [_]RelationalColumn{.{
+        .name = "payload",
+        .path = "payload",
+        .column_type = .json,
+        .is_json = true,
+        .json_kind = .object,
+    }};
+    const encoded = try serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    });
+    defer alloc.free(encoded);
+
+    try std.testing.expectError(error.InvalidFormat, deserializeSchema(alloc, encoded[0 .. encoded.len - 1]));
+
+    const trailing = try std.mem.concat(alloc, u8, &.{ encoded, "x" });
+    defer alloc.free(trailing);
+    try std.testing.expectError(error.InvalidFormat, deserializeSchema(alloc, trailing));
+
+    const invalid_json_kind = try alloc.dupe(u8, encoded);
+    defer alloc.free(invalid_json_kind);
+    invalid_json_kind[invalid_json_kind.len - 1] = 0xff;
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(alloc, invalid_json_kind));
+}
+
+test "schema serialization rejects inconsistent relational column catalogs" {
+    const alloc = std.testing.allocator;
+    const duplicate_names = [_]RelationalColumn{
+        .{ .name = "value", .path = "value", .column_type = .string },
+        .{ .name = "value", .path = "value_copy", .column_type = .string },
+    };
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &duplicate_names,
+    }));
+
+    const duplicate_paths = [_]RelationalColumn{
+        .{ .name = "first", .path = "value", .column_type = .string },
+        .{ .name = "second", .path = "value", .column_type = .string },
+    };
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &duplicate_paths,
+    }));
+
+    const inconsistent_json = [_]RelationalColumn{.{
+        .name = "payload",
+        .path = "payload",
+        .column_type = .json,
+        .is_json = false,
+        .json_kind = .any,
+    }};
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{
+        .storage_mode = .relational,
+        .relational_columns = &inconsistent_json,
+    }));
 }
 
 test "schema serialization rejects unsorted or duplicate exact fields" {
@@ -2165,6 +2809,37 @@ test "schema save/load via DocStore" {
     try std.testing.expectEqual(@as(u32, 7), loaded_v7.version);
 }
 
+test "schema and generation metadata commit in one transaction" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "schema-metadata-atomic");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    const public_key = "\x00\x00__metadata__:schema_json_test";
+    const public_json = "{\"version\":9}";
+    try std.testing.expect(try saveSchemaWithMetadata(
+        &store,
+        alloc,
+        .{ .version = 9, .default_type = "row", .storage_mode = .relational },
+        &.{.{ .key = public_key, .value = public_json }},
+        &.{},
+    ));
+
+    const loaded = (try loadSchema(&store, alloc)).?;
+    defer freeSchema(alloc, loaded);
+    try std.testing.expectEqual(@as(u32, 9), loaded.version);
+    try std.testing.expectEqual(StorageMode.relational, loaded.storage_mode);
+    const stored_public = try store.get(alloc, public_key);
+    defer alloc.free(stored_public);
+    try std.testing.expectEqualStrings(public_json, stored_public);
+
+    try std.testing.expect(!try saveSchemaWithMetadata(&store, alloc, loaded, &.{}, &.{public_key}));
+    try std.testing.expectError(error.NotFound, store.get(alloc, public_key));
+}
+
 test "schema preserves versioned history in DocStore" {
     const alloc = std.testing.allocator;
     const path = try tempTestPath(alloc, "schema-history");
@@ -2186,6 +2861,27 @@ test "schema preserves versioned history in DocStore" {
     defer freeSchema(alloc, previous);
     try std.testing.expectEqual(@as(u32, 0), previous.version);
     try std.testing.expectEqualStrings("doc_v0", previous.default_type);
+}
+
+test "schema epochs reject version reuse and active regression" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "schema-immutable-epochs");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    _ = try saveSchema(&store, alloc, .{ .version = 4, .default_type = "v4" });
+    try std.testing.expectError(
+        error.ImmutableSchemaVersionConflict,
+        saveSchema(&store, alloc, .{ .version = 4, .default_type = "different" }),
+    );
+    _ = try saveSchema(&store, alloc, .{ .version = 5, .default_type = "v5" });
+    try std.testing.expectError(
+        error.SchemaVersionRegression,
+        saveSchema(&store, alloc, .{ .version = 4, .default_type = "v4" }),
+    );
 }
 
 test "schema copy includes versioned history" {
@@ -2664,8 +3360,24 @@ test "sorted exact fields resolve before wildcard templates and find subfields w
 
 test "parseDateTimeToNs accepts rfc3339 and date-only values" {
     try std.testing.expectEqual(@as(?u64, 15), parseDateTimeToNs("1970-01-01T00:00:00.000000015Z"));
+    try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1970-01-01T01:00:00+01:00"));
+    try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1969-12-31T23:00:00-01:00"));
+    try std.testing.expectEqual(@as(?u64, std.time.ns_per_hour), parseDateTimeToNs("1970-01-01t00:00:00-01:00"));
     try std.testing.expectEqual(@as(?u64, 0), parseDateTimeToNs("1970-01-01"));
+    try std.testing.expect(parseDateTimeToNs("2024-02-29") != null);
     try std.testing.expect(parseDateTimeToNs("not-a-date") == null);
+    try std.testing.expect(parseDateTimeToNs("2023-02-29") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-13-01") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-04-31") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-01-01T24:00:00Z") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-01-01T00:60:00Z") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-01-01T12:34:60Z") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-01-01T23:59:60Z") == null);
+    try std.testing.expect(parseDateTimeToNs("2024-01-01T00:00:00.1234567890Z") == null);
+    try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+01:00") == null);
+    try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+24:00") == null);
+    try std.testing.expect(parseDateTimeToNs("1970-01-01T00:00:00+00:60") == null);
+    try std.testing.expect(parseDateTimeToNs("9999-12-31") == null);
 
     const formatted = try formatDateTimeNsAlloc(std.testing.allocator, 15);
     defer std.testing.allocator.free(formatted);

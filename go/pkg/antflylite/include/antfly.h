@@ -5,6 +5,12 @@
 // the Elastic License 2.0 at
 //
 //     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 #ifndef ANTFLY_H
 #define ANTFLY_H
@@ -25,6 +31,12 @@ typedef enum antfly_error_code {
     ANTFLY_INTENT_CONFLICT = 4,
     ANTFLY_TXN_NOT_FOUND = 5,
     ANTFLY_BUSY = 6,
+    /* The operation crossed its publication point, but crash durability could
+     * not be confirmed. Inspect the destination; do not retry automatically. */
+    ANTFLY_OUTCOME_UNKNOWN = 7,
+    /* The operation requires a capability unavailable on this platform or
+     * filesystem. Retrying unchanged will not succeed. */
+    ANTFLY_UNSUPPORTED = 8,
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
@@ -34,6 +46,12 @@ typedef enum antfly_error_code {
  * - Functions return ANTFLY_OK on success. Any other antfly_error_code is an
  *   error and should be handled with the stable strings returned by
  *   antfly_error_code_name and antfly_error_code_description.
+ * - ANTFLY_OUTCOME_UNKNOWN is not safe to retry automatically: publication
+ *   completed in the running process, but crash durability was not confirmed.
+ *   Inspect the caller-supplied destination before deciding how to proceed.
+ * - ANTFLY_UNSUPPORTED is not transient. For file restore operations it can
+ *   mean the source filesystem lacks required advisory locking; copy the
+ *   archive to a supported local filesystem before retrying.
  * - antfly_slice is borrowed input. The caller owns the memory and must keep it
  *   valid for the duration of the call.
  * - antfly_buffer is owned output. On success, the caller owns the returned
@@ -311,6 +329,12 @@ antfly_error_code antfly_lite_restore_backup_json(
 antfly_error_code antfly_lite_restore_json(
     const char *dest_path,
     antfly_slice backup,
+    bool replace,
+    antfly_buffer *out
+);
+antfly_error_code antfly_lite_restore_backup_file_json(
+    const char *dest_path,
+    const char *backup_path,
     bool replace,
     antfly_buffer *out
 );

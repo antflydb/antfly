@@ -109,6 +109,23 @@ pub const ScanResponse = struct {
     }
 };
 
+/// Backpressure-aware byte sink for NDJSON scans. `start` is invoked exactly
+/// once after routing proves the table exists and before the first byte (also
+/// for an empty result). A write error aborts storage iteration immediately.
+pub const ScanStreamSink = struct {
+    context: ?*anyopaque,
+    start_fn: *const fn (?*anyopaque) anyerror!void,
+    write_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
+
+    pub fn start(self: ScanStreamSink) !void {
+        try self.start_fn(self.context);
+    }
+
+    pub fn write(self: ScanStreamSink, bytes: []const u8) !void {
+        if (bytes.len != 0) try self.write_fn(self.context, bytes);
+    }
+};
+
 pub const ContentHashEntry = struct {
     id: []u8,
     hash: db_types.DocumentContentHash,
@@ -190,6 +207,16 @@ pub const TableReadSource = struct {
             opts: db_types.ScanOptions,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?ScanResponse,
+        scan_stream: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_types.ScanOptions,
+            consistency: read_gate.ReadConsistency,
+            sink: ScanStreamSink,
+        ) anyerror!bool = null,
         query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -253,6 +280,17 @@ pub const TableReadSource = struct {
             opts: db_types.ScanOptions,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?ScanResponse = null,
+        scan_group_local_stream: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_types.ScanOptions,
+            consistency: read_gate.ReadConsistency,
+            sink: ScanStreamSink,
+        ) anyerror!bool = null,
         scan_group_local_routed: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -264,6 +302,18 @@ pub const TableReadSource = struct {
             opts: db_types.ScanOptions,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?ScanResponse = null,
+        scan_group_local_routed_stream: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
+            group_id: u64,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_types.ScanOptions,
+            consistency: read_gate.ReadConsistency,
+            sink: ScanStreamSink,
+        ) anyerror!bool = null,
         query_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -511,6 +561,25 @@ pub const TableReadSource = struct {
         return try BoundaryAbi.call("scan", self.boundary_dispatch, self.vtable.scan, .{ self.ptr, alloc, table_name, from_key, to_key, opts, consistency });
     }
 
+    pub fn scanStream(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+        sink: ScanStreamSink,
+    ) !bool {
+        if (self.vtable.scan_stream) |stream_fn|
+            return try BoundaryAbi.call("scan_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, table_name, from_key, to_key, opts, consistency, sink });
+        var buffered = (try self.scan(alloc, table_name, from_key, to_key, opts, consistency)) orelse return false;
+        defer buffered.deinit(alloc);
+        try sink.start();
+        try sink.write(buffered.ndjson);
+        return true;
+    }
+
     /// Return a compact ordered stream of document identities and canonical
     /// content hashes. The internal wire representation remains an
     /// implementation detail of the routing-aware scan source.
@@ -694,6 +763,30 @@ pub const TableReadSource = struct {
         }
         const fn_ptr = self.vtable.scan_group_local orelse return null;
         return try BoundaryAbi.call("scan_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency });
+    }
+
+    pub fn scanGroupLocalStream(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+        sink: ScanStreamSink,
+    ) !bool {
+        if (self.route_fence) |fence| {
+            if (self.vtable.scan_group_local_routed_stream) |stream_fn|
+                return try BoundaryAbi.call("scan_group_local_routed_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, fence, group_id, table_name, from_key, to_key, opts, consistency, sink });
+        } else if (self.vtable.scan_group_local_stream) |stream_fn| {
+            return try BoundaryAbi.call("scan_group_local_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency, sink });
+        }
+        var buffered = (try self.scanGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency)) orelse return false;
+        defer buffered.deinit(alloc);
+        try sink.start();
+        try sink.write(buffered.ndjson);
+        return true;
     }
 
     pub fn queryGroupLocal(
@@ -1133,4 +1226,68 @@ test "catalog route fence dispatch is strict and fail closed" {
         error.InvalidCatalogRouteFence,
         wrong_group_source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 30, null, .none),
     );
+}
+
+test "scan stream preserves chunk backpressure without buffered fallback" {
+    const Fake = struct {
+        buffered_calls: usize = 0,
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
+            return null;
+        }
+
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: read_gate.ReadConsistency) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.buffered_calls += 1;
+            return null;
+        }
+
+        fn scanStream(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: read_gate.ReadConsistency, sink: ScanStreamSink) !bool {
+            try sink.start();
+            try sink.write("first\n");
+            try sink.write("second\n");
+            return true;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.SearchRequest, _: read_gate.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+    };
+    const Consumer = struct {
+        started: bool = false,
+        writes: usize = 0,
+
+        fn start(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+            self.started = true;
+        }
+
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+            self.writes += 1;
+            if (self.writes == 2) return error.ConsumerStopped;
+        }
+    };
+
+    var fake = Fake{};
+    var consumer = Consumer{};
+    const vtable: TableReadSource.VTable = .{
+        .lookup = Fake.lookup,
+        .scan = Fake.scan,
+        .scan_stream = Fake.scanStream,
+        .query = Fake.query,
+    };
+    const source: TableReadSource = .{ .ptr = &fake, .vtable = &vtable };
+    try std.testing.expectError(error.ConsumerStopped, source.scanStream(
+        std.testing.allocator,
+        "docs",
+        "",
+        "",
+        .{},
+        .stale,
+        .{ .context = &consumer, .start_fn = Consumer.start, .write_fn = Consumer.write },
+    ));
+    try std.testing.expect(consumer.started);
+    try std.testing.expectEqual(@as(usize, 2), consumer.writes);
+    try std.testing.expectEqual(@as(usize, 0), fake.buffered_calls);
 }

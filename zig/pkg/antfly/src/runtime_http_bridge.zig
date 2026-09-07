@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Transport adapters for the layout-only runtime HTTP ABI. This module is
 //! compiled independently on each side of a linked archive boundary; only the
@@ -69,11 +80,11 @@ pub const Outbound = struct {
         return .ok;
     }
 
-    fn start(raw: ?*anyopaque, status: u16) callconv(.c) abi.CallbackStatus {
+    fn start(raw: ?*anyopaque, status: u16, content_type: abi.Bytes) callconv(.c) abi.CallbackStatus {
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
         if (self.context.isCancellationRequested()) return .canceled;
         if (self.started) return .failed;
-        self.writer = self.context.streamResponse(status) catch |err| return callbackStatusAfterIo(self.context, err);
+        self.writer = self.context.streamResponseWithContentType(status, content_type.slice()) catch |err| return callbackStatusAfterIo(self.context, err);
         self.started = true;
         return .ok;
     }
@@ -145,9 +156,9 @@ fn inboundIsCancelled(raw: ?*const anyopaque) bool {
     return cancellation.requested();
 }
 
-fn inboundStart(raw: ?*anyopaque, status: u16) !void {
+fn inboundStart(raw: ?*anyopaque, status: u16, content_type: []const u8) !void {
     const stream: *const abi.StreamSink = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
-    try callbackResult(stream.start.?(stream.context, status));
+    try callbackResult(stream.start.?(stream.context, status, abi.Bytes.init(content_type)));
 }
 
 fn inboundWrite(raw: ?*anyopaque, bytes: []const u8) !void {
@@ -229,6 +240,7 @@ test "linked callbacks preserve streaming and cancellation semantics" {
     const State = struct {
         canceled: bool = false,
         status: u16 = 0,
+        saw_ndjson: bool = false,
         bytes: [16]u8 = undefined,
         bytes_len: usize = 0,
         closed: bool = false,
@@ -238,9 +250,10 @@ test "linked callbacks preserve streaming and cancellation semantics" {
             return @intFromBool(self.canceled);
         }
 
-        fn start(raw: ?*anyopaque, status: u16) callconv(.c) abi.CallbackStatus {
+        fn start(raw: ?*anyopaque, status: u16, content_type: abi.Bytes) callconv(.c) abi.CallbackStatus {
             const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
             self.status = status;
+            self.saw_ndjson = std.mem.eql(u8, content_type.slice(), "application/x-ndjson");
             return .ok;
         }
 
@@ -285,10 +298,11 @@ test "linked callbacks preserve streaming and cancellation semantics" {
     try std.testing.expect(context.isCancellationRequested());
     state.canceled = false;
 
-    var writer = try context.streamResponse(202);
+    var writer = try context.streamResponseWithContentType(202, "application/x-ndjson");
     try writer.write("linked");
     try writer.close();
     try std.testing.expectEqual(@as(u16, 202), state.status);
+    try std.testing.expect(state.saw_ndjson);
     try std.testing.expectEqualStrings("linked", state.bytes[0..state.bytes_len]);
     try std.testing.expect(state.closed);
 }
@@ -296,11 +310,11 @@ test "linked callbacks preserve streaming and cancellation semantics" {
 test "outbound stream callbacks preserve terminal status classes" {
     const std = @import("std");
     const Delegate = struct {
-        fn startCanceled(_: ?*anyopaque, _: u16) anyerror!void {
+        fn startCanceled(_: ?*anyopaque, _: u16, _: []const u8) anyerror!void {
             return error.Canceled;
         }
 
-        fn startOk(_: ?*anyopaque, _: u16) anyerror!void {}
+        fn startOk(_: ?*anyopaque, _: u16, _: []const u8) anyerror!void {}
 
         fn writeTimeout(_: ?*anyopaque, _: []const u8) anyerror!void {
             return error.Timeout;
@@ -326,19 +340,19 @@ test "outbound stream callbacks preserve terminal status classes" {
     };
     var canceled = Outbound{ .context = &context };
     const canceled_sink = canceled.stream();
-    try std.testing.expectEqual(.canceled, canceled_sink.start.?(canceled_sink.context, 200));
+    try std.testing.expectEqual(.canceled, canceled_sink.start.?(canceled_sink.context, 200, abi.Bytes.init("text/event-stream; charset=utf-8")));
 
     context.stream_delegate.?.start = Delegate.startOk;
     var terminal = Outbound{ .context = &context };
     const terminal_sink = terminal.stream();
-    try std.testing.expectEqual(.ok, terminal_sink.start.?(terminal_sink.context, 200));
+    try std.testing.expectEqual(.ok, terminal_sink.start.?(terminal_sink.context, 200, abi.Bytes.init("text/event-stream; charset=utf-8")));
     try std.testing.expectEqual(.timeout, terminal_sink.write.?(terminal_sink.context, abi.Bytes.init("x")));
     try std.testing.expectEqual(.end_of_stream, terminal_sink.close.?(terminal_sink.context));
 
     cancellation.store(true, .release);
     var pre_canceled = Outbound{ .context = &context };
     const pre_canceled_sink = pre_canceled.stream();
-    try std.testing.expectEqual(.canceled, pre_canceled_sink.start.?(pre_canceled_sink.context, 200));
+    try std.testing.expectEqual(.canceled, pre_canceled_sink.start.?(pre_canceled_sink.context, 200, abi.Bytes.init("text/event-stream; charset=utf-8")));
     try std.testing.expectEqual(.canceled, terminal_sink.close.?(terminal_sink.context));
 }
 
@@ -357,13 +371,13 @@ test "outbound callbacks prefer cancellation that arrives during transport IO" {
             return error.StreamReset;
         }
 
-        fn startCanceled(raw: ?*anyopaque, _: u16) anyerror!void {
+        fn startCanceled(raw: ?*anyopaque, _: u16, _: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
             self.cancel();
             return error.ConnectionClosed;
         }
 
-        fn startOk(_: ?*anyopaque, _: u16) anyerror!void {}
+        fn startOk(_: ?*anyopaque, _: u16, _: []const u8) anyerror!void {}
 
         fn writeCanceled(raw: ?*anyopaque, _: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
@@ -405,13 +419,13 @@ test "outbound callbacks prefer cancellation that arrives during transport IO" {
     };
     var start_outbound = Outbound{ .context = &context };
     const start_sink = start_outbound.stream();
-    try std.testing.expectEqual(.canceled, start_sink.start.?(start_sink.context, 200));
+    try std.testing.expectEqual(.canceled, start_sink.start.?(start_sink.context, 200, abi.Bytes.init("text/event-stream; charset=utf-8")));
 
     cancellation.store(false, .release);
     context.stream_delegate.?.start = State.startOk;
     var stream_outbound = Outbound{ .context = &context };
     const stream_sink = stream_outbound.stream();
-    try std.testing.expectEqual(.ok, stream_sink.start.?(stream_sink.context, 200));
+    try std.testing.expectEqual(.ok, stream_sink.start.?(stream_sink.context, 200, abi.Bytes.init("text/event-stream; charset=utf-8")));
     try std.testing.expectEqual(.canceled, stream_sink.write.?(stream_sink.context, abi.Bytes.init("x")));
 
     cancellation.store(false, .release);

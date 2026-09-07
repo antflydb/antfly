@@ -427,7 +427,7 @@ pub const Destination = struct {
         }
 
         for (docs) |kv| {
-            const doc_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
+            const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse continue;
             errdefer alloc.free(doc_key);
             try deletes.append(alloc, doc_key);
         }

@@ -15,22 +15,34 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
+const platform_time = @import("antfly_platform").time;
 
 const backup_codec = @import("backup_codec.zig");
 const backup_bundle = @import("backup_bundle.zig");
 const internal_keys = @import("internal_keys.zig");
 const docstore_mod = @import("docstore.zig");
 const doc_identity = @import("db/doc_identity.zig");
+const relational_store = @import("db/relational_store.zig");
+const relational_row_codec = @import("db/algebraic/relational_row_codec.zig");
+const table_catalog = @import("db/table_catalog.zig");
+const storage_schema = @import("schema.zig");
+const SchemaSpool = @import("schema_spool.zig").Spool;
+const public_table_schema = @import("../schema/mod.zig");
 const db_types = @import("db/types.zig");
 const artifact_ids = @import("db/artifact_ids.zig");
 const enrichment_artifact_codec = @import("db/enrichment/artifact_codec.zig");
+const index_manager = @import("db/catalog/index_manager.zig");
+const enrichment_catalog = @import("db/catalog/enrichment_catalog.zig");
+const resolver_catalog = @import("db/catalog/resolver_catalog.zig");
 const DocStore = docstore_mod.DocStore;
 const KeyEncoder = docstore_mod.KeyEncoder;
 const KVPair = docstore_mod.KVPair;
 
 /// Target batch size in bytes before flushing a document/embedding/edge batch.
 const batch_target_bytes: usize = 4 * 1024 * 1024;
+const portable_metadata_prefix = "\x00\x00__metadata__:";
 const resolution_public_id_prefix = "af1:resolution:";
+const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 
 const ResolutionArtifactRef = struct {
     doc_key: []u8,
@@ -73,6 +85,11 @@ const PortableOutputMode = union(enum) {
         included: []const bool,
         emitted: []bool,
         footer: *std.ArrayListUnmanaged(backup_bundle.FooterIndexEntry),
+        /// The private file-backed spool is the exact byte stream replayed by
+        /// bundle emission. Per-block CRC still detects accidental spool
+        /// corruption, and the inventory SHA-256 is embedded for strict restore
+        /// verification, so hashing the same private bytes twice is redundant.
+        trust_inventory_digest: bool,
     },
 };
 
@@ -84,19 +101,22 @@ const PortableOutput = struct {
     bundle_offset: u64 = 0,
 
     fn writeHeader(self: *PortableOutput, header: backup_codec.FileHeader) !void {
-        _ = header;
         // AFB2 owns the physical file header. Keep the logical AFB1 header in
         // the byte count so portable file-footer accounting remains stable
         // across the inventory and emission passes.
         self.bytes_written += backup_codec.header_size;
+        switch (self.mode) {
+            .inventory => if (self.writer) |writer| try backup_codec.writeHeaderTo(writer, header),
+            .bundle => {},
+        }
     }
 
     fn writeBlock(self: *PortableOutput, block_type: backup_codec.BlockType, payload: []const u8) !void {
         self.bytes_written += backup_codec.block_envelope_overhead + payload.len;
-        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
         switch (self.mode) {
             .inventory => |objects| {
+                var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
                 if (objects.items.len >= backup_bundle.max_objects) return error.BackupManifestTooLarge;
                 var object: PortableObject = .{
                     .block_type = block_type,
@@ -108,14 +128,21 @@ const PortableOutput = struct {
                 const path = try std.fmt.bufPrint(&object.path_buffer, "portable/{d:0>8}.block", .{objects.items.len});
                 object.path_len = @intCast(path.len);
                 try objects.append(self.alloc, object);
+                if (self.writer) |writer| try backup_codec.writeBlockTo(writer, block_type, payload);
             },
             .bundle => |state| {
                 if (state.next_ordinal.* >= state.expected.len) return error.NonDeterministicBackupCapture;
                 const ordinal = state.next_ordinal.*;
                 const expected = state.expected[ordinal];
-                if (expected.block_type != block_type or expected.size_bytes != payload.len or
-                    !std.crypto.timing_safe.eql(@TypeOf(digest), expected.sha256, digest))
+                if (expected.block_type != block_type or expected.size_bytes != payload.len)
                     return error.NonDeterministicBackupCapture;
+                const digest = expected.sha256;
+                if (!state.trust_inventory_digest) {
+                    var observed: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(payload, &observed, .{});
+                    if (!std.crypto.timing_safe.eql(@TypeOf(digest), digest, observed))
+                        return error.NonDeterministicBackupCapture;
+                }
                 const blob_index = portableBlobIndex(state.blobs, digest) orelse
                     return error.NonDeterministicBackupCapture;
                 state.next_ordinal.* += 1;
@@ -192,6 +219,11 @@ pub const ExportOptions = struct {
     table_name: []const u8 = "",
     created_at_unix_ns: i64 = 0,
     capture: backup_bundle.CaptureMode = .full,
+    /// Optional bounded-disk staging stream. Production file exports provide
+    /// this so the immutable store snapshot is classified and encoded once;
+    /// callers without filesystem authority retain the deterministic two-pass
+    /// compatibility path.
+    spool: ?struct { io: std.Io, file: std.Io.File } = null,
 };
 
 pub fn exportPortableToWriterWithOptions(
@@ -221,7 +253,16 @@ pub fn exportPortableToWriterWithOptions(
     var objects = std.ArrayListUnmanaged(PortableObject).empty;
     defer objects.deinit(alloc);
     var inventory_out: PortableOutput = .{ .alloc = alloc, .mode = .{ .inventory = &objects } };
-    try exportPortableSnapshot(alloc, &scan, &inventory_out);
+    if (options.spool) |spool| {
+        var spool_buffer: [64 * 1024]u8 = undefined;
+        var spool_writer = spool.file.writer(spool.io, &spool_buffer);
+        inventory_out.writer = &spool_writer.interface;
+        try exportPortableSnapshot(alloc, &scan, &inventory_out);
+        try spool_writer.end();
+        inventory_out.writer = null;
+    } else {
+        try exportPortableSnapshot(alloc, &scan, &inventory_out);
+    }
 
     const descriptors = try alloc.alloc(backup_bundle.ObjectDescriptor, objects.items.len);
     defer alloc.free(descriptors);
@@ -317,10 +358,22 @@ pub fn exportPortableToWriterWithOptions(
             .included = included,
             .emitted = emitted,
             .footer = &footer,
+            .trust_inventory_digest = options.spool != null,
         } },
         .bundle_offset = backup_codec.header_size + backup_codec.block_envelope_overhead + manifest.len,
     };
-    try exportPortableSnapshot(alloc, &scan, &bundle_out);
+    if (options.spool) |spool| {
+        var spool_reader = backup_codec.FileReader.init(spool.io, spool.file, inventory_out.bytes_written);
+        _ = try spool_reader.readHeader();
+        while (spool_reader.hasRemaining()) {
+            const block = try spool_reader.readBlock(alloc);
+            defer alloc.free(block.payload);
+            try bundle_out.writeBlock(block.block_type, block.payload);
+        }
+        _ = try spool_reader.verifiedFingerprint();
+    } else {
+        try exportPortableSnapshot(alloc, &scan, &bundle_out);
+    }
     if (next_ordinal != objects.items.len) return error.NonDeterministicBackupCapture;
     const footer_payload = try backup_bundle.encodeFooterIndexAlloc(alloc, footer.items);
     defer alloc.free(footer_payload);
@@ -378,6 +431,12 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     var metadata_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
     defer deinitKeyValueBatch(alloc, &metadata_batch);
     var metadata_batch_bytes: usize = 0;
+    var schema_cache: PortableArchiveValidation = .{
+        .format_version = backup_codec.format_version,
+        .snapshot = scan,
+        .snapshot_alloc = alloc,
+    };
+    defer schema_cache.deinit(alloc);
 
     var chunk_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
     defer deinitKeyValueBatch(alloc, &chunk_batch);
@@ -429,20 +488,42 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
 
     var cursor = try scan.openCursor();
     defer cursor.close();
-    var scan_entry = try cursor.first();
+    // AFB2 is manifest-first regardless of the backend's physical key order.
+    // The snapshot transaction is immutable, so a metadata-only cursor pass
+    // produces a stable layout registry without buffering user rows. The
+    // second pass streams each row exactly once into its output block.
+    var scan_entry = try cursor.seekAtOrAfter(portable_metadata_prefix);
     while (scan_entry) |kv| : (scan_entry = try cursor.next()) {
-        if (isPortableMetadataKey(kv.key)) {
-            try metadata_batch.append(alloc, .{
-                .key = try alloc.dupe(u8, kv.key),
-                .value = try alloc.dupe(u8, kv.value),
-            });
-            metadata_batch_bytes += kv.key.len + kv.value.len;
-            if (metadata_batch_bytes >= batch_target_bytes) {
-                try flushMetadataBatch(alloc, out, &metadata_batch);
-                metadata_batch_bytes = 0;
-            }
-            continue;
+        if (!std.mem.startsWith(u8, kv.key, portable_metadata_prefix)) break;
+        if (!isPortableMetadataKey(kv.key)) continue;
+        if (std.mem.startsWith(u8, kv.key, schema_version_prefix)) {
+            const layout = try storage_schema.deserializeSchema(alloc, kv.value);
+            defer storage_schema.freeSchema(alloc, layout);
+            const expected_key = try storage_schema.schemaVersionKeyAlloc(alloc, layout.version);
+            defer alloc.free(expected_key);
+            if (!std.mem.eql(u8, expected_key, kv.key)) return error.InvalidSchema;
+            if (schema_cache.layouts.contains(layout.version)) return error.InvalidSchema;
+            // The immutable source snapshot already owns the serialized bytes.
+            // Export needs only a directory and the same bounded decoded cache
+            // as restore, not a second copy of every layout.
+            try schema_cache.layouts.putNoClobber(alloc, layout.version, .{ .offset = 0, .len = 0 });
         }
+        try metadata_batch.append(alloc, .{
+            .key = try alloc.dupe(u8, kv.key),
+            .value = try alloc.dupe(u8, kv.value),
+        });
+        metadata_batch_bytes += kv.key.len + kv.value.len;
+        if (metadata_batch_bytes >= batch_target_bytes) {
+            try flushMetadataBatch(alloc, out, &metadata_batch);
+            metadata_batch_bytes = 0;
+        }
+    }
+    try flushMetadataBatch(alloc, out, &metadata_batch);
+    metadata_batch_bytes = 0;
+
+    scan_entry = try cursor.first();
+    while (scan_entry) |kv| : (scan_entry = try cursor.next()) {
+        if (isPortableMetadataKey(kv.key)) continue;
 
         if (kv.key.len > 0 and kv.key[0] == internal_keys.identity_namespace) {
             try identity_batch.append(alloc, .{
@@ -459,8 +540,14 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
 
         // Binary internal keys (0x01 prefix)
         if (internal_keys.isInternalUserKey(kv.key)) {
-            if (internal_keys.isPrimaryDocumentKey(kv.key)) {
-                const user_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
+            if (internal_keys.isStoredDocumentRowKey(kv.key)) {
+                const relational_row = internal_keys.isRelationalRowKey(kv.key);
+                if (relational_row) {
+                    const schema_version = try relational_store.rowSchemaVersion(kv.value);
+                    const layout = (try schema_cache.layoutForVersion(schema_version)) orelse return error.InvalidSchema;
+                    try relational_store.validateValueForSchemaAndLayout(kv.value, layout.schema.*, layout.physical);
+                }
+                const user_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse continue;
                 defer alloc.free(user_key);
                 const owned_value = try alloc.dupe(u8, kv.value);
                 var owned_value_pending = true;
@@ -477,7 +564,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
                 errdefer if (owned_key_pending) alloc.free(owned_key);
                 try doc_batch.append(alloc, .{
                     .key = owned_key,
-                    .value_flags = 0,
+                    .value_flags = if (relational_row) backup_codec.doc_value_flag_relational_row else 0,
                     .value = owned_value,
                     .timestamp_ns = if (timestamp_value) |value|
                         if (value.len >= 8) std.mem.readInt(u64, value[0..8], .little) else 0
@@ -553,9 +640,6 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     }
     if (identity_batch.items.len > 0) {
         try flushIdentityBatch(alloc, out, &identity_batch);
-    }
-    if (metadata_batch.items.len > 0) {
-        try flushMetadataBatch(alloc, out, &metadata_batch);
     }
     if (chunk_batch.items.len > 0) {
         try flushChunkBatch(alloc, out, &chunk_batch);
@@ -865,13 +949,25 @@ fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_c
     batch.deinit(alloc);
 }
 
-fn isPortableMetadataKey(key: []const u8) bool {
+pub fn isPortableMetadataKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:schema_v") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:schema_json") or
+        std.mem.startsWith(u8, key, public_table_schema.versioned_schema_key_prefix) or
+        std.mem.eql(u8, key, table_catalog.key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers");
+}
+
+/// True only for durable keys that a validated portable import may create.
+/// Publication rollback uses this ownership boundary so target-local routing,
+/// split, replay, and control metadata are never mistaken for staged data.
+pub fn isPortableStoreKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    return key[0] == internal_keys.user_namespace or
+        key[0] == internal_keys.identity_namespace or
+        isPortableMetadataKey(key);
 }
 
 fn appendChunkArtifactEntry(
@@ -1176,6 +1272,9 @@ fn PortableArchiveReader(comptime RawReader: type) type {
         blob_offsets: []?backup_bundle.FooterIndexEntry = &.{},
         base: ?PortableBaseBlobSource = null,
         trailer: ?backup_bundle.Trailer = null,
+        logical_hasher: std.crypto.hash.Blake3 = std.crypto.hash.Blake3.init(.{}),
+        completed_pass_fingerprint: ?backup_codec.FileReader.Fingerprint = null,
+        generation_changed: bool = false,
 
         fn init(raw: *RawReader) !Self {
             return initWithBase(raw, null);
@@ -1189,13 +1288,15 @@ fn PortableArchiveReader(comptime RawReader: type) type {
                 try readAndLimitAfb2Trailer(RawReader, raw)
             else
                 null;
-            return .{
+            var self: Self = .{
                 .raw = raw,
                 .header = header,
                 .manifest_pending = header.format_version == backup_codec.format_version,
                 .base = base,
                 .trailer = trailer,
             };
+            self.observeHeader(header);
+            return self;
         }
 
         fn deinit(self: *Self, alloc: Allocator) void {
@@ -1206,6 +1307,84 @@ fn PortableArchiveReader(comptime RawReader: type) type {
 
         pub fn readHeader(self: *Self) !backup_codec.FileHeader {
             return self.header;
+        }
+
+        /// Rewinds the logical archive without retaining decoded rows. AFB2
+        /// uses positional reads for objects, so its pass fingerprint belongs
+        /// here rather than to the physical framing reader.
+        pub fn reset(self: *Self, alloc: Allocator) !void {
+            if (self.header.format_version == backup_codec.legacy_format_version) {
+                self.raw.reset();
+                self.header = try self.raw.readHeader();
+                return;
+            }
+            if (!self.done) return error.EndOfStream;
+            const fingerprint = self.currentLogicalFingerprint();
+            if (self.completed_pass_fingerprint) |expected| {
+                if (!std.mem.eql(u8, &expected, &fingerprint)) self.generation_changed = true;
+            } else {
+                self.completed_pass_fingerprint = fingerprint;
+            }
+            if (self.manifest) |*manifest| manifest.deinit();
+            self.manifest = null;
+            if (self.blob_offsets.len > 0) alloc.free(self.blob_offsets);
+            self.blob_offsets = &.{};
+            self.raw.reset();
+            const header = try self.raw.readHeader();
+            self.header = header;
+            self.manifest_pending = true;
+            self.next_ordinal = 0;
+            self.done = false;
+            self.indexed = false;
+            self.logical_hasher = std.crypto.hash.Blake3.init(.{});
+            self.observeHeader(header);
+        }
+
+        pub fn verifiedFingerprint(self: *const Self) !backup_codec.FileReader.Fingerprint {
+            if (RawReader != backup_codec.FileReader)
+                @compileError("portable file fingerprints require backup_codec.FileReader");
+            if (self.header.format_version == backup_codec.legacy_format_version)
+                return try self.raw.verifiedFingerprint();
+            if (!self.done) return error.EndOfStream;
+            if (self.generation_changed) return error.SourceFileChanged;
+            const fingerprint = self.currentLogicalFingerprint();
+            if (self.completed_pass_fingerprint) |expected| {
+                if (!std.mem.eql(u8, &expected, &fingerprint)) return error.SourceFileChanged;
+                return expected;
+            }
+            return fingerprint;
+        }
+
+        pub fn verifyFingerprint(self: *const Self, expected: backup_codec.FileReader.Fingerprint) !void {
+            const actual = try self.verifiedFingerprint();
+            if (!std.mem.eql(u8, &expected, &actual)) return error.SourceFileChanged;
+        }
+
+        fn observeHeader(self: *Self, header: backup_codec.FileHeader) void {
+            var encoded: [44]u8 = undefined;
+            std.mem.writeInt(u32, encoded[0..4], header.format_version, .little);
+            std.mem.writeInt(u32, encoded[4..8], header.flags, .little);
+            std.mem.writeInt(i64, encoded[8..16], header.created_at_ns, .little);
+            @memcpy(encoded[16..32], &header.backup_id);
+            std.mem.writeInt(u32, encoded[32..36], header.table_count, .little);
+            std.mem.writeInt(u32, encoded[36..40], header.shard_count, .little);
+            std.mem.writeInt(u32, encoded[40..44], 0x48445232, .little);
+            self.logical_hasher.update(&encoded);
+        }
+
+        fn observeLogicalBlock(self: *Self, block_type: backup_codec.BlockType, payload: []const u8) void {
+            const tag = [_]u8{@intFromEnum(block_type)};
+            var len: [8]u8 = undefined;
+            std.mem.writeInt(u64, &len, @intCast(payload.len), .little);
+            self.logical_hasher.update(&tag);
+            self.logical_hasher.update(&len);
+            self.logical_hasher.update(payload);
+        }
+
+        fn currentLogicalFingerprint(self: *const Self) backup_codec.FileReader.Fingerprint {
+            var fingerprint: backup_codec.FileReader.Fingerprint = undefined;
+            self.logical_hasher.final(&fingerprint);
+            return fingerprint;
         }
 
         pub fn hasRemaining(self: *const Self) bool {
@@ -1244,6 +1423,7 @@ fn PortableArchiveReader(comptime RawReader: type) type {
                 }
                 self.manifest = manifest;
                 self.manifest_pending = false;
+                self.observeLogicalBlock(manifest_block.block_type, manifest_block.payload);
                 return manifest_block;
             }
 
@@ -1266,6 +1446,7 @@ fn PortableArchiveReader(comptime RawReader: type) type {
             } else try self.readBaseBlob(alloc, blob_index);
             self.next_ordinal += 1;
             if (self.next_ordinal == manifest.objects.len) self.done = true;
+            self.observeLogicalBlock(block_type, payload);
             return .{ .block_type = block_type, .payload = payload };
         }
 
@@ -1374,6 +1555,8 @@ fn PortableArchiveReader(comptime RawReader: type) type {
     };
 }
 
+pub const default_schema_cache_bytes: usize = 16 * 1024 * 1024;
+
 pub const ImportOptions = struct {
     pub const EmbeddingSourceField = struct {
         index_name: []const u8,
@@ -1385,7 +1568,19 @@ pub const ImportOptions = struct {
     import_derived_indexes: bool = true,
     embedding_source_fields: []const EmbeddingSourceField = &.{},
     bundle_base: ?PortableBaseBlobSource = null,
+    /// The destination is disposable and cannot become visible until this
+    /// function succeeds. This enables validate-and-apply in one streaming
+    /// pass; any error is handled by discarding the staging generation.
+    unpublished_staging: bool = false,
+    progress_context: ?*anyopaque = null,
+    progress_fn: ?*const fn (?*anyopaque, ImportProgress) void = null,
+    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
+    /// Decoded historical epochs, not total archive history. A single oversized
+    /// epoch may exceed this budget while its row is being validated.
+    schema_cache_bytes: usize = default_schema_cache_bytes,
 };
+
+pub const ImportProgress = @import("../common/restore_progress.zig").Progress;
 
 /// Import AFB data into the DocStore.
 pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !void {
@@ -1394,6 +1589,48 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
 
 pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
     try validatePortableImportBlocks(alloc, data, .{});
+}
+
+/// Validate the cross-catalog invariant required when an archive represents a
+/// complete database image. Generic portable imports intentionally remain
+/// usable for identity-free data migration; production restore entry points
+/// must call this after importing and before publishing their generation.
+pub fn validateCompleteDatabaseImageAlloc(alloc: Allocator, store: *DocStore) !void {
+    try doc_identity.validatePrimaryDocumentCoverageAlloc(alloc, store);
+
+    const runtime_schema = try storage_schema.loadSchema(store, alloc);
+    defer if (runtime_schema) |schema| storage_schema.freeSchema(alloc, schema);
+    const schema_json = store.get(alloc, "\x00\x00__metadata__:schema_json") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (schema_json) |value| alloc.free(value);
+
+    // A public schema is never a standalone durable contract: it is the source
+    // from which the executable runtime schema is derived. Direct compiled
+    // schemas may legitimately omit schema_json. Public-schema provenance is
+    // explicit in each immutable epoch, never inferred from missing metadata.
+    if (schema_json != null and runtime_schema == null) return error.InvalidBackupRequest;
+    if (runtime_schema) |schema| {
+        if (schema.requires_public_schema and schema_json == null) return error.InvalidBackupRequest;
+        if (schema_json) |value| {
+            var public_schema = public_table_schema.parseValidatedTableSchema(alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            defer public_schema.deinit(alloc);
+            const derived = public_table_schema.deriveRuntimeTableSchema(alloc, public_schema) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            defer storage_schema.freeSchema(alloc, derived);
+            const schemas_match = storage_schema.schemasEqual(alloc, schema, derived) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            if (!schemas_match) return error.InvalidBackupRequest;
+        }
+    }
 }
 
 /// Visits the verified logical portable blocks of either AFB1 or AFB2. This is
@@ -1428,6 +1665,14 @@ pub fn visitPortableBlocksWithBase(
 }
 
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
+    try opts.cancellation.check();
+    if (opts.unpublished_staging) {
+        var raw = backup_codec.SliceReader.init(data);
+        var reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&raw, opts.bundle_base);
+        defer reader.deinit(alloc);
+        const imported_identity = try validateAndImportPortableStagingReader(alloc, store, &reader, opts);
+        return try finishPortableIdentityImport(alloc, store, opts, imported_identity);
+    }
     var validation_raw = backup_codec.SliceReader.init(data);
     var validation_reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&validation_raw, opts.bundle_base);
     defer validation_reader.deinit(alloc);
@@ -1458,33 +1703,145 @@ pub fn importPortableFileWithOptions(
     file_size: u64,
     opts: ImportOptions,
 ) !void {
-    // The three passes must observe one immutable archive generation. Locking
-    // is fail-closed; the final stat also detects writers that ignore advisory
-    // locks on a shared filesystem.
-    try file.lock(io, .shared);
+    // Restore admission must never wait behind an archive writer while the
+    // caller may already hold a destination-wide restore lock.
+    try opts.cancellation.check();
+    if (!try file.tryLock(io, .shared)) return error.WriterLocked;
     defer file.unlock(io);
     const initial_stat = try file.stat(io);
     if (initial_stat.size != file_size) return error.SourceFileChanged;
+
+    if (opts.unpublished_staging) {
+        var raw = backup_codec.FileReader.init(io, file, file_size);
+        var reader = try PortableArchiveReader(backup_codec.FileReader).initWithBase(&raw, opts.bundle_base);
+        defer reader.deinit(alloc);
+        const imported_identity = try validateAndImportPortableStagingReader(alloc, store, &reader, opts);
+        try finishPortableIdentityImport(alloc, store, opts, imported_identity);
+        const final_stat = try file.stat(io);
+        if (final_stat.size != initial_stat.size or
+            !std.meta.eql(final_stat.mtime, initial_stat.mtime) or
+            !std.meta.eql(final_stat.ctime, initial_stat.ctime))
+            return error.SourceFileChanged;
+        return;
+    }
 
     var validation_raw = backup_codec.FileReader.init(io, file, file_size);
     var validation_reader = try PortableArchiveReader(backup_codec.FileReader).initWithBase(&validation_raw, opts.bundle_base);
     defer validation_reader.deinit(alloc);
     try validatePortableImportReader(alloc, &validation_reader, opts);
+    const validated_fingerprint = try validation_reader.verifiedFingerprint();
 
     var raw = backup_codec.FileReader.init(io, file, file_size);
     var reader = try PortableArchiveReader(backup_codec.FileReader).initWithBase(&raw, opts.bundle_base);
     defer reader.deinit(alloc);
     const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
+    try reader.verifyFingerprint(validated_fingerprint);
     try finishPortableIdentityImport(alloc, store, opts, imported_identity);
     if (opts.import_derived_indexes) {
         var derived_raw = backup_codec.FileReader.init(io, file, file_size);
         var derived_reader = try PortableArchiveReader(backup_codec.FileReader).initWithBase(&derived_raw, opts.bundle_base);
         defer derived_reader.deinit(alloc);
         try importPortableDerivedBlocks(alloc, store, &derived_reader, opts);
+        try derived_reader.verifyFingerprint(validated_fingerprint);
     }
     const final_stat = try file.stat(io);
-    if (final_stat.size != initial_stat.size or !std.meta.eql(final_stat.mtime, initial_stat.mtime))
+    if (final_stat.size != initial_stat.size or
+        !std.meta.eql(final_stat.mtime, initial_stat.mtime) or
+        !std.meta.eql(final_stat.ctime, initial_stat.ctime))
         return error.SourceFileChanged;
+}
+
+/// AFB2 restore path for a disposable destination. Framing, manifest digests,
+/// semantic validation, canonical row validation, and store application happen
+/// block-by-block without retaining or rereading the archive. Derived objects
+/// are safe to apply inline because the exporter orders metadata and base rows
+/// before them and the generation remains unpublished until completion.
+fn validateAndImportPortableStagingReader(
+    alloc: Allocator,
+    store: *DocStore,
+    reader: anytype,
+    opts: ImportOptions,
+) !bool {
+    const header = try reader.readHeader();
+    if (header.format_version < backup_codec.format_version) {
+        // Preserve AFB1 compatibility; its metadata ordering was unspecified.
+        try reader.reset(alloc);
+        try validatePortableImportReader(alloc, reader, opts);
+        try reader.reset(alloc);
+        const imported_identity = try importPortablePrimaryBlocks(alloc, store, reader);
+        if (opts.import_derived_indexes) {
+            try reader.reset(alloc);
+            try importPortableDerivedBlocks(alloc, store, reader, opts);
+        }
+        return imported_identity;
+    }
+
+    var archive: PortableArchiveValidation = .{
+        .format_version = header.format_version,
+        .schema_cache_bytes = opts.schema_cache_bytes,
+        .staging_store = store,
+        .snapshot_alloc = alloc,
+    };
+    defer archive.deinit(alloc);
+    var imported_identity = false;
+    var block_index: usize = 0;
+    var saw_bundle_manifest = false;
+    var payload_bytes: u64 = 0;
+    const restore_started_ns = platform_time.monotonicNs();
+    while (reader.hasRemaining()) {
+        try opts.cancellation.check();
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block_index == 0 and block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
+        if (block.block_type == .bundle_manifest) {
+            if (saw_bundle_manifest or block_index != 0) return error.InvalidBackupManifest;
+            var manifest = try backup_bundle.parseManifest(alloc, block.payload);
+            defer manifest.deinit();
+            if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
+            saw_bundle_manifest = true;
+        }
+        if (block.block_type == .metadata_batch and archive.saw_document_block)
+            return error.InvalidBackupManifest;
+        switch (block.block_type) {
+            .document_batch => {
+                try validateAndImportDocumentBatchPayload(alloc, store, block.payload, &archive);
+                archive.saw_document_block = true;
+            },
+            .doc_identity_batch => {
+                // The importer validates the identity namespace while applying
+                // the same decoded entries to unpublished staging.
+                try importIdentityBatch(alloc, store, block.payload);
+                imported_identity = true;
+            },
+            .metadata_batch => try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
+            .chunk_batch => if (opts.import_derived_indexes) try importChunkBatch(alloc, store, block.payload),
+            .artifact_batch => if (opts.import_derived_indexes) try importPublicArtifactBatch(alloc, store, block.payload, .asset),
+            .resolution_batch => if (opts.import_derived_indexes) try importResolutionArtifactBatch(alloc, store, block.payload),
+            .embedding_batch => if (opts.import_derived_indexes) try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
+            .sparse_batch => if (opts.import_derived_indexes) try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
+            .edge_batch => if (opts.import_derived_indexes) try importEdgeBatch(alloc, store, block.payload),
+            .shard_header, .shard_footer, .file_footer => try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive),
+            .bundle_manifest, .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
+            else => {},
+        }
+        block_index += 1;
+        payload_bytes +|= block.payload.len;
+        if (opts.progress_fn) |progress| {
+            const elapsed_ns = platform_time.monotonicNs() - restore_started_ns;
+            const scaled_rows = std.math.mul(u64, archive.document_row_count, std.time.ns_per_s) catch std.math.maxInt(u64);
+            progress(opts.progress_context, .{
+                .blocks_processed = block_index,
+                .rows_validated = archive.document_row_count,
+                .payload_bytes_processed = payload_bytes,
+                .elapsed_ns = elapsed_ns,
+                .rows_per_second = if (elapsed_ns == 0) 0 else scaled_rows / elapsed_ns,
+            });
+        }
+    }
+    if (!saw_bundle_manifest) return error.InvalidBackupManifest;
+    try opts.cancellation.check();
+    try archive.finish(alloc);
+    return imported_identity;
 }
 
 pub fn importPortableFile(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, file_size: u64) !void {
@@ -1548,6 +1905,11 @@ fn validatePortableImportBlocks(alloc: Allocator, data: []const u8, opts: Import
 
 fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportOptions) !void {
     const header = try reader.readHeader();
+    var archive: PortableArchiveValidation = .{
+        .format_version = header.format_version,
+        .schema_cache_bytes = opts.schema_cache_bytes,
+    };
+    defer archive.deinit(alloc);
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
     while (reader.hasRemaining()) {
@@ -1562,18 +1924,346 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
             if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
             saw_bundle_manifest = true;
         }
-        try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts);
+        if (header.format_version == backup_codec.format_version and
+            block.block_type == .metadata_batch and archive.saw_document_block)
+            return error.InvalidBackupManifest;
+        try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive);
+        if (block.block_type == .document_batch) archive.saw_document_block = true;
         block_index += 1;
     }
     if (header.format_version == backup_codec.format_version and !saw_bundle_manifest)
         return error.InvalidBackupManifest;
+    try archive.finish(alloc);
 }
 
-fn validatePortableImportBlockPayload(alloc: Allocator, block_type: backup_codec.BlockType, payload: []const u8, opts: ImportOptions) !void {
+const ArchiveSchemaLayout = struct {
+    schema: storage_schema.TableSchema,
+    physical: relational_row_codec.PhysicalLayout,
+
+    fn initOwned(alloc: Allocator, schema: storage_schema.TableSchema) !ArchiveSchemaLayout {
+        return .{ .schema = schema, .physical = try relational_row_codec.PhysicalLayout.init(alloc, schema) };
+    }
+
+    fn deinit(self: *ArchiveSchemaLayout, alloc: Allocator) void {
+        self.physical.deinit();
+        storage_schema.freeSchema(alloc, self.schema);
+        self.* = undefined;
+    }
+};
+
+const PortableArchiveValidation = struct {
+    format_version: u32,
+    schema_cache_bytes: usize = default_schema_cache_bytes,
+    spool: ?SchemaSpool = null,
+    snapshot: ?*DocStore.Txn = null,
+    staging_store: ?*DocStore = null,
+    snapshot_alloc: ?Allocator = null,
+    decoded: std.AutoHashMapUnmanaged(u32, DecodedEpoch) = .empty,
+    transient_epoch: ?DecodedEpoch = null,
+    admission: @import("db/schema_cache_admission.zig").Admission = .{},
+    decoded_bytes: usize = 0,
+    decode_clock: u64 = 0,
+    saw_document_rows: bool = false,
+    saw_relational_rows: bool = false,
+    saw_document_block: bool = false,
+    document_row_count: u64 = 0,
+    runtime_schema: ?storage_schema.TableSchema = null,
+    runtime_physical_layout: ?relational_row_codec.PhysicalLayout = null,
+    layouts: std.AutoHashMapUnmanaged(u32, SchemaSpool.Ref) = .empty,
+    active_public_validator: ?public_table_schema.CompiledTableValidator = null,
+    active_public_digest: ?[std.crypto.hash.Blake3.digest_length]u8 = null,
+    public_validators: std.AutoHashMapUnmanaged(u32, SchemaSpool.Ref) = .empty,
+    public_digests: std.AutoHashMapUnmanaged(u32, [std.crypto.hash.Blake3.digest_length]u8) = .empty,
+    table_catalog: ?table_catalog.Catalog = null,
+    saw_index_catalog: bool = false,
+    saw_enrichment_catalog: bool = false,
+    saw_resolver_catalog: bool = false,
+
+    const DecodedEpoch = struct {
+        version: u32,
+        arena: *std.heap.ArenaAllocator,
+        layout: ArchiveSchemaLayout,
+        validator: ?public_table_schema.CompiledTableValidator,
+        access: u64,
+
+        fn deinit(self: *DecodedEpoch, alloc: Allocator) void {
+            self.arena.deinit();
+            alloc.destroy(self.arena);
+        }
+    };
+
+    fn retainSchema(self: *PortableArchiveValidation, alloc: Allocator, bytes: []const u8) !SchemaSpool.Ref {
+        // Metadata can arrive in any order within the manifest section. Drop
+        // compiled entries so a newly arrived public validator is never missed.
+        self.clearDecoded(alloc);
+        // In AFB2 staging, metadata is durably applied before any row. Reuse
+        // those records instead of duplicating history into a scratch file.
+        if (self.staging_store != null) return .{ .offset = 0, .len = 0 };
+        if (self.spool == null) self.spool = .{ .alloc = alloc };
+        return try self.spool.?.append(bytes);
+    }
+
+    fn clearDecoded(self: *PortableArchiveValidation, alloc: Allocator) void {
+        if (self.transient_epoch) |*epoch| epoch.deinit(alloc);
+        self.transient_epoch = null;
+        var it = self.decoded.valueIterator();
+        while (it.next()) |epoch| epoch.deinit(alloc);
+        self.decoded.clearRetainingCapacity();
+        self.decoded_bytes = 0;
+    }
+
+    fn epochForVersion(self: *PortableArchiveValidation, version: u32) !?*DecodedEpoch {
+        const alloc = if (self.spool) |spool| spool.alloc else self.snapshot_alloc orelse return null;
+        if (self.transient_epoch) |*epoch| if (epoch.version != version) {
+            epoch.deinit(alloc);
+            self.transient_epoch = null;
+        };
+        self.admission.record(version);
+        self.decode_clock +%= 1;
+        if (self.decoded.getPtr(version)) |epoch| {
+            epoch.access = self.decode_clock;
+            return epoch;
+        }
+        if (self.transient_epoch) |*epoch| if (epoch.version == version) return epoch;
+        const ref = self.layouts.get(version) orelse return null;
+        const arena = try alloc.create(std.heap.ArenaAllocator);
+        errdefer alloc.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const arena_alloc = arena.allocator();
+        const encoded = if (self.snapshot) |snapshot| blk: {
+            const key = try storage_schema.schemaVersionKeyAlloc(alloc, version);
+            defer alloc.free(key);
+            const value = snapshot.get(key) catch |err| switch (err) {
+                error.NotFound => return error.InvalidSchema,
+                else => return err,
+            };
+            break :blk try alloc.dupe(u8, value);
+        } else if (self.staging_store) |store| blk: {
+            const key = try storage_schema.schemaVersionKeyAlloc(alloc, version);
+            defer alloc.free(key);
+            break :blk try store.get(alloc, key);
+        } else try self.spool.?.read(alloc, ref);
+        defer alloc.free(encoded);
+        const schema = try storage_schema.deserializeSchema(arena_alloc, encoded);
+        if (schema.version != version) return error.InvalidSchema;
+        const layout = try ArchiveSchemaLayout.initOwned(arena_alloc, schema);
+        var validator: ?public_table_schema.CompiledTableValidator = null;
+        if (self.public_validators.get(version)) |public_ref| {
+            const json = if (self.staging_store) |store| blk: {
+                const key = try public_table_schema.versionedSchemaKeyAlloc(alloc, version);
+                defer alloc.free(key);
+                break :blk try store.get(alloc, key);
+            } else try self.spool.?.read(alloc, public_ref);
+            defer alloc.free(json);
+            validator = try public_table_schema.CompiledTableValidator.init(arena_alloc, json);
+        }
+        const cost = arena.queryCapacity();
+        const incoming: DecodedEpoch = .{ .version = version, .arena = arena, .layout = layout, .validator = validator, .access = self.decode_clock };
+        if (cost > self.schema_cache_bytes) {
+            // Oversized epochs are borrowed working state, never residents.
+            // Do not flush a useful cache to serve one unusually wide schema.
+            self.transient_epoch = incoming;
+            return &self.transient_epoch.?;
+        }
+        while (self.decoded.count() > 0 and self.decoded_bytes +| cost > self.schema_cache_bytes) {
+            var oldest: ?u32 = null;
+            var oldest_access: u64 = std.math.maxInt(u64);
+            var it = self.decoded.iterator();
+            while (it.next()) |entry| {
+                const frequency = self.admission.frequency(entry.key_ptr.*);
+                const candidate_frequency = if (oldest) |candidate| self.admission.frequency(candidate) else 255;
+                if (oldest == null or frequency < candidate_frequency or
+                    (frequency == candidate_frequency and entry.value_ptr.access < oldest_access))
+                {
+                    oldest = entry.key_ptr.*;
+                    oldest_access = entry.value_ptr.access;
+                }
+            }
+            if (!self.admission.admits(version, oldest.?)) {
+                if (self.transient_epoch) |*previous| previous.deinit(alloc);
+                self.transient_epoch = incoming;
+                return &self.transient_epoch.?;
+            }
+            var evicted = self.decoded.fetchRemove(oldest.?).?.value;
+            self.decoded_bytes -= evicted.arena.queryCapacity();
+            evicted.deinit(alloc);
+        }
+        try self.decoded.put(alloc, version, incoming);
+        self.decoded_bytes += cost;
+        return self.decoded.getPtr(version).?;
+    }
+
+    fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
+        if (self.runtime_physical_layout) |*layout| layout.deinit();
+        if (self.runtime_schema) |schema| storage_schema.freeSchema(alloc, schema);
+        self.clearDecoded(alloc);
+        self.decoded.deinit(alloc);
+        if (self.spool) |*spool| spool.deinit();
+        self.layouts.deinit(alloc);
+        if (self.active_public_validator) |*validator| validator.deinit(alloc);
+        self.public_validators.deinit(alloc);
+        self.public_digests.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn validatorForVersion(
+        self: *PortableArchiveValidation,
+        version: ?u32,
+    ) !?*const public_table_schema.CompiledTableValidator {
+        if (version) |schema_version| {
+            if (try self.epochForVersion(schema_version)) |epoch|
+                if (epoch.validator) |*validator| return validator;
+            if (self.active_public_validator) |*validator|
+                if (validator.schema.version == schema_version) return validator;
+            return null;
+        }
+        return if (self.active_public_validator) |*validator| validator else null;
+    }
+
+    fn layoutForVersion(self: *PortableArchiveValidation, version: u32) !?struct {
+        schema: *const storage_schema.TableSchema,
+        physical: *const relational_row_codec.PhysicalLayout,
+    } {
+        if (try self.epochForVersion(version)) |epoch| return .{
+            .schema = &epoch.layout.schema,
+            .physical = &epoch.layout.physical,
+        };
+        if (self.runtime_schema) |*schema| if (schema.version == version) {
+            const physical = if (self.runtime_physical_layout) |*layout| layout else return null;
+            return .{ .schema = schema, .physical = physical };
+        };
+        return null;
+    }
+
+    fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
+        if (self.saw_document_rows and self.saw_relational_rows) return error.InvalidBackupRequest;
+        if (self.saw_relational_rows and self.format_version < 2) return error.InvalidBackupRequest;
+
+        const runtime_relational = if (self.runtime_schema) |schema| schema.storage_mode == .relational else false;
+        const public_relational = if (self.active_public_validator) |validator| validator.schema.storage_mode == .relational else false;
+        if (self.active_public_validator != null and self.runtime_schema != null and runtime_relational != public_relational)
+            return error.InvalidBackupRequest;
+        if (self.active_public_validator != null and self.runtime_schema == null) return error.InvalidBackupRequest;
+        if (self.runtime_schema) |schema|
+            if (schema.requires_public_schema and self.active_public_validator == null)
+                return error.InvalidBackupRequest;
+        if (self.table_catalog) |catalog| {
+            if (catalog.reconciled and (catalog.row_count != 0) != (self.document_row_count != 0))
+                return error.InvalidBackupRequest;
+            if (self.runtime_schema) |runtime_schema| {
+                if (!catalog.mode_initialized or catalog.storage_mode != runtime_schema.storage_mode or
+                    catalog.active_schema_version != runtime_schema.version)
+                    return error.InvalidBackupRequest;
+            }
+        }
+        if (self.active_public_validator) |validator| {
+            if (self.runtime_schema) |runtime_schema| {
+                const derived = public_table_schema.deriveRuntimeTableSchema(alloc, validator.schema) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidBackupRequest,
+                };
+                defer storage_schema.freeSchema(alloc, derived);
+                const schemas_match = storage_schema.schemasEqual(alloc, runtime_schema, derived) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidBackupRequest,
+                };
+                if (!schemas_match) return error.InvalidBackupRequest;
+            }
+            if (self.public_digests.get(validator.schema.version)) |versioned_digest| {
+                if (!std.mem.eql(u8, &versioned_digest, &self.active_public_digest.?))
+                    return error.InvalidBackupRequest;
+            }
+        }
+        var versioned_validators = self.public_validators.iterator();
+        while (versioned_validators.next()) |entry| {
+            const layout = (try self.layoutForVersion(entry.key_ptr.*)) orelse return error.InvalidBackupRequest;
+            const validator = (try self.validatorForVersion(entry.key_ptr.*)) orelse return error.InvalidBackupRequest;
+            const derived = public_table_schema.deriveRuntimeTableSchema(alloc, validator.schema) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            defer storage_schema.freeSchema(alloc, derived);
+            const schemas_match = storage_schema.schemasEqual(alloc, layout.schema.*, derived) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            if (!schemas_match) return error.InvalidBackupRequest;
+        }
+        if (self.saw_relational_rows and !runtime_relational) return error.InvalidBackupRequest;
+        if (self.saw_document_rows and runtime_relational) return error.InvalidBackupRequest;
+    }
+};
+
+test "portable archive accepts long history with a bounded decoded working set" {
+    const alloc = std.testing.allocator;
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    var source = try openTestStore(alloc, &source_tmp);
+    defer source.close();
+    var archive: PortableArchiveValidation = .{
+        .format_version = backup_codec.format_version,
+        .schema_cache_bytes = 1024,
+    };
+    defer archive.deinit(alloc);
+    for (0..4100) |version| {
+        const encoded = try storage_schema.serializeSchema(alloc, .{ .version = @intCast(version) });
+        defer alloc.free(encoded);
+        const key = try storage_schema.schemaVersionKeyAlloc(alloc, @intCast(version));
+        defer alloc.free(key);
+        try validateMetadataEntries(alloc, &.{.{ .key = key, .value = encoded }}, &archive);
+        try source.put(key, encoded);
+    }
+    try std.testing.expectEqual(@as(usize, 4100), archive.layouts.count());
+    for (0..4100) |version| {
+        const layout = (try archive.layoutForVersion(@intCast(version))).?;
+        try std.testing.expectEqual(@as(u32, @intCast(version)), layout.schema.version);
+        try std.testing.expect(archive.decoded_bytes <= archive.schema_cache_bytes);
+    }
+    // Fault a previously evicted epoch and keep duplicate detection independent
+    // of residency.
+    try std.testing.expectEqual(@as(u32, 0), (try archive.layoutForVersion(0)).?.schema.version);
+    const encoded = try storage_schema.serializeSchema(alloc, .{ .version = 0 });
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{.{
+        .key = "\x00\x00__metadata__:schema_v0",
+        .value = encoded,
+    }}, &archive));
+
+    // Exercise the public exporter and both import modes, not just the cache.
+    const active = try storage_schema.serializeSchema(alloc, .{ .version = 4099 });
+    defer alloc.free(active);
+    try source.put("\x00\x00__metadata__:schema", active);
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try exportPortable(alloc, &source, &portable);
+    for ([_]bool{ false, true }) |staged| {
+        var destination_tmp = std.testing.tmpDir(.{});
+        defer destination_tmp.cleanup();
+        var destination = try openTestStore(alloc, &destination_tmp);
+        defer destination.close();
+        try importPortableWithOptions(alloc, &destination, portable.items, .{
+            .unpublished_staging = staged,
+            .import_derived_indexes = false,
+            .schema_cache_bytes = 1024,
+        });
+        const restored = try storage_schema.loadSchemaVersion(&destination, alloc, 0);
+        defer if (restored) |schema| storage_schema.freeSchema(alloc, schema);
+        try std.testing.expectEqual(@as(u32, 0), restored.?.version);
+    }
+}
+
+fn validatePortableImportBlockPayload(
+    alloc: Allocator,
+    block_type: backup_codec.BlockType,
+    payload: []const u8,
+    opts: ImportOptions,
+    archive: *PortableArchiveValidation,
+) !void {
     switch (block_type) {
-        .document_batch => try validateDocumentBatchPayload(alloc, payload),
+        .document_batch => try validateDocumentBatchPayload(alloc, payload, archive),
         .doc_identity_batch => try validateIdentityBatchPayload(alloc, payload),
-        .metadata_batch => try validateMetadataBatchPayload(alloc, payload),
+        .metadata_batch => try validateMetadataBatchPayload(alloc, payload, archive),
         .chunk_batch => if (opts.import_derived_indexes) try validatePublicArtifactBatchPayload(alloc, payload, .chunk),
         .artifact_batch => if (opts.import_derived_indexes) try validatePublicArtifactBatchPayload(alloc, payload, .asset),
         .resolution_batch => if (opts.import_derived_indexes) try validateResolutionArtifactBatchPayload(alloc, payload),
@@ -1593,15 +2283,106 @@ fn validatePortableImportBlockPayload(alloc: Allocator, block_type: backup_codec
     }
 }
 
-fn validateDocumentBatchPayload(alloc: Allocator, payload: []const u8) !void {
-    const entries = try backup_codec.decodeDocumentBatch(alloc, payload);
-    defer {
-        for (entries) |entry| {
-            alloc.free(entry.key);
-            alloc.free(entry.value);
-        }
-        alloc.free(entries);
+fn validateDocumentBatchPayload(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation) !void {
+    const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
+    defer alloc.free(entries);
+    var validation_arena = std.heap.ArenaAllocator.init(alloc);
+    defer validation_arena.deinit();
+    for (entries) |entry| {
+        try validatePortableDocumentEntryAgainstArchive(validation_arena.allocator(), entry, archive);
+        _ = validation_arena.reset(.retain_capacity);
+        archive.document_row_count = std.math.add(u64, archive.document_row_count, 1) catch return error.InvalidBackupRequest;
+        if (entry.value_flags & backup_codec.doc_value_flag_relational_row != 0)
+            archive.saw_relational_rows = true
+        else
+            archive.saw_document_rows = true;
     }
+}
+
+fn validateAndImportDocumentBatchPayload(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+    archive: *PortableArchiveValidation,
+) !void {
+    const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
+    defer alloc.free(entries);
+    var validation_arena = std.heap.ArenaAllocator.init(alloc);
+    defer validation_arena.deinit();
+    for (entries) |entry| {
+        try validatePortableDocumentEntryAgainstArchive(validation_arena.allocator(), entry, archive);
+        _ = validation_arena.reset(.retain_capacity);
+        archive.document_row_count = std.math.add(u64, archive.document_row_count, 1) catch
+            return error.InvalidBackupRequest;
+        if (entry.value_flags & backup_codec.doc_value_flag_relational_row != 0)
+            archive.saw_relational_rows = true
+        else
+            archive.saw_document_rows = true;
+    }
+    try importDecodedDocumentEntries(alloc, store, entries);
+}
+
+fn validatePortableDocumentEntryAgainstArchive(
+    alloc: Allocator,
+    entry: backup_codec.DocumentEntry,
+    archive: *PortableArchiveValidation,
+) !void {
+    try validatePortableDocumentEntry(entry);
+    if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0) return;
+    const row_version = relational_store.rowSchemaVersion(entry.value) catch return error.InvalidBackupRequest;
+    const layout = (try archive.layoutForVersion(row_version)) orelse return error.InvalidBackupRequest;
+    if (try archive.validatorForVersion(row_version)) |validator| {
+        if (!validator.restore.full_root) {
+            // Canonical decoding discharges required/null/type constraints and
+            // authenticates the logical hash. Archive finish verifies the
+            // public/runtime schema binding before staging can be published.
+            relational_store.validateCanonicalValueForSchemaAndLayout(alloc, entry.value, layout.schema.*, layout.physical) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            const row = try relational_row_codec.ordinalRowViewTrusted(entry.value, layout.schema.*, layout.physical);
+            validator.validateRelationalRestoreFields(alloc, row) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidBackupRequest,
+            };
+            return;
+        }
+        var logical = relational_store.validateCanonicalAndMaterializeRootForSchemaAndLayoutAlloc(
+            alloc,
+            entry.value,
+            layout.schema.*,
+            layout.physical,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+        defer logical.deinit(alloc);
+        validator.validateValue(alloc, &logical.root) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+    } else if (layout.schema.requires_public_schema) {
+        return error.InvalidBackupRequest;
+    } else {
+        relational_store.validateCanonicalValueForSchemaAndLayout(
+            alloc,
+            entry.value,
+            layout.schema.*,
+            layout.physical,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+    }
+}
+
+/// Context-free envelope validation used again at the mutation boundary after
+/// the archive-wide, schema-aware preflight has succeeded.
+fn validatePortableDocumentEntry(entry: backup_codec.DocumentEntry) !void {
+    if (entry.value_flags & ~backup_codec.doc_value_known_flags != 0) return error.InvalidBackupRequest;
+    if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0) return;
+    if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0) return error.InvalidBackupRequest;
+    _ = relational_store.rowSchemaVersion(entry.value) catch return error.InvalidBackupRequest;
 }
 
 fn validateIdentityBatchPayload(alloc: Allocator, payload: []const u8) !void {
@@ -1614,12 +2395,134 @@ fn validateIdentityBatchPayload(alloc: Allocator, payload: []const u8) !void {
     }
 }
 
-fn validateMetadataBatchPayload(alloc: Allocator, payload: []const u8) !void {
+fn validateMetadataBatchPayload(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation) !void {
     const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
     defer freeKeyValueEntries(alloc, entries);
+    return try validateMetadataEntries(alloc, entries, archive);
+}
+
+fn validateMetadataEntries(
+    alloc: Allocator,
+    entries: []const backup_codec.KeyValueEntry,
+    archive: *PortableArchiveValidation,
+) !void {
     for (entries) |entry| {
         if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
+        if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema")) {
+            if (archive.runtime_schema != null) return error.InvalidMetadataBatch;
+            const schema = storage_schema.deserializeSchema(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            var schema_owned = true;
+            errdefer if (schema_owned) storage_schema.freeSchema(alloc, schema);
+            archive.runtime_physical_layout = relational_row_codec.PhysicalLayout.init(alloc, schema) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.runtime_schema = schema;
+            schema_owned = false;
+        } else if (std.mem.startsWith(u8, entry.key, schema_version_prefix)) {
+            const schema = storage_schema.deserializeSchema(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            const suffix = entry.key[schema_version_prefix.len..];
+            const key_version = std.fmt.parseInt(u32, suffix, 10) catch {
+                storage_schema.freeSchema(alloc, schema);
+                return error.InvalidMetadataBatch;
+            };
+            if (key_version != schema.version) {
+                storage_schema.freeSchema(alloc, schema);
+                return error.InvalidMetadataBatch;
+            }
+            defer storage_schema.freeSchema(alloc, schema);
+            const expected_key = try storage_schema.schemaVersionKeyAlloc(alloc, schema.version);
+            defer alloc.free(expected_key);
+            if (!std.mem.eql(u8, entry.key, expected_key)) return error.InvalidMetadataBatch;
+            // Validate even layouts with no rows, but do not retain their
+            // decoded allocation graph for the lifetime of the archive.
+            var physical = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+            defer physical.deinit();
+            if (archive.layouts.contains(schema.version)) return error.InvalidMetadataBatch;
+            const ref = try archive.retainSchema(alloc, entry.value);
+            try archive.layouts.putNoClobber(alloc, schema.version, ref);
+        } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
+            if (archive.active_public_validator != null) return error.InvalidMetadataBatch;
+            archive.active_public_validator = public_table_schema.CompiledTableValidator.init(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+            std.crypto.hash.Blake3.hash(entry.value, &digest, .{});
+            archive.active_public_digest = digest;
+        } else if (std.mem.startsWith(u8, entry.key, public_table_schema.versioned_schema_key_prefix)) {
+            const suffix = entry.key[public_table_schema.versioned_schema_key_prefix.len..];
+            const key_version = std.fmt.parseInt(u32, suffix, 10) catch return error.InvalidMetadataBatch;
+            const expected_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, key_version);
+            defer alloc.free(expected_key);
+            if (!std.mem.eql(u8, entry.key, expected_key)) return error.InvalidMetadataBatch;
+            var validator = public_table_schema.CompiledTableValidator.init(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            if (validator.schema.version != key_version) {
+                validator.deinit(alloc);
+                return error.InvalidMetadataBatch;
+            }
+            defer validator.deinit(alloc);
+            if (archive.public_validators.contains(key_version)) return error.InvalidMetadataBatch;
+            const ref = try archive.retainSchema(alloc, entry.value);
+            try archive.public_validators.putNoClobber(alloc, key_version, ref);
+            var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+            std.crypto.hash.Blake3.hash(entry.value, &digest, .{});
+            try archive.public_digests.putNoClobber(alloc, key_version, digest);
+        } else if (std.mem.eql(u8, entry.key, table_catalog.key)) {
+            if (archive.table_catalog != null) return error.InvalidMetadataBatch;
+            archive.table_catalog = table_catalog.Catalog.decode(entry.value) catch return error.InvalidMetadataBatch;
+        } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:indexes")) {
+            if (archive.saw_index_catalog) return error.InvalidMetadataBatch;
+            index_manager.validateSerializedCatalog(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.saw_index_catalog = true;
+        } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:enrichments")) {
+            if (archive.saw_enrichment_catalog) return error.InvalidMetadataBatch;
+            const configs = enrichment_catalog.deserializeCatalog(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            for (configs) |*config| config.deinit(alloc);
+            alloc.free(configs);
+            archive.saw_enrichment_catalog = true;
+        } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:resolvers")) {
+            if (archive.saw_resolver_catalog) return error.InvalidMetadataBatch;
+            const configs = resolver_catalog.deserializeCatalog(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            for (configs) |*config| config.deinit(alloc);
+            alloc.free(configs);
+            archive.saw_resolver_catalog = true;
+        }
     }
+}
+
+fn validateAndImportMetadataBatchPayload(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+    archive: *PortableArchiveValidation,
+) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    try validateMetadataEntries(alloc, entries, archive);
+
+    const writes = try alloc.alloc(KVPair, entries.len);
+    defer alloc.free(writes);
+    for (entries, 0..) |entry, i| writes[i] = .{ .key = entry.key, .value = entry.value };
+    if (writes.len > 0) try store.putBatch(writes, &.{});
 }
 
 fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, allowed_kind: db_types.ArtifactKind) !void {
@@ -1688,16 +2591,19 @@ fn validateImportedIdentityNamespace(store: *DocStore, opts: ImportOptions) !voi
 }
 
 fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
-    const entries = try backup_codec.decodeDocumentBatch(alloc, payload);
-    defer {
-        for (entries) |e| {
-            alloc.free(e.key);
-            alloc.free(e.value);
-        }
-        alloc.free(entries);
-    }
+    const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
+    defer alloc.free(entries);
 
-    // Build KV pairs with internal keys
+    try importDecodedDocumentEntries(alloc, store, entries);
+}
+
+fn importDecodedDocumentEntries(
+    alloc: Allocator,
+    store: *DocStore,
+    entries: []const backup_codec.DocumentEntry,
+) !void {
+    // Build KV pairs with internal keys. Decoded entry values already remain
+    // alive through putBatch, so only decompressed values need another buffer.
     var writes = std.ArrayListUnmanaged(KVPair).empty;
     defer writes.deinit(alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -1707,13 +2613,19 @@ fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
     }
 
     for (entries) |e| {
-        const store_key = try internal_keys.documentKeyAlloc(alloc, e.key);
-        try owned_keys.append(alloc, store_key);
-        const value = if (e.value_flags & backup_codec.doc_value_flag_compressed != 0)
-            try backup_codec.decompressZstd(alloc, e.value)
+        try validatePortableDocumentEntry(e);
+        const relational_row = e.value_flags & backup_codec.doc_value_flag_relational_row != 0;
+        const store_key = if (relational_row)
+            try internal_keys.relationalRowKeyAlloc(alloc, e.key)
         else
-            try alloc.dupe(u8, e.value);
-        try owned_keys.append(alloc, value);
+            try internal_keys.documentKeyAlloc(alloc, e.key);
+        try owned_keys.append(alloc, store_key);
+        const value = if (!relational_row and e.value_flags & backup_codec.doc_value_flag_compressed != 0) blk: {
+            try owned_keys.ensureUnusedCapacity(alloc, 1);
+            const decompressed = try backup_codec.decompressZstd(alloc, e.value);
+            owned_keys.appendAssumeCapacity(decompressed);
+            break :blk decompressed;
+        } else e.value;
         try writes.append(alloc, .{ .key = store_key, .value = value });
         if (e.timestamp_ns != 0) {
             const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, e.key);
@@ -2237,6 +3149,380 @@ fn freeAllocatedKVPairs(alloc: Allocator, pairs: *std.ArrayListUnmanaged(KVPair)
     pairs.deinit(alloc);
 }
 
+test "portable backup round trips relational rows and schema metadata" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:a");
+    defer alloc.free(row_key);
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"}},"required":["id","count"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const derived_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, derived_schema);
+    const packed_row = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"a\",\"count\":9007199254740993}", derived_schema);
+    defer alloc.free(packed_row);
+    const encoded_schema = try storage_schema.serializeSchema(alloc, derived_schema);
+    defer alloc.free(encoded_schema);
+    const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, "row:a");
+    defer alloc.free(timestamp_key);
+    var timestamp_value: [8]u8 = undefined;
+    std.mem.writeInt(u64, &timestamp_value, 1234, .little);
+    try src.putBatch(&.{
+        .{ .key = row_key, .value = packed_row },
+        .{ .key = timestamp_key, .value = &timestamp_value },
+        .{ .key = "\x00\x00__metadata__:schema", .value = encoded_schema },
+        .{ .key = "\x00\x00__metadata__:schema_v1", .value = encoded_schema },
+        .{ .key = "\x00\x00__metadata__:schema_json", .value = schema_json },
+    }, &.{});
+
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try exportPortable(alloc, &src, &portable);
+    try validatePortable(alloc, portable.items);
+
+    // The production file path stages encoded logical blocks on bounded disk,
+    // avoiding a second store scan while preserving byte-for-byte output.
+    const spool_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable.spool", .{tmp_src.sub_path});
+    defer alloc.free(spool_path);
+    var spool_io_impl = std.Io.Threaded.init(alloc, .{});
+    defer spool_io_impl.deinit();
+    const spool_io = spool_io_impl.io();
+    var spool_file = try std.Io.Dir.cwd().createFile(spool_io, spool_path, .{ .read = true, .truncate = true });
+    defer spool_file.close(spool_io);
+    var spooled: ArrayList(u8) = .empty;
+    defer spooled.deinit(alloc);
+    var spooled_writer = std.Io.Writer.Allocating.fromArrayList(alloc, &spooled);
+    defer spooled = spooled_writer.toArrayList();
+    try exportPortableToWriterWithOptions(alloc, &src, &spooled_writer.writer, .{
+        .spool = .{ .io = spool_io, .file = spool_file },
+    });
+    try std.testing.expectEqualSlices(u8, portable.items, spooled_writer.written());
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    const Progress = struct {
+        last: ?ImportProgress = null,
+
+        fn update(ctx: ?*anyopaque, progress: ImportProgress) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.last = progress;
+        }
+    };
+    var progress = Progress{};
+    try importPortableWithOptions(alloc, &dst, portable.items, .{
+        .unpublished_staging = true,
+        .schema_cache_bytes = 1,
+        .progress_context = &progress,
+        .progress_fn = Progress.update,
+    });
+    try std.testing.expect(progress.last != null);
+    try std.testing.expect(progress.last.?.blocks_processed > 0);
+    try std.testing.expectEqual(@as(u64, 1), progress.last.?.rows_validated);
+    try std.testing.expect(progress.last.?.payload_bytes_processed > 0);
+
+    const restored_row = try dst.get(alloc, row_key);
+    defer alloc.free(restored_row);
+    try std.testing.expectEqualSlices(u8, packed_row, restored_row);
+    try relational_store.validateValueForSchema(restored_row, derived_schema);
+    const restored_json = try relational_store.decodeValueForSchemaAlloc(alloc, restored_row, derived_schema);
+    defer alloc.free(restored_json);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"count\":9007199254740993}", restored_json);
+    const legacy_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+    defer alloc.free(legacy_key);
+    try std.testing.expectError(error.NotFound, dst.get(alloc, legacy_key));
+
+    var tmp_cancelled = std.testing.tmpDir(.{});
+    defer tmp_cancelled.cleanup();
+    var cancelled_dst = try openTestStore(alloc, &tmp_cancelled);
+    defer cancelled_dst.close();
+    var cancellation = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, importPortableWithOptions(alloc, &cancelled_dst, portable.items, .{
+        .unpublished_staging = true,
+        .cancellation = .fromAtomic(&cancellation),
+    }));
+    try std.testing.expectError(error.NotFound, cancelled_dst.get(alloc, row_key));
+
+    const restored_schema = try dst.get(alloc, "\x00\x00__metadata__:schema_json");
+    defer alloc.free(restored_schema);
+    try std.testing.expectEqualStrings(schema_json, restored_schema);
+    const restored_timestamp = try dst.get(alloc, timestamp_key);
+    defer alloc.free(restored_timestamp);
+    try std.testing.expectEqual(@as(u64, 1234), std.mem.readInt(u64, restored_timestamp[0..8], .little));
+}
+
+test "portable restore validates historical rows with their public schema epoch" {
+    const alloc = std.testing.allocator;
+    const schema_v1_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"note":{"type":"keyword"}},"required":["id","note"],"additionalProperties":false}}}}
+    ;
+    var parsed_v1 = try public_table_schema.parseValidatedTableSchema(alloc, schema_v1_json);
+    defer parsed_v1.deinit(alloc);
+    const runtime_v1 = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_v1);
+    defer storage_schema.freeSchema(alloc, runtime_v1);
+    var parsed_v2 = try public_table_schema.parseValidatedTableSchema(alloc, schema_v2_json);
+    defer parsed_v2.deinit(alloc);
+    const runtime_v2 = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_v2);
+    var runtime_v2_owned = true;
+    defer if (runtime_v2_owned) storage_schema.freeSchema(alloc, runtime_v2);
+
+    const packed_v1 = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"old\"}", runtime_v1);
+    defer alloc.free(packed_v1);
+    var archive: PortableArchiveValidation = .{
+        .format_version = 2,
+        .runtime_schema = runtime_v2,
+        .runtime_physical_layout = try relational_row_codec.PhysicalLayout.init(alloc, runtime_v2),
+        .active_public_validator = try public_table_schema.CompiledTableValidator.init(alloc, schema_v2_json),
+    };
+    runtime_v2_owned = false;
+    defer archive.deinit(alloc);
+    const encoded_v1 = try storage_schema.serializeSchema(alloc, runtime_v1);
+    defer alloc.free(encoded_v1);
+    try archive.layouts.put(alloc, 1, try archive.retainSchema(alloc, encoded_v1));
+
+    const entry = backup_codec.DocumentEntry{
+        .key = "row:old",
+        .value_flags = backup_codec.doc_value_flag_relational_row,
+        .value = packed_v1,
+        .timestamp_ns = 0,
+    };
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntryAgainstArchive(alloc, entry, &archive));
+    try archive.public_validators.put(alloc, 1, try archive.retainSchema(alloc, schema_v1_json));
+    try validatePortableDocumentEntryAgainstArchive(alloc, entry, &archive);
+}
+
+test "relational restore plans avoid scalar materialization and retain residual validation" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer"},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var validator = try public_table_schema.CompiledTableValidator.init(alloc, schema_json);
+    defer validator.deinit(alloc);
+    try std.testing.expect(!validator.restore.full_root);
+    try std.testing.expectEqual(@as(usize, 0), validator.restore.properties.len);
+    const runtime = try public_table_schema.deriveRuntimeTableSchema(alloc, validator.schema);
+    defer storage_schema.freeSchema(alloc, runtime);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, runtime);
+    defer layout.deinit();
+    const bytes = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"large scalar strings need no owned copy\",\"count\":7,\"active\":true}", runtime);
+    defer alloc.free(bytes);
+    try relational_store.validateCanonicalValueForSchemaAndLayout(alloc, bytes, runtime, &layout);
+    const row = try relational_row_codec.ordinalRowViewTrusted(bytes, runtime, &layout);
+    var no_allocations = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try validator.validateRelationalRestoreFields(no_allocations.allocator(), row);
+    try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
+
+    const residual_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"count":{"type":"integer","minimum":5},"active":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var residual = try public_table_schema.CompiledTableValidator.init(alloc, residual_json);
+    defer residual.deinit(alloc);
+    try std.testing.expect(!residual.restore.full_root);
+    try std.testing.expectEqualSlices(usize, &.{1}, residual.restore.properties);
+    try residual.validateRelationalRestoreFields(alloc, row);
+    const invalid = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"a\",\"count\":4}", runtime);
+    defer alloc.free(invalid);
+    try relational_store.validateCanonicalValueForSchemaAndLayout(alloc, invalid, runtime, &layout);
+    try std.testing.expectError(error.InvalidBatchRequest, residual.validateRelationalRestoreFields(alloc, try relational_row_codec.ordinalRowViewTrusted(invalid, runtime, &layout)));
+}
+
+test "relational restore plans retain root-sensitive validation" {
+    const alloc = std.testing.allocator;
+    const keywords = [_][]const u8{
+        "\"minProperties\":1",
+        "\"maxProperties\":1",
+        "\"propertyNames\":{\"pattern\":\"^[ab]$\"}",
+    };
+    for (keywords) |keyword| {
+        const json = try std.fmt.allocPrint(alloc,
+            \\{{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"a":{{"type":"string"}},"b":{{"type":"string"}}}},"additionalProperties":false,{s}}}}}}}}}
+        , .{keyword});
+        defer alloc.free(json);
+        var validator = try public_table_schema.CompiledTableValidator.init(alloc, json);
+        defer validator.deinit(alloc);
+        try std.testing.expect(validator.restore.full_root);
+    }
+}
+
+test "complete relational database image requires its public schema contract" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"keyword","enum":["active"]}},"required":["status"],"additionalProperties":false}}}}
+    ;
+    var parsed = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+    const encoded = try storage_schema.serializeSchema(alloc, runtime_schema);
+    defer alloc.free(encoded);
+    try store.put("\x00\x00__metadata__:schema", encoded);
+
+    try std.testing.expectError(error.InvalidBackupRequest, validateCompleteDatabaseImageAlloc(alloc, &store));
+    try store.put("\x00\x00__metadata__:schema_json", schema_json);
+    try validateCompleteDatabaseImageAlloc(alloc, &store);
+}
+
+test "complete database image rejects a public document schema without runtime schema" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}}}
+    ;
+    try store.put("\x00\x00__metadata__:schema_json", schema_json);
+    try std.testing.expectError(error.InvalidBackupRequest, validateCompleteDatabaseImageAlloc(alloc, &store));
+
+    var parsed = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+    const encoded = try storage_schema.serializeSchema(alloc, runtime_schema);
+    defer alloc.free(encoded);
+    try store.put("\x00\x00__metadata__:schema", encoded);
+    try validateCompleteDatabaseImageAlloc(alloc, &store);
+}
+
+test "portable archive validation rejects any public schema without its runtime companion" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}}}
+    ;
+    const public_validator = try public_table_schema.CompiledTableValidator.init(alloc, schema_json);
+    var validation: PortableArchiveValidation = .{
+        .format_version = 2,
+        .active_public_validator = public_validator,
+    };
+    defer validation.deinit(alloc);
+    try std.testing.expectError(error.InvalidBackupRequest, validation.finish(alloc));
+}
+
+test "portable backup rejects ambiguous or corrupt relational document entries" {
+    const alloc = std.testing.allocator;
+    const columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .string, .required = true },
+    };
+    const table_schema: storage_schema.TableSchema = .{
+        .version = 1,
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    const packed_row = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"a\"}", table_schema);
+    defer alloc.free(packed_row);
+
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntry(.{
+        .key = "row:a",
+        .value_flags = 0x80,
+        .value = packed_row,
+        .timestamp_ns = 0,
+    }));
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntry(.{
+        .key = "row:a",
+        .value_flags = backup_codec.doc_value_flag_compressed | backup_codec.doc_value_flag_relational_row,
+        .value = packed_row,
+        .timestamp_ns = 0,
+    }));
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntry(.{
+        .key = "row:a",
+        .value_flags = backup_codec.doc_value_flag_relational_row,
+        .value = "AROW-corrupt",
+        .timestamp_ns = 0,
+    }));
+}
+
+test "portable backup binds relational rows to archived runtime and public schemas" {
+    const alloc = std.testing.allocator;
+    const public_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","enum":["active"]}},"required":["id","status"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, public_schema);
+    defer parsed_schema.deinit(alloc);
+    const derived_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, derived_schema);
+    const runtime_schema = try storage_schema.serializeSchema(alloc, derived_schema);
+    defer alloc.free(runtime_schema);
+    const invalid_row = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"a\",\"status\":\"inactive\"}", derived_schema);
+    defer alloc.free(invalid_row);
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(alloc, &tmp);
+        defer store.close();
+        const row_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:a");
+        defer alloc.free(row_key);
+        const runtime_version_key = try storage_schema.schemaVersionKeyAlloc(alloc, derived_schema.version);
+        defer alloc.free(runtime_version_key);
+        const public_version_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, derived_schema.version);
+        defer alloc.free(public_version_key);
+        try store.putBatch(&.{
+            .{ .key = row_key, .value = invalid_row },
+            .{ .key = "\x00\x00__metadata__:schema", .value = runtime_schema },
+            .{ .key = runtime_version_key, .value = runtime_schema },
+            .{ .key = "\x00\x00__metadata__:schema_json", .value = public_schema },
+            .{ .key = public_version_key, .value = public_schema },
+        }, &.{});
+        var archive: ArrayList(u8) = .empty;
+        defer archive.deinit(alloc);
+        try exportPortable(alloc, &store, &archive);
+        try std.testing.expectError(error.InvalidBackupRequest, validatePortable(alloc, archive.items));
+    }
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(alloc, &tmp);
+        defer store.close();
+        const document_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+        defer alloc.free(document_key);
+        try store.putBatch(&.{
+            .{ .key = document_key, .value = "{\"id\":\"a\",\"status\":\"active\"}" },
+            .{ .key = "\x00\x00__metadata__:schema", .value = runtime_schema },
+            .{ .key = "\x00\x00__metadata__:schema_json", .value = public_schema },
+        }, &.{});
+        var archive: ArrayList(u8) = .empty;
+        defer archive.deinit(alloc);
+        try exportPortable(alloc, &store, &archive);
+        try std.testing.expectError(error.InvalidBackupRequest, validatePortable(alloc, archive.items));
+    }
+
+    var mismatched_schema = derived_schema;
+    mismatched_schema.version += 1;
+    const mismatched_runtime = try storage_schema.serializeSchema(alloc, mismatched_schema);
+    defer alloc.free(mismatched_runtime);
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try openTestStore(alloc, &tmp);
+        defer store.close();
+        try store.putBatch(&.{
+            .{ .key = "\x00\x00__metadata__:schema", .value = mismatched_runtime },
+            .{ .key = "\x00\x00__metadata__:schema_json", .value = public_schema },
+        }, &.{});
+        var archive: ArrayList(u8) = .empty;
+        defer archive.deinit(alloc);
+        try exportPortable(alloc, &store, &archive);
+        try std.testing.expectError(error.InvalidBackupRequest, validatePortable(alloc, archive.items));
+    }
+}
+
 const PortableBatchInspection = struct {
     alloc: Allocator,
     expected_type: backup_codec.BlockType,
@@ -2567,6 +3853,32 @@ test "file import restores production Go portable fixture" {
     }
 }
 
+test "file import reports a busy source without waiting for its writer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/locked.afb", .{tmp.sub_path});
+    defer alloc.free(archive_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var writer = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .read = true, .truncate = true });
+    defer writer.close(io);
+    try writer.writePositionalAll(io, "not-yet-complete", 0);
+    try writer.lock(io, .exclusive);
+    defer writer.unlock(io);
+
+    var reader = try std.Io.Dir.cwd().openFile(io, archive_path, .{});
+    defer reader.close(io);
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+    try std.testing.expectError(
+        error.WriterLocked,
+        importPortableFile(alloc, &store, io, reader, "not-yet-complete".len),
+    );
+}
+
 test "file import rejects oversized portable blocks before allocation" {
     const alloc = std.testing.allocator;
     var encoded: ArrayList(u8) = .empty;
@@ -2671,6 +3983,41 @@ test "import preflights logical block payloads before mutating destination" {
     defer alloc.free(store_key);
     try std.testing.expectError(error.Truncated, importPortable(alloc, &dst, portable.items));
     try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
+}
+
+test "import preflights durable catalogs before mutating destination" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "\x00\x00__metadata__:indexes", .value = "not-an-index-catalog" },
+        .{ .key = "\x00\x00__metadata__:enrichments", .value = "not-json" },
+        .{ .key = "\x00\x00__metadata__:resolvers", .value = "not-json" },
+    };
+    for (cases) |case| {
+        var tmp_src = std.testing.tmpDir(.{});
+        defer tmp_src.cleanup();
+        var src = try openTestStore(alloc, &tmp_src);
+        defer src.close();
+        const source_key = try internal_keys.documentKeyAlloc(alloc, "doc:must-not-publish");
+        defer alloc.free(source_key);
+        try src.putBatch(&.{
+            .{ .key = source_key, .value = "{\"title\":\"staged only\"}" },
+            .{ .key = case.key, .value = case.value },
+        }, &.{});
+
+        var portable: ArrayList(u8) = .empty;
+        defer portable.deinit(alloc);
+        try exportPortable(alloc, &src, &portable);
+
+        var tmp_dst = std.testing.tmpDir(.{});
+        defer tmp_dst.cleanup();
+        var dst = try openTestStore(alloc, &tmp_dst);
+        defer dst.close();
+        const store_key = try internal_keys.documentKeyAlloc(alloc, "doc:must-not-publish");
+        defer alloc.free(store_key);
+
+        try std.testing.expectError(error.InvalidMetadataBatch, importPortable(alloc, &dst, portable.items));
+        try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
+    }
 }
 
 test "export and import documents preserve timestamps" {
@@ -2802,11 +4149,22 @@ test "export and import preserves portable schema and catalog metadata" {
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
 
+    const public_schema = "{\"version\":1}";
+    var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, public_schema);
+    defer parsed_schema.deinit(alloc);
+    const derived_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, derived_schema);
+    const runtime_schema = try storage_schema.serializeSchema(alloc, derived_schema);
+    defer alloc.free(runtime_schema);
+    var empty_index_catalog: [12]u8 = undefined;
+    @memcpy(empty_index_catalog[0..4], "AIDX");
+    std.mem.writeInt(u32, empty_index_catalog[4..8], 2, .little);
+    std.mem.writeInt(u32, empty_index_catalog[8..12], 0, .little);
     const portable_entries = [_]KVPair{
-        .{ .key = "\x00\x00__metadata__:schema_json", .value = "{\"version\":1}" },
-        .{ .key = "\x00\x00__metadata__:schema", .value = "runtime-schema" },
-        .{ .key = "\x00\x00__metadata__:schema_v1", .value = "runtime-schema-v1" },
-        .{ .key = "\x00\x00__metadata__:indexes", .value = "[{\"name\":\"ft\",\"kind\":\"full_text\",\"config_json\":\"{}\"}]" },
+        .{ .key = "\x00\x00__metadata__:schema_json", .value = public_schema },
+        .{ .key = "\x00\x00__metadata__:schema", .value = runtime_schema },
+        .{ .key = "\x00\x00__metadata__:schema_v1", .value = runtime_schema },
+        .{ .key = "\x00\x00__metadata__:indexes", .value = &empty_index_catalog },
         .{ .key = "\x00\x00__metadata__:enrichments", .value = "[]" },
         .{ .key = "\x00\x00__metadata__:resolvers", .value = "[]" },
     };
