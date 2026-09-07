@@ -148,6 +148,30 @@ test "friendly alias refs parse as explicit model refs" {
     }
 }
 
+/// Pull accepts the public HuggingFace owner/model[:variant] syntax. Local
+/// command aliases must not silently select a different repository or bundle.
+fn parsePullModelRef(value: []const u8) !ModelRef {
+    const ref = try ModelRef.parse(value);
+    // This repository's main branch has no safetensors; retain the canonical
+    // pull repair without accepting a short-name alias.
+    if (std.ascii.eqlIgnoreCase(ref.owner, "BAAI") and
+        std.ascii.eqlIgnoreCase(ref.name, "bge-m3") and
+        std.mem.eql(u8, ref.variant, "auto"))
+        return ModelRef.parse(bge_m3_pinned_ref);
+    return ref;
+}
+
+test "pull uses canonical repository refs without short-name bundle aliases" {
+    const gguf = try parsePullModelRef("Qwen/Qwen3-Embedding-0.6B-GGUF");
+    try std.testing.expectEqualStrings("Qwen", gguf.owner);
+    try std.testing.expectEqualStrings("Qwen3-Embedding-0.6B-GGUF", gguf.name);
+    try std.testing.expectEqualStrings("auto", gguf.variant);
+    const safetensors = try parsePullModelRef("hf:Qwen/Qwen3-Embedding-0.6B:safetensors");
+    try std.testing.expectEqualStrings("safetensors", safetensors.variant);
+    try std.testing.expectError(error.InvalidModelRef, parsePullModelRef("qwen3-embedding-0.6b-safetensors"));
+    try std.testing.expectError(error.InvalidModelRef, parsePullModelRef("gemma4-e2b"));
+}
+
 fn parseModelRefOrAlias(value: []const u8) !ModelRef {
     return ModelRef.parse(resolveFriendlyRef(value) orelse value);
 }
@@ -494,8 +518,7 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
     ) !void {
-        const resolved_ref = resolveFriendlyRef(ref_str) orelse ref_str;
-        const ref = try ModelRef.parse(resolved_ref);
+        const ref = try parsePullModelRef(ref_str);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
 
@@ -2022,4 +2045,37 @@ test "resolveVariant retains legacy suffix resolution" {
     const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model-q4_0" });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
+}
+
+test "pull preserves the pinned Qwen3 BF16 executable profile through manifest finalization" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "staging" });
+    defer alloc.free(model_dir);
+    try download.beginManagedDownload(alloc, io, model_dir);
+    const config_path = try std.fs.path.join(alloc, &.{ model_dir, "model.safetensors" });
+    defer alloc.free(config_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = "payload" });
+    const plan_path = try std.fs.path.join(alloc, &.{ model_dir, download.managed_download_plan_filename });
+    defer alloc.free(plan_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = plan_path,
+        .data = "{\"version\":2,\"source\":{\"owner\":\"Qwen\",\"name\":\"Qwen3-Embedding-0.6B\",\"variant\":\"bf16-safetensors-bundle-v1\"},\"artifacts\":[{\"path\":\"model.safetensors\",\"size\":7}]}",
+    });
+    const manifest = qwen3_embedding_catalog.bundles[2].generated_model_manifest.?;
+    try download.writeManagedArtifactAndUpdatePlan(alloc, io, model_dir, "model_manifest.json", manifest);
+    var registry = ModelRegistry.init(alloc, model_dir);
+    try registry.writePulledModelManifest(io, model_dir, null, null);
+    var plan = try managed_receipt.loadValidatedPlan(alloc, io, model_dir);
+    defer plan.deinit();
+    const artifact = plan.find("model_manifest.json").?;
+    try std.testing.expectEqual(manifest.len, artifact.size);
+    try std.testing.expectEqualStrings(qwen3_embedding_catalog.gguf_bundle_model_manifest_sha256, artifact.sha256.?);
+    var loaded = try manifest_mod.loadFromManagedPlanDir(alloc, model_dir);
+    defer loaded.deinit();
+    try std.testing.expectEqual(manifest_mod.ModelType.embedder, loaded.model_type);
+    try std.testing.expect(loaded.embedding_profile.isResolved());
+    try std.testing.expectEqual(manifest_mod.PoolingStrategy.last, loaded.pooling);
 }

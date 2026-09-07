@@ -65,10 +65,11 @@ antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1   # GGUF F
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1  # safetensors
 ```
 
-The Q8_0 bundle is qualified on Metal, CUDA, and native CPU. The F16 GGUF is
-admitted on Metal, while the BF16 safetensors bundle is admitted on Metal and
-CUDA; each variant still requires its exact managed receipt and live artifact
-hashes.
+These pinned references reproduce the qualification fixtures. Normal pulls can
+use `Qwen/Qwen3-Embedding-0.6B-GGUF` or
+`Qwen/Qwen3-Embedding-0.6B:safetensors`. Serving validates the artifact and
+backend contract, without requiring a catalog identity or qualification receipt.
+See [model compatibility](../../MODEL_COMPATIBILITY.md).
 
 Then run the gate against the running server:
 
