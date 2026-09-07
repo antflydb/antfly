@@ -63666,6 +63666,10 @@ test "relational columnar narrow projections load only selected metadata on wide
 
 test "relational columnar coalescing progresses while a distant range stays hot" {
     const alloc = std.testing.allocator;
+    // This fixture assumes four 256-row bootstrap blocks and a fixed number
+    // of maintenance quanta; wall-clock scheduling must not change that shape.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
