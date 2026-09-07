@@ -12,6 +12,7 @@ const secrets = @import("../common/secrets.zig");
 const extensions = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
 const metadata_api = @import("../metadata/api.zig");
+const metadata_storage = @import("../metadata/storage/raft_apply_store.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const transition_state = @import("../metadata/transition_state.zig");
@@ -299,8 +300,10 @@ pub const Scenario = struct {
         };
 
         const CatalogService = struct {
+            allocator: std.mem.Allocator,
             package: extensions.PackageManifest = package_v1,
             proposals: usize = 0,
+            committed: ?metadata_storage.TransitionCommand = null,
             empty_tables: [0]metadata_table_manager.TableRecord = .{},
             empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
             empty_stores: [0]metadata_table_manager.StoreRecord = .{},
@@ -313,6 +316,10 @@ pub const Scenario = struct {
             }
 
             pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+                const delta = if (self.committed) |command| switch (command) {
+                    .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |value| value,
+                    else => return error.UnexpectedExtensionLifecycleCommand,
+                } else metadata_storage.ExtensionLifecycleDelta{};
                 return .{
                     .status = .{ .metadata_group_id = 1, .metrics = .{} },
                     .tables = self.empty_tables[0..],
@@ -320,6 +327,9 @@ pub const Scenario = struct {
                     .stores = self.empty_stores[0..],
                     .placement_intents = self.empty_placements[0..],
                     .extension_packages = self.packageSlice(),
+                    .installed_extensions = @constCast(delta.upsert_installed_extensions),
+                    .extension_members = @constCast(delta.upsert_extension_members),
+                    .extension_dependencies = @constCast(delta.upsert_extension_dependencies),
                     .split_transitions = self.empty_splits[0..],
                     .merge_transitions = self.empty_merges[0..],
                 };
@@ -328,24 +338,37 @@ pub const Scenario = struct {
             pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
             pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
-                _ = command;
+                // Retain the committed projection so the production lifecycle
+                // verifier can inspect it after proposal buffers are released.
+                const encoded = try metadata_storage.encodeTransitionCommand(self.allocator, command);
+                defer self.allocator.free(encoded);
+                const decoded = (try metadata_storage.decodeTransitionCommand(self.allocator, encoded)) orelse
+                    return error.UnexpectedExtensionLifecycleCommand;
+                if (self.committed) |*previous| previous.deinit(self.allocator);
+                self.committed = decoded;
                 self.proposals += 1;
+            }
+
+            fn deinit(self: *@This()) void {
+                if (self.committed) |*command| command.deinit(self.allocator);
             }
         };
 
         fn extensionLifecycle(self: *@This()) !void {
-            var service = CatalogService{};
-            var admin_installed = try extension_lifecycle.installOnServiceWithIo(&service, self.allocator, self.sim.io(), "memoryaf", .{
-                .version = "1.0.0",
-                .scope = .{ .kind = .cluster },
-            });
-            defer admin_installed.deinitOwned(self.allocator);
+            var service = CatalogService{ .allocator = self.allocator };
+            defer service.deinit();
             var dry_run = try extension_lifecycle.installOnServiceWithIo(&service, self.allocator, self.sim.io(), "memoryaf", .{
                 .version = "1.0.0",
                 .scope = .{ .kind = .cluster },
                 .dry_run = true,
             });
             defer dry_run.deinitOwned(self.allocator);
+            try std.testing.expectEqual(@as(usize, 0), service.proposals);
+            var admin_installed = try extension_lifecycle.installOnServiceWithIo(&service, self.allocator, self.sim.io(), "memoryaf", .{
+                .version = "1.0.0",
+                .scope = .{ .kind = .cluster },
+            });
+            defer admin_installed.deinitOwned(self.allocator);
 
             var catalog = extensions.ExtensionCatalog.init(self.allocator);
             defer catalog.deinit();
