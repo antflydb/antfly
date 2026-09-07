@@ -14,4 +14,5 @@
 
 test {
     _ = @import("storage/wal.zig");
+    _ = @import("storage/wal_vopr.zig");
 }

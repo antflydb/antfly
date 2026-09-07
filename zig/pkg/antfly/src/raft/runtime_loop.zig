@@ -114,10 +114,17 @@ pub const ManagedProgressDriver = struct {
     }
 
     pub fn check(self: *const ManagedProgressDriver) !void {
-        if (self.failed.load(.acquire))
-            return self.failure orelse error.RaftProgressDriverFailed;
+        try self.checkFailure();
         if (self.isStalled(platform_time.monotonicNs()))
             return error.RaftProgressDriverStalled;
+    }
+
+    /// Reports terminal source failures without applying the Raft-specific
+    /// round-duration watchdog. Control-plane users can legitimately spend
+    /// longer than that threshold waiting on bounded storage or HTTP work.
+    pub fn checkFailure(self: *const ManagedProgressDriver) !void {
+        if (self.failed.load(.acquire))
+            return self.failure orelse error.RaftProgressDriverFailed;
     }
 
     pub fn isHealthy(self: *const ManagedProgressDriver) bool {
@@ -512,6 +519,7 @@ test "managed raft progress driver publishes source failure" {
         try io_impl.io().sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectError(error.InjectedFailure, driver.check());
+    try std.testing.expectError(error.InjectedFailure, driver.checkFailure());
     try std.testing.expect(!driver.isHealthy());
     try std.testing.expectError(error.InjectedFailure, driver.waitForFailureOrTimeout(std.time.ns_per_s));
 }
@@ -531,6 +539,7 @@ test "managed raft progress driver reports a wedged round unhealthy" {
     driver.round_started_ns.store(platform_time.monotonicNs() -| (2 * std.time.ns_per_ms), .release);
     driver.round_generation.store(1, .release);
     try std.testing.expectError(error.RaftProgressDriverStalled, driver.check());
+    try driver.checkFailure();
     try std.testing.expect(!driver.isHealthy());
 }
 

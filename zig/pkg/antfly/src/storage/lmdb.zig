@@ -2903,6 +2903,28 @@ fn cleanupTmp(path: [*:0]const u8) void {
 
 const SimTests = lmdb_sim_test.namespace(@This());
 
+pub const VoprDifferentialAction = SimTests.DifferentialAction;
+pub const VoprScheduledAction = SimTests.ScheduledAction;
+pub const VoprSnapshotSummary = SimTests.SnapshotSummary;
+pub const VoprCrashOutcome = SimTests.CrashOutcome;
+pub const VoprCommitPhase = SimTests.CommitPhase;
+
+pub fn replayVoprDifferential(
+    allocator: std.mem.Allocator,
+    actions: []const VoprScheduledAction,
+) !VoprSnapshotSummary {
+    return SimTests.replayVoprDifferential(allocator, actions);
+}
+
+pub fn replayVoprCrash(
+    allocator: std.mem.Allocator,
+    prelude_actions: []const VoprDifferentialAction,
+    crash_action: VoprDifferentialAction,
+    phase: VoprCommitPhase,
+) !VoprCrashOutcome {
+    return SimTests.replayVoprCrash(allocator, prelude_actions, crash_action, phase);
+}
+
 test "LMDB replay fixtures stay green" {
     try SimTests.runReplayFixtures(std.testing.allocator);
 }

@@ -93,8 +93,41 @@ pub const internal = @import("internal/mod.zig");
 // Tracing (TLA+ trace validation)
 pub const tracing = @import("tracing/mod.zig");
 
+// Deterministic VOPR contracts, campaign policy, and replay artifacts.
+pub const vopr = @import("vopr");
+pub const domain_vopr = @import("vopr/domain_vopr.zig");
+pub const data_server_vopr = @import("vopr/data_server.zig");
+pub const admission_vopr = @import("vopr/admission.zig");
+pub const resource_pressure_vopr = @import("vopr/resource_pressure.zig");
+pub const object_store_vopr = @import("vopr/object_store.zig");
+pub const replication_backfill_vopr = @import("vopr/replication_backfill.zig");
+pub const supervision_vopr = @import("vopr/supervision.zig");
+pub const auth_lifecycle_vopr = @import("vopr/auth_lifecycle.zig");
+pub const serverless_workflow_vopr = @import("vopr/serverless_workflow.zig");
+pub const db_index_races_vopr = @import("vopr/db_index_races.zig");
+pub const provider_boundaries_vopr = @import("vopr/provider_boundaries.zig");
+pub const composed_query_vopr = @import("vopr/composed_query.zig");
+pub const query_embedding_cache_vopr = @import("vopr/query_embedding_cache.zig");
+pub const production_cluster_vopr = @import("vopr/production_cluster.zig");
+pub const full_cluster_vopr = @import("vopr/full_cluster.zig");
+pub const generation_reranking_vopr = @import("vopr/generation_reranking.zig");
+pub const distributed_query_vopr = @import("vopr/distributed_query.zig");
+pub const parquet_cache_vopr = @import("vopr/parquet_cache.zig");
+pub const provisioning_startup_vopr = @import("vopr/provisioning_startup.zig");
+pub const generation_lifecycle_vopr = @import("vopr/generation_lifecycle.zig");
+pub const backfill_marker_discovery_vopr = @import("vopr/backfill_marker_discovery.zig");
+pub const config_extension_lifecycle_vopr = @import("vopr/config_extension_lifecycle.zig");
+pub const vopr_determinism_audit = @import("vopr/determinism_audit.zig");
+pub const external_lake_vopr = @import("vopr/external_lake.zig");
+pub const media_runtime_vopr = @import("vopr/media_runtime.zig");
+pub const upgrade_compatibility_vopr = @import("vopr/upgrade_compatibility.zig");
+pub const request_lifecycle_vopr = @import("vopr/request_lifecycle.zig");
+pub const http_lifecycle_vopr = @import("vopr/http_lifecycle.zig");
+pub const http_disconnect_vopr = @import("vopr/http_disconnect.zig");
+
 // Raft integration
 pub const raft = @import("raft/mod.zig");
+pub const raft_vopr = @import("raft/vopr.zig");
 pub const admin = @import("admin/mod.zig");
 pub const extensions = @import("extensions/mod.zig");
 pub const public_api = @import("api/mod.zig");
@@ -151,12 +184,17 @@ pub const mem_backend = @import("storage/mem_backend.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const backend_conformance_test = @import("storage/backend_conformance_test.zig");
 pub const lsm_backend_sim_test = @import("storage/lsm_backend_sim_test.zig");
+pub const lsm_vopr = @import("storage/lsm_vopr.zig");
 pub const lmdb = @import("storage/lmdb.zig");
+pub const lmdb_vopr = @import("storage/lmdb_vopr.zig");
 pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const ha = @import("storage/ha/mod.zig");
+pub const ha_vopr = @import("storage/ha/vopr.zig");
 pub const wal = @import("storage/wal.zig");
+pub const wal_vopr = @import("storage/wal_vopr.zig");
 pub const persistent = @import("storage/persistent.zig");
+pub const persistent_vopr = @import("storage/persistent_vopr.zig");
 pub const docstore = @import("storage/docstore.zig");
 pub const resource_manager = @import("storage/resource_manager.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
@@ -169,8 +207,11 @@ pub const shard = @import("storage/shard.zig");
 pub const enrichment = @import("storage/enrichment.zig");
 pub const ttl = @import("storage/ttl.zig");
 pub const transactions = @import("storage/transactions.zig");
+pub const transaction_vopr = @import("storage/transaction_vopr.zig");
 pub const schema = @import("storage/schema.zig");
 pub const db = @import("storage/db/mod.zig");
+pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
+pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
     // Storage shard builds compile this authoritative discovery root and then
@@ -272,10 +313,12 @@ test {
 
     // Raft integration
     _ = raft;
+    _ = raft_vopr;
     _ = @import("raft/reconciler.zig");
     _ = extensions;
     _ = @import("extensions/lifecycle.zig");
     _ = metadata;
+    _ = vopr;
     _ = metadata_api;
     _ = metadata_admin;
     _ = metadata_http_routes;
@@ -310,11 +353,15 @@ test {
 
     // Storage
     _ = lmdb;
+    _ = lmdb_vopr;
     _ = lmdb_engine;
     _ = hbc;
     _ = ha;
+    _ = ha_vopr;
     _ = wal;
+    _ = wal_vopr;
     _ = persistent;
+    _ = persistent_vopr;
     _ = docstore;
     _ = backup_codec;
     _ = backup_bundle;
@@ -326,6 +373,35 @@ test {
     _ = enrichment;
     _ = ttl;
     _ = transactions;
+    _ = transaction_vopr;
+    _ = domain_vopr;
+    _ = data_server_vopr;
+    _ = admission_vopr;
+    _ = resource_pressure_vopr;
+    _ = object_store_vopr;
+    _ = replication_backfill_vopr;
+    _ = supervision_vopr;
+    _ = auth_lifecycle_vopr;
+    _ = serverless_workflow_vopr;
+    _ = db_index_races_vopr;
+    _ = provider_boundaries_vopr;
+    _ = composed_query_vopr;
+    _ = query_embedding_cache_vopr;
+    _ = full_cluster_vopr;
+    _ = generation_reranking_vopr;
+    _ = distributed_query_vopr;
+    _ = parquet_cache_vopr;
+    _ = provisioning_startup_vopr;
+    _ = generation_lifecycle_vopr;
+    _ = backfill_marker_discovery_vopr;
+    _ = config_extension_lifecycle_vopr;
+    _ = vopr_determinism_audit;
+    _ = external_lake_vopr;
+    _ = media_runtime_vopr;
+    _ = upgrade_compatibility_vopr;
+    _ = request_lifecycle_vopr;
+    _ = http_lifecycle_vopr;
+    _ = http_disconnect_vopr;
     _ = schema;
     _ = object_storage;
     _ = host_environment;
@@ -337,5 +413,8 @@ test {
     _ = storage_maintenance;
     _ = backend_conformance_test;
     _ = lsm_backend_sim_test;
+    _ = lsm_vopr;
     _ = db;
+    _ = index_manager_vopr;
+    _ = db_split_vopr;
 }

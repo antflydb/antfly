@@ -238,6 +238,7 @@ const RuntimeLeaseWatchdog = struct {
     const ObservationFailureStage = enum { fetch, validation };
 
     watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
+    io: std.Io,
     executor: lease_executor.LeaseExecutor,
     uri: []u8,
     token_path: []const u8,
@@ -316,6 +317,7 @@ const RuntimeLeaseWatchdog = struct {
                 .grace_ns = grace_ms * std.time.ns_per_ms,
                 .sentinel_path = sentinel_path,
             }, sentinel_generation, repaired_generation),
+            .io = io,
             .executor = executor,
             .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, api_endpoint.host, api_endpoint.port, namespace, lease_name),
             .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_token_path,
@@ -350,11 +352,9 @@ const RuntimeLeaseWatchdog = struct {
 
     fn recordRepairReceipt(ptr: *anyopaque, result: antfly.ha.rejoin.RewindResult) !void {
         const self: *RuntimeLeaseWatchdog = @ptrCast(@alignCast(ptr));
-        var io_impl = std.Io.Threaded.init(self.executor.alloc, .{});
-        defer io_impl.deinit();
         _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
             self.executor.alloc,
-            io_impl.io(),
+            self.io,
             self.watchdog.cfg.sentinel_path,
             self.stable_topology_id,
             self.node_id,
@@ -1683,7 +1683,12 @@ const LocalStandaloneMetadata = struct {
                 else => return err,
             };
             break :blk try self.alloc.dupe(u8, value);
-        } else readFileAlloc(self.alloc, self.catalog_path, 64 * 1024 * 1024) catch |err| switch (err) {
+        } else readFileAlloc(
+            self.alloc,
+            self.backend_runtime.io() orelse std.Options.debug_io,
+            self.catalog_path,
+            64 * 1024 * 1024,
+        ) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -1737,7 +1742,12 @@ const LocalStandaloneMetadata = struct {
             try txn.commit();
             try store.sync(true);
         } else {
-            try writeFileAtomically(self.alloc, self.catalog_path, encoded);
+            try writeFileAtomically(
+                self.alloc,
+                self.backend_runtime.io() orelse std.Options.debug_io,
+                self.catalog_path,
+                encoded,
+            );
         }
     }
 };
@@ -1849,24 +1859,27 @@ pub fn runFromIterator(
     defer termination_signals.deinit();
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
+    var setup_io = std.Io.Threaded.init(alloc, .{});
+    defer setup_io.deinit();
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
     if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
+        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
         secret_store_initialized = true;
     } else {
         const default_secret_store_path = try resolveDefaultSecretStorePathBeforeConfig(alloc, cli);
         defer alloc.free(default_secret_store_path);
-        secret_store = try antfly.common.secrets.FileStore.init(alloc, default_secret_store_path);
+        secret_store = try antfly.common.secrets.FileStore.initWithIo(alloc, setup_io.io(), default_secret_store_path);
         secret_store_initialized = true;
     }
 
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPathWithSecretsForDeployment(
+        try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(
             alloc,
+            setup_io.io(),
             config_path,
             &secret_store,
             .standalone,
@@ -1889,8 +1902,9 @@ pub fn runFromIterator(
     defer if (remote_content_runtime_initialized) remote_content_runtime.deinit();
     var remote_content_facade = antfly.common.config.Config.RemoteContentConfig{};
     const remote_content = if (cli.config_path) |config_path| blk: {
-        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
+        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.initWithIo(
             alloc,
+            setup_io.io(),
             config_path,
             &secret_store,
             .standalone,
@@ -1915,7 +1929,7 @@ pub fn runFromIterator(
 
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
-    if (storage_engine == .local) try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+    if (storage_engine == .local) try antfly.common.data_format.ensureCompatible(alloc, setup_io.io(), data_dir);
     // Validate and freeze the HA role before any startup helper can mutate a
     // primary-local sidecar that is not part of the continuous HA WAL.
     try validateHARole(cli);
@@ -1925,8 +1939,6 @@ pub fn runFromIterator(
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
 
-    var setup_io = std.Io.Threaded.init(alloc, .{});
-    defer setup_io.deinit();
     try ensureDirPath(setup_io.io(), resolved.replica_root_dir);
     try ensureParent(setup_io.io(), resolved.replica_catalog_path);
     try ensureParent(setup_io.io(), resolved.local_metadata_catalog_path);
@@ -2153,7 +2165,7 @@ pub fn runFromIterator(
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
-        init.io,
+        setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
     );
     defer active_audio_runtime.deinit();
@@ -2189,8 +2201,9 @@ pub fn runFromIterator(
         errdefer if (auth_runtime) |*runtime| runtime.deinit();
         auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
         auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
-        user_manager = try antfly.usermgr.UserManager.init(
+        user_manager = try antfly.usermgr.UserManager.initWithIo(
             alloc,
+            setup_io.io(),
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
@@ -3717,6 +3730,10 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
+fn readFileAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
+    return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
+}
+
 fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
     const deadline = deadline_ns orelse {
         lockAtomic(mutex);
@@ -3729,19 +3746,10 @@ fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
     }
 }
 
-fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
-}
-
-fn writeFileAtomically(alloc: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-standalone-metadata-{d}", .{ path, platform_time.monotonicNs() });
+fn writeFileAtomically(alloc: std.mem.Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    // Catalog mutations are serialized by LocalStandaloneMetadata.mutex.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-standalone-metadata", .{path});
     defer alloc.free(tmp_path);
-
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
 
     {
         var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
@@ -4266,6 +4274,7 @@ fn resolvePaths(
 
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
+    io: std.Io,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
     var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -4278,7 +4287,7 @@ fn initLayeredSecretStore(
         errdefer alloc.free(normalized_path);
         try normalized_paths.append(alloc, normalized_path);
     }
-    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
+    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, normalized_paths.items);
 }
 
 fn resolveExtensionPackageStoreDir(
@@ -4317,12 +4326,9 @@ fn resolveExtensionPackageStoreDirWithEnv(
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
     var probe = path;
     while (true) {
-        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(io_impl.io(), probe, alloc) catch |err| switch (err) {
+        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, probe, alloc) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -8525,7 +8531,7 @@ test "standalone metadata rejects corrupt catalog without double-freeing owned p
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/corrupt-catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
-    try writeFileAtomically(alloc, catalog_path, "{not-json");
+    try writeFileAtomically(alloc, std.Options.debug_io, catalog_path, "{not-json");
 
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();
@@ -8635,6 +8641,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
             .grace_ns = 10 * std.time.ns_per_s,
             .sentinel_path = "/tmp/lease-fenced",
         }, null, null),
+        .io = std.testing.io,
         .executor = undefined,
         .uri = undefined,
         .token_path = "",
@@ -8683,6 +8690,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
                 .grace_ns = 10 * std.time.ns_per_s,
                 .sentinel_path = "/tmp/lease-fenced",
             }, null, null),
+            .io = std.testing.io,
             .executor = undefined,
             .uri = undefined,
             .token_path = "",
@@ -8723,6 +8731,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
             .grace_ns = 10 * std.time.ns_per_s,
             .sentinel_path = "/tmp/lease-fenced",
         }, null, null),
+        .io = std.testing.io,
         .executor = undefined,
         .uri = undefined,
         .token_path = "",

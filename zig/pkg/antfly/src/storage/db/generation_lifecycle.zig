@@ -13,7 +13,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const background_runtime = @import("../background_runtime.zig");
 
 const Allocator = std.mem.Allocator;
-const publication_marker_name = ".antfly-generation-publication-v2";
+pub const publication_marker_name = ".antfly-generation-publication-v2";
 const publication_marker_tmp_name = ".antfly-generation-publication-v2.tmp";
 const max_publication_marker_bytes = 4096;
 const publication_lock_suffix = ".antfly-generation.lock";
@@ -458,7 +458,13 @@ const Manager = struct {
     }
 
     fn hasReaders(self: *Manager, path: []const u8) !bool {
-        const path_key = try canonicalPathAlloc(self.allocator, path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        return try self.hasReadersWithIo(path, io_impl.io());
+    }
+
+    fn hasReadersWithIo(self: *Manager, path: []const u8, io: std.Io) !bool {
+        const path_key = try canonicalPathAllocWithIo(self.allocator, io, path);
         defer self.allocator.free(path_key);
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -1101,6 +1107,19 @@ pub const StagedGeneration = struct {
         return outcome;
     }
 
+    /// Models loss of process memory after a crash without running rollback or
+    /// filesystem cleanup. The next opener must recover exclusively from the
+    /// durable marker and namespace. This is intentionally test-only.
+    pub fn abandonForCrashForTest(self: *StagedGeneration) void {
+        std.debug.assert(builtin.is_test);
+        if (self.closed) return;
+        self.alloc.free(self.staging_path);
+        self.alloc.free(self.staging_path_z);
+        self.alloc.free(self.live_path);
+        self.alloc.free(self.live_path_z);
+        self.closed = true;
+    }
+
     pub fn deinit(self: *StagedGeneration) void {
         if (self.closed) return;
         if (self.io) |io| return self.deinitWithIo(io);
@@ -1735,17 +1754,32 @@ pub fn acquirePublishedGenerationRead(alloc: Allocator, path: []const u8) !?Read
 }
 
 pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const u8, runtime: ?*background_runtime.BackendRuntime) !?ReadLease {
+    return try acquirePublishedGenerationReadWithRuntimeAndIo(alloc, path, runtime, null);
+}
+
+pub fn acquirePublishedGenerationReadWithIo(alloc: Allocator, path: []const u8, io: std.Io) !?ReadLease {
+    return try acquirePublishedGenerationReadWithRuntimeAndIo(alloc, path, null, io);
+}
+
+fn acquirePublishedGenerationReadWithRuntimeAndIo(
+    alloc: Allocator,
+    path: []const u8,
+    runtime: ?*background_runtime.BackendRuntime,
+    io_override: ?std.Io,
+) !?ReadLease {
     var fallback_io_impl: std.Io.Threaded = undefined;
     var fallback_io_owned = false;
     defer if (fallback_io_owned) fallback_io_impl.deinit();
     const io = if (runtime) |active|
-        active.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
+        active.filesystemIo() orelse io_override orelse return error.BackendRuntimeIoUnavailable
+    else if (io_override) |shared_io|
+        shared_io
     else blk: {
         fallback_io_impl = std.Io.Threaded.init(alloc, .{});
         fallback_io_owned = true;
         break :blk fallback_io_impl.io();
     };
-    const retained_io: ?std.Io = if (runtime != null) io else null;
+    const retained_io: ?std.Io = if (runtime != null or io_override != null) io else null;
     var reconciliation = reconcile: while (true) {
         if (try process_manager.beginReconciliationWithIo(path, io)) |value| break :reconcile value;
 
@@ -1876,6 +1910,10 @@ pub fn beginProcessExclusive(path: []const u8) !ExclusiveTransition {
     return try process_manager.beginExclusive(path);
 }
 
+pub fn beginProcessExclusiveWithIo(path: []const u8, io: std.Io) !ExclusiveTransition {
+    return try beginProcessExclusiveWithRuntimeAndIo(path, null, io);
+}
+
 pub fn beginProcessExclusiveWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !ExclusiveTransition {
     return try beginProcessExclusiveWithRuntimeAndIo(path, runtime, null);
 }
@@ -1899,6 +1937,10 @@ pub fn beginProcessPreparationWithRuntime(path: []const u8, runtime: ?*backgroun
     return try beginProcessPreparationWithRuntimeAndIo(path, runtime, null);
 }
 
+pub fn beginProcessPreparationWithIo(path: []const u8, io: std.Io) !PreparationTransition {
+    return try beginProcessPreparationWithRuntimeAndIo(path, null, io);
+}
+
 pub fn beginProcessPreparationWithRuntimeAndIo(
     path: []const u8,
     runtime: ?*background_runtime.BackendRuntime,
@@ -1914,6 +1956,10 @@ pub fn beginProcessPreparationWithRuntimeAndIo(
 
 pub fn hasPublishedGenerationRead(path: []const u8) !bool {
     return try process_manager.hasReaders(path);
+}
+
+pub fn hasPublishedGenerationReadWithIo(path: []const u8, io: std.Io) !bool {
+    return try process_manager.hasReadersWithIo(path, io);
 }
 
 test "generation lifecycle serializes the same root and validates capability target" {

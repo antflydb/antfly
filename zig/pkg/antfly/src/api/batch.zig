@@ -33,6 +33,10 @@ pub const OwnedBatchRequest = struct {
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
     split_transition_key: ?[]u8 = null,
+    merge_receiver_base_start: ?[]u8 = null,
+    merge_receiver_base_end: ?[]u8 = null,
+    merge_range_start: ?[]u8 = null,
+    merge_range_end: ?[]u8 = null,
     req: db_mod.types.BatchRequest = .{},
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
@@ -59,6 +63,10 @@ pub const OwnedBatchRequest = struct {
         if (self.split_checkpoint_range_start) |value| alloc.free(value);
         if (self.split_checkpoint_range_end) |value| alloc.free(value);
         if (self.split_transition_key) |value| alloc.free(value);
+        if (self.merge_receiver_base_start) |value| alloc.free(value);
+        if (self.merge_receiver_base_end) |value| alloc.free(value);
+        if (self.merge_range_start) |value| alloc.free(value);
+        if (self.merge_range_end) |value| alloc.free(value);
         self.* = undefined;
     }
 
@@ -250,6 +258,10 @@ fn parseBatchRequestWithOptions(
         const shard_id = try parseInternalU64(shard_value);
         const range_id = try parseInternalU64(range_value);
         const sequence = try parseInternalU64(sequence_value);
+        const previous_sequence = if (object.get("previous_sequence")) |previous_value|
+            try parseInternalU64(previous_value)
+        else
+            null;
         const bootstrap_sequence = if (object.get("bootstrap_sequence")) |bootstrap_value|
             try parseInternalU64(bootstrap_value)
         else
@@ -257,6 +269,10 @@ fn parseBatchRequestWithOptions(
         const operation = std.meta.stringToEnum(db_mod.types.SplitReplicationContext.Operation, operation_value.string) orelse
             return error.InvalidBatchRequest;
         if (transition_id == 0 or attempt_epoch == 0 or source_group_id == 0 or destination_group_id == 0 or table_id == 0 or shard_id == 0 or range_id == 0) return error.InvalidBatchRequest;
+        if (previous_sequence) |previous| {
+            if (operation != .delta or sequence == 0 or previous >= sequence)
+                return error.InvalidBatchRequest;
+        }
         break :replication .{
             .transition_id = transition_id,
             .attempt_epoch = attempt_epoch,
@@ -269,7 +285,33 @@ fn parseBatchRequestWithOptions(
             },
             .operation = operation,
             .sequence = sequence,
+            .previous_sequence = previous_sequence,
             .bootstrap_sequence = bootstrap_sequence,
+        };
+    };
+
+    const merge_replication: ?db_mod.types.MergeReplicationContext = replication: {
+        const value = root.get("_merge_replication") orelse break :replication null;
+        if (!allow_internal or value != .object) return error.InvalidBatchRequest;
+        const object = value.object;
+        const transition_id = try parseInternalU64(object.get("transition_id") orelse return error.InvalidBatchRequest);
+        const donor_group_id = try parseInternalU64(object.get("donor_group_id") orelse return error.InvalidBatchRequest);
+        const receiver_group_id = try parseInternalU64(object.get("receiver_group_id") orelse return error.InvalidBatchRequest);
+        const table_id = try parseInternalU64(object.get("namespace_table_id") orelse return error.InvalidBatchRequest);
+        const shard_id = try parseInternalU64(object.get("namespace_shard_id") orelse return error.InvalidBatchRequest);
+        const range_id = try parseInternalU64(object.get("namespace_range_id") orelse return error.InvalidBatchRequest);
+        if (transition_id == 0 or donor_group_id == 0 or receiver_group_id == 0 or
+            donor_group_id == receiver_group_id or table_id == 0 or shard_id == 0 or range_id == 0)
+            return error.InvalidBatchRequest;
+        break :replication .{
+            .transition_id = transition_id,
+            .donor_group_id = donor_group_id,
+            .receiver_group_id = receiver_group_id,
+            .identity_namespace = .{
+                .table_id = table_id,
+                .shard_id = shard_id,
+                .range_id = range_id,
+            },
         };
     };
 
@@ -302,6 +344,92 @@ fn parseBatchRequestWithOptions(
             .attempt_epoch = attempt_epoch,
             .destination_group_id = destination_group_id,
             .split_key = transition_key.?,
+        };
+    };
+
+    const merge_source_transition: ?db_mod.types.MergeSourceTransitionMutation = transition: {
+        const value = root.get("_merge_source_transition") orelse break :transition null;
+        if (!allow_internal or value != .object) return error.InvalidBatchRequest;
+        const object = value.object;
+        const kind_value = object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind_value != .string) return error.InvalidBatchRequest;
+        const kind = std.meta.stringToEnum(
+            db_mod.types.MergeSourceTransitionMutation.Kind,
+            kind_value.string,
+        ) orelse return error.InvalidBatchRequest;
+        const transition_id = try parseInternalU64(object.get("transition_id") orelse return error.InvalidBatchRequest);
+        const receiver_group_id = try parseInternalU64(object.get("receiver_group_id") orelse return error.InvalidBatchRequest);
+        if (transition_id == 0 or receiver_group_id == 0) return error.InvalidBatchRequest;
+        break :transition .{
+            .kind = kind,
+            .transition_id = transition_id,
+            .receiver_group_id = receiver_group_id,
+        };
+    };
+
+    var merge_receiver_base_start: ?[]u8 = null;
+    errdefer if (merge_receiver_base_start) |value| alloc.free(value);
+    var merge_receiver_base_end: ?[]u8 = null;
+    errdefer if (merge_receiver_base_end) |value| alloc.free(value);
+    var merge_range_start: ?[]u8 = null;
+    errdefer if (merge_range_start) |value| alloc.free(value);
+    var merge_range_end: ?[]u8 = null;
+    errdefer if (merge_range_end) |value| alloc.free(value);
+    const merge_checkpoint: ?db_mod.types.MergeReplicationCheckpoint = merge: {
+        const value = root.get("_merge_checkpoint") orelse break :merge null;
+        if (!allow_internal or value != .object) return error.InvalidBatchRequest;
+        const object = value.object;
+        const kind_value = object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind_value != .string) return error.InvalidBatchRequest;
+        const kind = std.meta.stringToEnum(
+            db_mod.types.MergeReplicationCheckpoint.Kind,
+            kind_value.string,
+        ) orelse return error.InvalidBatchRequest;
+        const transition_id = try parseInternalU64(object.get("transition_id") orelse return error.InvalidBatchRequest);
+        const donor_group_id = try parseInternalU64(object.get("donor_group_id") orelse return error.InvalidBatchRequest);
+        const receiver_group_id = try parseInternalU64(object.get("receiver_group_id") orelse return error.InvalidBatchRequest);
+        if (transition_id == 0 or donor_group_id == 0 or receiver_group_id == 0 or
+            donor_group_id == receiver_group_id)
+            return error.InvalidBatchRequest;
+        const base_start_value = object.get("receiver_base_start") orelse return error.InvalidBatchRequest;
+        const base_end_value = object.get("receiver_base_end") orelse return error.InvalidBatchRequest;
+        const merged_start_value = object.get("merged_start") orelse return error.InvalidBatchRequest;
+        const merged_end_value = object.get("merged_end") orelse return error.InvalidBatchRequest;
+        if (base_start_value != .string or base_end_value != .string or
+            merged_start_value != .string or merged_end_value != .string)
+            return error.InvalidBatchRequest;
+        merge_receiver_base_start = try alloc.dupe(u8, base_start_value.string);
+        merge_receiver_base_end = try alloc.dupe(u8, base_end_value.string);
+        merge_range_start = try alloc.dupe(u8, merged_start_value.string);
+        merge_range_end = try alloc.dupe(u8, merged_end_value.string);
+        const namespace: ?db_mod.DocIdentityNamespace = namespace: {
+            const table_value = object.get("namespace_table_id") orelse break :namespace null;
+            const shard_value = object.get("namespace_shard_id") orelse return error.InvalidBatchRequest;
+            const range_value = object.get("namespace_range_id") orelse return error.InvalidBatchRequest;
+            const table_id = try parseInternalU64(table_value);
+            const shard_id = try parseInternalU64(shard_value);
+            const range_id = try parseInternalU64(range_value);
+            if (table_id == 0 or shard_id == 0 or range_id == 0) return error.InvalidBatchRequest;
+            break :namespace .{ .table_id = table_id, .shard_id = shard_id, .range_id = range_id };
+        };
+        break :merge .{
+            .kind = kind,
+            .transition_id = transition_id,
+            .donor_group_id = donor_group_id,
+            .receiver_group_id = receiver_group_id,
+            .receiver_base_start = merge_receiver_base_start.?,
+            .receiver_base_end = merge_receiver_base_end.?,
+            .merged_start = merge_range_start.?,
+            .merged_end = merge_range_end.?,
+            .bootstrap_applied_index = if (object.get("bootstrap_applied_index")) |item|
+                try parseInternalU64(item)
+            else
+                0,
+            .allow_doc_identity_reassignment = if (object.get("allow_doc_identity_reassignment")) |item| switch (item) {
+                .bool => |flag| flag,
+                else => return error.InvalidBatchRequest,
+            } else false,
+            .receiver_identity_reassignment_namespace = namespace,
         };
     };
 
@@ -375,13 +503,17 @@ fn parseBatchRequestWithOptions(
         return error.InvalidBatchRequest;
     };
 
-    if (split_transition != null and
+    if ((split_transition != null or merge_source_transition != null) and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
-            predicates.len != 0 or split_checkpoint != null or split_replication != null or transaction != null))
+            predicates.len != 0 or split_checkpoint != null or split_replication != null or merge_replication != null or
+            split_transition != null and merge_source_transition != null or
+            merge_checkpoint != null or transaction != null))
     {
         return error.InvalidBatchRequest;
     }
-    if (transaction != null and (split_checkpoint != null or split_replication != null or split_transition != null)) {
+    if (transaction != null and (split_checkpoint != null or split_replication != null or merge_replication != null or
+        split_transition != null or merge_source_transition != null or merge_checkpoint != null))
+    {
         return error.InvalidBatchRequest;
     }
     if (predicates.len != 0 and transaction == null) return error.InvalidBatchRequest;
@@ -396,6 +528,26 @@ fn parseBatchRequestWithOptions(
     {
         return error.InvalidBatchRequest;
     }
+    if (merge_checkpoint) |checkpoint| {
+        if (split_checkpoint != null or split_replication != null or split_transition != null or
+            merge_source_transition != null or
+            transforms.len != 0 or predicates.len != 0 or writes.len != 0 or
+            (deletes.len != 0 and checkpoint.kind != .rollback))
+            return error.InvalidBatchRequest;
+    }
+    if (merge_replication != null and
+        (split_checkpoint != null or split_replication != null or split_transition != null or
+            merge_source_transition != null or transaction != null or
+            transforms.len != 0 or predicates.len != 0))
+    {
+        return error.InvalidBatchRequest;
+    }
+    if (merge_replication) |replication| if (merge_checkpoint) |checkpoint| {
+        if (replication.transition_id != checkpoint.transition_id or
+            replication.donor_group_id != checkpoint.donor_group_id or
+            replication.receiver_group_id != checkpoint.receiver_group_id)
+            return error.InvalidBatchRequest;
+    };
 
     return .{
         .writes = writes,
@@ -406,6 +558,10 @@ fn parseBatchRequestWithOptions(
         .split_checkpoint_range_start = checkpoint_start,
         .split_checkpoint_range_end = checkpoint_end,
         .split_transition_key = transition_key,
+        .merge_receiver_base_start = merge_receiver_base_start,
+        .merge_receiver_base_end = merge_receiver_base_end,
+        .merge_range_start = merge_range_start,
+        .merge_range_end = merge_range_end,
         .req = .{
             .writes = writes,
             .deletes = deletes,
@@ -415,7 +571,10 @@ fn parseBatchRequestWithOptions(
             .sync_level = sync_level,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
+            .merge_replication = merge_replication,
             .split_transition = split_transition,
+            .merge_source_transition = merge_source_transition,
+            .merge_checkpoint = merge_checkpoint,
             .transaction = transaction,
         },
     };
@@ -434,9 +593,11 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
     if (req.graph_writes.len > 0 or req.graph_deletes.len > 0 or (req.predicates.len > 0 and req.transaction == null)) {
         return error.UnsupportedBatchRequestEncoding;
     }
-    if (req.split_transition != null and
+    if ((req.split_transition != null or req.merge_source_transition != null) and
         (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
-            req.predicates.len != 0 or req.split_checkpoint != null or req.split_replication != null or req.transaction != null))
+            req.predicates.len != 0 or req.split_checkpoint != null or req.split_replication != null or req.merge_replication != null or
+            req.split_transition != null and req.merge_source_transition != null or
+            req.merge_checkpoint != null or req.transaction != null))
     {
         return error.InvalidBatchRequest;
     }
@@ -447,6 +608,28 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
     {
         return error.InvalidBatchRequest;
     }
+    if (req.merge_checkpoint) |checkpoint| {
+        if (req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_source_transition != null or
+            req.transforms.len != 0 or req.predicates.len != 0 or req.writes.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.transaction != null or
+            (req.deletes.len != 0 and checkpoint.kind != .rollback))
+            return error.InvalidBatchRequest;
+    }
+    if (req.merge_replication != null and
+        (req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_source_transition != null or req.transaction != null or
+            req.transforms.len != 0 or req.predicates.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0))
+    {
+        return error.InvalidBatchRequest;
+    }
+    if (req.merge_replication) |replication| if (req.merge_checkpoint) |checkpoint| {
+        if (replication.transition_id != checkpoint.transition_id or
+            replication.donor_group_id != checkpoint.donor_group_id or
+            replication.receiver_group_id != checkpoint.receiver_group_id)
+            return error.InvalidBatchRequest;
+    };
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -524,7 +707,20 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         if (replication.bootstrap_sequence) |sequence| {
             try writer.print(",\"bootstrap_sequence\":\"{d}\"", .{sequence});
         }
+        if (replication.previous_sequence) |sequence| {
+            try writer.print(",\"previous_sequence\":\"{d}\"", .{sequence});
+        }
         try writer.writeByte('}');
+    }
+    if (req.merge_replication) |replication| {
+        try writer.print(",\"_merge_replication\":{{\"transition_id\":\"{d}\",\"donor_group_id\":\"{d}\",\"receiver_group_id\":\"{d}\",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\"}}", .{
+            replication.transition_id,
+            replication.donor_group_id,
+            replication.receiver_group_id,
+            replication.identity_namespace.table_id,
+            replication.identity_namespace.shard_id,
+            replication.identity_namespace.range_id,
+        });
     }
     if (req.split_transition) |transition| {
         try writer.print(",\"_split_transition\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"destination_group_id\":\"{d}\",\"split_key\":{f}}}", .{
@@ -534,6 +730,35 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             transition.destination_group_id,
             std.json.fmt(transition.split_key, .{}),
         });
+    }
+    if (req.merge_source_transition) |transition| {
+        try writer.print(",\"_merge_source_transition\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"receiver_group_id\":\"{d}\"}}", .{
+            std.json.fmt(@tagName(transition.kind), .{}),
+            transition.transition_id,
+            transition.receiver_group_id,
+        });
+    }
+    if (req.merge_checkpoint) |checkpoint| {
+        try writer.print(",\"_merge_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"donor_group_id\":\"{d}\",\"receiver_group_id\":\"{d}\",\"receiver_base_start\":{f},\"receiver_base_end\":{f},\"merged_start\":{f},\"merged_end\":{f},\"bootstrap_applied_index\":\"{d}\",\"allow_doc_identity_reassignment\":{}", .{
+            std.json.fmt(@tagName(checkpoint.kind), .{}),
+            checkpoint.transition_id,
+            checkpoint.donor_group_id,
+            checkpoint.receiver_group_id,
+            std.json.fmt(checkpoint.receiver_base_start, .{}),
+            std.json.fmt(checkpoint.receiver_base_end, .{}),
+            std.json.fmt(checkpoint.merged_start, .{}),
+            std.json.fmt(checkpoint.merged_end, .{}),
+            checkpoint.bootstrap_applied_index,
+            checkpoint.allow_doc_identity_reassignment,
+        });
+        if (checkpoint.receiver_identity_reassignment_namespace) |namespace| {
+            try writer.print(",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\"", .{
+                namespace.table_id,
+                namespace.shard_id,
+                namespace.range_id,
+            });
+        }
+        try writer.writeByte('}');
     }
     if (req.transaction) |mutation| {
         try writer.writeAll(",\"_transaction\":{");
@@ -913,6 +1138,9 @@ test "internal batch split identity round trips the full u64 id space" {
                 .shard_id = max - 1,
                 .range_id = max - 2,
             },
+            .operation = .delta,
+            .sequence = max - 6,
+            .previous_sequence = max - 7,
         },
     });
     defer std.testing.allocator.free(encoded);
@@ -927,6 +1155,25 @@ test "internal batch split identity round trips the full u64 id space" {
     try std.testing.expectEqual(max, replication.identity_namespace.table_id);
     try std.testing.expectEqual(max - 1, replication.identity_namespace.shard_id);
     try std.testing.expectEqual(max - 2, replication.identity_namespace.range_id);
+    try std.testing.expectEqual(max - 6, replication.sequence);
+    try std.testing.expectEqual(max - 7, replication.previous_sequence.?);
+}
+
+test "internal batch parser rejects invalid split delta predecessor fences" {
+    const non_delta =
+        \\{"_split_replication":{"transition_id":1,"attempt_epoch":1,"source_group_id":2,"destination_group_id":3,"namespace_table_id":4,"namespace_shard_id":5,"namespace_range_id":6,"operation":"bootstrap","sequence":7,"previous_sequence":6}}
+    ;
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        parseInternalBatchRequest(std.testing.allocator, non_delta),
+    );
+    const non_monotonic =
+        \\{"_split_replication":{"transition_id":1,"attempt_epoch":1,"source_group_id":2,"destination_group_id":3,"namespace_table_id":4,"namespace_shard_id":5,"namespace_range_id":6,"operation":"delta","sequence":7,"previous_sequence":7}}
+    ;
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        parseInternalBatchRequest(std.testing.allocator, non_monotonic),
+    );
 }
 
 test "internal batch parser owns and round trips split transition" {

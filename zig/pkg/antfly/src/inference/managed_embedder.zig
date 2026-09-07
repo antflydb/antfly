@@ -6728,7 +6728,7 @@ pub fn testFileBackedApiKeyRotation() !void {
         .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"first-key\",\"created_at_ns\":1,\"updated_at_ns\":1}]}",
     });
 
-    var secret_store = try common_secrets.FileStore.init(alloc, store_path);
+    var secret_store = try common_secrets.FileStore.initWithIo(alloc, io_impl.io(), store_path);
     defer secret_store.deinit();
 
     var app = AuthCaptureApp{ .alloc = alloc };
@@ -6752,6 +6752,16 @@ pub fn testFileBackedApiKeyRotation() !void {
     defer managed.deinit();
     const first_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
 
+    const env_indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}","api_key":"${{env:OPENAI_API_KEY}}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(env_indexes_json);
+    var env_managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, env_indexes_json, .{
+        .secret_store = &secret_store,
+    });
+    defer env_managed.deinit();
+    const env_cache_key = try env_managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
+
     const first = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
     defer alloc.free(first);
     try app.expectHeader(0, "Bearer first-key");
@@ -6764,6 +6774,8 @@ pub fn testFileBackedApiKeyRotation() !void {
     _ = try secret_store.refreshIfChanged();
     const rotated_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
     try std.testing.expect(!std.mem.eql(u8, &first_cache_key, &rotated_cache_key));
+    const rotated_env_cache_key = try env_managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
+    try std.testing.expectEqualSlices(u8, &env_cache_key, &rotated_env_cache_key);
 
     const second = try managed.embedQuery(alloc, "semantic_idx", "beta concept");
     defer alloc.free(second);

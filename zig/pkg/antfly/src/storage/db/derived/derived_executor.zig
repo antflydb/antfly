@@ -23,16 +23,22 @@ const runtime_backend = @import("../../runtime_backend.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
+const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 
 pub const VisibilityWait = struct {
     cancellation: types.CancellationToken = .none,
     deadline_ns: ?u64 = null,
+    clock: ?platform_clock.Clock = null,
 
     pub fn check(self: @This()) !void {
         if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
         if (self.deadline_ns) |deadline_ns| {
-            if (platform_time.monotonicNs() >= deadline_ns) return error.EnrichmentWaitTimeout;
+            const now_ns = if (self.clock) |clock|
+                clock.nowRealtimeNs()
+            else
+                platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
         }
     }
 };

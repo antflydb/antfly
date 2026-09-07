@@ -38,35 +38,47 @@ pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
         return;
     }
 
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
-        try createAbsoluteDirPathPosix(path);
+    // Threaded's createDirPath verifies every existing component with lstat.
+    // That rejects otherwise valid absolute paths containing a directory
+    // symlink (notably /tmp on macOS). Resolve an existing target first, then
+    // create only missing ancestors. Every operation still uses the borrowed
+    // interface, which is essential for VoprIo directory-handle identity and
+    // fault injection.
+    try createAbsoluteDirPath(io, path);
+}
+
+fn createAbsoluteDirPath(io: std.Io, path: []const u8) anyerror!void {
+    if (std.Io.Dir.openDirAbsolute(io, path, .{})) |dir_value| {
+        var dir = dir_value;
+        dir.close(io);
         return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
     }
 
-    var idx: usize = 1;
-    while (idx < path.len) : (idx += 1) {
-        if (path[idx] != std.fs.path.sep) continue;
-        if (idx == 1) continue;
-        try createDirAbsolutePortable(path[0..idx]);
-    }
-    try createDirAbsolutePortable(path);
+    const parent = std.fs.path.dirname(path) orelse return error.BadPathName;
+    if (!std.mem.eql(u8, parent, path)) try createAbsoluteDirPath(io, parent);
+    std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+            dir.close(io);
+        },
+        else => return err,
+    };
 }
 
 pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
-    const base_name = std.fs.path.basename(path);
-    if (!std.fs.path.isAbsolute(path)) {
-        if (std.fs.path.dirname(path)) |parent_path| {
-            var parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{});
-            defer parent.close(io);
-            return try parent.createFile(io, base_name, flags);
-        }
-        return try std.Io.Dir.cwd().createFile(io, base_name, flags);
-    }
-
-    return try createAbsoluteFilePortable(io, path, flags);
+    // `Dir.createFile` likewise accepts both path forms and dispatches through
+    // std.Io, preserving virtual filesystem identity and fault injection.
+    return try std.Io.Dir.cwd().createFile(io, path, flags);
 }
 
-pub fn syncDirPortable(io: anytype, path: []const u8) !void {
+/// The explicit `anyerror` return keeps the cross-platform durability error in
+/// the public contract even when the current target's comptime OS branch can
+/// prove that it will not be produced. Callers must be able to handle artifacts
+/// created for a different deployment target without target-specific catches.
+pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
@@ -75,7 +87,7 @@ pub fn syncDirPortable(io: anytype, path: []const u8) !void {
     else
         try std.Io.Dir.cwd().openDir(io, if (path.len == 0) "." else path, .{ .iterate = true });
     defer dir.close(io);
-    try syncDirectoryFdPortable(dir.handle);
+    try syncDirectoryWithIo(io, dir);
 }
 
 pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
@@ -113,7 +125,7 @@ pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
 /// and `Dir.cwd()` is represented by `AT_FDCWD`; neither may be passed directly
 /// to `fsync`. Reopening `.` through the held directory keeps resolution bound
 /// to the same directory while obtaining a sync-capable descriptor.
-pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) !void {
+pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) anyerror!void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
@@ -122,7 +134,18 @@ pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) !void {
         .follow_symlinks = false,
     });
     defer sync_dir.close(io);
-    try syncDirectoryFdPortable(sync_dir.handle);
+    try syncDirectoryWithIo(io, sync_dir);
+}
+
+fn syncDirectoryWithIo(io: anytype, dir: std.Io.Dir) !void {
+    // std.Io exposes sync on File rather than Dir. Directory and file handles
+    // share the same backend handle type, so this remains a normal vtable call
+    // for both Threaded and VoprIo runtimes.
+    const file = std.Io.File{
+        .handle = dir.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    try file.sync(io);
 }
 
 pub fn syncFilePortable(io: anytype, path: []const u8) !void {

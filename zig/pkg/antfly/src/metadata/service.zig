@@ -3422,7 +3422,7 @@ fn cloneProjectedReplicationSourceStatusesOwned(
     return out;
 }
 
-fn replicationCutoverIntentApplied(
+pub fn replicationCutoverIntentApplied(
     record: metadata_table_manager.ReplicationSourceStatusRecord,
     expected: metadata_table_manager.ReplicationSourceStatusRecord,
 ) bool {
@@ -3460,7 +3460,7 @@ fn replicationCutoverIntentApplied(
         );
 }
 
-fn replicationCutoverAuthorityMatches(
+pub fn replicationCutoverAuthorityMatches(
     record: metadata_table_manager.ReplicationSourceStatusRecord,
     expected: metadata_table_manager.ReplicationSourceStatusRecord,
 ) bool {
@@ -3484,7 +3484,7 @@ fn replicationCutoverAuthorityMatches(
         std.mem.eql(u8, record.publication_name, expected.publication_name);
 }
 
-fn replicationCutoverRetirementMatches(
+pub fn replicationCutoverRetirementMatches(
     record: metadata_table_manager.ReplicationSourceStatusRecord,
     expected: metadata_table_manager.ReplicationSourceStatusRecord,
 ) bool {
@@ -3942,7 +3942,7 @@ pub const MetadataService = struct {
                 self.lockRuntime();
                 {
                     defer self.unlockRuntime();
-                    self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
+                    self.raft.requestReadIndex(self.metadata_group_id, request_ctx) catch |err| switch (err) {
                         error.NotLeader => {},
                         else => return err,
                     };
@@ -5067,14 +5067,36 @@ pub const MetadataService = struct {
     }
 
     pub fn runRound(self: *MetadataService) !void {
+        try self.runRoundInternal(true);
+    }
+
+    /// Advances only metadata Raft. Embedded runtimes use the same dedicated
+    /// ticker boundary as the production HTTP metadata service so projection
+    /// and storage work cannot starve consensus progress.
+    pub fn runRaftRoundOnly(self: *MetadataService) !void {
+        try self.ensureLifecycleListenerRegistered();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        try self.raft.runRaftRoundOnly();
+    }
+
+    /// Runs projection and reconciliation without advancing Raft. Callers
+    /// must concurrently drive `runRaftRoundOnly` at the configured cadence.
+    pub fn runControlRoundOnly(self: *MetadataService) !void {
+        try self.runRoundInternal(false);
+    }
+
+    fn runRoundInternal(self: *MetadataService, advance_raft: bool) !void {
         self.control_round_mutex.lockUncancelable(std.Options.debug_io);
         defer self.control_round_mutex.unlock(std.Options.debug_io);
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
-        self.lockRuntime();
-        {
-            defer self.unlockRuntime();
-            try self.raft.runRaftRoundOnly();
+        if (advance_raft) {
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                try self.raft.runRaftRoundOnly();
+            }
         }
         if (!try self.ensureMetadataIncarnation()) return;
         if (!self.observe_local_replica_root) return;
@@ -5911,18 +5933,22 @@ pub const MetadataService = struct {
                 .tables = tables,
                 .ranges = ranges,
             });
-        } else try metadata_table_provisioner.reconcileReplicaRootWithOptions(
-            self.alloc,
-            replica_root_dir,
-            self.metadata_group_id,
-            group_ids,
-            tables,
-            ranges,
-            .{
-                .backend_runtime = try self.ensureBackendRuntime(),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        );
+        } else owner: {
+            const backend_runtime = try self.ensureBackendRuntime();
+            break :owner try metadata_table_provisioner.reconcileReplicaRootWithOptions(
+                self.alloc,
+                replica_root_dir,
+                self.metadata_group_id,
+                group_ids,
+                tables,
+                ranges,
+                .{
+                    .io = backend_runtime.io() orelse std.Options.debug_io,
+                    .backend_runtime = backend_runtime,
+                    .destination_authorizer = self.destination_authorizer,
+                },
+            );
+        };
         try self.refreshLocalRestoreProgress(group_ids, tables, ranges);
         if (summary.indexes_pending != 0) return summary;
         self.local_table_provisioning_fingerprint = fingerprint;
@@ -6045,8 +6071,9 @@ pub const MetadataService = struct {
         self.store_status_ticks += 1;
         self.store_status_backfill_probe_ticks += 1;
         const replica_root_dir = self.replica_root_dir orelse return &.{};
-        try maybeRefreshStoreStatusBackfillMarkerCache(
+        try maybeRefreshStoreStatusBackfillMarkerCacheWithIo(
             self.alloc,
+            try backendIoForService(self),
             replica_root_dir,
             self.store_status_ticks,
             &self.store_status_backfill_probe_ticks,
@@ -6058,8 +6085,9 @@ pub const MetadataService = struct {
     fn refreshStoreStatusBackfillMarkersForLifecycleRound(self: *MetadataService) ![]const StoreStatusBackfillMarker {
         const replica_root_dir = self.replica_root_dir orelse return &.{};
         if (self.store_status_backfill_marker_cache.markers.len == 0 and self.store_status_backfill_marker_cache.scanned_at_ms == 0) {
-            try refreshStoreStatusBackfillMarkerCacheNow(
+            try refreshStoreStatusBackfillMarkerCacheNowWithIo(
                 self.alloc,
+                try backendIoForService(self),
                 replica_root_dir,
                 &self.store_status_backfill_probe_ticks,
                 &self.store_status_backfill_marker_cache,
@@ -6068,8 +6096,9 @@ pub const MetadataService = struct {
         }
 
         self.store_status_backfill_probe_ticks += 1;
-        try maybeRefreshStoreStatusBackfillMarkerCache(
+        try maybeRefreshStoreStatusBackfillMarkerCacheWithIo(
             self.alloc,
+            try backendIoForService(self),
             replica_root_dir,
             0,
             &self.store_status_backfill_probe_ticks,
@@ -6185,6 +6214,7 @@ pub const MetadataService = struct {
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
+                .io = runtime.io() orelse std.Options.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
@@ -8437,7 +8467,7 @@ pub const MetadataHttpService = struct {
         snapshot.queued_updates = self.raft.metrics.queued_updates;
         snapshot.applied_updates = self.raft.metrics.applied_updates;
         snapshot.sync_rounds = self.raft.metrics.sync_rounds;
-        snapshot.read_lease_requests = self.raft.metrics.read_lease_requests;
+        snapshot.read_index_requests = self.raft.metrics.read_index_requests;
         self.unlockRuntime();
 
         self.transition_metrics_mutex.lockUncancelable(std.Options.debug_io);
@@ -8638,7 +8668,7 @@ pub const MetadataHttpService = struct {
                 {
                     defer self.unlockRuntime();
                     request_attempts += 1;
-                    self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
+                    self.raft.requestReadIndex(self.metadata_group_id, request_ctx) catch |err| switch (err) {
                         // A follower may not know the leader yet during elections,
                         // restarts, or after endpoint-level load balancing. Keep
                         // driving raft below and retry the same read context until
@@ -9861,18 +9891,22 @@ pub const MetadataHttpService = struct {
                 .tables = inputs.tables,
                 .ranges = inputs.ranges,
             });
-        } else try metadata_table_provisioner.reconcileReplicaRootWithOptions(
-            self.alloc,
-            replica_root_dir,
-            self.metadata_group_id,
-            group_ids,
-            inputs.tables,
-            inputs.ranges,
-            .{
-                .backend_runtime = try self.ensureBackendRuntime(),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        );
+        } else owner: {
+            const backend_runtime = try self.ensureBackendRuntime();
+            break :owner try metadata_table_provisioner.reconcileReplicaRootWithOptions(
+                self.alloc,
+                replica_root_dir,
+                self.metadata_group_id,
+                group_ids,
+                inputs.tables,
+                inputs.ranges,
+                .{
+                    .io = backend_runtime.io() orelse std.Options.debug_io,
+                    .backend_runtime = backend_runtime,
+                    .destination_authorizer = self.destination_authorizer,
+                },
+            );
+        };
         try self.refreshLocalRestoreProgress(group_ids, inputs.tables, inputs.ranges, inputs.restore_progresses);
         if (summary.indexes_pending != 0) return summary;
         self.local_table_provisioning_fingerprint = fingerprint;
@@ -9995,8 +10029,9 @@ pub const MetadataHttpService = struct {
         self.store_status_ticks += 1;
         self.store_status_backfill_probe_ticks += 1;
         const replica_root_dir = self.replica_root_dir orelse return &.{};
-        try maybeRefreshStoreStatusBackfillMarkerCache(
+        try maybeRefreshStoreStatusBackfillMarkerCacheWithIo(
             self.alloc,
+            try backendIoForService(self),
             replica_root_dir,
             self.store_status_ticks,
             &self.store_status_backfill_probe_ticks,
@@ -10008,8 +10043,9 @@ pub const MetadataHttpService = struct {
     fn refreshStoreStatusBackfillMarkersForLifecycleRound(self: *MetadataHttpService) ![]const StoreStatusBackfillMarker {
         const replica_root_dir = self.replica_root_dir orelse return &.{};
         if (self.store_status_backfill_marker_cache.markers.len == 0 and self.store_status_backfill_marker_cache.scanned_at_ms == 0) {
-            try refreshStoreStatusBackfillMarkerCacheNow(
+            try refreshStoreStatusBackfillMarkerCacheNowWithIo(
                 self.alloc,
+                try backendIoForService(self),
                 replica_root_dir,
                 &self.store_status_backfill_probe_ticks,
                 &self.store_status_backfill_marker_cache,
@@ -10018,8 +10054,9 @@ pub const MetadataHttpService = struct {
         }
 
         self.store_status_backfill_probe_ticks += 1;
-        try maybeRefreshStoreStatusBackfillMarkerCache(
+        try maybeRefreshStoreStatusBackfillMarkerCacheWithIo(
             self.alloc,
+            try backendIoForService(self),
             replica_root_dir,
             0,
             &self.store_status_backfill_probe_ticks,
@@ -10162,6 +10199,7 @@ pub const MetadataHttpService = struct {
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
+                .io = runtime.io() orelse std.Options.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
                 .secret_store = self.secret_store,
@@ -11340,7 +11378,7 @@ test "metadata cdc provider quantum is bounded by observed lease remainder" {
 fn cdcWorkPermit(service: anytype) metadata_replication_backfill.WorkPermit {
     const Service = @TypeOf(service.*);
     const Callbacks = struct {
-        fn checkpoint(ptr: *anyopaque) !void {
+        fn checkpoint(ptr: *anyopaque, _: metadata_replication_backfill.WorkKind) !void {
             const typed: *Service = @ptrCast(@alignCast(ptr));
             try ensureCdcWorkPermit(typed);
         }
@@ -11762,9 +11800,14 @@ fn syncLocalStoreStatus(
 ) !void {
     var admin_snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&admin_snapshot);
+    const backend_runtime = try service.ensureBackendRuntime();
+    const status_io = backend_runtime.io() orelse if (builtin.is_test)
+        std.testing.io
+    else
+        return error.BackendIoUnavailable;
     var owned_backfill_markers: ?[]const StoreStatusBackfillMarker = null;
     const backfill_markers = scanned_backfill_markers orelse blk: {
-        owned_backfill_markers = try collectStoreStatusBackfillMarkers(service.alloc, replica_root_dir);
+        owned_backfill_markers = try collectStoreStatusBackfillMarkersWithIo(service.alloc, status_io, replica_root_dir);
         break :blk owned_backfill_markers.?;
     };
     defer if (owned_backfill_markers) |markers| freeStoreStatusBackfillMarkers(service.alloc, markers);
@@ -11776,12 +11819,6 @@ fn syncLocalStoreStatus(
     const merge_transitions = admin_snapshot.merge_transitions;
     const split_observations = admin_snapshot.split_observations;
     const merge_observations = admin_snapshot.merge_observations;
-    const backend_runtime = try service.ensureBackendRuntime();
-    const status_io = backend_runtime.io() orelse if (builtin.is_test)
-        std.testing.io
-    else
-        return error.BackendIoUnavailable;
-
     var local_stores = std.ArrayListUnmanaged(metadata_table_manager.StoreRecord).empty;
     defer local_stores.deinit(service.alloc);
     for (stores) |store| {
@@ -11820,7 +11857,7 @@ fn syncLocalStoreStatus(
         );
         defer freeOwnedStoreStatusReport(service.alloc, report);
         try service.reportStoreStatus(report);
-        try maybeRequestStoreStatusBackfillMarkerRescan(service, replica_root_dir, scanned_backfill_markers, backfill_markers);
+        try maybeRequestStoreStatusBackfillMarkerRescan(service, status_io, replica_root_dir, scanned_backfill_markers, backfill_markers);
         return;
     }
 
@@ -11837,7 +11874,7 @@ fn syncLocalStoreStatus(
     defer freeOwnedStoreStatusReports(service.alloc, reports);
     if (reports.len > 0) {
         _ = try reportStoreStatusesWithProjected(service, stores, reports);
-        try maybeRequestStoreStatusBackfillMarkerRescan(service, replica_root_dir, scanned_backfill_markers, backfill_markers);
+        try maybeRequestStoreStatusBackfillMarkerRescan(service, status_io, replica_root_dir, scanned_backfill_markers, backfill_markers);
         return;
     }
 
@@ -11856,11 +11893,11 @@ fn syncLocalStoreStatus(
     );
     defer freeOwnedStoreStatusReports(service.alloc, shared_reports);
     if (shared_reports.len == 0) {
-        try maybeRequestStoreStatusBackfillMarkerRescan(service, replica_root_dir, scanned_backfill_markers, backfill_markers);
+        try maybeRequestStoreStatusBackfillMarkerRescan(service, status_io, replica_root_dir, scanned_backfill_markers, backfill_markers);
         return;
     }
     _ = try reportStoreStatusesWithProjected(service, stores, shared_reports);
-    try maybeRequestStoreStatusBackfillMarkerRescan(service, replica_root_dir, scanned_backfill_markers, backfill_markers);
+    try maybeRequestStoreStatusBackfillMarkerRescan(service, status_io, replica_root_dir, scanned_backfill_markers, backfill_markers);
 }
 
 fn reportStoreStatusesWithProjected(
@@ -12748,14 +12785,21 @@ fn openDirPath(io: anytype, path: []const u8, iterate: bool) !std.Io.Dir {
         try std.Io.Dir.cwd().openDir(io, path, opts);
 }
 
-const StoreStatusBackfillMarker = struct {
+fn backendIoForService(service: anytype) !std.Io {
+    return (try service.ensureBackendRuntime()).io() orelse if (builtin.is_test)
+        std.testing.io
+    else
+        error.BackendIoUnavailable;
+}
+
+pub const StoreStatusBackfillMarker = struct {
     store_id: ?u64,
     group_id: u64,
     path: []const u8,
     owner_generation: ?u64 = null,
     state: State = .absent,
 
-    const State = union(enum) {
+    pub const State = union(enum) {
         absent,
         legacy,
         corrupt,
@@ -12770,12 +12814,12 @@ const StoreStatusBackfillMarker = struct {
     };
 };
 
-const StoreStatusBackfillMarkerCache = struct {
+pub const StoreStatusBackfillMarkerCache = struct {
     markers: []StoreStatusBackfillMarker = &.{},
     scanned_at_ms: u64 = 0,
     rescan_requested: bool = false,
 
-    fn deinit(self: *StoreStatusBackfillMarkerCache, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *StoreStatusBackfillMarkerCache, alloc: std.mem.Allocator) void {
         freeStoreStatusBackfillMarkers(alloc, self.markers);
         self.* = .{};
     }
@@ -12795,7 +12839,25 @@ fn maybeRefreshStoreStatusBackfillMarkerCache(
     probe_ticks: *usize,
     cache: *StoreStatusBackfillMarkerCache,
 ) !void {
-    const now_ms = monotonicMs();
+    return maybeRefreshStoreStatusBackfillMarkerCacheWithIo(
+        alloc,
+        std.Options.debug_io,
+        replica_root_dir,
+        store_status_ticks,
+        probe_ticks,
+        cache,
+    );
+}
+
+pub fn maybeRefreshStoreStatusBackfillMarkerCacheWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    store_status_ticks: usize,
+    probe_ticks: *usize,
+    cache: *StoreStatusBackfillMarkerCache,
+) !void {
+    const now_ms = monotonicMsWithIo(io);
     const should_rescan = if (cache.markers.len > 0)
         cache.rescan_requested or now_ms -| cache.scanned_at_ms >= store_status_backfill_rescan_interval_ms
     else
@@ -12805,7 +12867,7 @@ fn maybeRefreshStoreStatusBackfillMarkerCache(
                 now_ms -| cache.scanned_at_ms >= store_status_backfill_empty_rescan_interval_ms);
     if (!should_rescan) return;
 
-    const markers = try collectStoreStatusBackfillMarkers(alloc, replica_root_dir);
+    const markers = try collectStoreStatusBackfillMarkersWithIo(alloc, io, replica_root_dir);
     const markers_missing_state = storeStatusBackfillMarkersHaveMissingState(markers);
     cache.replace(alloc, markers, now_ms);
     cache.rescan_requested = markers_missing_state;
@@ -12818,18 +12880,44 @@ fn refreshStoreStatusBackfillMarkerCacheNow(
     probe_ticks: *usize,
     cache: *StoreStatusBackfillMarkerCache,
 ) !void {
-    const markers = try collectStoreStatusBackfillMarkers(alloc, replica_root_dir);
+    return refreshStoreStatusBackfillMarkerCacheNowWithIo(
+        alloc,
+        std.Options.debug_io,
+        replica_root_dir,
+        probe_ticks,
+        cache,
+    );
+}
+
+pub fn refreshStoreStatusBackfillMarkerCacheNowWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    probe_ticks: *usize,
+    cache: *StoreStatusBackfillMarkerCache,
+) !void {
+    const markers = try collectStoreStatusBackfillMarkersWithIo(alloc, io, replica_root_dir);
     const markers_missing_state = storeStatusBackfillMarkersHaveMissingState(markers);
-    cache.replace(alloc, markers, monotonicMs());
+    cache.replace(alloc, markers, monotonicMsWithIo(io));
     cache.rescan_requested = markers_missing_state;
     probe_ticks.* = 0;
 }
 
 fn monotonicMs() u64 {
-    return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    // Cache timestamps are compared with the borrowed I/O clock. Keep test
+    // fixtures in that same clock domain too: on platforms where `.awake`
+    // includes suspend time, POSIX CLOCK_MONOTONIC can otherwise make a fresh
+    // cache entry appear immediately expired after the machine has slept.
+    return monotonicMsWithIo(std.Options.debug_io);
 }
 
-fn scanStoreStatusBackfillMarkersWithIo(
+fn monotonicMsWithIo(io: std.Io) u64 {
+    const now_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+    if (now_ns <= 0) return 1;
+    return @max(1, @as(u64, @intCast(@divTrunc(now_ns, std.time.ns_per_ms))));
+}
+
+pub fn scanStoreStatusBackfillMarkersWithIo(
     alloc: std.mem.Allocator,
     io: std.Io,
     replica_root_dir: []const u8,
@@ -12922,9 +13010,14 @@ fn rebuildStateForPath(path: []const u8) backfill_state_mod.RebuildState {
 }
 
 fn collectStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]StoreStatusBackfillMarker {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    return collectStoreStatusBackfillMarkersWithIo(alloc, std.Options.debug_io, replica_root_dir);
+}
+
+pub fn collectStoreStatusBackfillMarkersWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+) ![]StoreStatusBackfillMarker {
     const markers = try scanStoreStatusBackfillMarkersWithIo(alloc, io, replica_root_dir);
     errdefer freeStoreStatusBackfillMarkers(alloc, markers);
     try loadStoreStatusBackfillMarkerResumeKeys(alloc, io, replica_root_dir, markers);
@@ -12938,7 +13031,7 @@ fn storeStatusBackfillMarkersHaveMissingState(markers: []const StoreStatusBackfi
     return false;
 }
 
-fn backfillMarkerStateFileExistsWithIo(
+pub fn backfillMarkerStateFileExistsWithIo(
     alloc: std.mem.Allocator,
     io: std.Io,
     replica_root_dir: []const u8,
@@ -12958,13 +13051,12 @@ fn backfillMarkerStateFileExists(
     replica_root_dir: []const u8,
     marker: StoreStatusBackfillMarker,
 ) !bool {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try backfillMarkerStateFileExistsWithIo(alloc, io_impl.io(), replica_root_dir, marker);
+    return backfillMarkerStateFileExistsWithIo(alloc, std.Options.debug_io, replica_root_dir, marker);
 }
 
 fn maybeRequestStoreStatusBackfillMarkerRescan(
     service: anytype,
+    io: std.Io,
     replica_root_dir: []const u8,
     scanned_backfill_markers: ?[]const StoreStatusBackfillMarker,
     active_backfill_markers: []const StoreStatusBackfillMarker,
@@ -12973,21 +13065,25 @@ fn maybeRequestStoreStatusBackfillMarkerRescan(
     if (active_backfill_markers.len == 0) return;
     if (service.store_status_backfill_marker_cache.rescan_requested) return;
 
-    var io_impl = std.Io.Threaded.init(service.alloc, .{});
-    defer io_impl.deinit();
-    for (active_backfill_markers) |marker| {
-        if (marker.state == .absent) {
-            service.store_status_backfill_marker_cache.rescan_requested = true;
-            return;
-        }
-        if (!try backfillMarkerStateFileExistsWithIo(service.alloc, io_impl.io(), replica_root_dir, marker)) {
-            service.store_status_backfill_marker_cache.rescan_requested = true;
-            return;
-        }
+    if (try storeStatusBackfillMarkersChangedWithIo(service.alloc, io, replica_root_dir, active_backfill_markers)) {
+        service.store_status_backfill_marker_cache.rescan_requested = true;
     }
 }
 
-fn freeStoreStatusBackfillMarkers(alloc: std.mem.Allocator, markers: []const StoreStatusBackfillMarker) void {
+pub fn storeStatusBackfillMarkersChangedWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    markers: []const StoreStatusBackfillMarker,
+) !bool {
+    for (markers) |marker| {
+        if (marker.state == .absent or
+            !try backfillMarkerStateFileExistsWithIo(alloc, io, replica_root_dir, marker)) return true;
+    }
+    return false;
+}
+
+pub fn freeStoreStatusBackfillMarkers(alloc: std.mem.Allocator, markers: []const StoreStatusBackfillMarker) void {
     for (markers) |marker| {
         alloc.free(marker.path);
         marker.state.deinit(alloc);
@@ -17014,6 +17110,7 @@ test "metadata service cached backfill markers rescan immediately after disappea
     }
     try maybeRequestStoreStatusBackfillMarkerRescan(
         &service,
+        io_impl.io(),
         replica_root,
         service.store_status_backfill_marker_cache.markers,
         service.store_status_backfill_marker_cache.markers,
@@ -18373,7 +18470,7 @@ test "metadata http service linearizable read waits for leader discovery" {
     try std.testing.expect(!svc.raft.host.http_host.host.isLocalLeader(2910));
     try svc.ensureLinearizableRead();
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
-    try std.testing.expect(svc.metrics().read_lease_requests > 0);
+    try std.testing.expect(svc.metrics().read_index_requests > 0);
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {

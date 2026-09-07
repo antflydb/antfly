@@ -14,4 +14,5 @@
 
 test {
     _ = @import("storage/db/catalog/index_manager.zig");
+    _ = @import("storage/index_manager_vopr.zig");
 }

@@ -14,6 +14,7 @@
 
 test {
     _ = @import("storage/db/db.zig");
+    _ = @import("storage/db_split_vopr.zig");
     _ = @import("storage/db/promotion_runtime.zig");
     _ = @import("storage/db/resolution_runtime.zig");
 }

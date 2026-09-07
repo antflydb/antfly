@@ -17,8 +17,11 @@ const platform_sync = @import("antfly_platform").sync;
 const objectstore = @import("objectstore");
 const catalog_types = @import("types.zig");
 const progress_store = @import("progress_store.zig");
+const head_coordination = @import("../head_coordination.zig");
 const remote_uri = @import("../remote_uri.zig");
 const object_store_support = @import("../object_store_support.zig");
+
+const retired_head_doc_offset = std.math.maxInt(u64);
 
 pub const ObjectProgressStore = struct {
     alloc: std.mem.Allocator,
@@ -152,13 +155,90 @@ pub const ObjectProgressStore = struct {
     pub fn getHead(self: *ObjectProgressStore, namespace: []const u8) !u64 {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
         defer self.alloc.free(key);
-        return try self.readValue(key);
+        var current = (try self.tryReadHeadCurrent(key)) orelse return error.FileNotFound;
+        defer current.deinit(self.alloc);
+        if (current.record.head_version == 0) return error.FileNotFound;
+        return current.record.head_version;
     }
 
     pub fn compareAndSwapHead(self: *ObjectProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
+        return try self.compareAndSwapHeadMaybeFenced(namespace, expected, version, null);
+    }
+
+    pub fn compareAndSwapHeadFenced(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        expected: ?u64,
+        version: u64,
+        fence: progress_store.PublicationFence,
+    ) !bool {
+        return try self.compareAndSwapHeadMaybeFenced(namespace, expected, version, fence);
+    }
+
+    fn compareAndSwapHeadMaybeFenced(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        expected: ?u64,
+        version: u64,
+        fence: ?progress_store.PublicationFence,
+    ) !bool {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
         defer self.alloc.free(key);
-        return try self.compareAndSwap(key, expected, version);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        var current = try self.tryReadHeadCurrent(key);
+        defer if (current) |*entry| entry.deinit(self.alloc);
+        const current_version: ?u64 = if (current) |entry|
+            if (entry.record.head_version == 0) null else entry.record.head_version
+        else
+            null;
+        if (current_version != expected) return false;
+        if (fence) |required| {
+            const entry = current orelse return error.WorkLeaseLost;
+            if (entry.record.released or
+                entry.record.fencing_token != required.fencing_token or
+                entry.record.owner_id == null or
+                !std.mem.eql(u8, entry.record.owner_id.?, required.owner_id))
+            {
+                return error.WorkLeaseLost;
+            }
+        }
+
+        var proposed = if (current) |entry|
+            entry.record
+        else
+            head_coordination.Record{};
+        proposed.head_version = version;
+        const payload = try head_coordination.payloadAlloc(self.alloc, proposed);
+        defer self.alloc.free(payload);
+        const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
+        defer self.alloc.free(content_type);
+
+        var result = self.client.putObject(self.bucket, key, payload, .{
+            .content_type = content_type,
+            .if_none_match = current == null,
+            .if_match_etag = if (current) |entry| entry.etag else null,
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => {
+                if (fence) |required| {
+                    var winner = try self.tryReadHeadCurrent(key);
+                    defer if (winner) |*entry| entry.deinit(self.alloc);
+                    const entry = winner orelse return error.WorkLeaseLost;
+                    if (entry.record.released or
+                        entry.record.fencing_token != required.fencing_token or
+                        entry.record.owner_id == null or
+                        !std.mem.eql(u8, entry.record.owner_id.?, required.owner_id))
+                    {
+                        return error.WorkLeaseLost;
+                    }
+                }
+                return false;
+            },
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        return true;
     }
 
     pub fn getGcWatermark(self: *ObjectProgressStore, namespace: []const u8) !?u64 {
@@ -225,6 +305,9 @@ pub const ObjectProgressStore = struct {
         expected: ?u64,
         head_version: u64,
     ) !bool {
+        if (expected) |current| {
+            if (head_version < current) return false;
+        }
         const key = try enrichmentStageKeyAlloc(self.alloc, self.prefix, namespace, stage, "HEAD_VERSION");
         defer self.alloc.free(key);
         return try self.compareAndSwap(key, expected, head_version);
@@ -246,6 +329,103 @@ pub const ObjectProgressStore = struct {
         const key = try enrichmentStageKeyAlloc(self.alloc, self.prefix, namespace, stage, "DOC_OFFSET");
         defer self.alloc.free(key);
         return try self.compareAndSwap(key, expected, doc_offset);
+    }
+
+    pub fn getEnrichmentStageHeadDocOffset(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        head_version: u64,
+    ) !?u64 {
+        const key = try enrichmentStageHeadOffsetKeyAlloc(self.alloc, self.prefix, namespace, stage, head_version);
+        defer self.alloc.free(key);
+        const value = try self.tryReadValue(key);
+        return if (value == retired_head_doc_offset) null else value;
+    }
+
+    pub fn compareAndSwapEnrichmentStageHeadDocOffset(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        head_version: u64,
+        expected: ?u64,
+        doc_offset: u64,
+    ) !bool {
+        if (doc_offset == retired_head_doc_offset) return error.InvalidEnrichmentDocOffset;
+        const key = try enrichmentStageHeadOffsetKeyAlloc(self.alloc, self.prefix, namespace, stage, head_version);
+        defer self.alloc.free(key);
+        return try self.compareAndSwap(key, expected, doc_offset);
+    }
+
+    pub fn deleteEnrichmentStageHeadDocOffset(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        head_version: u64,
+    ) !void {
+        const key = try enrichmentStageHeadOffsetKeyAlloc(self.alloc, self.prefix, namespace, stage, head_version);
+        defer self.alloc.free(key);
+        // Keep a same-key tombstone so a stale null-expected CAS cannot
+        // resurrect progress after retention removes the manifest. The
+        // conditional put also composes across runtime processes.
+        while (true) {
+            const current = try self.tryReadValue(key);
+            if (current == retired_head_doc_offset) return;
+            if (try self.compareAndSwap(key, current, retired_head_doc_offset)) return;
+        }
+    }
+
+    pub fn getEnrichmentStageProgress(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+    ) !?progress_store.EnrichmentStageProgress {
+        const key = try enrichmentStageKeyAlloc(self.alloc, self.prefix, namespace, stage, "STATE");
+        defer self.alloc.free(key);
+        const current = try self.tryReadStageProgressCurrent(key);
+        defer if (current) |*entry| if (entry.etag) |etag| self.alloc.free(etag);
+        return if (current) |entry| entry.value else null;
+    }
+
+    pub fn compareAndSwapEnrichmentStageProgress(
+        self: *ObjectProgressStore,
+        namespace: []const u8,
+        stage: catalog_types.EnrichmentStage,
+        expected: ?progress_store.EnrichmentStageProgress,
+        desired: progress_store.EnrichmentStageProgress,
+    ) !bool {
+        const key = try enrichmentStageKeyAlloc(self.alloc, self.prefix, namespace, stage, "STATE");
+        defer self.alloc.free(key);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const current = try self.tryReadStageProgressCurrent(key);
+        defer if (current) |*entry| if (entry.etag) |etag| self.alloc.free(etag);
+        const current_value = if (current) |entry| entry.value else null;
+        if (!stageProgressOptionalEql(current_value, expected)) return false;
+        if (current_value) |value| {
+            if (desired.head_version < value.head_version) return false;
+            if (desired.head_version == value.head_version and desired.doc_offset < value.doc_offset) return false;
+        }
+        // The provider version token is the cross-process CAS primitive. Do
+        // not silently degrade an existing-object update to an unconditional
+        // PUT when a backend omits it.
+        if (current) |entry| {
+            if (entry.etag == null) return error.MissingObjectEtag;
+        }
+
+        const payload = try std.fmt.allocPrint(self.alloc, "{d} {d}", .{ desired.head_version, desired.doc_offset });
+        defer self.alloc.free(payload);
+        var result = self.client.putObject(self.bucket, key, payload, .{
+            .content_type = "text/plain",
+            .if_none_match = current == null,
+            .if_match_etag = if (current) |entry| entry.etag else null,
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => return false,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        return true;
     }
 
     fn compareAndSwap(self: *ObjectProgressStore, key: []const u8, expected: ?u64, value: u64) !bool {
@@ -287,6 +467,72 @@ pub const ObjectProgressStore = struct {
         etag: ?[]u8,
     };
 
+    const CurrentStageProgress = struct {
+        value: progress_store.EnrichmentStageProgress,
+        etag: ?[]u8,
+    };
+
+    const CurrentHead = struct {
+        record: head_coordination.Record,
+        owned_owner_id: ?[]u8 = null,
+        etag: ?[]u8 = null,
+
+        fn deinit(self: *CurrentHead, alloc: std.mem.Allocator) void {
+            if (self.owned_owner_id) |owner_id| alloc.free(owner_id);
+            if (self.etag) |etag| alloc.free(etag);
+            self.* = undefined;
+        }
+    };
+
+    fn tryReadHeadCurrent(self: *ObjectProgressStore, key: []const u8) !?CurrentHead {
+        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+
+        const trimmed = std.mem.trim(u8, result.body, " \t\r\n");
+        var record: head_coordination.Record = undefined;
+        var owned_owner_id: ?[]u8 = null;
+        if (trimmed.len != 0 and trimmed[0] == '{') {
+            // Transitional compatibility with the short-lived JSON-body
+            // format. The next successful write migrates it back to the
+            // legacy-readable decimal-plus-whitespace representation.
+            var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, trimmed, .{
+                .ignore_unknown_fields = false,
+            });
+            defer parsed.deinit();
+            if (!head_coordination.valid(parsed.value))
+                return error.InvalidHeadCoordinationRecord;
+            if (parsed.value.owner_id) |owner_id| {
+                owned_owner_id = try self.alloc.dupe(u8, owner_id);
+            }
+            record = parsed.value;
+            record.owner_id = owned_owner_id;
+        } else {
+            const body_head = try std.fmt.parseInt(u64, trimmed, 10);
+            if (try head_coordination.parseContentTypeAlloc(self.alloc, result.metadata.content_type)) |parsed_value| {
+                var parsed = parsed_value;
+                defer parsed.deinit();
+                if (!head_coordination.valid(parsed.value) or parsed.value.head_version != body_head)
+                    return error.InvalidHeadCoordinationRecord;
+                if (parsed.value.owner_id) |owner_id| {
+                    owned_owner_id = try self.alloc.dupe(u8, owner_id);
+                }
+                record = parsed.value;
+                record.owner_id = owned_owner_id;
+            } else {
+                record = head_coordination.Record.fromLegacyHead(body_head);
+            }
+        }
+        errdefer if (owned_owner_id) |owner_id| self.alloc.free(owner_id);
+        return .{
+            .record = record,
+            .owned_owner_id = owned_owner_id,
+            .etag = if (result.metadata.etag) |etag| try self.alloc.dupe(u8, etag) else null,
+        };
+    }
+
     fn tryReadCurrent(self: *ObjectProgressStore, alloc: std.mem.Allocator, key: []const u8) !?CurrentValue {
         var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -299,10 +545,23 @@ pub const ObjectProgressStore = struct {
         };
     }
 
+    fn tryReadStageProgressCurrent(self: *ObjectProgressStore, key: []const u8) !?CurrentStageProgress {
+        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        return .{
+            .value = try parseStageProgress(result.body),
+            .etag = if (result.metadata.etag) |value| try self.alloc.dupe(u8, value) else null,
+        };
+    }
+
     const vtable: progress_store.ProgressStore.VTable = .{
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,
         .compare_and_swap_head = erasedCompareAndSwapHead,
+        .compare_and_swap_head_fenced = erasedCompareAndSwapHeadFenced,
         .get_gc_watermark = erasedGetGcWatermark,
         .compare_and_swap_gc_watermark = erasedCompareAndSwapGcWatermark,
         .get_enrichment_head_version = erasedGetEnrichmentHeadVersion,
@@ -315,6 +574,11 @@ pub const ObjectProgressStore = struct {
         .compare_and_swap_enrichment_stage_head_version = erasedCompareAndSwapEnrichmentStageHeadVersion,
         .get_enrichment_stage_doc_offset = erasedGetEnrichmentStageDocOffset,
         .compare_and_swap_enrichment_stage_doc_offset = erasedCompareAndSwapEnrichmentStageDocOffset,
+        .get_enrichment_stage_head_doc_offset = erasedGetEnrichmentStageHeadDocOffset,
+        .compare_and_swap_enrichment_stage_head_doc_offset = erasedCompareAndSwapEnrichmentStageHeadDocOffset,
+        .delete_enrichment_stage_head_doc_offset = erasedDeleteEnrichmentStageHeadDocOffset,
+        .get_enrichment_stage_progress = erasedGetEnrichmentStageProgress,
+        .compare_and_swap_enrichment_stage_progress = erasedCompareAndSwapEnrichmentStageProgress,
     };
 
     fn erasedDeinit(_: std.mem.Allocator, ptr: *anyopaque) void {
@@ -330,6 +594,17 @@ pub const ObjectProgressStore = struct {
     fn erasedCompareAndSwapHead(ptr: *anyopaque, namespace: []const u8, expected: ?u64, version: u64) !bool {
         const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapHead(namespace, expected, version);
+    }
+
+    fn erasedCompareAndSwapHeadFenced(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        expected: ?u64,
+        version: u64,
+        fence: progress_store.PublicationFence,
+    ) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.compareAndSwapHeadFenced(namespace, expected, version, fence);
     }
 
     fn erasedGetGcWatermark(ptr: *anyopaque, namespace: []const u8) !?u64 {
@@ -403,7 +678,86 @@ pub const ObjectProgressStore = struct {
         const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapEnrichmentStageDocOffset(namespace, @enumFromInt(stage_id), expected, doc_offset);
     }
+
+    fn erasedGetEnrichmentStageHeadDocOffset(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+        head_version: u64,
+    ) !?u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.getEnrichmentStageHeadDocOffset(namespace, @enumFromInt(stage_id), head_version);
+    }
+
+    fn erasedCompareAndSwapEnrichmentStageHeadDocOffset(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+        head_version: u64,
+        expected: ?u64,
+        doc_offset: u64,
+    ) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.compareAndSwapEnrichmentStageHeadDocOffset(
+            namespace,
+            @enumFromInt(stage_id),
+            head_version,
+            expected,
+            doc_offset,
+        );
+    }
+
+    fn erasedDeleteEnrichmentStageHeadDocOffset(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+        head_version: u64,
+    ) !void {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.deleteEnrichmentStageHeadDocOffset(namespace, @enumFromInt(stage_id), head_version);
+    }
+
+    fn erasedGetEnrichmentStageProgress(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+    ) !?progress_store.EnrichmentStageProgress {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.getEnrichmentStageProgress(namespace, @enumFromInt(stage_id));
+    }
+
+    fn erasedCompareAndSwapEnrichmentStageProgress(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        stage_id: u8,
+        expected: ?progress_store.EnrichmentStageProgress,
+        desired: progress_store.EnrichmentStageProgress,
+    ) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return try self.compareAndSwapEnrichmentStageProgress(
+            namespace,
+            @enumFromInt(stage_id),
+            expected,
+            desired,
+        );
+    }
 };
+
+fn parseStageProgress(raw: []const u8) !progress_store.EnrichmentStageProgress {
+    var fields = std.mem.tokenizeAny(u8, raw, " \t\r\n");
+    const head_version = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
+    const doc_offset = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
+    if (fields.next() != null) return error.InvalidEnrichmentStageProgress;
+    return .{ .head_version = head_version, .doc_offset = doc_offset };
+}
+
+fn stageProgressOptionalEql(
+    lhs: ?progress_store.EnrichmentStageProgress,
+    rhs: ?progress_store.EnrichmentStageProgress,
+) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return lhs.?.head_version == rhs.?.head_version and lhs.?.doc_offset == rhs.?.doc_offset;
+}
 
 fn keyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8, suffix: []const u8) ![]u8 {
     if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ namespace, suffix });
@@ -430,11 +784,23 @@ fn enrichmentStageKeyAlloc(
     return try std.fmt.allocPrint(alloc, "{s}/{s}/ENRICHMENT/{s}/{s}", .{ prefix, namespace, stageLeaf(stage), suffix });
 }
 
+fn enrichmentStageHeadOffsetKeyAlloc(
+    alloc: std.mem.Allocator,
+    prefix: []const u8,
+    namespace: []const u8,
+    stage: catalog_types.EnrichmentStage,
+    head_version: u64,
+) ![]u8 {
+    const suffix = try std.fmt.allocPrint(alloc, "DOC_OFFSETS/{d}", .{head_version});
+    defer alloc.free(suffix);
+    return try enrichmentStageKeyAlloc(alloc, prefix, namespace, stage, suffix);
+}
+
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
-test "objectstore-backed progress store supports cas over file uri" {
+test "serverless objectstore-backed progress store supports atomic stage CAS over file uri" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "progress");
     defer cleanupTmp(path);
@@ -453,7 +819,25 @@ test "objectstore-backed progress store supports cas over file uri" {
     try std.testing.expect(try store.compareAndSwapEnrichmentStage("docs", null, 2));
     try std.testing.expect(try store.compareAndSwapEnrichmentDocOffset("docs", null, 3));
     try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadVersion("docs", .chunk_embeddings, null, 4));
+    try std.testing.expect(!(try store.compareAndSwapEnrichmentStageHeadVersion("docs", .chunk_embeddings, 4, 3)));
     try std.testing.expect(try store.compareAndSwapEnrichmentStageDocOffset("docs", .chunk_embeddings, null, 5));
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4, 5, 6));
+    try std.testing.expectEqual(@as(?u64, 6), try store.getEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4));
+    try std.testing.expectEqual(@as(?u64, null), try store.getEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 5));
+    try store.deleteEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4);
+    try std.testing.expectEqual(@as(?u64, null), try store.getEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4));
+    try std.testing.expect(!(try store.compareAndSwapEnrichmentStageHeadDocOffset("docs", .chunk_embeddings, 4, null, 0)));
+    const first = progress_store.EnrichmentStageProgress{ .head_version = 4, .doc_offset = 6 };
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageProgress("docs", .chunk_embeddings, null, first));
+    const next = progress_store.EnrichmentStageProgress{ .head_version = 5, .doc_offset = 0 };
+    try std.testing.expect(try store.compareAndSwapEnrichmentStageProgress("docs", .chunk_embeddings, first, next));
+    try std.testing.expect(!(try store.compareAndSwapEnrichmentStageProgress(
+        "docs",
+        .chunk_embeddings,
+        first,
+        .{ .head_version = 4, .doc_offset = 7 },
+    )));
+    try std.testing.expectEqual(@as(?progress_store.EnrichmentStageProgress, next), try store.getEnrichmentStageProgress("docs", .chunk_embeddings));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

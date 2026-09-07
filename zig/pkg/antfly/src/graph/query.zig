@@ -532,6 +532,20 @@ test "canonical graph result node path is self-consistent" {
     }));
 }
 
+test "graph result node JSON accepts omitted optional path fields" {
+    var parsed = try std.json.parseFromSlice(
+        GraphResultNode,
+        std.testing.allocator,
+        "{\"key\":\"doc:z\",\"depth\":1,\"distance\":1}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.path == null);
+    try std.testing.expect(parsed.value.path_tables == null);
+    try std.testing.expect(parsed.value.path_edges == null);
+}
+
 pub const GraphQueryResult = struct {
     nodes: []GraphResultNode,
     matches: []pattern_mod.PatternMatch = &.{},

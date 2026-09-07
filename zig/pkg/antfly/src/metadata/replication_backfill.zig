@@ -56,19 +56,63 @@ const empty_cutover_provider_identity: foreign_mod.ExactCutoverIntent.ProviderId
 /// A runtime-owned CDC job must continuously prove that it still owns the
 /// replicated reconciliation lease. Provider calls receive a bounded deadline,
 /// while every provider, apply, and status boundary revalidates ownership.
+pub const WorkKind = enum {
+    snapshot_step,
+    stream_step,
+};
+
 pub const WorkPermit = struct {
     ptr: *anyopaque,
-    checkpoint_fn: *const fn (ptr: *anyopaque) anyerror!void,
+    checkpoint_fn: *const fn (ptr: *anyopaque, kind: WorkKind) anyerror!void,
     deadline_fn: *const fn (ptr: *anyopaque) anyerror!u64,
 
-    pub fn checkpoint(self: @This()) !void {
-        try self.checkpoint_fn(self.ptr);
+    pub fn checkpoint(self: @This(), kind: WorkKind) !void {
+        try self.checkpoint_fn(self.ptr, kind);
     }
 
     pub fn deadlineNs(self: @This()) !u64 {
         return try self.deadline_fn(self.ptr);
     }
 };
+
+/// Production-neutral boundaries in the replication lifecycle. VOPR and
+/// other schedulers may suspend at these points, but the replication kernel
+/// does not import a test runtime or expose internal ownership.
+pub const ReplicationLifecyclePhase = enum {
+    provider_prepared,
+    snapshot_batch_applied,
+    snapshot_checkpoint_persisted,
+    cutover_prepared,
+    stream_polled,
+    stream_change_applied,
+    stream_checkpoint_persisted,
+    failure_persisted,
+};
+
+pub const ReplicationLifecycleEvent = struct {
+    phase: ReplicationLifecyclePhase,
+    table_id: u64,
+    source_ordinal: u32,
+    snapshot_offset: u64 = 0,
+    authority_id: u64 = 0,
+    checkpoint: []const u8 = "",
+};
+
+pub const ReplicationLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: ReplicationLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: @This(), event: ReplicationLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
+
+fn ioNowMillis(io: std.Io) u64 {
+    return @intCast(@max(
+        @divTrunc(std.Io.Timestamp.now(io, .real).toNanoseconds(), std.time.ns_per_ms),
+        0,
+    ));
+}
 
 fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
@@ -108,14 +152,34 @@ pub const SnapshotBackfillRunner = struct {
     prepared_snapshot_timeout_ns: u64 = default_prepared_snapshot_timeout_ns,
     quantum_deadline_ns: ?u64 = null,
     work_permit: ?WorkPermit = null,
+    lifecycle_hook: ?ReplicationLifecycleHook = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 
     fn checkpointWork(self: *SnapshotBackfillRunner) !void {
-        if (self.work_permit) |permit| try permit.checkpoint();
+        if (self.work_permit) |permit| try permit.checkpoint(.snapshot_step);
     }
 
     fn workDeadlineNs(self: *SnapshotBackfillRunner) !?u64 {
         return if (self.work_permit) |permit| try permit.deadlineNs() else null;
+    }
+
+    fn reachLifecycle(
+        self: *SnapshotBackfillRunner,
+        phase: ReplicationLifecyclePhase,
+        table_id: u64,
+        source_ordinal: u32,
+        snapshot_offset: u64,
+        authority_id: u64,
+        checkpoint: []const u8,
+    ) !void {
+        if (self.lifecycle_hook) |hook| try hook.reach(.{
+            .phase = phase,
+            .table_id = table_id,
+            .source_ordinal = source_ordinal,
+            .snapshot_offset = snapshot_offset,
+            .authority_id = authority_id,
+            .checkpoint = checkpoint,
+        });
     }
 
     pub fn runTableSource(
@@ -241,8 +305,16 @@ pub const SnapshotBackfillRunner = struct {
                 .retired_cutover_authority_id = progress_retired_cutover_authority_id,
                 .retired_slot_name = progress_retired_slot_name.items,
                 .retired_publication_name = progress_retired_publication_name.items,
-                .updated_at_ms = nowMillis(),
+                .updated_at_ms = ioNowMillis(self.io),
             }) catch {};
+            self.reachLifecycle(
+                .failure_persisted,
+                table.table_id,
+                source_ordinal,
+                @intCast(progress_offset),
+                progress_cutover_authority_id,
+                progress_snapshot_checkpoint.items,
+            ) catch {};
             return err;
         };
     }
@@ -542,7 +614,7 @@ pub const SnapshotBackfillRunner = struct {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 try check(ptr);
                 var expected = ctx.record;
-                expected.updated_at_ms = nowMillis();
+                expected.updated_at_ms = ioNowMillis(ctx.runner.io);
                 var record = expected;
                 record.retired_cutover_authority_id = 0;
                 record.retired_slot_name = "";
@@ -584,7 +656,7 @@ pub const SnapshotBackfillRunner = struct {
                 .retired_cutover_authority_id = retired_cutover_authority_id,
                 .retired_slot_name = retired_slot_name,
                 .retired_publication_name = retired_publication_name,
-                .updated_at_ms = nowMillis(),
+                .updated_at_ms = ioNowMillis(self.io),
             },
             .progress_cutover_mode = progress_cutover_mode,
             .progress_prepared_checkpoint = progress_prepared_checkpoint,
@@ -751,8 +823,16 @@ pub const SnapshotBackfillRunner = struct {
             .cutover_authority_id = progress_cutover_authority_id.*,
             .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
             .cutover_provider_identity = progress_cutover_provider_identity.*,
-            .updated_at_ms = nowMillis(),
+            .updated_at_ms = ioNowMillis(self.io),
         });
+        try self.reachLifecycle(
+            .provider_prepared,
+            table.table_id,
+            source_ordinal,
+            @intCast(effective_start_offset),
+            progress_cutover_authority_id.*,
+            prepared_checkpoint,
+        );
 
         var summary: BackfillSummary = .{
             .final_offset = effective_start_offset,
@@ -878,6 +958,23 @@ pub const SnapshotBackfillRunner = struct {
                 try self.checkpointWork();
             }
 
+            try self.reachLifecycle(
+                .snapshot_batch_applied,
+                table.table_id,
+                source_ordinal,
+                @intCast(summary.final_offset + result.rows.len),
+                progress_cutover_authority_id.*,
+                if (next_snapshot_checkpoint) |checkpoint| checkpoint else "",
+            );
+
+            // Applying the target batch and publishing its durable source
+            // checkpoint are separate ownership-sensitive steps. Revalidate
+            // the work lease in that gap so a stale owner can never advance
+            // progress after losing authority. The target operation is
+            // idempotent, so a replacement may safely replay it from the last
+            // durable checkpoint.
+            try self.checkpointWork();
+
             try checkProgressCutoverAuthority(
                 status_sink,
                 table,
@@ -936,14 +1033,22 @@ pub const SnapshotBackfillRunner = struct {
                 .lag_millis = 0,
                 .consecutive_failures = 0,
                 .last_source_commit_at_ms = 0,
-                .last_success_at_ms = nowMillis(),
-                .last_change_applied_at_ms = nowMillis(),
+                .last_success_at_ms = ioNowMillis(self.io),
+                .last_change_applied_at_ms = ioNowMillis(self.io),
                 .cutover_intent_id = progress_cutover_intent_id.*,
                 .cutover_authority_id = progress_cutover_authority_id.*,
                 .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
                 .cutover_provider_identity = progress_cutover_provider_identity.*,
-                .updated_at_ms = nowMillis(),
+                .updated_at_ms = ioNowMillis(self.io),
             });
+            try self.reachLifecycle(
+                .snapshot_checkpoint_persisted,
+                table.table_id,
+                source_ordinal,
+                @intCast(summary.final_offset),
+                progress_cutover_authority_id.*,
+                progress_snapshot_checkpoint.items,
+            );
             try self.checkpointWork();
 
             if (result.rows.len < self.batch_size) break;
@@ -1009,14 +1114,22 @@ pub const SnapshotBackfillRunner = struct {
             .lag_millis = 0,
             .consecutive_failures = 0,
             .last_source_commit_at_ms = 0,
-            .last_success_at_ms = if (summary.rows_applied > 0) nowMillis() else 0,
-            .last_change_applied_at_ms = if (summary.rows_applied > 0) nowMillis() else 0,
+            .last_success_at_ms = if (summary.rows_applied > 0) ioNowMillis(self.io) else 0,
+            .last_change_applied_at_ms = if (summary.rows_applied > 0) ioNowMillis(self.io) else 0,
             .cutover_intent_id = progress_cutover_intent_id.*,
             .cutover_authority_id = progress_cutover_authority_id.*,
             .cutover_config_fingerprint = progress_cutover_config_fingerprint.*,
             .cutover_provider_identity = progress_cutover_provider_identity.*,
-            .updated_at_ms = nowMillis(),
+            .updated_at_ms = ioNowMillis(self.io),
         });
+        try self.reachLifecycle(
+            .cutover_prepared,
+            table.table_id,
+            source_ordinal,
+            @intCast(summary.final_offset),
+            progress_cutover_authority_id.*,
+            prepared_checkpoint,
+        );
 
         summary.snapshot_complete = true;
         return summary;
@@ -1208,19 +1321,40 @@ pub const SnapshotBackfillCoordinator = struct {
 
 pub const StreamingReplicationRunner = struct {
     alloc: Allocator,
+    io: std.Io = std.Options.debug_io,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
     secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
     work_permit: ?WorkPermit = null,
+    lifecycle_hook: ?ReplicationLifecycleHook = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 
     fn checkpointWork(self: *StreamingReplicationRunner) !void {
-        if (self.work_permit) |permit| try permit.checkpoint();
+        if (self.work_permit) |permit| try permit.checkpoint(.stream_step);
     }
 
     fn workDeadlineNs(self: *StreamingReplicationRunner) !?u64 {
         return if (self.work_permit) |permit| try permit.deadlineNs() else null;
+    }
+
+    fn reachLifecycle(
+        self: *StreamingReplicationRunner,
+        phase: ReplicationLifecyclePhase,
+        table_id: u64,
+        source_ordinal: u32,
+        snapshot_offset: u64,
+        authority_id: u64,
+        checkpoint: []const u8,
+    ) !void {
+        if (self.lifecycle_hook) |hook| try hook.reach(.{
+            .phase = phase,
+            .table_id = table_id,
+            .source_ordinal = source_ordinal,
+            .snapshot_offset = snapshot_offset,
+            .authority_id = authority_id,
+            .checkpoint = checkpoint,
+        });
     }
 
     pub fn runTableSourceFromCheckpoint(
@@ -1305,8 +1439,16 @@ pub const StreamingReplicationRunner = struct {
                     status.retired_publication_name
                 else
                     "",
-                .updated_at_ms = nowMillis(),
+                .updated_at_ms = ioNowMillis(self.io),
             }) catch {};
+            self.reachLifecycle(
+                .failure_persisted,
+                table.table_id,
+                source_ordinal,
+                @intCast(snapshot_offset),
+                if (existing_status) |status| status.cutover_authority_id else 0,
+                progress_checkpoint.items,
+            ) catch {};
             return err;
         };
     }
@@ -1397,6 +1539,14 @@ pub const StreamingReplicationRunner = struct {
                 status,
             );
         }
+        try self.reachLifecycle(
+            .stream_polled,
+            table.table_id,
+            source_ordinal,
+            @intCast(snapshot_offset),
+            if (existing_status) |status| status.cutover_authority_id else 0,
+            result.checkpoint,
+        );
         std.log.info(
             "metadata cdc stream poll end table={s} source={d} changes={d} lag={d}",
             .{ table.name, source_ordinal, result.changes.len, result.lag_records },
@@ -1428,7 +1578,7 @@ pub const StreamingReplicationRunner = struct {
                 .lag_millis = if (result.lag_millis > 0) result.lag_millis else prior_lag_millis,
                 .consecutive_failures = 0,
                 .last_source_commit_at_ms = prior_last_source_commit_at_ms,
-                .last_success_at_ms = nowMillis(),
+                .last_success_at_ms = ioNowMillis(self.io),
                 .last_change_applied_at_ms = prior_last_change_applied_at_ms,
                 .cutover_intent_id = if (existing_status) |status| status.cutover_intent_id else 0,
                 .cutover_authority_id = if (existing_status) |status| status.cutover_authority_id else 0,
@@ -1452,8 +1602,16 @@ pub const StreamingReplicationRunner = struct {
                     status.retired_publication_name
                 else
                     "",
-                .updated_at_ms = nowMillis(),
+                .updated_at_ms = ioNowMillis(self.io),
             });
+            try self.reachLifecycle(
+                .stream_checkpoint_persisted,
+                table.table_id,
+                source_ordinal,
+                @intCast(snapshot_offset),
+                if (existing_status) |status| status.cutover_authority_id else 0,
+                progress_checkpoint.items,
+            );
             return summary;
         }
 
@@ -1467,6 +1625,14 @@ pub const StreamingReplicationRunner = struct {
                 );
             }
             const apply_summary = try applyReplicationChange(self.alloc, self.write_source, table.name, change, parsed);
+            try self.reachLifecycle(
+                .stream_change_applied,
+                table.table_id,
+                source_ordinal,
+                @intCast(snapshot_offset),
+                if (existing_status) |status| status.cutover_authority_id else 0,
+                change.checkpoint,
+            );
             try self.checkpointWork();
             if (existing_status) |status| {
                 try callCheckCutoverAuthority(
@@ -1477,7 +1643,7 @@ pub const StreamingReplicationRunner = struct {
             }
             progress_checkpoint.clearRetainingCapacity();
             try progress_checkpoint.appendSlice(self.alloc, change.checkpoint);
-            const applied_at_ms = nowMillis();
+            const applied_at_ms = ioNowMillis(self.io);
             const applied_lag_ms: u64 = if (change.commit_timestamp_ms > 0)
                 @intCast(@max(@as(i64, 0), @as(i64, @intCast(applied_at_ms)) - @as(i64, @intCast(change.commit_timestamp_ms))))
             else if (result.lag_millis > 0) result.lag_millis else 0;
@@ -1506,7 +1672,7 @@ pub const StreamingReplicationRunner = struct {
                 .lag_millis = applied_lag_ms,
                 .consecutive_failures = 0,
                 .last_source_commit_at_ms = change.commit_timestamp_ms,
-                .last_success_at_ms = nowMillis(),
+                .last_success_at_ms = ioNowMillis(self.io),
                 .last_change_applied_at_ms = applied_at_ms,
                 .cutover_intent_id = if (existing_status) |status| status.cutover_intent_id else 0,
                 .cutover_authority_id = if (existing_status) |status| status.cutover_authority_id else 0,
@@ -1530,8 +1696,16 @@ pub const StreamingReplicationRunner = struct {
                     status.retired_publication_name
                 else
                     "",
-                .updated_at_ms = nowMillis(),
+                .updated_at_ms = ioNowMillis(self.io),
             });
+            try self.reachLifecycle(
+                .stream_checkpoint_persisted,
+                table.table_id,
+                source_ordinal,
+                @intCast(snapshot_offset),
+                if (existing_status) |status| status.cutover_authority_id else 0,
+                progress_checkpoint.items,
+            );
             try self.checkpointWork();
         }
 
@@ -2993,7 +3167,7 @@ test "metadata snapshot backfill stops before apply when its work permit is revo
         write_calls: usize = 0,
         deadline_calls: usize = 0,
 
-        fn checkpoint(ptr: *anyopaque) !void {
+        fn checkpoint(ptr: *anyopaque, _: WorkKind) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.permit_valid) return error.CdcWorkLeaseLost;
         }
@@ -3469,7 +3643,7 @@ fn countReplicationSourcesJson(alloc: Allocator, replication_sources_json: []con
 
 threadlocal var checkpoint_buf: [64]u8 = undefined;
 
-fn nowMillis() u64 {
+fn hostNowMillis() u64 {
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => {},
@@ -6325,7 +6499,7 @@ test "metadata replication live snapshot and later streaming insert through runn
     }
 
     const suffix = blk: {
-        var prng = std.Random.DefaultPrng.init(nowMillis());
+        var prng = std.Random.DefaultPrng.init(hostNowMillis());
         break :blk prng.random().int(u64);
     };
     const source_table = try std.fmt.allocPrint(alloc, "antfly_zig_metadata_cdc_live_{d}", .{suffix});
@@ -6659,7 +6833,7 @@ test "metadata http service live snapshot and later streaming insert through inj
     try server.runRound();
 
     const suffix = blk: {
-        var prng = std.Random.DefaultPrng.init(nowMillis());
+        var prng = std.Random.DefaultPrng.init(hostNowMillis());
         break :blk prng.random().int(u64);
     };
     const source_table = try std.fmt.allocPrint(alloc, "antfly_zig_metadata_cdc_hosted_{d}", .{suffix});

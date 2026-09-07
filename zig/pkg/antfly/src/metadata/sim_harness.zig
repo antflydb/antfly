@@ -13,11 +13,13 @@
 // limitations.
 
 const std = @import("std");
+const vopr = @import("vopr");
 const metadata_api = @import("api.zig");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_http_client = @import("http_client.zig");
 const metadata_http_server = @import("http_server.zig");
 const metadata_http_test_runtime = @import("http_test_runtime.zig");
+const metadata_node_operations = @import("node_operations.zig");
 const metadata_mod = @import("mod.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -31,6 +33,7 @@ const api_http_client = @import("../api/http_client.zig");
 const api_http_test_runtime = @import("../api/http_test_runtime.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
+const api_distributed_graph = @import("../api/distributed_graph.zig");
 const api_operation = @import("../api/operation.zig");
 const backups_api = @import("../api/backups.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
@@ -45,6 +48,8 @@ const raft_host = @import("../raft/host.zig");
 const raft_metadata_apply = @import("../raft/metadata_apply.zig");
 const raft_metadata_view = @import("../raft/metadata_view.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const read_gate = @import("../raft/read_gate.zig");
+const raft_shard_ops = @import("../raft/shard_ops.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const peer_resolver = @import("../raft/peer_resolver.zig");
 const raft_sim = @import("../raft/sim_harness.zig");
@@ -54,12 +59,15 @@ const transition_state = @import("transition_state.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const io_http_executor = @import("../common/http/io_http_executor.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const common_config = @import("../common/config.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const storage_sim = @import("../storage/sim_runtime.zig");
+const resource_manager_mod = @import("../storage/resource_manager.zig");
+const raft_trace_logger = @import("../tracing/raft_trace_logger.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
@@ -98,11 +106,11 @@ pub const SimSplitRuntime = struct {
     entries: [16]Entry = undefined,
     len: usize = 0,
     replica_root_dir: ?[]const u8 = null,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
 
     pub fn deinit(self: *@This()) void {
         for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
         self.len = 0;
-        self.replica_root_dir = null;
     }
 
     pub fn iface(self: *@This()) transition_runtime.SplitRuntime {
@@ -155,7 +163,7 @@ pub const SimSplitRuntime = struct {
             const destination_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, destination_group_id);
             defer alloc.free(destination_root_dir);
 
-            try ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
+            try self.ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
 
             const status = try data_mod.storage.observeSplitStatus(alloc, .{
                 .transition_id = transition_id,
@@ -167,6 +175,7 @@ pub const SimSplitRuntime = struct {
                 .source = .{ .root_dir = source_root_dir },
                 .dest = .{
                     .root_dir = destination_root_dir,
+                    .db = self.dbOptions(.{}),
                 },
             });
             return .{
@@ -304,14 +313,15 @@ pub const SimSplitRuntime = struct {
             const destination_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, destination_group_id);
             defer alloc.free(destination_root_dir);
 
-            try ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
+            try self.ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
 
             const coord = try alloc.create(data_mod.SplitSyncCoordinator);
             errdefer alloc.destroy(coord);
             var dest_db_options = db_mod.OpenOptions{};
-            if (try splitDestinationIdentityNamespaceFromSource(alloc, source_root_dir, destination_group_id)) |namespace| {
+            if (try self.splitDestinationIdentityNamespaceFromSource(alloc, source_root_dir, destination_group_id)) |namespace| {
                 dest_db_options.identity_namespace = namespace;
             }
+            dest_db_options.backend_runtime = self.backend_runtime;
             coord.* = try data_mod.SplitSyncCoordinator.init(alloc, .{
                 .transition_id = transition_id,
                 .attempt_epoch = attempt_epoch,
@@ -327,15 +337,17 @@ pub const SimSplitRuntime = struct {
     }
 
     fn splitDestinationIdentityNamespaceFromSource(
+        self: *@This(),
         alloc: std.mem.Allocator,
         source_root_dir: []const u8,
         destination_group_id: u64,
     ) !?db_mod.DocIdentityNamespace {
         _ = destination_group_id;
-        var db = db_mod.DB.open(alloc, source_root_dir, .{
+        const options = self.dbOptions(.{
             .open_mode = .status_only,
             .start_index_workers = false,
-        }) catch |err| switch (err) {
+        });
+        var db = db_mod.DB.open(alloc, source_root_dir, options) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -351,19 +363,45 @@ pub const SimSplitRuntime = struct {
     }
 
     fn ensureSourceApplyStoreSeeded(
+        self: *@This(),
         alloc: std.mem.Allocator,
         source_root_dir: []const u8,
         source_group_id: u64,
     ) !void {
-        var source_store = try data_mod.RaftApplyStore.init(alloc, .{ .root_dir = source_root_dir });
-        defer source_store.deinit();
-        if ((try source_store.latestBatch(source_group_id)) != null) return;
-
-        var db = db_mod.DB.open(alloc, source_root_dir, .{}) catch |err| switch (err) {
+        var db = db_mod.DB.open(alloc, source_root_dir, self.dbOptions(.{})) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer db.close();
+
+        try self.ensureSourceApplyStoreSeededFromDb(alloc, source_root_dir, source_group_id, &db);
+    }
+
+    fn ensureSourceApplyStoreSeededFromDb(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        source_root_dir: []const u8,
+        source_group_id: u64,
+        db: *db_mod.DB,
+    ) !void {
+        _ = self;
+        var source_store = try data_mod.RaftApplyStore.init(alloc, .{ .root_dir = source_root_dir });
+        defer source_store.deinit();
+
+        if (try source_store.latestBatchForTransition(source_group_id)) |watermark| {
+            const root_incarnation = try db.durableRootIncarnation();
+            if (!try source_store.reconcileGroupSnapshotFromAuthoritativeStoreAtRootIncarnation(
+                alloc,
+                source_group_id,
+                watermark,
+                root_incarnation,
+                db.getRange(),
+                db.core.store,
+                256,
+                2 * 1024 * 1024,
+            )) return error.SplitSourceProjectionAdvanced;
+            return;
+        }
 
         var ops = std.ArrayListUnmanaged([]u8).empty;
         defer {
@@ -411,7 +449,26 @@ pub const SimSplitRuntime = struct {
             .entries_bytes = encoded,
         });
     }
+
+    fn dbOptions(self: *const @This(), base: db_mod.OpenOptions) db_mod.OpenOptions {
+        var options = base;
+        options.backend_runtime = self.backend_runtime;
+        return options;
+    }
 };
+
+fn backendRuntimeForReplicaRoot(
+    cluster: *MetadataHttpClusterSimulation,
+    replica_root_dir: []const u8,
+) ?*db_mod.background_runtime.BackendRuntime {
+    for (cluster.cluster.configs, 0..) |config, index| {
+        const configured_root = config.host.http.host.replica_root_dir orelse continue;
+        if (!std.mem.eql(u8, configured_root, replica_root_dir)) continue;
+        const runtime = cluster.backendRuntime(index);
+        return if (runtime.hasDbOpenConfigurator()) runtime else null;
+    }
+    return null;
+}
 
 test "metadata sim split runtime preserves source identity namespace" {
     const alloc = std.testing.allocator;
@@ -476,6 +533,12 @@ const EnsureGroupTextIndexProgressContext = struct {
     index_name: []const u8,
 };
 
+const EnsureGroupGraphIndexProgressContext = struct {
+    replica_root_dir: []const u8,
+    group_id: u64,
+    index_name: []const u8,
+};
+
 fn projectedIdentityNamespaceForGroup(
     cluster: *MetadataHttpClusterSimulation,
     group_id: u64,
@@ -512,6 +575,7 @@ fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation
     var read_db = db_mod.DB.open(cluster.alloc, path, .{
         .open_mode = .query_readonly,
         .identity_namespace = identity_namespace,
+        .backend_runtime = backendRuntimeForReplicaRoot(cluster, ctx.replica_root_dir),
     }) catch |err| switch (err) {
         error.PathAlreadyExists, error.FileNotFound => return false,
         else => return err,
@@ -522,6 +586,7 @@ fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation
 
     var db = db_mod.DB.open(cluster.alloc, path, .{
         .identity_namespace = identity_namespace,
+        .backend_runtime = backendRuntimeForReplicaRoot(cluster, ctx.replica_root_dir),
     }) catch |err| switch (err) {
         error.PathAlreadyExists, error.FileNotFound => return false,
         error.LsmRootWriterAlreadyOpen => return true,
@@ -571,6 +636,78 @@ fn ensureGroupTextIndexOnActiveReplicas(
     if (ensured == 0) return error.TestExpectedEqual;
 }
 
+fn ensureGroupGraphIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+    const ctx: *EnsureGroupGraphIndexProgressContext = @ptrCast(@alignCast(ptr));
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(cluster.alloc, ctx.replica_root_dir, ctx.group_id);
+    defer cluster.alloc.free(path);
+    const identity_namespace = try projectedIdentityNamespaceForGroup(cluster, ctx.group_id);
+
+    var read_db = db_mod.DB.open(cluster.alloc, path, .{
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .identity_namespace = identity_namespace,
+        .backend_runtime = backendRuntimeForReplicaRoot(cluster, ctx.replica_root_dir),
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists, error.FileNotFound => return false,
+        else => return err,
+    };
+    defer read_db.close();
+
+    if (read_db.core.index_manager.graphIndex(ctx.index_name) != null) return true;
+
+    var db = db_mod.DB.open(cluster.alloc, path, .{
+        .start_index_workers = false,
+        .identity_namespace = identity_namespace,
+        .backend_runtime = backendRuntimeForReplicaRoot(cluster, ctx.replica_root_dir),
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists, error.FileNotFound => return false,
+        error.LsmRootWriterAlreadyOpen => return true,
+        else => return err,
+    };
+    defer db.close();
+
+    if (db.core.index_manager.graphIndex(ctx.index_name) == null) {
+        try db.addIndex(.{
+            .name = ctx.index_name,
+            .kind = .graph,
+            .config_json = "{}",
+        });
+    }
+    return true;
+}
+
+fn ensureGroupGraphIndex(
+    cluster: *MetadataHttpClusterSimulation,
+    replica_root_dir: []const u8,
+    group_id: u64,
+    index_name: []const u8,
+    max_rounds: usize,
+) !void {
+    var ctx = EnsureGroupGraphIndexProgressContext{
+        .replica_root_dir = replica_root_dir,
+        .group_id = group_id,
+        .index_name = index_name,
+    };
+    if (try cluster.runUntil(max_rounds, &ctx, ensureGroupGraphIndexProgressPredicate)) return;
+    return error.FileNotFound;
+}
+
+fn ensureGroupGraphIndexOnActiveReplicas(
+    cluster: *MetadataHttpClusterSimulation,
+    replica_root_dirs: []const []const u8,
+    group_id: u64,
+    index_name: []const u8,
+    max_rounds: usize,
+) !void {
+    var ensured: usize = 0;
+    for (0..cluster.cluster.nodes.len) |i| {
+        if (cluster.node(i).status(group_id) != .active) continue;
+        try ensureGroupGraphIndex(cluster, replica_root_dirs[i], group_id, index_name, max_rounds);
+        ensured += 1;
+    }
+    if (ensured == 0) return error.TestExpectedEqual;
+}
+
 fn runtimeDocIdentityStatusReportFromStats(
     stats: db_mod.types.DocIdentityStats,
 ) metadata_table_manager.RuntimeDocIdentityStatusReport {
@@ -598,14 +735,20 @@ fn runtimeDocIdentityStatusReportFromStats(
     };
 }
 
+pub const RuntimeGroupMetricsOverride = struct {
+    doc_count: u64,
+    disk_bytes: u64,
+};
+
 pub fn reportRuntimeDocIdentityForActiveReplicas(
     cluster: *MetadataHttpClusterSimulation,
     node: anytype,
     replica_root_dirs: []const []const u8,
     table_name: []const u8,
     group_ids: []const u64,
+    metrics_override: ?RuntimeGroupMetricsOverride,
 ) !void {
-    const alloc = std.testing.allocator;
+    const alloc = cluster.alloc;
     var reports = std.ArrayListUnmanaged(metadata_table_manager.StoreStatusReport).empty;
     defer {
         for (reports.items) |report| {
@@ -631,6 +774,7 @@ pub fn reportRuntimeDocIdentityForActiveReplicas(
             var db = db_mod.DB.open(alloc, path, .{
                 .open_mode = .status_only,
                 .start_index_workers = false,
+                .backend_runtime = backendRuntimeForReplicaRoot(cluster, replica_root_dirs[i]),
             }) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -638,35 +782,52 @@ pub fn reportRuntimeDocIdentityForActiveReplicas(
             defer db.close();
             const stats = try db.runtimeStatusStatsConsistent(alloc);
             defer db_mod.types.freeDBStats(alloc, stats);
-            const now_ms = currentGroupStatusTimestampMs();
+            const now_ms = cluster.manual_clock.clock().nowRealtimeMs();
+            const reported_doc_count = if (metrics_override) |metrics| metrics.doc_count else stats.doc_count;
+            const reported_disk_bytes = if (metrics_override) |metrics| metrics.disk_bytes else 1;
+            const raft_status = cluster.cluster.node(i).raftStatus(group_id) orelse continue;
+            const local_node_id = cluster.cluster.configs[i].host.http.host.local_node_id;
+            const local_voter = std.mem.indexOfScalar(u64, raft_status.conf_state.voters, local_node_id) != null;
             try group_statuses.append(alloc, .{
                 .group_id = group_id,
-                .doc_count = stats.doc_count,
-                .disk_bytes = 1,
-                .empty = stats.doc_count == 0,
+                .raft_applied_index = raft_status.applied_index,
+                .raft_term = raft_status.hard.current_term,
+                .raft_membership_index = raft_status.applied_index,
+                .doc_count = reported_doc_count,
+                .disk_bytes = reported_disk_bytes,
+                .disk_bytes_known = true,
+                .empty = reported_doc_count == 0,
                 .updated_at_millis = now_ms,
-                .local_leader = currentGroupLeaderIndex(cluster, group_id) == i,
-                .local_voter = true,
-                .voter_count = 1,
+                .local_leader = raft_status.soft.role == .leader,
+                .local_voter = local_voter,
+                .voter_count = @intCast(raft_status.conf_state.voters.len),
+                .voter_set_known = true,
+                .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
+                .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
             });
-            try runtime_statuses.append(alloc, .{
+            const runtime_report = try metadata_table_manager.cloneRuntimeGroupStatusReport(alloc, .{
                 .table_id = stats.doc_identity.namespace_table_id,
-                .table_name = try alloc.dupe(u8, table_name),
+                .table_name = table_name,
                 .group_id = group_id,
                 .store_id = @intCast(i + 1),
                 .node_id = @intCast(i + 1),
                 .updated_at_ns = now_ms * std.time.ns_per_ms,
-                .source = try alloc.dupe(u8, "metadata-sim"),
-                .freshness = try alloc.dupe(u8, "fresh"),
-                .doc_count = stats.doc_count,
-                .disk_bytes = 1,
+                .source = "metadata-sim",
+                .freshness = "fresh",
+                .doc_count = reported_doc_count,
+                .disk_bytes = reported_disk_bytes,
+                .disk_bytes_known = true,
                 .created_at_millis = now_ms,
                 .index_count = stats.index_count,
                 .enrichment = .{
-                    .projection_checkpoint_status = try alloc.dupe(u8, "clean"),
+                    .projection_checkpoint_status = "clean",
                 },
                 .doc_identity = runtimeDocIdentityStatusReportFromStats(stats.doc_identity),
             });
+            runtime_statuses.append(alloc, runtime_report) catch |err| {
+                metadata_table_manager.freeRuntimeGroupStatusReport(alloc, runtime_report);
+                return err;
+            };
         }
 
         if (runtime_statuses.items.len == 0 and group_statuses.items.len == 0) continue;
@@ -695,6 +856,7 @@ fn seedGroupDocsAcrossReplicaRoots(
     group_id: u64,
     writes: []const db_mod.types.BatchWrite,
 ) !void {
+    const identity_namespace = try projectedIdentityNamespaceForGroup(cluster, group_id);
     for (replica_root_dirs) |replica_root_dir| {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(cluster.alloc, replica_root_dir, group_id);
         defer cluster.alloc.free(path);
@@ -703,6 +865,9 @@ fn seedGroupDocsAcrossReplicaRoots(
             .open_mode = .writer_no_replay,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
+            .backend_runtime = backendRuntimeForReplicaRoot(cluster, replica_root_dir),
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = identity_namespace != null,
         }) catch |err| switch (err) {
             error.PathAlreadyExists, error.FileNotFound => continue,
             else => return err,
@@ -1006,6 +1171,57 @@ const split_query_needles_without_mid = [_][]const u8{
     "\"_id\":\"doc:b\"",
     "\"_id\":\"doc:y\"",
 };
+
+const AcknowledgedPublicDataModel = struct {
+    const Entry = struct {
+        key: []const u8,
+        value_needle: []const u8,
+        query_needle: []const u8,
+    };
+
+    entries: [5]Entry = undefined,
+    len: usize = 0,
+
+    fn acknowledge(self: *@This(), entry: Entry) !void {
+        if (self.len == self.entries.len) return error.ReferenceModelCapacityExceeded;
+        self.entries[self.len] = entry;
+        self.len += 1;
+    }
+
+    fn verify(
+        self: *const @This(),
+        cluster: *MetadataHttpClusterSimulation,
+        client: *api_http_client.ApiHttpClient,
+        client_base: []const u8,
+        table_name: []const u8,
+        max_rounds: usize,
+    ) !void {
+        var query_needles: [5][]const u8 = undefined;
+        for (self.entries[0..self.len], 0..) |entry, index| {
+            const visible = try waitForLookupContains(
+                cluster,
+                client,
+                client_base,
+                table_name,
+                entry.key,
+                entry.value_needle,
+                max_rounds,
+            );
+            if (!visible) std.debug.print("acknowledged data missing after transition key={s}\n", .{entry.key});
+            try std.testing.expect(visible);
+            query_needles[index] = entry.query_needle;
+        }
+        try std.testing.expect(try waitForQueryContainsAll(
+            cluster,
+            client,
+            client_base,
+            table_name,
+            shared_hello_query_body,
+            query_needles[0..self.len],
+            max_rounds,
+        ));
+    }
+};
 const merge_query_needles = [_][]const u8{
     "\"_id\":\"doc:a\"",
     "\"_id\":\"doc:z\"",
@@ -1044,6 +1260,7 @@ const AutomaticSplitPublicTrafficFailureMode = enum {
     restart_metadata_leader,
     restart_source_group_leader,
     partition_metadata_leader,
+    partition_then_restart_source_with_storage_crash,
 };
 
 const AutomaticSplitPublicTrafficScenario = struct {
@@ -1057,8 +1274,11 @@ const AutomaticSplitPublicTrafficScenario = struct {
     finalize_rounds: usize,
     post_failure_leader_wait_rounds: usize = 0,
     ensure_source_group_text_index_before_transition: bool = false,
+    modeled_storage: bool = false,
     failure_mode: AutomaticSplitPublicTrafficFailureMode = .none,
+    storage_crash_after_split: bool = false,
     verify: SplitPublicVerificationConfig,
+    compose_merge: ?ComposedMergePublicTrafficConfig = null,
 };
 
 const AutomaticMergePublicTrafficFailureMode = enum {
@@ -1080,6 +1300,220 @@ const AutomaticMergePublicTrafficScenario = struct {
     post_failure_leader_wait_rounds: usize = 0,
     failure_mode: AutomaticMergePublicTrafficFailureMode = .none,
     verify: MergePublicVerificationConfig,
+};
+
+const ComposedMergePublicTrafficConfig = struct {
+    transition_id: u64,
+    finalize_rounds: usize,
+    post_failure_leader_wait_rounds: usize = 0,
+    failure_mode: AutomaticMergePublicTrafficFailureMode = .none,
+    verify: MergePublicVerificationConfig,
+};
+
+pub const DistributedDataVoprCampaignConfig = struct {
+    seed: u64,
+    table_id: u64 = 4553,
+
+    pub fn validate(self: @This()) !void {
+        if (self.table_id == 0 or self.table_id > std.math.maxInt(i64) / 10_000) return error.InvalidDistributedDataVoprTableId;
+    }
+
+    pub fn fromTrace(artifact: *const vopr.trace.Trace) !@This() {
+        if (!std.mem.eql(u8, artifact.header.system, "antfly") or
+            !std.mem.eql(u8, artifact.header.scenario, DistributedDataVoprScenario.name) or
+            artifact.header.scenario_version != DistributedDataVoprScenario.version)
+            return error.IncompatibleDistributedDataVoprTrace;
+        const table_parameter_id = vopr.id.stable("parameter", "distributed_data.table_id");
+        const table_id = for (artifact.config.scenario_parameters) |parameter| {
+            if (parameter.id != table_parameter_id) continue;
+            if (parameter.value <= 0) return error.InvalidDistributedDataVoprTableId;
+            break @as(u64, @intCast(parameter.value));
+        } else return error.DistributedDataVoprParameterMissing;
+        const config: @This() = .{
+            .seed = artifact.config.seed orelse return error.DistributedDataVoprSeedMissing,
+            .table_id = table_id,
+        };
+        try config.validate();
+        return config;
+    }
+};
+
+const DistributedDataVoprContext = struct {
+    config: DistributedDataVoprCampaignConfig,
+};
+
+pub const DistributedDataVoprScenario = struct {
+    pub const name: []const u8 = "distributed-data-vopr";
+    pub const version: u32 = 1;
+
+    const completed_property = vopr.id.stable("property", "distributed_data.split_merge_completed");
+    const acknowledged_property = vopr.id.stable("property", "distributed_data.acknowledged_data_survives");
+    pub const properties = &[_]vopr.property.Declaration{
+        .{ .id = completed_property, .name = "distributed_data.split_merge_completed", .kind = .reachable },
+        .{ .id = acknowledged_property, .name = "distributed_data.acknowledged_data_survives", .kind = .always },
+    };
+
+    const Stage = enum { transport, split_fault, merge_fault, execute, done };
+    const delayed_off_id = vopr.id.stable("transition", "distributed_data.transport.immediate");
+    const delayed_on_id = vopr.id.stable("transition", "distributed_data.transport.delayed");
+    const split_restart_metadata_id = vopr.id.stable("transition", "distributed_data.split.restart_metadata_leader");
+    const split_restart_source_id = vopr.id.stable("transition", "distributed_data.split.restart_source_leader");
+    const split_partition_metadata_id = vopr.id.stable("transition", "distributed_data.split.partition_metadata_leader");
+    const merge_none_id = vopr.id.stable("transition", "distributed_data.merge.no_additional_fault");
+    const merge_restart_metadata_id = vopr.id.stable("transition", "distributed_data.merge.restart_metadata_leader");
+    const merge_restart_donor_id = vopr.id.stable("transition", "distributed_data.merge.restart_donor_leader");
+    const merge_partition_metadata_id = vopr.id.stable("transition", "distributed_data.merge.partition_metadata_leader");
+    const execute_id = vopr.id.stable("transition", "distributed_data.execute_split_merge_history");
+
+    pub const World = struct {
+        context: *DistributedDataVoprContext,
+        stage: Stage = .transport,
+        delayed_transport: bool = false,
+        split_failure: AutomaticSplitPublicTrafficFailureMode = .partition_metadata_leader,
+        merge_failure: AutomaticMergePublicTrafficFailureMode = .none,
+        completed: bool = false,
+    };
+
+    pub fn init(_: std.mem.Allocator) !World {
+        return error.DistributedDataVoprContextRequired;
+    }
+
+    pub fn initWithContext(_: std.mem.Allocator, context_ptr: ?*anyopaque) !World {
+        const context: *DistributedDataVoprContext = @ptrCast(@alignCast(context_ptr orelse return error.DistributedDataVoprContextRequired));
+        try context.config.validate();
+        return .{ .context = context };
+    }
+
+    pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+
+    pub fn enumerate(world: *World, list: *vopr.transition.List, alloc: std.mem.Allocator) !void {
+        switch (world.stage) {
+            .transport => {
+                try list.append(alloc, .{ .id = delayed_off_id, .name = "distributed_data.transport.immediate", .kind = .scheduler });
+                try list.append(alloc, .{ .id = delayed_on_id, .name = "distributed_data.transport.delayed", .kind = .scheduler, .weight = 3 });
+            },
+            .split_fault => {
+                try list.append(alloc, .{ .id = split_restart_metadata_id, .name = "distributed_data.split.restart_metadata_leader", .kind = .fault });
+                try list.append(alloc, .{ .id = split_restart_source_id, .name = "distributed_data.split.restart_source_leader", .kind = .fault });
+                try list.append(alloc, .{ .id = split_partition_metadata_id, .name = "distributed_data.split.partition_metadata_leader", .kind = .fault, .weight = 2 });
+            },
+            .merge_fault => {
+                try list.append(alloc, .{ .id = merge_none_id, .name = "distributed_data.merge.no_additional_fault", .kind = .fault, .weight = 3 });
+                try list.append(alloc, .{ .id = merge_restart_metadata_id, .name = "distributed_data.merge.restart_metadata_leader", .kind = .fault });
+                try list.append(alloc, .{ .id = merge_restart_donor_id, .name = "distributed_data.merge.restart_donor_leader", .kind = .fault });
+                try list.append(alloc, .{ .id = merge_partition_metadata_id, .name = "distributed_data.merge.partition_metadata_leader", .kind = .fault });
+            },
+            .execute => try list.append(alloc, .{ .id = execute_id, .name = "distributed_data.execute_split_merge_history", .kind = .workload }),
+            .done => {},
+        }
+    }
+
+    pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, alloc: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
+        switch (world.stage) {
+            .transport => {
+                world.delayed_transport = selected.id == delayed_on_id;
+                if (!world.delayed_transport and selected.id != delayed_off_id) return error.InvalidDistributedDataTransportChoice;
+                world.stage = .split_fault;
+            },
+            .split_fault => {
+                world.split_failure = if (selected.id == split_restart_metadata_id)
+                    .restart_metadata_leader
+                else if (selected.id == split_restart_source_id)
+                    .restart_source_group_leader
+                else if (selected.id == split_partition_metadata_id)
+                    .partition_metadata_leader
+                else
+                    return error.InvalidDistributedDataSplitFaultChoice;
+                world.stage = .merge_fault;
+            },
+            .merge_fault => {
+                world.merge_failure = if (selected.id == merge_none_id)
+                    .none
+                else if (selected.id == merge_restart_metadata_id)
+                    .restart_metadata_leader
+                else if (selected.id == merge_restart_donor_id)
+                    .restart_donor_group_leader
+                else if (selected.id == merge_partition_metadata_id)
+                    .partition_metadata_leader
+                else
+                    return error.InvalidDistributedDataMergeFaultChoice;
+                world.stage = .execute;
+            },
+            .execute => {
+                if (selected.id != execute_id) return error.InvalidDistributedDataExecuteChoice;
+                const table_id = world.context.config.table_id;
+                try runAutomaticSplitPublicTrafficScenario(.{
+                    .table_id = table_id,
+                    .path_prefix = "metadata-vopr-distributed-generated",
+                    .description = "generated VOPR distributed data durability docs",
+                    .delayed_transport = world.delayed_transport,
+                    .bootstrap_rounds = 48,
+                    .range_create_rounds = 64,
+                    .projected_index_rounds = 96,
+                    .finalize_rounds = 160,
+                    .post_failure_leader_wait_rounds = 96,
+                    .ensure_source_group_text_index_before_transition = true,
+                    .modeled_storage = true,
+                    .failure_mode = world.split_failure,
+                    .storage_crash_after_split = true,
+                    .verify = .{
+                        .route_rounds = 96,
+                        .active_rounds = 96,
+                        .leader_rounds = 192,
+                        .lookup_rounds = 192,
+                        .count_profile_rounds = 192,
+                    },
+                    .compose_merge = .{
+                        .transition_id = table_id * 10_000 + 2,
+                        .finalize_rounds = 192,
+                        .post_failure_leader_wait_rounds = 96,
+                        .failure_mode = world.merge_failure,
+                        .verify = .{
+                            .active_rounds = 128,
+                            .absent_rounds = 128,
+                            .route_rounds = 128,
+                            .leader_rounds = 192,
+                            .lookup_rounds = 192,
+                            .expect_profile = true,
+                        },
+                    },
+                });
+                world.completed = true;
+                world.stage = .done;
+            },
+            .done => return error.DistributedDataVoprAlreadyDone,
+        }
+        try events.emit(alloc, .{
+            .id = vopr.id.stable("event", "distributed_data.phase_completed"),
+            .name = "distributed_data.phase_completed",
+            .kind = if (world.completed) .client_response else .state_change,
+            .payload_digest = @intFromEnum(world.stage),
+        });
+        return if (world.completed)
+            vopr.outcome.TransitionOutcome.targetReached("distributed_data.split_merge_completed", @intFromEnum(world.stage))
+        else
+            vopr.outcome.TransitionOutcome.applied();
+    }
+
+    pub fn observe(world: *World, builder: *vopr.observation.Builder, alloc: std.mem.Allocator) !void {
+        try builder.addNamed(alloc, "distributed_data.stage", @intFromEnum(world.stage));
+        try builder.addNamed(alloc, "distributed_data.transport_delayed", @intFromBool(world.delayed_transport));
+        try builder.addNamed(alloc, "distributed_data.split_fault", @intFromEnum(world.split_failure));
+        try builder.addNamed(alloc, "distributed_data.merge_fault", @intFromEnum(world.merge_failure));
+        try builder.addNamed(alloc, "distributed_data.storage_crash_required", 1);
+        try builder.addNamed(alloc, "distributed_data.acknowledged_documents", if (world.completed) 5 else 0);
+    }
+
+    pub fn evaluate(world: *World, sink: *vopr.property.Sink, alloc: std.mem.Allocator) !void {
+        try sink.check(alloc, completed_property, world.completed);
+        // The terminal physical transition returns only after the public
+        // five-document reference model and single-shard profile pass.
+        try sink.check(alloc, acknowledged_property, !world.completed or world.stage == .done);
+    }
+
+    pub fn done(world: *World) bool {
+        return world.stage == .done;
+    }
 };
 
 fn expectBodyContainsAll(body: []const u8, needles: []const []const u8) !void {
@@ -1328,6 +1762,7 @@ fn verifySplitPublicTraffic(
     table_name: []const u8,
     roots: []const []const u8,
     cfg: SplitPublicVerificationConfig,
+    acknowledged_model: ?*AcknowledgedPublicDataModel,
 ) !void {
     const groups = try waitForSplitResolvedGroups(cluster, catalog, table_name, cfg.route_rounds);
     try std.testing.expect(try cluster.waitForGroupStatusCountAtLeast(groups.left_group, .active, cfg.left_active_count, cfg.active_rounds));
@@ -1344,7 +1779,7 @@ fn verifySplitPublicTraffic(
     try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.right_group, api_tables.default_full_text_index_name, 40);
     const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
     const split_groups = [_]u64{ groups.left_group, groups.right_group };
-    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, split_groups[0..]);
+    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, split_groups[0..], null);
     try cluster.stepAll();
 
     try std.testing.expect(try waitForLookupContains(cluster, client, client_base, table_name, "doc:a", "\"alpha\"", cfg.lookup_rounds));
@@ -1353,6 +1788,10 @@ fn verifySplitPublicTraffic(
     var post_split_batch = try client.fetchBatch(client_base, table_name, split_post_batch_body);
     defer post_split_batch.deinit(std.heap.page_allocator);
     try expectBodyContainsAll(post_split_batch.body, &.{"\"inserted\":2"});
+    if (acknowledged_model) |model| {
+        try model.acknowledge(.{ .key = "doc:b", .value_needle = "\"beta\"", .query_needle = "\"_id\":\"doc:b\"" });
+        try model.acknowledge(.{ .key = "doc:y", .value_needle = "\"gamma\"", .query_needle = "\"_id\":\"doc:y\"" });
+    }
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, groups.left_group, table_name, split_left_post_batch_body);
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, groups.right_group, table_name, split_right_post_batch_body);
 
@@ -1369,6 +1808,7 @@ fn verifySplitPublicTraffic(
     if (cfg.count_profile_rounds) |count_rounds| {
         try std.testing.expect(try waitForHelloCountProfile(cluster, client, client_base, table_name, 5, 2, true, count_rounds));
     }
+    if (acknowledged_model) |model| try model.verify(cluster, client, client_base, table_name, cfg.lookup_rounds);
 }
 
 fn verifyMergePublicTraffic(
@@ -1396,7 +1836,7 @@ fn verifyMergePublicTraffic(
     try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, api_tables.default_full_text_index_name, 40);
     const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
     const merge_groups = [_]u64{merged_group};
-    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..]);
+    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..], null);
     try cluster.stepAll();
 
     try std.testing.expect(try waitForLookupContains(cluster, client, client_base, table_name, "doc:a", "\"alpha\"", cfg.lookup_rounds));
@@ -1422,8 +1862,37 @@ fn verifyMergePublicTraffic(
     }
 }
 
+fn verifyComposedMergePublicTraffic(
+    cluster: *MetadataHttpClusterSimulation,
+    client: *api_http_client.ApiHttpClient,
+    api_base_uris: []const []const u8,
+    catalog: api_table_catalog.CatalogSource,
+    table_name: []const u8,
+    roots: []const []const u8,
+    merged_group: u64,
+    removed_group: u64,
+    cfg: MergePublicVerificationConfig,
+    acknowledged_model: *AcknowledgedPublicDataModel,
+) !void {
+    try std.testing.expect(try cluster.waitForGroupStatusCount(merged_group, .active, cfg.merged_active_count, cfg.active_rounds));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(removed_group, .absent, cfg.removed_absent_count, cfg.absent_rounds));
+    _ = try waitForResolvedGroupForKey(cluster, catalog, table_name, "doc:z", merged_group, cfg.route_rounds);
+    const merged_leader_index = (try waitForGroupLeaderIndex(cluster, merged_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
+    const client_base = api_base_uris[merged_leader_index];
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, api_tables.default_full_text_index_name, 40);
+    const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
+    const merge_groups = [_]u64{merged_group};
+    try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..], null);
+    try cluster.stepAll();
+
+    try acknowledged_model.verify(cluster, client, client_base, table_name, cfg.lookup_rounds);
+    if (cfg.expect_profile) {
+        try std.testing.expect(try waitForHelloCountProfile(cluster, client, client_base, table_name, @intCast(acknowledged_model.len), 1, true, cfg.lookup_rounds));
+    }
+}
+
 fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenario) !void {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) modeled distributed-data scheduling retains a native storage differential root
     defer tmp.cleanup();
 
     const initial_group_id = cfg.table_id * 10 + 1;
@@ -1438,6 +1907,21 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    var modeled_devices: [3]storage_sim.ModeledDevice = undefined;
+    var modeled_device_count: usize = 0;
+    defer for (modeled_devices[0..modeled_device_count]) |*device| device.deinit();
+    var modeled_configurators: [3]ModeledDbOpenConfigurator = undefined;
+    if (cfg.modeled_storage) {
+        for (&modeled_devices, &modeled_configurators) |*device, *configurator| {
+            device.* = storage_sim.ModeledDevice.init(std.testing.allocator);
+            modeled_device_count += 1;
+            configurator.* = .{
+                .device = device,
+                .device_incarnation = modeled_device_count,
+            };
+        }
+    }
 
     var delayed_a: ?raft_sim.DelayingRequestExecutor = null;
     defer if (delayed_a) |*executor| executor.deinit();
@@ -1488,6 +1972,11 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, cfg.table_id, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
+    const factories = [_]*TestDescriptorFactory{ &factory_a, &factory_b, &factory_c };
+    if (cfg.modeled_storage) for (0..3) |index| {
+        cluster.backendRuntime(index).setDbOpenConfigurator(modeled_configurators[index].iface());
+        factories[index].split_runtime.backend_runtime = cluster.backendRuntime(index);
+    };
     const leader_index = try startBootstrappedMetadataCluster(&cluster, cfg.bootstrap_rounds, true);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
@@ -1516,29 +2005,51 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     const roots = [_][]const u8{ root_a, root_b, root_c };
     var public_api: PublicApiTestRig(3) = undefined;
     try public_api.initLeaderBackedInPlace(std.testing.allocator, &cluster, roots);
-    defer public_api.deinit();
+    var public_api_open = true;
+    defer if (public_api_open) public_api.deinit();
     var client = public_api.client;
     const client_index = (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual;
-    const client_base = public_api.api_base_uris[client_index];
+    var client_base = public_api.api_base_uris[client_index];
     try ensureGroupTextIndex(&cluster, roots[client_index], initial_group_id, api_tables.default_full_text_index_name, 40);
     try std.testing.expect(try waitForNodeProjectedTableFieldContains(&cluster, client_index, "docs", .indexes_json, "\"full_text_index_v0\"", true, cfg.projected_index_rounds));
 
     var pre_split_batch = try client.fetchBatch(client_base, "docs", split_seed_batch_body);
     defer pre_split_batch.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, pre_split_batch.body, "\"inserted\":3") != null);
+    var acknowledged_model = AcknowledgedPublicDataModel{};
+    if (cfg.modeled_storage) {
+        try acknowledged_model.acknowledge(.{ .key = "doc:a", .value_needle = "\"alpha\"", .query_needle = "\"_id\":\"doc:a\"" });
+        try acknowledged_model.acknowledge(.{ .key = "doc:m", .value_needle = "\"mid\"", .query_needle = "\"_id\":\"doc:m\"" });
+        try acknowledged_model.acknowledge(.{ .key = "doc:z", .value_needle = "\"zeta\"", .query_needle = "\"_id\":\"doc:z\"" });
+    }
     try mirrorGroupBatchToActiveReplicas(&cluster, &client, public_api.api_base_uris[0..], initial_group_id, "docs", split_seed_batch_body);
     try std.testing.expect(try waitForMedianKeyEquals(&cluster, cluster.node(leader_index), initial_group_id, "doc:m", 64));
 
     const source_leader = switch (cfg.failure_mode) {
-        .restart_source_group_leader, .restart_metadata_leader => (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual,
-        else => null,
+        .restart_source_group_leader, .restart_metadata_leader, .partition_then_restart_source_with_storage_crash => (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual,
+        else => if (cfg.storage_crash_after_split)
+            (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual
+        else
+            null,
     };
     if (cfg.ensure_source_group_text_index_before_transition) {
         const source_leader_index = source_leader orelse return error.TestExpectedEqual;
         try ensureGroupTextIndex(&cluster, roots[source_leader_index], initial_group_id, api_tables.default_full_text_index_name, 40);
     }
+    if (cfg.modeled_storage) {
+        const source_groups = [_]u64{initial_group_id};
+        try reportRuntimeDocIdentityForActiveReplicas(
+            &cluster,
+            cluster.node(leader_index),
+            roots[0..],
+            "docs",
+            source_groups[0..],
+            .{ .doc_count = 256, .disk_bytes = 180 },
+        );
+        try cluster.stepAll();
+    }
 
-    try reportSplitCandidateStatus(cluster.node(leader_index), initial_group_id, 256, 180, "doc:m");
+    if (!cfg.modeled_storage) try reportSplitCandidateStatus(cluster.node(leader_index), initial_group_id, 256, 180, "doc:m");
     try cluster.stepAll();
 
     const split_summary = try requireLeasedReconcile(cluster.node(leader_index), &auto_loop);
@@ -1560,7 +2071,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
             try cluster.restartNode(source_leader orelse return error.TestExpectedEqual);
             break :blk (try cluster.waitForMetadataLeader(cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
         },
-        .partition_metadata_leader => blk: {
+        .partition_metadata_leader, .partition_then_restart_source_with_storage_crash => blk: {
             try isolateMetadataNode(&cluster, query_index);
             break :blk (try waitForMetadataLeaderExcluding(&cluster, query_index, cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
         },
@@ -1572,7 +2083,193 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     const retirement = try retireFinalizedSplitTransition(cluster.node(verification_index), &auto_loop);
     try std.testing.expectEqual(@as(usize, 2), retirement.removal.range_upserts);
 
-    try verifySplitPublicTraffic(&cluster, &client, public_api.api_base_uris[0..], public_api.catalog_sources[verification_index].iface(), client_base, "docs", roots[0..], cfg.verify);
+    if (cfg.failure_mode == .partition_then_restart_source_with_storage_crash or cfg.storage_crash_after_split) {
+        if (!cfg.modeled_storage) return error.ModeledStorageRequired;
+        cluster.cluster.healAll();
+        const restart_index = source_leader orelse return error.TestExpectedEqual;
+        public_api.deinit();
+        public_api_open = false;
+        try modeled_devices[restart_index].device().crash();
+        try cluster.restartNode(restart_index);
+        _ = (try cluster.waitForMetadataLeader(cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+        try public_api.initLeaderBackedInPlace(std.testing.allocator, &cluster, roots);
+        public_api_open = true;
+        client = public_api.client;
+        client_base = public_api.api_base_uris[restart_index];
+    }
+
+    try verifySplitPublicTraffic(
+        &cluster,
+        &client,
+        public_api.api_base_uris[0..],
+        public_api.catalog_sources[verification_index].iface(),
+        client_base,
+        "docs",
+        roots[0..],
+        cfg.verify,
+        if (cfg.modeled_storage) &acknowledged_model else null,
+    );
+
+    if (cfg.compose_merge) |merge_cfg| {
+        if (!cfg.modeled_storage) return error.ModeledStorageRequired;
+        cluster.cluster.healAll();
+        try cluster.stepAll();
+
+        const merge_leader_index = currentMetadataLeaderIndex(&cluster) orelse
+            ((try cluster.waitForMetadataLeader(merge_cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual);
+        const merge_catalog = public_api.catalog_sources[merge_leader_index].iface();
+        const groups = try waitForSplitResolvedGroups(&cluster, merge_catalog, "docs", merge_cfg.verify.route_rounds);
+        try reportMergeCandidateStatuses(cluster.node(merge_leader_index), groups.left_group, 16, 10, groups.right_group, 12, 12);
+        try cluster.stepAll();
+
+        // Split assigns distinct document-identity namespaces to the two
+        // children. Their deliberate recombination therefore uses the public
+        // merge workflow's explicit reassignment opt-in; automatic admission
+        // correctly refuses to infer that policy decision.
+        const merge_summary = try workflow.requestMerge(&cluster.node(merge_leader_index), .{
+            .transition_id = merge_cfg.transition_id,
+            .table_id = cfg.table_id,
+            .donor_group_id = groups.right_group,
+            .receiver_group_id = groups.left_group,
+            .allow_doc_identity_reassignment = true,
+        });
+        try std.testing.expectEqual(@as(usize, 1), merge_summary.merge_upserts);
+        const merge_query_index = currentMetadataLeaderIndex(&cluster) orelse merge_leader_index;
+        const merge_transitions = try cluster.node(merge_query_index).listProjectedMergeTransitions(std.testing.allocator);
+        defer cluster.node(merge_query_index).freeProjectedMergeTransitions(std.testing.allocator, merge_transitions);
+        try std.testing.expectEqual(@as(usize, 1), merge_transitions.len);
+        const merge_transition_id = merge_transitions[0].transition_id;
+        const donor_leader_index = (try waitForGroupLeaderIndex(&cluster, groups.right_group, merge_cfg.verify.leader_rounds)) orelse return error.TestExpectedEqual;
+
+        const merge_observer_index: ?usize = switch (merge_cfg.failure_mode) {
+            .none => null,
+            .restart_metadata_leader => blk: {
+                try cluster.restartNode(merge_query_index);
+                break :blk (try cluster.waitForMetadataLeader(merge_cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+            },
+            .restart_donor_group_leader => blk: {
+                try cluster.restartNode(donor_leader_index);
+                break :blk (try cluster.waitForMetadataLeader(merge_cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+            },
+            .partition_metadata_leader => blk: {
+                try isolateMetadataNode(&cluster, merge_query_index);
+                break :blk (try waitForMetadataLeaderExcluding(&cluster, merge_query_index, merge_cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+            },
+        };
+
+        try std.testing.expect(try waitForMergeTransitionFinalized(
+            &cluster,
+            merge_transition_id,
+            merge_observer_index,
+            merge_query_index,
+            merge_cfg.finalize_rounds,
+        ));
+        // This HTTP topology rig models transition progress in
+        // `SimMergeRuntime`; it does not own the data server's borrowed DB
+        // leases. Materialize the modeled bootstrap on every active receiver
+        // replica before retiring the donor. The production-path regression
+        // for the same split->merge handoff lives beside DataServer's local
+        // merge fallback and exercises the real coordinator and leases.
+        try mirrorGroupBatchToActiveReplicas(
+            &cluster,
+            &client,
+            public_api.api_base_uris[0..],
+            groups.left_group,
+            "docs",
+            split_right_cutover_body,
+        );
+        try mirrorGroupBatchToActiveReplicas(
+            &cluster,
+            &client,
+            public_api.api_base_uris[0..],
+            groups.left_group,
+            "docs",
+            split_right_post_batch_body,
+        );
+        const merge_verification_index = merge_observer_index orelse (currentMetadataLeaderIndex(&cluster) orelse merge_query_index);
+        const merge_retirement = try retireFinalizedMergeTransition(cluster.node(merge_verification_index), workflow.controlLoop());
+        try std.testing.expectEqual(@as(usize, 1), merge_retirement.removal.range_upserts);
+        try std.testing.expectEqual(@as(usize, 1), merge_retirement.removal.range_removals);
+        try verifyComposedMergePublicTraffic(
+            &cluster,
+            &client,
+            public_api.api_base_uris[0..],
+            public_api.catalog_sources[merge_verification_index].iface(),
+            "docs",
+            roots[0..],
+            groups.left_group,
+            groups.right_group,
+            merge_cfg.verify,
+            &acknowledged_model,
+        );
+    }
+}
+
+pub fn runDistributedDataVoprCampaignWithChoices(
+    alloc: std.mem.Allocator,
+    config: DistributedDataVoprCampaignConfig,
+    source: vopr.choice.Source,
+    flight_recorder: ?*vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
+    try config.validate();
+    var context = DistributedDataVoprContext{ .config = config };
+    const parameters = [_]vopr.trace.Parameter{.named("distributed_data.table_id", @intCast(config.table_id))};
+    var backend_ids = [_]u64{
+        vopr.id.stable("backend", "raft.memory"),
+        vopr.id.stable("backend", "storage.modeled_lsm"),
+    };
+    std.mem.sort(u64, &backend_ids, {}, std.sort.asc(u64));
+    return try vopr.runner.run(DistributedDataVoprScenario, alloc, source, .{
+        .system = "antfly",
+        .seed = config.seed,
+        .transition_budget = 4,
+        .resource_budget = 3,
+        .backend_ids = &backend_ids,
+        .scenario_parameters = &parameters,
+        .source_revision = "distributed-data-vopr-v1",
+        .target = "native",
+        .optimize = "test",
+        .scenario_context = &context,
+        .flight_recorder = flight_recorder,
+    });
+}
+
+pub fn recordDistributedDataVoprCampaign(
+    alloc: std.mem.Allocator,
+    config: DistributedDataVoprCampaignConfig,
+) !vopr.trace.Trace {
+    var seeded = vopr.choice.Seeded.init(config.seed);
+    return try runDistributedDataVoprCampaignWithChoices(alloc, config, seeded.source(), null);
+}
+
+pub fn replayDistributedDataVoprCampaign(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+) !vopr.trace.Trace {
+    const config = try DistributedDataVoprCampaignConfig.fromTrace(recorded);
+    var context = DistributedDataVoprContext{ .config = config };
+    return try vopr.replay.exactWithContext(DistributedDataVoprScenario, alloc, recorded, &context);
+}
+
+pub fn reduceDistributedDataVoprCampaign(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    max_attempts: u64,
+) !vopr.reducer.Result {
+    const target = if (recorded.failures.items.len > 0)
+        recorded.failures.items[0].fingerprint
+    else
+        return error.FailingTraceRequired;
+    const config = try DistributedDataVoprCampaignConfig.fromTrace(recorded);
+    var context = DistributedDataVoprContext{ .config = config };
+    return vopr.reducer.reduceWithContext(
+        DistributedDataVoprScenario,
+        alloc,
+        recorded,
+        target,
+        .{ .max_attempts = max_attempts },
+        &context,
+    );
 }
 
 fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenario) !void {
@@ -1733,13 +2430,14 @@ fn makeGroupStatus(
     group_id: u64,
     doc_count: u64,
     disk_bytes: u64,
+    now_ms: u64,
 ) metadata_table_manager.GroupStatusReport {
     return .{
         .group_id = group_id,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
         .empty = false,
-        .updated_at_millis = currentGroupStatusTimestampMs(),
+        .updated_at_millis = now_ms,
     };
 }
 
@@ -1811,7 +2509,7 @@ fn buildHealthyStoreStatusReports(
     node: anytype,
     group_statuses: []const metadata_table_manager.GroupStatusReport,
 ) ![]metadata_table_manager.StoreStatusReport {
-    const alloc = std.testing.allocator;
+    const alloc = node.cluster.alloc;
     const projected_stores = try node.listProjectedStores(alloc);
     defer node.freeProjectedStores(alloc, projected_stores);
     const projected_intents = try node.listProjectedPlacementIntents(alloc);
@@ -1913,8 +2611,9 @@ fn reportHealthyStoreStatuses(
     node: anytype,
     group_statuses: []const metadata_table_manager.GroupStatusReport,
 ) !void {
+    const alloc = node.cluster.alloc;
     const reports = try buildHealthyStoreStatusReports(node, group_statuses);
-    defer freeOwnedSimStoreStatusReports(std.testing.allocator, reports);
+    defer freeOwnedSimStoreStatusReports(alloc, reports);
     try std.testing.expectEqual(reports.len, try node.reportStoreStatuses(reports));
 }
 
@@ -2036,8 +2735,9 @@ fn reportSplitCandidateStatus(
     median_key: ?[]const u8,
 ) !void {
     _ = median_key;
+    const now_ms = node.cluster.manual_clock.clock().nowRealtimeMs();
     const group_statuses = [_]metadata_table_manager.GroupStatusReport{
-        makeGroupStatus(group_id, doc_count, disk_bytes),
+        makeGroupStatus(group_id, doc_count, disk_bytes, now_ms),
     };
     try reportHealthyStoreStatuses(node, group_statuses[0..]);
 }
@@ -2051,9 +2751,10 @@ fn reportMergeCandidateStatuses(
     donor_doc_count: u64,
     donor_disk_bytes: u64,
 ) !void {
+    const now_ms = node.cluster.manual_clock.clock().nowRealtimeMs();
     const group_statuses = [_]metadata_table_manager.GroupStatusReport{
-        makeGroupStatus(receiver_group_id, receiver_doc_count, receiver_disk_bytes),
-        makeGroupStatus(donor_group_id, donor_doc_count, donor_disk_bytes),
+        makeGroupStatus(receiver_group_id, receiver_doc_count, receiver_disk_bytes, now_ms),
+        makeGroupStatus(donor_group_id, donor_doc_count, donor_disk_bytes, now_ms),
     };
     try reportHealthyStoreStatuses(node, group_statuses[0..]);
 }
@@ -2250,10 +2951,41 @@ fn projectedTableFieldContainsOnNode(
 }
 
 pub const SimMergeRuntime = struct {
+    const HostedLeaseContext = struct {
+        alloc: std.mem.Allocator,
+        lease: api_table_writes.HostedProvisionedTableWriteSource.GroupWriterLease,
+
+        fn release(ptr: *anyopaque) void {
+            const self: *HostedLeaseContext = @ptrCast(@alignCast(ptr));
+            self.lease.release();
+            const alloc = self.alloc;
+            alloc.destroy(self);
+        }
+
+        fn acquire(
+            alloc: std.mem.Allocator,
+            source: *api_table_writes.HostedProvisionedTableWriteSource,
+            group_id: u64,
+            table_name: []const u8,
+        ) !data_mod.storage.db_split_handoff.BorrowedDestinationDb {
+            const self = try alloc.create(HostedLeaseContext);
+            errdefer alloc.destroy(self);
+            self.* = .{
+                .alloc = alloc,
+                .lease = try source.leaseGroupWriter(alloc, group_id, table_name),
+            };
+            return .{
+                .db = self.lease.db(),
+                .ctx = self,
+                .release_fn = release,
+            };
+        }
+    };
+
     const Entry = struct {
         donor_group_id: u64,
         receiver_group_id: u64,
-        coord: ?*transition_runtime.MergeCoordinatorRuntime = null,
+        coord: ?*data_mod.MergeCoordinator = null,
         status: data_mod.MergeTransitionStatus = .{
             .phase = .prepare,
             .donor_group_id = 0,
@@ -2272,6 +3004,12 @@ pub const SimMergeRuntime = struct {
     entries: [16]Entry = undefined,
     len: usize = 0,
     replica_root_dir: ?[]const u8 = null,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    donor_replica_root_dir: ?[]const u8 = null,
+    donor_backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    donor_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
+    receiver_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
+    table_name: []const u8 = "docs",
 
     pub fn deinit(self: *@This()) void {
         for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
@@ -2319,45 +3057,14 @@ pub const SimMergeRuntime = struct {
         return &self.entries[self.len - 1];
     }
 
-    fn releaseCoordinator(self: *@This(), entry: *Entry) void {
-        _ = self;
-        if (entry.coord) |coord| {
-            coord.deinit();
-            std.heap.page_allocator.destroy(coord);
-            entry.coord = null;
-        }
-    }
-
-    fn withCoordinator(self: *@This(), donor_group_id: u64, receiver_group_id: u64) !*transition_runtime.MergeCoordinatorRuntime {
-        const entry = self.entryFor(donor_group_id, receiver_group_id);
-        if (entry.coord == null) {
-            const alloc = std.heap.page_allocator;
-            const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
-            const donor_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, donor_group_id);
-            defer alloc.free(donor_root_dir);
-            const receiver_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, receiver_group_id);
-            defer alloc.free(receiver_root_dir);
-
-            try SimSplitRuntime.ensureSourceApplyStoreSeeded(alloc, donor_root_dir, donor_group_id);
-
-            const coord = try alloc.create(transition_runtime.MergeCoordinatorRuntime);
-            errdefer alloc.destroy(coord);
-            coord.* = try transition_runtime.MergeCoordinatorRuntime.init(alloc, .{
-                .donor_root_dir = donor_root_dir,
-                .receiver_root_dir = receiver_root_dir,
-                .donor_group_id = donor_group_id,
-                .receiver_group_id = receiver_group_id,
-                .receiver = .{ .root_dir = receiver_root_dir },
-            });
-            entry.coord = coord;
-        }
-        return entry.coord.?;
-    }
-
     fn observeStatus(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !data_mod.MergeTransitionStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().observeStatus(donor_group_id, receiver_group_id);
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !data_mod.MergeTransitionStatus {
+                    return try coord.status();
+                }
+            }.call, .{});
         }
         return self.entryFor(donor_group_id, receiver_group_id).status;
     }
@@ -2365,7 +3072,11 @@ pub const SimMergeRuntime = struct {
     fn recordDocIdentityReassignment(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().recordDocIdentityReassignment(donor_group_id, receiver_group_id);
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !void {
+                    try coord.recordDocIdentityReassignmentOptIn();
+                }
+            }.call, .{});
         }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.allow_doc_identity_reassignment = true;
@@ -2374,7 +3085,11 @@ pub const SimMergeRuntime = struct {
     fn acceptReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().acceptReceiver(donor_group_id, receiver_group_id);
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !void {
+                    try coord.acceptDonorRange();
+                }
+            }.call, .{});
         }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .bootstrap_peer;
@@ -2384,7 +3099,12 @@ pub const SimMergeRuntime = struct {
     fn catchUpReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !usize {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().catchUpReceiver(donor_group_id, receiver_group_id);
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !usize {
+                    _ = try coord.ensureReceiverBootstrapped();
+                    return try coord.catchUp();
+                }
+            }.call, .{});
         }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .cutover_ready;
@@ -2401,9 +3121,11 @@ pub const SimMergeRuntime = struct {
     fn finalizeMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            const finalized = try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().finalizeMerge(donor_group_id, receiver_group_id);
-            if (finalized) self.releaseCoordinator(self.entryFor(donor_group_id, receiver_group_id));
-            return finalized;
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !bool {
+                    return try coord.finalizeMerge();
+                }
+            }.call, .{});
         }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .finalized;
@@ -2414,9 +3136,11 @@ pub const SimMergeRuntime = struct {
     fn rollbackMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
-            const rolled_back = try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().rollbackMerge(donor_group_id, receiver_group_id);
-            if (rolled_back) self.releaseCoordinator(self.entryFor(donor_group_id, receiver_group_id));
-            return rolled_back;
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !bool {
+                    return try coord.rollbackMerge();
+                }
+            }.call, .{});
         }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .rolled_back;
@@ -2427,6 +3151,116 @@ pub const SimMergeRuntime = struct {
         entry.status.cutover_ready = false;
         entry.status.receiver_ready_for_reads = false;
         return true;
+    }
+
+    fn releaseCoordinator(self: *@This(), entry: *Entry) void {
+        _ = self;
+        if (entry.coord) |coord| {
+            coord.deinit();
+            std.heap.page_allocator.destroy(coord);
+            entry.coord = null;
+        }
+    }
+
+    fn withCoordinator(
+        self: *@This(),
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        comptime Func: anytype,
+        args: anytype,
+    ) !@typeInfo(@TypeOf(Func)).@"fn".return_type.? {
+        const entry = self.entryFor(donor_group_id, receiver_group_id);
+        if (entry.coord == null) {
+            const alloc = std.heap.page_allocator;
+            const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
+            const donor_replica_root_dir = self.donor_replica_root_dir orelse replica_root_dir;
+            const donor_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, donor_replica_root_dir, donor_group_id);
+            defer alloc.free(donor_root_dir);
+            const receiver_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, receiver_group_id);
+            defer alloc.free(receiver_root_dir);
+
+            var donor_lease: ?data_mod.storage.db_split_handoff.BorrowedDestinationDb = if (self.donor_write_source) |source|
+                try HostedLeaseContext.acquire(alloc, source, donor_group_id, self.table_name)
+            else
+                null;
+            errdefer if (donor_lease) |lease| lease.release();
+            var receiver_lease: ?data_mod.storage.db_split_handoff.BorrowedDestinationDb = if (self.receiver_write_source) |source|
+                try HostedLeaseContext.acquire(alloc, source, receiver_group_id, self.table_name)
+            else
+                null;
+            errdefer if (receiver_lease) |lease| lease.release();
+
+            var seed_runtime = SimSplitRuntime{
+                .replica_root_dir = donor_replica_root_dir,
+                .backend_runtime = self.donor_backend_runtime orelse self.backend_runtime,
+            };
+            if (donor_lease) |lease|
+                try seed_runtime.ensureSourceApplyStoreSeededFromDb(alloc, donor_root_dir, donor_group_id, lease.db)
+            else
+                try seed_runtime.ensureSourceApplyStoreSeeded(alloc, donor_root_dir, donor_group_id);
+
+            var receiver_db_options = db_mod.OpenOptions{
+                .backend_runtime = self.backend_runtime,
+                .prefer_existing_identity_namespace = true,
+            };
+            const receiver_namespace = if (receiver_lease) |lease|
+                try identityNamespace(alloc, lease.db)
+            else
+                try self.receiverIdentityNamespace(alloc, receiver_root_dir);
+            if (receiver_namespace) |namespace| receiver_db_options.identity_namespace = namespace;
+            const donor_db_options = db_mod.OpenOptions{
+                .backend_runtime = self.donor_backend_runtime orelse self.backend_runtime,
+                .prefer_existing_identity_namespace = true,
+            };
+
+            const coord = try alloc.create(data_mod.MergeCoordinator);
+            errdefer alloc.destroy(coord);
+            const owned_donor_lease = donor_lease;
+            const owned_receiver_lease = receiver_lease;
+            donor_lease = null;
+            receiver_lease = null;
+            coord.* = try data_mod.MergeCoordinator.init(alloc, .{
+                .donor_root_dir = donor_root_dir,
+                .receiver_root_dir = receiver_root_dir,
+                .donor_group_id = donor_group_id,
+                .receiver_group_id = receiver_group_id,
+                .donor_db = donor_db_options,
+                .donor_lease = owned_donor_lease,
+                .receiver = .{ .root_dir = receiver_root_dir, .db = receiver_db_options },
+                .receiver_lease = owned_receiver_lease,
+                .receiver_identity_reassignment_namespace = receiver_namespace,
+            });
+            entry.coord = coord;
+        }
+        return @call(.auto, Func, .{entry.coord.?} ++ args);
+    }
+
+    fn receiverIdentityNamespace(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        receiver_root_dir: []const u8,
+    ) !?db_mod.DocIdentityNamespace {
+        var db = db_mod.DB.open(alloc, receiver_root_dir, .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .backend_runtime = self.backend_runtime,
+            .prefer_existing_identity_namespace = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer db.close();
+        return try identityNamespace(alloc, &db);
+    }
+
+    fn identityNamespace(alloc: std.mem.Allocator, db: *db_mod.DB) !?db_mod.DocIdentityNamespace {
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
+        if (stats.doc_identity.namespace_table_id == 0) return null;
+        return .{
+            .table_id = stats.doc_identity.namespace_table_id,
+            .shard_id = stats.doc_identity.namespace_shard_id,
+            .range_id = stats.doc_identity.namespace_range_id,
+        };
     }
 };
 
@@ -2457,7 +3291,15 @@ const TestDescriptorFactory = struct {
     merge_runtime: SimMergeRuntime = .{},
     group_stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
     primary_group_id: ?u64 = null,
+    trace_group_id: ?u64 = null,
+    trace_logger: ?raft_engine.core.TraceLogger = null,
     active_descriptors: usize = 0,
+    retain_transition_runtimes: bool = false,
+
+    fn deinitTransitionRuntimes(self: *@This()) void {
+        self.split_runtime.deinit();
+        self.merge_runtime.deinit();
+    }
 
     fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
         return .{
@@ -2502,6 +3344,7 @@ const TestDescriptorFactory = struct {
                     .pre_vote = false,
                     .check_quorum = true,
                     .step_down_on_removal = true,
+                    .trace_logger = if (self.trace_group_id == record.group_id) self.trace_logger else null,
                 },
                 .storage = store.storage(),
             },
@@ -2519,7 +3362,8 @@ const TestDescriptorFactory = struct {
         self.alloc.free(desc.group.raft_config.peers);
         std.debug.assert(self.active_descriptors > 0);
         self.active_descriptors -= 1;
-        if (self.active_descriptors == 0) self.split_runtime.deinit();
+        if (self.active_descriptors == 0 and !self.retain_transition_runtimes)
+            self.deinitTransitionRuntimes();
     }
 };
 
@@ -2551,6 +3395,15 @@ fn makeHostSimDeps(factory: *TestDescriptorFactory) raft_sim.ManagedHttpHostSimu
     return makeHostSimDepsWithTransportExecutor(factory, null);
 }
 
+fn makeHostSimDepsWithBorrowedIo(
+    factory: *TestDescriptorFactory,
+    io: std.Io,
+) raft_sim.ManagedHttpHostSimulationDeps {
+    var deps = makeHostSimDeps(factory);
+    deps.borrowed_io = io;
+    return deps;
+}
+
 fn makeHostSimDepsWithTransportExecutor(
     factory: *TestDescriptorFactory,
     request_executor: ?raft_transport.RequestExecutor,
@@ -2571,6 +3424,68 @@ fn makeHostSimDepsWithTransportExecutor(
             },
         },
     };
+}
+
+const ModeledDbOpenConfigurator = struct {
+    device: *storage_sim.ModeledDevice,
+    /// Stable identity of the modeled physical device. The DB path alone is
+    /// only a namespace: rebinding that namespace to a different device must
+    /// change the projection incarnation used by split/merge checkpoints.
+    device_incarnation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+
+    fn iface(self: *@This()) db_mod.background_runtime.DbOpenConfigurator {
+        return .{ .ptr = self, .configure_fn = configure };
+    }
+
+    fn configure(ptr: *anyopaque, path: []const u8, opaque_options: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const options: *db_mod.OpenOptions = @ptrCast(@alignCast(opaque_options));
+        options.primary_backend = .{ .lsm = .{ .flush_threshold = 1 } };
+        options.storage = self.device.storage();
+        options.resource_manager = self.resource_manager;
+        options.physical_root_mode = .external_backend;
+        const namespace_hash = std.hash.Wyhash.hash(0x6d6f6465_6c65642d, path);
+        options.external_root_incarnation =
+            (@as(u128, self.device_incarnation) << 64) | @as(u128, namespace_hash);
+        if (options.external_root_incarnation == 0)
+            options.external_root_incarnation = 1;
+        options.index_backends = .{
+            .text_main_backend = .lsm,
+            .text_lsm_storage = self.device.storage(),
+            .dense_storage_backend = .lsm,
+            .dense_lsm_storage = self.device.storage(),
+            .graph_reverse_backend = .lsm,
+            .graph_lsm_storage = self.device.storage(),
+        };
+    }
+};
+
+test "modeled DB configurator supplies stable physical-root incarnations" {
+    var device_a = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer device_a.deinit();
+    var device_b = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer device_b.deinit();
+
+    var configurator_a = ModeledDbOpenConfigurator{
+        .device = &device_a,
+        .device_incarnation = 11,
+    };
+    var configurator_b = ModeledDbOpenConfigurator{
+        .device = &device_b,
+        .device_incarnation = 12,
+    };
+    var first = db_mod.OpenOptions{};
+    var reopened = db_mod.OpenOptions{};
+    var rebound = db_mod.OpenOptions{};
+    try configurator_a.iface().configure("group-7/table-db", &first);
+    try configurator_a.iface().configure("group-7/table-db", &reopened);
+    try configurator_b.iface().configure("group-7/table-db", &rebound);
+
+    try std.testing.expectEqual(db_mod.OpenOptions.PhysicalRootMode.external_backend, first.physical_root_mode);
+    try std.testing.expect(first.external_root_incarnation != 0);
+    try std.testing.expectEqual(first.external_root_incarnation, reopened.external_root_incarnation);
+    try std.testing.expect(first.external_root_incarnation != rebound.external_root_incarnation);
 }
 
 pub const MetadataHttpNodeSimulation = struct {
@@ -2598,6 +3513,13 @@ pub const MetadataHttpNodeSimulation = struct {
         return self.sim().serviceMetrics();
     }
 
+    pub fn replaceTransitionOps(
+        self: MetadataHttpNodeSimulation,
+        ops: raft_shard_ops.ShardOperationAdapter,
+    ) !raft_shard_ops.OwnedShardOperationAdapter.Registration {
+        return try self.sim().runtime.svc.replaceTransitionOps(ops);
+    }
+
     pub fn metadataStatus(self: MetadataHttpNodeSimulation) !metadata_service.MetadataStatus {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
@@ -2607,6 +3529,12 @@ pub const MetadataHttpNodeSimulation = struct {
             self,
             self.serviceMetrics(),
         );
+    }
+
+    pub fn metadataIncarnation(self: MetadataHttpNodeSimulation) !?metadata_api.MetadataClusterIncarnation {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        return try store.getMetadataIncarnation(self.cluster.metadata_group_id);
     }
 
     pub fn adminSnapshot(self: MetadataHttpNodeSimulation) !metadata_api.AdminSnapshot {
@@ -2686,7 +3614,10 @@ pub const MetadataHttpNodeSimulation = struct {
         const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(db_path);
 
-        var db = db_mod.DB.open(alloc, db_path, .{ .open_mode = .status_only }) catch |err| switch (err) {
+        var db = db_mod.DB.open(alloc, db_path, .{
+            .open_mode = .status_only,
+            .backend_runtime = backendRuntimeForReplicaRoot(cluster, replica_root_dir),
+        }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -2895,6 +3826,10 @@ pub const MetadataHttpNodeSimulation = struct {
         _ = try self.reportStoreStatuses(&.{report});
     }
 
+    pub fn upsertSchemaProgress(self: MetadataHttpNodeSimulation, record: metadata_table_manager.SchemaProgressRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_schema_progress = record });
+    }
+
     pub fn reportStoreStatuses(self: MetadataHttpNodeSimulation, reports: []const metadata_table_manager.StoreStatusReport) !usize {
         const projected = try self.listProjectedStores(self.cluster.alloc);
         defer self.freeProjectedStores(self.cluster.alloc, projected);
@@ -2926,6 +3861,103 @@ pub const MetadataHttpNodeSimulation = struct {
 
     pub fn upsertTable(self: MetadataHttpNodeSimulation, record: metadata_table_manager.TableRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
+    }
+
+    /// Drive replication status through the same metadata-Raft transition
+    /// command used by the production service. Deployment-shaped VOPR tests
+    /// use these methods instead of maintaining a shadow status ledger.
+    pub fn upsertReplicationSourceStatus(
+        self: MetadataHttpNodeSimulation,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
+    }
+
+    pub fn claimReplicationSourceCutoverDurable(
+        self: MetadataHttpNodeSimulation,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = expected_replication_sources_json,
+            .expected_authority_id = expected_authority_id,
+            .record = record,
+        } });
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const current_table = (try store.getTable(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            record.table_id,
+        )) orelse return error.TableNotFound;
+        defer metadata_table_manager.freeTable(self.cluster.alloc, current_table);
+        if (!std.mem.eql(
+            u8,
+            current_table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return error.ReplicationSourceConfigChanged;
+        const current = (try store.getReplicationSourceStatus(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            record.table_id,
+            record.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.cluster.alloc, current);
+        if (!metadata_service.replicationCutoverIntentApplied(current, record))
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
+    pub fn replicationSourceAuthorityCurrent(
+        self: MetadataHttpNodeSimulation,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const current_table = (try store.getTable(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            expected.table_id,
+        )) orelse return error.ReplicationSourceConfigChanged;
+        defer metadata_table_manager.freeTable(self.cluster.alloc, current_table);
+        if (!std.mem.eql(
+            u8,
+            current_table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return error.ReplicationSourceConfigChanged;
+        const current = (try store.getReplicationSourceStatus(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.cluster.alloc, current);
+        if (!metadata_service.replicationCutoverAuthorityMatches(current, expected))
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: MetadataHttpNodeSimulation,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        try self.proposeTransitionCommand(.{
+            .complete_replication_source_retirement = expected,
+        });
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const current = (try store.getReplicationSourceStatus(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.cluster.alloc, current);
+        if (!metadata_service.replicationCutoverAuthorityMatches(current, expected) or
+            current.retired_cutover_authority_id != 0 or
+            current.retired_slot_name.len != 0 or
+            current.retired_publication_name.len != 0)
+            return error.ReplicationCutoverAuthorityLost;
     }
 
     pub fn replaceTableDefinition(
@@ -3111,19 +4143,38 @@ pub const MetadataHttpNodeSimulation = struct {
         defer self.cluster.metadata_proposal_in_flight -= 1;
         var operation_may_have_been_admitted = false;
 
+        // A composed deployment can report several data-server status changes
+        // at once. Concurrent proposals are valid, but concurrent attempts to
+        // recover an absent leader are not useful: each forced campaign raises
+        // a different term and the otherwise healthy quorum can livelock. One
+        // caller owns forced campaigns while every caller continues stepping
+        // the quorum and retrying its own proposal.
+        const owns_leader_recovery = self.cluster.metadata_leader_recovery_in_flight.cmpxchgStrong(
+            false,
+            true,
+            .acq_rel,
+            .acquire,
+        ) == null;
+        defer if (owns_leader_recovery)
+            self.cluster.metadata_leader_recovery_in_flight.store(false, .release);
+
         for (commands) |command| {
             const encoded = metadata_storage.encodeTransitionCommand(self.cluster.alloc, command) catch |err|
                 return simulationMutationError(err, operation_may_have_been_admitted);
             defer self.cluster.alloc.free(encoded);
 
-            const recovery_candidate_index = bestMetadataElectionCandidateIndex(self.cluster) orelse self.index;
             var attempts: usize = 0;
             command_retry: while (attempts < 8) : (attempts += 1) {
                 const target_index = self.cluster.currentMetadataLeaderIndex() orelse {
+                    // Nested/concurrent callers must not advance every
+                    // election clock while the recovery owner is trying to
+                    // establish one candidate. Their mutation is retryable;
+                    // returning preserves the single-owner election schedule.
+                    if (!owns_leader_recovery) return error.NotLeader;
                     // A single, up-to-date candidate breaks synchronized
                     // election ties without continuously advancing terms on
                     // different replicas.
-                    self.cluster.node(recovery_candidate_index).campaignMetadataGroup() catch |err| switch (err) {
+                    self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
                         error.UnknownGroup => {},
                         else => return simulationMutationError(err, operation_may_have_been_admitted),
                     };
@@ -3342,6 +4393,17 @@ const SimulationSchedulerGate = struct {
 };
 
 pub const MetadataHttpClusterSimulation = struct {
+    pub const DataPlaneOwnership = enum {
+        /// Metadata and data replicas are co-located in the managed-host
+        /// simulation. This remains the default for focused metadata tests.
+        co_located,
+        /// Only the metadata group is materialized by this harness. Projected
+        /// data placements remain authoritative metadata, but production
+        /// DataServer owners consume and report them instead of creating
+        /// shadow replicas in the metadata processes.
+        external,
+    };
+
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
     cluster: raft_sim.ManagedHttpClusterSimulation,
@@ -3361,8 +4423,10 @@ pub const MetadataHttpClusterSimulation = struct {
     scheduler_gate: SimulationSchedulerGate = .{},
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
+    metadata_leader_recovery_in_flight: std.atomic.Value(bool) = .init(false),
     metadata_proposal_post_apply_failure: ?anyerror = null,
     next_reallocation_request_id: u128 = 1,
+    data_plane_ownership: DataPlaneOwnership = .co_located,
 
     pub const ProgressPredicate = *const fn (*MetadataHttpClusterSimulation, *anyopaque) anyerror!bool;
     const min_pending_reconcile_lease_retry_ms: u64 = 250;
@@ -3519,6 +4583,7 @@ pub const MetadataHttpClusterSimulation = struct {
             .manual_clock = manual_clock,
             .reconcile_lease_update_in_flight = false,
             .metadata_proposal_in_flight = 0,
+            .metadata_leader_recovery_in_flight = .init(false),
         };
         try cluster.registerVirtualNodes();
         return cluster;
@@ -3549,6 +4614,21 @@ pub const MetadataHttpClusterSimulation = struct {
         try self.registerVirtualNodes();
     }
 
+    /// Selects who owns projected data replicas. Call this before publishing
+    /// any data placement when composing production DataServers with the real
+    /// metadata quorum.
+    pub fn setDataPlaneOwnership(
+        self: *MetadataHttpClusterSimulation,
+        ownership: DataPlaneOwnership,
+    ) void {
+        if (ownership == .external and self.data_plane_ownership != .external) {
+            for (0..self.cluster.nodes.len) |index|
+                self.cluster.node(index).disableTransitionOps();
+        }
+        self.data_plane_ownership = ownership;
+        @memset(self.placement_intent_hash_valid, false);
+    }
+
     pub fn stopAll(self: *MetadataHttpClusterSimulation) void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
@@ -3557,6 +4637,28 @@ pub const MetadataHttpClusterSimulation = struct {
 
     pub fn node(self: *MetadataHttpClusterSimulation, index: usize) MetadataHttpNodeSimulation {
         return .{ .cluster = self, .index = index };
+    }
+
+    /// Break deterministic election lockstep without inventing authority. The
+    /// replica with the freshest log must campaign in a term strictly newer
+    /// than every observed candidate; otherwise a lagging replica that ticks
+    /// first can repeatedly consume the shared next term without ever being
+    /// eligible for an up-to-date quorum's votes.
+    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterSimulation) !void {
+        const candidate_index = bestMetadataElectionCandidateIndex(self) orelse
+            return error.UnknownGroup;
+        var max_observed_term: u64 = 0;
+        for (self.cluster.nodes) |*replica| {
+            const status = replica.raftStatus(self.metadata_group_id) orelse continue;
+            max_observed_term = @max(max_observed_term, status.hard.current_term);
+        }
+        for (0..self.cluster.nodes.len + 2) |_| {
+            const status = self.cluster.node(candidate_index).raftStatus(self.metadata_group_id) orelse
+                return error.UnknownGroup;
+            if (status.hard.current_term > max_observed_term) return;
+            try self.cluster.node(candidate_index).campaignGroup(self.metadata_group_id);
+        }
+        return error.MetadataElectionTermDidNotAdvance;
     }
 
     pub fn backendRuntime(self: *MetadataHttpClusterSimulation, index: usize) *db_mod.background_runtime.BackendRuntime {
@@ -3580,6 +4682,20 @@ pub const MetadataHttpClusterSimulation = struct {
         for (0..self.cluster.nodes.len) |i| {
             try self.refreshOwnedMetadataRuntimes(i);
         }
+    }
+
+    /// One atomic node round for the VOPR scheduler. Network delivery and time
+    /// advancement are intentionally separate transitions.
+    pub fn stepNode(self: *MetadataHttpClusterSimulation, index: usize) anyerror!void {
+        if (index >= self.cluster.nodes.len) return error.InvalidNodeIndex;
+        try self.refreshOwnedMetadataRuntimes(index);
+        _ = try self.cluster.node(index).stepOnce();
+        try self.refreshOwnedMetadataRuntimes(index);
+    }
+
+    pub fn advanceSimTime(self: *MetadataHttpClusterSimulation, ticks: u64) void {
+        self.manual_clock.advanceMs(ticks *| 100);
+        self.virtual_network.advanceClockTicks(ticks);
     }
 
     pub fn stepAllExcept(self: *MetadataHttpClusterSimulation, stalled_index: usize) anyerror!void {
@@ -3659,7 +4775,7 @@ pub const MetadataHttpClusterSimulation = struct {
         return null;
     }
 
-    fn currentMetadataLeaderIndex(self: *MetadataHttpClusterSimulation) ?usize {
+    pub fn currentMetadataLeaderIndex(self: *MetadataHttpClusterSimulation) ?usize {
         return bestMetadataLeaderIndex(self);
     }
 
@@ -3916,6 +5032,9 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     fn refreshLocalPlacementIntents(self: *MetadataHttpClusterSimulation, index: usize) !void {
+        if (self.data_plane_ownership == .external)
+            return try self.refreshMetadataPlacementIntent(index);
+
         const sim = self.cluster.node(index);
         const store = sim.runtime.svc.host.owned_metadata_store orelse return;
         const local_node_id = self.cluster.configs[index].host.http.host.local_node_id;
@@ -3980,6 +5099,93 @@ pub const MetadataHttpClusterSimulation = struct {
         }
 
         try sim.runtime.svc.host.replacePlacementIntents(local);
+        _ = try sim.runtime.svc.host.reconcileOnce();
+        self.placement_intent_hashes[index] = local_hash;
+        self.placement_intent_hash_valid[index] = true;
+    }
+
+    /// Reconciles only the metadata replica into a metadata process. Data
+    /// placements stay in the replicated metadata store for external
+    /// DataServers to consume, but cannot accidentally instantiate a second,
+    /// test-owned data plane with the same node and group identities.
+    fn refreshMetadataPlacementIntent(self: *MetadataHttpClusterSimulation, index: usize) !void {
+        const sim = self.cluster.node(index);
+        const store = sim.runtime.svc.host.owned_metadata_store orelse return;
+        const local_node_id = self.cluster.configs[index].host.http.host.local_node_id;
+        const projected = try store.listLocalPlacementIntents(
+            self.alloc,
+            self.metadata_group_id,
+            local_node_id,
+        );
+        defer store.freePlacementIntents(self.alloc, projected);
+
+        var selected: []const raft_reconciler.PlacementIntent = &.{};
+        for (projected, 0..) |intent, intent_index| {
+            if (intent.record.group_id != self.metadata_group_id) continue;
+            selected = projected[intent_index .. intent_index + 1];
+            break;
+        }
+
+        var synthesized: [1]raft_reconciler.PlacementIntent = undefined;
+        var synthesized_peers: ?[]u64 = null;
+        defer if (synthesized_peers) |peers| self.alloc.free(peers);
+        if (selected.len == 0) {
+            if (sim.runtime.svc.host.http_host.host.raftStatus(self.metadata_group_id)) |status| {
+                synthesized_peers = try allocPeerNodeIdsExcludingSelf(
+                    self.alloc,
+                    status.conf_state.voters,
+                    local_node_id,
+                );
+                synthesized[0] = .{
+                    .record = .{
+                        .group_id = self.metadata_group_id,
+                        .replica_id = local_node_id,
+                        .local_node_id = local_node_id,
+                        .bootstrap_mode = .persisted,
+                    },
+                    .peer_node_ids = synthesized_peers.?,
+                };
+                selected = synthesized[0..];
+            }
+        }
+
+        const local_hash = hashPlacementIntentSlice(selected);
+        if (self.placement_intent_hash_valid[index] and
+            self.placement_intent_hashes[index] == local_hash)
+        {
+            _ = try sim.runtime.svc.host.reconcileOnce();
+            return;
+        }
+
+        const base_uris = try self.alloc.alloc([]u8, self.cluster.nodes.len);
+        defer {
+            for (base_uris) |uri| self.alloc.free(uri);
+            self.alloc.free(base_uris);
+        }
+        for (0..self.cluster.nodes.len) |peer_index|
+            base_uris[peer_index] = try self.nodeBaseUri(self.alloc, peer_index);
+
+        for (selected) |intent| {
+            for (intent.peer_node_ids) |node_id| {
+                if (node_id == local_node_id) continue;
+                const peer_index = self.indexForNodeId(node_id) orelse continue;
+                try sim.runtime.svc.host.apply(.{
+                    .peer_route = .{
+                        .upsert = .{
+                            .group_id = self.metadata_group_id,
+                            .node_id = node_id,
+                            .endpoints = &.{.{
+                                .protocol = .http,
+                                .address = base_uris[peer_index],
+                                .metadata = "",
+                            }},
+                        },
+                    },
+                });
+            }
+        }
+
+        try sim.runtime.svc.host.replacePlacementIntents(selected);
         _ = try sim.runtime.svc.host.reconcileOnce();
         self.placement_intent_hashes[index] = local_hash;
         self.placement_intent_hash_valid[index] = true;
@@ -4396,6 +5602,12 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
             const peer_status = peer.raftStatus(cluster.metadata_group_id) orelse continue;
             if (peer_status.hard.current_term == status.hard.current_term and peer_status.soft.leader_id == status.id) support += 1;
         }
+        // A local leader role is not sufficient authority for mutations. A
+        // former leader can retain that soft state while a quorum has moved to
+        // a higher term; routing proposals to it suppresses the recovery path
+        // and guarantees that the proposed index cannot commit.
+        const quorum = cluster.cluster.nodes.len / 2 + 1;
+        if (support < quorum) continue;
         if (best_index == null or
             support > best_support or
             (support == best_support and status.hard.current_term > best_term) or
@@ -4638,12 +5850,9 @@ fn bootstrapDesiredLoop(
     node: MetadataHttpNodeSimulation,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !void {
+    loop.setClock(node.cluster.manual_clock.clock());
     try loop.stateRef().syncProjected(node);
     try loop.stateRef().seedDesiredFromProjected();
-}
-
-fn currentGroupStatusTimestampMs() u64 {
-    return platform_clock.Clock.real().nowRealtimeMs();
 }
 
 fn metadataBlackholeEndpoints() []const peer_resolver.PeerEndpoint {
@@ -5018,7 +6227,7 @@ const PublicApiLinearizableReadDriver = struct {
         const sequence = try self.activateRequest(cluster.metadata_group_id);
         var request_context_buf: [96]u8 = undefined;
         const request_context = try self.requestContext(&request_context_buf, sequence);
-        cluster.cluster.node(self.node_index).runtime.svc.requestReadableLease(
+        cluster.cluster.node(self.node_index).runtime.svc.requestReadIndex(
             cluster.metadata_group_id,
             request_context,
         ) catch |err| switch (err) {
@@ -5257,26 +6466,67 @@ const PublicApiStatusSource = struct {
     }
 };
 
-const MetadataAdminSimSource = struct {
+pub const MetadataAdminSimSource = struct {
     node: MetadataHttpNodeSimulation,
 
-    fn iface(self: *@This()) metadata_http_server.AdminSource {
+    pub fn iface(self: *@This()) metadata_http_server.AdminSource {
         return .{
             .ptr = self,
             .vtable = &.{
+                .head = head,
+                .linearizable_head = linearizableHead,
+                .linearizable_snapshot = linearizableSnapshot,
                 .status = status,
                 .admin_snapshot = adminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+                .validate_publication = validatePublication,
+                .validate_table_publication = validateTablePublication,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .create_table = createTable,
+                .drop_table = dropTable,
+                .update_schema = updateSchema,
+                .create_index = createIndex,
+                .drop_index = dropIndex,
                 .upsert_node = upsertNode,
                 .request_node_shutdown = requestNodeShutdown,
                 .cancel_node_shutdown = cancelNodeShutdown,
                 .finalize_node_shutdown = finalizeNodeShutdown,
                 .upsert_store = upsertStore,
+                .report_store_status = reportStoreStatus,
+                .upsert_schema_progress = upsertSchemaProgress,
                 .trigger_reallocate = triggerReallocate,
                 .request_split = requestSplit,
                 .request_merge = requestMerge,
             },
         };
+    }
+
+    fn head(ptr: *anyopaque) !metadata_api.MetadataHead {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const current = try self.node.metadataStatus();
+        return .{
+            .metadata_group_id = current.metadata_group_id,
+            .metadata_incarnation = current.metadata_incarnation,
+            .metadata_epoch = current.metadata_epoch,
+        };
+    }
+
+    fn linearizableHead(ptr: *anyopaque, request: api_operation.RequestContext) !metadata_api.MetadataHead {
+        try request.ensureActive();
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        return try head(ptr);
+    }
+
+    fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !metadata_api.AdminSnapshot {
+        try request.ensureActive();
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        return try target.adminSnapshot();
     }
 
     fn status(ptr: *anyopaque) !metadata_api.MetadataStatus {
@@ -5289,9 +6539,104 @@ const MetadataAdminSimSource = struct {
         return try self.node.adminSnapshot();
     }
 
+    fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.node.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn linearizableRoutingSnapshot(
+        ptr: *anyopaque,
+        request: api_operation.RequestContext,
+    ) !metadata_api.CatalogRoutingSnapshot {
+        try request.ensureActive();
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        return try target.catalogRoutingSnapshot(request.deadline_ns);
+    }
+
+    fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.node.freeCatalogRoutingSnapshot(snapshot);
+    }
+
+    fn validatePublication(
+        ptr: *anyopaque,
+        contract: metadata_api.CatalogPublicationContract,
+    ) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        var snapshot = try target.adminSnapshot();
+        defer target.freeAdminSnapshot(&snapshot);
+        return contract.matches(&snapshot);
+    }
+
+    fn validateTablePublication(
+        ptr: *anyopaque,
+        contract: metadata_api.CatalogTablePublicationContract,
+    ) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        var snapshot = try target.adminSnapshot();
+        defer target.freeAdminSnapshot(&snapshot);
+        return contract.matches(&snapshot);
+    }
+
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.node.freeAdminSnapshot(snapshot);
+    }
+
+    fn createTable(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        table_name: []const u8,
+        req: api_tables.CreateTableRequest,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyCreateTableMutation(self.node, table_name, req);
+    }
+
+    fn dropTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        _ = try applyDropTableMutation(self.node, alloc, table_name);
+    }
+
+    fn updateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyUpdateSchemaMutation(self.node, alloc, table_name, schema_json);
+    }
+
+    fn createIndex(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        index_json: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyCreateIndexMutation(self.node, alloc, table_name, index_name, index_json);
+    }
+
+    fn dropIndex(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyDropIndexMutation(self.node, alloc, table_name, index_name);
     }
 
     fn upsertNode(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
@@ -5299,28 +6644,24 @@ const MetadataAdminSimSource = struct {
         defer metadata_table_manager.freeNode(alloc, record);
         const target = currentMetadataMutationNode(self.node);
         try target.registerNode(record);
-        try target.runRound();
     }
 
     fn requestNodeShutdown(ptr: *anyopaque, node_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = currentMetadataMutationNode(self.node);
         try target.requestNodeShutdown(node_id);
-        try target.runRound();
     }
 
     fn cancelNodeShutdown(ptr: *anyopaque, node_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = currentMetadataMutationNode(self.node);
         try target.cancelNodeShutdown(node_id);
-        try target.runRound();
     }
 
     fn finalizeNodeShutdown(ptr: *anyopaque, node_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = currentMetadataMutationNode(self.node);
         try target.finalizeNodeShutdown(node_id);
-        try target.runRound();
     }
 
     fn upsertStore(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) !void {
@@ -5328,14 +6669,33 @@ const MetadataAdminSimSource = struct {
         defer metadata_table_manager.freeStore(alloc, record);
         const target = currentMetadataMutationNode(self.node);
         try target.registerStore(record);
-        try target.runRound();
+    }
+
+    fn reportStoreStatus(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        report: metadata_table_manager.StoreStatusReport,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        defer metadata_node_operations.freeStoreStatusReport(alloc, report);
+        const target = currentMetadataMutationNode(self.node);
+        try target.reportStoreStatus(report);
+    }
+
+    fn upsertSchemaProgress(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        record: metadata_table_manager.SchemaProgressRecord,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        try target.upsertSchemaProgress(record);
     }
 
     fn triggerReallocate(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = currentMetadataMutationNode(self.node);
         try target.requestReallocation(1);
-        try target.runRound();
     }
 
     fn requestSplit(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.SplitRequest) !void {
@@ -5356,7 +6716,6 @@ const MetadataAdminSimSource = struct {
             .destination_group_id = req.destination_group_id orelse deriveGroupId(table_name, req.split_key, 0x53504c47, source_group_id),
             .split_key = req.split_key,
         });
-        try target.runRound();
     }
 
     fn requestMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.MergeRequest) !void {
@@ -5376,7 +6735,6 @@ const MetadataAdminSimSource = struct {
             .receiver_group_id = req.receiver_group_id,
             .allow_doc_identity_reassignment = req.allow_doc_identity_reassignment,
         });
-        try target.runRound();
     }
 };
 
@@ -5528,6 +6886,7 @@ fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, pass
 fn PublicApiServerOptions(comptime N: usize) type {
     return struct {
         auth_managers: ?*[N]SimAuthManager = null,
+        resource_managers: ?*[N]resource_manager_mod.ResourceManager = null,
     };
 }
 
@@ -5535,10 +6894,11 @@ fn startPublicApiServers(
     comptime N: usize,
     alloc: std.mem.Allocator,
     cluster: *MetadataHttpClusterSimulation,
-    shared_io: *std.Io.Threaded,
+    shared_io: std.Io,
+    async_limit: std.Io.Limit,
     roots: *const [N][]const u8,
     metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode,
-    forward_executor: *std_http_executor.StdHttpExecutor,
+    forward_executor: http_common.RequestExecutor,
     listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
@@ -5563,29 +6923,30 @@ fn startPublicApiServers(
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
-            forward_executor.executor(),
+            forward_executor,
         );
-        _ = read_sources[i].withIo(shared_io);
+        _ = read_sources[i].withIoInterface(shared_io, async_limit);
         _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
-            forward_executor.executor(),
+            forward_executor,
         );
         _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
-            .auth_enabled = true,
-            .user_manager = &auth_managers[i].manager,
-            .internal_service_secret = sim_internal_service_secret,
-            .internal_service_issuer = "metadata-sim",
-        } else .{
+        var server_config: api_http_server.ApiHttpServerConfig = .{
             .internal_service_secret = sim_internal_service_secret,
             .internal_service_issuer = "metadata-sim",
         };
+        if (options.auth_managers) |auth_managers| {
+            server_config.auth_enabled = true;
+            server_config.user_manager = &auth_managers[i].manager;
+        }
+        if (options.resource_managers) |resource_managers|
+            server_config.resource_manager = &resource_managers[i];
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             alloc,
             http_alloc,
@@ -5711,10 +7072,11 @@ fn PublicApiTestRig(comptime N: usize) type {
                 N,
                 alloc,
                 cluster,
-                &self.http_io,
+                self.http_io.io(),
+                self.http_io.async_limit,
                 &roots,
                 metadata_snapshot_mode,
-                &self.forward_executor,
+                self.forward_executor.executor(),
                 &self.listeners,
                 &self.servers,
                 &self.status_sources,
@@ -5761,12 +7123,1495 @@ fn PublicApiTestRig(comptime N: usize) type {
     };
 }
 
+/// Deployment-shaped metadata/data/public-HTTP owner graph for the composed
+/// full-cluster VOPR scenario. Metadata and Raft retain their deterministic
+/// explicit-step transport while every public listener, forwarding request,
+/// client, timeout, and shutdown task borrows the caller's single VoprIo.
+pub const VoprPublicClusterFixture = struct {
+    pub const BootstrapPhase = enum(u8) {
+        created,
+        local_resources_ready,
+        metadata_runtime_ready,
+        raft_wire_ready,
+        metadata_quorum_ready,
+        projected_tables_ready,
+        hosted_data_ready,
+        public_stack_ready,
+    };
+
+    pub const FaultMode = enum { clean, metadata_partition, node_restart, graph_inflight_restart, graph_topology_churn, graph_transport_failure, partial_http_write, resource_pressure };
+    pub const node_count = 3;
+    pub const metadata_group_id: u64 = 6840;
+    pub const table_id: u64 = 6841;
+    pub const data_group_id: u64 = 6842;
+    pub const tenant_table_id: u64 = 6843;
+    pub const tenant_data_group_id: u64 = 6844;
+    pub const graph_data_group_id: u64 = 6845;
+    const graph_index_name = "graph_idx";
+    const graph_indexes_json =
+        "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"graph_idx\":{\"type\":\"graph\"}}";
+
+    alloc: std.mem.Allocator,
+    sim: *vopr.vopr_io.VoprIo,
+    tmp: std.testing.TmpDir,
+    roots: [node_count][]u8 = undefined,
+    root_count: usize = 0,
+    catalogs: [node_count][]u8 = undefined,
+    catalog_count: usize = 0,
+    stores: [node_count]raft_engine.core.MemoryStorage = undefined,
+    store_count: usize = 0,
+    factories: [node_count]TestDescriptorFactory = undefined,
+    factory_count: usize = 0,
+    modeled_devices: [node_count]storage_sim.ModeledDevice = undefined,
+    modeled_device_count: usize = 0,
+    modeled_configurators: [node_count]ModeledDbOpenConfigurator = undefined,
+    resource_managers: [node_count]resource_manager_mod.ResourceManager = undefined,
+    resource_manager_count: usize = 0,
+    resource_reservations: [node_count]?resource_manager_mod.BatchReservation = .{null} ** node_count,
+    cluster: MetadataHttpClusterSimulation = undefined,
+    cluster_live: bool = false,
+    cluster_started: bool = false,
+    raft_wire_executor: io_http_executor.IoHttpExecutor = undefined,
+    raft_wire_executor_live: bool = false,
+    raft_wire_runtimes: [node_count]raft_transport.HttpxRuntime = undefined,
+    raft_wire_runtime_count: usize = 0,
+    raft_wire_targets: [node_count]raft_transport.AbsoluteHttpExecutor = undefined,
+    raft_wire_requests: u64 = 0,
+    listeners: [node_count]api_http_test_runtime.Runtime = undefined,
+    servers: [node_count]api_http_server.ApiHttpServer = undefined,
+    status_sources: [node_count]PublicApiStatusSource = undefined,
+    catalog_sources: [node_count]PublicApiCatalogSource = undefined,
+    routers: [node_count]PublicApiRouter(node_count) = undefined,
+    read_sources: [node_count]api_table_reads.HostedProvisionedTableReadSource = undefined,
+    write_sources: [node_count]api_table_writes.HostedProvisionedTableWriteSource = undefined,
+    api_base_uris: [node_count][]const u8 = undefined,
+    uri_count: usize = 0,
+    forward_http_executor: io_http_executor.IoHttpExecutor = undefined,
+    client_http_executor: io_http_executor.IoHttpExecutor = undefined,
+    forward_executor_live: bool = false,
+    client_executor_live: bool = false,
+    stack_live: bool = false,
+    client: api_http_client.ApiHttpClient = undefined,
+    metadata_leader_index: usize = 0,
+    client_index: usize = 0,
+    graph_remote_client_index: usize = 0,
+    graph_restart_node_index: usize = 0,
+    actual_host_count: usize = 0,
+    write_done: std.Io.Event = .unset,
+    tenant_write_done: std.Io.Event = .unset,
+    resource_recovered: std.Io.Event = .unset,
+    graph_round_paused: std.Io.Event = .unset,
+    graph_fault_recovered: std.Io.Event = .unset,
+    graph_fault_workload_ready: std.Io.Event = .unset,
+    fault_mode: FaultMode = .clean,
+    write_finished: bool = false,
+    read_finished: bool = false,
+    tenant_write_finished: bool = false,
+    tenant_read_finished: bool = false,
+    graph_read_finished: bool = false,
+    fault_finished: bool = false,
+    write_sound: bool = false,
+    read_sound: bool = false,
+    tenant_write_sound: bool = false,
+    tenant_read_sound: bool = false,
+    table_isolation_sound: bool = false,
+    graph_query_sound: bool = false,
+    graph_inflight_restart_observed: bool = false,
+    graph_inflight_restart_recovered: bool = false,
+    graph_topology_churn_observed: bool = false,
+    graph_topology_churn_finalized: bool = false,
+    graph_topology_churn_error_code: u64 = 0,
+    graph_topology_partial_rejected_sound: bool = false,
+    graph_transport_failure_injected: bool = false,
+    graph_transport_failure_observed: bool = false,
+    graph_transport_failure_error_code: u64 = 0,
+    graph_partial_rejected_sound: bool = false,
+    topology_sound: bool = false,
+    resource_denial_sound: bool = false,
+    resource_recovery_sound: bool = false,
+    resource_pressure_observed: bool = false,
+    resource_denial_error_code: u64 = 0,
+    cleanup_sound: bool = false,
+    request_errors: u64 = 0,
+    last_request_error_code: u64 = 0,
+    complete: bool = false,
+    bootstrap_phase: BootstrapPhase = .created,
+    teardown_started: bool = false,
+
+    pub fn init(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*VoprPublicClusterFixture {
+        return initWithDataPlaneOwnership(alloc, sim, .co_located);
+    }
+
+    /// Construct the metadata quorum with projected data placements owned by
+    /// external production DataServers from the first reconciliation round.
+    /// This avoids materializing a shadow hosted data plane merely to tear it
+    /// down again before the production owners start.
+    pub fn initExternalDataPlane(
+        alloc: std.mem.Allocator,
+        sim: *vopr.vopr_io.VoprIo,
+    ) !*VoprPublicClusterFixture {
+        return initWithDataPlaneOwnership(alloc, sim, .external);
+    }
+
+    fn initWithDataPlaneOwnership(
+        alloc: std.mem.Allocator,
+        sim: *vopr.vopr_io.VoprIo,
+        data_plane_ownership: MetadataHttpClusterSimulation.DataPlaneOwnership,
+    ) !*VoprPublicClusterFixture {
+        const self = try create(alloc, sim);
+        errdefer self.deinit();
+        try self.bootstrapWithDataPlaneOwnership(data_plane_ownership);
+        return self;
+    }
+
+    pub fn create(
+        alloc: std.mem.Allocator,
+        sim: *vopr.vopr_io.VoprIo,
+    ) !*VoprPublicClusterFixture {
+        const self = try alloc.create(VoprPublicClusterFixture);
+        self.* = .{
+            .alloc = alloc,
+            .sim = sim,
+            .tmp = std.testing.tmpDir(.{}), // vopr-audit: allow(host_filesystem) unique process-local namespace; all modeled I/O still uses VoprIo
+        };
+        return self;
+    }
+
+    pub fn bootstrap(self: *VoprPublicClusterFixture) !void {
+        return self.bootstrapWithDataPlaneOwnership(.co_located);
+    }
+
+    pub fn bootstrapExternalDataPlane(self: *VoprPublicClusterFixture) !void {
+        return self.bootstrapWithDataPlaneOwnership(.external);
+    }
+
+    fn bootstrapWithDataPlaneOwnership(
+        self: *VoprPublicClusterFixture,
+        data_plane_ownership: MetadataHttpClusterSimulation.DataPlaneOwnership,
+    ) !void {
+        if (self.bootstrap_phase != .created) return error.PublicClusterFixtureAlreadyBootstrapped;
+        const alloc = self.alloc;
+        const sim = self.sim;
+
+        for (0..node_count) |index| {
+            self.stores[index] = raft_engine.core.MemoryStorage.init(alloc);
+            self.store_count += 1;
+            self.modeled_devices[index] = storage_sim.ModeledDevice.init(alloc);
+            self.modeled_device_count += 1;
+            self.resource_managers[index] = resource_manager_mod.ResourceManager.init(.{
+                .memory_budget = .{
+                    .soft_limit_bytes = 384 * 1024 * 1024,
+                    .hard_limit_bytes = 512 * 1024 * 1024,
+                },
+                .query_embedding_cache_bytes = 4 * 1024 * 1024,
+                .identity_allocator = alloc,
+            });
+            self.resource_manager_count += 1;
+            self.modeled_configurators[index] = .{
+                .device = &self.modeled_devices[index],
+                .device_incarnation = index + 1,
+                .resource_manager = &self.resource_managers[index],
+            };
+            self.roots[index] = try std.fmt.allocPrint(
+                alloc,
+                ".zig-cache/tmp/{s}/full-cluster-node-{d}",
+                .{ self.tmp.sub_path, index + 1 },
+            );
+            self.root_count += 1;
+            self.catalogs[index] = try std.fmt.allocPrint(
+                alloc,
+                ".zig-cache/tmp/{s}/full-cluster-node-{d}.catalog",
+                .{ self.tmp.sub_path, index + 1 },
+            );
+            self.catalog_count += 1;
+        }
+        for (0..node_count) |index| {
+            self.factories[index] = .{
+                .alloc = alloc,
+                .store = &self.stores[index],
+                .peers = &.{ 1, 2, 3 },
+                // This composed fixture owns structural transitions across
+                // replica descriptor retirement. Individual descriptor churn
+                // must not discard a coordinator between workflow steps.
+                .retain_transition_runtimes = true,
+            };
+            self.factory_count += 1;
+            self.factories[index].split_runtime.replica_root_dir = self.roots[index];
+            self.factories[index].merge_runtime.replica_root_dir = self.roots[index];
+        }
+        self.bootstrap_phase = .local_resources_ready;
+
+        var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+            makeHostSimConfig(1, metadata_group_id, self.roots[0], self.catalogs[0]),
+            makeHostSimConfig(2, metadata_group_id, self.roots[1], self.catalogs[1]),
+            makeHostSimConfig(3, metadata_group_id, self.roots[2], self.catalogs[2]),
+        };
+        // Raft rounds are deliberately bounded and synchronous in this
+        // fixture. The send still crosses the virtual fault router and a real
+        // httpx/VoprIo socket; it simply completes before the next round.
+        for (&configs) |*config| config.host.http.transport.driver.async_send_worker_count = 0;
+        const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+            makeHostSimDepsWithBorrowedIo(&self.factories[0], sim.io()),
+            makeHostSimDepsWithBorrowedIo(&self.factories[1], sim.io()),
+            makeHostSimDepsWithBorrowedIo(&self.factories[2], sim.io()),
+        };
+        self.cluster = try MetadataHttpClusterSimulation.init(alloc, metadata_group_id, &configs, &deps);
+        self.cluster_live = true;
+        self.cluster.setDataPlaneOwnership(data_plane_ownership);
+        for (0..node_count) |index| self.catalog_sources[index] = .{
+            .node = self.cluster.node(index),
+            .metadata_snapshot_mode = .leader_backed,
+        };
+        // startAll publishes the harness's default in-process routes. Do that
+        // before replacing them with concrete httpx listener targets so the
+        // wire routes remain authoritative throughout bootstrap.
+        try self.cluster.startAll();
+        self.cluster.virtual_network.useSerializedDrains();
+        self.bootstrap_phase = .metadata_runtime_ready;
+        self.raft_wire_executor = io_http_executor.IoHttpExecutor.init(alloc, sim.io(), .{
+            // The metadata harness drains one serialized Raft delivery at a
+            // time. Use a fresh real HTTP/1 connection for each frame so a
+            // scheduler-controlled keep-alive expiry cannot turn the next
+            // non-idempotent POST into an ambiguous stale-socket reuse. The
+            // production data-Raft composition separately exercises pooled
+            // async delivery and retry ownership.
+            .keep_alive = false,
+            .connect_timeout_ms = 0,
+            .read_timeout_ms = 0,
+            .write_timeout_ms = 0,
+            .pool_max_connections = 24,
+            .pool_max_per_host = 8,
+        });
+        self.raft_wire_executor_live = true;
+        for (0..node_count) |index| {
+            self.raft_wire_runtimes[index] = try raft_transport.HttpxRuntime.start(
+                alloc,
+                sim.io(),
+                self.cluster.cluster.node(index).serverRequestExecutor(),
+            );
+            self.raft_wire_runtime_count += 1;
+            self.raft_wire_targets[index] = .{
+                .alloc = alloc,
+                .base_uri = self.raft_wire_runtimes[index].base_uri,
+                .inner = self.raft_wire_executor.executor(),
+            };
+            const node_id = self.cluster.cluster.configs[index].host.http.host.local_node_id;
+            try self.cluster.virtual_network.registerNode(
+                node_id,
+                self.raft_wire_targets[index].executor(),
+            );
+        }
+        self.bootstrap_phase = .raft_wire_ready;
+        for (0..node_count) |index| {
+            self.cluster.backendRuntime(index).setDbOpenConfigurator(self.modeled_configurators[index].iface());
+            self.factories[index].split_runtime.backend_runtime = self.cluster.backendRuntime(index);
+            self.factories[index].merge_runtime.backend_runtime = self.cluster.backendRuntime(index);
+        }
+        self.metadata_leader_index = try finishBootstrappedMetadataCluster(&self.cluster, 48, true);
+        self.cluster_started = true;
+        self.bootstrap_phase = .metadata_quorum_ready;
+
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{
+                .group_id = data_group_id,
+                .table_id = table_id,
+                .start_key = "doc:a",
+                .end_key = "doc:m",
+            },
+            .{
+                .group_id = graph_data_group_id,
+                .table_id = table_id,
+                .start_key = "doc:m",
+                .end_key = null,
+            },
+        };
+        if (data_plane_ownership == .external) {
+            try self.initializeExternalProjectedTables(&workflow, &ranges);
+            self.bootstrap_phase = .projected_tables_ready;
+            return;
+        }
+
+        try createActiveTableRanges(&workflow, &self.cluster, self.metadata_leader_index, .{
+            .table_id = table_id,
+            .name = "docs",
+            .description = "full cluster VOPR documents",
+            .indexes_json = graph_indexes_json,
+            .desired_replica_count = 2,
+            .min_ranges = 1,
+        }, &ranges, 192);
+        const placement = try waitForFirstProjectedRange(
+            &self.cluster,
+            self.metadata_leader_index,
+            2,
+            2,
+            true,
+            192,
+        );
+        self.actual_host_count = placement.active_count;
+        self.client_index = placement.non_host_index orelse return error.FullClusterNonHostMissing;
+        try std.testing.expect(try self.cluster.waitForGroupStatusCount(graph_data_group_id, .active, 2, 192));
+        self.graph_restart_node_index = currentGroupLeaderIndex(&self.cluster, graph_data_group_id) orelse
+            return error.FullClusterGraphLeaderMissing;
+        const receiver_leader_index = currentGroupLeaderIndex(&self.cluster, data_group_id) orelse
+            return error.FullClusterDataLeaderMissing;
+        // Metadata transition actions execute on the metadata leader, while
+        // adjacent data ranges need not be colocated with it. Point that
+        // runtime at the actual donor and receiver leaders so the VOPR mode
+        // crosses a real node-local storage boundary instead of silently
+        // falling back to an empty metadata-leader directory.
+        for (&self.factories) |*factory| {
+            factory.merge_runtime.replica_root_dir = null;
+            factory.merge_runtime.backend_runtime = null;
+            factory.merge_runtime.donor_replica_root_dir = null;
+            factory.merge_runtime.donor_backend_runtime = null;
+            factory.merge_runtime.donor_write_source = null;
+            factory.merge_runtime.receiver_write_source = null;
+        }
+        const merge_runtime = &self.factories[self.metadata_leader_index].merge_runtime;
+        merge_runtime.replica_root_dir = self.roots[receiver_leader_index];
+        merge_runtime.backend_runtime = self.cluster.backendRuntime(receiver_leader_index);
+        merge_runtime.donor_replica_root_dir = self.roots[self.graph_restart_node_index];
+        merge_runtime.donor_backend_runtime = self.cluster.backendRuntime(self.graph_restart_node_index);
+        var graph_remote_client_found = false;
+        for (0..node_count) |index| {
+            if (self.cluster.node(index).status(graph_data_group_id) == .active) continue;
+            self.graph_remote_client_index = index;
+            graph_remote_client_found = true;
+            break;
+        }
+        if (!graph_remote_client_found) return error.FullClusterGraphRemoteClientMissing;
+        try ensureGroupGraphIndexOnActiveReplicas(
+            &self.cluster,
+            self.roots[0..],
+            data_group_id,
+            graph_index_name,
+            192,
+        );
+        try ensureGroupGraphIndexOnActiveReplicas(
+            &self.cluster,
+            self.roots[0..],
+            graph_data_group_id,
+            graph_index_name,
+            192,
+        );
+        try seedGroupDocsAcrossReplicaRoots(&self.cluster, self.roots[0..], data_group_id, &.{
+            .{ .key = "doc:b", .value = "{\"title\":\"identity bootstrap left\"}" },
+        });
+        try seedGroupDocsAcrossReplicaRoots(&self.cluster, self.roots[0..], graph_data_group_id, &.{
+            .{ .key = "doc:x", .value = "{\"title\":\"identity bootstrap right\"}" },
+        });
+        const graph_groups = [_]u64{ data_group_id, graph_data_group_id };
+        const status_node = currentMetadataMutationNode(self.cluster.node(self.metadata_leader_index));
+        try reportRuntimeDocIdentityForActiveReplicas(
+            &self.cluster,
+            status_node,
+            self.roots[0..],
+            "docs",
+            &graph_groups,
+            null,
+        );
+        try self.cluster.stepAll();
+
+        const tenant_ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = tenant_data_group_id,
+            .table_id = tenant_table_id,
+            .start_key = "tenant:a",
+            .end_key = null,
+        }};
+        try createActiveTableRanges(&workflow, &self.cluster, self.metadata_leader_index, .{
+            .table_id = tenant_table_id,
+            .name = "tenant_b_docs",
+            .description = "full cluster VOPR tenant-isolation documents",
+            .indexes_json = api_tables.default_indexes_json,
+            .desired_replica_count = 2,
+            .min_ranges = 1,
+        }, &tenant_ranges, 192);
+        _ = try waitForFirstProjectedRange(
+            &self.cluster,
+            self.metadata_leader_index,
+            3,
+            2,
+            true,
+            192,
+        );
+        try ensureGroupTextIndexOnActiveReplicas(
+            &self.cluster,
+            self.roots[0..],
+            tenant_data_group_id,
+            api_tables.default_full_text_index_name,
+            192,
+        );
+        self.bootstrap_phase = .hosted_data_ready;
+
+        const deterministic_http_config: io_http_executor.IoHttpExecutorConfig = .{
+            .keep_alive = true,
+            .connect_timeout_ms = 0,
+            .read_timeout_ms = 0,
+            .write_timeout_ms = 0,
+            .pool_max_connections = 24,
+            .pool_max_per_host = 8,
+        };
+        self.forward_http_executor = io_http_executor.IoHttpExecutor.init(alloc, sim.io(), deterministic_http_config);
+        self.forward_executor_live = true;
+        self.client_http_executor = io_http_executor.IoHttpExecutor.init(alloc, sim.io(), deterministic_http_config);
+        self.client_executor_live = true;
+        const borrowed_roots = [_][]const u8{ self.roots[0], self.roots[1], self.roots[2] };
+        try startPublicApiServers(
+            node_count,
+            alloc,
+            &self.cluster,
+            sim.io(),
+            .limited(16),
+            &borrowed_roots,
+            .leader_backed,
+            self.forward_http_executor.executor(),
+            &self.listeners,
+            &self.servers,
+            &self.status_sources,
+            &self.catalog_sources,
+            &self.routers,
+            &self.read_sources,
+            &self.write_sources,
+            .{ .resource_managers = &self.resource_managers },
+            &self.api_base_uris,
+        );
+        // The hosted public stack owns the resident group writers. Retain
+        // those exact writers for the real merge coordinator instead of
+        // reopening live LSM roots through a parallel test-only path.
+        merge_runtime.donor_write_source = &self.write_sources[self.graph_restart_node_index];
+        merge_runtime.receiver_write_source = &self.write_sources[receiver_leader_index];
+        const graph_hook = api_distributed_graph.LifecycleHook{
+            .ptr = self,
+            .reach_fn = reachDistributedGraphLifecycle,
+        };
+        for (&self.read_sources) |*source| _ = source.withDistributedGraphLifecycleHook(graph_hook);
+        self.uri_count = node_count;
+        self.stack_live = true;
+        self.client = api_http_client.ApiHttpClient.init(alloc, self.client_http_executor.executor());
+        for (0..node_count) |index| try self.cluster.node(index).runRound();
+        self.bootstrap_phase = .public_stack_ready;
+    }
+
+    pub fn bootstrapPhaseOrdinal(self: *const VoprPublicClusterFixture) u8 {
+        return @intFromEnum(self.bootstrap_phase);
+    }
+
+    pub fn externalCatalogSource(
+        self: *VoprPublicClusterFixture,
+        index: usize,
+    ) !api_table_catalog.CatalogSource {
+        if (index >= node_count) return error.InvalidNodeIndex;
+        return self.catalog_sources[index].iface();
+    }
+
+    pub fn replaceExternalTransitionOps(
+        self: *VoprPublicClusterFixture,
+        index: usize,
+        ops: raft_shard_ops.ShardOperationAdapter,
+    ) !raft_shard_ops.OwnedShardOperationAdapter.Registration {
+        if (index >= node_count) return error.InvalidNodeIndex;
+        return try self.cluster.node(index).replaceTransitionOps(ops);
+    }
+
+    /// Replace the source catalog through metadata Raft and wait until every
+    /// projected replica observes the exact bytes. Exact-cutover authority is
+    /// fenced against these bytes, so returning early would weaken the
+    /// topology-change history into a local callback race.
+    pub fn replaceReplicationSources(
+        self: *VoprPublicClusterFixture,
+        replication_sources_json: []const u8,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        const leader = self.cluster.node(leader_index);
+        const tables = try leader.listProjectedTables(self.alloc);
+        defer leader.freeProjectedTables(self.alloc, tables);
+        const current = for (tables) |record| {
+            if (record.table_id == table_id) break record;
+        } else return error.TableNotFound;
+        var replacement = current;
+        replacement.replication_sources_json = replication_sources_json;
+        try leader.upsertTable(replacement);
+
+        for (0..64) |_| {
+            var all_current = true;
+            for (0..node_count) |index| {
+                const node = self.cluster.node(index);
+                const projected = try node.listProjectedTables(self.alloc);
+                defer node.freeProjectedTables(self.alloc, projected);
+                const matches = for (projected) |record| {
+                    if (record.table_id != table_id) continue;
+                    break std.mem.eql(
+                        u8,
+                        record.replication_sources_json,
+                        replication_sources_json,
+                    );
+                } else false;
+                if (!matches) {
+                    all_current = false;
+                    break;
+                }
+            }
+            if (all_current) return;
+            try self.cluster.stepAll();
+        }
+        return error.ReplicationSourceProjectionTimeout;
+    }
+
+    pub fn upsertReplicationSourceStatus(
+        self: *VoprPublicClusterFixture,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        try self.cluster.node(leader_index).upsertReplicationSourceStatus(record);
+    }
+
+    pub fn claimReplicationSourceCutoverDurable(
+        self: *VoprPublicClusterFixture,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        try self.cluster.node(leader_index).claimReplicationSourceCutoverDurable(
+            expected_replication_sources_json,
+            expected_authority_id,
+            record,
+        );
+    }
+
+    pub fn replicationSourceAuthorityCurrent(
+        self: *VoprPublicClusterFixture,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        try self.cluster.node(leader_index).replicationSourceAuthorityCurrent(
+            expected_replication_sources_json,
+            expected,
+        );
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: *VoprPublicClusterFixture,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        try self.cluster.node(leader_index).completeReplicationSourceCutoverRetirementDurable(expected);
+    }
+
+    /// Admit a structural transition into the metadata quorum while real,
+    /// externally owned DataServers execute the data-plane commands. Keeping
+    /// this operation on the deployment-shaped fixture avoids teaching a
+    /// generic VOPR scenario about metadata's internal control-loop types.
+    pub fn requestExternalDataSplit(
+        self: *VoprPublicClusterFixture,
+        transition_id: u64,
+        source_group_id: u64,
+        destination_group_id: u64,
+        split_key: []const u8,
+    ) !void {
+        for (0..128) |round| {
+            const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse {
+                // Synchronous deterministic stepping can leave every healthy
+                // replica in a lock-step candidacy. A campaign is a real Raft
+                // input (not a fabricated leader response) and supplies the
+                // same symmetry break that production election jitter does.
+                if (round % 8 == 7)
+                    try self.cluster.node((round / 8) % node_count).campaignMetadataGroup();
+                try self.cluster.stepAll();
+                continue;
+            };
+            var workflow = metadata_table_workflow.TableWorkflow.init(self.alloc);
+            defer workflow.deinit();
+            const summary = workflow.requestSplit(&self.cluster.node(leader_index), .{
+                .transition_id = transition_id,
+                .table_id = table_id,
+                .source_group_id = source_group_id,
+                .destination_group_id = destination_group_id,
+                .split_key = split_key,
+            }) catch |err| switch (err) {
+                error.NotLeader => {
+                    if (round % 8 == 7)
+                        try self.cluster.node((round / 8) % node_count).campaignMetadataGroup();
+                    try self.cluster.stepAll();
+                    continue;
+                },
+                else => return err,
+            };
+            if (summary.split_admissions != 1)
+                return error.ExternalDataSplitAdmissionMismatch;
+            return;
+        }
+        return error.ExternalDataSplitAdmissionTimeout;
+    }
+
+    pub fn externalDataSplitFinalized(
+        self: *VoprPublicClusterFixture,
+        transition_id: u64,
+    ) !bool {
+        const phase = (try self.externalDataSplitPhase(transition_id)) orelse return false;
+        return phase == .finalized;
+    }
+
+    /// Return the metadata leader's durable view of an externally executed
+    /// split. Deployment-shaped VOPR histories use this to place public work
+    /// inside a real nonterminal topology transition without importing the
+    /// metadata control loop into the scenario.
+    pub fn externalDataSplitPhase(
+        self: *VoprPublicClusterFixture,
+        transition_id: u64,
+    ) !?data_mod.RangeTransitionPhase {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return null;
+        const observation = try self.cluster.node(leader_index).observeSplitTransition(transition_id) orelse
+            return null;
+        return observation.status.phase;
+    }
+
+    /// Publish the finalized transition marker, then atomically replace the
+    /// old range with its two post-split ranges and retire the marker. These
+    /// are deliberately separate reconcile commits: readers must never see
+    /// unfenced topology before the terminal transition is durable.
+    pub fn retireExternalDataSplit(
+        self: *VoprPublicClusterFixture,
+        transition_id: u64,
+    ) !void {
+        if (!try self.externalDataSplitFinalized(transition_id))
+            return error.ExternalDataSplitNotFinalized;
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        var workflow = metadata_table_workflow.TableWorkflow.init(self.alloc);
+        defer workflow.deinit();
+        try workflow.bootstrapDesiredFromCommitted(&self.cluster.node(leader_index));
+
+        const terminal = try self.cluster.node(leader_index).reconcileOnceEnsuringLease(workflow.controlLoop());
+        if (terminal.split_upserts != 1 or terminal.split_removals != 0 or
+            terminal.range_upserts != 0 or terminal.range_removals != 0)
+            return error.ExternalDataSplitTerminalPublicationMismatch;
+        try self.cluster.stepAll();
+
+        const removal = try self.cluster.node(leader_index).reconcileOnceEnsuringLease(workflow.controlLoop());
+        if (removal.split_removals != 1 or removal.range_upserts != 2)
+            return error.ExternalDataSplitTopologyPublicationMismatch;
+        try self.cluster.stepAll();
+    }
+
+    fn initializeExternalProjectedTables(
+        self: *VoprPublicClusterFixture,
+        workflow: *metadata_table_workflow.TableWorkflow,
+        ranges: []const metadata_table_manager.RangeRecord,
+    ) !void {
+        const docs_summary = try workflow.createTableWithRanges(&self.cluster.node(self.metadata_leader_index), .{
+            .table_id = table_id,
+            .name = "docs",
+            .description = "full cluster VOPR documents",
+            .indexes_json = graph_indexes_json,
+            .desired_replica_count = 2,
+            .min_ranges = 1,
+        }, ranges);
+        if (docs_summary.placement_upserts != ranges.len * 2)
+            return error.ExternalDataPlanePlacementCountMismatch;
+        _ = try waitForFirstProjectedRange(
+            &self.cluster,
+            self.metadata_leader_index,
+            ranges.len,
+            0,
+            false,
+            192,
+        );
+        if (!try waitForProjectedTablePresenceOnAllNodes(&self.cluster, "docs", 192))
+            return error.ExternalDataPlaneProjectionTimeout;
+
+        const tenant_ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = tenant_data_group_id,
+            .table_id = tenant_table_id,
+            .start_key = "tenant:a",
+            .end_key = null,
+        }};
+        const tenant_summary = try workflow.createTableWithRanges(&self.cluster.node(self.metadata_leader_index), .{
+            .table_id = tenant_table_id,
+            .name = "tenant_b_docs",
+            .description = "full cluster VOPR tenant-isolation documents",
+            .indexes_json = api_tables.default_indexes_json,
+            .desired_replica_count = 2,
+            .min_ranges = 1,
+        }, &tenant_ranges);
+        if (tenant_summary.placement_upserts != 2)
+            return error.ExternalDataPlanePlacementCountMismatch;
+        _ = try waitForFirstProjectedRange(
+            &self.cluster,
+            self.metadata_leader_index,
+            ranges.len + tenant_ranges.len,
+            0,
+            false,
+            192,
+        );
+        if (!try waitForProjectedTablePresenceOnAllNodes(&self.cluster, "tenant_b_docs", 192))
+            return error.ExternalDataPlaneProjectionTimeout;
+    }
+
+    pub fn start(self: *VoprPublicClusterFixture, mode: FaultMode) !void {
+        self.fault_mode = mode;
+        if (mode != .graph_transport_failure) self.graph_fault_workload_ready.set(self.sim.io());
+        switch (mode) {
+            .clean => {
+                self.resource_recovered.set(self.sim.io());
+                self.fault_finished = true;
+            },
+            .metadata_partition => {
+                self.resource_recovered.set(self.sim.io());
+                const leader_node_id = self.cluster.cluster.configs[self.metadata_leader_index].host.http.host.local_node_id;
+                try self.cluster.virtual_network.partitionNode(leader_node_id);
+                _ = self.sim.io().async(healMetadataPartition, .{ self, leader_node_id });
+            },
+            .node_restart => {
+                self.resource_recovered.set(self.sim.io());
+                _ = self.sim.io().async(restartNonHost, .{self});
+            },
+            .graph_inflight_restart => {
+                self.resource_recovered.set(self.sim.io());
+                _ = self.sim.io().async(restartGraphLeaderDuringQuery, .{self});
+            },
+            .graph_topology_churn => {
+                self.resource_recovered.set(self.sim.io());
+                _ = self.sim.io().async(mergeGraphRangesDuringQuery, .{self});
+            },
+            .graph_transport_failure => self.resource_recovered.set(self.sim.io()),
+            .partial_http_write => {
+                self.resource_recovered.set(self.sim.io());
+                try self.sim.limitNextNetworkWrite(1);
+                self.fault_finished = true;
+            },
+            .resource_pressure => {
+                try self.saturateNodeMemory();
+                _ = self.sim.io().async(runResourcePressure, .{self});
+            },
+        }
+        _ = self.sim.io().async(runWriter, .{self});
+        _ = self.sim.io().async(runReader, .{self});
+        _ = self.sim.io().async(runTenantWriter, .{self});
+        _ = self.sim.io().async(runTenantReader, .{self});
+        _ = self.sim.io().async(runGraphReader, .{self});
+        _ = self.sim.io().async(shutdownWhenComplete, .{self});
+    }
+
+    /// Retire the hosted public/data rig while preserving the live metadata
+    /// quorum, its concrete HTTP/Raft wire, projected catalog, node-local
+    /// resource owners, and roots. A deployment-shaped VOPR composition uses
+    /// this handoff before installing production DataServers so there can be
+    /// only one owner for each projected data replica identity.
+    pub fn detachHostedDataPlane(self: *VoprPublicClusterFixture) !void {
+        if (!self.cluster_live or !self.cluster_started) return error.MetadataClusterUnavailable;
+        if (!self.stack_live) return error.HostedDataPlaneAlreadyDetached;
+
+        deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
+        self.stack_live = false;
+        for (self.api_base_uris[0..self.uri_count]) |uri| self.alloc.free(uri);
+        self.uri_count = 0;
+        if (self.client_executor_live) {
+            self.client_http_executor.deinit();
+            self.client_executor_live = false;
+        }
+        if (self.forward_executor_live) {
+            self.forward_http_executor.deinit();
+            self.forward_executor_live = false;
+        }
+
+        self.cluster.setDataPlaneOwnership(.external);
+        for (0..64) |_| {
+            try self.cluster.stepAll();
+            var retired = true;
+            for (0..node_count) |index| {
+                if (self.cluster.node(index).status(data_group_id) != .absent or
+                    self.cluster.node(index).status(graph_data_group_id) != .absent or
+                    self.cluster.node(index).status(tenant_data_group_id) != .absent)
+                {
+                    retired = false;
+                    break;
+                }
+            }
+            if (retired) return;
+        }
+        return error.HostedDataPlaneRetirementTimeout;
+    }
+
+    fn runWriter(self: *VoprPublicClusterFixture) void {
+        self.resource_recovered.waitUncancelable(self.sim.io());
+        defer {
+            self.write_finished = true;
+            self.write_done.set(self.sim.io());
+        }
+        var response = self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+            \\{"inserts":{"doc:a":{"title":"alpha","body":"graph source","_edges":{"graph_idx":{"links":[{"target":"doc:z"}]}}},"doc:z":{"title":"zeta","body":"hello distributed world","_edges":{"graph_idx":{"links":[{"target":"doc:y"}]}}},"doc:y":{"title":"gamma","body":"hello cluster"}},"sync_level":"full_index"}
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer response.deinit(self.alloc);
+        self.write_sound = response.status >= 200 and response.status < 300 and
+            std.mem.indexOf(u8, response.body, "\"inserted\":3") != null;
+    }
+
+    fn runReader(self: *VoprPublicClusterFixture) void {
+        self.write_done.waitUncancelable(self.sim.io());
+        defer self.read_finished = true;
+        if (!self.write_sound) return;
+        var lookup = self.client.fetchLookup(
+            self.api_base_uris[self.client_index],
+            "docs",
+            "doc:z",
+            null,
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer lookup.deinit(self.alloc);
+        self.read_sound = std.mem.indexOf(u8, lookup.body, "\"zeta\"") != null;
+    }
+
+    fn runTenantWriter(self: *VoprPublicClusterFixture) void {
+        self.resource_recovered.waitUncancelable(self.sim.io());
+        defer {
+            self.tenant_write_finished = true;
+            self.tenant_write_done.set(self.sim.io());
+        }
+        const route_index = (self.client_index + 1) % node_count;
+        var response = self.client.fetchBatch(self.api_base_uris[route_index], "tenant_b_docs",
+            \\{"inserts":{"tenant:z":{"title":"private","body":"tenant-isolation-sentinel"}}}
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer response.deinit(self.alloc);
+        self.tenant_write_sound = response.status >= 200 and response.status < 300 and
+            std.mem.indexOf(u8, response.body, "\"inserted\":1") != null;
+    }
+
+    fn runTenantReader(self: *VoprPublicClusterFixture) void {
+        self.tenant_write_done.waitUncancelable(self.sim.io());
+        defer self.tenant_read_finished = true;
+        if (!self.tenant_write_sound) return;
+        const route_index = (self.client_index + 2) % node_count;
+        var tenant_query = self.client.fetchQuery(self.api_base_uris[route_index], "tenant_b_docs",
+            \\{"full_text_search":{"match":{"field":"body","text":"tenant-isolation-sentinel"}},"fields":["title","body"],"limit":10}
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer tenant_query.deinit(self.alloc);
+        self.tenant_read_sound = std.mem.indexOf(u8, tenant_query.body, "\"_id\":\"tenant:z\"") != null;
+        if (self.client.fetchLookup(
+            self.api_base_uris[self.client_index],
+            "docs",
+            "tenant:z",
+            null,
+        )) |response| {
+            var unexpected = response;
+            unexpected.deinit(self.alloc);
+        } else |err| {
+            if (err == error.UnexpectedHttpStatus) {
+                self.table_isolation_sound = self.tenant_read_sound;
+            } else {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+            }
+        }
+    }
+
+    fn runGraphReader(self: *VoprPublicClusterFixture) void {
+        self.write_done.waitUncancelable(self.sim.io());
+        defer self.graph_read_finished = true;
+        if (!self.write_sound) return;
+
+        self.graph_fault_workload_ready.waitUncancelable(self.sim.io());
+        if (self.fault_mode == .graph_transport_failure) {
+            while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+        } else if (self.fault_mode != .graph_inflight_restart and self.fault_mode != .graph_topology_churn) {
+            while (!self.fault_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+        }
+        const query_body = test_contract_helpers.encodeGraphTraverseQueryRequest(
+            self.alloc,
+            "walk",
+            graph_index_name,
+            &.{"doc:a"},
+            &.{"links"},
+            2,
+            10,
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer self.alloc.free(query_body);
+        if (self.fault_mode == .graph_transport_failure or self.fault_mode == .graph_topology_churn) {
+            var failed = self.client.fetchQueryRaw(
+                self.api_base_uris[if (self.fault_mode == .graph_transport_failure) self.graph_remote_client_index else self.client_index],
+                "docs",
+                query_body,
+            ) catch |err| {
+                self.sim.setNetworkOutage(false);
+                self.fault_finished = true;
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+                return;
+            };
+            defer failed.deinit(self.alloc);
+            const fail_closed = failed.status == 503 and
+                std.mem.indexOf(u8, failed.body, "\"code\":\"distributed_query_unavailable\"") != null and
+                std.mem.indexOf(u8, failed.body, "\"retryable\":true") != null and
+                std.mem.indexOf(u8, failed.body, "graph_results") == null and
+                std.mem.indexOf(u8, failed.body, "doc:z") == null and
+                std.mem.indexOf(u8, failed.body, "doc:y") == null;
+            if (self.fault_mode == .graph_transport_failure) {
+                self.graph_partial_rejected_sound = self.graph_transport_failure_injected and
+                    self.graph_transport_failure_observed and fail_closed;
+            } else {
+                self.graph_topology_partial_rejected_sound = self.graph_topology_churn_observed and
+                    self.graph_topology_churn_finalized and self.graph_topology_churn_error_code != 0 and fail_closed;
+            }
+            if (!fail_closed) {
+                self.sim.setNetworkOutage(false);
+                self.fault_finished = true;
+                return;
+            }
+        }
+        const query_route_index = if (self.fault_mode == .graph_transport_failure)
+            self.graph_remote_client_index
+        else
+            self.client_index;
+        var query = self.client.fetchQuery(
+            self.api_base_uris[query_route_index],
+            "docs",
+            query_body,
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer query.deinit(self.alloc);
+        var parsed = std.json.parseFromSlice(metadata_openapi.QueryResponses, self.alloc, query.body, .{}) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer parsed.deinit();
+        const responses = parsed.value.responses orelse return;
+        if (responses.len != 1) return;
+        const graph_results = responses[0].graph_results orelse return;
+        const walk = graph_results.map.get("walk") orelse return;
+        const node_result = switch (walk) {
+            .graph_nodes_result => |result| result,
+            else => return,
+        };
+        const nodes = node_result.nodes;
+        var found_z = false;
+        var found_y = false;
+        for (nodes) |node| {
+            found_z = found_z or std.mem.eql(u8, node.key, "doc:z");
+            found_y = found_y or std.mem.eql(u8, node.key, "doc:y");
+        }
+        self.graph_query_sound = node_result.stats.returned_items == 2 and
+            !node_result.stats.truncated and nodes.len == 2 and found_z and found_y;
+        if (!self.graph_query_sound) std.debug.print(
+            "full cluster graph recovery returned incomplete result after mode={s}: {s}\n",
+            .{ @tagName(self.fault_mode), query.body },
+        );
+    }
+
+    fn reachDistributedGraphLifecycle(ptr: *anyopaque, event: api_distributed_graph.LifecycleEvent) void {
+        const self: *VoprPublicClusterFixture = @ptrCast(@alignCast(ptr));
+        switch (self.fault_mode) {
+            .graph_inflight_restart => {
+                if (event.phase != .expand_round_completed or event.depth != 1 or
+                    self.graph_inflight_restart_observed)
+                    return;
+                self.graph_inflight_restart_observed = true;
+                self.graph_round_paused.set(self.sim.io());
+                self.graph_fault_recovered.waitUncancelable(self.sim.io());
+            },
+            .graph_topology_churn => switch (event.phase) {
+                .expand_round_completed => {
+                    if (event.depth != 1 or self.graph_topology_churn_observed) return;
+                    self.graph_topology_churn_observed = true;
+                    self.graph_round_paused.set(self.sim.io());
+                    self.graph_fault_recovered.waitUncancelable(self.sim.io());
+                },
+                .attempt_failed => {
+                    if (!self.graph_topology_churn_observed or self.graph_topology_churn_error_code != 0) return;
+                    self.graph_topology_churn_error_code = event.error_code;
+                },
+                else => {},
+            },
+            .graph_transport_failure => switch (event.phase) {
+                .expand_round_completed => {
+                    if (event.depth != 1 or self.graph_transport_failure_injected) return;
+                    self.graph_transport_failure_injected = true;
+                    self.sim.setNetworkOutage(true);
+                },
+                .attempt_failed => {
+                    if (!self.graph_transport_failure_injected or self.graph_transport_failure_observed) return;
+                    self.graph_transport_failure_observed = true;
+                    self.graph_transport_failure_error_code = event.error_code;
+                    self.sim.setNetworkOutage(false);
+                    self.fault_finished = true;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    pub fn allowGraphFaultWorkload(self: *VoprPublicClusterFixture) void {
+        self.graph_fault_workload_ready.set(self.sim.io());
+    }
+
+    fn healMetadataPartition(self: *VoprPublicClusterFixture, node_id: u64) void {
+        self.sim.io().sleep(.fromNanoseconds(10), .awake) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
+        self.cluster.virtual_network.healNode(node_id);
+        var rounds: usize = 0;
+        while (rounds < 16) : (rounds += 1) self.cluster.stepAll() catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
+        self.topology_sound = currentMetadataLeaderIndex(&self.cluster) != null;
+        self.fault_finished = true;
+    }
+
+    fn restartNonHost(self: *VoprPublicClusterFixture) void {
+        self.write_done.waitUncancelable(self.sim.io());
+        while (!self.read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
+        const recovered = self.restartNodeAndWait(self.client_index) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
+        self.topology_sound = recovered;
+        self.fault_finished = true;
+    }
+
+    fn restartGraphLeaderDuringQuery(self: *VoprPublicClusterFixture) void {
+        self.graph_round_paused.waitUncancelable(self.sim.io());
+        while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        const leader_index = currentGroupLeaderIndex(&self.cluster, graph_data_group_id) orelse {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        const recovered = self.restartNodeAndWait(leader_index) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        self.graph_inflight_restart_recovered = recovered;
+        self.topology_sound = recovered;
+        self.fault_finished = true;
+        self.graph_fault_recovered.set(self.sim.io());
+    }
+
+    fn mergeGraphRangesDuringQuery(self: *VoprPublicClusterFixture) void {
+        self.graph_round_paused.waitUncancelable(self.sim.io());
+        while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        const transition_id: u64 = 6_845_001;
+        var workflow = metadata_table_workflow.TableWorkflow.init(self.alloc);
+        defer workflow.deinit();
+        _ = workflow.requestMerge(&self.cluster.node(leader_index), .{
+            .transition_id = transition_id,
+            .table_id = table_id,
+            .donor_group_id = graph_data_group_id,
+            .receiver_group_id = data_group_id,
+            // These independently bootstrapped ranges own distinct document
+            // identity namespaces. The operator-visible merge contract must
+            // explicitly authorize the receiver namespace to win.
+            .allow_doc_identity_reassignment = true,
+        }) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        const finalized = waitForMergeTransitionFinalized(
+            &self.cluster,
+            transition_id,
+            null,
+            leader_index,
+            192,
+        ) catch false;
+        if (finalized) {
+            const reconcile_index = currentMetadataLeaderIndex(&self.cluster) orelse leader_index;
+            workflow.bootstrapDesiredFromCommitted(&self.cluster.node(reconcile_index)) catch |err| {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+                self.fault_finished = true;
+                self.graph_fault_recovered.set(self.sim.io());
+                return;
+            };
+            _ = retireFinalizedMergeTransition(self.cluster.node(reconcile_index), workflow.controlLoop()) catch |err| {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+                self.fault_finished = true;
+                self.graph_fault_recovered.set(self.sim.io());
+                return;
+            };
+            const receiver_ready = self.cluster.waitForGroupStatusCount(data_group_id, .active, 2, 192) catch false;
+            const donor_retired = self.cluster.waitForGroupStatus(graph_data_group_id, .absent, 192) catch false;
+            if (!receiver_ready or !donor_retired) {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(error.FullClusterGraphMergeNotReady);
+                self.fault_finished = true;
+                self.graph_fault_recovered.set(self.sim.io());
+                return;
+            }
+            ensureGroupGraphIndexOnActiveReplicas(
+                &self.cluster,
+                self.roots[0..],
+                data_group_id,
+                graph_index_name,
+                192,
+            ) catch |err| {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+                self.fault_finished = true;
+                self.graph_fault_recovered.set(self.sim.io());
+                return;
+            };
+        }
+        self.graph_topology_churn_finalized = finalized;
+        self.topology_sound = finalized;
+        self.fault_finished = true;
+        self.graph_fault_recovered.set(self.sim.io());
+    }
+
+    fn restartNodeAndWait(self: *VoprPublicClusterFixture, node_index: usize) !bool {
+        try self.cluster.restartNode(node_index);
+        self.raft_wire_runtimes[node_index].setTarget(
+            self.cluster.cluster.node(node_index).serverRequestExecutor(),
+        );
+        self.read_sources[node_index].read_safety_barrier =
+            read_gate.alreadyReadSafeBarrier();
+        const restarted_node_id = self.cluster.cluster.configs[node_index].host.http.host.local_node_id;
+        try self.cluster.virtual_network.registerNode(
+            restarted_node_id,
+            self.raft_wire_targets[node_index].executor(),
+        );
+        var recovered = false;
+        var rounds: usize = 0;
+        while (rounds < 192) : (rounds += 1) {
+            try self.cluster.stepAll();
+            if (currentMetadataLeaderIndex(&self.cluster) == null or
+                currentGroupLeaderIndex(&self.cluster, data_group_id) == null or
+                currentGroupLeaderIndex(&self.cluster, graph_data_group_id) == null)
+                continue;
+
+            const ranges = self.cluster.node(node_index).listProjectedRanges(self.alloc) catch continue;
+            defer self.cluster.node(node_index).freeProjectedRanges(self.alloc, ranges);
+            var docs_ranges: usize = 0;
+            for (ranges) |range| if (range.table_id == table_id) {
+                docs_ranges += 1;
+            };
+            if (docs_ranges == 2) {
+                recovered = true;
+                break;
+            }
+        }
+        return recovered;
+    }
+
+    /// Model a node-local background owner (for example, resident inference
+    /// state) consuming every remaining byte in each production process
+    /// envelope. The reservation does not allocate host memory; it exercises
+    /// the same exactly-once accounting and admission contract as production
+    /// owners while public traffic continues over the real HTTP stack.
+    fn saturateNodeMemory(self: *VoprPublicClusterFixture) !void {
+        errdefer self.releaseNodeMemory();
+        for (self.resource_managers[0..self.resource_manager_count], 0..) |*manager, index| {
+            const stats = manager.snapshot().memory;
+            if (stats.hard_limit_bytes == 0 or stats.used_bytes >= stats.hard_limit_bytes)
+                return error.InvalidFullClusterResourceEnvelope;
+            self.resource_reservations[index] = try manager.reserveBatchClassified(&.{.{
+                .slice = .inference_model_residency,
+                .bytes = stats.hard_limit_bytes - stats.used_bytes,
+            }});
+        }
+    }
+
+    fn releaseNodeMemory(self: *VoprPublicClusterFixture) void {
+        for (&self.resource_reservations) |*slot| if (slot.*) |*reservation| {
+            reservation.release();
+            slot.* = null;
+        };
+    }
+
+    fn allNodeMemorySaturated(self: *VoprPublicClusterFixture) bool {
+        for (self.resource_managers[0..self.resource_manager_count]) |*manager| {
+            const memory = manager.snapshot().memory;
+            if (memory.hard_limit_bytes == 0 or memory.used_bytes != memory.hard_limit_bytes) return false;
+        }
+        return self.resource_manager_count == node_count;
+    }
+
+    fn runResourcePressure(self: *VoprPublicClusterFixture) void {
+        self.resource_pressure_observed = self.allNodeMemorySaturated();
+        if (self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+            \\{"inserts":{"pressure:probe":{"title":"pressure","body":"node-local-resource-pressure"}}}
+        )) |response| {
+            var unexpected = response;
+            unexpected.deinit(self.alloc);
+        } else |err| {
+            self.resource_denial_error_code = @intFromError(err);
+            self.resource_denial_sound = self.resource_pressure_observed and
+                (err == error.LeaderUnavailable or err == error.UnexpectedHttpStatus);
+        }
+
+        self.releaseNodeMemory();
+        self.resource_recovered.set(self.sim.io());
+
+        var recovered = self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+            \\{"inserts":{"pressure:probe":{"title":"pressure","body":"node-local-resource-pressure"}}}
+        ) catch {
+            self.fault_finished = true;
+            return;
+        };
+        recovered.deinit(self.alloc);
+        var lookup = self.client.fetchLookup(
+            self.api_base_uris[self.client_index],
+            "docs",
+            "pressure:probe",
+            null,
+        ) catch {
+            self.fault_finished = true;
+            return;
+        };
+        defer lookup.deinit(self.alloc);
+        self.resource_recovery_sound = std.mem.indexOf(u8, lookup.body, "node-local-resource-pressure") != null;
+        self.fault_finished = true;
+    }
+
+    fn shutdownWhenComplete(self: *VoprPublicClusterFixture) void {
+        while (!self.write_finished or !self.read_finished or !self.tenant_write_finished or
+            !self.tenant_read_finished or !self.graph_read_finished or !self.fault_finished)
+        {
+            self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+                self.request_errors +|= 1;
+                return;
+            };
+        }
+        for (self.factories[0..self.factory_count]) |*factory| factory.deinitTransitionRuntimes();
+        if (self.stack_live) {
+            deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
+            self.stack_live = false;
+        }
+        for (self.api_base_uris[0..self.uri_count]) |uri| self.alloc.free(uri);
+        self.uri_count = 0;
+        if (self.client_executor_live) {
+            self.client_http_executor.deinit();
+            self.client_executor_live = false;
+        }
+        if (self.forward_executor_live) {
+            self.forward_http_executor.deinit();
+            self.forward_executor_live = false;
+        }
+        self.topology_sound = self.topology_sound or currentMetadataLeaderIndex(&self.cluster) != null;
+        // Drivers are joined before their real wire peers and shared client
+        // pool disappear. Preserve the final health facts above because the
+        // cluster is intentionally no longer queryable after this point.
+        if (self.cluster_started) {
+            self.cluster.stopAll();
+            self.cluster_started = false;
+        }
+        if (self.cluster_live) {
+            self.cluster.deinit();
+            self.cluster_live = false;
+        }
+        self.stopRaftWire();
+        self.cleanup_sound = true;
+        self.complete = true;
+    }
+
+    pub fn deinit(self: *VoprPublicClusterFixture) void {
+        self.releaseNodeMemory();
+        for (self.factories[0..self.factory_count]) |*factory| factory.deinitTransitionRuntimes();
+        if (self.stack_live) {
+            deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
+            self.stack_live = false;
+        }
+        for (self.api_base_uris[0..self.uri_count]) |uri| self.alloc.free(uri);
+        self.uri_count = 0;
+        if (self.client_executor_live) {
+            self.client_http_executor.deinit();
+            self.client_executor_live = false;
+        }
+        if (self.forward_executor_live) {
+            self.forward_http_executor.deinit();
+            self.forward_executor_live = false;
+        }
+        // Drivers are torn down while their wire peers still exist; this lets
+        // cancellation drain any committed outbound work before listeners and
+        // the client pool disappear.
+        if (self.cluster_started) self.cluster.stopAll();
+        if (self.cluster_live) self.cluster.deinit();
+        self.stopRaftWire();
+        for (self.modeled_devices[0..self.modeled_device_count]) |*device| device.deinit();
+        for (self.resource_managers[0..self.resource_manager_count]) |*manager| manager.deinit(self.alloc);
+        for (self.stores[0..self.store_count]) |*store| store.deinit();
+        for (self.roots[0..self.root_count]) |root| self.alloc.free(root);
+        for (self.catalogs[0..self.catalog_count]) |catalog| self.alloc.free(catalog);
+        self.tmp.cleanup();
+        self.alloc.destroy(self);
+    }
+
+    /// Publish every long-lived owner stop before a shared VoprIo cleanup
+    /// suffix begins. Joining and destruction remain in `deinit`, after the
+    /// scheduler has allowed listener and connection fibers to unwind.
+    pub fn beginTeardown(self: *VoprPublicClusterFixture) void {
+        if (self.teardown_started) return;
+        self.teardown_started = true;
+        if (self.client_executor_live) self.client_http_executor.beginShutdown();
+        if (self.forward_executor_live) self.forward_http_executor.beginShutdown();
+        if (self.stack_live) for (self.listeners[0..self.uri_count]) |*listener|
+            listener.requestStop();
+        for (self.raft_wire_runtimes[0..self.raft_wire_runtime_count]) |*runtime|
+            runtime.requestStop();
+        if (self.cluster_started) {
+            self.cluster.stopAll();
+            self.cluster_started = false;
+        }
+    }
+
+    fn stopRaftWire(self: *VoprPublicClusterFixture) void {
+        if (self.raft_wire_runtime_count > 0) {
+            for (self.raft_wire_runtimes[0..self.raft_wire_runtime_count]) |*runtime|
+                self.raft_wire_requests +|= runtime.requestCount();
+            var index = self.raft_wire_runtime_count;
+            while (index > 0) {
+                index -= 1;
+                self.raft_wire_runtimes[index].deinit();
+            }
+            self.raft_wire_runtime_count = 0;
+        }
+        if (self.raft_wire_executor_live) {
+            self.raft_wire_executor.deinit();
+            self.raft_wire_executor_live = false;
+        }
+    }
+
+    pub fn healthSnapshot(self: *VoprPublicClusterFixture) struct {
+        hosts: usize,
+        requests_ok: bool,
+        topology_ok: bool,
+        cleanup_ok: bool,
+        raft_wire_requests: u64,
+        node_resource_managers: usize,
+        resource_denial_ok: bool,
+        resource_recovery_ok: bool,
+        resource_pressure_observed: bool,
+        resource_denial_error_code: u64,
+        graph_query_ok: bool,
+        graph_inflight_restart_observed: bool,
+        graph_inflight_restart_recovered: bool,
+        graph_topology_churn_observed: bool,
+        graph_topology_churn_finalized: bool,
+        graph_topology_churn_error_code: u64,
+        graph_topology_partial_rejected_sound: bool,
+        graph_transport_failure_injected: bool,
+        graph_transport_failure_observed: bool,
+        graph_transport_failure_error_code: u64,
+        graph_partial_rejected_sound: bool,
+    } {
+        return .{
+            .hosts = self.actual_host_count,
+            .requests_ok = self.write_sound and self.read_sound and self.tenant_write_sound and
+                self.tenant_read_sound and self.table_isolation_sound and self.graph_query_sound and
+                self.request_errors == 0,
+            .topology_ok = self.topology_sound,
+            .cleanup_ok = self.cleanup_sound,
+            .raft_wire_requests = self.raft_wire_requests,
+            .node_resource_managers = self.resource_manager_count,
+            .resource_denial_ok = self.resource_denial_sound,
+            .resource_recovery_ok = self.resource_recovery_sound,
+            .resource_pressure_observed = self.resource_pressure_observed,
+            .resource_denial_error_code = self.resource_denial_error_code,
+            .graph_query_ok = self.graph_query_sound,
+            .graph_inflight_restart_observed = self.graph_inflight_restart_observed,
+            .graph_inflight_restart_recovered = self.graph_inflight_restart_recovered,
+            .graph_topology_churn_observed = self.graph_topology_churn_observed,
+            .graph_topology_churn_finalized = self.graph_topology_churn_finalized,
+            .graph_topology_churn_error_code = self.graph_topology_churn_error_code,
+            .graph_topology_partial_rejected_sound = self.graph_topology_partial_rejected_sound,
+            .graph_transport_failure_injected = self.graph_transport_failure_injected,
+            .graph_transport_failure_observed = self.graph_transport_failure_observed,
+            .graph_transport_failure_error_code = self.graph_transport_failure_error_code,
+            .graph_partial_rejected_sound = self.graph_partial_rejected_sound,
+        };
+    }
+
+    pub fn deploymentResourceUsage(self: *VoprPublicClusterFixture, index: usize) !vopr.deployment.ResourceUsage {
+        if (index >= self.resource_manager_count or index >= self.modeled_device_count)
+            return error.InvalidFullClusterNodeIndex;
+        return .{
+            .memory_bytes = self.resource_managers[index].snapshot().memory.used_bytes,
+            .disk_bytes = self.modeled_devices[index].usedBytes(),
+            // Public listeners, forwarding clients, Raft drivers, and DB
+            // background owners have all joined before `complete` publishes.
+            .active_tasks = 0,
+            .open_sockets = 0,
+        };
+    }
+};
+
 fn startBootstrappedMetadataCluster(
     cluster: *MetadataHttpClusterSimulation,
     leader_wait_rounds: usize,
     publish_stores: bool,
 ) !usize {
     try cluster.startAll();
+    return try finishBootstrappedMetadataCluster(cluster, leader_wait_rounds, publish_stores);
+}
+
+fn finishBootstrappedMetadataCluster(
+    cluster: *MetadataHttpClusterSimulation,
+    leader_wait_rounds: usize,
+    publish_stores: bool,
+) !usize {
     try cluster.bootstrapMetadataReplicas();
     const leader_index = (try cluster.waitForMetadataLeader(leader_wait_rounds)) orelse return error.TestExpectedEqual;
     try cluster.node(leader_index).campaignMetadataGroup();
@@ -5777,7 +8622,9 @@ fn startBootstrappedMetadataCluster(
     return leader_index;
 }
 
-const MetadataVoprCampaignConfig = struct {
+const metadata_vopr_scenario_version: u32 = 6;
+
+pub const MetadataVoprCampaignConfig = struct {
     seed: u64,
     operation_count: usize = 64,
     metadata_group_id: u64,
@@ -5786,38 +8633,200 @@ const MetadataVoprCampaignConfig = struct {
     split_group_id: u64,
     split_transition_id: u64,
     workload: MetadataVoprWorkload = .smoke,
+    injected_bug: MetadataVoprInjectedBug = .none,
+
+    pub fn fromTrace(artifact: *const vopr.trace.Trace) !MetadataVoprCampaignConfig {
+        if (!std.mem.eql(u8, artifact.header.system, "antfly") or
+            !std.mem.eql(u8, artifact.header.scenario, "metadata-vopr") or
+            artifact.header.scenario_version != metadata_vopr_scenario_version)
+            return error.IncompatibleMetadataVoprTrace;
+        const workload_value = try traceParameter(artifact, "metadata.workload");
+        const workload: MetadataVoprWorkload = switch (workload_value) {
+            0 => .smoke,
+            1 => .expanded,
+            else => return error.InvalidMetadataVoprWorkload,
+        };
+        const injected_bug_value = try traceParameter(artifact, "metadata.injected_bug");
+        const injected_bug: MetadataVoprInjectedBug = switch (injected_bug_value) {
+            0 => .none,
+            1 => .overlapping_link_fault_safety,
+            else => return error.InvalidMetadataVoprInjectedBug,
+        };
+        const operation_count_value = try traceParameter(artifact, "metadata.operation_count");
+        const result = MetadataVoprCampaignConfig{
+            .seed = artifact.config.seed orelse return error.MetadataVoprSeedMissing,
+            .operation_count = std.math.cast(usize, operation_count_value) orelse return error.InvalidMetadataVoprParameter,
+            .metadata_group_id = try traceParameter(artifact, "metadata.group_id"),
+            .table_id = try traceParameter(artifact, "metadata.table_id"),
+            .range_group_id = try traceParameter(artifact, "metadata.range_group_id"),
+            .split_group_id = try traceParameter(artifact, "metadata.split_group_id"),
+            .split_transition_id = try traceParameter(artifact, "metadata.split_transition_id"),
+            .workload = workload,
+            .injected_bug = injected_bug,
+        };
+        try result.validate();
+        return result;
+    }
+
+    pub fn validate(self: MetadataVoprCampaignConfig) !void {
+        if (self.operation_count == 0) return error.InvalidMetadataVoprOperationBudget;
+        const values = [_]u64{ self.metadata_group_id, self.table_id, self.range_group_id, self.split_group_id, self.split_transition_id };
+        for (values, 0..) |value, index| {
+            if (value == 0 or value > std.math.maxInt(i64)) return error.InvalidMetadataVoprId;
+            for (values[0..index]) |prior| if (prior == value) return error.DuplicateMetadataVoprId;
+        }
+    }
+
+    fn traceParameter(artifact: *const vopr.trace.Trace, name: []const u8) !u64 {
+        const parameter_id = vopr.id.stable("parameter", name);
+        for (artifact.config.scenario_parameters) |parameter| {
+            if (parameter.id != parameter_id) continue;
+            if (parameter.value < 0) return error.InvalidMetadataVoprParameter;
+            return @intCast(parameter.value);
+        }
+        return error.MetadataVoprParameterMissing;
+    }
 };
 
-const MetadataVoprWorkload = enum {
+pub const MetadataVoprWorkload = enum {
     smoke,
     expanded,
 };
 
+/// Test-only faults in the oracle, never in production behavior. These make
+/// the autonomous discovery/replay/reduction/promotion pipeline itself
+/// regression-testable without checking in a broken Antfly implementation.
+pub const MetadataVoprInjectedBug = enum {
+    none,
+    overlapping_link_fault_safety,
+};
+
+/// Deterministic target-state source used only to meta-test the Antfly VOPR
+/// pipeline. It discovers the injected overlap invariant by selecting two
+/// distinct link-partition transitions from the actual enabled sets, then
+/// lets the quiet suffix choose canonical ordinary work.
+pub const MetadataOverlapDiscoveryChoice = struct {
+    link_starts: u8 = 0,
+
+    pub fn source(self: *MetadataOverlapDiscoveryChoice) vopr.choice.Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: vopr.choice.Request) !u64 {
+        const self: *MetadataOverlapDiscoveryChoice = @ptrCast(@alignCast(ptr));
+        if (self.link_starts < 2) {
+            for (request.enabled) |candidate| {
+                if (!std.mem.eql(u8, candidate.name, "metadata.network.partition_link")) continue;
+                self.link_starts += 1;
+                return candidate.id;
+            }
+            return error.InjectedOverlapTargetNotEnabled;
+        }
+        return request.enabled[0].id;
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *MetadataOverlapDiscoveryChoice = @ptrCast(@alignCast(ptr));
+        if (self.link_starts != 2) return error.InjectedOverlapTargetNotReached;
+    }
+};
+
+const MetadataNodeCrashLifecycleChoice = struct {
+    stage: enum { crash, restart, complete } = .crash,
+
+    fn source(self: *@This()) vopr.choice.Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: vopr.choice.Request) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target_name: ?[]const u8 = switch (self.stage) {
+            .crash => "metadata.node.crash",
+            .restart => "metadata.node.restart",
+            .complete => null,
+        };
+        if (target_name) |name| {
+            for (request.enabled) |candidate| {
+                if (!std.mem.eql(u8, candidate.name, name)) continue;
+                self.stage = switch (self.stage) {
+                    .crash => .restart,
+                    .restart => .complete,
+                    .complete => unreachable,
+                };
+                return candidate.id;
+            }
+            return error.MetadataNodeLifecycleTargetNotEnabled;
+        }
+        return request.enabled[0].id;
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.stage != .complete) return error.MetadataNodeLifecycleTargetNotReached;
+    }
+};
+
 const MetadataVoprAction = enum {
     step,
+    network_deliver,
+    network_drop,
+    network_duplicate,
+    network_delay,
+    network_release,
+    time_advance,
     drop_next,
+    drop_burst,
+    reset_next,
     duplicate_next,
     delay_next,
+    start_queue_limit,
+    stop_queue_limit,
+    start_route_unavailable,
+    stop_route_unavailable,
+    pause_node,
+    resume_node,
     release_fifo,
     release_random,
     start_link_partition,
     start_node_partition,
+    stop_link_partition,
+    stop_node_partition,
     heal_all,
-    restart_follower,
+    graceful_stop_node,
+    crash_node,
+    restart_node,
 };
 
 fn metadataVoprActionName(action: MetadataVoprAction) []const u8 {
     return switch (action) {
         .step => "step",
+        .network_deliver => "network_deliver",
+        .network_drop => "network_drop",
+        .network_duplicate => "network_duplicate",
+        .network_delay => "network_delay",
+        .network_release => "network_release",
+        .time_advance => "time_advance",
         .drop_next => "drop_next",
+        .drop_burst => "drop_burst",
+        .reset_next => "reset_next",
         .duplicate_next => "duplicate_next",
         .delay_next => "delay_next",
+        .start_queue_limit => "start_queue_limit",
+        .stop_queue_limit => "stop_queue_limit",
+        .start_route_unavailable => "start_route_unavailable",
+        .stop_route_unavailable => "stop_route_unavailable",
+        .pause_node => "pause_node",
+        .resume_node => "resume_node",
         .release_fifo => "release_fifo",
         .release_random => "release_random",
         .start_link_partition => "start_link_partition",
         .start_node_partition => "start_node_partition",
+        .stop_link_partition => "stop_link_partition",
+        .stop_node_partition => "stop_node_partition",
         .heal_all => "heal_all",
-        .restart_follower => "restart_follower",
+        .graceful_stop_node => "graceful_stop_node",
+        .crash_node => "crash_node",
+        .restart_node => "restart_node",
     };
 }
 
@@ -5829,26 +8838,101 @@ fn metadataVoprReplayCommand(cfg: MetadataVoprCampaignConfig) []const u8 {
 }
 
 const MetadataVoprCampaignState = struct {
-    active_link: ?raft_sim.VirtualHttpNetwork.Link = null,
-    active_node_id: ?u64 = null,
+    active_links: [2]raft_sim.VirtualHttpNetwork.Link = undefined,
+    active_link_count: usize = 0,
+    active_node_ids: [1]u64 = undefined,
+    active_node_count: usize = 0,
+    unavailable_node_id: ?u64 = null,
+    queue_capacity: ?usize = null,
+    paused_node_id: ?u64 = null,
+    gracefully_stopped_node_id: ?u64 = null,
+    crashed_node_id: ?u64 = null,
+
+    fn faultCount(self: *const MetadataVoprCampaignState) usize {
+        return self.active_link_count + self.active_node_count +
+            @intFromBool(self.unavailable_node_id != null) +
+            @intFromBool(self.queue_capacity != null) +
+            @intFromBool(self.paused_node_id != null) +
+            @intFromBool(self.gracefully_stopped_node_id != null) +
+            @intFromBool(self.crashed_node_id != null);
+    }
+
+    fn containsLink(self: *const MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) bool {
+        for (self.active_links[0..self.active_link_count]) |active| {
+            if (active.source_id == link.source_id and active.target_id == link.target_id) return true;
+        }
+        return false;
+    }
+
+    fn addLink(self: *MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) !void {
+        if (self.containsLink(link)) return error.MetadataVoprFaultAlreadyActive;
+        if (self.active_link_count == self.active_links.len) return error.MetadataVoprFaultBudgetExceeded;
+        self.active_links[self.active_link_count] = link;
+        self.active_link_count += 1;
+    }
+
+    fn removeLink(self: *MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) !void {
+        for (self.active_links[0..self.active_link_count], 0..) |active, index| {
+            if (active.source_id != link.source_id or active.target_id != link.target_id) continue;
+            _ = orderedRemove(raft_sim.VirtualHttpNetwork.Link, self.active_links[0..self.active_link_count], index);
+            self.active_link_count -= 1;
+            return;
+        }
+        return error.MetadataVoprFaultNotActive;
+    }
+
+    fn containsNode(self: *const MetadataVoprCampaignState, node_id: u64) bool {
+        for (self.active_node_ids[0..self.active_node_count]) |active| if (active == node_id) return true;
+        return false;
+    }
+
+    fn addNode(self: *MetadataVoprCampaignState, node_id: u64) !void {
+        if (self.containsNode(node_id)) return error.MetadataVoprFaultAlreadyActive;
+        if (self.active_node_count == self.active_node_ids.len) return error.MetadataVoprFaultBudgetExceeded;
+        self.active_node_ids[self.active_node_count] = node_id;
+        self.active_node_count += 1;
+    }
+
+    fn removeNode(self: *MetadataVoprCampaignState, node_id: u64) !void {
+        for (self.active_node_ids[0..self.active_node_count], 0..) |active, index| {
+            if (active != node_id) continue;
+            _ = orderedRemove(u64, self.active_node_ids[0..self.active_node_count], index);
+            self.active_node_count -= 1;
+            return;
+        }
+        return error.MetadataVoprFaultNotActive;
+    }
 
     fn clear(self: *MetadataVoprCampaignState) void {
-        self.active_link = null;
-        self.active_node_id = null;
+        self.active_link_count = 0;
+        self.active_node_count = 0;
+        self.unavailable_node_id = null;
+        self.queue_capacity = null;
+        self.paused_node_id = null;
+        self.gracefully_stopped_node_id = null;
+        self.crashed_node_id = null;
+    }
+
+    fn nodeUnavailable(self: *const MetadataVoprCampaignState, node_id: u64) bool {
+        return self.gracefully_stopped_node_id == node_id or self.crashed_node_id == node_id;
+    }
+
+    fn linksConfinedToNode(self: *const MetadataVoprCampaignState, node_id: u64) bool {
+        for (self.active_links[0..self.active_link_count]) |link| {
+            if (link.source_id != node_id and link.target_id != node_id) return false;
+        }
+        return true;
     }
 };
 
-fn metadataVoprNodeId(cluster: *MetadataHttpClusterSimulation, index: usize) u64 {
-    return cluster.cluster.configs[index].host.http.host.local_node_id;
+fn orderedRemove(comptime T: type, values: []T, index: usize) T {
+    const removed = values[index];
+    std.mem.copyForwards(T, values[index .. values.len - 1], values[index + 1 ..]);
+    return removed;
 }
 
-fn metadataVoprPickIndex(random: std.Random, node_count: usize, exclude: ?usize) usize {
-    std.debug.assert(node_count > 0);
-    var index = @as(usize, @intCast(random.intRangeLessThan(u32, 0, @as(u32, @intCast(node_count)))));
-    if (exclude) |excluded| {
-        if (node_count > 1 and index == excluded) index = (index + 1) % node_count;
-    }
-    return index;
+fn metadataVoprNodeId(cluster: *MetadataHttpClusterSimulation, index: usize) u64 {
+    return cluster.cluster.configs[index].host.http.host.local_node_id;
 }
 
 fn metadataVoprReportFailure(
@@ -5870,35 +8954,989 @@ fn metadataVoprReportFailure(
     }
 }
 
-fn metadataVoprRunRandomTransportActions(
+const MetadataVoprCandidate = struct {
+    transition: vopr.transition.Transition,
+    action: MetadataVoprAction,
+    source_node_id: ?u64 = null,
+    target_node_id: ?u64 = null,
+    node_index: ?usize = null,
+    ticks: u64 = 0,
+    message_id: ?u64 = null,
+};
+
+const MetadataVoprDriver = struct {
+    alloc: std.mem.Allocator,
     cluster: *MetadataHttpClusterSimulation,
-    random: std.Random,
     cfg: MetadataVoprCampaignConfig,
-    state: *MetadataVoprCampaignState,
-    operation_index: *usize,
-    count: usize,
-) !void {
-    const action_count = std.meta.tags(MetadataVoprAction).len;
-    for (0..count) |_| {
-        const action = @as(MetadataVoprAction, @enumFromInt(random.intRangeLessThan(u32, 0, @intCast(action_count))));
-        metadataVoprRunAction(cluster, random, cfg, state, operation_index.*, action) catch |err| {
-            metadataVoprReportFailure(cfg, operation_index.*, action, err);
+    source: vopr.choice.Source,
+    artifact: ?vopr.trace.Trace,
+    flight_recorder: ?*vopr.flight_recorder.Recorder,
+    state: MetadataVoprCampaignState = .{},
+    occurrence: u64 = 0,
+    last_committed: [3]u64 = @splat(0),
+    last_applied: [3]u64 = @splat(0),
+    leader_failure_at: ?u64 = null,
+    monotonic_failure_at: ?u64 = null,
+    recovery_failure_at: ?u64 = null,
+    injected_failure_at: ?u64 = null,
+    quiet_mode: bool = false,
+    recovery_satisfied: bool = false,
+
+    const choice_site = vopr.id.stable("choice", "antfly.metadata.transport_action");
+    const leader_property = vopr.id.stable("property", "metadata.raft.leader_unique_per_term");
+    const monotonic_property = vopr.id.stable("property", "metadata.raft.indices_monotonic");
+    const recovery_property = vopr.id.stable("property", "metadata.eventually_recovers_after_quiescence");
+    pub const injected_overlap_property = vopr.id.stable("property", "metadata.injected.overlapping_link_fault_safety");
+
+    fn init(
+        alloc: std.mem.Allocator,
+        cluster: *MetadataHttpClusterSimulation,
+        cfg: MetadataVoprCampaignConfig,
+        source: vopr.choice.Source,
+        flight_recorder: ?*vopr.flight_recorder.Recorder,
+    ) !MetadataVoprDriver {
+        try cfg.validate();
+        var scenario_parameters = [_]vopr.trace.Parameter{
+            .named("metadata.operation_count", @intCast(cfg.operation_count)),
+            .named("metadata.group_id", @intCast(cfg.metadata_group_id)),
+            .named("metadata.table_id", @intCast(cfg.table_id)),
+            .named("metadata.range_group_id", @intCast(cfg.range_group_id)),
+            .named("metadata.split_group_id", @intCast(cfg.split_group_id)),
+            .named("metadata.split_transition_id", @intCast(cfg.split_transition_id)),
+            .named("metadata.workload", @intFromEnum(cfg.workload)),
+            .named("metadata.injected_bug", @intFromEnum(cfg.injected_bug)),
+        };
+        std.mem.sort(vopr.trace.Parameter, &scenario_parameters, {}, struct {
+            fn lessThan(_: void, lhs: vopr.trace.Parameter, rhs: vopr.trace.Parameter) bool {
+                return lhs.id < rhs.id;
+            }
+        }.lessThan);
+        var self = MetadataVoprDriver{
+            .alloc = alloc,
+            .cluster = cluster,
+            .cfg = cfg,
+            .source = source,
+            .flight_recorder = flight_recorder,
+            .artifact = try vopr.trace.Trace.init(alloc, .{
+                .system = "antfly",
+                .scenario = "metadata-vopr",
+                .scenario_version = metadata_vopr_scenario_version,
+                .source_revision = "vopr-metadata-phase1",
+                .target = "native",
+                .optimize = "test",
+            }, .{
+                .seed = cfg.seed,
+                .transition_budget = @intCast(cfg.operation_count + 64),
+                .resource_budget = 3,
+                .fixture_hashes = &.{},
+                .feature_flags = &.{},
+                .backend_ids = &.{vopr.id.stable("backend", "raft.memory")},
+                .scenario_parameters = &scenario_parameters,
+            }),
+        };
+        errdefer self.artifact.?.deinit();
+        _ = try self.recordObservation(0);
+        return self;
+    }
+
+    fn deinit(self: *MetadataVoprDriver) void {
+        if (self.artifact) |*artifact| artifact.deinit();
+        self.artifact = null;
+    }
+
+    fn trace(self: *MetadataVoprDriver) *vopr.trace.Trace {
+        return &self.artifact.?;
+    }
+
+    fn actionId(action: MetadataVoprAction, discriminator: u64) u64 {
+        return vopr.id.derive("antfly.metadata.action", @as(u64, @intFromEnum(action)) + 1, discriminator);
+    }
+
+    fn appendCandidate(
+        candidates: *std.ArrayListUnmanaged(MetadataVoprCandidate),
+        alloc: std.mem.Allocator,
+        candidate: MetadataVoprCandidate,
+    ) !void {
+        try candidates.append(alloc, candidate);
+    }
+
+    fn enumerate(self: *MetadataVoprDriver, candidates: *std.ArrayListUnmanaged(MetadataVoprCandidate)) !void {
+        if (self.quiet_mode and self.state.faultCount() > 0) {
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{ .id = actionId(.heal_all, 0), .name = "metadata.network.heal_all", .kind = .fault },
+                .action = .heal_all,
+            });
+            return;
+        }
+        for (0..self.cluster.cluster.nodes.len) |node_index| {
+            const node_id = metadataVoprNodeId(self.cluster, node_index);
+            if (self.state.paused_node_id != null and self.state.paused_node_id.? == node_id) continue;
+            if (self.state.nodeUnavailable(node_id)) continue;
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.step, node_id),
+                    .name = "metadata.node_round",
+                    .kind = .scheduler,
+                    .actor_id = node_id,
+                    .parameter = @intCast(node_index),
+                },
+                .action = .step,
+                .source_node_id = node_id,
+                .node_index = node_index,
+            });
+        }
+        const messages = try self.cluster.virtual_network.queuedMessages(self.alloc);
+        defer self.alloc.free(messages);
+        for (messages) |message| {
+            if (message.due_tick <= self.cluster.virtual_network.virtual_tick) {
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.network_deliver, message.id),
+                        .name = "metadata.network.deliver_message",
+                        .kind = .scheduler,
+                        .actor_id = message.source_id,
+                        .resource_id = message.id,
+                        .parameter = @intCast(@min(message.due_tick, @as(u64, std.math.maxInt(i64)))),
+                    },
+                    .action = .network_deliver,
+                    .message_id = message.id,
+                });
+            }
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.network_drop, message.id),
+                    .name = "metadata.network.drop_message",
+                    .kind = .fault,
+                    .actor_id = message.source_id,
+                    .resource_id = message.id,
+                },
+                .action = .network_drop,
+                .message_id = message.id,
+            });
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.network_duplicate, message.id),
+                    .name = "metadata.network.duplicate_message",
+                    .kind = .fault,
+                    .actor_id = message.source_id,
+                    .resource_id = message.id,
+                },
+                .action = .network_duplicate,
+                .message_id = message.id,
+            });
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.network_delay, message.id),
+                    .name = "metadata.network.delay_message",
+                    .kind = .fault,
+                    .actor_id = message.source_id,
+                    .resource_id = message.id,
+                    .parameter = 2,
+                },
+                .action = .network_delay,
+                .message_id = message.id,
+                .ticks = 2,
+            });
+            if (message.due_tick > self.cluster.virtual_network.virtual_tick) {
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.network_release, message.id),
+                        .name = "metadata.network.release_message",
+                        .kind = .scheduler,
+                        .actor_id = message.source_id,
+                        .resource_id = message.id,
+                    },
+                    .action = .network_release,
+                    .message_id = message.id,
+                });
+            }
+        }
+        const next_tick = self.cluster.virtual_network.virtual_tick +| 1;
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{
+                .id = actionId(.time_advance, next_tick),
+                .name = "metadata.time_advance",
+                .kind = .scheduler,
+                .parameter = @intCast(@min(next_tick, @as(u64, std.math.maxInt(i64)))),
+            },
+            .action = .time_advance,
+            .ticks = 1,
+        });
+        if (self.quiet_mode) return;
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.drop_next, 0), .name = "metadata.network.drop_next", .kind = .fault },
+            .action = .drop_next,
+        });
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.drop_burst, 2), .name = "metadata.network.drop_burst", .kind = .fault, .parameter = 2 },
+            .action = .drop_burst,
+            .ticks = 2,
+        });
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.reset_next, 0), .name = "metadata.network.reset_next", .kind = .fault },
+            .action = .reset_next,
+        });
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.duplicate_next, 0), .name = "metadata.network.duplicate_next", .kind = .fault },
+            .action = .duplicate_next,
+        });
+        for (1..4) |ticks| {
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{ .id = actionId(.delay_next, ticks), .name = "metadata.network.delay_next", .kind = .fault, .parameter = @intCast(ticks) },
+                .action = .delay_next,
+                .ticks = ticks,
+            });
+        }
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.release_fifo, 0), .name = "metadata.network.release_fifo", .kind = .scheduler },
+            .action = .release_fifo,
+        });
+        try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.release_random, 0), .name = "metadata.network.release_seeded", .kind = .scheduler },
+            .action = .release_random,
+        });
+
+        if (self.state.faultCount() == 0) {
+            for (1..3) |capacity| {
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.start_queue_limit, capacity),
+                        .name = "metadata.network.limit_queue",
+                        .kind = .fault,
+                        .parameter = @intCast(capacity),
+                    },
+                    .action = .start_queue_limit,
+                    .ticks = capacity,
+                });
+            }
+            for (0..self.cluster.cluster.nodes.len) |node_index| {
+                const node_id = metadataVoprNodeId(self.cluster, node_index);
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.start_route_unavailable, node_id),
+                        .name = "metadata.network.route_unavailable",
+                        .kind = .fault,
+                        .actor_id = node_id,
+                    },
+                    .action = .start_route_unavailable,
+                    .source_node_id = node_id,
+                });
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.pause_node, node_id),
+                        .name = "metadata.node.pause",
+                        .kind = .fault,
+                        .actor_id = node_id,
+                        .parameter = @intCast(node_index),
+                    },
+                    .action = .pause_node,
+                    .source_node_id = node_id,
+                    .node_index = node_index,
+                });
+            }
+        }
+        if (self.state.active_node_count == 0 and
+            self.state.queue_capacity == null and
+            self.state.unavailable_node_id == null and
+            self.state.paused_node_id == null and
+            self.state.gracefully_stopped_node_id == null and
+            self.state.crashed_node_id == null)
+        {
+            for (0..self.cluster.cluster.nodes.len) |node_index| {
+                const node_id = metadataVoprNodeId(self.cluster, node_index);
+                // Existing link faults may overlap a node lifecycle only when
+                // they are incident to that node, leaving the other two nodes
+                // as an intact healthy quorum.
+                if (!self.state.linksConfinedToNode(node_id)) continue;
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.graceful_stop_node, node_id),
+                        .name = "metadata.node.graceful_stop",
+                        .kind = .fault,
+                        .actor_id = node_id,
+                        .parameter = @intCast(node_index),
+                    },
+                    .action = .graceful_stop_node,
+                    .source_node_id = node_id,
+                    .node_index = node_index,
+                });
+                try appendCandidate(candidates, self.alloc, .{
+                    .transition = .{
+                        .id = actionId(.crash_node, node_id),
+                        .name = "metadata.node.crash",
+                        .kind = .fault,
+                        .actor_id = node_id,
+                        .parameter = @intCast(node_index),
+                    },
+                    .action = .crash_node,
+                    .source_node_id = node_id,
+                    .node_index = node_index,
+                });
+            }
+        }
+        if (self.state.queue_capacity) |capacity| try appendCandidate(candidates, self.alloc, .{
+            .transition = .{
+                .id = actionId(.stop_queue_limit, capacity),
+                .name = "metadata.network.clear_queue_limit",
+                .kind = .fault,
+                .parameter = @intCast(capacity),
+            },
+            .action = .stop_queue_limit,
+            .ticks = capacity,
+        });
+        if (self.state.unavailable_node_id) |node_id| try appendCandidate(candidates, self.alloc, .{
+            .transition = .{
+                .id = actionId(.stop_route_unavailable, node_id),
+                .name = "metadata.network.route_restored",
+                .kind = .fault,
+                .actor_id = node_id,
+            },
+            .action = .stop_route_unavailable,
+            .source_node_id = node_id,
+        });
+        if (self.state.paused_node_id) |node_id| try appendCandidate(candidates, self.alloc, .{
+            .transition = .{
+                .id = actionId(.resume_node, node_id),
+                .name = "metadata.node.resume",
+                .kind = .fault,
+                .actor_id = node_id,
+            },
+            .action = .resume_node,
+            .source_node_id = node_id,
+        });
+
+        // Preserve a healthy-quorum-oriented budget: up to two directed link
+        // faults may overlap, while a whole-node isolation remains exclusive.
+        if (self.state.active_node_count == 0 and self.state.active_link_count < self.state.active_links.len) {
+            for (0..self.cluster.cluster.nodes.len) |source_index| {
+                const source_id = metadataVoprNodeId(self.cluster, source_index);
+                for (0..self.cluster.cluster.nodes.len) |target_index| {
+                    if (source_index == target_index) continue;
+                    const target_id = metadataVoprNodeId(self.cluster, target_index);
+                    const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = source_id, .target_id = target_id };
+                    if (self.state.containsLink(link)) continue;
+                    const link_id = vopr.id.derive("antfly.metadata.link", source_id, target_id);
+                    try appendCandidate(candidates, self.alloc, .{
+                        .transition = .{
+                            .id = actionId(.start_link_partition, link_id),
+                            .name = "metadata.network.partition_link",
+                            .kind = .fault,
+                            .actor_id = source_id,
+                            .resource_id = target_id,
+                        },
+                        .action = .start_link_partition,
+                        .source_node_id = source_id,
+                        .target_node_id = target_id,
+                    });
+                }
+                if (self.state.faultCount() == 0) {
+                    try appendCandidate(candidates, self.alloc, .{
+                        .transition = .{
+                            .id = actionId(.start_node_partition, source_id),
+                            .name = "metadata.network.partition_node",
+                            .kind = .fault,
+                            .actor_id = source_id,
+                        },
+                        .action = .start_node_partition,
+                        .source_node_id = source_id,
+                    });
+                }
+            }
+        }
+        for (self.state.active_links[0..self.state.active_link_count]) |link| {
+            const link_id = vopr.id.derive("antfly.metadata.link", link.source_id, link.target_id);
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.stop_link_partition, link_id),
+                    .name = "metadata.network.heal_link",
+                    .kind = .fault,
+                    .actor_id = link.source_id,
+                    .resource_id = link.target_id,
+                },
+                .action = .stop_link_partition,
+                .source_node_id = link.source_id,
+                .target_node_id = link.target_id,
+            });
+        }
+        for (self.state.active_node_ids[0..self.state.active_node_count]) |node_id| {
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.stop_node_partition, node_id),
+                    .name = "metadata.network.heal_node",
+                    .kind = .fault,
+                    .actor_id = node_id,
+                },
+                .action = .stop_node_partition,
+                .source_node_id = node_id,
+            });
+        }
+        if (self.state.faultCount() > 0) try appendCandidate(candidates, self.alloc, .{
+            .transition = .{ .id = actionId(.heal_all, 0), .name = "metadata.network.heal_all", .kind = .fault },
+            .action = .heal_all,
+        });
+
+        if (self.state.gracefully_stopped_node_id orelse self.state.crashed_node_id) |node_id| {
+            const node_index = for (0..self.cluster.cluster.nodes.len) |candidate_index| {
+                if (metadataVoprNodeId(self.cluster, candidate_index) == node_id) break candidate_index;
+            } else return error.MetadataVoprNodeMissing;
+            try appendCandidate(candidates, self.alloc, .{
+                .transition = .{
+                    .id = actionId(.restart_node, node_id),
+                    .name = "metadata.node.restart",
+                    .kind = .fault,
+                    .actor_id = node_id,
+                    .parameter = @intCast(node_index),
+                },
+                .action = .restart_node,
+                .source_node_id = node_id,
+                .node_index = node_index,
+            });
+        }
+    }
+
+    fn runActions(self: *MetadataVoprDriver, count: usize) !void {
+        for (0..count) |_| try self.runOne();
+    }
+
+    fn runOne(self: *MetadataVoprDriver) !void {
+        var candidates: std.ArrayListUnmanaged(MetadataVoprCandidate) = .empty;
+        defer candidates.deinit(self.alloc);
+        try self.enumerate(&candidates);
+        var transitions = vopr.transition.List{};
+        defer transitions.deinit(self.alloc);
+        for (candidates.items) |candidate| try transitions.append(self.alloc, candidate.transition);
+        try transitions.canonicalize();
+        const selected_id = try self.source.choose(.{
+            .site_id = choice_site,
+            .site_name = "antfly.metadata.transport_action",
+            .occurrence = self.occurrence,
+            .enabled = transitions.items.items,
+        });
+        const enabled_ids = try self.alloc.alloc(u64, transitions.items.items.len);
+        defer self.alloc.free(enabled_ids);
+        for (transitions.items.items, 0..) |enabled, index| enabled_ids[index] = enabled.id;
+        try self.trace().addChoice(.{
+            .site_id = choice_site,
+            .site_name = "antfly.metadata.transport_action",
+            .occurrence = self.occurrence,
+            .enabled_ids = enabled_ids,
+            .selected_id = selected_id,
+        });
+        const selected = for (candidates.items) |candidate| {
+            if (candidate.transition.id == selected_id) break candidate;
+        } else return error.SelectedMetadataActionMissing;
+
+        const state_before = self.state;
+        self.execute(selected) catch |err| {
+            metadataVoprReportFailure(self.cfg, @intCast(self.occurrence), selected.action, err);
             return err;
         };
-        operation_index.* += 1;
+        self.occurrence += 1;
+        try self.trace().addTransition(.{
+            .index = self.occurrence,
+            .id = selected.transition.id,
+            .name = selected.transition.name,
+            .kind = selected.transition.kind,
+            .actor_id = selected.transition.actor_id,
+            .resource_id = selected.transition.resource_id,
+            .parameter = selected.transition.parameter,
+            .payload_digest = selected.transition.payloadDigest(),
+        });
+        if (selected.transition.kind == .fault) try self.recordFaultChanges(selected, state_before);
+        try self.trace().addEvent(.{
+            .index = self.occurrence,
+            .ordinal = 0,
+            .id = vopr.id.stable("event", "metadata.action_applied"),
+            .name = "metadata.action_applied",
+            .kind = .state_change,
+            .actor_id = selected.transition.actor_id,
+            .resource_id = selected.transition.resource_id,
+            .payload_digest = @bitCast(selected.transition.parameter),
+        });
+        if (self.flight_recorder) |recorder| {
+            var source_buffer: [32]u8 = undefined;
+            var target_buffer: [32]u8 = undefined;
+            var parameter_buffer: [32]u8 = undefined;
+            const source = if (selected.source_node_id) |node_id|
+                try std.fmt.bufPrint(&source_buffer, "{d}", .{node_id})
+            else
+                "none";
+            const target = if (selected.target_node_id) |node_id|
+                try std.fmt.bufPrint(&target_buffer, "{d}", .{node_id})
+            else
+                "none";
+            const parameter = try std.fmt.bufPrint(&parameter_buffer, "{d}", .{selected.transition.parameter});
+            const details = try std.fmt.allocPrint(
+                self.alloc,
+                "action={s} kind={s} source={s} target={s} parameter={s} quiet={}",
+                .{ @tagName(selected.action), @tagName(selected.transition.kind), source, target, parameter, self.quiet_mode },
+            );
+            defer self.alloc.free(details);
+            try recorder.record(.{
+                .index = self.occurrence,
+                .ordinal = 0,
+                .id = vopr.id.stable("event", "metadata.action_applied"),
+                .name = "metadata.action_applied",
+                .kind = .state_change,
+                .actor_id = selected.transition.actor_id,
+                .resource_id = selected.transition.resource_id,
+                .payload_digest = @bitCast(selected.transition.parameter),
+                .details = details,
+                .fields = &.{
+                    .{ .name = "action", .value = @tagName(selected.action) },
+                    .{ .name = "transition_kind", .value = @tagName(selected.transition.kind) },
+                    .{ .name = "source_node", .value = source },
+                    .{ .name = "target_node", .value = target },
+                    .{ .name = "parameter", .value = parameter },
+                    .{ .name = "quiet_mode", .value = if (self.quiet_mode) "true" else "false" },
+                },
+            });
+        }
+        _ = try self.recordObservation(self.occurrence);
+        try self.evaluateProperties(self.occurrence);
     }
-}
+
+    const FaultChange = struct {
+        id: u64,
+        name: []const u8,
+        phase: vopr.trace.FaultPhase,
+    };
+
+    fn recordFaultChanges(self: *MetadataVoprDriver, selected: MetadataVoprCandidate, before: MetadataVoprCampaignState) !void {
+        var changes: [12]FaultChange = undefined;
+        var count: usize = 0;
+        switch (selected.action) {
+            .start_link_partition, .stop_link_partition => {
+                const link_id = vopr.id.derive("antfly.metadata.link", selected.source_node_id.?, selected.target_node_id.?);
+                changes[count] = .{
+                    .id = vopr.id.derive("fault.metadata.link-partition", link_id, 0),
+                    .name = "metadata.network.partition_link",
+                    .phase = if (selected.action == .start_link_partition) .start else .end,
+                };
+                count += 1;
+            },
+            .start_node_partition, .stop_node_partition => {
+                changes[count] = nodeFaultChange(
+                    "metadata.network.partition_node",
+                    selected.source_node_id.?,
+                    if (selected.action == .start_node_partition) .start else .end,
+                );
+                count += 1;
+            },
+            .start_queue_limit, .stop_queue_limit => {
+                changes[count] = .{
+                    .id = vopr.id.derive("fault.metadata.queue-capacity", selected.ticks, 0),
+                    .name = "metadata.network.queue_capacity",
+                    .phase = if (selected.action == .start_queue_limit) .start else .end,
+                };
+                count += 1;
+            },
+            .start_route_unavailable, .stop_route_unavailable => {
+                changes[count] = nodeFaultChange(
+                    "metadata.network.route_unavailable",
+                    selected.source_node_id.?,
+                    if (selected.action == .start_route_unavailable) .start else .end,
+                );
+                count += 1;
+            },
+            .pause_node, .resume_node => {
+                changes[count] = nodeFaultChange(
+                    "metadata.node.paused",
+                    selected.source_node_id.?,
+                    if (selected.action == .pause_node) .start else .end,
+                );
+                count += 1;
+            },
+            .graceful_stop_node => {
+                changes[count] = nodeFaultChange("metadata.node.gracefully_stopped", selected.source_node_id.?, .start);
+                count += 1;
+            },
+            .crash_node => {
+                changes[count] = nodeFaultChange("metadata.node.crashed", selected.source_node_id.?, .start);
+                count += 1;
+            },
+            .restart_node => {
+                const name: []const u8 = if (before.crashed_node_id == selected.source_node_id.?)
+                    "metadata.node.crashed"
+                else
+                    "metadata.node.gracefully_stopped";
+                changes[count] = nodeFaultChange(name, selected.source_node_id.?, .end);
+                count += 1;
+            },
+            .heal_all => {
+                for (before.active_links[0..before.active_link_count]) |link| {
+                    const link_id = vopr.id.derive("antfly.metadata.link", link.source_id, link.target_id);
+                    changes[count] = .{
+                        .id = vopr.id.derive("fault.metadata.link-partition", link_id, 0),
+                        .name = "metadata.network.partition_link",
+                        .phase = .end,
+                    };
+                    count += 1;
+                }
+                for (before.active_node_ids[0..before.active_node_count]) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.network.partition_node", node_id, .end);
+                    count += 1;
+                }
+                if (before.queue_capacity) |capacity| {
+                    changes[count] = .{
+                        .id = vopr.id.derive("fault.metadata.queue-capacity", capacity, 0),
+                        .name = "metadata.network.queue_capacity",
+                        .phase = .end,
+                    };
+                    count += 1;
+                }
+                if (before.unavailable_node_id) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.network.route_unavailable", node_id, .end);
+                    count += 1;
+                }
+                if (before.paused_node_id) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.node.paused", node_id, .end);
+                    count += 1;
+                }
+                if (before.gracefully_stopped_node_id) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.node.gracefully_stopped", node_id, .end);
+                    count += 1;
+                }
+                if (before.crashed_node_id) |node_id| {
+                    changes[count] = nodeFaultChange("metadata.node.crashed", node_id, .end);
+                    count += 1;
+                }
+            },
+            else => {
+                changes[count] = .{ .id = selected.transition.id, .name = selected.transition.name, .phase = .pulse };
+                count += 1;
+            },
+        }
+        std.mem.sort(FaultChange, changes[0..count], {}, struct {
+            fn lessThan(_: void, lhs: FaultChange, rhs: FaultChange) bool {
+                if (lhs.id != rhs.id) return lhs.id < rhs.id;
+                return @intFromEnum(lhs.phase) < @intFromEnum(rhs.phase);
+            }
+        }.lessThan);
+        for (changes[0..count]) |change| try self.trace().addFault(.{
+            .index = self.occurrence,
+            .id = change.id,
+            .name = change.name,
+            .phase = change.phase,
+        });
+    }
+
+    fn nodeFaultChange(name: []const u8, node_id: u64, phase: vopr.trace.FaultPhase) FaultChange {
+        return .{ .id = vopr.id.derive("fault.metadata.node", vopr.id.stable("fault-kind", name), node_id), .name = name, .phase = phase };
+    }
+
+    fn execute(self: *MetadataVoprDriver, selected: MetadataVoprCandidate) !void {
+        switch (selected.action) {
+            .step => try self.cluster.stepNode(selected.node_index.?),
+            .network_deliver => try self.cluster.virtual_network.deliverMessage(selected.message_id.?),
+            .network_drop => try self.cluster.virtual_network.dropMessage(selected.message_id.?),
+            .network_duplicate => _ = try self.cluster.virtual_network.duplicateMessage(selected.message_id.?),
+            .network_delay => try self.cluster.virtual_network.delayMessage(selected.message_id.?, selected.ticks),
+            .network_release => try self.cluster.virtual_network.releaseMessage(selected.message_id.?),
+            .time_advance => self.cluster.advanceSimTime(selected.ticks),
+            .drop_next => {
+                try self.cluster.cluster.inject(.drop_next);
+            },
+            .drop_burst => {
+                try self.cluster.cluster.inject(.{ .drop_burst = @intCast(selected.ticks) });
+            },
+            .reset_next => {
+                try self.cluster.cluster.inject(.reset_next);
+            },
+            .duplicate_next => {
+                try self.cluster.cluster.inject(.duplicate_next);
+            },
+            .delay_next => {
+                try self.cluster.cluster.inject(.{ .delay_next_ticks = selected.ticks });
+            },
+            .start_queue_limit => {
+                try self.cluster.cluster.inject(.{ .queue_capacity = @intCast(selected.ticks) });
+                self.state.queue_capacity = @intCast(selected.ticks);
+            },
+            .stop_queue_limit => {
+                try self.cluster.cluster.inject(.clear_queue_capacity);
+                self.state.queue_capacity = null;
+            },
+            .start_route_unavailable => {
+                const node_id = selected.source_node_id.?;
+                try self.cluster.cluster.inject(.{ .route_unavailable = node_id });
+                self.state.unavailable_node_id = node_id;
+            },
+            .stop_route_unavailable => {
+                const node_id = selected.source_node_id.?;
+                self.cluster.cluster.heal(.{ .route_unavailable = node_id });
+                self.state.unavailable_node_id = null;
+            },
+            .pause_node => {
+                self.state.paused_node_id = selected.source_node_id.?;
+            },
+            .resume_node => {
+                if (self.state.paused_node_id != selected.source_node_id.?) return error.MetadataVoprFaultNotActive;
+                self.state.paused_node_id = null;
+            },
+            .release_fifo => {
+                try self.cluster.cluster.inject(.release_fifo);
+            },
+            .release_random => {
+                try self.cluster.cluster.inject(.{ .release_random = self.cfg.seed ^ self.occurrence });
+            },
+            .start_link_partition => {
+                const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
+                try self.cluster.cluster.inject(.{ .partition_link = link });
+                try self.state.addLink(link);
+            },
+            .start_node_partition => {
+                const node_id = selected.source_node_id.?;
+                try self.cluster.cluster.inject(.{ .partition_node = node_id });
+                try self.state.addNode(node_id);
+            },
+            .stop_link_partition => {
+                const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
+                self.cluster.cluster.heal(.{ .partition_link = link });
+                try self.state.removeLink(link);
+            },
+            .stop_node_partition => {
+                const node_id = selected.source_node_id.?;
+                self.cluster.cluster.heal(.{ .partition_node = node_id });
+                try self.state.removeNode(node_id);
+            },
+            .heal_all => {
+                self.cluster.cluster.healAll();
+                if (self.state.crashed_node_id) |node_id| {
+                    const node_index = for (0..self.cluster.cluster.nodes.len) |candidate_index| {
+                        if (metadataVoprNodeId(self.cluster, candidate_index) == node_id) break candidate_index;
+                    } else return error.MetadataVoprNodeMissing;
+                    try self.cluster.restartNode(node_index);
+                }
+                self.state.clear();
+            },
+            .graceful_stop_node => {
+                const node_id = selected.source_node_id.?;
+                if (self.state.gracefully_stopped_node_id != null or self.state.crashed_node_id != null)
+                    return error.MetadataVoprFaultBudgetExceeded;
+                try self.cluster.cluster.inject(.{ .route_unavailable = node_id });
+                self.state.gracefully_stopped_node_id = node_id;
+            },
+            .crash_node => {
+                const node_id = selected.source_node_id.?;
+                if (self.state.gracefully_stopped_node_id != null or self.state.crashed_node_id != null)
+                    return error.MetadataVoprFaultBudgetExceeded;
+                // The host remains allocated but is unreachable and receives
+                // no rounds. Restart destroys this volatile process image and
+                // reconstructs it from the preserved durable dependencies.
+                try self.cluster.cluster.inject(.{ .route_unavailable = node_id });
+                self.state.crashed_node_id = node_id;
+            },
+            .restart_node => {
+                const node_id = selected.source_node_id.?;
+                if (self.state.crashed_node_id == node_id) {
+                    try self.cluster.restartNode(selected.node_index.?);
+                    self.state.crashed_node_id = null;
+                } else if (self.state.gracefully_stopped_node_id == node_id) {
+                    self.state.gracefully_stopped_node_id = null;
+                } else return error.MetadataVoprFaultNotActive;
+                self.cluster.cluster.heal(.{ .route_unavailable = node_id });
+            },
+        }
+    }
+
+    fn recordObservation(self: *MetadataVoprDriver, index: u64) !u64 {
+        var builder = vopr.observation.Builder{};
+        defer builder.deinit(self.alloc);
+        try builder.addNamed(self.alloc, "metadata.network.queued", @intCast(self.cluster.virtual_network.queuedCount()));
+        try builder.addNamed(self.alloc, "metadata.network.tick", @intCast(@min(self.cluster.virtual_network.virtual_tick, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.requests", @intCast(@min(self.cluster.virtual_network.request_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.delivered", @intCast(@min(self.cluster.virtual_network.delivered_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.dropped", @intCast(@min(self.cluster.virtual_network.dropped_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.duplicated", @intCast(@min(self.cluster.virtual_network.duplicated_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.delayed", @intCast(@min(self.cluster.virtual_network.delayed_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.reset", @intCast(@min(self.cluster.virtual_network.reset_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.unavailable", @intCast(@min(self.cluster.virtual_network.unavailable_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.network.saturated", @intCast(@min(self.cluster.virtual_network.saturated_count, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.fault.active", @intFromBool(self.state.faultCount() > 0));
+        try builder.addNamed(self.alloc, "metadata.fault.active_count", @intCast(self.state.faultCount()));
+        try builder.addNamed(self.alloc, "metadata.fault.partitioned_links", @intCast(self.state.active_link_count));
+        try builder.addNamed(self.alloc, "metadata.fault.partitioned_nodes", @intCast(self.state.active_node_count));
+        try builder.addNamed(self.alloc, "metadata.fault.route_unavailable", @intFromBool(self.state.unavailable_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.fault.queue_limited", @intFromBool(self.state.queue_capacity != null));
+        try builder.addNamed(self.alloc, "metadata.fault.node_paused", @intFromBool(self.state.paused_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.fault.node_gracefully_stopped", @intFromBool(self.state.gracefully_stopped_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.fault.node_crashed", @intFromBool(self.state.crashed_node_id != null));
+        try builder.addNamed(self.alloc, "metadata.phase.quiet", @intFromBool(self.quiet_mode));
+        var leader_count: i64 = 0;
+        var commit_total: u64 = 0;
+        var applied_total: u64 = 0;
+        for (self.cluster.cluster.nodes, 0..) |*node, node_index| {
+            if (self.state.nodeUnavailable(metadataVoprNodeId(self.cluster, node_index))) continue;
+            if (node.raftStatus(self.cluster.metadata_group_id)) |status| {
+                leader_count += @intFromBool(status.soft.role == .leader);
+                commit_total +|= status.hard.commit_index;
+                applied_total +|= status.applied_index;
+            }
+        }
+        try builder.addNamed(self.alloc, "metadata.raft.leader_count", leader_count);
+        try builder.addNamed(self.alloc, "metadata.raft.commit_total", @intCast(@min(commit_total, @as(u64, std.math.maxInt(i64)))));
+        try builder.addNamed(self.alloc, "metadata.raft.applied_total", @intCast(@min(applied_total, @as(u64, std.math.maxInt(i64)))));
+        try builder.canonicalize();
+        const digest = builder.digest();
+        try self.trace().addObservation(.{ .index = index, .digest = digest, .features = builder.features.items });
+        return digest;
+    }
+
+    fn evaluateProperties(self: *MetadataVoprDriver, index: u64) !void {
+        var leader_count: usize = 0;
+        var leader_terms: [3]u64 = undefined;
+        var leader_unique = true;
+        var monotonic = true;
+        for (self.cluster.cluster.nodes, 0..) |*node, node_index| {
+            if (self.state.nodeUnavailable(metadataVoprNodeId(self.cluster, node_index))) continue;
+            if (node.raftStatus(self.cluster.metadata_group_id)) |status| {
+                if (status.soft.role == .leader) {
+                    for (leader_terms[0..leader_count]) |term| {
+                        if (term == status.hard.current_term) leader_unique = false;
+                    }
+                    leader_terms[leader_count] = status.hard.current_term;
+                    leader_count += 1;
+                }
+                monotonic = monotonic and status.hard.commit_index >= self.last_committed[node_index] and status.applied_index >= self.last_applied[node_index];
+                self.last_committed[node_index] = status.hard.commit_index;
+                self.last_applied[node_index] = status.applied_index;
+            }
+        }
+        if (!leader_unique and self.leader_failure_at == null) self.leader_failure_at = index;
+        if (!monotonic and self.monotonic_failure_at == null) self.monotonic_failure_at = index;
+        var pending: [4]vopr.trace.PropertyRecord = undefined;
+        var pending_count: usize = 0;
+        pending[pending_count] = .{
+            .index = index,
+            .property_id = leader_property,
+            .name = "metadata.raft.leader_unique_per_term",
+            .kind = .always,
+            .condition = leader_unique,
+            .details = "at most one metadata leader is visible in each term",
+        };
+        pending_count += 1;
+        pending[pending_count] = .{
+            .index = index,
+            .property_id = monotonic_property,
+            .name = "metadata.raft.indices_monotonic",
+            .kind = .always,
+            .condition = monotonic,
+            .details = "per-node commit and applied indices do not regress",
+        };
+        pending_count += 1;
+        if (self.quiet_mode) {
+            const recovered = leader_count == 1;
+            self.recovery_satisfied = self.recovery_satisfied or recovered;
+            pending[pending_count] = .{
+                .index = index,
+                .property_id = recovery_property,
+                .name = "metadata.eventually_recovers_after_quiescence",
+                .kind = .eventually_after_quiescence,
+                .condition = recovered,
+                .details = "a single metadata leader is restored during the quiet suffix",
+            };
+            pending_count += 1;
+        }
+        if (self.cfg.injected_bug == .overlapping_link_fault_safety) {
+            const safe = self.state.active_link_count < 2;
+            if (!safe and self.injected_failure_at == null) self.injected_failure_at = index;
+            pending[pending_count] = .{
+                .index = index,
+                .property_id = injected_overlap_property,
+                .name = "metadata.injected.overlapping_link_fault_safety",
+                .kind = .always,
+                .condition = safe,
+                .details = "synthetic meta-test invariant fails only when two directed link faults overlap",
+            };
+            pending_count += 1;
+        }
+        std.mem.sort(vopr.trace.PropertyRecord, pending[0..pending_count], {}, struct {
+            fn lessThan(_: void, lhs: vopr.trace.PropertyRecord, rhs: vopr.trace.PropertyRecord) bool {
+                return lhs.property_id < rhs.property_id;
+            }
+        }.lessThan);
+        for (pending[0..pending_count]) |record| try self.trace().addProperty(record);
+    }
+
+    fn beginQuietSuffix(self: *MetadataVoprDriver, budget: usize) !void {
+        if (budget == 0) return error.InvalidQuietSuffixBudget;
+        self.quiet_mode = true;
+        try self.runActions(budget);
+        if (!self.recovery_satisfied) self.recovery_failure_at = self.occurrence;
+    }
+
+    fn healAllRecorded(self: *MetadataVoprDriver) !void {
+        if (self.state.faultCount() == 0) return;
+        const was_quiet = self.quiet_mode;
+        self.quiet_mode = true;
+        defer self.quiet_mode = was_quiet;
+        try self.runOne();
+        if (self.state.faultCount() != 0) return error.MetadataVoprHealTransitionIncomplete;
+        for (0..4) |_| try self.cluster.stepAll();
+        _ = try self.cluster.waitForMetadataLeader(96) orelse return error.NotLeader;
+    }
+
+    fn finish(self: *MetadataVoprDriver) !vopr.trace.Trace {
+        try self.source.finish();
+        const final_digest = self.trace().observations.items[self.trace().observations.items.len - 1].digest;
+        const PendingFailure = struct { index: u64, property_id: u64, name: []const u8 };
+        var failures: [4]PendingFailure = undefined;
+        var failure_count: usize = 0;
+        if (self.leader_failure_at) |index| {
+            failures[failure_count] = .{ .index = index, .property_id = leader_property, .name = "metadata.raft.leader_unique_per_term" };
+            failure_count += 1;
+        }
+        if (self.monotonic_failure_at) |index| {
+            failures[failure_count] = .{ .index = index, .property_id = monotonic_property, .name = "metadata.raft.indices_monotonic" };
+            failure_count += 1;
+        }
+        if (self.recovery_failure_at) |index| {
+            failures[failure_count] = .{ .index = index, .property_id = recovery_property, .name = "metadata.eventually_recovers_after_quiescence" };
+            failure_count += 1;
+        }
+        if (self.injected_failure_at) |index| {
+            failures[failure_count] = .{ .index = index, .property_id = injected_overlap_property, .name = "metadata.injected.overlapping_link_fault_safety" };
+            failure_count += 1;
+        }
+        std.mem.sort(PendingFailure, failures[0..failure_count], {}, struct {
+            fn lessThan(_: void, lhs: PendingFailure, rhs: PendingFailure) bool {
+                if (lhs.index != rhs.index) return lhs.index < rhs.index;
+                return lhs.property_id < rhs.property_id;
+            }
+        }.lessThan);
+        for (failures[0..failure_count]) |failure| {
+            try self.trace().addFailure(.{
+                .index = failure.index,
+                .class = .property,
+                .property_id = failure.property_id,
+                .identity = failure.name,
+                .fingerprint = vopr.id.derive("failure", failure.property_id, 1),
+                .observation_digest = null,
+            });
+        }
+        self.trace().summary = .{
+            .transitions = self.occurrence,
+            .final_observation_digest = final_digest,
+            .property_failures = failure_count,
+        };
+        try self.trace().validate();
+        const result = self.artifact.?;
+        self.artifact = null;
+        return result;
+    }
+};
 
 fn metadataVoprStartFollowerPartition(
     cluster: *MetadataHttpClusterSimulation,
     state: *MetadataVoprCampaignState,
 ) !void {
-    if (state.active_link != null or state.active_node_id != null) return;
+    if (state.faultCount() != 0) return;
     const leader_index = try metadataVoprLeaderIndex(cluster);
     const follower_index = (leader_index + 1) % cluster.cluster.nodes.len;
     const node_id = metadataVoprNodeId(cluster, follower_index);
     try cluster.cluster.inject(.{ .partition_node = node_id });
-    state.active_node_id = node_id;
+    try state.addNode(node_id);
     try cluster.stepAll();
 }
 
@@ -5906,7 +9944,7 @@ fn metadataVoprStartFollowerLinkPartition(
     cluster: *MetadataHttpClusterSimulation,
     state: *MetadataVoprCampaignState,
 ) !void {
-    if (state.active_link != null or state.active_node_id != null) return;
+    if (state.faultCount() != 0) return;
     const leader_index = try metadataVoprLeaderIndex(cluster);
     const follower_index = (leader_index + 1) % cluster.cluster.nodes.len;
     const link = raft_sim.VirtualHttpNetwork.Link{
@@ -5914,7 +9952,7 @@ fn metadataVoprStartFollowerLinkPartition(
         .target_id = metadataVoprNodeId(cluster, leader_index),
     };
     try cluster.cluster.inject(.{ .partition_link = link });
-    state.active_link = link;
+    try state.addLink(link);
     try cluster.stepAll();
 }
 
@@ -5923,81 +9961,15 @@ fn metadataVoprHealAll(
     state: *MetadataVoprCampaignState,
 ) !void {
     cluster.cluster.healAll();
+    if (state.crashed_node_id) |node_id| {
+        const node_index = for (0..cluster.cluster.nodes.len) |candidate_index| {
+            if (metadataVoprNodeId(cluster, candidate_index) == node_id) break candidate_index;
+        } else return error.MetadataVoprNodeMissing;
+        try cluster.restartNode(node_index);
+    }
     state.clear();
     for (0..4) |_| try cluster.stepAll();
     _ = try cluster.waitForMetadataLeader(96) orelse return error.NotLeader;
-}
-
-fn metadataVoprRunAction(
-    cluster: *MetadataHttpClusterSimulation,
-    random: std.Random,
-    cfg: MetadataVoprCampaignConfig,
-    state: *MetadataVoprCampaignState,
-    operation_index: usize,
-    action: MetadataVoprAction,
-) !void {
-    const node_count = cluster.cluster.nodes.len;
-    switch (action) {
-        .step => try cluster.stepAll(),
-        .drop_next => {
-            try cluster.cluster.inject(.drop_next);
-            try cluster.stepAll();
-        },
-        .duplicate_next => {
-            try cluster.cluster.inject(.duplicate_next);
-            try cluster.stepAll();
-        },
-        .delay_next => {
-            const ticks = @as(u64, random.intRangeLessThan(u32, 1, 4));
-            try cluster.cluster.inject(.{ .delay_next_ticks = ticks });
-            try cluster.stepAll();
-        },
-        .release_fifo => {
-            try cluster.cluster.inject(.release_fifo);
-            try cluster.stepAll();
-        },
-        .release_random => {
-            try cluster.cluster.inject(.{ .release_random = cfg.seed ^ @as(u64, @intCast(operation_index)) });
-            try cluster.stepAll();
-        },
-        .start_link_partition => {
-            if (state.active_link != null or state.active_node_id != null) {
-                try cluster.stepAll();
-                return;
-            }
-            const source_index = metadataVoprPickIndex(random, node_count, null);
-            const target_index = metadataVoprPickIndex(random, node_count, source_index);
-            const link = raft_sim.VirtualHttpNetwork.Link{
-                .source_id = metadataVoprNodeId(cluster, source_index),
-                .target_id = metadataVoprNodeId(cluster, target_index),
-            };
-            try cluster.cluster.inject(.{ .partition_link = link });
-            state.active_link = link;
-            try cluster.stepAll();
-        },
-        .start_node_partition => {
-            if (state.active_link != null or state.active_node_id != null) {
-                try cluster.stepAll();
-                return;
-            }
-            const index = metadataVoprPickIndex(random, node_count, null);
-            const node_id = metadataVoprNodeId(cluster, index);
-            try cluster.cluster.inject(.{ .partition_node = node_id });
-            state.active_node_id = node_id;
-            try cluster.stepAll();
-        },
-        .heal_all => {
-            cluster.cluster.healAll();
-            state.clear();
-            try cluster.stepAll();
-        },
-        .restart_follower => {
-            const leader_index = currentMetadataLeaderIndex(cluster);
-            const index = metadataVoprPickIndex(random, node_count, leader_index);
-            try cluster.restartNode(index);
-            try cluster.stepAll();
-        },
-    }
 }
 
 fn metadataVoprLeaderIndex(cluster: *MetadataHttpClusterSimulation) !usize {
@@ -6129,13 +10101,11 @@ fn metadataVoprAddRange(
 fn metadataVoprRunLivenessWorkload(
     cluster: *MetadataHttpClusterSimulation,
     cfg: MetadataVoprCampaignConfig,
-    random: std.Random,
-    state: *MetadataVoprCampaignState,
-    operation_index: *usize,
+    driver: *MetadataVoprDriver,
 ) !void {
     return switch (cfg.workload) {
         .smoke => metadataVoprRunSmokeLivenessWorkload(cluster, cfg),
-        .expanded => metadataVoprRunExpandedLivenessWorkload(cluster, cfg, random, state, operation_index),
+        .expanded => metadataVoprRunExpandedLivenessWorkload(cluster, cfg, driver),
     };
 }
 
@@ -6164,34 +10134,32 @@ fn metadataVoprRunSmokeLivenessWorkload(
 fn metadataVoprRunExpandedLivenessWorkload(
     cluster: *MetadataHttpClusterSimulation,
     cfg: MetadataVoprCampaignConfig,
-    random: std.Random,
-    state: *MetadataVoprCampaignState,
-    operation_index: *usize,
+    driver: *MetadataVoprDriver,
 ) !void {
     var workflow = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
     defer workflow.deinit();
     const phase_fault_actions = @max(@as(usize, 1), cfg.operation_count / 12);
 
     try metadataVoprCreateActiveTable(cluster, &workflow, cfg.table_id, "vopr-docs", cfg.range_group_id, 3, 96);
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     var lifecycle = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
     defer lifecycle.deinit();
     const lifecycle_table_id = cfg.table_id + 1000;
     const lifecycle_group_a = cfg.range_group_id + 1000;
     const lifecycle_group_b = cfg.range_group_id + 1001;
-    try metadataVoprStartFollowerPartition(cluster, state);
+    try metadataVoprStartFollowerPartition(cluster, &driver.state);
     try metadataVoprCreateActiveTable(cluster, &lifecycle, lifecycle_table_id, "vopr-life", lifecycle_group_a, 2, 64);
     const drop_leader_index = try metadataVoprLeaderIndex(cluster);
     const drop_summary = try lifecycle.dropTable(&cluster.node(drop_leader_index), lifecycle_table_id);
     try std.testing.expectEqual(@as(usize, 1), drop_summary.table_removals);
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprHealAll(cluster, &driver.state);
     try std.testing.expect(try cluster.waitForGroupStatus(lifecycle_group_a, .absent, 64));
     try metadataVoprCreateActiveTable(cluster, &lifecycle, lifecycle_table_id, "vopr-life", lifecycle_group_b, 2, 64);
     try std.testing.expect(try cluster.waitForGroupStatusCount(lifecycle_group_b, .active, 2, 64));
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     var churn_workflow = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
     defer churn_workflow.deinit();
@@ -6213,8 +10181,8 @@ fn metadataVoprRunExpandedLivenessWorkload(
     ));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, churn_group_id, .active, 64));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, churn_group_id, .active, 64));
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     var merge_workflow = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
     defer merge_workflow.deinit();
@@ -6228,7 +10196,7 @@ fn metadataVoprRunExpandedLivenessWorkload(
         .start_key = "doc:a",
         .end_key = "doc:m",
     }};
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
+    try metadataVoprStartFollowerLinkPartition(cluster, &driver.state);
     _ = try metadataVoprCreateTableWithRanges(cluster, &merge_workflow, .{
         .table_id = merge_table_id,
         .name = "vopr-merge",
@@ -6253,29 +10221,29 @@ fn metadataVoprRunExpandedLivenessWorkload(
         .allow_doc_identity_reassignment = true,
     });
     try std.testing.expectEqual(@as(usize, 1), merge_summary.merge_upserts);
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprHealAll(cluster, &driver.state);
     var merge_ctx = MetadataMergeTransitionProgressContext{ .transition_id = merge_transition_id };
     try cluster.assertProgress("metadata-vopr-merge-progress", 48, &merge_ctx, metadataMergeTransitionProgressPredicate);
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     const topo_leader_index = try metadataVoprLeaderIndex(cluster);
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
+    try metadataVoprStartFollowerLinkPartition(cluster, &driver.state);
     try cluster.node(topo_leader_index).upsertNode(.{ .node_id = 3, .role = "maintenance" });
     try cluster.node(topo_leader_index).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = false });
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprHealAll(cluster, &driver.state);
     var store_down_ctx = VoprStoreLiveProgressContext{ .store_id = 3, .expected_live = false };
     try cluster.assertProgress("metadata-vopr-store-down", 32, &store_down_ctx, voprStoreLiveProgressPredicate);
     try cluster.node(try metadataVoprLeaderIndex(cluster)).upsertNode(.{ .node_id = 3, .role = "data" });
     try cluster.node(try metadataVoprLeaderIndex(cluster)).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = true });
     var store_up_ctx = VoprStoreLiveProgressContext{ .store_id = 3, .expected_live = true };
     try cluster.assertProgress("metadata-vopr-store-up", 32, &store_up_ctx, voprStoreLiveProgressPredicate);
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
 
     const split_leader_index = try metadataVoprLeaderIndex(cluster);
     try reportSplitCandidateStatus(cluster.node(split_leader_index), cfg.range_group_id, 256, 180, "doc:m");
-    try metadataVoprStartFollowerPartition(cluster, state);
+    try metadataVoprStartFollowerPartition(cluster, &driver.state);
     const split_summary = try workflow.requestSplit(&cluster.node(split_leader_index), .{
         .transition_id = cfg.split_transition_id,
         .table_id = cfg.table_id,
@@ -6285,13 +10253,13 @@ fn metadataVoprRunExpandedLivenessWorkload(
     });
     try std.testing.expectEqual(@as(usize, 1), split_summary.split_admissions);
     try cluster.restartNode(split_leader_index);
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprHealAll(cluster, &driver.state);
     _ = try metadataVoprLeaderIndex(cluster);
     var split_ctx = MetadataSplitTransitionProgressContext{ .transition_id = cfg.split_transition_id };
     try cluster.assertProgress("metadata-vopr-restart-split-progress", 64, &split_ctx, metadataSplitTransitionProgressPredicate);
 
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
-    try metadataVoprHealAll(cluster, state);
+    try metadataVoprStartFollowerLinkPartition(cluster, &driver.state);
+    try metadataVoprHealAll(cluster, &driver.state);
     const shutdown_leader_index = try metadataVoprLeaderIndex(cluster);
     const shutdown_node_id = metadataVoprNodeId(cluster, (shutdown_leader_index + 1) % cluster.cluster.nodes.len);
     var drain_ctx = VoprStoreDrainProgressContext{ .store_id = shutdown_node_id, .expected_drain_requested = true };
@@ -6300,14 +10268,72 @@ fn metadataVoprRunExpandedLivenessWorkload(
         reportMetadataVoprDrainState(cluster, shutdown_node_id);
         return err;
     };
-    try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
-    try metadataVoprHealAll(cluster, state);
+    try driver.runActions(phase_fault_actions);
+    try metadataVoprHealAll(cluster, &driver.state);
     try cluster.assertProgress("metadata-vopr-store-drain-requested", 48, &drain_ctx, voprStoreDrainProgressPredicate);
 }
 
-fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignConfig) !void {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+const MetadataVoprScratch = struct {
+    alloc: std.mem.Allocator,
+    io_impl: *std.Io.Threaded, // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
+    sub_path: []u8,
+
+    fn init(alloc: std.mem.Allocator) !MetadataVoprScratch {
+        const io_impl = try alloc.create(std.Io.Threaded); // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = std.Io.Threaded.init(alloc, .{}); // vopr-audit: allow(native_thread_or_io) differential scratch backend only
+        errdefer io_impl.deinit();
+        var random_bytes: [12]u8 = undefined;
+        io_impl.io().random(&random_bytes); // vopr-audit: allow(host_entropy) random bytes isolate a normalized scratch path and never enter choices observations or events
+        var encoded: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
+        _ = std.base64.url_safe.Encoder.encode(&encoded, &random_bytes);
+        const sub_path = try alloc.dupe(u8, &encoded);
+        errdefer alloc.free(sub_path);
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{sub_path});
+        defer alloc.free(path);
+        try std.Io.Dir.cwd().createDirPath(io_impl.io(), path);
+        return .{ .alloc = alloc, .io_impl = io_impl, .sub_path = sub_path };
+    }
+
+    fn deinit(self: *MetadataVoprScratch) void {
+        const path = std.fmt.allocPrint(self.alloc, ".zig-cache/tmp/{s}", .{self.sub_path}) catch null;
+        if (path) |owned_path| {
+            std.Io.Dir.cwd().deleteTree(self.io_impl.io(), owned_path) catch {};
+            self.alloc.free(owned_path);
+        }
+        self.alloc.free(self.sub_path);
+        self.io_impl.deinit();
+        self.alloc.destroy(self.io_impl);
+        self.* = undefined;
+    }
+};
+
+pub fn runMetadataVoprCampaignWithChoices(
+    alloc: std.mem.Allocator,
+    cfg: MetadataVoprCampaignConfig,
+    source: vopr.choice.Source,
+) !vopr.trace.Trace {
+    return try runMetadataVoprCampaignWithChoicesAndRecorder(alloc, cfg, source, null);
+}
+
+pub fn runMetadataVoprCampaignWithChoicesAndRecorder(
+    alloc: std.mem.Allocator,
+    cfg: MetadataVoprCampaignConfig,
+    source: vopr.choice.Source,
+    recorder: ?*vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
+    return try runMetadataVoprCampaignWithChoicesAndRaftTrace(alloc, cfg, source, null, recorder);
+}
+
+fn runMetadataVoprCampaignWithChoicesAndRaftTrace(
+    alloc: std.mem.Allocator,
+    cfg: MetadataVoprCampaignConfig,
+    source: vopr.choice.Source,
+    raft_trace_writer: ?*std.Io.Writer,
+    recorder: ?*vopr.flight_recorder.Recorder,
+) !vopr.trace.Trace {
+    var scratch = try MetadataVoprScratch.init(alloc);
+    defer scratch.deinit();
 
     var store_a = raft_engine.core.MemoryStorage.init(alloc);
     defer store_a.deinit();
@@ -6319,18 +10345,27 @@ fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignCo
     var factory_a = TestDescriptorFactory{ .alloc = alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
     var factory_b = TestDescriptorFactory{ .alloc = alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+    var raft_loggers: [3]raft_trace_logger.RaftNdjsonTraceLogger = undefined;
+    if (raft_trace_writer) |writer| {
+        const factories = [_]*TestDescriptorFactory{ &factory_a, &factory_b, &factory_c };
+        for (&raft_loggers, factories) |*logger, factory| {
+            logger.* = .{ .writer = writer };
+            factory.trace_group_id = cfg.metadata_group_id;
+            factory.trace_logger = logger.traceLogger();
+        }
+    }
 
-    const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a", .{ tmp.sub_path, cfg.seed });
+    const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(root_a);
-    const root_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-b", .{ tmp.sub_path, cfg.seed });
+    const root_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-b", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(root_b);
-    const root_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c", .{ tmp.sub_path, cfg.seed });
+    const root_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(root_c);
-    const cat_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a.txt", .{ tmp.sub_path, cfg.seed });
+    const cat_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-a.txt", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-b.txt", .{ tmp.sub_path, cfg.seed });
+    const cat_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-b.txt", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c.txt", .{ tmp.sub_path, cfg.seed });
+    const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c.txt", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
@@ -6350,19 +10385,210 @@ fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignCo
 
     _ = try startBootstrappedMetadataCluster(&cluster, 48, true);
 
-    var prng = std.Random.DefaultPrng.init(cfg.seed);
-    const random = prng.random();
-    var campaign_state = MetadataVoprCampaignState{};
-    var operation_index: usize = 0;
+    var driver = try MetadataVoprDriver.init(alloc, &cluster, cfg, source, recorder);
+    defer driver.deinit();
     if (cfg.workload == .smoke) {
-        try metadataVoprRunRandomTransportActions(&cluster, random, cfg, &campaign_state, &operation_index, cfg.operation_count);
-        try metadataVoprHealAll(&cluster, &campaign_state);
+        try driver.runActions(cfg.operation_count);
+        try driver.healAllRecorded();
     }
-    metadataVoprRunLivenessWorkload(&cluster, cfg, random, &campaign_state, &operation_index) catch |err| {
+    metadataVoprRunLivenessWorkload(&cluster, cfg, &driver) catch |err| {
         metadataVoprReportFailure(cfg, null, null, err);
         return err;
     };
-    try metadataVoprHealAll(&cluster, &campaign_state);
+    try driver.healAllRecorded();
+    // Heal hostile faults, then permit only node/message/time transitions. The
+    // bounded quiet suffix is itself part of the decision trace and is checked
+    // by an eventually-after-quiescence property.
+    try driver.beginQuietSuffix(12);
+    return try driver.finish();
+}
+
+pub fn recordMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignConfig) !vopr.trace.Trace {
+    var seeded = vopr.choice.Seeded.init(cfg.seed);
+    return try runMetadataVoprCampaignWithChoices(alloc, cfg, seeded.source());
+}
+
+pub fn replayMetadataVoprCampaign(alloc: std.mem.Allocator, recorded: *const vopr.trace.Trace) !vopr.trace.Trace {
+    return try replayMetadataVoprCampaignWithRaftTrace(alloc, recorded, null);
+}
+
+pub fn replayMetadataVoprCampaignToRaftTrace(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    writer: *std.Io.Writer,
+) !vopr.trace.Trace {
+    return try replayMetadataVoprCampaignWithRaftTrace(alloc, recorded, writer);
+}
+
+fn replayMetadataVoprCampaignWithRaftTrace(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    writer: ?*std.Io.Writer,
+) !vopr.trace.Trace {
+    const cfg = try MetadataVoprCampaignConfig.fromTrace(recorded);
+    var replay_source = vopr.choice.Replay{ .records = recorded.choices.items };
+    var replayed = try runMetadataVoprCampaignWithChoicesAndRaftTrace(alloc, cfg, replay_source.source(), writer, null);
+    errdefer replayed.deinit();
+    const expected = try recorded.renderAlloc(alloc);
+    defer alloc.free(expected);
+    const actual = try replayed.renderAlloc(alloc);
+    defer alloc.free(actual);
+    if (!std.mem.eql(u8, expected, actual)) return error.MetadataVoprReplayArtifactDiverged;
+    return replayed;
+}
+
+pub const MetadataVoprReduction = struct {
+    artifact: vopr.trace.Trace,
+    original_transitions: u64,
+    reduced_transitions: u64,
+    target_fingerprint: u64,
+    attempts: u64,
+
+    pub fn deinit(self: *MetadataVoprReduction) void {
+        self.artifact.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn reduceMetadataVoprCampaign(
+    alloc: std.mem.Allocator,
+    recorded: *const vopr.trace.Trace,
+    max_attempts: u64,
+) !MetadataVoprReduction {
+    if (max_attempts == 0) return error.InvalidReductionAttemptBudget;
+    const target = if (recorded.failures.items.len > 0) recorded.failures.items[0].fingerprint else return error.FailingTraceRequired;
+    var proof = try replayMetadataVoprCampaign(alloc, recorded);
+    proof.deinit();
+    var current = try cloneMetadataTrace(alloc, recorded);
+    errdefer current.deinit();
+    const original_count = current.summary.?.transitions;
+    var attempts: u64 = 0;
+
+    // First shrink the generated workload budget. The fixed final decision is
+    // retained explicitly so every candidate still includes the quiet
+    // workload and final observation checkpoint.
+    var cfg = try MetadataVoprCampaignConfig.fromTrace(&current);
+    if (cfg.workload == .smoke) {
+        var candidate_count = cfg.operation_count;
+        while (candidate_count > 0 and attempts < max_attempts) {
+            candidate_count -= 1;
+            attempts += 1;
+            const quiet_suffix_choices = 12;
+            const selections = try alloc.alloc(u64, candidate_count + quiet_suffix_choices);
+            defer alloc.free(selections);
+            for (current.choices.items[0..candidate_count], selections[0..candidate_count]) |record, *selection| selection.* = record.selected_id;
+            const current_quiet = current.choices.items[current.choices.items.len - quiet_suffix_choices ..];
+            for (current_quiet, selections[candidate_count..]) |record, *selection| selection.* = record.selected_id;
+            var scripted = vopr.choice.Scripted{ .selections = selections };
+            var candidate_cfg = cfg;
+            candidate_cfg.operation_count = candidate_count;
+            var candidate = runMetadataVoprCampaignWithChoices(alloc, candidate_cfg, scripted.source()) catch continue;
+            defer candidate.deinit();
+            if (!metadataTraceHasFingerprint(&candidate, target)) continue;
+            var exact = replayMetadataVoprCampaign(alloc, &candidate) catch continue;
+            exact.deinit();
+            const replacement = try cloneMetadataTrace(alloc, &candidate);
+            current.deinit();
+            current = replacement;
+            cfg = candidate_cfg;
+        }
+    }
+
+    // Then simplify individual scheduling/fault choices while preserving the
+    // target. Equal-length candidates must be lexicographically smaller, which
+    // makes the pass convergent and deterministic.
+    var changed = true;
+    while (changed and attempts < max_attempts) {
+        changed = false;
+        var choice_index = current.choices.items.len;
+        while (choice_index > 0 and attempts < max_attempts) {
+            choice_index -= 1;
+            const record = current.choices.items[choice_index];
+            for (record.enabled_ids) |alternative| {
+                if (alternative == record.selected_id or attempts == max_attempts) continue;
+                attempts += 1;
+                var mutating = vopr.choice.Mutating.init(current.choices.items, choice_index, alternative, 0x6d65_7461_7265_6475 +% attempts);
+                var candidate = runMetadataVoprCampaignWithChoices(alloc, cfg, mutating.source()) catch continue;
+                defer candidate.deinit();
+                if (!metadataTraceHasFingerprint(&candidate, target)) continue;
+                if (!try metadataTraceSimpler(alloc, &candidate, &current)) continue;
+                var exact = replayMetadataVoprCampaign(alloc, &candidate) catch continue;
+                exact.deinit();
+                const replacement = try cloneMetadataTrace(alloc, &candidate);
+                current.deinit();
+                current = replacement;
+                changed = true;
+                break;
+            }
+            if (changed) break;
+        }
+    }
+
+    return .{
+        .artifact = current,
+        .original_transitions = original_count,
+        .reduced_transitions = current.summary.?.transitions,
+        .target_fingerprint = target,
+        .attempts = attempts,
+    };
+}
+
+fn metadataTraceHasFingerprint(artifact: *const vopr.trace.Trace, target: u64) bool {
+    for (artifact.failures.items) |failure| if (failure.fingerprint == target) return true;
+    return false;
+}
+
+fn cloneMetadataTrace(alloc: std.mem.Allocator, artifact: *const vopr.trace.Trace) !vopr.trace.Trace {
+    const bytes = try artifact.renderAlloc(alloc);
+    defer alloc.free(bytes);
+    return try vopr.trace.parseAlloc(alloc, bytes);
+}
+
+fn metadataTraceSimpler(alloc: std.mem.Allocator, candidate: *const vopr.trace.Trace, current: *const vopr.trace.Trace) !bool {
+    if (candidate.summary.?.transitions != current.summary.?.transitions) return candidate.summary.?.transitions < current.summary.?.transitions;
+    const candidate_bytes = try candidate.renderAlloc(alloc);
+    defer alloc.free(candidate_bytes);
+    const current_bytes = try current.renderAlloc(alloc);
+    defer alloc.free(current_bytes);
+    return std.mem.lessThan(u8, candidate_bytes, current_bytes);
+}
+
+fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignConfig) !void {
+    var recorded = try recordMetadataVoprCampaign(alloc, cfg);
+    defer recorded.deinit();
+    var replayed = try replayMetadataVoprCampaign(alloc, &recorded);
+    defer replayed.deinit();
+}
+
+pub fn discoverMetadataVoprInjectedOverlap(alloc: std.mem.Allocator, seed: u64) !vopr.trace.Trace {
+    const base_id = 70_000 + seed % 1_000_000;
+    var discovery = MetadataOverlapDiscoveryChoice{};
+    return try runMetadataVoprCampaignWithChoices(alloc, .{
+        .seed = seed,
+        .operation_count = 2,
+        .metadata_group_id = base_id,
+        .table_id = base_id + 1,
+        .range_group_id = base_id + 2,
+        .split_group_id = base_id + 3,
+        .split_transition_id = base_id + 4,
+        .injected_bug = .overlapping_link_fault_safety,
+    }, discovery.source());
+}
+
+test "metadata VOPR injected overlap bug is discovered replayed and reduced" {
+    var discovered = try discoverMetadataVoprInjectedOverlap(std.testing.allocator, 0xA17F_FA11);
+    defer discovered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), discovered.failures.items.len);
+    try std.testing.expectEqual(MetadataVoprDriver.injected_overlap_property, discovered.failures.items[0].property_id.?);
+
+    var replayed = try replayMetadataVoprCampaign(std.testing.allocator, &discovered);
+    replayed.deinit();
+    var reduced = try reduceMetadataVoprCampaign(std.testing.allocator, &discovered, 8);
+    defer reduced.deinit();
+    try std.testing.expectEqual(discovered.failures.items[0].fingerprint, reduced.target_fingerprint);
+    try std.testing.expect(reduced.reduced_transitions <= reduced.original_transitions);
+    var reduced_replay = try replayMetadataVoprCampaign(std.testing.allocator, &reduced.artifact);
+    reduced_replay.deinit();
 }
 
 test "metadata VOPR seeded smoke campaign" {
@@ -6375,6 +10601,60 @@ test "metadata VOPR seeded smoke campaign" {
         .split_group_id = 6103,
         .split_transition_id = 6104,
     });
+}
+
+test "metadata VOPR trace exactly replays 100 consecutive times" {
+    var recorded = try recordMetadataVoprCampaign(std.testing.allocator, .{
+        .seed = 0xA17F_0100,
+        .operation_count = 1,
+        .metadata_group_id = 6120,
+        .table_id = 6121,
+        .range_group_id = 6122,
+        .split_group_id = 6123,
+        .split_transition_id = 6124,
+    });
+    defer recorded.deinit();
+    for (0..100) |_| {
+        var replayed = try replayMetadataVoprCampaign(std.testing.allocator, &recorded);
+        replayed.deinit();
+    }
+}
+
+test "metadata VOPR records crash interval and durable-state restart lifecycle" {
+    var choices = MetadataNodeCrashLifecycleChoice{};
+    var recorded = try runMetadataVoprCampaignWithChoices(std.testing.allocator, .{
+        .seed = 0xA17F_C2A5,
+        .operation_count = 2,
+        .metadata_group_id = 6150,
+        .table_id = 6151,
+        .range_group_id = 6152,
+        .split_group_id = 6153,
+        .split_transition_id = 6154,
+    }, choices.source());
+    defer recorded.deinit();
+
+    var crash_id: ?u64 = null;
+    var saw_start = false;
+    var saw_end = false;
+    for (recorded.faults.items) |fault_record| {
+        if (!std.mem.eql(u8, fault_record.name, "metadata.node.crashed")) continue;
+        crash_id = crash_id orelse fault_record.id;
+        try std.testing.expectEqual(crash_id.?, fault_record.id);
+        saw_start = saw_start or fault_record.phase == .start;
+        saw_end = saw_end or fault_record.phase == .end;
+    }
+    try std.testing.expect(saw_start and saw_end);
+    var saw_crashed_observation = false;
+    for (recorded.observations.items) |observation_record| {
+        for (observation_record.features) |feature| {
+            if (std.mem.eql(u8, feature.name, "metadata.fault.node_crashed") and feature.value == 1)
+                saw_crashed_observation = true;
+        }
+    }
+    try std.testing.expect(saw_crashed_observation);
+
+    var replayed = try replayMetadataVoprCampaign(std.testing.allocator, &recorded);
+    replayed.deinit();
 }
 
 test "metadata VOPR expanded generated workload campaign" {
@@ -6517,6 +10797,82 @@ test "metadata http cluster simulation drives table placement convergence" {
     const nodes = try cluster.node(leader_index).listProjectedNodes(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedNodes(std.testing.allocator, nodes);
     try std.testing.expectEqual(@as(usize, 3), nodes.len);
+}
+
+test "metadata-only cluster preserves external data placements without shadow replicas" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-a", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-b", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_b);
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-c", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_c);
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-a.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-b.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-c.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4050, root_a, cat_a),
+        makeHostSimConfig(2, 4050, root_b, cat_b),
+        makeHostSimConfig(3, 4050, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4050, &configs, &deps);
+    defer cluster.deinit();
+    cluster.setDataPlaneOwnership(.external);
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.bootstrapMetadataReplicas();
+    const leader_index = (try cluster.waitForMetadataLeader(24)) orelse return error.TestExpectedEqual;
+    try cluster.node(leader_index).campaignMetadataGroup();
+    try cluster.stepAll();
+    try cluster.publishClusterNodes(leader_index);
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    const summary = try workflow.createTable(&cluster.node(leader_index), .{
+        .table_id = 46,
+        .name = "external_docs",
+        .desired_replica_count = 3,
+        .min_ranges = 1,
+    }, .{
+        .group_id = 4601,
+        .table_id = 46,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
+    for (0..8) |_| try cluster.stepAll();
+
+    const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
+    defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    const factories = [_]*TestDescriptorFactory{ &factory_a, &factory_b, &factory_c };
+    for (0..3) |index| {
+        try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(index).status(4601));
+        try std.testing.expect(!factories[index].group_stores.contains(4601));
+    }
 }
 
 test "metadata http cluster simulation serves public lifecycle from a non-host node after public create" {
@@ -6905,10 +11261,11 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
         4,
         sim_alloc,
         &cluster,
-        &http_io,
+        http_io.io(),
+        http_io.async_limit,
         &roots,
         .local,
-        &forward_executor,
+        forward_executor.executor(),
         &listeners,
         &servers,
         &status_sources,
@@ -7106,10 +11463,11 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
         4,
         sim_alloc,
         &cluster,
-        &http_io,
+        http_io.io(),
+        http_io.async_limit,
         &roots,
         .local,
-        &forward_executor,
+        forward_executor.executor(),
         &listeners,
         &servers,
         &status_sources,
@@ -8864,6 +13222,18 @@ test "metadata http cluster simulation serves public traffic across automatic sp
     });
 }
 
+test "metadata VOPR distributed data survives split partition node restart and modeled storage crash" {
+    var recorded = try recordDistributedDataVoprCampaign(std.testing.allocator, .{
+        .seed = 0xd157_71b0_7ed0_0001,
+        .table_id = 4553,
+    });
+    defer recorded.deinit();
+    try std.testing.expectEqual(@as(u64, 4), recorded.summary.?.transitions);
+    try std.testing.expectEqual(@as(usize, 0), recorded.failures.items.len);
+    var replayed = try replayDistributedDataVoprCampaign(std.testing.allocator, &recorded);
+    replayed.deinit();
+}
+
 test "metadata http cluster simulation drives automatic merge through the control loop" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10472,7 +14842,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor.executor(),
         );
@@ -10494,7 +14864,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, http_io.io(), &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -10745,7 +15115,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor.executor(),
         );
@@ -10760,7 +15130,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, http_io.io(), &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -11018,7 +15388,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor.executor(),
         );
@@ -11033,7 +15403,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
         _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, http_io.io(), &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -11931,7 +16301,7 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
         if (rounds % 8 == 0) {
             const read_index = rounds / 8;
             if (read_index > 0) try std.testing.expect(read_barriers[recovered_leader].completed(read_index - 1));
-            try cluster.cluster.node(recovered_leader).runtime.svc.requestReadableLease(
+            try cluster.cluster.node(recovered_leader).runtime.svc.requestReadIndex(
                 4972,
                 ReadBarrierRecorder.contexts[read_index],
             );
@@ -12179,7 +16549,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
         );
         listeners[index] = try api_http_test_runtime.Runtime.startShared(
             leanSimHttpAllocator(),
-            &http_io,
+            http_io.io(),
             &servers[index],
         );
         started += 1;

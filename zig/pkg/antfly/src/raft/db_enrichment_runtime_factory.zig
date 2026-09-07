@@ -33,6 +33,7 @@ pub const GroupDbPathResolver = struct {
 pub const OpenDbRuntimeFactoryConfig = struct {
     open_options: db_mod.OpenOptions,
     owner_id: ?[]const u8 = null,
+    io: ?std.Io = null,
 };
 
 pub const OpenDbRuntimeFactory = struct {
@@ -68,9 +69,11 @@ pub const OpenDbRuntimeFactory = struct {
 
         const path = try self.resolver.resolvePath(self.alloc, group_id);
         defer self.alloc.free(path);
-        var io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
+        const io = self.cfg.io orelse if (open_options.backend_runtime) |runtime|
+            runtime.io() orelse std.Options.debug_io
+        else
+            std.Options.debug_io;
+        try fs_paths.createDirPathPortable(io, path);
 
         const db = try self.alloc.create(db_mod.DB);
         errdefer self.alloc.destroy(db);

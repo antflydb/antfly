@@ -382,7 +382,8 @@ fn exportHttpResponse(
 
 pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthContext) callconv(.c) abi.Status {
     if (validateContext(abi.InternalServiceAuthContext, context.abi_version, context.struct_size)) |failure| return failure;
-    const io = context.executor.get() catch |err| return fail(err);
+    var executor = context.executor.receive() catch |err| return fail(err);
+    const io = executor.io();
     const state: *HandlerState = @ptrCast(@alignCast(context.handler_handle));
     const request = context.request;
     const alloc = state.alloc;
@@ -423,7 +424,8 @@ pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthCo
 
 pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
     if (validateContext(abi.HttpHandleContext, context.abi_version, context.struct_size)) |failure| return failure;
-    const io = context.executor.get() catch |err| return fail(err);
+    var executor = context.executor.receive() catch |err| return fail(err);
+    const io = executor.io();
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
     const state = route.owner;
     const request = context.request;

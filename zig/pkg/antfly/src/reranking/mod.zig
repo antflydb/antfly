@@ -280,12 +280,16 @@ pub fn rerankDocumentsWithOptions(
             if (options.execution_context) |context| {
                 if (local.rerank_texts_with_context) |rerank| {
                     const scores = try rerank(local.ptr, alloc, cfg.model, query, documents, context);
+                    errdefer alloc.free(scores);
+                    try validateScores(scores, documents.len);
                     try context.check();
                     return scores;
                 }
             }
             if (local.rerank_texts) |rerank| {
                 const scores = try rerank(local.ptr, alloc, cfg.model, query, documents);
+                errdefer alloc.free(scores);
+                try validateScores(scores, documents.len);
                 if (options.execution_context) |context| try context.check();
                 return scores;
             }
@@ -310,6 +314,7 @@ pub fn rerankDocumentsWithOptions(
             }
             var result = try provider.reranker().rerank(alloc, cfg.model, query, documents);
             defer result.deinit();
+            try validateScores(result.scores, documents.len);
             if (options.execution_context) |context| try context.check();
             return try alloc.dupe(f32, result.scores);
         },
@@ -319,6 +324,7 @@ pub fn rerankDocumentsWithOptions(
             defer quota.release();
             const scores = try rerankCohere(alloc, http, cfg, token, options.execution_context, quota.limiter().observer(0), query, documents);
             errdefer alloc.free(scores);
+            try validateScores(scores, documents.len);
             if (options.execution_context) |context| try context.check();
             return scores;
         },
@@ -355,9 +361,17 @@ pub fn rerankDocumentsWithOptions(
                 .cancellation = httpCancellation(if (options.execution_context) |context| context.cancellation else null),
             });
             errdefer alloc.free(scores);
+            try validateScores(scores, documents.len);
             if (options.execution_context) |context| try context.check();
             return scores;
         },
+    }
+}
+
+fn validateScores(scores: []const f32, document_count: usize) !void {
+    if (scores.len != document_count) return error.InvalidRerankerResponse;
+    for (scores) |score| {
+        if (!std.math.isFinite(score)) return error.InvalidRerankerResponse;
     }
 }
 

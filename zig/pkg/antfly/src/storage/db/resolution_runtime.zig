@@ -1596,7 +1596,7 @@ pub const ResolutionRuntime = struct {
     index_manager: *index_manager_mod.IndexManager,
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
-    io_impl: ?*background_runtime_mod.IoImpl,
+    io: ?Io,
     /// Optional cross-shard candidate source injected by the api/serving layer;
     /// null means local-only blocking (the worker's own store). Must outlive the
     /// runtime.
@@ -1634,7 +1634,7 @@ pub const ResolutionRuntime = struct {
             .index_manager = index_manager,
             .write_ctx = write_ctx,
             .write_fn = write_fn,
-            .io_impl = backend_runtime.io_impl,
+            .io = backend_runtime.io(),
             .candidate_source = candidate_source,
             .embedder = embedder,
             .applied_sequence = .init(applied),
@@ -1690,8 +1690,7 @@ pub const ResolutionRuntime = struct {
     pub fn start(self: *ResolutionRuntime) !void {
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         defer self.worker_mutex.unlock(io);
         if (self.worker_started.load(.acquire)) return;
@@ -1703,15 +1702,14 @@ pub const ResolutionRuntime = struct {
 
     pub fn stop(self: *ResolutionRuntime) void {
         self.shutdown_flag.store(true, .release);
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
+        if (self.io) |io| {
             self.worker_mutex.lockUncancelable(io);
             self.worker_cond.broadcast(io);
             self.worker_mutex.unlock(io);
         }
         if (self.future) |*future| {
-            if (self.io_impl) |io_impl| {
-                _ = future.await(io_impl.io());
+            if (self.io) |io| {
+                _ = future.await(io);
             }
             self.future = null;
         }
@@ -1720,8 +1718,7 @@ pub const ResolutionRuntime = struct {
 
     fn wakeWorker(self: *ResolutionRuntime) void {
         if (!self.worker_started.load(.acquire)) return;
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         self.worker_cond.broadcast(io);
         self.worker_mutex.unlock(io);
@@ -1884,7 +1881,7 @@ pub const ResolutionRuntime = struct {
     }
 
     fn workerMain(self: *ResolutionRuntime) void {
-        const io = (self.io_impl orelse return).io();
+        const io = self.io orelse return;
         while (!self.shutdown_flag.load(.acquire)) {
             self.worker_mutex.lockUncancelable(io);
             while (!self.shutdown_flag.load(.acquire) and

@@ -13,25 +13,48 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
 const catalog_service = @import("../catalog/service.zig");
+const work_lease = @import("work_lease.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const PublishRunStats = struct {
     published_namespaces: usize = 0,
     head_conflicts: usize = 0,
     idle_namespaces: usize = 0,
+    lease_conflicts: usize = 0,
+    lease_takeovers: usize = 0,
 };
 
 pub const BackgroundPublisher = struct {
     alloc: Allocator,
+    io: std.Io,
     catalog: *catalog_service.CatalogService,
     poll_interval_ms: u64,
-    thread: ?std.Thread = null,
+    future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    stop_wake: std.Io.Event = .unset,
+    idle_waiting: std.atomic.Value(bool) = .init(false),
+    failure_mu: std.atomic.Mutex = .unlocked,
+    run_failure: ?anyerror = null,
+    lease_provider: ?work_lease.Provider = null,
+    lease_owner_id: ?[]u8 = null,
+    lease_ttl_ns: u64 = 30 * std.time.ns_per_s,
 
     pub fn init(alloc: Allocator, catalog: *catalog_service.CatalogService, poll_interval_ms: u64) BackgroundPublisher {
+        return initWithIo(alloc, std.Options.debug_io, catalog, poll_interval_ms);
+    }
+
+    pub fn initWithIo(
+        alloc: Allocator,
+        io: std.Io,
+        catalog: *catalog_service.CatalogService,
+        poll_interval_ms: u64,
+    ) BackgroundPublisher {
         return .{
             .alloc = alloc,
+            .io = io,
             .catalog = catalog,
             .poll_interval_ms = poll_interval_ms,
         };
@@ -39,29 +62,72 @@ pub const BackgroundPublisher = struct {
 
     pub fn deinit(self: *BackgroundPublisher) void {
         self.stop();
+        if (self.lease_owner_id) |owner_id| self.alloc.free(owner_id);
         self.* = undefined;
     }
 
     pub fn start(self: *BackgroundPublisher) !void {
-        if (self.thread != null) return error.AlreadyStarted;
+        if (self.future != null) return error.AlreadyStarted;
         self.stop_requested.store(false, .monotonic);
-        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        self.idle_waiting.store(false, .monotonic);
+        self.stop_wake.reset();
+        lockAtomic(&self.failure_mu);
+        self.run_failure = null;
+        self.failure_mu.unlock();
+        self.future = try self.io.concurrent(runLoop, .{self});
     }
 
     pub fn stop(self: *BackgroundPublisher) void {
         self.stop_requested.store(true, .monotonic);
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        self.stop_wake.set(self.io);
+        if (self.future) |*future| {
+            // Wake the idle wait explicitly. Awaiting preserves cleanup in an
+            // in-flight publication while avoiding the configured interval.
+            _ = future.await(self.io);
+            self.future = null;
         }
     }
 
+    pub fn runtimeFailure(self: *BackgroundPublisher) ?anyerror {
+        lockAtomic(&self.failure_mu);
+        defer self.failure_mu.unlock();
+        return self.run_failure;
+    }
+
+    pub fn configureLease(
+        self: *BackgroundPublisher,
+        provider: work_lease.Provider,
+        owner_id: []const u8,
+        ttl_ns: u64,
+    ) !void {
+        if (self.future != null) return error.AlreadyStarted;
+        if (owner_id.len == 0) return error.InvalidLeaseOwner;
+        if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        const owned_owner = try self.alloc.dupe(u8, owner_id);
+        if (self.lease_owner_id) |current| self.alloc.free(current);
+        self.lease_owner_id = owned_owner;
+        self.lease_provider = provider;
+        self.lease_ttl_ns = ttl_ns;
+    }
+
     pub fn runOnce(self: *BackgroundPublisher) !PublishRunStats {
+        return self.runOnceUntil(null);
+    }
+
+    pub fn runOnceUntil(
+        self: *BackgroundPublisher,
+        cancel_requested: ?*const std.atomic.Value(bool),
+    ) !PublishRunStats {
+        const cancellation = maintenance_cancellation.Token{
+            .io = self.io,
+            .requested = cancel_requested,
+        };
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         var stats = PublishRunStats{};
         for (namespaces) |namespace| {
+            try cancellation.check();
             var status = self.catalog.buildStatus(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => {
                     stats.idle_namespaces += 1;
@@ -75,9 +141,74 @@ pub const BackgroundPublisher = struct {
                 continue;
             }
 
-            var result = self.catalog.buildNamespace(namespace.name) catch |err| switch (err) {
+            var held_lease: ?work_lease.HeldLease = null;
+            var held_bootstrap_lease: ?work_lease.HeldBootstrapLease = null;
+            // The absent-to-first-HEAD CAS is already the atomic publication
+            // fence. Avoid materializing a HEAD=0 lease placeholder, which
+            // older publishers interpret as an existing head and cannot
+            // replace during a rolling rollback.
+            if (self.lease_provider) |provider| {
+                if (status.head_version == 0) {
+                    held_bootstrap_lease = try work_lease.acquireBootstrapHeld(
+                        provider,
+                        self.io,
+                        namespace.name,
+                        self.lease_owner_id orelse return error.MissingLeaseOwner,
+                        self.lease_ttl_ns,
+                    );
+                    if (held_bootstrap_lease == null) {
+                        stats.lease_conflicts += 1;
+                        continue;
+                    }
+                    if (held_bootstrap_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
+                } else {
+                    held_lease = try work_lease.acquireHeld(
+                        provider,
+                        self.io,
+                        namespace.name,
+                        self.lease_owner_id orelse return error.MissingLeaseOwner,
+                        self.lease_ttl_ns,
+                    );
+                    if (held_lease == null) {
+                        stats.lease_conflicts += 1;
+                        continue;
+                    }
+                    if (held_lease.?.acquisition.took_over) stats.lease_takeovers += 1;
+                }
+            }
+            defer if (held_bootstrap_lease) |*lease| {
+                _ = lease.release() catch {};
+            };
+            defer if (held_lease) |*lease| {
+                _ = lease.release() catch {};
+            };
+
+            const publication_guard = if (held_lease) |*lease|
+                lease.guard()
+            else if (held_bootstrap_lease) |*lease|
+                lease.guard()
+            else
+                null;
+            const build_cancellation = if (held_lease) |*lease|
+                lease.cancellation(cancellation)
+            else if (held_bootstrap_lease) |*lease|
+                lease.cancellation(cancellation)
+            else
+                cancellation;
+            var result = self.catalog.buildNamespaceGuardedUntil(
+                namespace.name,
+                publication_guard,
+                build_cancellation,
+            ) catch |err| switch (err) {
                 error.HeadChanged => {
                     stats.head_conflicts += 1;
+                    continue;
+                },
+                error.WorkLeaseLost => {
+                    // Takeover after acquisition is expected contention. The
+                    // stale worker is fenced at publication and the publisher
+                    // must remain available for later namespaces and ticks.
+                    stats.lease_conflicts += 1;
                     continue;
                 },
                 error.FileNotFound => {
@@ -102,13 +233,28 @@ pub const BackgroundPublisher = struct {
 
     fn runLoop(self: *BackgroundPublisher) void {
         while (!self.stop_requested.load(.monotonic)) {
-            _ = self.runOnce() catch PublishRunStats{};
-            sleepMs(@max(self.poll_interval_ms, 1));
+            _ = self.runOnceUntil(&self.stop_requested) catch |err| {
+                if (err == error.Canceled and self.stop_requested.load(.acquire)) return;
+                lockAtomic(&self.failure_mu);
+                if (self.run_failure == null) self.run_failure = err;
+                self.failure_mu.unlock();
+                return;
+            };
+            self.idle_waiting.store(true, .release);
+            defer self.idle_waiting.store(false, .release);
+            self.stop_wake.waitTimeout(self.io, .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(@max(self.poll_interval_ms, 1))),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return,
+            };
+            return;
         }
     }
 };
 
-test "background publisher runOnce publishes namespaces with pending WAL" {
+test "serverless background publisher publishes once and stop wakes a long idle wait" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -160,11 +306,29 @@ test "background publisher runOnce publishes namespaces with pending WAL" {
     });
     defer ingest.deinit(alloc);
 
-    var publisher = BackgroundPublisher.init(alloc, &catalog, 1);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    var publisher = BackgroundPublisher.initWithIo(
+        alloc,
+        io_impl.io(),
+        &catalog,
+        std.math.maxInt(u32),
+    );
+    defer publisher.deinit();
     const published = try publisher.runOnce();
     try std.testing.expectEqual(@as(usize, 1), published.published_namespaces);
     try std.testing.expectEqual(@as(usize, 0), published.head_conflicts);
     try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
+
+    var canceled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Canceled, publisher.runOnceUntil(&canceled));
+
+    try publisher.start();
+    var attempts: usize = 0;
+    while (!publisher.idle_waiting.load(.acquire) and attempts < 50) : (attempts += 1) sleepMs(5);
+    try std.testing.expect(publisher.idle_waiting.load(.acquire));
+    publisher.stop();
+    try std.testing.expect(publisher.future == null);
 }
 
 test "background publisher loop publishes asynchronously and latest reads remain valid" {
@@ -368,11 +532,19 @@ fn cleanupTmp(path: [*:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
+// Native-thread regression tests below intentionally use a real sleep while
+// exercising the Threaded differential backend. Production loops sleep on the
+// borrowed `std.Io` stored by `BackgroundPublisher`.
 fn sleepMs(ms: u64) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    std.Io.Clock.Duration.sleep(.{
-        .clock = .awake,
-        .raw = .fromMilliseconds(@intCast(if (ms == 0) @as(u64, 1) else ms)),
-    }, io_impl.io()) catch {};
+    std.Io.sleep(
+        io_impl.io(),
+        .fromMilliseconds(@intCast(@max(ms, 1))),
+        .awake,
+    ) catch {};
+}
+
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
+    platform_sync.lockYielding(mutex);
 }

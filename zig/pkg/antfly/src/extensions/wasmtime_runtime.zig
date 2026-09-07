@@ -39,6 +39,7 @@ pub const HostImports = struct {
 };
 
 pub const InvokeOptions = struct {
+    io: std.Io = std.Options.debug_io,
     host_imports: HostImports = .{},
     package_store_root: ?[]const u8 = null,
     fuel: u64 = 50_000_000,
@@ -61,10 +62,10 @@ pub fn invokeExtensionWithOptions(
     request_json: []const u8,
     options: InvokeOptions,
 ) InvokeError![]u8 {
-    const artifact_path = try resolveArtifactPathAlloc(alloc, binding, options.package_store_root);
+    const artifact_path = try resolveArtifactPathAllocWithIo(alloc, options.io, binding, options.package_store_root);
     defer alloc.free(artifact_path);
 
-    const wasm = readFileAlloc(alloc, artifact_path) catch |err| switch (err) {
+    const wasm = readFileAllocWithIo(alloc, options.io, artifact_path) catch |err| switch (err) {
         error.FileNotFound => return error.WasmtimeArtifactNotFound,
         else => return err,
     };
@@ -85,6 +86,10 @@ pub fn invokeExtensionWithOptions(
 }
 
 fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, package_store_root: ?[]const u8) InvokeError![]u8 {
+    return resolveArtifactPathAllocWithIo(alloc, std.Options.debug_io, binding, package_store_root);
+}
+
+fn resolveArtifactPathAllocWithIo(alloc: std.mem.Allocator, io: std.Io, binding: RuntimeBinding, package_store_root: ?[]const u8) InvokeError![]u8 {
     if (!safeRelativeArtifactPath(binding.artifact)) return error.InvalidArtifactPath;
 
     const root = package_store_root orelse getenv(package_store_env) orelse return error.WasmtimePackageStoreUnavailable;
@@ -102,7 +107,7 @@ fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, p
     try candidates.append(alloc, try std.fs.path.join(alloc, &.{ root, binding.package_name, binding.package_version, binding.artifact }));
 
     for (candidates.items) |candidate| {
-        artifactPathExists(candidate) catch |err| switch (err) {
+        artifactPathExistsWithIo(io, candidate) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
@@ -145,12 +150,8 @@ fn safeRelativeArtifactPath(path: []const u8) bool {
     return true;
 }
 
-fn artifactPathExists(path: []const u8) !void {
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
-        .ACCMODE = .RDONLY,
-        .CLOEXEC = true,
-    }, 0);
-    _ = std.posix.system.close(fd);
+fn artifactPathExistsWithIo(io: std.Io, path: []const u8) !void {
+    std.Io.Dir.cwd().access(io, path, .{}) catch |err| return err;
 }
 
 test "wasmtime runtime resolves canonical package store artifacts" {
@@ -260,24 +261,11 @@ test "wasmtime runtime preserves legacy versioned artifact layout" {
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
-        .ACCMODE = .RDONLY,
-        .CLOEXEC = true,
-    }, 0);
-    defer _ = std.posix.system.close(fd);
+    return readFileAllocWithIo(alloc, std.Options.debug_io, path);
+}
 
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    var buffer: [8192]u8 = undefined;
-    var total: usize = 0;
-    while (true) {
-        const n = try std.posix.read(fd, &buffer);
-        if (n == 0) break;
-        total += n;
-        if (total > 64 * 1024 * 1024) return error.FileTooLarge;
-        try out.appendSlice(alloc, buffer[0..n]);
-    }
-    return try out.toOwnedSlice(alloc);
+fn readFileAllocWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(64 * 1024 * 1024));
 }
 
 fn getenv(comptime name: [:0]const u8) ?[]const u8 {

@@ -62,6 +62,7 @@ pub const RoutedBatchAuthority = union(enum) {
     /// Public batch decoding cannot construct this command shape.
     transaction,
     split_replication,
+    merge_replication,
 };
 
 pub const RoutedRaftBatchWriter = struct {
@@ -266,7 +267,14 @@ pub const Operations = struct {
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
-            else => return error.Internal,
+            else => {
+                std.log.err("group-local Raft batch validation failed group_id={} table={s} err={s}", .{
+                    group_id,
+                    table_name,
+                    @errorName(err),
+                });
+                return error.Internal;
+            },
         };
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
@@ -277,7 +285,14 @@ pub const Operations = struct {
             error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
-            else => return error.Internal,
+            else => {
+                std.log.err("group-local Raft batch failed group_id={} table={s} err={s}", .{
+                    group_id,
+                    table_name,
+                    @errorName(err),
+                });
+                return error.Internal;
+            },
         }) orelse return error.NotFound;
         return .{
             .inserted = @intCast(input.writes.len),
@@ -299,7 +314,14 @@ pub const Operations = struct {
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
-            else => return error.Internal,
+            else => {
+                std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
+                    group_id,
+                    table_name,
+                    @errorName(err),
+                });
+                return error.Internal;
+            },
         };
         const writer = self.routed_raft_batch_writer orelse return error.Unavailable;
         var parsed_fence: ?std.json.Parsed(metadata_api.CatalogRouteFence) = null;
@@ -344,23 +366,57 @@ pub const Operations = struct {
                 .cleanup => {},
             }
             break :transaction .transaction;
-        } else split: {
+        } else if (input.split_replication) |split_replication| split: {
             // Publicly routed writes always carry a catalog fence. Split
             // replication is different: its destination is intentionally not
             // catalog-visible yet, and the replicated transition identity is
             // the authority checked by every destination replica. Admit only
             // that self-identifying internal batch shape without a fence.
-            const split_replication = input.split_replication orelse return error.Unavailable;
             if (split_replication.transition_id == 0 or
                 split_replication.attempt_epoch == 0 or
                 split_replication.source_group_id == 0 or
                 split_replication.destination_group_id != group_id or
-                split_replication.source_group_id == group_id)
+                split_replication.source_group_id == group_id or
+                input.merge_replication != null)
             {
                 return error.InvalidArgument;
             }
             break :split .split_replication;
-        };
+        } else if (input.merge_replication) |merge_replication| merge: {
+            // Merge copy/checkpoint batches have the same private authority
+            // shape as split replication: the receiver is not necessarily a
+            // catalog-routable public write target while the transition is in
+            // flight. Carry and validate its exact destination identity on
+            // every forwarded command instead of requiring a catalog fence.
+            if (merge_replication.transition_id == 0 or
+                merge_replication.donor_group_id == 0 or
+                merge_replication.receiver_group_id != group_id or
+                merge_replication.donor_group_id == group_id or
+                merge_replication.identity_namespace.table_id == 0 or
+                merge_replication.identity_namespace.shard_id == 0 or
+                merge_replication.identity_namespace.range_id == 0 or
+                input.split_checkpoint != null or
+                input.split_replication != null or
+                input.split_transition != null or
+                input.merge_source_transition != null or
+                input.transaction != null or
+                input.transforms.len != 0 or
+                input.predicates.len != 0 or
+                input.graph_writes.len != 0 or
+                input.graph_deletes.len != 0)
+            {
+                return error.InvalidArgument;
+            }
+            if (input.merge_checkpoint) |checkpoint| {
+                if (checkpoint.transition_id != merge_replication.transition_id or
+                    checkpoint.donor_group_id != merge_replication.donor_group_id or
+                    checkpoint.receiver_group_id != merge_replication.receiver_group_id)
+                {
+                    return error.InvalidArgument;
+                }
+            }
+            break :merge .merge_replication;
+        } else return error.Unavailable;
         _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.TopologyChanged => return error.TopologyChanged,
@@ -374,7 +430,14 @@ pub const Operations = struct {
             error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
-            else => return error.Internal,
+            else => {
+                std.log.err("routed Raft batch failed group_id={} table={s} err={s}", .{
+                    group_id,
+                    table_name,
+                    @errorName(err),
+                });
+                return error.Internal;
+            },
         }) orelse return error.NotFound;
         return .{
             .inserted = @intCast(input.writes.len),
@@ -700,7 +763,7 @@ pub const Operations = struct {
             input.key,
             options,
             input.consistency,
-        ) catch |err| return mapCommonReadError(err) orelse error.Internal;
+        ) catch |err| return mapCommonReadError(err) orelse mapLookupError(err);
         return result orelse error.NotFound;
     }
 
@@ -933,6 +996,31 @@ pub const Operations = struct {
         };
     }
 };
+
+fn mapLookupError(err: anyerror) Error {
+    return switch (err) {
+        error.Timeout => error.DeadlineExceeded,
+        error.Cancelled, error.Canceled => error.Canceled,
+        error.TopologyChanged => error.TopologyChanged,
+        error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
+        error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
+        error.NotLeader,
+        error.LeaderUnavailable,
+        error.GroupLeaderUnavailable,
+        error.UnknownGroup,
+        error.ReadUnavailable,
+        => error.GroupLeaderUnavailable,
+        error.PersistentDescriptorAdmissionExhausted,
+        error.ResourceBudgetExceeded,
+        error.WriterLocked,
+        error.LsmRootWriterAlreadyOpen,
+        error.ResidentDbRetryRequired,
+        error.StorageReadTemporarilyUnavailable,
+        => error.StorageReadTemporarilyUnavailable,
+        error.TableNotFound, error.NotFound => error.NotFound,
+        else => error.Internal,
+    };
+}
 
 fn ensurePreDecisionRequestActive(request: operation.RequestContext) Error!void {
     request.ensureActive() catch |err| switch (err) {
@@ -1282,6 +1370,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         fail_identity: bool = false,
         visibility_error: ?anyerror = null,
         saw_unfenced_split: bool = false,
+        saw_unfenced_merge: bool = false,
         saw_unfenced_transaction: bool = false,
 
         fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
@@ -1308,6 +1397,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
                 .catalog => |catalog_fence| try std.testing.expectEqual(group_id, catalog_fence.route.group_id),
                 .transaction => self.saw_unfenced_transaction = true,
                 .split_replication => self.saw_unfenced_split = true,
+                .merge_replication => self.saw_unfenced_merge = true,
             }
             try std.testing.expectEqualStrings("documents", table_name);
             try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
@@ -1457,6 +1547,35 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         forwarding,
     ));
     try std.testing.expectEqual(@as(usize, 6), state.calls);
+
+    const merge_replication: db_mod.types.MergeReplicationContext = .{
+        .transition_id = 92,
+        .donor_group_id = 16,
+        .receiver_group_id = 17,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 17 },
+    };
+    _ = try operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{ .merge_replication = merge_replication },
+        forwarding,
+    );
+    try std.testing.expectEqual(@as(usize, 7), state.calls);
+    try std.testing.expect(state.saw_unfenced_merge);
+
+    var mismatched_merge = merge_replication;
+    mismatched_merge.receiver_group_id = 18;
+    try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{ .merge_replication = mismatched_merge },
+        forwarding,
+    ));
+    try std.testing.expectEqual(@as(usize, 7), state.calls);
 }
 
 test "typed internal query workers preserve identity generation validation" {
@@ -1615,6 +1734,13 @@ test "typed internal group reads preserve retryable resident storage failures" {
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.algebraicPartials(alloc, .{}, 7, "docs", "{}"));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "chunks"));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifests(alloc, .{}, 7, "docs", "doc:a"));
+    try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.NotLeader));
+    try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.UnknownGroup));
+    try std.testing.expectEqual(
+        error.StorageReadTemporarilyUnavailable,
+        mapLookupError(error.ResourceBudgetExceeded),
+    );
+    try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
 }
 
 test "internal group reads are callable without an HTTP request" {

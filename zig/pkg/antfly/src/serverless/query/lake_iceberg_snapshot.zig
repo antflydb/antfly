@@ -2264,6 +2264,27 @@ fn buildManifestListFixture(alloc: Allocator, manifest_length: usize) !std.Array
     });
 }
 
+/// Builds a minimal, standards-shaped Iceberg manifest list for deterministic
+/// composition tests. The bytes still pass through the production Avro decoder;
+/// this helper only avoids copying a binary fixture into every campaign.
+pub fn buildTestManifestListAlloc(
+    alloc: Allocator,
+    manifest_path: []const u8,
+    manifest_length: usize,
+    added_files: usize,
+    added_rows: u64,
+) ![]u8 {
+    var fixture = try buildOneManifestListFixture(alloc, manifest_path, .data, manifest_length, .{
+        .added_files = @intCast(added_files),
+        .existing_files = 0,
+        .deleted_files = 0,
+        .added_rows = @intCast(added_rows),
+        .existing_rows = 0,
+        .deleted_rows = 0,
+    });
+    return try fixture.toOwnedSlice(alloc);
+}
+
 fn buildDeleteManifestListFixture(alloc: Allocator, manifest_length: usize) !std.ArrayListUnmanaged(u8) {
     return try buildOneManifestListFixture(alloc, "s3://bucket/t/metadata/d-a.avro", .deletes, manifest_length, .{
         .added_files = 1,
@@ -2368,6 +2389,40 @@ fn buildDataManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
 
     try appendAvroBlock(alloc, &out, block.items, 2, "fedcba9876543210");
     return out;
+}
+
+pub const TestDataFile = struct {
+    status: iceberg_avro.ManifestEntryStatus = .added,
+    path: []const u8,
+    rows: u64,
+    bytes: u64,
+};
+
+/// Builds a minimal data manifest for deterministic composition tests. The
+/// returned bytes are decoded by `parseDataManifestAlloc` in the real snapshot
+/// discovery path.
+pub fn buildTestDataManifestAlloc(alloc: Allocator, files: []const TestDataFile) ![]u8 {
+    if (files.len == 0) return error.InvalidIcebergDataManifest;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendAvroHeader(alloc, &out, dataManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    for (files) |file| {
+        if (file.path.len == 0 or file.rows == 0 or file.bytes == 0) return error.InvalidIcebergDataManifest;
+        try appendDataManifestRecord(
+            alloc,
+            &block,
+            file.status,
+            .data,
+            file.path,
+            @intCast(file.rows),
+            @intCast(file.bytes),
+        );
+    }
+    try appendAvroBlock(alloc, &out, block.items, @intCast(files.len), "fedcba9876543210");
+    return try out.toOwnedSlice(alloc);
 }
 
 fn buildDeleteManifestFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {

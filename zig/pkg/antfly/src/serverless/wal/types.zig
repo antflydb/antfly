@@ -19,10 +19,17 @@ pub const Record = struct {
     lsn: u64,
     timestamp_ns: u64,
     payload: []u8,
+    /// Durable request identity when the producer used idempotent append.
+    /// Legacy records and stores that do not support that protocol leave it
+    /// null.
+    operation_id: ?[]u8 = null,
 };
 
 pub fn freeRecords(alloc: Allocator, records: []Record) void {
-    for (records) |record| alloc.free(record.payload);
+    for (records) |record| {
+        alloc.free(record.payload);
+        if (record.operation_id) |operation_id| alloc.free(operation_id);
+    }
     alloc.free(records);
 }
 

@@ -459,6 +459,29 @@ pub fn executeChain(
     factory: GeneratorFactory,
     messages: []const ChatMessage,
 ) !GenerateResult {
+    return executeChainInternal(alloc, null, chain, factory, messages);
+}
+
+/// Executes retry backoff through a caller-owned runtime. Production and VOPR
+/// callers should use this entry point so time, cancellation, and scheduling
+/// remain part of the same `std.Io` history.
+pub fn executeChainWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    chain: []const ChainLink,
+    factory: GeneratorFactory,
+    messages: []const ChatMessage,
+) !GenerateResult {
+    return executeChainInternal(alloc, io, chain, factory, messages);
+}
+
+fn executeChainInternal(
+    alloc: std.mem.Allocator,
+    io: ?std.Io,
+    chain: []const ChainLink,
+    factory: GeneratorFactory,
+    messages: []const ChatMessage,
+) !GenerateResult {
     if (chain.len == 0) return error.EmptyGeneratorChain;
 
     var last_err: anyerror = error.EmptyGeneratorChain;
@@ -471,7 +494,7 @@ pub fn executeChain(
         };
         defer generator.deinit();
 
-        const result = executeWithRetry(alloc, generator, link.generator.model, messages, link.retry) catch |err| {
+        const result = executeWithRetry(alloc, io, generator, link.generator.model, messages, link.retry) catch |err| {
             last_err = err;
             if (i + 1 < chain.len and shouldTryNext(link.condition orelse .on_error, err)) continue;
             return err;
@@ -483,6 +506,7 @@ pub fn executeChain(
 
 fn executeWithRetry(
     alloc: std.mem.Allocator,
+    io: ?std.Io,
     generator: Generator,
     model: []const u8,
     messages: []const ChatMessage,
@@ -496,7 +520,12 @@ fn executeWithRetry(
     while (true) : (attempt += 1) {
         const result = generator.generate(alloc, model, messages) catch |err| {
             if (attempt + 1 >= retry.max_attempts) return err;
-            if (backoff_ms > 0) sleepMs(backoff_ms);
+            if (backoff_ms > 0) {
+                if (io) |runtime_io|
+                    try runtime_io.sleep(.fromMilliseconds(backoff_ms), .awake)
+                else
+                    sleepMs(backoff_ms);
+            }
             backoff_ms = if (backoff_ms == 0)
                 retry.max_backoff_ms
             else

@@ -436,8 +436,8 @@ pub fn namespace(comptime Api: type) type {
             }
         };
 
-        const DifferentialAction = lmdb_sim_fixture.DifferentialAction;
-        const ScheduledAction = lmdb_sim_fixture.ScheduledAction;
+        pub const DifferentialAction = lmdb_sim_fixture.DifferentialAction;
+        pub const ScheduledAction = lmdb_sim_fixture.ScheduledAction;
 
         const OwnedEntry = struct {
             key: []u8,
@@ -458,13 +458,41 @@ pub fn namespace(comptime Api: type) type {
         };
 
         const ReplayFixture = lmdb_sim_fixture.ReplayFixture;
-        const CrashOutcome = lmdb_sim_fixture.CrashOutcome;
+        pub const CrashOutcome = lmdb_sim_fixture.CrashOutcome;
+        pub const CommitPhase = lmdb_sim_fixture.CommitPhase;
 
-        const SnapshotSummary = struct {
+        pub const SnapshotSummary = struct {
             main_count: usize,
             docs_count: usize,
             dups_count: usize,
         };
+
+        /// Common-runner seam used by the VOPR adapter. It intentionally
+        /// reuses the complete C-versus-Zig differential workload and its
+        /// snapshot oracle rather than maintaining a second model.
+        pub fn replayVoprDifferential(
+            allocator: std.mem.Allocator,
+            actions: []const ScheduledAction,
+        ) !SnapshotSummary {
+            return replayScheduledWorkload(allocator, .{ .max_dbs = 4 }, actions);
+        }
+
+        /// Replays a modeled Zig-LMDB crash publication phase after applying
+        /// the same committed prelude to C LMDB and Zig LMDB.
+        pub fn replayVoprCrash(
+            allocator: std.mem.Allocator,
+            prelude_actions: []const DifferentialAction,
+            crash_action: DifferentialAction,
+            phase: lmdb_sim_fixture.CommitPhase,
+        ) !CrashOutcome {
+            return replayCrashWorkload(
+                allocator,
+                .{ .max_dbs = 4 },
+                prelude_actions,
+                crash_action,
+                phaseFromFixturePhase(phase),
+            );
+        }
 
         pub fn runDifferentialDefault(allocator: std.mem.Allocator) !void {
             try runDifferentialScheduleCaseOrSkip(allocator, .{ .max_dbs = 4 }, 0xA17F_1EED, 72, "diff-default");

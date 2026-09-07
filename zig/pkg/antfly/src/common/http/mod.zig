@@ -13,6 +13,7 @@
 // limitations.
 
 pub const http_common = @import("http_common.zig");
+pub const io_http_executor = @import("io_http_executor.zig");
 pub const peer_disconnect_observer = @import("peer_disconnect_observer.zig");
 pub const std_http_executor = @import("std_http_executor.zig");
 pub const std_http_listener = @import("std_http_listener.zig");
@@ -20,6 +21,8 @@ pub const std_http_listener = @import("std_http_listener.zig");
 pub const Header = http_common.Header;
 pub const HttpRequest = http_common.HttpRequest;
 pub const HttpResponse = http_common.HttpResponse;
+pub const IoHttpExecutor = io_http_executor.IoHttpExecutor;
+pub const IoHttpExecutorConfig = io_http_executor.IoHttpExecutorConfig;
 pub const Method = http_common.Method;
 pub const RequestExecutor = http_common.RequestExecutor;
 pub const RequestHeader = http_common.RequestHeader;
@@ -38,6 +41,8 @@ test "common http module compiles" {
     _ = Header;
     _ = HttpRequest;
     _ = HttpResponse;
+    _ = IoHttpExecutor;
+    _ = IoHttpExecutorConfig;
     _ = Method;
     _ = RequestExecutor;
     _ = RequestHeader;

@@ -422,12 +422,17 @@ fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
 }
 
 fn syncPublishedParent(io: std.Io, path: []const u8) !void {
-    fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".") catch |err| switch (err) {
+    fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".") catch |narrow_err| {
+        // The generic std.Io implementation exposes a target- and backend-
+        // specific inferred error set. Widen it at this policy boundary so
+        // the portable unsupported case remains expressible even when the
+        // native backend cannot produce that tag.
+        const err: anyerror = narrow_err;
         // Platforms without durable directory sync have an explicit
         // best-effort publication policy. Do not report an ordinary write
         // failure after the atomic replacement is already visible.
-        error.DurableDirectorySyncUnsupported => return,
-        else => return error.RebuildStateDurabilityUncertain,
+        if (err == error.DurableDirectorySyncUnsupported) return;
+        return error.RebuildStateDurabilityUncertain;
     };
 }
 

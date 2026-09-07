@@ -245,7 +245,7 @@ fn runProvisionedDenseIngest(
     var read_source = public_api.ProvisionedTableReadSource.init(
         replica_root_dir,
         catalog,
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     try storage.attachSources(&read_source, &write_source);
 

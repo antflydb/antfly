@@ -106,6 +106,10 @@ pub const Slice = enum(u8) {
     inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
+    /// Pending persistent object-range cache writes. The durable bytes use
+    /// the capacity-domain ledger; this slice owns only queued key/payload
+    /// memory until the cache worker completes or drops the write.
+    lake_range_cache_queue,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -139,6 +143,7 @@ pub const Slice = enum(u8) {
             .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
+            .lake_range_cache_queue => "lake.range_cache_queue",
         };
     }
 };
@@ -364,6 +369,7 @@ pub const Options = struct {
             .{},
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
         };
     }
 
@@ -399,6 +405,7 @@ pub const Options = struct {
             .{ .soft_action = .report, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .reject_work },
         };
     }
 };
@@ -1002,6 +1009,7 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        _ = alloc;
         lockAtomic(&self.reclaimer_mutex);
         for (self.reclaimers.items) |slot| {
             if (slot.identity != 0 or slot.in_flight != 0)
@@ -1022,7 +1030,7 @@ pub const ResourceManager = struct {
             @panic("resource manager deinitialized with live reservations");
         if (self.batch_reservation_identities.count() != 0)
             @panic("resource manager deinitialized with live batch reservations");
-        self.capacity_domains.deinit(alloc);
+        self.capacity_domains.deinit(self.identity_allocator);
         self.capacity_domains = .empty;
         self.reservation_identities.deinit(self.identity_allocator);
         self.reservation_identities = .empty;
@@ -1040,10 +1048,11 @@ pub const ResourceManager = struct {
         observation: CapacityObservation,
         now_ns: u64,
     ) !CapacityReservation {
+        _ = alloc;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
-        const entry = try self.capacity_domains.getOrPut(alloc, domain_id);
+        const entry = try self.capacity_domains.getOrPut(self.identity_allocator, domain_id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
         const domain = entry.value_ptr;
         self.observeCapacityLocked(domain, observation);
@@ -2721,6 +2730,17 @@ test "default tokenizer cache budget is aligned with its resource slice" {
     );
 }
 
+test "default lake range cache queue budget is aligned with its terminal resource slice" {
+    const budgets = Options.defaultBudgets();
+    const policies = Options.defaultPolicies();
+    const index = @intFromEnum(Slice.lake_range_cache_queue);
+    try std.testing.expectEqual(slice_count - 1, index);
+    try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), budgets[index].soft_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), budgets[index].hard_limit_bytes);
+    try std.testing.expectEqual(PressureAction.report, policies[index].soft_action);
+    try std.testing.expectEqual(PressureAction.reject_work, policies[index].hard_action);
+}
+
 test "identity allocation failure rolls back every memory ledger" {
     var identity_storage: [1]u8 = undefined;
     var identity_fba = std.heap.FixedBufferAllocator.init(&identity_storage);
@@ -3078,6 +3098,19 @@ test "resource manager coordinates growable capacity by physical domain" {
     try std.testing.expectEqual(@as(u64, 2), stats.denials);
     try std.testing.expectEqual(@as(u64, 1), stats.growth_denials);
     try std.testing.expectEqual(@as(usize, 2), stats.domain_count);
+}
+
+test "resource manager owns capacity domains independently of consumer allocator" {
+    var manager = ResourceManager.init(.{
+        .identity_allocator = std.testing.allocator,
+        .disk_safety_floor_bytes = 0,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var reservation = try manager.reserveCapacity(std.heap.page_allocator, 7, 1, .{}, 0);
+    reservation.release();
+    try std.testing.expectEqual(@as(usize, 1), manager.capacityStats().domain_count);
 }
 
 test "capacity reservation revalidation fails closed when available space falls" {

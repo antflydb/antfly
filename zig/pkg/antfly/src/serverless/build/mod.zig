@@ -42,6 +42,8 @@ pub const vector_index = @import("vector_index.zig");
 
 pub const BuildResult = builder.BuildResult;
 pub const Builder = builder.Builder;
+pub const PublicationLifecycleEvent = builder.PublicationLifecycleEvent;
+pub const PublicationLifecycleHook = builder.PublicationLifecycleHook;
 pub const AlgebraicManifestPlan = algebraic_manifest.Plan;
 pub const AlgebraicPublishedArtifact = algebraic_manifest.PublishedArtifact;
 pub const planAlgebraicManifestAlloc = algebraic_manifest.planAlloc;
@@ -53,6 +55,8 @@ pub const publishAlgebraicExpressionFoldsAlloc = algebraic_publish.publishExpres
 pub const Compactor = compactor.Compactor;
 pub const CompactionResult = compactor.CompactionResult;
 pub const BackgroundPublisher = coordinator.BackgroundPublisher;
+pub const work_lease = @import("work_lease.zig");
+pub const ObjectWorkLeaseStore = @import("object_work_lease_store.zig").ObjectWorkLeaseStore;
 pub const ArtifactImpactPlan = impact_planner.ArtifactImpactPlan;
 pub const ArtifactFamily = impact_planner.ArtifactFamily;
 pub const ExternalSourceManifestPlan = external_source_manifest.Plan;
@@ -166,6 +170,8 @@ test "serverless build module compiles" {
     _ = builder;
     _ = compactor;
     _ = coordinator;
+    _ = work_lease;
+    _ = ObjectWorkLeaseStore;
     _ = external_source_manifest;
     _ = external_source_plan_resolver;
     _ = external_source_plan_resolver_api;

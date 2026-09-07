@@ -147,6 +147,65 @@ pub const ServerlessHttpServer = struct {
     }
 };
 
+/// Caller-owned-I/O publication of an existing serverless protocol stack.
+/// This is useful both for embedded deployments and deterministic VOPR worlds:
+/// the handler and catalog remain owned by their production stack while every
+/// listener, connection, request task, timeout, and shutdown wake borrows the
+/// supplied `std.Io`.
+pub const HttpxRuntime = struct {
+    alloc: std.mem.Allocator,
+    server: *httpx.Server,
+    listener_task: *httpx.ListenerTask,
+    base_uri: []u8,
+
+    pub fn start(alloc: std.mem.Allocator, io: std.Io, target: *ServerlessHttpServer) !HttpxRuntime {
+        const server = try alloc.create(httpx.Server);
+        errdefer alloc.destroy(server);
+        server.* = httpx.Server.initWithConfig(alloc, io, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .header_read_timeout_ms = 0,
+            .body_read_timeout_ms = 0,
+            .response_write_timeout_ms = 0,
+            .max_connections = 16,
+            .max_request_tasks = 16,
+            .borrow_http_runtime_io = true,
+            .h1_disconnect_cancellation = .disabled,
+        });
+        errdefer server.deinit();
+        server.global(httpx.Handler.bind(target, ServerlessHttpServer.handleHttpx));
+
+        const listener_task = try alloc.create(httpx.ListenerTask);
+        errdefer alloc.destroy(listener_task);
+        listener_task.* = httpx.ListenerTask.init(server);
+        try listener_task.start();
+        errdefer {
+            listener_task.requestStop();
+            listener_task.join() catch {};
+        }
+
+        const address = server.boundAddress() orelse return error.ListenerNotStarted;
+        const base_uri = try std.fmt.allocPrint(alloc, "http://{f}", .{address});
+        return .{
+            .alloc = alloc,
+            .server = server,
+            .listener_task = listener_task,
+            .base_uri = base_uri,
+        };
+    }
+
+    pub fn deinit(self: *HttpxRuntime) void {
+        self.listener_task.requestStop();
+        self.listener_task.join() catch |err|
+            std.debug.panic("serverless HTTP listener failed: {s}", .{@errorName(err)});
+        self.alloc.destroy(self.listener_task);
+        self.server.deinit();
+        self.alloc.destroy(self.server);
+        self.alloc.free(self.base_uri);
+        self.* = undefined;
+    }
+};
+
 fn handlerIface(handler: anytype) Handler {
     const HandlerType = @TypeOf(handler);
     const Child = switch (@typeInfo(HandlerType)) {

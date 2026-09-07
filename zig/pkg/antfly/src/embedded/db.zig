@@ -46,6 +46,12 @@ pub const OpenOptions = struct {
     enrichment: ?support.enrichment_runtime.Config = null,
     inference: support.lite.backend.InferenceOpenOptions = .{},
     ttl_cleanup: ttl_runtime.Config = .{},
+    /// Optional runtime ownership supplied by an embedding host. When set,
+    /// background work and all DB-level I/O use the caller's std.Io lanes.
+    backend_runtime: ?*support.background_runtime.BackendRuntime = null,
+    /// Optional caller-owned std.Io for the native `.aflite` container. This
+    /// is normally the same interface exposed by `backend_runtime`.
+    lite_io: ?std.Io = null,
 };
 
 pub const Profile = support.lite.backend.Profile;
@@ -99,6 +105,7 @@ pub const DB = struct {
         var lite_backend = try support.lite.backend.Handle.open(alloc, path, .{
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
             .no_sync = opts.no_sync,
+            .io = liteIo(opts),
         });
         return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend);
     }
@@ -108,6 +115,7 @@ pub const DB = struct {
         var lite_backend = try support.lite.backend.Handle.createWithOptions(alloc, path, .{
             .exclusive = true,
             .no_sync = opts.no_sync,
+            .io = liteIo(opts),
         });
         return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend);
     }
@@ -345,6 +353,7 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         .storage = opts.storage,
         .index_backends = opts.index_backends,
         .ttl_cleanup = opts.ttl_cleanup,
+        .backend_runtime = opts.backend_runtime,
     };
     if (profile == .hosted) {
         resolved.executor = .{ .backend = .manual };
@@ -359,6 +368,12 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
 
 fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
     return open_mode == .query_readonly or open_mode == .status_only;
+}
+
+fn liteIo(opts: OpenOptions) ?std.Io {
+    if (opts.lite_io) |io| return io;
+    if (opts.backend_runtime) |runtime| return runtime.io();
+    return null;
 }
 
 fn openModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {

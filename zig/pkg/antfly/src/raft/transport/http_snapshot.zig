@@ -351,7 +351,7 @@ pub const HttpSnapshotTransport = struct {
     artifact_io: std.Io,
     owned_artifact_io: ?*std.Io.Threaded = null,
     staging_budget: *SnapshotStagingBudget,
-    send_threads: []std.Thread = &.{},
+    send_workers: []std.Io.Future(void) = &.{},
     send_mutex: std.Io.Mutex = .init,
     send_ready: std.Io.Condition = .init,
     send_state: SenderState = .stopped,
@@ -527,23 +527,23 @@ pub const HttpSnapshotTransport = struct {
             self.send_active_jobs = &.{};
         }
         @memset(self.send_active_jobs, null);
-        self.send_threads = try self.alloc.alloc(std.Thread, worker_count);
+        self.send_workers = try self.alloc.alloc(std.Io.Future(void), worker_count);
         var started: usize = 0;
         errdefer {
             self.send_mutex.lockUncancelable(self.artifact_io);
             self.send_state = .closing;
             self.send_ready.broadcast(self.artifact_io);
             self.send_mutex.unlock(self.artifact_io);
-            for (self.send_threads[0..started]) |thread| thread.join();
+            for (self.send_workers[0..started]) |*worker| _ = worker.await(self.artifact_io);
             self.send_mutex.lockUncancelable(self.artifact_io);
             self.send_state = .stopped;
             self.send_ready.broadcast(self.artifact_io);
             self.send_mutex.unlock(self.artifact_io);
-            self.alloc.free(self.send_threads);
-            self.send_threads = &.{};
+            self.alloc.free(self.send_workers);
+            self.send_workers = &.{};
         }
-        while (started < self.send_threads.len) : (started += 1) {
-            self.send_threads[started] = try std.Thread.spawn(.{}, asyncSnapshotSenderMain, .{ self, started });
+        while (started < self.send_workers.len) : (started += 1) {
+            self.send_workers[started] = try self.artifact_io.concurrent(asyncSnapshotSenderMain, .{ self, started });
         }
         // Publish running only after every worker handle is initialized. This
         // keeps concurrent stop from ever joining uninitialized storage, while
@@ -577,9 +577,9 @@ pub const HttpSnapshotTransport = struct {
         while (self.send_reserved_jobs != 0)
             self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
         self.send_mutex.unlock(self.artifact_io);
-        for (self.send_threads) |thread| thread.join();
-        if (self.send_threads.len > 0) self.alloc.free(self.send_threads);
-        self.send_threads = &.{};
+        for (self.send_workers) |*worker| _ = worker.await(self.artifact_io);
+        if (self.send_workers.len > 0) self.alloc.free(self.send_workers);
+        self.send_workers = &.{};
         if (self.send_active_jobs.len > 0) self.alloc.free(self.send_active_jobs);
         self.send_active_jobs = &.{};
         self.send_mutex.lockUncancelable(self.artifact_io);

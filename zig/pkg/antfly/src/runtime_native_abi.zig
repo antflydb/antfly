@@ -10,7 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const abi_version: u32 = 2;
+pub const abi_version: u32 = 3;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {
@@ -45,24 +45,10 @@ pub const TypeContract = extern struct {
     }
 };
 
-/// Versioned, same-toolchain borrow of a host-owned executor. The receiver may
-/// copy the std.Io interface but must not retain it beyond the host's declared
-/// lease lifetime and must never deinitialize it.
-pub const IoBorrow = extern struct {
-    pointer: *const anyopaque,
-    contract: TypeContract,
-
-    pub fn init(io: *const std.Io) IoBorrow {
-        return .{ .pointer = io, .contract = .of(std.Io) };
-    }
-
-    pub fn get(self: IoBorrow) !std.Io {
-        if (!self.contract.matches(.of(std.Io))) return error.InvalidArgument;
-        if (@intFromPtr(self.pointer) % @alignOf(std.Io) != 0) return error.InvalidArgument;
-        const io: *const std.Io = @ptrCast(@alignCast(self.pointer));
-        return io.*;
-    }
-};
+/// Versioned, error-translating borrow of a host-owned executor. Keep the
+/// received adapter at a stable address while its std.Io is in use, never
+/// outlive the host's declared lease, and never deinitialize the host executor.
+pub const IoBorrow = @import("runtime_io_abi.zig").Borrow;
 
 pub const CallContract = extern struct {
     version: u32 = abi_version,
@@ -234,13 +220,13 @@ test "native method identifiers are deterministic" {
 test "native executor borrows validate before reconstructing std.Io" {
     const io = std.testing.io;
     const borrow = IoBorrow.init(&io);
-    _ = try borrow.get();
+    _ = try borrow.receive();
 
     var incompatible = borrow;
     incompatible.contract.version += 1;
-    try std.testing.expectError(error.InvalidArgument, incompatible.get());
+    try std.testing.expectError(error.InvalidArgument, incompatible.receive());
 
     var misaligned = borrow;
-    misaligned.pointer = @ptrFromInt(1);
-    try std.testing.expectError(error.InvalidArgument, misaligned.get());
+    misaligned.vtable = @ptrFromInt(1);
+    try std.testing.expectError(error.InvalidArgument, misaligned.receive());
 }

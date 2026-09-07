@@ -21,6 +21,7 @@ pub const lite_backend = lite.backend;
 pub const lite_native = lite.native;
 pub const host_environment = @import("storage/host_environment.zig");
 pub const object_storage = @import("storage/object_storage.zig");
+pub const background_runtime = @import("storage/background_runtime.zig");
 pub const db = @import("storage/db/db.zig");
 pub const db_core = @import("storage/db/core.zig");
 pub const db_types = @import("storage/db/types.zig");
@@ -46,6 +47,7 @@ test {
     _ = lite_native;
     _ = host_environment;
     _ = object_storage;
+    _ = background_runtime;
     _ = db;
     _ = db_core;
     _ = db_types;

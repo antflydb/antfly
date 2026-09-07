@@ -79,7 +79,8 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     }
 } else struct {
     alloc: Allocator,
-    io_impl: ?*Io.Threaded,
+    /// Borrowed backend-neutral executor owned by BackendRuntime.
+    io: ?Io,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     config: Config,
@@ -99,11 +100,11 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !SparseCompactionRuntime {
-        const io_impl = backend_runtime.io_impl;
-        if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
+        const io = backend_runtime.io();
+        if (config.enabled and io == null) return error.MissingBackendRuntimeIo;
         return .{
             .alloc = alloc,
-            .io_impl = io_impl,
+            .io = io,
             .index_manager = index_manager,
             .apply_mutex = apply_mutex,
             .config = config,
@@ -169,8 +170,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
 
     fn startLocked(self: *SparseCompactionRuntime) !void {
         if (self.future != null or self.paused or !self.desired_running) return;
-        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        const io = io_impl.io();
+        const io = self.io orelse return error.MissingBackendRuntimeIo;
         if (builtin.is_test and consumeTestStartFailure()) return error.TestTransientMaintenanceRestart;
         self.mutex.lockUncancelable(io);
         self.shutdown = false;
@@ -180,8 +180,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     }
 
     fn stopLocked(self: *SparseCompactionRuntime) bool {
-        const io_impl = self.io_impl orelse return false;
-        const io = io_impl.io();
+        const io = self.io orelse return false;
         if (self.future == null) return false;
 
         self.mutex.lockUncancelable(io);
@@ -197,8 +196,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
 
     pub fn notify(self: *SparseCompactionRuntime) void {
         if (!self.config.enabled) return;
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.mutex.lockUncancelable(io);
         self.notified = true;
         self.cond.broadcast(io);
@@ -251,8 +249,7 @@ const MandatoryApplyRetirement = struct {
     cancellation_protected: bool = true,
 
     fn acquire(runtime: *SparseCompactionRuntime) !MandatoryApplyRetirement {
-        const io_impl = runtime.io_impl orelse return error.MissingBackendRuntimeIo;
-        const io = io_impl.io();
+        const io = runtime.io orelse return error.MissingBackendRuntimeIo;
         const previous_cancel_protection = io.swapCancelProtection(.blocked);
         errdefer _ = io.swapCancelProtection(previous_cancel_protection);
 
@@ -320,8 +317,7 @@ fn waitForWork(runtime: *SparseCompactionRuntime) void {
     var remaining_ms = runtime.config.idle_interval_ms;
     if (remaining_ms == 0) remaining_ms = 1;
 
-    const io_impl = runtime.io_impl orelse return;
-    const io = io_impl.io();
+    const io = runtime.io orelse return;
     runtime.mutex.lockUncancelable(io);
     if (runtime.notified or runtime.shutdown) {
         runtime.notified = false;
@@ -333,7 +329,7 @@ fn waitForWork(runtime: *SparseCompactionRuntime) void {
     while (remaining_ms > 0) {
         if (isShutdown(runtime)) return;
         const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
+        io.sleep(.fromMilliseconds(@intCast(slice_ms)), .awake) catch return;
         remaining_ms -= slice_ms;
         runtime.mutex.lockUncancelable(io);
         const notified = runtime.notified;
@@ -345,24 +341,24 @@ fn waitForWork(runtime: *SparseCompactionRuntime) void {
 
 fn sleepMs(runtime: *SparseCompactionRuntime, ms: u64) void {
     var remaining_ms = if (ms == 0) 1 else ms;
+    const io = runtime.io orelse return;
     while (remaining_ms > 0) {
         if (isShutdown(runtime)) return;
         const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
+        io.sleep(.fromMilliseconds(@intCast(slice_ms)), .awake) catch return;
         remaining_ms -= slice_ms;
     }
 }
 
 fn isShutdown(runtime: *SparseCompactionRuntime) bool {
-    const io_impl = runtime.io_impl orelse return runtime.shutdown;
-    const io = io_impl.io();
+    const io = runtime.io orelse return runtime.shutdown;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
     return runtime.shutdown;
 }
 
 fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) !bool {
-    const io_impl = runtime.io_impl orelse return false;
+    const io = runtime.io orelse return false;
     const Cancellation = struct {
         runtime: *SparseCompactionRuntime,
 
@@ -371,7 +367,7 @@ fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) !bool {
         }
     };
     runtime.apply_mutex.lockExclusiveIo(
-        io_impl.io(),
+        io,
         @as(?Cancellation, .{ .runtime = runtime }),
     ) catch |err| switch (err) {
         // The component stop token makes this optional pass a no-op. Backend
@@ -419,7 +415,7 @@ test "sparse compaction propagates backend cancellation before task start" {
     var apply_lock: apply_rw_lock_mod.ApplyRwLock = .{};
     var runtime: SparseCompactionRuntime = .{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io = io,
         .index_manager = undefined,
         .apply_mutex = &apply_lock,
         .config = .{ .enabled = true },
@@ -465,7 +461,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
             release_blocker: *std.atomic.Value(bool),
             retired: *std.atomic.Value(bool),
         ) Io.Cancelable!void {
-            const io = runtime.io_impl.?.io();
+            const io = runtime.io.?;
             cancellation_point_ready.store(true, .release);
             io.sleep(.fromSeconds(60), .awake) catch |err| switch (err) {
                 error.Canceled => io.recancel(),
@@ -502,7 +498,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
     var apply_lock: apply_rw_lock_mod.ApplyRwLock = .{};
     var runtime: SparseCompactionRuntime = .{
         .alloc = std.testing.allocator,
-        .io_impl = &io_impl,
+        .io = io,
         .index_manager = undefined,
         .apply_mutex = &apply_lock,
         .config = .{ .enabled = true },

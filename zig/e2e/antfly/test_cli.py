@@ -722,8 +722,13 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                 return status
             return None
 
+        # The production policy performs six short inline attempts inside each
+        # of six durable worker attempts. Their bounded exponential backoffs
+        # can legitimately take a little over a minute before the source is
+        # parked as terminal debt, so this assertion must cover that complete
+        # policy rather than imposing a shorter, contradictory deadline.
         settled_failure = wait_until(
-            isolated_failure_is_settled, timeout_s=30.0, interval_s=0.05
+            isolated_failure_is_settled, timeout_s=90.0, interval_s=0.05
         )
         assert settled_failure is not None, cli(
             "index", "get", "--table", table, "--index", "thumbnail"

@@ -26,6 +26,13 @@ const query_reader = @import("../query/indexed_reader.zig");
 const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const embedder_mod = @import("../../storage/db/enrichment/embedder.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
+const objectstore = @import("objectstore");
+const artifacts_object_store = @import("../artifacts/object_store.zig");
+const manifest_object_store = @import("../manifest/object_store.zig");
+const progress_object_store = @import("../catalog/object_progress_store.zig");
+const wal_object_store = @import("../wal/object_store.zig");
+const operation_identity = @import("operation_id.zig");
 
 pub const EnrichmentRunStats = struct {
     enriched_namespaces: usize = 0,
@@ -136,6 +143,16 @@ pub const SparseEnricher = struct {
     }
 
     pub fn runNamespaceWithConfig(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig) !EnrichmentRunStats {
+        return try self.runNamespaceWithConfigUntil(namespace, cfg, null);
+    }
+
+    pub fn runNamespaceWithConfigUntil(
+        self: *SparseEnricher,
+        namespace: []const u8,
+        cfg: SparseEnricherConfig,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !EnrichmentRunStats {
+        try maintenance_cancellation.check(cancellation);
         const head = self.progress.getHead(namespace) catch |err| switch (err) {
             error.FileNotFound => return .{ .idle_namespaces = 1 },
             else => return err,
@@ -146,28 +163,66 @@ pub const SparseEnricher = struct {
         if (latest_lsn != manifest.wal_end_lsn) {
             return .{ .idle_namespaces = 1 };
         }
+        // Enrichment progress is a second durable write after WAL append.
+        // The append must be both idempotent and conditioned on the immutable
+        // manifest's WAL boundary. Otherwise an ingest that lands during model
+        // work can be overwritten by a stale derived upsert at a newer LSN.
+        if (!self.wal.supportsConditionalIdempotentAppend())
+            return error.IdempotentAppendUnsupported;
 
         const docs = try self.loadPublishedDocsAlloc(manifest);
         defer query_mod.freeMaterializedDocuments(self.alloc, docs);
+        try maintenance_cancellation.check(cancellation);
 
-        const stored_head = try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage);
-        if (stored_head != head) {
-            _ = try self.progress.compareAndSwapEnrichmentStageHeadVersion(namespace, cfg.stage, stored_head, head);
-            _ = try self.progress.compareAndSwapEnrichmentStageDocOffset(
-                namespace,
-                cfg.stage,
-                try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage),
-                0,
-            );
+        // Loading and materializing the immutable manifest can be expensive.
+        // Do not initialize progress or emit work if publication moved while
+        // it was in flight. The atomic stage state below prevents a stale
+        // worker from regressing progress after a newer worker takes over.
+        if ((try self.progress.getHead(namespace)) != head)
+            return error.EnrichmentProgressChanged;
+
+        var stage_progress = try self.progress.getEnrichmentStageProgress(namespace, cfg.stage);
+        if (stage_progress == null) {
+            // Migrate either legacy unscoped progress or the short-lived
+            // per-head layout. Only an offset explicitly associated with this
+            // exact head is reusable; a newly published head starts at zero.
+            const legacy_head = try self.progress.getEnrichmentStageHeadVersion(namespace, cfg.stage);
+            if (legacy_head) |version| {
+                if (version > head) return error.EnrichmentProgressChanged;
+            }
+            const initial_offset = if (legacy_head == head)
+                (try self.progress.getEnrichmentStageHeadDocOffset(namespace, cfg.stage, head)) orelse
+                    (try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0
+            else
+                0;
+            const initial = catalog_mod.EnrichmentStageProgress{
+                .head_version = head,
+                .doc_offset = initial_offset,
+            };
+            if (try self.progress.compareAndSwapEnrichmentStageProgress(namespace, cfg.stage, null, initial)) {
+                stage_progress = initial;
+            } else {
+                stage_progress = (try self.progress.getEnrichmentStageProgress(namespace, cfg.stage)) orelse
+                    return error.EnrichmentProgressChanged;
+            }
         }
-        const start_offset: usize = @intCast((try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0);
+        if (stage_progress.?.head_version > head) return error.EnrichmentProgressChanged;
+        if (stage_progress.?.head_version < head) {
+            const next = catalog_mod.EnrichmentStageProgress{ .head_version = head, .doc_offset = 0 };
+            if (!(try self.progress.compareAndSwapEnrichmentStageProgress(namespace, cfg.stage, stage_progress, next)))
+                return error.EnrichmentProgressChanged;
+            stage_progress = next;
+        }
+        const start_offset: usize = @intCast(stage_progress.?.doc_offset);
         if (start_offset >= docs.len) {
             return .{ .idle_namespaces = 1 };
         }
 
         var stats = EnrichmentRunStats{};
         var next_offset: usize = start_offset;
+        var expected_latest_lsn = latest_lsn;
         for (docs[start_offset..], start_offset..) |doc, doc_index| {
+            try maintenance_cancellation.check(cancellation);
             next_offset = doc_index + 1;
             const derived = buildDerivedBodyAlloc(self, cfg.stage, doc.body, cfg.pipeline_version, cfg.model_preference) catch |err| {
                 if (isRecoverableEnrichmentError(err)) {
@@ -181,6 +236,7 @@ pub const SparseEnricher = struct {
                 return err;
             };
             defer if (derived.body) |body| self.alloc.free(body);
+            try maintenance_cancellation.check(cancellation);
             const body = derived.body orelse continue;
             const mutation = api_types.DocumentMutation{
                 .kind = .upsert,
@@ -189,7 +245,24 @@ pub const SparseEnricher = struct {
             };
             const encoded = try api_codec.encodeMutationAlloc(self.alloc, mutation);
             defer self.alloc.free(encoded);
-            _ = try self.wal.append(namespace, doc.last_timestamp_ns + 1, encoded);
+            const timestamp_ns = std.math.add(u64, doc.last_timestamp_ns, 1) catch
+                return error.EnrichmentTimestampOverflow;
+            var operation_id_buf: [128]u8 = undefined;
+            const operation_id = try enrichmentOperationId(
+                &operation_id_buf,
+                head,
+                cfg.stage,
+                doc_index,
+                cfg.pipeline_version,
+            );
+            const appended_lsn = (try self.wal.appendIdempotentIfLatest(
+                namespace,
+                timestamp_ns,
+                encoded,
+                operation_id,
+                expected_latest_lsn,
+            )) orelse return error.EnrichmentProgressChanged;
+            expected_latest_lsn = appended_lsn;
             stats.enriched_documents += 1;
             stats.wal_appends += 1;
             if (derived.used_model) stats.model_documents += 1;
@@ -197,8 +270,23 @@ pub const SparseEnricher = struct {
             if (stats.wal_appends >= cfg.batch_size) break;
         }
 
-        const previous_offset = (try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0;
-        _ = try self.progress.compareAndSwapEnrichmentStageDocOffset(namespace, cfg.stage, previous_offset, @intCast(next_offset));
+        try maintenance_cancellation.check(cancellation);
+        const previous = (try self.progress.getEnrichmentStageProgress(namespace, cfg.stage)) orelse
+            return error.EnrichmentProgressChanged;
+        if (previous.head_version != head) return error.EnrichmentProgressChanged;
+        const durable_next: u64 = @intCast(next_offset);
+        // Concurrent workers may already have advanced this stage. Never let
+        // a slower completion move durable progress backwards.
+        if (previous.doc_offset < durable_next and
+            !(try self.progress.compareAndSwapEnrichmentStageProgress(
+                namespace,
+                cfg.stage,
+                previous,
+                .{ .head_version = head, .doc_offset = durable_next },
+            )))
+        {
+            return error.EnrichmentProgressChanged;
+        }
         if (stats.enriched_documents == 0) {
             stats.idle_namespaces = 1;
         } else {
@@ -273,6 +361,16 @@ pub const SparseEnricher = struct {
         alloc.free(mutations);
     }
 };
+
+fn enrichmentOperationId(
+    buf: []u8,
+    head: u64,
+    stage: catalog_mod.EnrichmentStage,
+    doc_index: usize,
+    pipeline_version: u32,
+) ![]const u8 {
+    return try operation_identity.format(buf, head, @intFromEnum(stage), doc_index, pipeline_version);
+}
 
 fn findArtifactIndex(manifest: manifest_mod.Manifest, kind: manifest_mod.ArtifactKind) ?usize {
     for (manifest.artifacts, 0..) |artifact, idx| {
@@ -811,6 +909,144 @@ const FailingSparseEmbedder = struct {
     }
 };
 
+const CancelingSparseEmbedder = struct {
+    requested: *std.atomic.Value(bool),
+
+    fn embedSparse(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        _: []const u8,
+        _: []const u8,
+    ) !embedder_mod.SparseEmbedding {
+        const self: *CancelingSparseEmbedder = @ptrCast(@alignCast(ptr));
+        const indices = try alloc.dupe(u32, &.{1});
+        errdefer alloc.free(indices);
+        const values = try alloc.dupe(f32, &.{1.0});
+        self.requested.store(true, .release);
+        return .{ .indices = indices, .values = values };
+    }
+
+    fn interface(self: *CancelingSparseEmbedder) embedder_mod.SparseEmbedder {
+        return .{
+            .ptr = self,
+            .sparse_embed_fn = embedSparse,
+            .deinit_fn = null,
+        };
+    }
+};
+
+const CancelAfterAppendWal = struct {
+    inner: *wal_mod.WalStore,
+    requested: *std.atomic.Value(bool),
+
+    fn walStore(self: *@This()) wal_mod.WalStore {
+        return .{
+            .allocator = self.inner.allocator,
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    const vtable: wal_mod.WalStore.VTable = .{
+        .deinit = deinit,
+        .append = append,
+        .read_from_alloc = readFromAlloc,
+        .latest_lsn = latestLsn,
+        .truncate_prefix = truncatePrefix,
+    };
+
+    fn deinit(_: Allocator, _: *anyopaque) void {}
+
+    fn append(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const lsn = try self.inner.append(namespace, timestamp_ns, payload);
+        self.requested.store(true, .release);
+        return lsn;
+    }
+
+    fn readFromAlloc(ptr: *anyopaque, alloc: Allocator, namespace: []const u8, start_lsn: u64) ![]wal_mod.Record {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.vtable.read_from_alloc(self.inner.ptr, alloc, namespace, start_lsn);
+    }
+
+    fn latestLsn(ptr: *anyopaque, namespace: []const u8) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.latestLsn(namespace);
+    }
+
+    fn truncatePrefix(ptr: *anyopaque, namespace: []const u8, keep_from_lsn: u64) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.truncatePrefix(namespace, keep_from_lsn);
+    }
+};
+
+const InjectBeforeConditionalAppendWal = struct {
+    inner: *wal_mod.WalStore,
+    injected_payload: []const u8,
+    injected: bool = false,
+
+    fn walStore(self: *@This()) wal_mod.WalStore {
+        return .{
+            .allocator = self.inner.allocator,
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    const vtable: wal_mod.WalStore.VTable = .{
+        .deinit = deinit,
+        .append = append,
+        .append_idempotent_if_latest = appendIdempotentIfLatest,
+        .read_from_alloc = readFromAlloc,
+        .latest_lsn = latestLsn,
+        .truncate_prefix = truncatePrefix,
+    };
+
+    fn deinit(_: Allocator, _: *anyopaque) void {}
+
+    fn append(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.append(namespace, timestamp_ns, payload);
+    }
+
+    fn appendIdempotentIfLatest(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        timestamp_ns: u64,
+        payload: []const u8,
+        operation_id: []const u8,
+        expected_latest_lsn: u64,
+    ) !?u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!self.injected) {
+            _ = try self.inner.append(namespace, timestamp_ns + 1, self.injected_payload);
+            self.injected = true;
+        }
+        return try self.inner.appendIdempotentIfLatest(
+            namespace,
+            timestamp_ns,
+            payload,
+            operation_id,
+            expected_latest_lsn,
+        );
+    }
+
+    fn readFromAlloc(ptr: *anyopaque, alloc: Allocator, namespace: []const u8, start_lsn: u64) ![]wal_mod.Record {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.vtable.read_from_alloc(self.inner.ptr, alloc, namespace, start_lsn);
+    }
+
+    fn latestLsn(ptr: *anyopaque, namespace: []const u8) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.latestLsn(namespace);
+    }
+
+    fn truncatePrefix(ptr: *anyopaque, namespace: []const u8, keep_from_lsn: u64) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.truncatePrefix(namespace, keep_from_lsn);
+    }
+};
+
 fn buildDeterministicEmbeddingAlloc(alloc: Allocator, text: []const u8, dims: usize) ![]f32 {
     const embedding = try alloc.alloc(f32, dims);
     @memset(embedding, 0);
@@ -1104,6 +1340,176 @@ test "sparse enricher appends derived sparse mutation when published docs lack s
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"lexical_sparse_version\":1") != null);
 }
 
+test "serverless enrichment fails closed before a non-idempotent append" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-cancel-after-append");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-cancel-after-append");
+    const wal_root = tmpPath(&wal_root_buf, "wal-cancel-after-append");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
+    const batch = [_]api_types.DocumentMutation{.{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"alpha bravo\"}",
+    }};
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
+    defer ingest.deinit(alloc);
+    var build = try builder.publishNamespace("docs");
+    defer build.deinit(alloc);
+
+    var requested = std.atomic.Value(bool).init(false);
+    var canceling_impl = CancelAfterAppendWal{ .inner = &wal_store, .requested = &requested };
+    var canceling_wal = canceling_impl.walStore();
+    defer canceling_wal.deinit();
+    var enricher = SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &canceling_wal);
+    try std.testing.expectError(
+        error.IdempotentAppendUnsupported,
+        enricher.runNamespaceWithConfig("docs", .{
+            .batch_size = 4,
+            .pipeline_version = lexical_sparse_enrichment_version,
+        }),
+    );
+    try std.testing.expectEqual(@as(?u64, null), try progress_store.getEnrichmentDocOffset("docs"));
+    try std.testing.expectEqual(@as(u64, 1), try wal_store.latestLsn("docs"));
+}
+
+test "serverless enrichment WAL fence rejects a user mutation that lands during model work" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-stale-wal-fence");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-stale-wal-fence");
+    const wal_root = tmpPath(&wal_root_buf, "wal-stale-wal-fence");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
+    const initial = [_]api_types.DocumentMutation{.{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"stale source\"}",
+    }};
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &initial });
+    defer ingest.deinit(alloc);
+    var build = try builder.publishNamespace("docs");
+    defer build.deinit(alloc);
+
+    const user_delete = api_types.DocumentMutation{ .kind = .delete, .doc_id = "doc-a" };
+    const encoded_delete = try api_codec.encodeMutationAlloc(alloc, user_delete);
+    defer alloc.free(encoded_delete);
+    var injecting_impl = InjectBeforeConditionalAppendWal{
+        .inner = &wal_store,
+        .injected_payload = encoded_delete,
+    };
+    var injecting_wal = injecting_impl.walStore();
+    defer injecting_wal.deinit();
+    var enricher = SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &injecting_wal);
+    try std.testing.expectError(
+        error.EnrichmentProgressChanged,
+        enricher.runNamespaceWithConfig("docs", .{
+            .batch_size = 4,
+            .pipeline_version = lexical_sparse_enrichment_version,
+        }),
+    );
+
+    const tail = try wal_store.readFromAlloc("docs", 2);
+    defer wal_mod.freeRecords(alloc, tail);
+    try std.testing.expectEqual(@as(usize, 1), tail.len);
+    var mutation = try api_codec.decodeMutationAlloc(alloc, tail[0].payload);
+    defer mutation.deinit(alloc);
+    try std.testing.expectEqual(api_types.MutationKind.delete, mutation.kind);
+    try std.testing.expectEqual(@as(u64, 2), try wal_store.latestLsn("docs"));
+}
+
+test "serverless object enrichment writes a stable idempotent WAL identity" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-artifacts", "tenant");
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-manifests", "tenant");
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "enrichment-progress", "tenant");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-wal", "tenant");
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+
+    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var api = @import("../api/service.zig").Service.init(alloc, &wal, &builder);
+    const batch = [_]api_types.DocumentMutation{.{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"alpha bravo\"}",
+    }};
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
+    defer ingest.deinit(alloc);
+    var build = try builder.publishNamespace("docs");
+    defer build.deinit(alloc);
+
+    var enricher = SparseEnricher.init(alloc, &artifacts, &manifests, &progress, &wal);
+    const stats = try enricher.runNamespaceWithConfig("docs", .{
+        .batch_size = 4,
+        .pipeline_version = lexical_sparse_enrichment_version,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.wal_appends);
+    const tail = try wal.readFromAlloc("docs", 2);
+    defer wal_mod.freeRecords(alloc, tail);
+    try std.testing.expectEqual(@as(usize, 1), tail.len);
+    try std.testing.expectEqualStrings("enrich-v1/1/1/0/1", tail[0].operation_id.?);
+    try std.testing.expectEqual(
+        tail[0].lsn,
+        try wal.appendIdempotent(
+            "docs",
+            tail[0].timestamp_ns,
+            tail[0].payload,
+            tail[0].operation_id.?,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 2), try wal.latestLsn("docs"));
+}
+
 test "sparse enricher can append derived chunk preview mutation" {
     const alloc = std.testing.allocator;
 
@@ -1382,7 +1788,7 @@ test "sparse enricher skips docs already enriched at current version" {
     try std.testing.expectEqual(@as(u64, 1), try wal_store.latestLsn("docs"));
 }
 
-test "sparse enricher can use model-backed dense and sparse embedders" {
+test "serverless sparse enricher can use model-backed dense and sparse embedders" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1459,6 +1865,36 @@ test "sparse enricher can use model-backed dense and sparse embedders" {
     defer mutation.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"chunk_embeddings\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"f") != null);
+
+    const second_batch = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "doc-b", .body = "{\"text\":\"juliet kilo lima\"}" },
+    };
+    var second_ingest = try api.ingestBatch(.{
+        .namespace = "docs",
+        .timestamp_ns = 200,
+        .mutations = &second_batch,
+    });
+    defer second_ingest.deinit(alloc);
+    var second_build = try builder.publishNamespace("docs");
+    defer second_build.deinit(alloc);
+
+    var requested: std.atomic.Value(bool) = .init(false);
+    var canceling_sparse = CancelingSparseEmbedder{ .requested = &requested };
+    try enricher.setSparseEmbedder(canceling_sparse.interface(), "serverless_sparse");
+    const before_cancel_lsn = try wal_store.latestLsn("docs");
+    try std.testing.expectError(
+        error.Canceled,
+        enricher.runNamespaceWithConfigUntil("docs", .{
+            .batch_size = 4,
+            .pipeline_version = lexical_sparse_enrichment_version,
+            .stage = .lexical_sparse,
+            .model_preference = .prefer_model,
+        }, .{
+            .io = std.Options.debug_io,
+            .requested = &requested,
+        }),
+    );
+    try std.testing.expectEqual(before_cancel_lsn, try wal_store.latestLsn("docs"));
 }
 
 test "sparse enricher prefers model but falls back deterministically when sparse model fails" {

@@ -8,7 +8,6 @@
 
 const std = @import("std");
 const cache_budget = @import("../common/cache_budget.zig");
-const platform_time = @import("antfly_platform").time;
 
 pub const Key = [32]u8;
 
@@ -38,6 +37,40 @@ pub const Stats = struct {
 };
 
 pub const ComputeFn = *const fn (context: *anyopaque, alloc: std.mem.Allocator) anyerror![]f32;
+
+/// Stable production work boundaries at which a deployment may account for
+/// or delay cache work. The cache does not depend on VOPR: production owners
+/// can install any thread-safe implementation, while deterministic scenarios
+/// adapt these operations to a node-bound logical service-rate model. An
+/// installed implementation must be thread-safe and outlive every cache call
+/// that can reach it.
+pub const WorkKind = enum {
+    request,
+    hit_copy,
+    coalesced_wait,
+    producer_compute,
+};
+
+pub const WorkCostPort = struct {
+    ptr: *anyopaque,
+    charge_fn: *const fn (*anyopaque, WorkKind, u64) anyerror!void,
+
+    pub fn charge(self: WorkCostPort, kind: WorkKind, units: u64) !void {
+        try self.charge_fn(self.ptr, kind, units);
+    }
+};
+
+/// Optional production-safe lifecycle seam used by deterministic schedules to
+/// suspend after an entry is pinned but before its value is copied. The hook
+/// runs outside the cache mutex and is unset in production.
+pub const LifecycleHook = struct {
+    ptr: *anyopaque,
+    after_pin: *const fn (*anyopaque, Key) void,
+
+    fn afterPin(self: LifecycleHook, key: Key) void {
+        self.after_pin(self.ptr, key);
+    }
+};
 
 const Entry = struct {
     key: Key,
@@ -76,6 +109,8 @@ pub const QueryEmbeddingCache = struct {
     active_pins: usize = 0,
     uncached_inflight: usize = 0,
     counters: Stats = .{},
+    lifecycle_hook: ?LifecycleHook = null,
+    work_cost_port: ?WorkCostPort = null,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, config: Config) QueryEmbeddingCache {
         return .{
@@ -83,6 +118,23 @@ pub const QueryEmbeddingCache = struct {
             .io = io,
             .config = config,
         };
+    }
+
+    pub fn setLifecycleHook(self: *QueryEmbeddingCache, hook: ?LifecycleHook) void {
+        self.lifecycle_hook = hook;
+    }
+
+    pub fn setWorkCostPort(self: *QueryEmbeddingCache, port: ?WorkCostPort) void {
+        // Configuration is owner-controlled. Install or remove the port only
+        // while no cache request is concurrently executing.
+        self.work_cost_port = port;
+    }
+
+    /// Returns the logical cache charge used for admission. Exposing the same
+    /// calculation lets resource envelopes and deterministic tests configure
+    /// exact one-entry or N-entry budgets without duplicating layout math.
+    pub fn entryChargeBytes(vector_len: usize) usize {
+        return entryCharge(vector_len);
     }
 
     pub fn deinit(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget) void {
@@ -106,17 +158,34 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
-        if (!self.config.enabled) return self.computeUncached(caller_alloc, deadline_ns, context, compute);
+        try self.chargeWork(.request, 1);
+        if (deadlineExpiredAt(self.nowNs(), deadline_ns)) return error.Timeout;
+        if (!self.config.enabled) return self.computeUncachedInner(caller_alloc, deadline_ns, context, compute);
 
         const io = self.io;
         self.mutex.lockUncancelable(io);
         if (self.entries.get(key)) |entry| {
-            const now = platform_time.monotonicNs();
+            const now = self.nowNs();
             if (now < entry.expires_at_ns) {
                 self.touchLocked(entry, now);
                 self.counters.hits +|= 1;
                 self.pinEntryLocked(entry);
                 self.mutex.unlock(io);
+
+                if (self.lifecycle_hook) |hook| hook.afterPin(key);
+
+                self.chargeWork(.hit_copy, entry.vector.len) catch |err| {
+                    self.mutex.lockUncancelable(io);
+                    self.unpinEntryLocked(entry, budget);
+                    self.mutex.unlock(io);
+                    return err;
+                };
+                if (deadlineExpiredAt(self.nowNs(), deadline_ns)) {
+                    self.mutex.lockUncancelable(io);
+                    self.unpinEntryLocked(entry, budget);
+                    self.mutex.unlock(io);
+                    return error.Timeout;
+                }
 
                 const result = caller_alloc.dupe(f32, entry.vector) catch |err| {
                     self.mutex.lockUncancelable(io);
@@ -136,6 +205,12 @@ pub const QueryEmbeddingCache = struct {
             flight.refs += 1;
             self.counters.coalesced_waiters +|= 1;
             self.mutex.unlock(io);
+            self.chargeWork(.coalesced_wait, 1) catch |err| {
+                self.mutex.lockUncancelable(io);
+                self.releaseFlightLocked(key, flight);
+                self.mutex.unlock(io);
+                return err;
+            };
             self.waitForFlight(flight, deadline_ns) catch |err| {
                 self.mutex.lockUncancelable(io);
                 if (err == error.Timeout) self.counters.waiter_timeouts +|= 1;
@@ -155,7 +230,7 @@ pub const QueryEmbeddingCache = struct {
             return result;
         }
 
-        if (deadlineExpired(deadline_ns)) {
+        if (deadlineExpiredAt(self.nowNs(), deadline_ns)) {
             self.mutex.unlock(io);
             return error.Timeout;
         }
@@ -182,7 +257,17 @@ pub const QueryEmbeddingCache = struct {
         self.counters.producer_computations +|= 1;
         self.mutex.unlock(io);
 
-        const compute_started_ns = platform_time.monotonicNs();
+        const compute_started_ns = self.nowNs();
+        self.chargeWork(.producer_compute, 1) catch |err| {
+            self.mutex.lockUncancelable(io);
+            self.recordProducerDurationLocked(compute_started_ns);
+            flight.err = err;
+            flight.done = true;
+            flight.ready.set(io);
+            self.releaseFlightLocked(key, flight);
+            self.mutex.unlock(io);
+            return err;
+        };
         const computed = compute(context, self.alloc) catch |err| {
             self.mutex.lockUncancelable(io);
             self.recordProducerDurationLocked(compute_started_ns);
@@ -225,9 +310,20 @@ pub const QueryEmbeddingCache = struct {
         context: *anyopaque,
         compute: ComputeFn,
     ) ![]f32 {
+        try self.chargeWork(.request, 1);
+        return self.computeUncachedInner(caller_alloc, deadline_ns, context, compute);
+    }
+
+    fn computeUncachedInner(
+        self: *QueryEmbeddingCache,
+        caller_alloc: std.mem.Allocator,
+        deadline_ns: ?u64,
+        context: *anyopaque,
+        compute: ComputeFn,
+    ) ![]f32 {
         const io = self.io;
         self.mutex.lockUncancelable(io);
-        if (deadlineExpired(deadline_ns)) {
+        if (deadlineExpiredAt(self.nowNs(), deadline_ns)) {
             self.mutex.unlock(io);
             return error.Timeout;
         }
@@ -241,7 +337,11 @@ pub const QueryEmbeddingCache = struct {
         self.counters.uncached_computations +|= 1;
         self.mutex.unlock(io);
 
-        const compute_started_ns = platform_time.monotonicNs();
+        const compute_started_ns = self.nowNs();
+        self.chargeWork(.producer_compute, 1) catch |err| {
+            self.finishUncachedCompute(compute_started_ns);
+            return err;
+        };
         const result = compute(context, caller_alloc) catch |err| {
             self.finishUncachedCompute(compute_started_ns);
             return err;
@@ -254,7 +354,7 @@ pub const QueryEmbeddingCache = struct {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.expireOldestLocked(platform_time.monotonicNs(), budget, metrics_expire_batch);
+        self.expireOldestLocked(self.nowNs(), budget, metrics_expire_batch);
         var result = self.counters;
         result.entries = self.entries.count();
         result.live_bytes = self.live_bytes;
@@ -264,7 +364,7 @@ pub const QueryEmbeddingCache = struct {
     }
 
     fn recordProducerDurationLocked(self: *QueryEmbeddingCache, started_ns: u64) void {
-        const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+        const elapsed_ns = self.nowNs() -| started_ns;
         self.counters.producer_compute_ns_total +|= elapsed_ns;
     }
 
@@ -283,11 +383,15 @@ pub const QueryEmbeddingCache = struct {
 
     fn waitForFlight(self: *QueryEmbeddingCache, flight: *Flight, deadline_ns: ?u64) !void {
         const deadline = deadline_ns orelse {
-            flight.ready.waitUncancelable(self.io);
+            // A coalesced waiter is not the producer and owns no shared state
+            // that requires an uncancelable region. Let its enclosing std.Io
+            // task be canceled, then release its flight reference through the
+            // caller's existing error path.
+            try flight.ready.wait(self.io);
             return;
         };
         while (!flight.ready.isSet()) {
-            const now = platform_time.monotonicNs();
+            const now = self.nowNs();
             if (now >= deadline) return error.Timeout;
             flight.ready.waitTimeout(self.io, .{
                 .duration = .{
@@ -318,7 +422,7 @@ pub const QueryEmbeddingCache = struct {
             self.counters.rejected_admissions +|= 1;
             return;
         }
-        self.expireOldestLocked(platform_time.monotonicNs(), budget, admission_expire_batch);
+        self.expireOldestLocked(self.nowNs(), budget, admission_expire_batch);
         while (self.live_bytes > self.config.max_bytes - charge) {
             const victim = self.oldest orelse break;
             self.removeEntryLocked(victim, budget, false);
@@ -340,7 +444,7 @@ pub const QueryEmbeddingCache = struct {
             .key = key,
             .vector = owned_vector,
             .charge_bytes = charge,
-            .expires_at_ns = platform_time.monotonicNs() +| self.config.ttl_ns,
+            .expires_at_ns = self.nowNs() +| self.config.ttl_ns,
         };
         try self.entries.put(self.alloc, key, entry);
         self.linkNewestLocked(entry);
@@ -415,6 +519,14 @@ pub const QueryEmbeddingCache = struct {
         self.alloc.free(entry.vector);
         self.alloc.destroy(entry);
     }
+
+    fn nowNs(self: *const QueryEmbeddingCache) u64 {
+        return @intCast(@max(std.Io.Timestamp.now(self.io, .awake).toNanoseconds(), 0));
+    }
+
+    fn chargeWork(self: *QueryEmbeddingCache, kind: WorkKind, units: usize) !void {
+        if (self.work_cost_port) |port| try port.charge(kind, @intCast(units));
+    }
 };
 
 fn copyFlightResult(alloc: std.mem.Allocator, flight: *const Flight) ![]f32 {
@@ -423,9 +535,9 @@ fn copyFlightResult(alloc: std.mem.Allocator, flight: *const Flight) ![]f32 {
     return try alloc.dupe(f32, flight.result orelse return error.QueryEmbeddingProducerFailed);
 }
 
-fn deadlineExpired(deadline_ns: ?u64) bool {
+fn deadlineExpiredAt(now_ns: u64, deadline_ns: ?u64) bool {
     const deadline = deadline_ns orelse return false;
-    return platform_time.monotonicNs() >= deadline;
+    return now_ns >= deadline;
 }
 
 const TestCompute = struct {
@@ -580,7 +692,7 @@ pub fn testInflightAdmissionBound() !void {
             &budget,
             std.testing.allocator,
             producer_key,
-            platform_time.monotonicNs() +| std.time.ns_per_ms,
+            @as(u64, @intCast(@max(std.Io.Timestamp.now(compute_io.io(), .awake).toNanoseconds(), 0))) +| std.time.ns_per_ms,
             &compute,
             BlockingCompute.run,
         ),
