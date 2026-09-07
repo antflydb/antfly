@@ -281,15 +281,43 @@ pub const RunGeometry = struct {
 /// A pipeline-qualified projection, independent of the backend implementing it.
 /// The named input determines sequence geometry, not its position in an array.
 /// Used for imported seq2seq stages whose symbolic outputs omit the transform.
+/// Allocation-free shape view shared by preparation and physical execution.
+/// Geometry callbacks cannot inspect tensor payloads or require materialization.
+pub const ShapeInputs = union(enum) {
+    tensors: []const Tensor,
+    shapes: []const TensorInfo,
+
+    pub fn len(self: @This()) usize {
+        return switch (self) {
+            .tensors => |v| v.len,
+            .shapes => |v| v.len,
+        };
+    }
+    pub fn get(self: @This(), i: usize) TensorInfo {
+        return switch (self) {
+            .tensors => |v| .{ .name = v[i].name, .shape = v[i].shape, .dtype = v[i].dtype },
+            .shapes => |v| v[i],
+        };
+    }
+    pub fn named(self: @This(), name: []const u8) ?TensorInfo {
+        for (0..self.len()) |i| {
+            const input = self.get(i);
+            if (std.mem.eql(u8, input.name, name)) return input;
+        }
+        return null;
+    }
+};
+
 pub const SequenceOutputGeometry = struct {
     input_name: []const u8,
     sequence_axis: usize = 1,
     sequence_divisor: usize = 1,
     width: usize,
 
-    fn resolve(self: @This(), inputs: []const Tensor, batch: usize) !RunGeometry {
+    fn resolve(self: @This(), inputs: ShapeInputs, batch: usize) !RunGeometry {
         if (self.width == 0 or self.sequence_divisor == 0) return error.InvalidInputShape;
-        for (inputs) |input| {
+        for (0..inputs.len()) |i| {
+            const input = inputs.get(i);
             if (!std.mem.eql(u8, input.name, self.input_name)) continue;
             if (input.shape.len <= self.sequence_axis or input.shape[self.sequence_axis] <= 0) return error.InvalidInputShape;
             const sequence: usize = @intCast(input.shape[self.sequence_axis]);
@@ -305,9 +333,9 @@ pub const SequenceOutputGeometry = struct {
 pub const CachedDecoderGeometry = struct {
     vocab_size: usize,
 
-    fn resolve(self: @This(), inputs: []const Tensor, outputs: []const TensorInfo, batch: usize) !RunGeometry {
-        const ids = namedTensor(inputs, "input_ids") orelse return error.MissingInputs;
-        const encoder = namedTensor(inputs, "encoder_hidden_states") orelse return error.MissingInputs;
+    fn resolve(self: @This(), inputs: ShapeInputs, outputs: []const TensorInfo, batch: usize) !RunGeometry {
+        const ids = inputs.named("input_ids") orelse return error.MissingInputs;
+        const encoder = inputs.named("encoder_hidden_states") orelse return error.MissingInputs;
         if (ids.shape.len != 2 or encoder.shape.len != 3 or ids.shape[1] <= 0 or encoder.shape[1] <= 0) return error.InvalidInputShape;
         const tokens: usize = @intCast(ids.shape[1]);
         const context: usize = @intCast(encoder.shape[1]);
@@ -321,8 +349,9 @@ pub const CachedDecoderGeometry = struct {
                 const prefix = "present.";
                 if (!std.mem.startsWith(u8, output.name, prefix) or output.shape.len != 4) return error.UnresolvedOutputGeometry;
                 const suffix = output.name[prefix.len..];
-                var past: ?Tensor = null;
-                for (inputs) |input| {
+                var past: ?TensorInfo = null;
+                for (0..inputs.len()) |i| {
+                    const input = inputs.get(i);
                     if (std.mem.startsWith(u8, input.name, "past_key_values.") and std.mem.eql(u8, input.name["past_key_values.".len..], suffix)) {
                         past = input;
                         break;
@@ -344,11 +373,6 @@ pub const CachedDecoderGeometry = struct {
     }
 };
 
-fn namedTensor(inputs: []const Tensor, name: []const u8) ?Tensor {
-    for (inputs) |input| if (std.mem.eql(u8, input.name, name)) return input;
-    return null;
-}
-
 test "imported sequence geometry resolves transformed audio axes without native hooks" {
     const Probe = struct {
         fn info(_: *anyopaque) []const TensorInfo {
@@ -365,6 +389,31 @@ test "imported sequence geometry resolves transformed audio axes without native 
     try std.testing.expect(peak.host_scratch_bytes >= request.output_bytes.?);
     const odd = Tensor{ .data = &.{}, .shape = &.{ 1, 80, 3001 }, .dtype = .f32, .name = "input_features", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false };
     try std.testing.expectEqual(@as(usize, 1501 * 384 * 4 + 24), (try session.planRun(&.{odd}, 1)).output_bytes.?);
+    const shapes = try session.planShapes(&.{.{ .name = "input_features", .dtype = .f32, .shape = &.{ 8, 80, 3000 } }}, 8);
+    try std.testing.expectEqual(request.output_bytes, shapes.output_bytes);
+    try std.testing.expectEqual(@as(usize, 8 * 80 * 3000 * 4), shapes.input_bytes);
+}
+
+test "shape-only planning shares native geometry and workspace with execution" {
+    const Probe = struct {
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1, -1 } }};
+        }
+        fn geometry(_: *anyopaque, inputs: ShapeInputs, batch: usize) !?RunGeometry {
+            const ids = inputs.named("input_ids").?;
+            const seq: usize = @intCast(ids.shape[1]);
+            return .{ .sequence = seq, .output_bytes = batch * seq * 32768 * 4 + 24, .workspace_bytes = batch * seq * seq * 8 };
+        }
+    };
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.info, .backend = undefined, .close = undefined, .runGeometry = Probe.geometry } };
+    var input = try Tensor.initInt64(std.testing.allocator, "input_ids", &.{ 1, 2 }, &.{ 1, 2 });
+    defer input.deinit();
+    const physical = try session.planRun(&.{input}, 8);
+    const planned = try session.planShapes(&.{.{ .name = input.name, .dtype = input.dtype, .shape = &.{ 8, 2 } }}, 8);
+    try std.testing.expectEqualDeep(physical, planned);
+    try std.testing.expectEqual(@as(usize, 8 * 2 * 32768 * 4 + 24), planned.output_bytes.?);
+    try std.testing.expectEqual(@as(usize, 8 * 2 * 2 * 8), planned.workspace_bytes);
 }
 
 fn addBytes(lhs: usize, rhs: usize) !usize {
@@ -443,6 +492,9 @@ pub const Session = struct {
     run_admission: ?RunAdmission = null,
     output_geometry: ?SequenceOutputGeometry = null,
     cached_decoder_geometry: ?CachedDecoderGeometry = null,
+    /// Explicit stage contract: these small control tensors are equal across
+    /// a physical batch and passed once, never concatenated as independent rows.
+    broadcast_inputs: []const []const u8 = &.{},
     /// Borrowed from the model/runtime owner; stable for every session copy.
     execution_gate: ?*std.atomic.Mutex = null,
 
@@ -456,7 +508,7 @@ pub const Session = struct {
         independentBatchRows: ?*const fn (ptr: *anyopaque, inputs: []const Tensor) bool = null,
         /// Allocation-free stage planning. Inputs describe logical geometry;
         /// batch is the requested physical row count (possibly fused).
-        runGeometry: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, batch: usize) anyerror!?RunGeometry = null,
+        runGeometry: ?*const fn (ptr: *anyopaque, inputs: ShapeInputs, batch: usize) anyerror!?RunGeometry = null,
         backend: *const fn (ptr: *anyopaque) BackendType,
         interruption: ?*const fn (ptr: *anyopaque) Interruption = null,
         close: *const fn (ptr: *anyopaque) void,
@@ -577,10 +629,42 @@ pub const Session = struct {
     pub fn planRun(self: Session, inputs: []const Tensor, batch_override: ?usize) !RunRequest {
         var request = try RunRequest.fromTensors(inputs);
         if (batch_override) |batch| {
-            if (request.input_bytes % request.batch != 0) return error.InvalidInputShape;
-            request.input_bytes = try mulBytes(request.input_bytes / request.batch, batch);
+            request.input_bytes = 0;
+            for (inputs) |input| {
+                const bytes = if (self.isBroadcastInput(input.name)) input.data.len else blk: {
+                    if (input.data.len % request.batch != 0) return error.InvalidInputShape;
+                    break :blk try mulBytes(input.data.len / request.batch, batch);
+                };
+                request.input_bytes = try addBytes(request.input_bytes, bytes);
+            }
             request.batch = batch;
         }
+        try self.resolveRunGeometry(.{ .tensors = inputs }, &request);
+        if (batch_override == null) request.pre_admitted_host_bytes = try self.inputResidencyCredit(inputs);
+        return request;
+    }
+
+    pub fn isBroadcastInput(self: Session, name: []const u8) bool {
+        for (self.broadcast_inputs) |input| if (std.mem.eql(u8, input, name)) return true;
+        return false;
+    }
+
+    pub fn planShapes(self: Session, inputs: []const TensorInfo, batch: usize) !RunRequest {
+        if (inputs.len == 0 or batch == 0) return error.InvalidInputShape;
+        var request = RunRequest{ .batch = batch, .sequence = positiveDimension(inputs[0].shape, 1) };
+        for (inputs) |input| {
+            var elements: usize = 1;
+            for (input.shape) |dim| {
+                if (dim < 0) return error.UnresolvedOutputGeometry;
+                elements = try mulBytes(elements, @intCast(dim));
+            }
+            request.input_bytes = try addBytes(request.input_bytes, try mulBytes(elements, input.dtype.byteSize()));
+        }
+        try self.resolveRunGeometry(.{ .shapes = inputs }, &request);
+        return request;
+    }
+
+    fn resolveRunGeometry(self: Session, inputs: ShapeInputs, request: *RunRequest) !void {
         const resolved_geometry = if (self.vtable.runGeometry) |geometry| try geometry(self.ptr, inputs, request.batch) else null;
         const concrete = resolved_geometry orelse if (self.cached_decoder_geometry) |geometry| try geometry.resolve(inputs, self.outputInfo(), request.batch) else if (self.output_geometry) |geometry| try geometry.resolve(inputs, request.batch) else null;
         if (concrete) |resolved| {
@@ -589,8 +673,6 @@ pub const Session = struct {
             request.output_kv_bytes = resolved.output_kv_bytes;
             request.workspace_bytes = resolved.workspace_bytes;
         }
-        if (batch_override == null) request.pre_admitted_host_bytes = try self.inputResidencyCredit(inputs);
-        return request;
     }
 
     pub fn inputResidencyCredit(self: Session, inputs: []const Tensor) !usize {

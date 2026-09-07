@@ -55,7 +55,7 @@ const SharedOutputs = struct {
         }
         for (self.outputs, output) |tensor, *view| {
             const shape = try self.allocator.dupe(i64, tensor.shape);
-            shape[0] = @intCast(count);
+            if (shape[0] != 0) shape[0] = @intCast(count);
             const stride = tensor.data.len / total;
             view.* = .{
                 .data = tensor.data[start * stride ..][0 .. count * stride],
@@ -84,7 +84,7 @@ fn destroy(allocator: std.mem.Allocator, tensors: []Tensor) void {
 fn validTensor(tensor: Tensor) bool {
     var elements: usize = 1;
     for (tensor.shape) |dim| {
-        if (dim <= 0) return false;
+        if (dim < 0) return false;
         elements = std.math.mul(usize, elements, @intCast(dim)) catch return false;
     }
     return (std.math.mul(usize, elements, tensor.dtype.byteSize()) catch return false) == tensor.data.len;
@@ -96,7 +96,10 @@ pub fn eligible(session: session_mod.Session, inputs: []const Tensor) bool {
     if (inputs.len == 0) return false;
     if (inputs[0].shape.len == 0 or inputs[0].shape[0] <= 0) return false;
     for (inputs, 0..) |input, index| {
-        if (!validTensor(input) or input.shape.len == 0 or input.shape[0] != inputs[0].shape[0]) return false;
+        if (!validTensor(input)) return false;
+        if (session.isBroadcastInput(input.name)) {
+            if (input.data.len == 0 or input.data.len > 8) return false;
+        } else if (input.shape.len == 0 or input.shape[0] != inputs[0].shape[0]) return false;
         for (inputs[0..index]) |previous| if (std.mem.eql(u8, previous.name, input.name)) return false;
     }
     if (session.vtable.independentBatchRows) |qualified| return qualified(session.ptr, inputs);
@@ -107,8 +110,13 @@ pub fn eligible(session: session_mod.Session, inputs: []const Tensor) bool {
         var matched = false;
         for (declared) |info| {
             if (!std.mem.eql(u8, info.name, input.name)) continue;
-            if (info.dtype != input.dtype or info.shape.len != input.shape.len or info.shape[0] > 0) return false;
-            for (info.shape[1..], input.shape[1..]) |expected, actual| if (expected > 0 and expected != actual) return false;
+            if (info.dtype != input.dtype or info.shape.len != input.shape.len) return false;
+            if (session.isBroadcastInput(input.name)) {
+                if (!std.mem.eql(i64, info.shape, input.shape)) return false;
+            } else {
+                if (info.shape[0] > 0) return false;
+                for (info.shape[1..], input.shape[1..]) |expected, actual| if (expected > 0 and expected != actual) return false;
+            }
             matched = true;
             break;
         }
@@ -137,6 +145,7 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
     try signature.writer.print("{d}:{d};", .{ @intFromPtr(session.vtable), @intFromPtr(gate) });
     try std.json.Stringify.value(session.output_geometry, .{}, &signature.writer);
     try std.json.Stringify.value(session.cached_decoder_geometry, .{}, &signature.writer);
+    try std.json.Stringify.value(session.broadcast_inputs, .{}, &signature.writer);
     // A fused native call must stay inside the same supervising boundary.
     // Never inherit just one caller's deadline/cancellation for its peers.
     if (control) |active| if (active.hard_cancellation) |boundary| {
@@ -154,7 +163,8 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
     var bytes: usize = 0;
     for (inputs) |tensor| {
         bytes = try std.math.add(usize, bytes, tensor.data.len);
-        try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = tensor.shape[1..] }, .{}, &signature.writer);
+        const broadcast = session.isBroadcastInput(tensor.name);
+        try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{} }, .{}, &signature.writer);
     }
     const ticket = Ticket{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = @intCast(inputs[0].shape[0]) };
     // Requests already larger than the coalescing window keep their existing
@@ -347,6 +357,11 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
         alloc.free(batch_inputs);
     };
     for (first.inputs, 0..) |input, column| {
+        if (first.session.isBroadcastInput(input.name)) {
+            batch_inputs[column] = input.borrowedView(input.name);
+            initialized += 1;
+            continue;
+        }
         const shape = try alloc.dupe(i64, input.shape);
         errdefer alloc.free(shape);
         shape[0] = @intCast(rows);
@@ -366,12 +381,15 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     defer if (owns_outputs) destroy(alloc, outputs);
     if (outputs.len == 0 or outputs.len != first.session.outputInfo().len) return error.InvalidFusedOutputShape;
     for (outputs, first.session.outputInfo()) |tensor, info| {
-        if (!validTensor(tensor) or tensor.dtype != info.dtype or tensor.shape.len == 0 or tensor.shape[0] != rows) return error.InvalidFusedOutputShape;
+        const empty_cross_cache = first.session.cached_decoder_geometry != null and
+            std.mem.startsWith(u8, tensor.name, "present.") and std.mem.indexOf(u8, tensor.name, ".encoder.") != null and
+            tensor.data.len == 0 and tensor.shape.len == 4 and tensor.shape[0] == 0;
+        if (!validTensor(tensor) or tensor.dtype != info.dtype or tensor.shape.len == 0 or (tensor.shape[0] != rows and !empty_cross_cache)) return error.InvalidFusedOutputShape;
         // Native multi-entry sessions qualify concrete stages independently
         // of their summary metadata. Graph contracts must match exactly.
         if (first.session.vtable.independentBatchRows == null) {
             if (tensor.shape.len != info.shape.len) return error.InvalidFusedOutputShape;
-            for (tensor.shape[1..], info.shape[1..]) |actual, declared| if (declared > 0 and actual != declared) return error.InvalidFusedOutputShape;
+            if (!empty_cross_cache) for (tensor.shape[1..], info.shape[1..]) |actual, declared| if (declared > 0 and actual != declared) return error.InvalidFusedOutputShape;
         }
     }
     // No backend scratch or input packing survives this invocation. Keep only
@@ -518,6 +536,47 @@ test "tensor microbatch fuses forwards and retains zero-copy outputs through las
     try std.testing.expectEqual(@as(u64, 8), broker.snapshot(std.testing.io).native_items);
 }
 
+test "tensor microbatch broadcasts scalar controls and separates unequal values" {
+    const Probe = struct {
+        fn info(_: *anyopaque) []const TestSession.Info {
+            return &.{
+                .{ .name = "values", .dtype = .f32, .shape = &.{ -1, -1 } },
+                .{ .name = "branch", .dtype = .bool_, .shape = &.{} },
+            };
+        }
+        fn forward(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+            try std.testing.expectEqual(@as(usize, 0), inputs[1].shape.len);
+            try std.testing.expectEqual(@as(usize, 1), inputs[1].data.len);
+            return TestSession.forward(raw, inputs, allocator);
+        }
+    };
+    var fake = TestSession{};
+    var vtable = TestSession.vtable;
+    vtable.inputInfo = Probe.info;
+    vtable.run = Probe.forward;
+    const session = session_mod.Session{ .ptr = &fake, .vtable = &vtable, .broadcast_inputs = &.{"branch"} };
+    var broker = micro.Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    var gate = std.atomic.Mutex.unlocked;
+    var input = try Tensor.initFloat32(std.testing.allocator, "values", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+    defer input.deinit();
+    var branch_data = [_]u8{ 0, 1 };
+    var inputs: [2][2]Tensor = undefined;
+    for (&inputs, 0..) |*values, i| values.* = .{ input, .{ .name = "branch", .dtype = .bool_, .shape = &.{}, .data = branch_data[i..][0..1], .allocator = std.testing.allocator, .owns_shape = false, .owns_data = false } };
+    var callers: [4]TestSubmit = undefined;
+    for (&callers, 0..) |*caller, i| caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &inputs[i % 2] };
+    defer for (&callers) |*caller| caller.deinit();
+    var group = std.Io.Group.init;
+    defer group.cancel(std.testing.io);
+    for (&callers) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
+    try group.await(std.testing.io);
+    for (&callers) |*caller| {
+        if (caller.err) |err| return err;
+        try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, caller.output.?[0].asFloat32());
+    }
+    try std.testing.expectEqual(@as(usize, 2), fake.calls.load(.monotonic));
+}
+
 test "tensor microbatch rejoins shared encoder rows without repacking and restores request order" {
     const memory = @import("../runtime/tier/memory.zig");
     var controller = memory.AdmissionController{};
@@ -619,7 +678,7 @@ test "tensor microbatch yields idle workspace and permits remain reusable" {
 test "tensor microbatch admits expanded GPU outputs before forwarding" {
     const memory = @import("../runtime/tier/memory.zig");
     const Geometry = struct {
-        fn plan(_: *anyopaque, _: []const Tensor, batch: usize) !?session_mod.RunGeometry {
+        fn plan(_: *anyopaque, _: session_mod.ShapeInputs, batch: usize) !?session_mod.RunGeometry {
             return .{ .sequence = 2, .output_bytes = batch * 64 * 4 + 16 };
         }
     };
@@ -660,7 +719,7 @@ test "tensor microbatch admits expanded GPU outputs before forwarding" {
 test "tensor microbatch reusable permit expands native output geometry" {
     const memory = @import("../runtime/tier/memory.zig");
     const Geometry = struct {
-        fn plan(_: *anyopaque, _: []const Tensor, batch: usize) !?session_mod.RunGeometry {
+        fn plan(_: *anyopaque, _: session_mod.ShapeInputs, batch: usize) !?session_mod.RunGeometry {
             return .{ .sequence = 2, .output_bytes = batch * 64 * 4 + 16 };
         }
     };

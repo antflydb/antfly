@@ -81,6 +81,7 @@ pub const State = struct {
         if (!qualified(session) or vocab_size == 0) return null;
         var planned = session;
         planned.cached_decoder_geometry = .{ .vocab_size = vocab_size };
+        planned.broadcast_inputs = &.{"use_cache_branch"};
         return .{ .allocator = allocator, .session = planned, .cache = kv.KvCache.init(allocator), .encoder = encoder.borrowedView("encoder_hidden_states"), .mask = mask, .vocab_size = vocab_size };
     }
 
@@ -207,19 +208,20 @@ const TestDecoder = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.calls += 1;
         const ids = inputs[0].asInt64();
+        const rows: usize = @intCast(inputs[0].shape[0]);
+        const tokens = ids.len / rows;
         self.submitted_tokens += ids.len;
         const cached = inputs[2].data[0] == 1;
         const old = inputs[3].asFloat32();
-        const context = inputs[1].asFloat32()[0];
-        if (cached) {
-            try std.testing.expect(old.len > 0);
-            try std.testing.expectEqual(context, inputs[5].asFloat32()[0]);
-        } else try std.testing.expectEqual(@as(usize, 0), old.len);
-        const time = old.len / 2 + ids.len;
-        const values = try allocator.alloc(f32, time * 2);
+        const old_time = old.len / rows / 2;
+        const time = old_time + tokens;
+        const values = try allocator.alloc(f32, rows * time * 2);
         defer allocator.free(values);
-        @memcpy(values[0..old.len], old);
-        for (ids, 0..) |id, i| @memset(values[old.len + i * 2 ..][0..2], @as(f32, @floatFromInt(id)));
+        for (0..rows) |row| {
+            const data = values[row * time * 2 ..][0 .. time * 2];
+            @memcpy(data[0 .. old_time * 2], old[row * old_time * 2 ..][0 .. old_time * 2]);
+            for (ids[row * tokens ..][0..tokens], 0..) |id, i| @memset(data[(old_time + i) * 2 ..][0..2], @as(f32, @floatFromInt(id)));
+        }
         const outputs = try allocator.alloc(backends.Tensor, output_info.len);
         var initialized: usize = 0;
         errdefer {
@@ -229,19 +231,26 @@ const TestDecoder = struct {
         const logits = try allocator.alloc(f32, ids.len * 4);
         defer allocator.free(logits);
         @memset(logits, 0);
-        var sum: usize = @intFromFloat(context);
-        var i: usize = 0;
-        while (i < values.len) : (i += 2) sum += @intFromFloat(values[i]);
-        logits[(ids.len - 1) * 4 + sum % 4] = 10;
+        for (0..rows) |row| {
+            const context = inputs[1].asFloat32()[row * 4];
+            if (cached) {
+                try std.testing.expect(old_time > 0);
+                try std.testing.expectEqual(context, inputs[5].asFloat32()[row * 4]);
+            } else try std.testing.expectEqual(@as(usize, 0), old_time);
+            var sum: usize = @intFromFloat(context);
+            var i: usize = 0;
+            while (i < time) : (i += 1) sum += @intFromFloat(values[(row * time + i) * 2]);
+            logits[((row + 1) * tokens - 1) * 4 + sum % 4] = 10;
+        }
         for (output_info, 0..) |info, index| {
             outputs[index] = if (index == 0)
-                try backends.Tensor.initFloat32(allocator, info.name, &.{ 1, @intCast(ids.len), 4 }, logits)
+                try backends.Tensor.initFloat32(allocator, info.name, &.{ @intCast(rows), @intCast(tokens), 4 }, logits)
             else if (index < 3)
-                try backends.Tensor.initFloat32(allocator, info.name, &.{ 1, 1, @intCast(time), 2 }, values)
+                try backends.Tensor.initFloat32(allocator, info.name, &.{ @intCast(rows), 1, @intCast(time), 2 }, values)
             else if (cached)
-                try backends.Tensor.initFloat32(allocator, info.name, &.{ 1, 1, 0, 2 }, &.{})
+                try backends.Tensor.initFloat32(allocator, info.name, &.{ 0, 1, 0, 2 }, &.{})
             else
-                try backends.Tensor.initFloat32(allocator, info.name, &.{ 1, 1, 2, 2 }, inputs[1].asFloat32());
+                try backends.Tensor.initFloat32(allocator, info.name, &.{ @intCast(rows), 1, 2, 2 }, inputs[1].asFloat32());
             initialized += 1;
         }
         if (self.cancel_after) |flag| flag.store(true, .release);
@@ -287,6 +296,69 @@ fn checkIncremental(allocator: std.mem.Allocator) !void {
 
 test "incremental seq2seq reuses self and cross KV with context isolation and full-prefix parity" {
     try checkIncremental(std.testing.allocator);
+}
+
+test "incremental seq2seq fuses prefill and cached steps with broadcast branch and isolated contexts" {
+    const micro = @import("../server/executor_microbatch.zig");
+    const tensors = @import("../server/tensor_microbatch.zig");
+    const memory = @import("../runtime/tier/memory.zig");
+    const Harness = struct {
+        broker: micro.Broker,
+        fn dispatch(raw: *anyopaque, task: micro.Task, alloc: std.mem.Allocator, session: backends.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends.Tensor, control: ?Control) ![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return tensors.run(&self.broker, alloc, std.testing.io, task, session, permit, gate.?, inputs, control, null, 500_000);
+        }
+    };
+    const Job = struct {
+        state: *State,
+        prefix: []const i64,
+        dispatch: Dispatch,
+        result: ?backends.Tensor = null,
+        err: ?anyerror = null,
+        fn run(self: *@This()) std.Io.Cancelable!void {
+            self.result = self.state.step(self.prefix, self.dispatch, null) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var harness = Harness{ .broker = micro.Broker.init(std.testing.allocator) };
+    defer harness.broker.deinit();
+    var controller = memory.AdmissionController{};
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    var fake = TestDecoder{};
+    var gate = std.atomic.Mutex.unlocked;
+    var session = fake.session();
+    session.execution_gate = &gate;
+    session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false };
+    var encoder = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 1, 1, 1, 1 });
+    defer encoder.deinit();
+    var other = try backends.Tensor.initFloat32(std.testing.allocator, "hidden", &.{ 1, 2, 2 }, &.{ 2, 2, 2, 2 });
+    defer other.deinit();
+    var first = State.init(std.testing.allocator, session, encoder, &.{ 1, 1 }, 4).?;
+    defer first.deinit();
+    var second = State.init(std.testing.allocator, session, other, &.{ 1, 1 }, 4).?;
+    defer second.deinit();
+    const prefix = [_]i64{ 0, 2, 3 };
+    for (1..4) |length| {
+        var jobs = [_]Job{
+            .{ .state = &first, .prefix = prefix[0..length], .dispatch = .{ .ptr = &harness, .task = .rewrite, .run_fn = Harness.dispatch } },
+            .{ .state = &second, .prefix = prefix[0..length], .dispatch = .{ .ptr = &harness, .task = .rewrite, .run_fn = Harness.dispatch } },
+        };
+        defer for (&jobs) |*job| if (job.result) |*value| value.deinit();
+        var group = std.Io.Group.init;
+        defer group.cancel(std.testing.io);
+        for (&jobs) |*job| group.async(std.testing.io, Job.run, .{job});
+        try group.await(std.testing.io);
+        for (&jobs, 1..) |*job, context| {
+            if (job.err) |err| return err;
+            var sum = context;
+            for (prefix[0..length]) |id| sum += @intCast(id);
+            try std.testing.expectEqual(@as(f32, 10), job.result.?.asFloat32()[sum % 4]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expectEqual(@as(usize, 6), fake.submitted_tokens);
 }
 
 test "incremental seq2seq cache ownership unwinds allocation failures" {

@@ -7092,9 +7092,19 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
         }
     };
     var fake = FakeReader{ .first_ptr = png[0..].ptr, .second_ptr = jpeg[0..].ptr };
-    var state: inference_host.LinkedInferenceState = undefined;
-    state.alloc = alloc;
-    state.read_encoded_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read };
+    var state = inference_host.LinkedInferenceState{
+        .alloc = alloc,
+        .io = std.testing.io,
+        .node = undefined, // The model-free override must not enter Node.
+        .warm_models = undefined,
+        .content_security = null,
+        .s3_credentials = null,
+        .runtime_config = undefined,
+        .owned_models_dir = null,
+        .owned_ml_dir = null,
+        .route_validator = undefined,
+        .read_encoded_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read },
+    };
     var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &state };
 
     // Traverse the production caller, ProviderInvokeContext construction,
@@ -7213,9 +7223,19 @@ test "standalone raster reader ABI preserves borrowed strided pages and identity
         }
     };
     var fake = FakeReader{ .expected = .{ first[0..].ptr, second[0..].ptr } };
-    var state: inference_host.LinkedInferenceState = undefined;
-    state.alloc = alloc;
-    state.read_raster_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read };
+    var state = inference_host.LinkedInferenceState{
+        .alloc = alloc,
+        .io = std.testing.io,
+        .node = undefined, // The model-free override must not enter Node.
+        .warm_models = undefined,
+        .content_security = null,
+        .s3_credentials = null,
+        .runtime_config = undefined,
+        .owned_models_dir = null,
+        .owned_ml_dir = null,
+        .route_validator = undefined,
+        .read_raster_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read },
+    };
     var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &state };
 
     var batch = try inferenceProviderReadRasterImagesReported(&lifetime, alloc, "florence2", request);

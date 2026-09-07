@@ -4531,16 +4531,17 @@ pub const Node = struct {
         defer runtime_handle.release();
         const assets = runtime_handle.get();
         const dec_config = assets.decoder_config;
-        const input_tokens = try maxTokenizerTextTokens(allocator, io, assets.tokenizer(), inputs);
+        const rewriting = @import("../pipelines/rewriting.zig");
+        var prepared = try rewriting.PreparedTextBatch.init(allocator, assets.encoder.?.session, assets.tokenizer(), inputs, dec_config.max_length, null);
+        defer prepared.deinit();
         try validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = inputs.len,
             .text_bytes_per_item = maxTextBytes(inputs),
-            .input_tokens_per_item = input_tokens,
+            .input_tokens_per_item = prepared.max_tokens,
             .output_tokens_per_item = std.math.cast(usize, dec_config.max_length) orelse std.math.maxInt(usize),
             .has_text = true,
         });
 
-        const rewriting = @import("../pipelines/rewriting.zig");
         var pipeline = rewriting.RewritingPipeline{
             .allocator = allocator,
             .enc_dec = .{
@@ -4560,7 +4561,7 @@ pub const Node = struct {
             for (outputs[0..initialized]) |output| allocator.free(output);
             allocator.free(outputs);
         }
-        const rewritten = try pipeline.rewriteBatch(io, inputs);
+        const rewritten = try pipeline.rewritePrepared(io, &prepared);
         defer {
             for (rewritten) |*result| result.deinit();
             allocator.free(rewritten);
@@ -15404,16 +15405,17 @@ pub const Node = struct {
         const encoder_session = assets.encoder.?.session;
         const decoder_session = assets.decoder.?.session;
         const dec_config = assets.decoder_config;
-        const max_input_tokens = maxTokenizerTextTokens(ctx.allocator, self.session_manager.io, assets.tokenizer(), body.inputs) catch |err|
+        const rewriting = @import("../pipelines/rewriting.zig");
+        var prepared = rewriting.PreparedTextBatch.init(ctx.allocator, encoder_session, assets.tokenizer(), body.inputs, dec_config.max_length, execution_control) catch |err|
             return inferenceFailureResponse(ctx, err);
+        defer prepared.deinit();
         validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = body.inputs.len,
             .text_bytes_per_item = maxTextBytes(body.inputs),
-            .input_tokens_per_item = max_input_tokens,
+            .input_tokens_per_item = prepared.max_tokens,
             .output_tokens_per_item = std.math.cast(usize, dec_config.max_length) orelse std.math.maxInt(usize),
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
-        const rewriting = @import("../pipelines/rewriting.zig");
         var pipeline = rewriting.RewritingPipeline{
             .allocator = ctx.allocator,
             .enc_dec = .{
@@ -15445,7 +15447,7 @@ pub const Node = struct {
         var rewrite_owned_io: ?std.Io.Threaded = null;
         defer if (rewrite_owned_io) |*owned| owned.deinit();
         const rewrite_io = self.inferenceIo(ctx.allocator, execution_control.io, &rewrite_owned_io);
-        const rewritten = pipeline.rewriteBatch(rewrite_io, body.inputs) catch |err|
+        const rewritten = pipeline.rewritePrepared(rewrite_io, &prepared) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer {
             for (rewritten) |*result| result.deinit();
@@ -15455,7 +15457,7 @@ pub const Node = struct {
             const inner = try ctx.allocator.alloc([]const u8, 1);
             errdefer ctx.allocator.free(inner);
             inner[0] = try ctx.allocator.dupe(u8, result.text);
-            completion_tokens += countTokenizerTokens(ctx.allocator, self.session_manager.io, assets.tokenizer(), result.text) catch estimateTextTokens(result.text);
+            completion_tokens += result.completion_tokens;
             data[i] = .{
                 .object = "rewrite",
                 .index = @intCast(i),
@@ -15464,12 +15466,11 @@ pub const Node = struct {
             filled = i + 1;
         }
 
-        const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, assets.tokenizer(), body.inputs) catch estimateTextsTokens(body.inputs);
         return ctx.json(api.RewriteResponse{
             .object = "list",
             .data = data,
             .model = body.model,
-            .usage = tokenUsage(prompt_tokens, completion_tokens),
+            .usage = tokenUsage(prepared.total_tokens, completion_tokens),
         });
     }
 

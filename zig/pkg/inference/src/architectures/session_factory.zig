@@ -8058,10 +8058,12 @@ fn maybeApplyPooler(
     return try cb.toFloat32(activated_ct, allocator);
 }
 
-fn archRunGeometry(ptr: *anyopaque, inputs: []const Tensor, batch: usize) !?@import("../backends/session.zig").RunGeometry {
+fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").ShapeInputs, batch: usize) !?@import("../backends/session.zig").RunGeometry {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (inputs.len == 0 or inputs[0].shape.len < 2 or inputs[0].shape[1] <= 0) return null;
-    const input_seq: usize = @intCast(inputs[0].shape[1]);
+    if (inputs.len() == 0) return null;
+    const first = inputs.get(0);
+    if (first.shape.len < 2 or first.shape[1] <= 0) return null;
+    const input_seq: usize = @intCast(first.shape[1]);
     var sequence = input_seq;
     var output_seq = input_seq;
     var workspace_bytes: usize = 0;
@@ -8085,15 +8087,16 @@ fn archRunGeometry(ptr: *anyopaque, inputs: []const Tensor, batch: usize) !?@imp
             break :blk cfg.hidden_size;
         },
         .whisper => |cfg| blk: {
-            if (inputs[0].dtype == .f32 and std.mem.eql(u8, inputs[0].name, "input_features")) {
-                if (inputs[0].shape.len != 3 or inputs[0].shape[2] <= 0) return error.InvalidInputShape;
-                sequence = @intCast(inputs[0].shape[2]);
+            if (first.dtype == .f32 and std.mem.eql(u8, first.name, "input_features")) {
+                if (first.shape.len != 3 or first.shape[2] <= 0) return error.InvalidInputShape;
+                sequence = @intCast(first.shape[2]);
                 output_seq = (std.math.add(usize, sequence, 1) catch return error.ResourceLimitExceeded) / 2;
                 workspace_bytes = try whisperStageWorkspace(batch, output_seq, output_seq, cfg.d_model, cfg.encoder_attention_heads, cfg.encoder_ffn_dim);
                 break :blk cfg.d_model;
             }
-            if (inputs.len < 2 or inputs[1].shape.len != 3 or inputs[1].shape[1] <= 0) return error.InvalidInputShape;
-            sequence = @max(input_seq, @as(usize, @intCast(inputs[1].shape[1])));
+            const hidden = inputs.named("encoder_hidden_states") orelse return error.InvalidInputShape;
+            if (hidden.shape.len != 3 or hidden.shape[1] <= 0) return error.InvalidInputShape;
+            sequence = @max(input_seq, @as(usize, @intCast(hidden.shape[1])));
             workspace_bytes = try whisperStageWorkspace(batch, input_seq, sequence, cfg.d_model, cfg.decoder_attention_heads, cfg.decoder_ffn_dim);
             break :blk cfg.vocab_size;
         },
@@ -8120,7 +8123,7 @@ test "native stage geometry resolves Whisper encoder and decoder output residenc
     arch.arch_config = .{ .whisper = .{} };
     arch.task = .generic;
     const input = Tensor{ .data = &.{}, .dtype = .f32, .shape = &.{ 1, 80, 3000 }, .name = "input_features", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false };
-    const encoder = (try archRunGeometry(&arch, &.{input}, 8)).?;
+    const encoder = (try archRunGeometry(&arch, .{ .tensors = &.{input} }, 8)).?;
     try std.testing.expectEqual(@as(usize, 3000), encoder.sequence);
     try std.testing.expectEqual(@as(usize, 8 * 1500 * 384 * 4 + 24), encoder.output_bytes);
     var ids = input;
@@ -8130,7 +8133,7 @@ test "native stage geometry resolves Whisper encoder and decoder output residenc
     var hidden = input;
     hidden.shape = &.{ 1, 1500, 384 };
     hidden.name = "encoder_hidden_states";
-    const decoder = (try archRunGeometry(&arch, &.{ ids, hidden }, 8)).?;
+    const decoder = (try archRunGeometry(&arch, .{ .tensors = &.{ ids, hidden } }, 8)).?;
     try std.testing.expectEqual(@as(usize, 1500), decoder.sequence);
     try std.testing.expectEqual(@as(usize, 8 * 3 * 51865 * 4 + 24), decoder.output_bytes);
 }

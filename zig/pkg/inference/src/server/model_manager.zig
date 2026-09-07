@@ -3567,6 +3567,8 @@ pub const CompositeAssets = struct {
     encoder: ?ManagedSession = null,
     decoder: ?ManagedSession = null,
     kind: CompositeKind = .whisper_metadata,
+    decoder_execution: enum { full_prefix, merged_kv } = .full_prefix,
+    considered_merged_decoder: bool = false,
     decoder_config: encoder_decoder.DecoderConfig,
     generation: ComponentPlanKey,
     active_handles: usize = 0,
@@ -5991,11 +5993,23 @@ pub const ModelManager = struct {
         var decoder: ?ManagedSession = null;
         errdefer if (decoder) |*managed| managed.deinit();
         if (kind != .whisper_metadata) {
-            if (component_paths.len != 2) return error.InvalidModelLayout;
+            if (component_paths.len != 2 and component_paths.len != 3) return error.InvalidModelLayout;
             var loader = try self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, component_paths);
             encoder = if (control) |active| try loader.loadWithControl(component_paths[0], active) else try loader.load(component_paths[0]);
             var strict = try loader.restrictToBackend(encoder.?.session.backend());
-            decoder = if (control) |active| try strict.loadWithControl(component_paths[1], active) else try strict.load(component_paths[1]);
+            if (component_paths.len == 3) {
+                // Try the qualified fast path before allocating the fallback
+                // decoder. No extra model residency remains on the warm path.
+                decoder = (if (control) |active| strict.loadWithControl(component_paths[2], active) else strict.load(component_paths[2])) catch |err| switch (err) {
+                    error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => null,
+                    else => return err,
+                };
+                if (decoder) |*candidate| if (!@import("../pipelines/seq2seq_decode.zig").qualified(candidate.session)) {
+                    candidate.deinit();
+                    decoder = null;
+                };
+            }
+            if (decoder == null) decoder = if (control) |active| try strict.loadWithControl(component_paths[1], active) else try strict.load(component_paths[1]);
         }
         const verified_generation = try self.compositeRuntimeKey(
             model_dir,
@@ -6013,6 +6027,8 @@ pub const ModelManager = struct {
             .encoder = encoder,
             .decoder = decoder,
             .kind = kind,
+            .decoder_execution = if (decoder != null and @import("../pipelines/seq2seq_decode.zig").qualified(decoder.?.session)) .merged_kv else .full_prefix,
+            .considered_merged_decoder = component_paths.len == 3,
             .decoder_config = decoder_config,
             .generation = asset_generation,
         };
@@ -6126,6 +6142,26 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !CompositeAssetsHandle {
         if (control) |active| try active.check();
+        if (kind != .whisper_metadata and component_paths.len == 2 and std.mem.endsWith(u8, component_paths[1], ".onnx")) {
+            if (try encoder_decoder.findMergedDecoder(self.allocator, model_dir)) |candidate| {
+                defer self.allocator.free(candidate);
+                if (!std.mem.eql(u8, candidate, component_paths[1])) {
+                    const planned = [_][]const u8{ component_paths[0], component_paths[1], candidate };
+                    // Existing component policy caches validate backend support
+                    // and the complete external-data closure. Unsupported
+                    // optional graphs do not remove a working full-prefix route.
+                    _ = self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, &planned) catch |err| switch (err) {
+                        error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => return self.acquireCompositeRuntimePlanned(model_dir, component_paths, kind, control),
+                        else => return err,
+                    };
+                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, kind, control);
+                }
+            }
+        }
+        return self.acquireCompositeRuntimePlanned(model_dir, component_paths, kind, control);
+    }
+
+    fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, kind: CompositeKind, control: ?InferenceExecutionControl) !CompositeAssetsHandle {
         const asset_generation = try self.compositeRuntimeKey(
             model_dir,
             component_paths,
@@ -6198,7 +6234,11 @@ pub const ModelManager = struct {
         component_paths: []const []const u8,
     ) !void {
         const assets = handle.get();
-        const current = try self.compositeRuntimeKey(model_dir, component_paths, assets.kind);
+        const current = if (assets.considered_merged_decoder and component_paths.len == 2) blk: {
+            const candidate = try encoder_decoder.findMergedDecoder(self.allocator, model_dir) orelse return error.ModelArtifactsChanging;
+            defer self.allocator.free(candidate);
+            break :blk try self.compositeRuntimeKey(model_dir, &.{ component_paths[0], component_paths[1], candidate }, assets.kind);
+        } else try self.compositeRuntimeKey(model_dir, component_paths, assets.kind);
         if (!std.mem.eql(u8, assets.generation[0..], current[0..]))
             return error.ModelArtifactsChanging;
     }
@@ -10255,6 +10295,53 @@ test "component compatibility validates explicit split ONNX graphs" {
             .multistage_ocr,
         ),
     );
+}
+
+test "composite decoder selection qualifies optional merged artifacts and pins fallback" {
+    const allocator = std.testing.allocator;
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try builder.tensorConst(&.{ 1, 1, 1, 1 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.add(input, bias));
+    const bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx", "decoder_model_merged.onnx" }) |name|
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"t5","vocab_size":4,"d_model":4,"decoder_start_token_id":0}
+    });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"}],"model":{"type":"BPE","vocab":{"<unk>":0},"merges":[]}}
+    });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    const paths = try encoder_decoder.findEncoderDecoderPaths(allocator, root);
+    defer allocator.free(paths.encoder);
+    defer allocator.free(paths.decoder);
+    var sessions = backends.SessionManager.init(allocator);
+    sessions.preferred_backends = &.{.native};
+    var manager = ModelManager.init(allocator, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    var first = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer first.release();
+    try std.testing.expect(first.get().considered_merged_decoder);
+    try std.testing.expectEqual(.full_prefix, first.get().decoder_execution);
+    var second = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer second.release();
+    try std.testing.expect(first.get() == second.get());
+    try manager.validateCompositeAssetsCurrent(&first, root, &.{ paths.encoder, paths.decoder });
+    // Invalid optional publication cannot displace the working ordinary graph.
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "decoder_model_merged.onnx", .data = "invalid" });
+    var fallback = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer fallback.release();
+    try std.testing.expect(!fallback.get().considered_merged_decoder);
+    try std.testing.expectEqual(.full_prefix, fallback.get().decoder_execution);
+    try std.testing.expect(first.get() != fallback.get());
 }
 
 test "split Whisper assets remain model-lifetime cached across request handles" {

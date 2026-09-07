@@ -83,11 +83,24 @@ pub const EncoderDecoderPipeline = struct {
         if (enc.controller != dec.controller or enc.backend_class != dec.backend_class) return false;
         const mul = std.math.mul;
         const add = std.math.add;
-        const hidden_bytes = if (self.encoder.output_geometry) |geometry| try add(usize, try mul(usize, try mul(usize, width, geometry.width), 4), 24) else try session_mod.estimatedOutputBytes(&.{ 1, std.math.cast(i64, width) orelse return error.ResourceLimitExceeded }, self.encoder.outputInfo());
-        const encoder_inputs = try mul(usize, width, 16);
-        const decoder_inputs = try add(usize, hidden_bytes, try mul(usize, try add(usize, width, self.config.max_length), 8));
-        const enc_peak = try enc.estimateRequest(.{ .batch = count, .sequence = width, .input_bytes = try mul(usize, count, encoder_inputs), .host_preprocess_bytes = try mul(usize, count, encoder_inputs), .output_bytes = try mul(usize, count, hidden_bytes) }, self.encoder.outputInfo());
-        var dec_request = session_mod.RunRequest{ .batch = count, .sequence = @max(width, self.config.max_length), .input_bytes = try mul(usize, count, decoder_inputs), .host_preprocess_bytes = try mul(usize, count, decoder_inputs) };
+        const input_shape = [_]i64{ @intCast(count), std.math.cast(i64, width) orelse return error.ResourceLimitExceeded };
+        var enc_request = try self.encoder.planShapes(&.{
+            .{ .name = "input_ids", .dtype = .i64, .shape = &input_shape },
+            .{ .name = "attention_mask", .dtype = .i64, .shape = &input_shape },
+        }, count);
+        const hidden_bytes = enc_request.output_bytes orelse try session_mod.estimatedOutputBytes(&input_shape, self.encoder.outputInfo());
+        const hidden_width = (if (enc_request.output_bytes != null) hidden_bytes -| 24 else hidden_bytes) / count / width / 4;
+        if (hidden_width == 0) return false;
+        const hidden_shape = [_]i64{ @intCast(count), @intCast(width), @intCast(hidden_width) };
+        const decoder_shape = [_]i64{ @intCast(count), std.math.cast(i64, self.config.max_length) orelse return error.ResourceLimitExceeded };
+        var dec_request = try self.decoder.planShapes(&.{
+            .{ .name = "input_ids", .dtype = .i64, .shape = &decoder_shape },
+            .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &hidden_shape },
+            .{ .name = "encoder_attention_mask", .dtype = .i64, .shape = &input_shape },
+        }, count);
+        enc_request.host_preprocess_bytes = enc_request.input_bytes;
+        dec_request.host_preprocess_bytes = dec_request.input_bytes;
+        const enc_peak = try enc.estimateRequest(enc_request, self.encoder.outputInfo());
         const incremental = @import("seq2seq_decode.zig");
         const cache_bytes = if (incremental.qualified(self.decoder)) try incremental.cacheBound(self.decoder, count, self.config.max_length, width) else 0;
         if (cache_bytes > 0) {
@@ -267,6 +280,12 @@ const decoder_candidates = &[_][]const u8{
     "decoder_model_merged.onnx",
     "decoder_with_past_model.onnx",
 };
+
+/// Discovery only. The runtime qualifies the loaded graph before choosing it;
+/// filename presence is not a cache capability declaration.
+pub fn findMergedDecoder(allocator: std.mem.Allocator, model_dir: []const u8) !?[]const u8 {
+    return findModelFile(allocator, model_dir, &.{"decoder_model_merged.onnx"});
+}
 
 /// Check if a model directory contains encoder-decoder ONNX files.
 pub fn isEncoderDecoderModel(model_dir: []const u8) bool {

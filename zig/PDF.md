@@ -4845,12 +4845,16 @@ for every subsequent direct/fallback execution. Native stage descriptors provide
 concrete output and workspace geometry before direct or fused host-tensor
 execution; Whisper encoder hidden states and decoder logits have distinct plans.
 Reusable permits recheck larger later windows rather than freezing the first
-invocation's geometry. Rewriting first admits bounded preprocessing and tokenizes
-once, then plans execution groups using actual padded widths. Planning accounts
+invocation's geometry. `Session.planShapes` and `Session.planRun` now share an
+allocation-free shape view, including configured decoder vocabulary widths and
+native workspace estimates. Rewriting admits a prepared token owner before any
+tokenizer work, validates the whole bounded request with those IDs, then plans
+eight-row execution windows using actual padded widths. HTTP/direct validation,
+inference and usage reuse IDs/counts rather than re-encoding input text. Planning accounts
 for encoder residency and the worst decoder stage with one workspace per
 physical stage, not per sequence. Stage gates include admission and packing so
 this residency model remains valid. Permanent limits reduce execution width and
-live pressure can independently shrink preprocessing windows. Execution admission
+the prepared owner reserves token storage and one tensor window. Execution admission
 remains the authority under concurrent pressure.
 
 Eligible masked rewriting/reranking stages use bounded length classes, with
@@ -4870,11 +4874,23 @@ now handles qualified merged seq2seq exports using the existing ONNX KV owner.
 It performs prefill once, submits only appended tokens, and retains immutable
 cross-attention state when cached branches return empty cross outputs. Both
 generic seq2seq and transcription use it when the selected artifact exposes
-the explicit ABI. Existing artifact-selection order and native generation /
-Florence caching are unchanged. This is not a new prefix-cache implementation.
+the explicit ABI. Composite runtime selection considers an optional merged
+decoder and qualifies its loaded ABI before choosing it over the ordinary
+decoder. Component policy and generation fingerprints cover the considered
+graphs and external data; unsupported candidates preserve the ordinary route.
+Native generation / Florence caching are unchanged. This is not a new
+prefix-cache implementation.
 Cache output geometry and old/new cache overlap are admitted against host and
 KV limits before execution; allocation failure and cancellation unwind the
 request-owned state. Other layouts retain their existing execution path.
+Qualified merged steps now fuse both prefill and cached invocations with matching
+positions. Small broadcast controls are explicit and their values participate
+in compatibility; they are never concatenated as batch rows. Empty cross-cache
+results retain the prior per-request owner. Hermetic tests show three physical
+forwards instead of six for two independent three-step sequences, with matching
+context-specific logits. This is a forward-count result, not a hardware speedup
+claim. Device-resident cache transport and device-side row gather/scatter remain
+unimplemented; the host KV path continues to account for old/new overlap.
 
 The follow-up scheduler now partitions tokenized rewrite windows by length
 class before padding and restores request order after execution. Capacity
@@ -4888,6 +4904,27 @@ Extend length bucketing to other pipelines only with masking and output-position
 parity tests. Accelerator-backed parity, peak-memory and throughput measurements
 remain release requirements; hermetic batching tests do not establish a hardware
 speedup.
+
+### Remaining resident-decoder execution contract
+
+The next cache optimization must live under the pinned backend runtime, not in
+PDF preparation or a second process-global prefix cache. A backend-owned decoder
+state should carry request/context identity, artifact generation, cache position,
+device handles and a residency lease. Prefill/append operations consume admitted
+input tokens and return logits without exporting the growing cache to host memory.
+Cache replacement must reserve old/new overlap in the actual device domain and
+retain cross-attention buffers until the last request or batch-row view releases
+them. Cancellation must not release storage before device completion.
+
+Fusing resident states additionally requires qualified device-side row
+gather/scatter and compatible cache positions. Backends lacking those operations
+must keep the validated host-tensor fusion path or use singleton resident
+execution; a device handle must never masquerade as an empty host tensor.
+Separate init/past graph plans must pin both artifacts, validate matching cache
+names/dtypes/layouts, and share the same admission and completion ownership.
+Enabling these paths requires per-backend parity, mixed-EOS, cancellation,
+allocation-failure, cache-pressure and measured transfer/throughput tests. They
+are not implemented by the host fusion changes above.
 
 ## Open decisions
 

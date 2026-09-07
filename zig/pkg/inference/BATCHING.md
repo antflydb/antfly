@@ -131,7 +131,8 @@ A backend veto overrides metadata. Neither a family name nor dynamic axes alone
 prove that shared caches or model state are safe to batch.
 
 Compatibility includes the concrete session generation, task, execution gate,
-input names/dtypes/non-batch shapes, supervising process boundary, and admission
+input names/dtypes/non-batch shapes, explicit broadcast controls and their exact
+values, supervising process boundary, and admission
 controller/limits. A window retains at most eight caller submissions, 64 tensor
 rows and 64 MiB of input data. Larger existing request batches bypass the queue.
 The existing Node broker owns scheduling; no new thread pool or background
@@ -162,7 +163,12 @@ tokenizer and progress-sink access sequential and gives workers independent
 tensor/token storage. Fixed/specialized graphs and whole-request-locked
 multimodal reranking retain their established execution paths.
 
-Rewriting first admits a bounded preprocessing window and tokenizes it once.
+Rewriting first admits a prepared token owner for the bounded request queue and
+tokenizes it once, before validation or any model forward. HTTP and direct
+execution share these IDs; input usage uses the stored counts and output usage
+uses generated IDs rather than re-encoding decoded text. Token IDs are retained
+for whole-request validation; padded tensors and model execution stay bounded
+to eight-row windows. Capacity is checked before the first tokenizer call.
 It partitions that window by token-length class before materializing tensors,
 then restores original result order. Subdivision never inherits an unrelated
 long request's padding width.
@@ -172,12 +178,13 @@ output and preprocessing. Each physical stage counts one workspace rather than
 one workspace per sequence; encoder and decoder gates serialize admission and
 packing as well as their forwards. Execution width shrinks to singleton when a
 larger group does not fit permanent limits, without repeating tokenization.
-Preprocessing admission can independently shrink the window under live pressure.
+The prepared owner reserves token storage plus one execution window, not a
+window of materialized model inputs for every item in the request.
 This is conservative planning, not a reservation of future execution: concurrent
 request admission can still return temporary exhaustion.
 
-`Session.planRun` combines concrete input geometry with an optional native stage
-descriptor for output bytes and workspace. Native Whisper describes encoder
+`Session.planShapes` and `Session.planRun` use the same allocation-free shape
+view and native stage descriptor for output bytes and workspace. Native Whisper describes encoder
 hidden states, decoder vocabulary logits and attention/FFN peaks separately;
 placeholder output metadata is not used for these stages. Both direct and fused
 host-tensor forwards use the descriptor, and reusable preprocessing permits
@@ -228,10 +235,19 @@ encoder context and request; it is not a second cross-request prefix cache.
 
 Existing native generation prefix caching and Florence incremental caching are
 unchanged. Other seq2seq layouts retain their existing path. Separate init/past
-graphs, a native Whisper incremental adapter, device-resident graph caches and
-fused stepping with broadcast cache-branch inputs still require qualification.
-The merged adapter does not change artifact selection order or claim that every
-artifact containing an optional cached decoder selects it automatically.
+graphs, a native Whisper incremental adapter and device-resident graph caches
+still require implementation and qualification. Qualified merged steps now fuse
+both prefill (empty past inputs) and equal-position cached steps. The explicitly
+broadcast `use_cache_branch` is passed once; differing values cannot coalesce.
+Empty cross-cache outputs retain each request's previous cache owner.
+
+Composite runtimes consider an optional merged decoder before loading the
+ordinary decoder. The existing component policy verifies backend support and
+the artifact dependency closure; the loaded cache ABI must qualify before
+selection. Valid but unqualified candidates are closed before fallback loading.
+Unsupported optional graphs preserve the ordinary route, while resource and
+cancellation failures propagate. The considered graphs and their external data
+participate in the generation key; selection is pinned with the runtime.
 
 This is shared fused-batching infrastructure, not a claim that every artifact
 and provider now executes natively batched. GPU generation's shared graph,

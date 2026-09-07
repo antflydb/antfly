@@ -28,6 +28,7 @@ const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const enc_dec_mod = @import("encoder_decoder.zig");
+pub const PreparedTextBatch = @import("prepared_text.zig").PreparedTextBatch;
 
 pub const RewriteConfig = struct {
     max_length: usize = 512,
@@ -36,6 +37,7 @@ pub const RewriteConfig = struct {
 pub const RewriteResult = struct {
     text: []const u8,
     allocator: std.mem.Allocator,
+    completion_tokens: usize = 0,
 
     pub fn deinit(self: *RewriteResult) void {
         self.allocator.free(self.text);
@@ -52,16 +54,27 @@ pub const RewritingPipeline = struct {
     /// calls stay sequential; workers own only tensors and generated token IDs.
     /// Existing runtimes without a dispatcher retain singleton execution.
     pub fn rewriteBatch(self: *RewritingPipeline, io: std.Io, texts: []const []const u8) ![]RewriteResult {
+        var prepared = try self.prepare(texts);
+        defer prepared.deinit();
+        return self.rewritePrepared(io, &prepared);
+    }
+
+    pub fn prepare(self: *const RewritingPipeline, texts: []const []const u8) !PreparedTextBatch {
+        return PreparedTextBatch.init(self.allocator, self.enc_dec.encoder, self.tokenizer, texts, self.config.max_length, self.enc_dec.execution_control);
+    }
+
+    pub fn rewritePrepared(self: *RewritingPipeline, io: std.Io, prepared: *const PreparedTextBatch) ![]RewriteResult {
+        try prepared.validateFor(self.enc_dec.encoder, self.tokenizer, self.config.max_length);
         const allocator = self.allocator;
-        const results = try allocator.alloc(RewriteResult, texts.len);
+        const results = try allocator.alloc(RewriteResult, prepared.ids.len);
         var initialized: usize = 0;
         errdefer {
             for (results[0..initialized]) |*result| result.deinit();
             allocator.free(results);
         }
         if (self.enc_dec.batch_dispatch == null) {
-            for (texts, results) |text, *result| {
-                result.* = try self.rewrite(text);
+            for (prepared.ids, results) |ids, *result| {
+                result.* = try self.rewriteTokens(ids);
                 initialized += 1;
             }
             return results;
@@ -93,32 +106,14 @@ pub const RewritingPipeline = struct {
                 std.heap.smp_allocator.free(self_job.mask);
             }
         };
-        while (initialized < texts.len) {
-            var count = @min(@as(usize, 8), texts.len - initialized);
-            var preprocess_permit: @import("../backends/session.zig").RunPermit = undefined;
-            while (true) {
-                const bytes = try self.preprocessBytes(texts[initialized..][0..count]);
-                preprocess_permit = self.enc_dec.encoder.admitHostPreprocess(bytes) catch |err| switch (err) {
-                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => {
-                        if (count == 1) return err;
-                        count = @max(@as(usize, 1), count / 2);
-                        continue;
-                    },
-                };
-                break;
-            }
-            defer preprocess_permit.deinit();
-            const window = texts[initialized..][0..count];
-            var tokenized: [8][]i32 = undefined;
-            var tokenized_count: usize = 0;
-            defer for (tokenized[0..tokenized_count]) |ids| allocator.free(ids);
+        while (initialized < prepared.ids.len) {
+            const count = @min(@as(usize, 8), prepared.ids.len - initialized);
+            const tokenized = prepared.ids[initialized..][0..count];
             var order: [8]usize = undefined;
             var widths: [8]usize = undefined;
-            for (window, 0..) |text, i| {
+            for (tokenized, 0..) |ids, i| {
                 if (self.enc_dec.execution_control) |control| try control.check();
-                tokenized[i] = try self.tokenizer.encode(allocator, text);
-                tokenized_count += 1;
-                if (tokenized[i].len == 0) return error.InvalidInputShape;
+                if (ids.len == 0) return error.InvalidInputShape;
                 order[i] = i;
                 const length = @min(tokenized[i].len, self.config.max_length);
                 if (length == 0) return error.InvalidInputShape;
@@ -136,7 +131,7 @@ pub const RewritingPipeline = struct {
                 const width = widths[order[work_offset]];
                 var execute_count: usize = 1;
                 while (work_offset + execute_count < count and widths[order[work_offset + execute_count]] == width) execute_count += 1;
-                while (execute_count > 1 and !try self.enc_dec.fitsWindow(execute_count, width, try self.preprocessBytes(window)))
+                while (execute_count > 1 and !try self.enc_dec.fitsWindow(execute_count, width, prepared.reserved_bytes))
                     execute_count = @max(@as(usize, 1), execute_count / 2);
                 var jobs: [8]Job = undefined;
                 var job_count: usize = 0;
@@ -168,7 +163,7 @@ pub const RewritingPipeline = struct {
                 for (jobs[0..execute_count], order[work_offset..][0..execute_count]) |*job, original| {
                     if (job.err) |err| return err;
                     if (self.enc_dec.execution_control) |control| try control.check();
-                    completed[original] = .{ .allocator = allocator, .text = try self.tokenizer.decode(allocator, job.output.?.text_ids) };
+                    completed[original] = .{ .allocator = allocator, .text = try self.tokenizer.decode(allocator, job.output.?.text_ids), .completion_tokens = job.output.?.text_ids.len -| 1 };
                 }
                 work_offset += execute_count;
             }
@@ -181,22 +176,16 @@ pub const RewritingPipeline = struct {
         return results;
     }
 
-    fn preprocessBytes(self: *const RewritingPipeline, texts: []const []const u8) !usize {
-        const max_tokens = std.math.mul(usize, texts.len, self.config.max_length) catch return error.ResourceLimitExceeded;
-        var bytes = std.math.mul(usize, max_tokens, 32) catch return error.ResourceLimitExceeded;
-        for (texts) |text| bytes = std.math.add(usize, bytes, std.math.mul(usize, text.len, 8) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
-        return bytes;
+    pub fn rewrite(self: *RewritingPipeline, text: []const u8) !RewriteResult {
+        var prepared = try self.prepare(&.{text});
+        defer prepared.deinit();
+        return self.rewriteTokens(prepared.ids[0]);
     }
 
-    pub fn rewrite(self: *RewritingPipeline, text: []const u8) !RewriteResult {
+    fn rewriteTokens(self: *RewritingPipeline, token_ids_i32: []const i32) !RewriteResult {
         const allocator = self.allocator;
-
-        // 1. Tokenize input text (raw, no [CLS]/[SEP] — T5/BART have their own special tokens)
-        if (self.enc_dec.execution_control) |control| try control.update(.tokenizing, 0, 1);
-        const token_ids_i32 = try self.tokenizer.encode(allocator, text);
-        defer allocator.free(token_ids_i32);
-        if (self.enc_dec.execution_control) |control| try control.update(.tokenizing, 1, 1);
-
+        if (self.enc_dec.execution_control) |control| try control.check();
+        if (token_ids_i32.len == 0) return error.InvalidInputShape;
         // Convert i32 token IDs to i64 for the backend
         const seq_len = @min(token_ids_i32.len, self.config.max_length);
         const input_ids = try allocator.alloc(i64, seq_len);
@@ -228,6 +217,7 @@ pub const RewritingPipeline = struct {
         return .{
             .text = output_text,
             .allocator = allocator,
+            .completion_tokens = gen_result.text_ids.len -| 1,
         };
     }
 };
@@ -243,8 +233,10 @@ test "rewrite arrays fuse padded encoder and independent decoder stages" {
         largest: usize = 0,
         identify: bool = false,
         encoder_cells: usize = 0,
+        tokenizations: usize = 0,
         fn encode(raw: *anyopaque, allocator: std.mem.Allocator, text: []const u8) ![]i32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.tokenizations += 1;
             const ids = try allocator.alloc(i32, text.len);
             @memset(ids, if (self.identify) @intCast(text.len) else 2);
             return ids;
@@ -310,13 +302,23 @@ test "rewrite arrays fuse padded encoder and independent decoder stages" {
         .tokenizer = .{ .ptr = &probe, .vtable = &.{ .encode = Probe.encode, .decode = Probe.decode, .encodeInto = undefined, .encodeForModel = undefined, .encodeGeneration = undefined, .specialTokens = undefined, .vocabSize = undefined, .deinit = undefined } },
         .config = .{ .max_length = 4 },
     };
-    const results = try pipeline.rewriteBatch(std.testing.io, &.{ "ab", "ab", "ab", "ab", "ab", "ab", "ab", "ab" });
+    var prepared = try pipeline.prepare(&.{ "ab", "ab", "ab", "ab", "ab", "ab", "ab", "ab" });
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 2), prepared.max_tokens);
+    try std.testing.expectEqual(@as(usize, 16), prepared.total_tokens);
+    try std.testing.expectEqual(@as(usize, 8), probe.tokenizations);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    pipeline.config.max_length += 1;
+    try std.testing.expectError(error.InvalidPreparedTextInputs, pipeline.rewritePrepared(std.testing.io, &prepared));
+    pipeline.config.max_length -= 1;
+    const results = try pipeline.rewritePrepared(std.testing.io, &prepared);
     defer {
         for (results) |*result| result.deinit();
         std.testing.allocator.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expectEqual(@as(usize, 8), probe.largest);
+    try std.testing.expectEqual(@as(usize, 8), probe.tokenizations);
     for (results) |result| try std.testing.expectEqualStrings("rewritten", result.text);
 
     // The same request must remain usable when only singleton stage peaks fit.
@@ -372,4 +374,15 @@ test "rewrite arrays fuse padded encoder and independent decoder stages" {
     }
     try std.testing.expectEqual(@as(usize, 512 + 7 * 16), probe.encoder_cells);
     for (mixed, 0..) |result, index| try std.testing.expectEqualStrings(if (index == 1) "long" else "short", result.text);
+    // Symbolic vocabulary metadata must use the same concrete projection as
+    // execution, rather than approving a window with a trailing width of one.
+    pipeline.enc_dec.encoder.output_geometry = .{ .input_name = "input_ids", .width = 1 };
+    pipeline.enc_dec.decoder.output_geometry = .{ .input_name = "input_ids", .width = 32768 };
+    pipeline.enc_dec.config.max_length = 128;
+    try std.testing.expect(!try pipeline.enc_dec.fitsWindow(8, 16, 4096));
+    const before = probe.tokenizations;
+    pipeline.enc_dec.encoder.run_admission.?.limits.host_limit_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.prepare(&.{"not tokenized"}));
+    try std.testing.expectEqual(before, probe.tokenizations);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }
