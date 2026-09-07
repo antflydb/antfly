@@ -403,7 +403,10 @@ insertion gaps without walking every marker. A limited filtered scan evaluates
 the earlier dirty-row prefix before reading any base predicate pages, then
 one physical predicate-page window as needed. It stops as soon as its limit is
 met. Dirty cursors preserve tombstone metadata and never point-read deleted
-primary rows; `overlay_tombstones_skipped` measures this work. Unlimited scans retain block-vectorized evaluation. Cancellation
+primary rows; `overlay_tombstones_skipped` measures this work. Admission charges
+point-lookup overhead only for live deltas, plus measured journal bytes for all
+markers, so delete waves do not force narrow projections into wide primary reads.
+Unlimited scans retain block-vectorized evaluation. Cancellation
 and deadline checks run between windows, predicate nodes, and payload pages.
 Boolean leaves are ordered once per expression/block using numeric pruning,
 unread candidate-page bytes, and logical evaluation weights. Wide strings/blobs
@@ -466,8 +469,16 @@ payload identities and row mappings. Small fragmented pages are transposed
 once per output block/epoch; inline cells are sorted once before encoding.
 This bounds bookkeeping under alternating updated/unchanged rows while avoiding
 tiny scalar fragments. Wide slices are reused only when the current mapped
-page averages at least 128 encoded bytes per row; complete pages can always be
-reused. Descriptors remain bounded by the 256-row block limit.
+page averages at least 128 encoded bytes per row. Full physical pages can always
+be reused; a complete *mapping* of a partial physical page is still a slice.
+Partial slices are admitted only when they retain at least half of the original
+payload's uncompressed cell bytes, including doc IDs, and at most eight partial
+slices are retained per destination column/block. Other slices are repacked into
+new byte-bounded pages. This bounds decoded-byte amplification after churn to
+2x live cell bytes per reused slice (excluding fixed codec headers), without
+penalizing a surviving large value merely because most small rows were deleted.
+Partial source pages are decoded once for byte accounting; oversized singleton
+pages keep the metadata-only path. Descriptors remain bounded by the 256-row limit.
 Decoded source pages outlive destination flushes; copied cells are owned by
 the writer and reused descriptors own no borrowed source memory.
 Empty output ranges publish explicit empty roots; publication never widens a
@@ -483,7 +494,10 @@ including for an unchanged oversized field in a full-row scalar update.
 Existing payloads skip both compression and payload writes; unchanged covered
 pages also bypass payload reads and cell hashing. `payload_encoding_bytes`
 reports the raw cell budget actually passed to the encoder, including staged
-work that is subsequently canceled.
+work that is subsequently canceled. `payload_slices_repacked` counts attempted
+slice rewrites triggered by utilization or fragment limits. Repeated deletion
+waves are tested against both retained payload bytes and scan bytes across
+restart, including reclamation while an older scan remains pinned.
 Thus neither an empty prefix nor an orphan-heavy gap after a live row can
 repeatedly consume the budget before the worker reaches its successor. Uncovered
 bootstrap ranges continue to use the bounded owner cursor. Dirty journal and
@@ -697,6 +711,15 @@ directory remains O(schema versions), and validation-only freestanding calls
 without a filesystem retain the serialized spool in memory. Canonical row and cross-schema
 validation still run before staging publication. Export uses compiled physical
 offsets, keeping dense-row column traversal linear in schema width.
+
+The export data cursor seeks past the column-cache, already-exported metadata,
+and replay namespaces. It examines at most the first cursor entry of each
+excluded namespace, rather than walking every materialized payload. Other binary
+and legacy graph key ranges retain their existing export semantics. Both the
+file-spooled single-pass path and deterministic no-spool two-pass path use this
+cursor. Optional `ExportStats` expose snapshot passes, examined data-cursor
+entries, and namespace seeks so export work can be tested independently of
+derived-cache size.
 
 `schema_capability.classifyChange` already distinguishes additive changes
 (new algebraic field → no rebuild) from breaking algebraic changes (removed or

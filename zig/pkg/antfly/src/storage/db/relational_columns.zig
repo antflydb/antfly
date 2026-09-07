@@ -60,6 +60,7 @@ pub const Maintenance = struct {
     payloads_reused: std.atomic.Value(u64) = .init(0),
     payload_bytes_written: std.atomic.Value(u64) = .init(0),
     payload_encoding_bytes: std.atomic.Value(u64) = .init(0),
+    payload_slices_repacked: std.atomic.Value(u64) = .init(0),
     pending: std.atomic.Value(bool) = .init(false),
     backing_off: std.atomic.Value(bool) = .init(false),
     retry_after_ns: std.atomic.Value(u64) = .init(0),
@@ -140,6 +141,7 @@ pub const Maintenance = struct {
             .payloads_reused = self.payloads_reused.load(.monotonic),
             .payload_bytes_written = self.payload_bytes_written.load(.monotonic),
             .payload_encoding_bytes = self.payload_encoding_bytes.load(.monotonic),
+            .payload_slices_repacked = self.payload_slices_repacked.load(.monotonic),
             .primary_rows_read = self.primary_rows_read.load(.monotonic),
             .scheduler_candidates = self.scheduler_candidates.load(.monotonic),
             .scheduler_commits = self.scheduler_commits.load(.monotonic),
@@ -213,6 +215,27 @@ pub fn payloadKeyForTest(db: anytype, alloc: alloc_type, generation: u64, block:
     return error.NotFound;
 }
 
+pub fn payloadStorageBytesForTest(db: anytype, alloc: alloc_type) !u64 {
+    const raw = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(raw);
+    const manifest = try Manifest.decode(raw);
+    const lower = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:v:", .{ prefix, manifest.generation });
+    defer alloc.free(lower);
+    const upper = (try keys.nextPrefixAlloc(alloc, lower)).?;
+    defer alloc.free(upper);
+    const Counter = struct {
+        bytes: u64 = 0,
+        fn visit(ptr: ?*anyopaque, _: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.bytes += value.len;
+            return .@"continue";
+        }
+    };
+    var counter: Counter = .{};
+    try db.core.store.scanWithContext(lower, upper, .{}, &counter, Counter.visit);
+    return counter.bytes;
+}
+
 fn appendInt(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, comptime T: type, value: T) !void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .little);
@@ -222,7 +245,38 @@ fn appendInt(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, comptime T: t
 const Row = struct { key: []const u8, hash: [32]u8, timestamp: u64, physical_bytes: u64 = 0 };
 const Bounds = struct { present: bool = false, minimum: f64 = 0, maximum: f64 = 0 };
 const Fragment = struct { first: usize, end: usize, ref: payloads.Ref };
-const Column = struct { writer: dv.TypedDocValuesWriter, presence: [null_bytes]u8 = @splat(0), nulls: [null_bytes]u8 = @splat(0), bounds: Bounds = .{}, fragments: std.ArrayListUnmanaged(Fragment) = .empty };
+const Column = struct { writer: dv.TypedDocValuesWriter, presence: [null_bytes]u8 = @splat(0), nulls: [null_bytes]u8 = @splat(0), bounds: Bounds = .{}, fragments: std.ArrayListUnmanaged(Fragment) = .empty, partial_fragments: usize = 0 };
+
+/// Exact uncompressed cell bytes in typed doc values, including its doc ID.
+/// Byte utilization (rather than row density) preserves useful skewed pages.
+fn payloadCellBytes(value: dv.TypedValue) u64 {
+    return 4 + switch (value) {
+        .bytes_val => |bytes| @as(u64, bytes.len) + 4,
+        .bool_val => @as(u64, 1),
+        .geo_point => @as(u64, 16),
+        .numeric_val => @as(u64, 9),
+        else => @as(u64, 8),
+    };
+}
+
+const max_partial_fragments = 8;
+
+fn reusePartialPayload(total_bytes: u64, retained_bytes: u64, partial_fragments: usize) bool {
+    return retained_bytes != 0 and retained_bytes <= total_bytes and
+        retained_bytes >= total_bytes - retained_bytes and partial_fragments < max_partial_fragments;
+}
+
+test "relational columnar partial reuse bounds byte amplification and fragments" {
+    // A single large surviving value may justify reuse; many tiny surviving
+    // values may not. These bounds deliberately do not use row cardinality.
+    try std.testing.expect(reusePartialPayload(10_000, 7_500, 0));
+    try std.testing.expect(!reusePartialPayload(10_000, 128, 0));
+    try std.testing.expect(reusePartialPayload(10_000, 5_000, 7));
+    try std.testing.expect(!reusePartialPayload(10_000, 4_999, 0));
+    try std.testing.expect(!reusePartialPayload(10_000, 9_999, 8));
+    try std.testing.expect(!reusePartialPayload(0, 0, 0));
+    try std.testing.expect(!reusePartialPayload(10_000, 10_001, 0));
+}
 
 fn appendPage(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, end: usize, ref: ?payloads.Ref) !void {
     try appendInt(list, alloc, u16, @intCast(end));
@@ -694,13 +748,37 @@ fn ColumnBuilder(comptime DBType: type) type {
                             while (i < pages.end(page) and selected[i] and remap[i] == remap[i - 1] + 1) : (i += 1) {}
                             var has_payload = false;
                             var has_presence = false;
-                            for (first..i) |row| has_presence = has_presence or source.present(row);
+                            for (first..i) |row| {
+                                const present = source.present(row);
+                                has_presence = has_presence or present;
+                                has_payload = has_payload or (present and source.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) == 0);
+                            }
                             if (!has_presence) {
                                 @memset(materialize[first..i], false);
                                 continue;
                             }
                             const entry = try self.columns.getOrPut(dest, ordinal);
                             if (!entry.found_existing) entry.value_ptr.* = .{ .writer = dv.TypedDocValuesWriter.init(dest, block.valueType(ordinal), max_rows) };
+                            var ref = pages.reference(page);
+                            ref.source_first += @intCast(first - pages.first(page));
+                            const partial = ref.source_first != 0 or i - first != ref.source_rows;
+                            if (partial and has_payload) {
+                                // Ordinary pages are byte-bounded; oversized
+                                // singleton pages always take the zero-copy full
+                                // path. Inspect partial payloads once, including
+                                // mappings inherited from earlier compactions.
+                                try block.loadPage(ordinal, page);
+                                const decoded = block.decoded_payloads.get(ref.digest).?;
+                                var retained_bytes: u64 = 0;
+                                const source_end = @min(decoded.values.len, @as(usize, ref.source_first) + i - first);
+                                for (decoded.values[@min(ref.source_first, source_end)..source_end]) |value| if (value) |cell| {
+                                    retained_bytes += payloadCellBytes(cell);
+                                };
+                                if (!reusePartialPayload(decoded.logical_bytes, retained_bytes, entry.value_ptr.partial_fragments)) {
+                                    _ = self.db.relational_column_maintenance.payload_slices_repacked.fetchAdd(1, .monotonic);
+                                    continue; // Materialize selected cells below.
+                                }
+                            }
                             for (first..i) |row| {
                                 materialize[row] = false;
                                 const bit = @as(u8, 1) << @intCast(row % 8);
@@ -711,9 +789,8 @@ fn ColumnBuilder(comptime DBType: type) type {
                                 }
                             }
                             if (has_payload) {
-                                var ref = pages.reference(page);
-                                ref.source_first += @intCast(first - pages.first(page));
                                 try entry.value_ptr.fragments.append(dest, .{ .first = remap[first], .end = remap[i - 1] + 1, .ref = ref });
+                                if (partial) entry.value_ptr.partial_fragments += 1;
                                 if (source.bounds.present) {
                                     const bounds = &entry.value_ptr.bounds;
                                     bounds.minimum = if (bounds.present) @min(bounds.minimum, source.bounds.minimum) else source.bounds.minimum;
@@ -1670,7 +1747,8 @@ fn planRange(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from
     }
     // Predicate/projection pages are charged once, before any payload is read.
     // CPU ranking weights belong to leaf ordering, not this byte estimate.
-    const overlay = delta_bytes +| @as(u64, count) *| 4096 +| projected_bytes;
+    // Tombstones cost sequential journal traversal, never primary-row lookups.
+    const overlay = delta_bytes +| delta_live *| 4096 +| probe_bytes +| projected_bytes;
     const primary = delta_bytes +| base_bytes +| (base_count +| delta_live) *| 64;
     if (opts.columnar_stats) |stats| {
         stats.estimated_overlay_bytes +|= overlay;
@@ -2123,7 +2201,7 @@ const Block = struct {
     scan_options: ?types.ScanOptions = null,
     stop: ?*const std.atomic.Value(bool) = null,
 
-    const DecodedPayload = struct { value_type: dv.ValueType, values: []?dv.TypedValue, encoded_bytes: u64 };
+    const DecodedPayload = struct { value_type: dv.ValueType, values: []?dv.TypedValue, encoded_bytes: u64, logical_bytes: u64 };
 
     fn checkWork(self: *@This()) !void {
         if (self.stop) |stop| if (stop.load(.acquire)) return error.Canceled;
@@ -2247,19 +2325,21 @@ const Block = struct {
             var reader = try dv.TypedDocValuesReader.init(self.alloc, bytes);
             var decoded_values: [max_rows]?dv.TypedValue = @splat(null);
             var extent: usize = 0;
+            var logical_bytes: u64 = 0;
             for (0..reader.num_chunks) |chunk_index| {
                 var chunk = try reader.decodeChunk(@intCast(chunk_index));
                 var it = chunk.iterator();
                 while (try it.next()) |entry| {
                     if (entry.doc_id >= ref.source_rows or decoded_values[entry.doc_id] != null) return error.InvalidColumnSegment;
                     decoded_values[entry.doc_id] = entry.value;
+                    logical_bytes += payloadCellBytes(entry.value);
                     extent = @max(extent, entry.doc_id + 1);
                 }
             }
             const digest = payloads.identity(reader.value_type, decoded_values[0..extent]);
             if (!std.mem.eql(u8, &digest, &ref.digest)) return error.InvalidColumnSegment;
             const result = try self.alloc.create(DecodedPayload);
-            result.* = .{ .value_type = reader.value_type, .values = try self.alloc.dupe(?dv.TypedValue, decoded_values[0..extent]), .encoded_bytes = encoded.len };
+            result.* = .{ .value_type = reader.value_type, .values = try self.alloc.dupe(?dv.TypedValue, decoded_values[0..extent]), .encoded_bytes = encoded.len, .logical_bytes = logical_bytes };
             try self.decoded_payloads.put(self.alloc, ref.digest, result);
             break :blk result;
         };

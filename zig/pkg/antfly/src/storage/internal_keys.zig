@@ -25,7 +25,8 @@ pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
 pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
-pub const relational_columnar_dirty_prefix = "\x00\x00__columnar__:dirty:";
+pub const relational_columnar_prefix = "\x00\x00__columnar__:";
+pub const relational_columnar_dirty_prefix = relational_columnar_prefix ++ "dirty:";
 pub const relational_columnar_mutation_key = "\x00\x00__columnar__:mutation";
 
 pub fn relationalColumnarDirtyKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {

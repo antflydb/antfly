@@ -2578,6 +2578,7 @@ pub const ColumnarMaintenanceStats = struct {
     payloads_reused: u64 = 0,
     payload_bytes_written: u64 = 0,
     payload_encoding_bytes: u64 = 0,
+    payload_slices_repacked: u64 = 0,
     /// Authoritative rows decoded during bootstrap/dirty range preparation.
     primary_rows_read: u64 = 0,
     admission_root_reads: u64 = 0,

@@ -99,6 +99,7 @@ const PortableOutput = struct {
     mode: PortableOutputMode,
     bytes_written: u64 = 0,
     bundle_offset: u64 = 0,
+    stats: ?*ExportStats = null,
 
     fn writeHeader(self: *PortableOutput, header: backup_codec.FileHeader) !void {
         // AFB2 owns the physical file header. Keep the logical AFB1 header in
@@ -213,7 +214,14 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
     return try exportPortableToWriterWithOptions(alloc, store, sink_writer, .{});
 }
 
+pub const ExportStats = struct {
+    snapshot_passes: u64 = 0,
+    data_cursor_entries: u64 = 0,
+    excluded_namespace_seeks: u64 = 0,
+};
+
 pub const ExportOptions = struct {
+    stats: ?*ExportStats = null,
     header_backup_id: [16]u8 = [_]u8{0} ** 16,
     backup_id: []const u8 = "",
     table_name: []const u8 = "",
@@ -252,7 +260,7 @@ pub fn exportPortableToWriterWithOptions(
 
     var objects = std.ArrayListUnmanaged(PortableObject).empty;
     defer objects.deinit(alloc);
-    var inventory_out: PortableOutput = .{ .alloc = alloc, .mode = .{ .inventory = &objects } };
+    var inventory_out: PortableOutput = .{ .alloc = alloc, .mode = .{ .inventory = &objects }, .stats = options.stats };
     if (options.spool) |spool| {
         var spool_buffer: [64 * 1024]u8 = undefined;
         var spool_writer = spool.file.writer(spool.io, &spool_buffer);
@@ -361,6 +369,7 @@ pub fn exportPortableToWriterWithOptions(
             .trust_inventory_digest = options.spool != null,
         } },
         .bundle_offset = backup_codec.header_size + backup_codec.block_envelope_overhead + manifest.len,
+        .stats = options.stats,
     };
     if (options.spool) |spool| {
         var spool_reader = backup_codec.FileReader.init(spool.io, spool.file, inventory_out.bytes_written);
@@ -386,7 +395,75 @@ pub fn exportPortableToWriterWithOptions(
     try sink_writer.writeAll(&trailer);
 }
 
+/// Skip entire nonportable namespaces, not individual derived payloads. Keep
+/// all other binary/legacy graph key ranges intact. At most the first cursor
+/// entry in each excluded namespace is inspected before seeking past it.
+fn nextPortableDataEntry(cursor: anytype, initial: anytype, stats: ?*ExportStats) !@TypeOf(initial) {
+    var entry = initial;
+    const exclusions = .{
+        .{ internal_keys.relational_columnar_prefix, "\x00\x00__columnar__;" },
+        .{ portable_metadata_prefix, "\x00\x00__metadata__;" },
+        .{ &[_]u8{internal_keys.replay_namespace}, &[_]u8{internal_keys.replay_namespace + 1} },
+    };
+    while (entry) |kv| {
+        if (stats) |s| s.data_cursor_entries += 1;
+        var skipped = false;
+        inline for (exclusions) |range| {
+            if (!skipped and std.mem.startsWith(u8, kv.key, range[0])) {
+                entry = try cursor.seekAtOrAfter(range[1]);
+                if (stats) |s| s.excluded_namespace_seeks += 1;
+                skipped = true;
+            }
+        }
+        if (!skipped) return entry;
+    }
+    return null;
+}
+
+test "portable backup namespace seeks preserve adjacent binary and legacy keys" {
+    const Cursor = struct {
+        const Entry = struct { key: []const u8 };
+        const entries = [_][]const u8{
+            "\x00\x00__columnar__9:i:x:out:t:y:o",
+            internal_keys.relational_columnar_prefix ++ "blocks:a",
+            internal_keys.relational_columnar_prefix ++ "dirty:z",
+            "\x00\x00__columnar__;:i:x:out:t:y:o",
+            portable_metadata_prefix ++ "schema",
+            "\x00\x00__metadata__;neighbor",
+            "\x01row",
+            "\x02replay:a",
+            "\x02replay:z",
+            "\x03identity",
+            "legacy:i:x:out:t:y:o",
+        };
+        index: usize = 0,
+        fn current(self: *@This()) ?Entry {
+            return if (self.index < entries.len) .{ .key = entries[self.index] } else null;
+        }
+        fn next(self: *@This()) !?Entry {
+            self.index += 1;
+            return self.current();
+        }
+        fn seekAtOrAfter(self: *@This(), key: []const u8) !?Entry {
+            while (self.index < entries.len and std.mem.order(u8, entries[self.index], key) == .lt) self.index += 1;
+            return self.current();
+        }
+    };
+    const expected = [_]usize{ 0, 3, 5, 6, 9, 10 };
+    var cursor: Cursor = .{};
+    var stats: ExportStats = .{};
+    var entry = try nextPortableDataEntry(&cursor, cursor.current(), &stats);
+    for (expected) |index| {
+        try std.testing.expectEqualStrings(Cursor.entries[index], entry.?.key);
+        entry = try nextPortableDataEntry(&cursor, try cursor.next(), &stats);
+    }
+    try std.testing.expect(entry == null);
+    try std.testing.expectEqual(@as(u64, 3), stats.excluded_namespace_seeks);
+    try std.testing.expectEqual(@as(u64, 9), stats.data_cursor_entries);
+}
+
 fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput) !void {
+    if (out.stats) |stats| stats.snapshot_passes += 1;
     const backup_id = [_]u8{0} ** 16; // zero UUID for now
     try out.writeHeader(.{
         .format_version = backup_codec.legacy_format_version,
@@ -521,8 +598,8 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     try flushMetadataBatch(alloc, out, &metadata_batch);
     metadata_batch_bytes = 0;
 
-    scan_entry = try cursor.first();
-    while (scan_entry) |kv| : (scan_entry = try cursor.next()) {
+    scan_entry = try nextPortableDataEntry(&cursor, try cursor.first(), out.stats);
+    while (scan_entry) |kv| : (scan_entry = try nextPortableDataEntry(&cursor, try cursor.next(), out.stats)) {
         if (isPortableMetadataKey(kv.key)) continue;
 
         if (kv.key.len > 0 and kv.key[0] == internal_keys.identity_namespace) {
@@ -3187,6 +3264,27 @@ test "portable backup round trips relational rows and schema metadata" {
     try exportPortable(alloc, &src, &portable);
     try validatePortable(alloc, portable.items);
 
+    // Materialized columns and replay are not portable data. Export work must
+    // remain independent of their record count and output must not change.
+    const excluded = try alloc.alloc(u8, 128 * 1024);
+    defer alloc.free(excluded);
+    @memset(excluded, 0x9a);
+    for (0..64) |i| {
+        const cache_key = try std.fmt.allocPrint(alloc, "{s}blocks:{d:0>4}", .{ internal_keys.relational_columnar_prefix, i });
+        defer alloc.free(cache_key);
+        const replay_key = try std.fmt.allocPrint(alloc, "{c}{d:0>4}", .{ internal_keys.replay_namespace, i });
+        defer alloc.free(replay_key);
+        try src.putBatch(&.{ .{ .key = cache_key, .value = excluded }, .{ .key = replay_key, .value = "ignored" } }, &.{});
+    }
+    var measured_writer = std.Io.Writer.Allocating.init(alloc);
+    defer measured_writer.deinit();
+    var measured_stats: ExportStats = .{};
+    try exportPortableToWriterWithOptions(alloc, &src, &measured_writer.writer, .{ .stats = &measured_stats });
+    try std.testing.expectEqualSlices(u8, portable.items, measured_writer.written());
+    try std.testing.expectEqual(@as(u64, 2), measured_stats.snapshot_passes);
+    try std.testing.expectEqual(@as(u64, 6), measured_stats.excluded_namespace_seeks);
+    try std.testing.expect(measured_stats.data_cursor_entries <= 12);
+
     // The production file path stages encoded logical blocks on bounded disk,
     // avoiding a second store scan while preserving byte-for-byte output.
     const spool_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable.spool", .{tmp_src.sub_path});
@@ -3200,10 +3298,15 @@ test "portable backup round trips relational rows and schema metadata" {
     defer spooled.deinit(alloc);
     var spooled_writer = std.Io.Writer.Allocating.fromArrayList(alloc, &spooled);
     defer spooled = spooled_writer.toArrayList();
+    var spooled_stats: ExportStats = .{};
     try exportPortableToWriterWithOptions(alloc, &src, &spooled_writer.writer, .{
         .spool = .{ .io = spool_io, .file = spool_file },
+        .stats = &spooled_stats,
     });
     try std.testing.expectEqualSlices(u8, portable.items, spooled_writer.written());
+    try std.testing.expectEqual(@as(u64, 1), spooled_stats.snapshot_passes);
+    try std.testing.expectEqual(@as(u64, 3), spooled_stats.excluded_namespace_seeks);
+    try std.testing.expect(spooled_stats.data_cursor_entries <= 6);
 
     var tmp_dst = std.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
