@@ -59,6 +59,10 @@ pub const Tensor = struct {
     allocator: std.mem.Allocator,
     owns_data: bool,
     owns_shape: bool,
+    /// Alignment used to allocate owned `data`. Most constructors allocate a
+    /// byte slice; adopting typed storage must preserve its original alignment
+    /// for the allocator's free contract.
+    data_alignment: std.mem.Alignment = .@"1",
     /// When set, `data` is a slice inside this stable mmap-backed byte range.
     mmap_source_bytes: ?[]const u8 = null,
     lifetime: ?Lifetime = null,
@@ -87,6 +91,29 @@ pub const Tensor = struct {
 
     pub fn initFloat32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f32) !Tensor {
         return initOwned(f32, allocator, name, shape, data, .f32);
+    }
+
+    /// Adopt caller-allocated f32 storage without copying it. Ownership moves
+    /// only after this function succeeds; on error the caller still owns
+    /// `data`. This is intended for preprocessors that can write directly into
+    /// the backend tensor's final host representation.
+    pub fn initFloat32Owned(
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        shape: []const i64,
+        data: []f32,
+    ) !Tensor {
+        const owned_shape = try allocator.dupe(i64, shape);
+        return .{
+            .data = std.mem.sliceAsBytes(data),
+            .dtype = .f32,
+            .shape = owned_shape,
+            .name = name,
+            .allocator = allocator,
+            .owns_data = true,
+            .owns_shape = true,
+            .data_alignment = .of(f32),
+        };
     }
 
     pub fn initInt64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i64) !Tensor {
@@ -177,7 +204,7 @@ pub const Tensor = struct {
     }
 
     pub fn deinit(self: *Tensor) void {
-        if (self.owns_data) self.allocator.free(self.data);
+        if (self.owns_data) self.allocator.rawFree(self.data, self.data_alignment, @returnAddress());
         if (self.owns_shape) self.allocator.free(self.shape);
         if (self.lifetime) |lifetime| {
             self.lifetime = null;
@@ -208,6 +235,27 @@ test "tensor constructor frees copied data when shape allocation fails" {
     );
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "tensor adopts float storage only after shape allocation succeeds" {
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(f32, 2);
+    data[0] = 1.0;
+    data[1] = 2.0;
+    const original_ptr = data.ptr;
+    var tensor = try Tensor.initFloat32Owned(alloc, "owned", &.{2}, data);
+    try std.testing.expectEqual(@intFromPtr(original_ptr), @intFromPtr(tensor.asFloat32().ptr));
+    tensor.deinit();
+
+    const retained = try alloc.alloc(f32, 1);
+    defer alloc.free(retained);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Tensor.initFloat32Owned(failing.allocator(), "retained", &.{1}, retained),
+    );
+    retained[0] = 3.0;
+    try std.testing.expectEqual(@as(f32, 3.0), retained[0]);
 }
 
 test "tensor scalar dtype sizes" {

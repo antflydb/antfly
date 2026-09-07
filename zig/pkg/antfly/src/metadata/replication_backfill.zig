@@ -6727,7 +6727,6 @@ test "metadata http service live snapshot and later streaming insert through inj
     while (platform_time.monotonicNs() < initial_snapshot_deadline_ns) {
         server.svc.cdc_next_round_at_ms = 0;
         try server.runRound();
-
         var check_db = try db_mod.DB.open(alloc, db_path, .{
             .open_mode = .query_readonly,
         });

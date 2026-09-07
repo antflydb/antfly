@@ -7,8 +7,10 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.inference_read_response_object import InferenceReadResponseObject
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_batch_execution_report import InferenceBatchExecutionReport
     from ..models.inference_generate_usage import InferenceGenerateUsage
     from ..models.inference_read_object import InferenceReadObject
 
@@ -24,12 +26,14 @@ class InferenceReadResponse:
         data (list[InferenceReadObject]): Read result objects, one per input image.
         model (str): Name of model used for reading
         usage (InferenceGenerateUsage):
+        execution (InferenceBatchExecutionReport | Unset): Observed executor behavior, not a capability prediction.
     """
 
     object_: InferenceReadResponseObject
     data: list[InferenceReadObject]
     model: str
     usage: InferenceGenerateUsage
+    execution: InferenceBatchExecutionReport | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +48,10 @@ class InferenceReadResponse:
 
         usage = self.usage.to_dict()
 
+        execution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.execution, Unset):
+            execution = self.execution.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -54,11 +62,14 @@ class InferenceReadResponse:
                 "usage": usage,
             }
         )
+        if execution is not UNSET:
+            field_dict["execution"] = execution
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_batch_execution_report import InferenceBatchExecutionReport
         from ..models.inference_generate_usage import InferenceGenerateUsage
         from ..models.inference_read_object import InferenceReadObject
 
@@ -76,11 +87,19 @@ class InferenceReadResponse:
 
         usage = InferenceGenerateUsage.from_dict(d.pop("usage"))
 
+        _execution = d.pop("execution", UNSET)
+        execution: InferenceBatchExecutionReport | Unset
+        if isinstance(_execution, Unset):
+            execution = UNSET
+        else:
+            execution = InferenceBatchExecutionReport.from_dict(_execution)
+
         inference_read_response = cls(
             object_=object_,
             data=data,
             model=model,
             usage=usage,
+            execution=execution,
         )
 
         inference_read_response.additional_properties = d

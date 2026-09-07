@@ -28,7 +28,9 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const inference_request_context = @import("../inference/request_context.zig");
+const remote_capabilities = @import("../inference/remote_capabilities.zig");
+const execution_context = @import("../inference/execution_context.zig");
+const inference_request_context = @import("../inference/execution_context.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -313,6 +315,7 @@ pub const testing = if (builtin.is_test) struct {
 pub const ProvisionedTableReadCache = struct {
     alloc: std.mem.Allocator,
     threaded: Io.Threaded,
+    remote_capability_cache: remote_capabilities.Cache,
     lsm_cache: ?*lsm_backend.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -442,9 +445,17 @@ pub const ProvisionedTableReadCache = struct {
     };
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedTableReadCache {
+        const threaded = threaded_io_limits.initService(alloc);
         return .{
             .alloc = alloc,
-            .threaded = threaded_io_limits.initService(alloc),
+            .threaded = threaded,
+            // Cache synchronization must not retain a pointer to the local
+            // `threaded` value before this returned aggregate reaches its
+            // stable address.
+            .remote_capability_cache = remote_capabilities.Cache.init(
+                alloc,
+                std.Io.Threaded.global_single_threaded.io(),
+            ),
             .incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.init(alloc),
         };
     }
@@ -465,6 +476,7 @@ pub const ProvisionedTableReadCache = struct {
             self.reranker_runtime = null;
         }
         self.incoming_graph_routes.deinit();
+        self.remote_capability_cache.deinit();
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         for (self.entries.items) |entry| {
@@ -501,11 +513,12 @@ pub const ProvisionedTableReadCache = struct {
     fn managedReadRuntimeConfig(self: *const ProvisionedTableReadCache) ManagedReadRuntimeConfig {
         return .{
             .backend_runtime = self.backend_runtime,
-            .antfly_provider = self.antfly_provider,
+            .antfly_provider = providerWithCapabilityCache(self.antfly_provider, &@constCast(self).remote_capability_cache),
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
             .remote_content = self.remote_content,
+            .remote_capability_cache = &@constCast(self).remote_capability_cache,
         };
     }
 
@@ -2540,7 +2553,7 @@ pub const BoundTableReadSource = struct {
         const agg_ns = if (phase_profile) platform_time.monotonicNs() - agg_start_ns else 0;
         try checkQueryDeadline(response_req);
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
-        try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null, null);
+        try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{ .source_table = table_name });
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
         const encode_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         const response = try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -3030,11 +3043,15 @@ pub const ProvisionedTableReadSource = struct {
     fn managedReadRuntimeConfig(self: *const ProvisionedTableReadSource) ManagedReadRuntimeConfig {
         return .{
             .backend_runtime = self.backend_runtime,
-            .antfly_provider = self.antfly_provider,
+            .antfly_provider = providerWithCapabilityCache(
+                self.antfly_provider,
+                if (self.cache) |cache| &cache.remote_capability_cache else null,
+            ),
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
             .remote_content = self.remote_content,
+            .remote_capability_cache = if (self.cache) |cache| &cache.remote_capability_cache else null,
         };
     }
 
@@ -3504,7 +3521,13 @@ pub const ProvisionedTableReadSource = struct {
             try applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), .stale);
             execution.releaseDb();
             try checkQueryDeadline(response_req);
-            try applyQueryPostProcessing(alloc, response_req, &result, &meta, routed.antfly_provider, routed.secret_store, routed.reranker_runtime);
+            try applyQueryPostProcessing(
+                alloc,
+                response_req,
+                &result,
+                &meta,
+                routed.managedReadRuntimeConfig().forTable(table_name),
+            );
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
 
@@ -3580,7 +3603,13 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, routed.antfly_provider, routed.secret_store, routed.reranker_runtime);
+            try applyQueryPostProcessing(
+                alloc,
+                graph_req,
+                &merged,
+                &meta,
+                routed.managedReadRuntimeConfig().forTable(table_name),
+            );
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = queryProvisionedAcrossGroups(routed, alloc, group_ids, req, table_name, .stale) catch |err| switch (err) {
@@ -3608,7 +3637,13 @@ pub const ProvisionedTableReadSource = struct {
             else => return err,
         };
         try checkQueryDeadline(req);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, routed.antfly_provider, routed.secret_store, routed.reranker_runtime);
+        try applyQueryPostProcessing(
+            alloc,
+            req,
+            &merged,
+            &meta,
+            routed.managedReadRuntimeConfig().forTable(table_name),
+        );
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -3980,7 +4015,13 @@ pub const ProvisionedTableReadSource = struct {
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), .stale);
             execution.releaseDb();
-            try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store, self.reranker_runtime);
+            try applyQueryPostProcessing(
+                alloc,
+                response_req,
+                &result,
+                &meta,
+                self.managedReadRuntimeConfig().forTable(table_name),
+            );
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
         unreachable;
@@ -4391,8 +4432,12 @@ pub const HostedProvisionedTableReadSource = struct {
     internal_service_issuer: ?[]const u8 = null,
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
-    reranker_runtime: ?*reranking_runtime.Runtime = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
+    reranker_runtime: ?*reranking_runtime.Runtime = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     incoming_graph_routes: ?*distributed_graph.IncomingSourceGroupCache = null,
 
@@ -4422,14 +4467,62 @@ pub const HostedProvisionedTableReadSource = struct {
         return self;
     }
 
+    pub fn withAntflyProvider(
+        self: *HostedProvisionedTableReadSource,
+        provider: ?managed_embedder.AntflyProvider,
+    ) *HostedProvisionedTableReadSource {
+        self.antfly_provider = providerWithCapabilityCache(provider, self.remote_capability_cache);
+        return self;
+    }
+
+    pub fn withInferenceAPIURL(
+        self: *HostedProvisionedTableReadSource,
+        inference_api_url: ?[]const u8,
+    ) *HostedProvisionedTableReadSource {
+        self.inference_api_url = inference_api_url;
+        return self;
+    }
+
     pub fn withRerankerRuntime(self: *HostedProvisionedTableReadSource, runtime: *reranking_runtime.Runtime) *HostedProvisionedTableReadSource {
         self.reranker_runtime = runtime;
         return self;
     }
 
-    pub fn withSecretStore(self: *HostedProvisionedTableReadSource, secret_store: ?*common_secrets.FileStore) *HostedProvisionedTableReadSource {
+    pub fn withSecretStore(
+        self: *HostedProvisionedTableReadSource,
+        secret_store: ?*common_secrets.FileStore,
+    ) *HostedProvisionedTableReadSource {
         self.secret_store = secret_store;
         return self;
+    }
+
+    pub fn withRemoteContent(
+        self: *HostedProvisionedTableReadSource,
+        remote_content: ?*const scraping.RemoteContentConfig,
+    ) *HostedProvisionedTableReadSource {
+        self.remote_content = remote_content;
+        return self;
+    }
+
+    pub fn withRemoteCapabilityCache(
+        self: *HostedProvisionedTableReadSource,
+        cache: ?*remote_capabilities.Cache,
+    ) *HostedProvisionedTableReadSource {
+        self.remote_capability_cache = cache;
+        self.antfly_provider = providerWithCapabilityCache(self.antfly_provider, cache);
+        return self;
+    }
+
+    fn managedReadRuntimeConfig(self: *const HostedProvisionedTableReadSource) ManagedReadRuntimeConfig {
+        return .{
+            .backend_runtime = self.backend_runtime,
+            .antfly_provider = providerWithCapabilityCache(self.antfly_provider, self.remote_capability_cache),
+            .inference_api_url = self.inference_api_url,
+            .secret_store = self.secret_store,
+            .reranker_runtime = self.reranker_runtime,
+            .remote_content = self.remote_content,
+            .remote_capability_cache = self.remote_capability_cache,
+        };
     }
 
     pub fn withIncomingGraphRoutes(
@@ -5058,7 +5151,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             if (route == .local) {
-                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
                 defer execution.releaseDb();
                 try checkQueryDeadline(execution.request);
                 var result = execution.result;
@@ -5073,7 +5166,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
                 execution.releaseDb();
                 try checkQueryDeadline(response_req);
-                try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, self.secret_store, self.reranker_runtime);
+                try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.managedReadRuntimeConfig().forTable(table_name));
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
             }
         }
@@ -5122,7 +5215,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, null, self.secret_store, self.reranker_runtime);
+            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
@@ -5136,7 +5229,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, null, self.secret_store, self.reranker_runtime);
+        try applyQueryPostProcessing(alloc, req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -5278,7 +5371,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const start_ns = platform_time.monotonicNs();
-        var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+        var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
         defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
@@ -5291,7 +5384,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
         execution.releaseDb();
-        try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, self.secret_store, self.reranker_runtime);
+        try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.managedReadRuntimeConfig().forTable(table_name));
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
 
@@ -5308,7 +5401,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency),
+            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency),
             .remote => null,
         };
     }
@@ -5500,7 +5593,7 @@ pub const HostedProvisionedTableReadSource = struct {
                         .frontier_id = item.id,
                         .frontier_key = try alloc.dupe(u8, item.key),
                         .graph_result = graph_blk: {
-                            var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
+                            var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, search_req, consistency);
                             defer result.deinit();
                             var graph_result = if (result.graph_results.len > 0)
                                 try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
@@ -5585,7 +5678,24 @@ const ManagedReadRuntimeConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
+    source_table: []const u8 = "",
+
+    fn forTable(self: ManagedReadRuntimeConfig, table_name: []const u8) ManagedReadRuntimeConfig {
+        var routed = self;
+        routed.source_table = table_name;
+        return routed;
+    }
 };
+
+fn providerWithCapabilityCache(
+    provider: ?managed_embedder.AntflyProvider,
+    cache: ?*remote_capabilities.Cache,
+) ?managed_embedder.AntflyProvider {
+    var bound = provider orelse return null;
+    bound.remote_capability_cache = cache orelse bound.remote_capability_cache;
+    return bound;
+}
 
 const TextStatsFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
@@ -9184,7 +9294,7 @@ fn queryHostedAcrossGroupsPhase(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, group_req, consistency),
+            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, group_req, consistency),
             .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
@@ -17254,13 +17364,11 @@ fn applyQueryPostProcessing(
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
-    antfly_provider: ?managed_embedder.AntflyProvider,
-    secret_store: ?*common_secrets.FileStore,
-    reranker_runtime: ?*reranking_runtime.Runtime,
+    runtime_cfg: ManagedReadRuntimeConfig,
 ) !void {
     if ((req.reranker == null and req.pruner == null) or result.hits.len == 0) return;
     const candidate_count = if (req.reranker != null)
-        try applyReranker(alloc, req, result, meta, antfly_provider, secret_store, reranker_runtime)
+        try applyReranker(alloc, req, result, meta, runtime_cfg)
     else
         result.hits.len;
     const pruned_count = pruneSearchHitPrefix(req, result.hits[0..candidate_count]).len;
@@ -17273,9 +17381,7 @@ fn applyReranker(
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
-    antfly_provider: ?managed_embedder.AntflyProvider,
-    secret_store: ?*common_secrets.FileStore,
-    reranker_runtime: ?*reranking_runtime.Runtime,
+    runtime_cfg: ManagedReadRuntimeConfig,
 ) !usize {
     const cfg = req.reranker orelse return 0;
     if (req.reranker_query_text.len == 0) return error.UnsupportedQueryRequest;
@@ -17284,23 +17390,34 @@ fn applyReranker(
     const output_limit = rerankerOutputLimit(req.limit, cfg.top_n);
     const rerank_count = rerankerCandidateCount(result.hits.len, cfg.candidate_count, req.offset, output_limit);
 
+    var inference_lane: ?db_mod.background_runtime.BackendRuntime.InferenceLaneLease = null;
+    defer if (inference_lane) |*lease| lease.release();
     var fallback_io: ?std.Io.Threaded = null;
     defer if (fallback_io) |*io_impl| io_impl.deinit();
+    const io = if (runtime_cfg.reranker_runtime) |runtime|
+        runtime.io
+    else if (runtime_cfg.backend_runtime) |backend| blk: {
+        inference_lane = try backend.acquireInferenceLane();
+        break :blk inference_lane.?.io();
+    } else blk: {
+        fallback_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        break :blk fallback_io.?.io();
+    };
+
     var fallback_http: ?httpx.Client = null;
     defer if (fallback_http) |*http| http.deinit();
-    const http = if (reranker_runtime) |runtime|
+    const http = if (runtime_cfg.reranker_runtime) |runtime|
         &runtime.http
     else blk: {
-        fallback_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        fallback_http = httpx.Client.initWithConfig(alloc, fallback_io.?.io(), .{ .keep_alive = false });
+        fallback_http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
         break :blk &fallback_http.?;
     };
     const inference_context = inference_request_context.RequestContext{
-        .io = if (reranker_runtime) |runtime| runtime.io else fallback_io.?.io(),
+        .io = io,
         .deadline_ns = req.execution_deadline_ns,
         .cancellation = req.cancellation,
     };
-    var admission_lease: ?reranking_runtime.AdmissionLease = if (reranker_runtime) |runtime|
+    var admission_lease: ?reranking_runtime.AdmissionLease = if (runtime_cfg.reranker_runtime) |runtime|
         try runtime.acquire(inference_context)
     else
         null;
@@ -17326,22 +17443,28 @@ fn applyReranker(
         initialized_docs += 1;
     }
 
-    const scores = if (reranker_runtime) |runtime|
-        runtime.rerankAdmitted(alloc, cfg, .{
-            .antfly_provider = antfly_provider,
-            .secret_store = secret_store,
-            .execution_context = inference_context,
-        }, req.reranker_query_text, documents)
+    const dependencies: reranking_runtime.Options = .{
+        .antfly_provider = runtime_cfg.antfly_provider,
+        .secret_store = runtime_cfg.secret_store,
+        .capability_cache = runtime_cfg.remote_capability_cache,
+        .execution = execution_context.Context{
+            .default_endpoint = runtime_cfg.inference_api_url,
+            .capability_cache = runtime_cfg.remote_capability_cache,
+            .io = io,
+            .routing = .{ .source_table = runtime_cfg.source_table },
+            .deadline_ns = req.execution_deadline_ns,
+            .cancellation = req.cancellation orelse .none,
+        },
+        .execution_context = inference_context,
+    };
+    const scores = if (runtime_cfg.reranker_runtime) |runtime|
+        runtime.rerankAdmitted(alloc, cfg, dependencies, req.reranker_query_text, documents)
     else
         reranking_runtime.rerankDocumentsWithOptions(
             alloc,
             http,
             cfg,
-            .{
-                .antfly_provider = antfly_provider,
-                .secret_store = secret_store,
-                .execution_context = inference_context,
-            },
+            dependencies,
             req.reranker_query_text,
             documents,
         );
@@ -17467,9 +17590,7 @@ test "reranker admission precedes candidate rendering" {
         },
         &result,
         &meta,
-        null,
-        null,
-        &runtime,
+        .{ .reranker_runtime = &runtime },
     ));
     try std.testing.expectEqual(@as(usize, 1), runtime.admission.stats().in_flight);
 }
@@ -17547,7 +17668,7 @@ test "coordinator prunes the final score domain before paging" {
     };
     var meta = query_api.QueryResponseMeta{};
     defer meta.deinit(alloc);
-    try applyQueryPostProcessing(alloc, req, &result, &meta, null, null, null);
+    try applyQueryPostProcessing(alloc, req, &result, &meta, .{});
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("b", result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 100), result.total_hits);

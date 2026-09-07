@@ -143,7 +143,9 @@ def sync_detailed(
     each source edge; malformed images return 400 and dimension or aggregate excess
     returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
     multimodal reranking, image `/extract`, and the embedded read, extract, and dense
-    embedding APIs. Batch generation rejects multimodal content before media fetch.
+    embedding APIs. Batch generation accepts bounded image and audio media parts,
+    applies the same aggregate encoded-byte and decoded-image admission before model
+    execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
         body (InferenceReadRequest):
@@ -214,7 +216,9 @@ def sync(
     each source edge; malformed images return 400 and dimension or aggregate excess
     returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
     multimodal reranking, image `/extract`, and the embedded read, extract, and dense
-    embedding APIs. Batch generation rejects multimodal content before media fetch.
+    embedding APIs. Batch generation accepts bounded image and audio media parts,
+    applies the same aggregate encoded-byte and decoded-image admission before model
+    execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
         body (InferenceReadRequest):
@@ -280,7 +284,9 @@ async def asyncio_detailed(
     each source edge; malformed images return 400 and dimension or aggregate excess
     returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
     multimodal reranking, image `/extract`, and the embedded read, extract, and dense
-    embedding APIs. Batch generation rejects multimodal content before media fetch.
+    embedding APIs. Batch generation accepts bounded image and audio media parts,
+    applies the same aggregate encoded-byte and decoded-image admission before model
+    execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
         body (InferenceReadRequest):
@@ -349,7 +355,9 @@ async def asyncio(
     each source edge; malformed images return 400 and dimension or aggregate excess
     returns 413. The same decoded-pixel policy covers generate/chat, dense embedding,
     multimodal reranking, image `/extract`, and the embedded read, extract, and dense
-    embedding APIs. Batch generation rejects multimodal content before media fetch.
+    embedding APIs. Batch generation accepts bounded image and audio media parts,
+    applies the same aggregate encoded-byte and decoded-image admission before model
+    execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
         body (InferenceReadRequest):

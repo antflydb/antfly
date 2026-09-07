@@ -21,15 +21,53 @@ const Chunk = chunk_mod.Chunk;
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
+const chunk_provider = @import("provider.zig");
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const remote_capabilities = @import("../inference/remote_capabilities.zig");
+const inference_work = @import("../inference/work.zig");
+const execution_context = @import("../inference/execution_context.zig");
+const platform_time = @import("antfly_platform").time;
 
 const Allocator = std.mem.Allocator;
+const remote_chunk_max_response_bytes: usize = 16 << 20;
+const remote_chunk_max_timeout_ms: u64 = 300_000;
+
+const ChunkInputFn = *const fn (
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+) anyerror![]inference_chunker.Chunk;
+const ChunkInputWithContextFn = *const fn (
+    ptr: *anyopaque,
+    alloc: Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    context: execution_context.RequestContext,
+) anyerror![]inference_chunker.Chunk;
+const ChunkProviderVTable = struct {
+    chunk_input: ?ChunkInputFn = null,
+    chunk_input_with_context: ?ChunkInputWithContextFn = null,
+};
+const ChunkProviderBoundary = runtime_callback_abi.Boundary(ChunkProviderVTable);
 
 pub const RemoteChunk = inference_chunker.Chunk;
 pub const RemoteInput = inference_chunker.Input;
 pub const RemoteBinaryInput = inference_chunker.BinaryInput;
 
 pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8) ![]Chunk {
-    const shared_chunks = try chunkInput(alloc, cfg, .{ .text = text });
+    return try chunkTextWithProvider(alloc, cfg, text, null);
+}
+
+pub fn chunkTextWithProvider(
+    alloc: Allocator,
+    cfg: chunking_types.Config,
+    text: []const u8,
+    antfly_provider: ?chunk_provider.Provider,
+) ![]Chunk {
+    const shared_chunks = try chunkInputWithProvider(alloc, cfg, .{ .text = text }, antfly_provider);
     defer freeRemoteChunks(alloc, shared_chunks);
 
     var chunks = try alloc.alloc(Chunk, shared_chunks.len);
@@ -63,26 +101,163 @@ pub fn chunkBinary(alloc: Allocator, cfg: chunking_types.Config, mime_type: []co
 }
 
 pub fn chunkInput(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
-    if (cfg.api_url.len == 0) return try chunkInputDirect(alloc, cfg, input);
+    return try chunkInputWithProvider(alloc, cfg, input, null);
+}
+
+pub fn chunkInputWithProvider(
+    alloc: Allocator,
+    cfg: chunking_types.Config,
+    input: RemoteInput,
+    antfly_provider: ?chunk_provider.Provider,
+) ![]RemoteChunk {
+    const execution: execution_context.Context = if (antfly_provider) |provider| provider.execution else .{};
+    try execution.check(platform_time.monotonicNs());
+    const linked_callback_available = if (antfly_provider) |provider|
+        provider.chunk_input_with_context_callback != null or provider.chunk_input_callback != null
+    else
+        false;
+    const trimmed_endpoint = std.mem.trim(u8, cfg.api_url, " \t\r\n");
+    const explicit_endpoint: ?[]const u8 = if (trimmed_endpoint.len > 0)
+        trimmed_endpoint
+    else
+        null;
+    const resolved_endpoint = execution.resolveAntflyEndpoint(explicit_endpoint, linked_callback_available);
+    if (resolved_endpoint == null) if (antfly_provider) |provider| {
+        const ptr = provider.ptr orelse return error.InvalidChunkProvider;
+        const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
+        const io = execution.io orelse std.Io.Threaded.global_single_threaded.io();
+        const request_context = execution.requestContext(io);
+        try request_context.check();
+        const chunks = if (provider.chunk_input_with_context_callback) |callback| blk: {
+            const chunk_input: ChunkInputWithContextFn = @ptrCast(@alignCast(callback));
+            break :blk try ChunkProviderBoundary.call("chunk_input_with_context", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg, request_context });
+        } else if (provider.chunk_input_callback) |callback| blk: {
+            const chunk_input: ChunkInputFn = @ptrCast(@alignCast(callback));
+            break :blk try ChunkProviderBoundary.call("chunk_input", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg });
+        } else return error.InvalidChunkProvider;
+        defer inference_chunker.types.freeChunks(alloc, chunks);
+        try request_context.check();
+        return try cloneRemoteChunks(alloc, chunks);
+    };
+    const endpoint = resolved_endpoint orelse return try chunkInputDirect(alloc, cfg, input);
     if (cfg.model.len == 0) return error.InvalidChunkerConfig;
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
+    var fallback_io: ?std.Io.Threaded = null;
+    defer if (fallback_io) |*io_impl| io_impl.deinit();
+    const io = if (execution.io) |io|
+        io
+    else blk: {
+        fallback_io = std.Io.Threaded.init(alloc, .{});
+        break :blk fallback_io.?.io();
+    };
 
-    var http = httpx.Client.init(alloc, io_impl.io());
-    defer http.deinit();
+    var fallback_http: ?httpx.Client = null;
+    defer if (fallback_http) |*client| client.deinit();
+    const http = execution.http_client orelse blk: {
+        fallback_http = httpx.Client.initWithConfig(alloc, io, .{
+            .keep_alive = false,
+            .cookies_enabled = false,
+        });
+        break :blk &fallback_http.?;
+    };
 
-    const url = try std.fmt.allocPrint(alloc, "{s}/chunk", .{cfg.api_url});
+    var fallback_capability_cache: ?remote_capabilities.Cache = null;
+    defer if (fallback_capability_cache) |*cache| cache.deinit();
+    var capability_cache = execution.capability_cache;
+    if (capability_cache == null) {
+        fallback_capability_cache = remote_capabilities.Cache.init(alloc, http.io);
+        capability_cache = &fallback_capability_cache.?;
+    }
+    const model = if (cfg.model.len > 0) cfg.model else "fixed";
+    var routing_header_storage: [1][2][]const u8 = undefined;
+    const routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, 0);
+    const routing_headers = routing_header_storage[0..routing_header_count];
+    var capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
+        http,
+        endpoint,
+        model,
+        .chunk,
+        routing_headers,
+        execution.waitContext(),
+    );
+    var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
+    if (capability_lease.capabilities) |capabilities| {
+        if (capabilities.framed_attachments and switch (input) {
+            .binary => true,
+            .text => false,
+        }) attachment_transport = .framed_binary;
+        const shape: inference_work.InvocationShape = switch (input) {
+            .text => |text| .{
+                .item_count = 1,
+                .modalities = .{ .text = true },
+                .text_bytes = text.len,
+                .max_text_bytes_per_item = text.len,
+            },
+            .binary => |binary| .{
+                .item_count = 1,
+                .modalities = inference_work.modalityForMimeType(binary.mime_type) orelse
+                    return error.UnsupportedChunkMediaType,
+                .encoded_media_bytes = try attachment_transport.wireSize(
+                    binary.data.len,
+                    binary.mime_type.len,
+                ),
+                .max_media_parts_per_item = 1,
+            },
+        };
+        try capabilities.validateInvocation(.chunk, shape);
+    }
+
+    const url = try std.fmt.allocPrint(alloc, "{s}/chunk", .{endpoint});
     defer alloc.free(url);
 
-    const body = try encodeChunkRequest(alloc, cfg, input);
-    defer alloc.free(body);
+    var body = try encodeChunkRequest(alloc, cfg, input, attachment_transport);
+    defer body.deinit(alloc);
 
-    var resp = try http.post(url, .{ .json = body });
+    var header_storage: [4][2][]const u8 = undefined;
+    var header_count: usize = 0;
+    for (routing_headers) |header| {
+        header_storage[header_count] = header;
+        header_count += 1;
+    }
+    if (capability_lease.routing_token) |*token| {
+        header_storage[header_count] = .{ remote_capabilities.capability_token_header, token.slice() };
+        header_count += 1;
+    }
+    if (capability_lease.descriptor_revision) |*revision| {
+        header_storage[header_count] = .{ remote_capabilities.capability_revision_header, revision.slice() };
+        header_count += 1;
+    }
+    if (attachment_transport == .framed_binary) {
+        header_storage[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
+        header_count += 1;
+    }
+    var resp = try http.post(url, .{
+        .json = if (attachment_transport == .framed_binary) null else body.metadata_or_json,
+        .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
+        .headers = header_storage[0..header_count],
+        .timeout_ms = try execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_chunk_max_timeout_ms),
+        .max_response_size = execution.boundedResponseBytes(remote_chunk_max_response_bytes),
+        .cancellation = httpx.CancellationToken.fromCallback(
+            execution.cancellation.ptr,
+            execution.cancellation.is_cancelled_fn,
+        ),
+    });
     defer resp.deinit();
-    if (!resp.ok()) return error.ChunkRequestFailed;
+    if (!resp.ok()) {
+        const stale = resp.headers.get(remote_capabilities.capability_stale_header);
+        if (resp.status.code == 409 and stale != null and
+            std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
+        {
+            try capability_cache.?.invalidate(endpoint, model, .chunk, routing_headers);
+            return error.InferenceCapabilitiesStale;
+        }
+        return error.ChunkRequestFailed;
+    }
     const response_body = resp.body orelse return error.EmptyResponse;
-    return try parseChunkResponse(alloc, response_body);
+    const chunks = try parseChunkResponse(alloc, response_body);
+    errdefer inference_chunker.types.freeChunks(alloc, chunks);
+    try execution.check(platform_time.monotonicNs());
+    return chunks;
 }
 
 fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
@@ -106,7 +281,6 @@ fn cloneRemoteChunks(alloc: Allocator, source: []const RemoteChunk) ![]RemoteChu
     var initialized: usize = 0;
     errdefer {
         for (chunks[0..initialized]) |*chunk| {
-            alloc.free(@constCast(chunk.mime_type));
             chunk.deinit(alloc);
         }
         alloc.free(chunks);
@@ -124,6 +298,7 @@ fn cloneRemoteChunks(alloc: Allocator, source: []const RemoteChunk) ![]RemoteChu
             .end_time_ms = chunk.end_time_ms,
             .frame_index = chunk.frame_index,
             .frame_delay_ms = chunk.frame_delay_ms,
+            .owns_mime_type = true,
             .owns_text = chunk.text != null,
             .owns_data = chunk.data != null,
         };
@@ -133,14 +308,27 @@ fn cloneRemoteChunks(alloc: Allocator, source: []const RemoteChunk) ![]RemoteChu
 }
 
 pub fn freeRemoteChunks(alloc: Allocator, chunks: []RemoteChunk) void {
-    for (chunks) |*chunk| {
-        alloc.free(@constCast(chunk.mime_type));
-        chunk.deinit(alloc);
-    }
+    for (chunks) |*chunk| chunk.deinit(alloc);
     alloc.free(chunks);
 }
 
-fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]u8 {
+const EncodedChunkRequest = struct {
+    metadata_or_json: []u8,
+    envelope: ?httpx.attachment_envelope.EncodedSegments = null,
+
+    fn deinit(self: *EncodedChunkRequest, alloc: Allocator) void {
+        if (self.envelope) |*envelope| envelope.deinit();
+        alloc.free(self.metadata_or_json);
+        self.* = undefined;
+    }
+};
+
+fn encodeChunkRequest(
+    alloc: Allocator,
+    cfg: chunking_types.Config,
+    input: RemoteInput,
+    attachment_transport: inference_work.AttachmentTransport,
+) !EncodedChunkRequest {
     const config: inference_api.ChunkConfig = .{
         .model = cfg.model,
         .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else null,
@@ -162,23 +350,37 @@ fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: Remot
                 .input = .{ .string = text },
                 .config = config,
             };
-            return try httpx.json.Json.stringify(alloc, request);
+            return .{ .metadata_or_json = try httpx.json.Json.stringify(alloc, request) };
         },
         .binary => |binary| {
-            const data_b64 = try base64EncodeAlloc(alloc, binary.data);
-            defer alloc.free(data_b64);
+            const framed = attachment_transport == .framed_binary;
+            const data = if (framed)
+                "attachment:0"
+            else
+                try base64EncodeAlloc(alloc, binary.data);
+            defer if (!framed) alloc.free(@constCast(data));
             const request = struct {
                 input: inference_api.MediaContentPart,
                 config: inference_api.ChunkConfig,
             }{
                 .input = .{
                     .type = "media",
-                    .data = data_b64,
+                    .data = data,
                     .mime_type = binary.mime_type,
                 },
                 .config = config,
             };
-            return try httpx.json.Json.stringify(alloc, request);
+            const metadata = try httpx.json.Json.stringify(alloc, request);
+            if (!framed) return .{ .metadata_or_json = metadata };
+            errdefer alloc.free(metadata);
+            const attachments = [_]httpx.attachment_envelope.Attachment{.{
+                .mime_type = binary.mime_type,
+                .data = binary.data,
+            }};
+            return .{
+                .metadata_or_json = metadata,
+                .envelope = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, &attachments),
+            };
         },
     }
 }
@@ -220,13 +422,12 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
             .end_time_ms = chunk.end_time_ms,
             .frame_index = if (chunk.frame_index) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
             .frame_delay_ms = if (chunk.frame_delay_ms) |v| std.math.cast(u32, v) orelse return error.InvalidChunkerResponse else null,
+            .owns_mime_type = true,
             .owns_text = false,
             .owns_data = false,
         };
         errdefer {
-            if (out.mime_type.len > 0) alloc.free(@constCast(out.mime_type));
-            if (out.owns_text and out.text != null) alloc.free(out.text.?);
-            if (out.owns_data and out.data != null) alloc.free(out.data.?);
+            out.deinit(alloc);
         }
         if (chunk.text) |value| {
             out.text = try alloc.dupe(u8, value);
@@ -262,6 +463,29 @@ test "antfly chunker compiles" {
     _ = chunkBinary;
 }
 
+test "antfly chunk request frames borrowed binary input without base64" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var body = try encodeChunkRequest(
+                alloc,
+                .{ .provider = .antfly, .model = "fixed" },
+                .{ .binary = .{ .mime_type = "image/gif", .data = "GIF89a" } },
+                .framed_binary,
+            );
+            defer body.deinit(alloc);
+            const envelope = body.envelope orelse return error.MissingAttachmentEnvelope;
+            try std.testing.expectEqual(@as(usize, 4), envelope.segments.len);
+            try std.testing.expectEqualStrings("image/gif", envelope.segments[2]);
+            try std.testing.expectEqualStrings("GIF89a", envelope.segments[3]);
+            var metadata = try std.json.parseFromSlice(std.json.Value, alloc, body.metadata_or_json, .{});
+            defer metadata.deinit();
+            const input = metadata.value.object.get("input").?.object;
+            try std.testing.expectEqualStrings("attachment:0", input.get("data").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
 test "antfly chunker text round trip" {
     const alloc = std.testing.allocator;
     const FakeApp = struct {
@@ -275,6 +499,12 @@ test "antfly chunker text round trip" {
         }
 
         fn execute(_: *anyopaque, req_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqualStrings("docs", req.header("X-Antfly-Source-Table") orelse "");
+            if (req.method == .GET) return .{
+                .status = 200,
+                .content_type = try req_alloc.dupe(u8, "application/json"),
+                .body = try req_alloc.dupe(u8, "{\"chunkers\":{\"chunker-v1\":{}}}"),
+            };
             try std.testing.expectEqual(http_common.Method.POST, req.method);
             try std.testing.expect(std.mem.endsWith(u8, req.uri, "/chunk"));
             try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"chunker-v1\"") != null);
@@ -300,12 +530,15 @@ test "antfly chunker text round trip" {
 
     const cfg = chunking_types.Config{
         .provider = .antfly,
-        .api_url = base_uri,
         .model = "chunker-v1",
         .text = .{ .target_tokens = 8, .overlap_tokens = 2 },
     };
+    const provider = chunk_provider.Provider{ .execution = .{
+        .default_endpoint = base_uri,
+        .routing = .{ .source_table = "docs" },
+    } };
 
-    const chunks = try chunkText(alloc, cfg, "alpha beta gamma delta");
+    const chunks = try chunkTextWithProvider(alloc, cfg, "alpha beta gamma delta", provider);
     defer {
         for (chunks) |*chunk| chunk.deinit(alloc);
         alloc.free(chunks);
@@ -464,4 +697,78 @@ test "antfly chunker local path preserves explicit zero overlap when target is s
 
     try std.testing.expect(chunks.len > 0);
     try std.testing.expect(chunks[0].text != null);
+}
+
+test "antfly chunker uses the embedded provider executor when available" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        legacy_calls: usize = 0,
+        context_calls: usize = 0,
+
+        fn chunk(
+            ptr: *anyopaque,
+            result_alloc: Allocator,
+            model: []const u8,
+            input: inference_chunker.Input,
+            _: chunking_types.Config,
+        ) ![]inference_chunker.Chunk {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy_calls += 1;
+            _ = result_alloc;
+            _ = model;
+            _ = input;
+            return error.TestUnexpectedResult;
+        }
+
+        fn chunkWithContext(
+            ptr: *anyopaque,
+            result_alloc: Allocator,
+            model: []const u8,
+            input: inference_chunker.Input,
+            _: chunking_types.Config,
+            context: execution_context.RequestContext,
+        ) ![]inference_chunker.Chunk {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expect(context.deadline_ns != null);
+            self.context_calls += 1;
+            try std.testing.expectEqualStrings("fixed", model);
+            try std.testing.expectEqualStrings("provider input", input.text);
+            const out = try result_alloc.alloc(inference_chunker.Chunk, 1);
+            out[0] = .{
+                .id = 0,
+                .mime_type = try result_alloc.dupe(u8, "text/plain"),
+                .text = try result_alloc.dupe(u8, "provider output"),
+                .owns_mime_type = true,
+                .owns_text = true,
+            };
+            return out;
+        }
+    };
+    var fake = Fake{};
+    const provider = chunk_provider.Provider{
+        .ptr = &fake,
+        .boundary_dispatch = ChunkProviderBoundary.local_dispatch,
+        .chunk_input_callback = @ptrCast(&Fake.chunk),
+        .chunk_input_with_context_callback = @ptrCast(&Fake.chunkWithContext),
+        .execution = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    };
+    const cfg = chunking_types.Config{ .provider = .antfly, .model = "fixed" };
+    const chunks = try chunkTextWithProvider(alloc, cfg, "provider input", provider);
+    defer {
+        for (chunks) |*chunk| chunk.deinit(alloc);
+        alloc.free(chunks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.context_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+    try std.testing.expectEqualStrings("provider output", chunks[0].text.?);
+
+    var canceled = std.atomic.Value(bool).init(true);
+    var canceled_provider = provider;
+    canceled_provider.execution.cancellation = .fromAtomic(&canceled);
+    try std.testing.expectError(
+        error.Canceled,
+        chunkTextWithProvider(alloc, cfg, "provider input", canceled_provider),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.context_calls);
 }

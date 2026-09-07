@@ -41,6 +41,43 @@ func TestEndpointSliceDeleteUsesDiscoveredPort(t *testing.T) {
 	}
 }
 
+func TestEndpointSliceRegistrationPreservesNamespaceIdentity(t *testing.T) {
+	t.Parallel()
+
+	p := NewProxy(Config{RefreshInterval: time.Minute})
+	w := &K8sWatcher{proxy: p}
+	ready := true
+	port := int32(8080)
+	for namespace, address := range map[string]string{
+		"team-a": "10.0.0.1",
+		"team-b": "10.0.0.2",
+	} {
+		w.processEndpointSlice(&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Labels:    map[string]string{"kubernetes.io/service-name": "inference-gpu"},
+			},
+			Ports: []discoveryv1.EndpointPort{{Name: strPtr("http"), Port: &port}},
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses:  []string{address},
+				Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+			}},
+		})
+	}
+
+	teamA := p.Registry().GetEndpointsForNamespacedPool("team-a", "gpu")
+	teamB := p.Registry().GetEndpointsForNamespacedPool("team-b", "gpu")
+	if len(teamA) != 1 || teamA[0].Namespace() != "team-a" || teamA[0].Address() != "http://10.0.0.1:8080" {
+		t.Fatalf("team-a endpoints = %#v", teamA)
+	}
+	if len(teamB) != 1 || teamB[0].Namespace() != "team-b" || teamB[0].Address() != "http://10.0.0.2:8080" {
+		t.Fatalf("team-b endpoints = %#v", teamB)
+	}
+	if standalone := p.Registry().GetEndpointsForPool("gpu"); len(standalone) != 0 {
+		t.Fatalf("standalone pool lookup crossed namespace boundary: %#v", standalone)
+	}
+}
+
 func TestK8sWatcherActivatesScaleToZeroPool(t *testing.T) {
 	t.Parallel()
 

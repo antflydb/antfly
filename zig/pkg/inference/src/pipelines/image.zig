@@ -18,6 +18,7 @@
 // decoded pixels through the shared resize/normalize/CHW preprocessing path.
 
 const std = @import("std");
+const linalg = @import("inference_linalg");
 const antfly_image = @import("antfly_image");
 const shared = antfly_image.processing;
 
@@ -30,10 +31,13 @@ pub const PixelFormat = shared.PixelFormat;
 pub const ImageU8 = shared.ImageU8;
 pub const DecodeLimits = antfly_image.DecodeLimits;
 
-pub const EncodedImageInfo = struct {
-    width: u32,
-    height: u32,
-};
+pub const EncodedImageInfo = antfly_image.EncodedImageInfo;
+
+pub const supportsMimeEssence = antfly_image.supportsInferenceMimeEssence;
+
+pub fn mimeEssenceForEncoded(bytes: []const u8) ?[]const u8 {
+    return antfly_image.inferenceMimeEssenceForFormat(antfly_image.detectFormat(bytes));
+}
 
 /// Decoded image in HWC u8 format.
 pub const Image = struct {
@@ -83,53 +87,12 @@ fn validateImageDimensions(width: u32, height: u32) !void {
 /// server uses this before model loading/inference to account aggregate pixel
 /// pressure and to distinguish malformed input from configured size limits.
 pub fn inspectEncodedForInference(image_bytes: []const u8, max_dimension: ?u32) !EncodedImageInfo {
-    const info = try inspectEncoded(image_bytes);
+    const info = antfly_image.inspectEncoded(image_bytes) catch return error.ImageDecodeFailed;
     try antfly_image.DecodeLimits.inference_default.validate(info.width, info.height);
     if (max_dimension) |limit| {
         if (info.width > limit or info.height > limit) return error.ImageTooLarge;
     }
     return info;
-}
-
-fn inspectEncoded(image_bytes: []const u8) !EncodedImageInfo {
-    switch (antfly_image.detectFormat(image_bytes)) {
-        .png => {
-            if (image_bytes.len < 24) return error.ImageDecodeFailed;
-            const width = std.mem.readInt(u32, image_bytes[16..20], .big);
-            const height = std.mem.readInt(u32, image_bytes[20..24], .big);
-            if (width == 0 or height == 0) return error.ImageDecodeFailed;
-            return .{ .width = width, .height = height };
-        },
-        .jpeg => {
-            const info = antfly_image.jpeg.probe(image_bytes) catch |err| switch (err) {
-                error.JpegDecodeFailed, error.UnsupportedJpegFormat => return error.ImageDecodeFailed,
-            };
-            return .{ .width = info.width, .height = info.height };
-        },
-        .gif => {
-            if (image_bytes.len < 10) return error.ImageDecodeFailed;
-            const width = std.mem.readInt(u16, image_bytes[6..8], .little);
-            const height = std.mem.readInt(u16, image_bytes[8..10], .little);
-            if (width == 0 or height == 0) return error.ImageDecodeFailed;
-            return .{ .width = width, .height = height };
-        },
-        .bmp => {
-            const info = antfly_image.bmp.probe(image_bytes) catch |err| switch (err) {
-                error.BmpDecodeFailed, error.UnsupportedBmpFormat => return error.ImageDecodeFailed,
-                else => return err,
-            };
-            return .{ .width = info.width, .height = info.height };
-        },
-        .webp => {
-            const info = antfly_image.webp.probe(image_bytes) catch |err| switch (err) {
-                error.WebpDecodeFailed, error.UnsupportedWebpFormat => return error.ImageDecodeFailed,
-            };
-            const width = info.width orelse return error.ImageDecodeFailed;
-            const height = info.height orelse return error.ImageDecodeFailed;
-            return .{ .width = width, .height = height };
-        },
-        else => return error.ImageDecodeFailed,
-    }
 }
 
 fn validateEncodedImageDimensions(image_bytes: []const u8) !void {
@@ -589,8 +552,501 @@ test "clip batch preprocessing matches single image preprocessing" {
     );
     defer alloc.free(single);
 
+    var caller_owned: [24]f32 = undefined;
+    try preprocessClipBatchIntoBounded(
+        &caller_owned,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .{},
+    );
+
     try std.testing.expectEqualSlices(f32, single, batch[0..single.len]);
     try std.testing.expectEqualSlices(f32, single, batch[single.len .. single.len * 2]);
+    try std.testing.expectEqualSlices(f32, batch, &caller_owned);
+}
+
+test "bounded batch preprocessing preserves input-indexed tensor order" {
+    const images = [_][]const u8{ red_png_2x2[0..], clip_contract_png_16x8[0..] };
+    var serial: [24]f32 = undefined;
+    var parallel: [24]f32 = undefined;
+
+    try preprocessBatchIntoBounded(
+        &serial,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .bilinear,
+        .{ .max_workers = 1, .max_inflight_decoded_bytes = 16 * 1024 },
+    );
+    try preprocessBatchIntoBounded(
+        &parallel,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .bilinear,
+        .{ .max_workers = 2, .max_inflight_decoded_bytes = 16 * 1024 },
+    );
+
+    try std.testing.expectEqualSlices(f32, &serial, &parallel);
+    try std.testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(serial[0..12]), std.mem.sliceAsBytes(serial[12..24])));
+}
+
+test "borrowed raster batch preprocesses strided RGBA without decode copy or retention" {
+    var padded = [_]u8{
+        255, 0, 0,   255, 0, 255, 0, 255, 91, 92, 93, 94,
+        0,   0, 255, 255, 7, 8,   9, 255, 81, 82, 83, 84,
+    };
+    const raster = antfly_image.BorrowedRasterAttachment{
+        .bytes = &padded,
+        .width = 2,
+        .height = 2,
+        .stride_bytes = 12,
+        .item_id = "page-7",
+        .page_number = 7,
+    };
+    const view = try raster.imageView();
+    try std.testing.expectEqual(@intFromPtr(padded[0..].ptr), @intFromPtr(view.data.ptr));
+
+    var actual: [12]f32 = undefined;
+    try preprocessBorrowedRasterBatchInto(
+        std.testing.allocator,
+        &actual,
+        &.{raster},
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .nearest,
+    );
+    const snapshot = actual;
+    @memset(&padded, 0);
+    try std.testing.expectEqualSlices(f32, &snapshot, &actual);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[5], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[10], 1e-6);
+}
+
+test "borrowed raster Pillow bicubic scratch is bounded and caller-owned" {
+    var rgba = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+        255, 255, 255, 255,
+    };
+    const raster = antfly_image.BorrowedRasterAttachment{
+        .bytes = &rgba,
+        .width = 2,
+        .height = 2,
+        .stride_bytes = 8,
+    };
+    const decoded = Image{ .data = &rgba, .width = 2, .height = 2, .channels = 4 };
+    const expected = try preprocessDecodedWithResample(
+        std.testing.allocator,
+        decoded,
+        3,
+        .{ 0.5, 0.5, 0.5 },
+        .{ 0.5, 0.5, 0.5 },
+        .pillow_bicubic,
+    );
+    defer std.testing.allocator.free(expected);
+
+    var actual: [27]f32 = undefined;
+    try preprocessBorrowedRasterBatchIntoWithOptions(
+        std.testing.allocator,
+        &actual,
+        &.{raster},
+        3,
+        .{ 0.5, 0.5, 0.5 },
+        .{ 0.5, 0.5, 0.5 },
+        .pillow_bicubic,
+        .{ .max_inflight_decoded_bytes = 64 * 1024 },
+    );
+    try std.testing.expectEqualSlices(f32, expected, &actual);
+
+    try std.testing.expectError(
+        error.ImagePreprocessDecodedBytesExceeded,
+        preprocessBorrowedRasterBatchIntoWithOptions(
+            std.testing.allocator,
+            &actual,
+            &.{raster},
+            3,
+            .{ 0.5, 0.5, 0.5 },
+            .{ 0.5, 0.5, 0.5 },
+            .pillow_bicubic,
+            .{ .max_inflight_decoded_bytes = 64 },
+        ),
+    );
+}
+
+test "borrowed raster CLIP preprocessing preserves strided center crop semantics" {
+    var padded = [_]u8{
+        0, 0, 0, 255, 10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 91, 92, 93, 94,
+        0, 0, 0, 255, 10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 81, 82, 83, 84,
+    };
+    const raster = antfly_image.BorrowedRasterAttachment{
+        .bytes = &padded,
+        .width = 4,
+        .height = 2,
+        .stride_bytes = 20,
+    };
+    var actual: [12]f32 = undefined;
+    try preprocessClipBorrowedRasterBatchInto(
+        std.testing.allocator,
+        &actual,
+        &.{raster},
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0 / 255.0), actual[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0 / 255.0), actual[1], 1e-6);
+    for (actual[4..]) |value| try std.testing.expectApproxEqAbs(@as(f32, 0), value, 1e-6);
+}
+
+test "borrowed raster preprocessing uses caller executor without reordering" {
+    const red = [_]u8{
+        255, 0, 0, 255, 255, 0, 0, 255,
+        255, 0, 0, 255, 255, 0, 0, 255,
+    };
+    const blue = [_]u8{
+        0, 0, 255, 255, 0, 0, 255, 255,
+        0, 0, 255, 255, 0, 0, 255, 255,
+    };
+    const rasters = [_]antfly_image.BorrowedRasterAttachment{
+        .{ .bytes = &red, .width = 2, .height = 2, .stride_bytes = 8, .page_number = 1 },
+        .{ .bytes = &blue, .width = 2, .height = 2, .stride_bytes = 8, .page_number = 2 },
+    };
+    var serial: [24]f32 = undefined;
+    var parallel: [24]f32 = undefined;
+    try preprocessBorrowedRasterBatchIntoWithOptions(
+        std.testing.allocator,
+        &serial,
+        &rasters,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .nearest,
+        .{ .max_workers = 1 },
+    );
+    try preprocessBorrowedRasterBatchIntoWithOptions(
+        std.testing.allocator,
+        &parallel,
+        &rasters,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .nearest,
+        .{ .max_workers = 2, .io = std.testing.io },
+    );
+    try std.testing.expectEqualSlices(f32, &serial, &parallel);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), parallel[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), parallel[12 + 8], 1e-6);
+}
+
+test "bounded batch preprocessing uses a caller-owned executor without changing output" {
+    const images = [_][]const u8{ red_png_2x2[0..], clip_contract_png_16x8[0..] };
+    var serial: [24]f32 = undefined;
+    var runtime_owned: [24]f32 = undefined;
+
+    try preprocessBatchIntoBounded(
+        &serial,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .bilinear,
+        .{ .max_workers = 1, .max_inflight_decoded_bytes = 16 * 1024 },
+    );
+    try preprocessBatchIntoBounded(
+        &runtime_owned,
+        &images,
+        2,
+        .{ 0.0, 0.0, 0.0 },
+        .{ 1.0, 1.0, 1.0 },
+        .bilinear,
+        .{
+            .max_workers = 2,
+            .max_inflight_decoded_bytes = 16 * 1024,
+            .io = std.testing.io,
+        },
+    );
+
+    try std.testing.expectEqualSlices(f32, &serial, &runtime_owned);
+}
+
+test "bounded batch preprocessing rejects a decoded image above its wave budget" {
+    var output: [12]f32 = undefined;
+    try std.testing.expectError(
+        error.ImagePreprocessDecodedBytesExceeded,
+        preprocessBatchIntoBounded(
+            &output,
+            &.{red_png_2x2[0..]},
+            2,
+            .{ 0.0, 0.0, 0.0 },
+            .{ 1.0, 1.0, 1.0 },
+            .bilinear,
+            .{ .max_workers = 2, .max_inflight_decoded_bytes = 15 },
+        ),
+    );
+}
+
+fn readPipelineImageFixture(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        relative_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            const prefixed = try std.fmt.allocPrint(allocator, "../../{s}", .{relative_path});
+            defer allocator.free(prefixed);
+            return std.Io.Dir.cwd().readFileAlloc(
+                std.testing.io,
+                prefixed,
+                allocator,
+                .limited(4 * 1024 * 1024),
+            );
+        },
+        else => return err,
+    };
+}
+
+test "bounded preprocessing charges high-bit-depth PNG codec scratch" {
+    const alloc = std.testing.allocator;
+    const fixture = try readPipelineImageFixture(alloc, "testdata/image/png/highbit/rgba16-2x2.png");
+    defer alloc.free(fixture);
+
+    var output: [12]f32 = undefined;
+    // The old pixels*4 estimate was exactly 16 bytes and admitted this image,
+    // despite the decoder retaining a 16-bit raw scan buffer at the same time.
+    try std.testing.expectError(
+        error.ImagePreprocessDecodedBytesExceeded,
+        preprocessBatchIntoBounded(
+            &output,
+            &.{fixture},
+            2,
+            .{ 0.0, 0.0, 0.0 },
+            .{ 1.0, 1.0, 1.0 },
+            .bilinear,
+            .{ .max_workers = 1, .max_inflight_decoded_bytes = 16 },
+        ),
+    );
+}
+
+test "bounded preprocessing charges progressive JPEG coefficient state" {
+    const alloc = std.testing.allocator;
+    const fixture = try readPipelineImageFixture(alloc, "testdata/image/jpeg/progressive/red-3x2.jpg");
+    defer alloc.free(fixture);
+
+    var output: [12]f32 = undefined;
+    // The final 3x2 RGBA image is 24 bytes. Progressive coefficient storage is
+    // now charged to the same hard boundary instead of escaping the wave cap.
+    try std.testing.expectError(
+        error.ImagePreprocessDecodedBytesExceeded,
+        preprocessBatchIntoBounded(
+            &output,
+            &.{fixture},
+            2,
+            .{ 0.0, 0.0, 0.0 },
+            .{ 1.0, 1.0, 1.0 },
+            .bilinear,
+            .{ .max_workers = 1, .max_inflight_decoded_bytes = 24 },
+        ),
+    );
+}
+
+test "preprocessing slab physically bounds many small codec allocations" {
+    var budget = try SharedPreprocessBudget.initWithBacking(std.testing.allocator, 4096);
+    defer budget.deinit();
+    const allocator = budget.allocator();
+    var allocations: [512][]u8 = undefined;
+    var allocation_count: usize = 0;
+    while (allocation_count < allocations.len) {
+        const memory = allocator.alloc(u8, 1) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            break;
+        };
+        const address = @intFromPtr(memory.ptr);
+        try std.testing.expect(address >= @intFromPtr(budget.slab.ptr));
+        try std.testing.expect(address + memory.len <= @intFromPtr(budget.slab.ptr) + budget.slab.len);
+        allocations[allocation_count] = memory;
+        allocation_count += 1;
+    }
+    try std.testing.expect(allocation_count > 1);
+    try std.testing.expect(allocation_count < allocations.len);
+    try std.testing.expect(budget.limit_exceeded.load(.acquire));
+    try std.testing.expect(budget.peak_live_bytes.load(.acquire) <= budget.slab.len);
+    for (allocations[0..allocation_count]) |memory| allocator.free(memory);
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes.load(.acquire));
+}
+
+test "preprocessing slab preserves backing allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        SharedPreprocessBudget.initWithBacking(failing.allocator(), 4096),
+    );
+}
+
+test "preprocessing slab supports concurrent codec allocation lifetimes" {
+    var budget = try SharedPreprocessBudget.initWithBacking(std.testing.allocator, 1024 * 1024);
+    defer budget.deinit();
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(shared_budget: *SharedPreprocessBudget, worker_failed: *std.atomic.Value(bool)) void {
+            const allocator = shared_budget.allocator();
+            var blocks: [64][]u8 = undefined;
+            var count: usize = 0;
+            while (count < blocks.len) : (count += 1) {
+                blocks[count] = allocator.alloc(u8, 1 + (count % 31)) catch {
+                    worker_failed.store(true, .release);
+                    break;
+                };
+            }
+            while (count > 0) {
+                count -= 1;
+                allocator.free(blocks[count]);
+            }
+        }
+    };
+
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    errdefer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &budget, &failed });
+        started += 1;
+    }
+    for (threads) |thread| thread.join();
+    started = 0;
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes.load(.acquire));
+    try std.testing.expect(budget.peak_live_bytes.load(.acquire) <= budget.slab.len);
+}
+
+test "preprocessing slab sizing follows bounded wave demand instead of request ceiling" {
+    const ceiling = 128 * 1024 * 1024;
+    const tiny = preprocessSlabBytesForWave(16, 1, ceiling);
+    try std.testing.expect(tiny >= 16);
+    try std.testing.expect(tiny < 1024 * 1024);
+    try std.testing.expectEqual(ceiling, preprocessSlabBytesForWave(ceiling, maximum_preprocess_workers, ceiling));
+    try std.testing.expectEqual(ceiling, preprocessSlabBytesForWave(std.math.maxInt(usize), maximum_preprocess_workers, ceiling));
+}
+
+test "preprocessing slab growth remains physically capped" {
+    const TrackingBacking = struct {
+        child: std.mem.Allocator,
+        live_bytes: usize = 0,
+        peak_live_bytes: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            } };
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const memory = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+            self.live_bytes += len;
+            self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
+            return memory;
+        }
+
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(self.live_bytes >= memory.len);
+            self.live_bytes -= memory.len;
+            self.child.rawFree(memory, alignment, ret_addr);
+        }
+    };
+    var tracking = TrackingBacking{ .child = std.testing.allocator };
+    var budget = try SharedPreprocessBudget.initResizableWithBacking(tracking.allocator(), 4096, 16 * 1024);
+    defer budget.deinit();
+    const allocator = budget.allocator();
+
+    try std.testing.expectError(error.OutOfMemory, allocator.alloc(u8, 6000));
+    try std.testing.expect(budget.limit_exceeded.load(.acquire));
+    try std.testing.expect(try budget.growAfterExhaustion());
+    try std.testing.expectEqual(@as(usize, 8192), budget.slab.len);
+    const memory = try allocator.alloc(u8, 6000);
+    allocator.free(memory);
+
+    try std.testing.expect(try budget.growAfterExhaustion());
+    try std.testing.expectEqual(@as(usize, 16 * 1024), budget.slab.len);
+    try std.testing.expect(!(try budget.growAfterExhaustion()));
+    try std.testing.expect(budget.slab.len <= budget.max_bytes);
+    try std.testing.expect(tracking.peak_live_bytes <= budget.max_bytes);
+}
+
+test "preprocessing slab admission follows physical growth deltas" {
+    const Recorder = struct {
+        calls: [3][2]usize = undefined,
+        len: usize = 0,
+        deny_above: usize = 8192,
+
+        fn grow(context: *anyopaque, current: usize, target: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (target > self.deny_above) return error.ResourceTemporarilyUnavailable;
+            self.calls[self.len] = .{ current, target };
+            self.len += 1;
+        }
+    };
+    var recorder = Recorder{};
+    var budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(
+        std.testing.allocator,
+        4096,
+        16 * 1024,
+        .{ .context = &recorder, .grow = Recorder.grow },
+    );
+    defer budget.deinit();
+    try budget.ensureCapacity(8192);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, budget.ensureCapacity(16 * 1024));
+    try std.testing.expectEqual(@as(usize, 8192), budget.slab.len);
+    try std.testing.expectEqual(@as(usize, 2), recorder.len);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4096 }, &recorder.calls[0]);
+    try std.testing.expectEqualSlices(usize, &.{ 4096, 8192 }, &recorder.calls[1]);
+}
+
+test "preprocessing slab growth failure leaves no retired backing allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var budget = try SharedPreprocessBudget.initResizableWithBacking(failing.allocator(), 4096, 8192);
+    defer budget.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, budget.ensureCapacity(8192));
+    try std.testing.expectEqual(@as(usize, 0), budget.slab.len);
+    try std.testing.expect(budget.free_head == null);
+}
+
+test "adaptive preprocessing recovers concurrency for a cheap tail" {
+    const ceiling: usize = 8;
+    var workers = reduceAdaptivePreprocessWorkers(ceiling, ceiling);
+    try std.testing.expectEqual(@as(usize, 4), workers);
+    workers = reduceAdaptivePreprocessWorkers(workers, workers);
+    try std.testing.expectEqual(@as(usize, 2), workers);
+
+    // Once an expensive prefix has completed at the reduced width, successful
+    // cheap waves restore parallelism without exceeding the configured limit.
+    workers = recoverAdaptivePreprocessWorkers(workers, ceiling);
+    try std.testing.expectEqual(@as(usize, 4), workers);
+    workers = recoverAdaptivePreprocessWorkers(workers, ceiling);
+    try std.testing.expectEqual(ceiling, workers);
+    try std.testing.expectEqual(ceiling, recoverAdaptivePreprocessWorkers(workers, ceiling));
 }
 
 test "decode png fixture dimensions are stable" {
@@ -721,6 +1177,18 @@ pub fn preprocessDecodedWithResample(
     resample: Resample,
 ) ![]f32 {
     return shared.preprocessDecodedWithResample(allocator, toSharedImage(img), target_size, mean, std_dev, resample);
+}
+
+pub fn preprocessDecodedWithResampleInto(
+    allocator: std.mem.Allocator,
+    img: Image,
+    output: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+) !void {
+    return shared.preprocessDecodedWithResampleInto(allocator, toSharedImage(img), output, target_size, mean, std_dev, resample);
 }
 
 /// Preprocess an already-decoded image to an explicit width/height target.
@@ -1007,18 +1475,167 @@ pub fn preprocessBatch(
     mean: [3]f32,
     std_dev: [3]f32,
 ) ![]f32 {
+    return preprocessBatchWithOptions(allocator, image_list, target_size, mean, std_dev, .{});
+}
+
+pub fn preprocessBatchWithOptions(
+    allocator: std.mem.Allocator,
+    image_list: []const []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    options: BatchPreprocessOptions,
+) ![]f32 {
     const ts: usize = target_size;
-    const per_image = 3 * ts * ts;
-    const result = try allocator.alloc(f32, image_list.len * per_image);
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const output_len = std.math.mul(usize, image_list.len, per_image) catch return error.InvalidInputShape;
+    const result = try allocator.alloc(f32, output_len);
     errdefer allocator.free(result);
-
-    for (image_list, 0..) |image_bytes, i| {
-        const single = try preprocess(allocator, image_bytes, target_size, mean, std_dev);
-        defer allocator.free(single);
-        @memcpy(result[i * per_image ..][0..per_image], single);
-    }
-
+    try preprocessBatchIntoBounded(result, image_list, target_size, mean, std_dev, .bilinear, options);
     return result;
+}
+
+/// Controls CPU preprocessing independently from model batch size. The byte
+/// ceiling is a hard aggregate limit for every allocation made by the image
+/// codecs in an active wave. The caller-owned output tensor is admitted by the
+/// model runtime separately and is intentionally not charged here.
+pub const ScratchAdmission = struct {
+    context: *anyopaque,
+    /// Admit the additional physical bytes before the codec slab grows from
+    /// `current_bytes` to `target_bytes`. Implementations retain every acquired
+    /// delta until preprocessing returns, so concurrent requests cannot overbook
+    /// the process while the slab is replaced between waves.
+    grow: *const fn (*anyopaque, usize, usize) anyerror!void,
+};
+
+pub const BatchPreprocessOptions = struct {
+    max_workers: usize = 8,
+    max_inflight_decoded_bytes: usize = 128 * 1024 * 1024,
+    /// Production runtimes pass their leased inference executor here. Offline
+    /// and test callers may omit it and use the synchronous linalg fallback.
+    io: ?std.Io = null,
+    scratch_admission: ?ScratchAdmission = null,
+};
+
+/// Decode and preprocess directly into a caller-owned batch tensor. Output
+/// slices are indexed before workers start, so completion order cannot reorder
+/// model inputs. Temporary decode state uses one thread-safe allocator per
+/// task and is released before the next admitted wave.
+pub fn preprocessBatchIntoBounded(
+    result: []f32,
+    image_list: []const []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+    options: BatchPreprocessOptions,
+) !void {
+    const ts: usize = target_size;
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const expected_len = std.math.mul(usize, image_list.len, per_image) catch return error.InvalidInputShape;
+    if (result.len != expected_len) return error.InvalidInputShape;
+    try runBoundedPreprocessBatch(image_list, result, per_image, .{ .square = .{
+        .target_size = target_size,
+        .mean = mean,
+        .std_dev = std_dev,
+        .resample = resample,
+    } }, options);
+}
+
+/// Preprocess renderer-owned rasters directly into caller-owned model storage.
+/// Source buffers are never decoded, copied, or retained. The allocator is
+/// used only to provision bounded, thread-safe resampler scratch for modes
+/// such as Pillow-compatible bicubic. Arbitrary validated row stride is
+/// preserved all the way into the sampler.
+pub fn preprocessBorrowedRasterBatchInto(
+    allocator: std.mem.Allocator,
+    result: []f32,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+) !void {
+    return preprocessBorrowedRasterBatchIntoWithOptions(
+        allocator,
+        result,
+        rasters,
+        target_size,
+        mean,
+        std_dev,
+        resample,
+        .{},
+    );
+}
+
+pub fn preprocessBorrowedRasterBatchIntoWithOptions(
+    allocator: std.mem.Allocator,
+    result: []f32,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+    options: BatchPreprocessOptions,
+) !void {
+    const ts: usize = target_size;
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const expected_len = std.math.mul(usize, rasters.len, per_image) catch return error.InvalidInputShape;
+    if (result.len != expected_len) return error.InvalidInputShape;
+
+    try runBorrowedRasterPreprocessBatch(allocator, rasters, result, per_image, .{ .square = .{
+        .target_size = target_size,
+        .mean = mean,
+        .std_dev = std_dev,
+        .resample = resample,
+    } }, options);
+}
+
+/// CLIP/SigLIP variant of the borrowed-raster fast path. It preserves the
+/// encoded implementation's short-edge resize and center-crop semantics while
+/// honoring renderer row stride and retaining no source memory.
+pub fn preprocessClipBorrowedRasterBatchInto(
+    allocator: std.mem.Allocator,
+    result: []f32,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    return preprocessClipBorrowedRasterBatchIntoWithOptions(
+        allocator,
+        result,
+        rasters,
+        target_size,
+        mean,
+        std_dev,
+        .{},
+    );
+}
+
+pub fn preprocessClipBorrowedRasterBatchIntoWithOptions(
+    allocator: std.mem.Allocator,
+    result: []f32,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    options: BatchPreprocessOptions,
+) !void {
+    const ts: usize = target_size;
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const expected_len = std.math.mul(usize, rasters.len, per_image) catch return error.InvalidInputShape;
+    if (result.len != expected_len) return error.InvalidInputShape;
+
+    try runBorrowedRasterPreprocessBatch(allocator, rasters, result, per_image, .{ .clip = .{
+        .target_size = target_size,
+        .mean = mean,
+        .std_dev = std_dev,
+    } }, options);
 }
 
 /// Preprocess CLIP embedding images: resize the shortest edge to target_size,
@@ -1030,116 +1647,617 @@ pub fn preprocessClipBatch(
     mean: [3]f32,
     std_dev: [3]f32,
 ) ![]f32 {
-    const ts: usize = target_size;
-    const per_image = 3 * ts * ts;
-    const result = try allocator.alloc(f32, image_list.len * per_image);
-    errdefer allocator.free(result);
-
-    if (image_list.len > 1) {
-        try preprocessClipBatchParallel(image_list, result, per_image, target_size, mean, std_dev);
-        return result;
-    }
-
-    for (image_list, 0..) |image_bytes, i| {
-        try preprocessClipImage(
-            allocator,
-            image_bytes,
-            result[i * per_image ..][0..per_image],
-            target_size,
-            mean,
-            std_dev,
-        );
-    }
-
-    return result;
+    return preprocessClipBatchWithOptions(allocator, image_list, target_size, mean, std_dev, .{});
 }
 
-const max_clip_preprocess_threads: usize = 8;
-
-const ClipPreprocessBatch = struct {
+pub fn preprocessClipBatchWithOptions(
+    allocator: std.mem.Allocator,
     image_list: []const []const u8,
-    result: []f32,
-    per_image: usize,
     target_size: u32,
     mean: [3]f32,
     std_dev: [3]f32,
-    next: std.atomic.Value(usize) = .{ .raw = 0 },
-};
+    options: BatchPreprocessOptions,
+) ![]f32 {
+    const ts: usize = target_size;
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const output_len = std.math.mul(usize, image_list.len, per_image) catch return error.InvalidInputShape;
+    const result = try allocator.alloc(f32, output_len);
+    errdefer allocator.free(result);
 
-const ClipPreprocessWorker = struct {
-    batch: *ClipPreprocessBatch,
-    err: ?anyerror = null,
-
-    fn run(self: *ClipPreprocessWorker) void {
-        const allocator = std.heap.page_allocator;
-
-        while (true) {
-            const i = self.batch.next.fetchAdd(1, .monotonic);
-            if (i >= self.batch.image_list.len) return;
-
-            preprocessClipImage(
-                allocator,
-                self.batch.image_list[i],
-                self.batch.result[i * self.batch.per_image ..][0..self.batch.per_image],
-                self.batch.target_size,
-                self.batch.mean,
-                self.batch.std_dev,
-            ) catch |err| {
-                self.err = err;
-                return;
-            };
-        }
-    }
-};
-
-fn preprocessClipBatchParallel(
-    image_list: []const []const u8,
-    result: []f32,
-    per_image: usize,
-    target_size: u32,
-    mean: [3]f32,
-    std_dev: [3]f32,
-) !void {
-    const cpu_count = std.Thread.getCpuCount() catch 1;
-    const thread_count = @min(image_list.len, @min(cpu_count, max_clip_preprocess_threads));
-    if (thread_count <= 1) {
-        const allocator = std.heap.page_allocator;
-        for (image_list, 0..) |image_bytes, i| {
-            try preprocessClipImage(
-                allocator,
-                image_bytes,
-                result[i * per_image ..][0..per_image],
-                target_size,
-                mean,
-                std_dev,
-            );
-        }
-        return;
-    }
-
-    var batch = ClipPreprocessBatch{
-        .image_list = image_list,
-        .result = result,
-        .per_image = per_image,
+    try runBoundedPreprocessBatch(image_list, result, per_image, .{ .clip = .{
         .target_size = target_size,
         .mean = mean,
         .std_dev = std_dev,
-    };
-    var workers: [max_clip_preprocess_threads]ClipPreprocessWorker = undefined;
-    var threads: [max_clip_preprocess_threads]std.Thread = undefined;
-    var spawned: usize = 0;
+    } }, options);
+    return result;
+}
 
-    while (spawned < thread_count) : (spawned += 1) {
-        workers[spawned] = .{ .batch = &batch };
-        threads[spawned] = std.Thread.spawn(.{}, ClipPreprocessWorker.run, .{&workers[spawned]}) catch |err| {
-            for (threads[0..spawned]) |thread| thread.join();
-            return err;
+/// CLIP/SigLIP preprocessing into caller-owned model storage. This is the
+/// ownership-preserving counterpart to `preprocessClipBatchWithOptions` and
+/// avoids retaining a temporary normalized tensor alongside the model input.
+pub fn preprocessClipBatchIntoBounded(
+    result: []f32,
+    image_list: []const []const u8,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    options: BatchPreprocessOptions,
+) !void {
+    const ts: usize = target_size;
+    const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
+    const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
+    const expected_len = std.math.mul(usize, image_list.len, per_image) catch return error.InvalidInputShape;
+    if (result.len != expected_len) return error.InvalidInputShape;
+
+    try runBoundedPreprocessBatch(image_list, result, per_image, .{ .clip = .{
+        .target_size = target_size,
+        .mean = mean,
+        .std_dev = std_dev,
+    } }, options);
+}
+
+const maximum_preprocess_workers: usize = 8;
+const preprocess_slab_worker_headroom_bytes: usize = 64 * 1024;
+
+const BatchPreprocessOperation = union(enum) {
+    square: struct {
+        target_size: u32,
+        mean: [3]f32,
+        std_dev: [3]f32,
+        resample: Resample,
+    },
+    clip: struct {
+        target_size: u32,
+        mean: [3]f32,
+        std_dev: [3]f32,
+    },
+};
+
+fn preprocessSlabBytesForWave(decoded_bytes: usize, worker_count: usize, max_bytes: usize) usize {
+    // RGBA is the format-independent lower bound. Double it for codec working
+    // state and add bounded per-worker metadata/entropy scratch. This is only
+    // an eager sizing hint: the allocator grows on a real exhaustion signal,
+    // and max_bytes remains the authoritative physical ceiling.
+    const decoded_and_scratch = std.math.mul(usize, decoded_bytes, 2) catch std.math.maxInt(usize);
+    const worker_headroom = std.math.mul(usize, worker_count, preprocess_slab_worker_headroom_bytes) catch std.math.maxInt(usize);
+    const desired = std.math.add(usize, decoded_and_scratch, worker_headroom) catch std.math.maxInt(usize);
+    return @min(max_bytes, @max(@min(max_bytes, @sizeOf(SharedPreprocessBudget.FreeBlock)), desired));
+}
+
+fn reduceAdaptivePreprocessWorkers(current: usize, failed_wave_len: usize) usize {
+    const observed = @min(current, failed_wave_len);
+    return if (observed <= 2) 1 else observed / 2;
+}
+
+fn recoverAdaptivePreprocessWorkers(current: usize, configured_limit: usize) usize {
+    return @min(configured_limit, std.math.mul(usize, current, 2) catch configured_limit);
+}
+
+/// A wave-scoped, thread-safe allocator that accounts decoder output and all
+/// codec scratch against one aggregate ceiling. Using the allocator as the
+/// enforcement boundary avoids format-specific peak estimates becoming stale
+/// when a codec adds a new intermediate buffer.
+const SharedPreprocessBudget = struct {
+    const FreeBlock = extern struct {
+        len: usize,
+        next: ?*FreeBlock,
+    };
+    const AllocationHeader = extern struct {
+        block_start: [*]u8,
+        block_len: usize,
+    };
+
+    backing: std.mem.Allocator,
+    slab: []align(@alignOf(FreeBlock)) u8,
+    max_bytes: usize,
+    free_head: ?*FreeBlock,
+    locked: std.atomic.Value(bool) = .init(false),
+    live_bytes: std.atomic.Value(usize) = .init(0),
+    peak_live_bytes: std.atomic.Value(usize) = .init(0),
+    limit_exceeded: std.atomic.Value(bool) = .init(false),
+    scratch_admission: ?ScratchAdmission = null,
+
+    fn init(max_live_bytes: usize) !@This() {
+        return initResizableWithBacking(std.heap.page_allocator, max_live_bytes, max_live_bytes);
+    }
+
+    fn initWithBacking(backing: std.mem.Allocator, max_live_bytes: usize) !@This() {
+        return initResizableWithBacking(backing, max_live_bytes, max_live_bytes);
+    }
+
+    fn initResizableWithBacking(backing: std.mem.Allocator, initial_bytes: usize, max_bytes: usize) !@This() {
+        return initResizableAdmittedWithBacking(backing, initial_bytes, max_bytes, null);
+    }
+
+    fn initResizableAdmittedWithBacking(
+        backing: std.mem.Allocator,
+        initial_bytes: usize,
+        max_bytes: usize,
+        scratch_admission: ?ScratchAdmission,
+    ) !@This() {
+        if (initial_bytes == 0 or initial_bytes > max_bytes) return error.InvalidBatchPreprocessOptions;
+        if (scratch_admission) |admission| try admission.grow(admission.context, 0, initial_bytes);
+        const slab = try backing.alignedAlloc(u8, .of(FreeBlock), initial_bytes);
+        var self = @This(){
+            .backing = backing,
+            .slab = slab,
+            .max_bytes = max_bytes,
+            .free_head = null,
+            .scratch_admission = scratch_admission,
+        };
+        self.resetFreeList();
+        return self;
+    }
+
+    fn resetFreeList(self: *@This()) void {
+        self.free_head = null;
+        if (self.slab.len < @sizeOf(FreeBlock)) return;
+        const first: *FreeBlock = @ptrCast(@alignCast(self.slab.ptr));
+        first.* = .{ .len = self.slab.len, .next = null };
+        self.free_head = first;
+    }
+
+    /// Grow only between waves, when no codec retains an allocation. Retire the
+    /// old slab before allocating its replacement so physical backing never
+    /// exceeds max_bytes, even transiently. On backing failure the request is
+    /// terminal, but the empty budget remains valid for deferred destruction.
+    fn ensureCapacity(self: *@This(), requested_bytes: usize) !void {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        const target = @min(requested_bytes, self.max_bytes);
+        if (target <= self.slab.len) return;
+
+        if (self.scratch_admission) |admission|
+            try admission.grow(admission.context, self.slab.len, target);
+
+        const retired = self.slab;
+        self.slab = retired[0..0];
+        self.free_head = null;
+        self.backing.free(retired);
+        const replacement = try self.backing.alignedAlloc(u8, .of(FreeBlock), target);
+        self.slab = replacement;
+        self.resetFreeList();
+    }
+
+    fn growAfterExhaustion(self: *@This()) !bool {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        if (self.slab.len >= self.max_bytes) return false;
+        const doubled = std.math.mul(usize, self.slab.len, 2) catch self.max_bytes;
+        try self.ensureCapacity(@min(self.max_bytes, @max(self.slab.len + 1, doubled)));
+        return true;
+    }
+
+    fn deinit(self: *@This()) void {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        if (self.slab.len > 0) self.backing.free(self.slab);
+        self.* = undefined;
+    }
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
         };
     }
-    for (threads[0..spawned]) |thread| thread.join();
-    for (workers[0..spawned]) |worker| {
-        if (worker.err) |err| return err;
+
+    fn lock(self: *@This()) void {
+        while (true) {
+            if (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) == null) return;
+            std.Thread.yield() catch {};
+        }
     }
+
+    fn unlock(self: *@This()) void {
+        self.locked.store(false, .release);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        _ = ret_addr;
+        self.lock();
+        defer self.unlock();
+
+        const requested_alignment = alignment.toByteUnits();
+        const allocation_alignment = @max(requested_alignment, @alignOf(AllocationHeader));
+        var previous: ?*FreeBlock = null;
+        var current = self.free_head;
+        while (current) |block| {
+            const block_start = @intFromPtr(block);
+            const header_end = std.math.add(usize, block_start, @sizeOf(AllocationHeader)) catch break;
+            const user_start = std.mem.alignForward(usize, header_end, allocation_alignment);
+            const user_end = std.math.add(usize, user_start, len) catch break;
+            var suffix_start = std.mem.alignForward(usize, user_end, @alignOf(FreeBlock));
+            const block_end = std.math.add(usize, block_start, block.len) catch break;
+            if (suffix_start > block_end or user_end > block_end) {
+                previous = block;
+                current = block.next;
+                continue;
+            }
+
+            // Avoid manufacturing a free fragment too small to hold its own
+            // metadata. Such tail padding remains charged to this allocation.
+            if (block_end - suffix_start < @sizeOf(FreeBlock)) suffix_start = block_end;
+            const consumed = suffix_start - block_start;
+            const next = block.next;
+            if (suffix_start < block_end) {
+                const suffix: *FreeBlock = @ptrFromInt(suffix_start);
+                suffix.* = .{ .len = block_end - suffix_start, .next = next };
+                if (previous) |prev| prev.next = suffix else self.free_head = suffix;
+            } else if (previous) |prev| {
+                prev.next = next;
+            } else {
+                self.free_head = next;
+            }
+
+            const header: *AllocationHeader = @ptrFromInt(user_start - @sizeOf(AllocationHeader));
+            header.* = .{ .block_start = @ptrFromInt(block_start), .block_len = consumed };
+            const live = self.live_bytes.load(.monotonic) + consumed;
+            self.live_bytes.store(live, .release);
+            self.peak_live_bytes.store(@max(self.peak_live_bytes.load(.monotonic), live), .release);
+            return @ptrFromInt(user_start);
+        }
+        self.limit_exceeded.store(true, .release);
+        return null;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        // Returning false asks Allocator to allocate-copy-free. This keeps the
+        // free-list metadata simple and charges the true simultaneous peak.
+        return false;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        _ = alignment;
+        _ = ret_addr;
+        self.lock();
+        defer self.unlock();
+
+        const header_addr = @intFromPtr(memory.ptr) - @sizeOf(AllocationHeader);
+        const header: *const AllocationHeader = @ptrFromInt(header_addr);
+        const block_start = header.block_start;
+        const block_len = header.block_len;
+        const released: *FreeBlock = @ptrCast(@alignCast(block_start));
+        released.* = .{ .len = block_len, .next = null };
+
+        var previous: ?*FreeBlock = null;
+        var current = self.free_head;
+        while (current) |block| {
+            if (@intFromPtr(block) > @intFromPtr(released)) break;
+            previous = block;
+            current = block.next;
+        }
+        released.next = current;
+        if (previous) |prev| prev.next = released else self.free_head = released;
+
+        if (current) |next| {
+            if (@intFromPtr(released) + released.len == @intFromPtr(next)) {
+                released.len += next.len;
+                released.next = next.next;
+            }
+        }
+        if (previous) |prev| {
+            if (@intFromPtr(prev) + prev.len == @intFromPtr(released)) {
+                prev.len += released.len;
+                prev.next = released.next;
+            }
+        }
+
+        const old_live = self.live_bytes.load(.monotonic);
+        std.debug.assert(old_live >= block_len);
+        self.live_bytes.store(old_live - block_len, .release);
+    }
+};
+
+const BatchPreprocessTask = struct {
+    allocator: std.mem.Allocator,
+    image_bytes: []const u8,
+    output: []f32,
+    operation: BatchPreprocessOperation,
+    err: ?anyerror = null,
+
+    fn run(self: *BatchPreprocessTask) void {
+        switch (self.operation) {
+            .square => |square| {
+                const decoded = decodeRgba(self.allocator, self.image_bytes) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                defer decoded.deinit(self.allocator);
+                preprocessDecodedWithResampleInto(
+                    self.allocator,
+                    decoded,
+                    self.output,
+                    square.target_size,
+                    square.mean,
+                    square.std_dev,
+                    square.resample,
+                ) catch |err| {
+                    self.err = err;
+                };
+            },
+            .clip => |clip| preprocessClipImage(
+                self.allocator,
+                self.image_bytes,
+                self.output,
+                clip.target_size,
+                clip.mean,
+                clip.std_dev,
+            ) catch |err| {
+                self.err = err;
+            },
+        }
+    }
+
+    fn runOpaque(ptr: *anyopaque) void {
+        const self: *BatchPreprocessTask = @ptrCast(@alignCast(ptr));
+        self.run();
+    }
+};
+
+const BorrowedRasterPreprocessTask = struct {
+    allocator: std.mem.Allocator,
+    raster: antfly_image.BorrowedRasterAttachment,
+    output: []f32,
+    operation: BatchPreprocessOperation,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        const view = self.raster.imageView() catch |err| {
+            self.err = err;
+            return;
+        };
+        switch (self.operation) {
+            .square => |square| shared.preprocessDecodedWithResampleInto(
+                self.allocator,
+                view,
+                self.output,
+                square.target_size,
+                square.mean,
+                square.std_dev,
+                square.resample,
+            ) catch |err| {
+                self.err = err;
+            },
+            .clip => |clip| {
+                view.validate() catch |err| {
+                    self.err = err;
+                    return;
+                };
+                preprocessImageViewClip(
+                    view,
+                    self.output,
+                    clip.target_size,
+                    clip.mean,
+                    clip.std_dev,
+                );
+            },
+        }
+    }
+
+    fn runOpaque(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.run();
+    }
+};
+
+fn runBorrowedRasterPreprocessBatch(
+    backing_allocator: std.mem.Allocator,
+    rasters: []const antfly_image.BorrowedRasterAttachment,
+    result: []f32,
+    per_image: usize,
+    operation: BatchPreprocessOperation,
+    options: BatchPreprocessOptions,
+) !void {
+    if (options.max_workers == 0 or options.max_inflight_decoded_bytes == 0)
+        return error.InvalidBatchPreprocessOptions;
+    if (rasters.len == 0) return;
+    const cpu_count = linalg.pool.cachedCpuCount();
+    const worker_limit: usize = @max(@as(usize, 1), @min(
+        rasters.len,
+        @min(cpu_count, @min(options.max_workers, maximum_preprocess_workers)),
+    ));
+    var tasks: [maximum_preprocess_workers]BorrowedRasterPreprocessTask = undefined;
+    var jobs: [maximum_preprocess_workers]linalg.pool.Job = undefined;
+    var scratch_budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(
+        backing_allocator,
+        preprocessSlabBytesForWave(0, worker_limit, options.max_inflight_decoded_bytes),
+        options.max_inflight_decoded_bytes,
+        options.scratch_admission,
+    );
+    defer scratch_budget.deinit();
+    const scratch_allocator = scratch_budget.allocator();
+    var first: usize = 0;
+    var adaptive_worker_limit: usize = worker_limit;
+    while (first < rasters.len) {
+        const wave_len = @min(adaptive_worker_limit, rasters.len - first);
+        scratch_budget.limit_exceeded.store(false, .release);
+        for (tasks[0..wave_len], 0..) |*task, offset| {
+            const index = first + offset;
+            task.* = .{
+                .allocator = scratch_allocator,
+                .raster = rasters[index],
+                .output = result[index * per_image ..][0..per_image],
+                .operation = operation,
+            };
+        }
+        for (jobs[0..wave_len], tasks[0..wave_len]) |*job, *task|
+            job.* = .{ .fn_ptr = BorrowedRasterPreprocessTask.runOpaque, .ctx = task };
+        if (options.io) |io|
+            try linalg.pool.dispatchJobsIo(io, jobs[0..wave_len])
+        else for (jobs[0..wave_len]) |job|
+            job.fn_ptr(job.ctx);
+        var first_error: ?anyerror = null;
+        for (tasks[0..wave_len]) |task| {
+            if (task.err) |err| {
+                first_error = err;
+                break;
+            }
+        }
+        std.debug.assert(scratch_budget.live_bytes.load(.acquire) == 0);
+        if (first_error) |err| {
+            if (err == error.OutOfMemory and scratch_budget.limit_exceeded.load(.acquire)) {
+                if (try scratch_budget.growAfterExhaustion()) continue;
+                if (wave_len > 1) {
+                    adaptive_worker_limit = reduceAdaptivePreprocessWorkers(adaptive_worker_limit, wave_len);
+                    continue;
+                }
+                return error.ImagePreprocessDecodedBytesExceeded;
+            }
+            return err;
+        }
+        first += wave_len;
+        adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
+    }
+}
+
+fn runBoundedPreprocessBatch(
+    image_list: []const []const u8,
+    result: []f32,
+    per_image: usize,
+    operation: BatchPreprocessOperation,
+    options: BatchPreprocessOptions,
+) !void {
+    if (options.max_workers == 0 or options.max_inflight_decoded_bytes == 0)
+        return error.InvalidBatchPreprocessOptions;
+    if (image_list.len == 0) return;
+
+    const decoded_bytes = try std.heap.page_allocator.alloc(usize, image_list.len);
+    defer std.heap.page_allocator.free(decoded_bytes);
+    for (image_list, decoded_bytes) |image_bytes, *bytes| {
+        const info = inspectEncodedForInference(image_bytes, null) catch |err| switch (err) {
+            // Preserve the public preprocess/decode error contract while the
+            // new batch-only aggregate ceiling remains separately observable.
+            error.ImageTooLarge => return error.ImageDecodeFailed,
+            else => return err,
+        };
+        const pixels = try info.pixels();
+        const rgba_bytes_u64 = std.math.mul(u64, pixels, 4) catch return error.ImagePreprocessDecodedBytesExceeded;
+        bytes.* = std.math.cast(usize, rgba_bytes_u64) orelse return error.ImagePreprocessDecodedBytesExceeded;
+        if (bytes.* > options.max_inflight_decoded_bytes) return error.ImagePreprocessDecodedBytesExceeded;
+    }
+
+    const cpu_count = linalg.pool.cachedCpuCount();
+    const worker_limit = @max(@as(usize, 1), @min(image_list.len, @min(cpu_count, @min(options.max_workers, maximum_preprocess_workers))));
+    var tasks: [maximum_preprocess_workers]BatchPreprocessTask = undefined;
+    var jobs: [maximum_preprocess_workers]linalg.pool.Job = undefined;
+
+    var first: usize = 0;
+    var adaptive_worker_limit: usize = worker_limit;
+    // Start from the first wave's bounded demand rather than reserving the
+    // entire (normally 128 MiB) request ceiling. The slab grows only between
+    // waves and never beyond the ceiling, then remains reusable for the rest
+    // of this request without per-wave mmap/munmap churn.
+    const first_wave_len = planPreprocessWaveLength(decoded_bytes, first, adaptive_worker_limit, options.max_inflight_decoded_bytes);
+    const first_wave_bytes = preprocessWaveDecodedBytes(decoded_bytes[first..][0..first_wave_len]);
+    var wave_budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(
+        std.heap.page_allocator,
+        preprocessSlabBytesForWave(first_wave_bytes, first_wave_len, options.max_inflight_decoded_bytes),
+        options.max_inflight_decoded_bytes,
+        options.scratch_admission,
+    );
+    defer wave_budget.deinit();
+    const wave_allocator = wave_budget.allocator();
+    while (first < image_list.len) {
+        const wave_len = planPreprocessWaveLength(decoded_bytes, first, adaptive_worker_limit, options.max_inflight_decoded_bytes);
+        const wave_decoded_bytes = preprocessWaveDecodedBytes(decoded_bytes[first..][0..wave_len]);
+        std.debug.assert(wave_len > 0);
+        std.debug.assert(wave_budget.live_bytes.load(.acquire) == 0);
+        try wave_budget.ensureCapacity(preprocessSlabBytesForWave(
+            wave_decoded_bytes,
+            wave_len,
+            options.max_inflight_decoded_bytes,
+        ));
+        wave_budget.limit_exceeded.store(false, .release);
+
+        for (tasks[0..wave_len], 0..) |*task, offset| {
+            const index = first + offset;
+            task.* = .{
+                .allocator = wave_allocator,
+                .image_bytes = image_list[index],
+                .output = result[index * per_image ..][0..per_image],
+                .operation = operation,
+            };
+        }
+
+        for (jobs[0..wave_len], tasks[0..wave_len]) |*job, *task| {
+            job.* = .{ .fn_ptr = BatchPreprocessTask.runOpaque, .ctx = task };
+        }
+        // Production calls schedule through the BackendRuntime-owned
+        // inference executor, which supplies the aggregate CPU/thread bound
+        // and lifecycle. Offline callers retain the synchronous fallback.
+        if (options.io) |io|
+            try linalg.pool.dispatchJobsIo(io, jobs[0..wave_len])
+        else for (jobs[0..wave_len]) |job|
+            job.fn_ptr(job.ctx);
+        // Error selection is input-index deterministic rather than completion
+        // order dependent.
+        var first_error: ?anyerror = null;
+        for (tasks[0..wave_len]) |task| {
+            if (task.err) |err| {
+                first_error = err;
+                break;
+            }
+        }
+        std.debug.assert(wave_budget.live_bytes.load(.acquire) == 0);
+        if (first_error) |err| {
+            if (err == error.OutOfMemory and wave_budget.limit_exceeded.load(.acquire)) {
+                // An intentionally small initial reservation is not evidence
+                // that concurrency is unsafe. Grow within the physical cap and
+                // retry this same wave before reducing worker width.
+                if (try wave_budget.growAfterExhaustion()) continue;
+                // A format may need substantially more scratch than its final
+                // RGBA buffer. Retry with less concurrency so a valid image is
+                // not rejected merely because peers occupied the shared cap.
+                if (wave_len > 1) {
+                    adaptive_worker_limit = reduceAdaptivePreprocessWorkers(adaptive_worker_limit, wave_len);
+                    continue;
+                }
+                return error.ImagePreprocessDecodedBytesExceeded;
+            }
+            return err;
+        }
+        first += wave_len;
+        adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
+    }
+}
+
+fn planPreprocessWaveLength(decoded_bytes: []const usize, first: usize, worker_limit: usize, max_bytes: usize) usize {
+    var wave_len: usize = 0;
+    var wave_decoded_bytes: usize = 0;
+    while (first + wave_len < decoded_bytes.len and wave_len < worker_limit) {
+        const bytes = decoded_bytes[first + wave_len];
+        const next = std.math.add(usize, wave_decoded_bytes, bytes) catch break;
+        if (wave_len > 0 and next > max_bytes) break;
+        wave_decoded_bytes = next;
+        wave_len += 1;
+    }
+    return wave_len;
+}
+
+fn preprocessWaveDecodedBytes(decoded_bytes: []const usize) usize {
+    var total: usize = 0;
+    for (decoded_bytes) |bytes| total += bytes;
+    return total;
 }
 
 fn preprocessClipImage(
@@ -1151,16 +2269,12 @@ fn preprocessClipImage(
     std_dev: [3]f32,
 ) !void {
     if (antfly_image.detectFormat(image_bytes) == .jpeg) {
-        const fast = preprocessClipJpegChw(allocator, image_bytes, target_size, mean, std_dev) catch |err| switch (err) {
-            error.UnsupportedJpegFormat => null,
+        const fast = preprocessClipJpegChwInto(allocator, image_bytes, result, target_size, mean, std_dev) catch |err| switch (err) {
+            error.UnsupportedJpegFormat => false,
             error.JpegDecodeFailed => return error.ImageDecodeFailed,
             else => return err,
         };
-        if (fast) |chw| {
-            defer allocator.free(chw);
-            @memcpy(result, chw);
-            return;
-        }
+        if (fast) return;
     }
 
     const img = try decodeRgba(allocator, image_bytes);
@@ -1168,18 +2282,21 @@ fn preprocessClipImage(
     preprocessDecodedClip(img, result, target_size, mean, std_dev);
 }
 
-fn preprocessClipJpegChw(
+fn preprocessClipJpegChwInto(
     allocator: std.mem.Allocator,
     image_bytes: []const u8,
+    result: []f32,
     target_size: u32,
     mean: [3]f32,
     std_dev: [3]f32,
-) ![]f32 {
+) !bool {
     if (clipJpegDctScaleEnabled()) {
         // Opt-in only: DCT scaling is faster but changes the resulting CLIP tensor.
-        return antfly_image.jpeg.preprocessClipChwDctScaled(allocator, image_bytes, target_size, mean, std_dev);
+        try antfly_image.jpeg.preprocessClipChwDctScaledInto(allocator, image_bytes, result, target_size, mean, std_dev);
+    } else {
+        try antfly_image.jpeg.preprocessClipChwInto(allocator, image_bytes, result, target_size, mean, std_dev);
     }
-    return antfly_image.jpeg.preprocessClipChw(allocator, image_bytes, target_size, mean, std_dev);
+    return true;
 }
 
 fn clipJpegDctScaleEnabled() bool {
@@ -1195,10 +2312,22 @@ fn preprocessDecodedClip(
     mean: [3]f32,
     std_dev: [3]f32,
 ) void {
+    preprocessImageViewClip(toSharedImage(img), result, target_size, mean, std_dev);
+}
+
+fn preprocessImageViewClip(
+    img: ImageU8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) void {
     std.debug.assert(target_size > 0);
     std.debug.assert(img.width > 0 and img.height > 0);
 
     const ts: usize = target_size;
+    const channels = img.channels();
+    const stride = img.rowStride() catch unreachable;
     const resized = clipResizeDims(img.width, img.height, target_size);
     const resized_w = resized.width;
     const resized_h = resized.height;
@@ -1208,7 +2337,7 @@ fn preprocessDecodedClip(
     const scale_y = @as(f32, @floatFromInt(img.height)) / @as(f32, @floatFromInt(resized_h));
 
     if (img.width == target_size and img.height == target_size) {
-        preprocessClipCenterCropNoResize(img, result, ts, 0, 0, mean, std_dev);
+        preprocessClipCenterCropNoResizeView(img, result, ts, 0, 0, mean, std_dev);
         return;
     }
 
@@ -1225,10 +2354,10 @@ fn preprocessDecodedClip(
             const fx = src_x - @as(f32, @floatFromInt(x0));
 
             for (0..3) |ch| {
-                const p00 = pixelAt(img, x0, y0, ch);
-                const p10 = pixelAt(img, x1, y0, ch);
-                const p01 = pixelAt(img, x0, y1, ch);
-                const p11 = pixelAt(img, x1, y1, ch);
+                const p00 = pixelAtResolvedView(img.data, stride, channels, x0, y0, ch);
+                const p10 = pixelAtResolvedView(img.data, stride, channels, x1, y0, ch);
+                const p01 = pixelAtResolvedView(img.data, stride, channels, x0, y1, ch);
+                const p11 = pixelAtResolvedView(img.data, stride, channels, x1, y1, ch);
                 const top = p00 * (1.0 - fx) + p10 * fx;
                 const bottom = p01 * (1.0 - fx) + p11 * fx;
                 const value = top * (1.0 - fy) + bottom * fy;
@@ -1236,6 +2365,13 @@ fn preprocessDecodedClip(
             }
         }
     }
+}
+
+inline fn pixelAtResolvedView(data: []const u8, stride: usize, channels: usize, x: u32, y: u32, ch: usize) f32 {
+    const xi: usize = @intCast(x);
+    const yi: usize = @intCast(y);
+    const ci = @min(ch, channels - 1);
+    return @floatFromInt(data[yi * stride + xi * channels + ci]);
 }
 
 const ClipResizeDims = struct {
@@ -1264,8 +2400,20 @@ fn preprocessClipCenterCropNoResize(
     mean: [3]f32,
     std_dev: [3]f32,
 ) void {
-    const width: usize = @intCast(img.width);
-    const channels: usize = @intCast(img.channels);
+    preprocessClipCenterCropNoResizeView(toSharedImage(img), result, target_size, crop_left, crop_top, mean, std_dev);
+}
+
+fn preprocessClipCenterCropNoResizeView(
+    img: ImageU8,
+    result: []f32,
+    target_size: usize,
+    crop_left: u32,
+    crop_top: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) void {
+    const channels = img.channels();
+    const stride = img.rowStride() catch unreachable;
     const left: usize = @intCast(crop_left);
     const top: usize = @intCast(crop_top);
     const plane_stride = target_size * target_size;
@@ -1278,7 +2426,7 @@ fn preprocessClipCenterCropNoResize(
     const inv_255 = 1.0 / 255.0;
 
     for (0..target_size) |y| {
-        const row_base = ((top + y) * width + left) * channels;
+        const row_base = (top + y) * stride + left * channels;
         const dst_row = y * target_size;
         for (0..target_size) |x| {
             const src = row_base + x * channels;

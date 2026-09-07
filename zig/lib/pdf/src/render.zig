@@ -109,11 +109,8 @@ pub fn renderPageContentPngInBoxRotatedCancelable(
     rotation: PageRotation,
     cancellation: reader.CancellationProbe,
 ) ![]u8 {
-    try cancellation.check();
-    var raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation);
+    const raw = try renderPageContentRgbaInBoxRotatedCancelable(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, rotation, cancellation);
     defer alloc.free(raw.rgba);
-    try cancellation.check();
-    try rotateRawPageCanvasAlloc(alloc, &raw, rotation, cancellation);
     try cancellation.check();
     return try image.png.encodeRgbaWithCancellation(
         alloc,
@@ -124,11 +121,255 @@ pub fn renderPageContentPngInBoxRotatedCancelable(
     );
 }
 
-const RawPageCanvas = struct {
+/// Tightly packed, allocator-owned RGBA8 output from the native renderer.
+/// The caller owns `rgba` and must release it with the allocator passed to the
+/// render operation. `stride` is explicit so transport code does not need to
+/// infer layout from the pixel format.
+pub const RgbaCanvas = struct {
     rgba: []u8,
     width: usize,
     height: usize,
+
+    pub fn stride(self: @This()) !usize {
+        return std.math.mul(usize, self.width, 4) catch error.RenderedPageTooLarge;
+    }
 };
+
+pub fn renderPageContentRgbaInBoxRotatedCancelable(
+    alloc: Allocator,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    rotation: PageRotation,
+    cancellation: reader.CancellationProbe,
+) !RgbaCanvas {
+    return try renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(
+        alloc,
+        alloc,
+        page_box,
+        text_runs,
+        image_runs,
+        shading_runs,
+        pattern_runs,
+        shape_runs,
+        rotation,
+        cancellation,
+    );
+}
+
+/// Render with independent scratch and retained-output allocators. Render
+/// plans, group canvases, glyph/image decode state, and other temporaries use
+/// `scratch_alloc`; only the returned root canvas uses `output_alloc`.
+pub fn renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    rotation: PageRotation,
+    cancellation: reader.CancellationProbe,
+) !RgbaCanvas {
+    try cancellation.check();
+    var raw = try renderPageContentRgbaInBoxAllocWithBudget(scratch_alloc, output_alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
+    errdefer output_alloc.free(raw.rgba);
+    try cancellation.check();
+    try rotateRawPageCanvasAlloc(output_alloc, &raw, rotation, cancellation);
+    try cancellation.check();
+    return raw;
+}
+
+pub const ResizedPng = struct {
+    png: []u8,
+    width: u32,
+    height: u32,
+};
+
+/// Consume an already-rendered PNG and re-encode it inside the requested
+/// bounding box without walking the PDF page again. Output-size adaptation is
+/// fundamentally an encoded-representation concern; repeating font parsing,
+/// image decoding, and painting for the same page makes incompressible scans
+/// pay the complete renderer cost for every retry.
+///
+/// `owned_png` is consumed on every return path. The decoded and resized
+/// rasters are charged to `alloc`, so the render worker's existing aggregate
+/// working-set allocator remains the hard memory boundary.
+pub fn resizeOwnedPngToMaxDimensionAlloc(
+    alloc: Allocator,
+    owned_png: []u8,
+    max_dimension: u32,
+    cancellation: reader.CancellationProbe,
+) !ResizedPng {
+    defer alloc.free(owned_png);
+    if (max_dimension == 0) return error.InvalidRenderDimension;
+    try cancellation.check();
+
+    const decoded = try image.png.decodeRgba(alloc, owned_png);
+    defer alloc.free(decoded.rgba);
+    return try resizeDecodedRgbaToMaxDimensionAlloc(
+        alloc,
+        decoded.rgba,
+        decoded.width,
+        decoded.height,
+        max_dimension,
+        cancellation,
+    );
+}
+
+/// Consume one oversized renderer output and search smaller encodings while
+/// retaining exactly one decode of the original raster. Every retry samples
+/// from that original, avoiding both repeated PNG decode and cumulative image
+/// degradation.
+pub fn resizeOwnedPngToOutputLimitAlloc(
+    alloc: Allocator,
+    owned_png: []u8,
+    output_limit: usize,
+    min_dimension: u32,
+    max_resize_attempts: u8,
+    cancellation: reader.CancellationProbe,
+) !ResizedPng {
+    defer alloc.free(owned_png);
+    if (output_limit == 0 or min_dimension == 0 or max_resize_attempts == 0)
+        return error.RenderedPageOutputTooLarge;
+    try cancellation.check();
+
+    const decoded = try image.png.decodeRgba(alloc, owned_png);
+    defer alloc.free(decoded.rgba);
+    var current_dimension = @max(decoded.width, decoded.height);
+    var current_encoded_bytes = owned_png.len;
+    var attempt: u8 = 0;
+    while (attempt < max_resize_attempts and current_dimension > min_dimension) : (attempt += 1) {
+        const next_dimension = nextOutputDimension(
+            current_dimension,
+            current_encoded_bytes,
+            output_limit,
+            min_dimension,
+        );
+        if (next_dimension >= current_dimension) return error.RenderedPageOutputTooLarge;
+        const candidate = try resizeDecodedRgbaToMaxDimensionAlloc(
+            alloc,
+            decoded.rgba,
+            decoded.width,
+            decoded.height,
+            next_dimension,
+            cancellation,
+        );
+        if (candidate.png.len <= output_limit) return candidate;
+        current_dimension = @max(candidate.width, candidate.height);
+        current_encoded_bytes = candidate.png.len;
+        alloc.free(candidate.png);
+    }
+    return error.RenderedPageOutputTooLarge;
+}
+
+fn nextOutputDimension(current: u32, encoded_bytes: usize, byte_budget: usize, minimum: u32) u32 {
+    if (current <= minimum) return current;
+    if (encoded_bytes == 0 or byte_budget >= encoded_bytes)
+        return @max(minimum, current - @max(@as(u32, 1), current / 4));
+    const ratio = @as(f64, @floatFromInt(byte_budget)) / @as(f64, @floatFromInt(encoded_bytes));
+    const scale = @min(0.75, @sqrt(ratio) * 0.90);
+    const estimated: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(current)) * scale));
+    return @max(minimum, @min(current - 1, estimated));
+}
+
+fn resizeDecodedRgbaToMaxDimensionAlloc(
+    alloc: Allocator,
+    rgba: []const u8,
+    width: u32,
+    height: u32,
+    max_dimension: u32,
+    cancellation: reader.CancellationProbe,
+) !ResizedPng {
+    const pixel_count = std.math.mul(usize, @as(usize, width), @as(usize, height)) catch
+        return error.RenderedPageTooLarge;
+    const expected_bytes = std.math.mul(usize, pixel_count, 4) catch
+        return error.RenderedPageTooLarge;
+    if (rgba.len != expected_bytes) return error.InvalidImageData;
+    const source_max = @max(width, height);
+    if (source_max == 0) return error.InvalidRenderDimension;
+    if (source_max <= max_dimension) {
+        return .{
+            .png = try image.png.encodeRgbaWithCancellation(
+                alloc,
+                width,
+                height,
+                rgba,
+                .{ .context = cancellation.context, .is_cancelled_fn = cancellation.is_cancelled_fn },
+            ),
+            .width = width,
+            .height = height,
+        };
+    }
+
+    const target_width: u32 = @max(
+        1,
+        @as(u32, @intCast((@as(u64, width) * max_dimension) / source_max)),
+    );
+    const target_height: u32 = @max(
+        1,
+        @as(u32, @intCast((@as(u64, height) * max_dimension) / source_max)),
+    );
+    const target_pixels = std.math.mul(usize, target_width, target_height) catch
+        return error.RenderedPageTooLarge;
+    const target_bytes = std.math.mul(usize, target_pixels, 4) catch
+        return error.RenderedPageTooLarge;
+    const resized = try alloc.alloc(u8, target_bytes);
+    defer alloc.free(resized);
+
+    // Bilinear filtering preserves thin glyph strokes substantially better
+    // than nearest-neighbour reduction. Coordinates use pixel centres and are
+    // clamped at the source edge, making singleton dimensions well-defined.
+    const source_width: usize = width;
+    const source_height: usize = height;
+    const destination_width: usize = target_width;
+    const destination_height: usize = target_height;
+    for (0..destination_height) |y| {
+        if ((y & 31) == 0) try cancellation.check();
+        const source_y = ((@as(f64, @floatFromInt(y)) + 0.5) *
+            @as(f64, @floatFromInt(source_height)) /
+            @as(f64, @floatFromInt(destination_height))) - 0.5;
+        const y0_float = @floor(@max(0.0, source_y));
+        const y0: usize = @min(source_height - 1, @as(usize, @intFromFloat(y0_float)));
+        const y1: usize = @min(source_height - 1, y0 + 1);
+        const fy = @max(0.0, @min(1.0, source_y - y0_float));
+        for (0..destination_width) |x| {
+            const source_x = ((@as(f64, @floatFromInt(x)) + 0.5) *
+                @as(f64, @floatFromInt(source_width)) /
+                @as(f64, @floatFromInt(destination_width))) - 0.5;
+            const x0_float = @floor(@max(0.0, source_x));
+            const x0: usize = @min(source_width - 1, @as(usize, @intFromFloat(x0_float)));
+            const x1: usize = @min(source_width - 1, x0 + 1);
+            const fx = @max(0.0, @min(1.0, source_x - x0_float));
+            const destination = (y * destination_width + x) * 4;
+            inline for (0..4) |channel| {
+                const top_left = @as(f64, @floatFromInt(rgba[(y0 * source_width + x0) * 4 + channel]));
+                const top_right = @as(f64, @floatFromInt(rgba[(y0 * source_width + x1) * 4 + channel]));
+                const bottom_left = @as(f64, @floatFromInt(rgba[(y1 * source_width + x0) * 4 + channel]));
+                const bottom_right = @as(f64, @floatFromInt(rgba[(y1 * source_width + x1) * 4 + channel]));
+                const top = top_left + (top_right - top_left) * fx;
+                const bottom = bottom_left + (bottom_right - bottom_left) * fx;
+                resized[destination + channel] = @intFromFloat(@round(top + (bottom - top) * fy));
+            }
+        }
+    }
+    try cancellation.check();
+    return .{
+        .png = try image.png.encodeRgbaWithCancellation(
+            alloc,
+            target_width,
+            target_height,
+            resized,
+            .{ .context = cancellation.context, .is_cancelled_fn = cancellation.is_cancelled_fn },
+        ),
+        .width = target_width,
+        .height = target_height,
+    };
+}
 
 const BilevelSampleBudget = struct {
     const minimum_samples: u64 = 262_144;
@@ -176,7 +417,7 @@ const BilevelCancellationPoller = struct {
     }
 };
 
-fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
+fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RgbaCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
     switch (rotation) {
         .none => return,
         .clockwise_180 => {
@@ -739,14 +980,15 @@ fn renderPageContentRgbaInBoxAlloc(
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
     cancellation: reader.CancellationProbe,
-) !RawPageCanvas {
-    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
+) !RgbaCanvas {
+    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
 }
 
 const CanvasBackground = enum { opaque_white, transparent };
 
 fn renderPageContentRgbaInBoxAllocWithBudget(
-    alloc: Allocator,
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
     page_box: reader.PageBox,
     text_runs: []const reader.TextRun,
     image_runs: []const reader.ImageRun,
@@ -756,7 +998,7 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
     cancellation: reader.CancellationProbe,
     shared_bilevel_sample_budget: ?*BilevelSampleBudget,
     background: CanvasBackground,
-) !RawPageCanvas {
+) !RgbaCanvas {
     try cancellation.check();
     const page_w = @max(1.0, page_box.max_x - page_box.min_x);
     const page_h = @max(1.0, page_box.max_y - page_box.min_y);
@@ -766,17 +1008,17 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
     if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
     const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.RenderedPageTooLarge;
 
-    var plan = try buildRenderPlanAlloc(alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
-    defer plan.deinit(alloc);
+    var plan = try buildRenderPlanAlloc(scratch_alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
+    defer plan.deinit(scratch_alloc);
     const planned_pixels = std.math.mul(usize, pixel_count, plan.peak_canvas_count) catch return error.RenderedPageTooLarge;
     if (planned_pixels > 200_000_000) return error.RenderedPageTooLarge;
 
-    const rgba = try alloc.alloc(u8, rgba_len);
-    errdefer alloc.free(rgba);
+    const rgba = try output_alloc.alloc(u8, rgba_len);
+    errdefer output_alloc.free(rgba);
     @memset(rgba, if (background == .opaque_white) 0xff else 0x00);
     var local_bilevel_sample_budget = BilevelSampleBudget.init(pixel_count);
     const bilevel_sample_budget = shared_bilevel_sample_budget orelse &local_bilevel_sample_budget;
-    try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation, bilevel_sample_budget);
+    try renderGroupChildrenAlloc(scratch_alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation, bilevel_sample_budget);
 
     return .{ .rgba = rgba, .width = width, .height = height };
 }
@@ -1833,6 +2075,7 @@ fn renderPatternTileCanvasAlloc(
 ) anyerror!RawTile {
     const raw = try renderPageContentRgbaInBoxAllocWithBudget(
         alloc,
+        alloc,
         run.pattern_bbox,
         run.tile_text_runs,
         run.tile_image_runs,
@@ -2825,6 +3068,33 @@ test "render plan schedules a large page exactly once per choice" {
     for (seen) |was_seen| try std.testing.expect(was_seen);
 }
 
+test "render plan orders unsorted inputs across paint kinds" {
+    const alloc = std.testing.allocator;
+    const text_runs = [_]reader.TextRun{
+        .{ .text = "late", .x = 0, .y = 0, .font_size = 12, .paint_order = 9 },
+        .{ .text = "early", .x = 0, .y = 0, .font_size = 12, .paint_order = 1 },
+    };
+    const shape_runs = [_]reader.ShapeRun{
+        .{ .kind = .fill, .paint_order = 8, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 2, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+    };
+    const pattern_runs = [_]reader.PatternRun{
+        .{ .kind = .fill, .paint_order = 7, .points = @constCast(&[_][2]f64{}), .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, .pattern_x_step = 1, .pattern_y_step = 1 },
+        .{ .kind = .fill, .paint_order = 3, .points = @constCast(&[_][2]f64{}), .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, .pattern_x_step = 1, .pattern_y_step = 1 },
+    };
+
+    var plan = try buildRenderPlanAlloc(alloc, &text_runs, &.{}, &.{}, &pattern_runs, &shape_runs);
+    defer plan.deinit(alloc);
+    const schedule = plan.schedules[0].items;
+    try std.testing.expectEqual(@as(usize, 6), schedule.len);
+    try std.testing.expect(schedule[0] == .text and schedule[0].text == 1);
+    try std.testing.expect(schedule[1] == .shape and schedule[1].shape == 1);
+    try std.testing.expect(schedule[2] == .pattern and schedule[2].pattern == 1);
+    try std.testing.expect(schedule[3] == .pattern and schedule[3].pattern == 0);
+    try std.testing.expect(schedule[4] == .shape and schedule[4].shape == 0);
+    try std.testing.expect(schedule[5] == .text and schedule[5].text == 0);
+}
+
 test "blend pixel mode multiply darkens with backdrop" {
     var canvas = [_]u8{ 0xff, 0x00, 0x00, 0xff };
     blendPixelMode(&canvas, 0, .{ 0x00, 0x00, 0xff, 0xff }, .multiply);
@@ -2929,6 +3199,7 @@ test "non-isolated coverage rendering consumes the shared bilevel budget" {
     }};
     var budget = BilevelSampleBudget{ .remaining_samples = 8 };
     const raw = try renderPageContentRgbaInBoxAllocWithBudget(
+        alloc,
         alloc,
         .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
         &.{},
@@ -3277,7 +3548,7 @@ test "raw page rotation normalizes dimensions and pixel orientation" {
     };
 
     for (cases) |case| {
-        var raw = RawPageCanvas{
+        var raw = RgbaCanvas{
             .rgba = try alloc.alloc(u8, 2 * 3 * 4),
             .width = 2,
             .height = 3,
@@ -4637,4 +4908,49 @@ test "render plan preserves text fill before stroke across backing kinds" {
     };
     try std.testing.expect(context.lessThan(.{ .shape = 0 }, .{ .pattern = 0 }));
     try std.testing.expect(!context.lessThan(.{ .pattern = 0 }, .{ .shape = 0 }));
+}
+
+test "encoded output retry resizes an owned raster without a PDF rerender" {
+    const alloc = std.testing.allocator;
+    const rgba = [_]u8{
+        255, 0, 0,   255, 255, 0, 0,   255, 0,   255, 0,   255, 0,   255, 0,   255,
+        0,   0, 255, 255, 0,   0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    };
+    const owned_png = try image.png.encodeRgba(alloc, 4, 2, &rgba);
+    const resized = try resizeOwnedPngToMaxDimensionAlloc(alloc, owned_png, 2, .{});
+    defer alloc.free(resized.png);
+    try std.testing.expectEqual(@as(u32, 2), resized.width);
+    try std.testing.expectEqual(@as(u32, 1), resized.height);
+
+    const decoded = try image.png.decodeRgba(alloc, resized.png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(resized.width, decoded.width);
+    try std.testing.expectEqual(resized.height, decoded.height);
+}
+
+test "encoded output retry reaches a bounded byte target from one source raster" {
+    const alloc = std.testing.allocator;
+    const width: u32 = 64;
+    const height: u32 = 64;
+    const rgba = try alloc.alloc(u8, @as(usize, width) * @as(usize, height) * 4);
+    defer alloc.free(rgba);
+    // A small deterministic xorshift stream prevents the PNG encoder from
+    // collapsing this fixture into an already-sub-limit representation.
+    var state: u32 = 0x9e37_79b9;
+    for (rgba) |*channel| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        channel.* = @truncate(state);
+    }
+
+    const owned_png = try image.png.encodeRgba(alloc, width, height, rgba);
+    if (owned_png.len <= 512) {
+        alloc.free(owned_png);
+        return error.TestUnexpectedResult;
+    }
+    const resized = try resizeOwnedPngToOutputLimitAlloc(alloc, owned_png, 512, 1, 8, .{});
+    defer alloc.free(resized.png);
+    try std.testing.expect(resized.png.len <= 512);
+    try std.testing.expect(@max(resized.width, resized.height) < width);
 }

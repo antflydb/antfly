@@ -19,8 +19,9 @@
 const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
+const antfly_image = @import("antfly_image");
 
-pub const abi_version: u32 = 20;
+pub const abi_version: u32 = 24;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -157,6 +158,64 @@ pub const ProviderOperation = enum(c_int) {
     transcribe_audio = 10,
     extract = 11,
     list_models_json = 12,
+    read_encoded_images = 13,
+    generate_messages_with_attachments = 14,
+    model_capabilities = 15,
+    read_encoded_images_reported = 16,
+    chunk_input = 17,
+    rewrite_texts = 18,
+    classify_texts = 19,
+    read_raster_images_reported = 20,
+    embed_dense_rasters = 21,
+};
+
+pub const ProviderBinaryPayload = extern struct {
+    bytes: String,
+    content_type: String,
+};
+
+/// Logical work identity is independent of attachment storage order. Multiple
+/// attachments may belong to one item and one item index need not equal the
+/// payload ordinal.
+pub const ProviderAttachmentRef = extern struct {
+    attachment_index: usize,
+    item_index: usize = 0,
+    item_id: OptionalString = .{},
+    source_fingerprint: OptionalString = .{},
+    page_number: u32 = 0,
+    has_page_number: u8 = 0,
+};
+
+/// JSON metadata paired with ProviderInvokeContext.binary_payloads for
+/// operations that borrow attachments. Binary payloads are operation-neutral;
+/// the operation JSON defines their interpretation. Cardinality deliberately
+/// appears in both channels so the host rejects a torn call before borrowing
+/// memory.
+pub const ReadEncodedImagesRequest = struct {
+    model: []const u8,
+    image_count: usize,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
+};
+
+pub const RasterImageMetadata = struct {
+    width: u32,
+    height: u32,
+    stride_bytes: usize,
+    format: antfly_image.RasterFormat,
+};
+
+/// Metadata paired one-for-one with borrowed binary raster payloads. Identity
+/// stays in ProviderAttachmentRef so every attachment ABI uses the same
+/// provenance channel.
+pub const ReadRasterImagesRequest = struct {
+    model: []const u8,
+    raster_count: usize,
+    rasters: []const RasterImageMetadata,
+    prompt: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const ProgressView = extern struct {
@@ -179,8 +238,13 @@ pub const ProviderInvokeContext = extern struct {
     has_deadline: u8,
     out_response_handle: *?*anyopaque,
     out_response_json: *String,
-    /// Appended in ABI v18 so older layouts fail the strict size/version gate
-    /// rather than silently losing cooperative cancellation.
+    binary_payloads: ?[*]const ProviderBinaryPayload = null,
+    binary_payloads_len: usize = 0,
+    attachment_refs: ?[*]const ProviderAttachmentRef = null,
+    attachment_refs_len: usize = 0,
+    /// Borrowed invocation cancellation follows the operation-neutral binary
+    /// attachment fields. ABI v24's strict size/version gate rejects older
+    /// layouts rather than silently losing media or cooperative cancellation.
     cancellation: http_abi.CancellationView = .{},
     /// Appended in ABI v19 and extended in v20 with model/backend detail.
     progress: ProgressView = .{},

@@ -62,6 +62,38 @@ pytest_plugins = ("e2e_scheduler",)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
+
+
+def finish_create_table(api, table_name: str, response, *, timeout_s: float = 30.0):
+    """Resolve a committed create by observation, never by replaying its POST."""
+    created = api._check(response)
+    api._created_tables.add(table_name)
+    if response.status_code != 202:
+        return created
+    status = created.get("status")
+    if status not in ("committed_visibility_pending", "committed_repair_required"):
+        raise AssertionError(
+            f"Table create needs intervention: {table_name}: {created}"
+        )
+    deadline = time.monotonic() + timeout_s
+    last = created
+    while time.monotonic() < deadline:
+        observed = api._request("GET", f"/tables/{table_name}")
+        if observed.status_code == 200:
+            last = api._check(observed)
+            if (last.get("name") or last.get("table_name")) == table_name:
+                return last
+        elif observed.status_code not in (404, 500, 503):
+            api._check(observed)
+            raise AssertionError(
+                f"Unexpected table observation: {observed.status_code}"
+            )
+        time.sleep(0.1)
+    raise AssertionError(
+        f"Committed table create did not become visible: {table_name}: {last}"
+    )
+
+
 E2E_BACKUP_CONNECTION = "e2e-backups"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
@@ -1411,6 +1443,52 @@ class PdfOcrE2EServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith(f"{INFERENCE_PUBLIC_API_ROOT}/models?"):
+                    body = json.dumps(
+                        {
+                            "readers": {
+                                "antflydb/Florence-2-base": {
+                                    "inputs": ["text", "image"],
+                                    "inference_capabilities": {
+                                        "version": 4,
+                                        "task": "read",
+                                        "input_modalities": ["text", "image"],
+                                        "accepted_mime_types": [
+                                            "image/png",
+                                            "image/jpeg",
+                                        ],
+                                        "input_granularity": "page",
+                                        "output": "read_result",
+                                        "result_cardinality": "one_per_item",
+                                        "prompt_policy": "explicit",
+                                        "borrowed_attachments": False,
+                                        "task_limits": {
+                                            "max_text_bytes_per_item": 65536,
+                                            "max_input_tokens_per_item": 4096,
+                                            "max_output_tokens_per_item": 4096,
+                                            "max_candidates_per_request": None,
+                                            "max_schema_bytes": None,
+                                        },
+                                        "batch": {
+                                            "mode": "native",
+                                            "preferred_items": 8,
+                                            "max_items": 8,
+                                            "max_encoded_media_bytes": 67108864,
+                                            "max_decoded_pixels": 32000000,
+                                            "max_media_parts_per_item": 1,
+                                            "per_item_failures": False,
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.path == "/fixtures/two-page.pdf":
                     pdf = outer._pdf
                 elif self.path == "/fixtures/form-xobject-text.pdf":
@@ -2817,9 +2895,7 @@ def stateful_api(request: pytest.FixtureRequest):
                     time.sleep(0.1)
                     continue
                 if response.status_code not in (404, 500):
-                    created = self._check(response)
-                    self._created_tables.add(table_name)
-                    return created
+                    return finish_create_table(self, table_name, response)
                 if time.monotonic() >= deadline:
                     return self._check(response)
                 time.sleep(0.1)
@@ -3377,9 +3453,7 @@ def backup_api(request: pytest.FixtureRequest):
                     time.sleep(0.1)
                     continue
                 if response.status_code not in (404, 500):
-                    created = self._check(response)
-                    self._created_tables.add(table_name)
-                    return created
+                    return finish_create_table(self, table_name, response)
                 if time.monotonic() >= deadline:
                     return self._check(response)
                 time.sleep(0.1)

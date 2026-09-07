@@ -29,6 +29,123 @@ pub const conformance = conformance_impl;
 pub const Format = enum { png, jpeg, jpeg2000_jp2, jpeg2000_j2k, gif, bmp, webp, unknown };
 pub const DecodeLimits = limits.DecodeLimits;
 
+/// Canonical MIME for the linked-process raw raster ABI. This is deliberately
+/// not an encoded-image MIME and must never be sent over HTTP or advertised as
+/// a model input codec. `RasterFormat` remains separately explicit so a future
+/// ABI extension cannot reinterpret existing bytes based on a MIME string.
+pub const rgba8_raster_mime_type = "image/x-antfly-rgba8";
+
+pub const RasterFormat = enum {
+    rgba8,
+
+    pub fn channels(self: RasterFormat) usize {
+        return switch (self) {
+            .rgba8 => 4,
+        };
+    }
+
+    pub fn mimeType(self: RasterFormat) []const u8 {
+        return switch (self) {
+            .rgba8 => rgba8_raster_mime_type,
+        };
+    }
+};
+
+/// A synchronous borrowed view of a decoded raster plus stable work identity.
+/// The producer owns `bytes` and every identity slice for the complete
+/// invocation; consumers must not retain any pointer after returning. Rows may
+/// contain padding, but the buffer itself is exact: no trailing unaccounted
+/// storage is accepted.
+///
+/// This physical ABI is task-neutral. Reader, generator, embedder, reranker,
+/// and extractor adapters may use it only after their resolved local executor
+/// advertises a concrete raw-raster path.
+pub const BorrowedRasterAttachment = struct {
+    bytes: []const u8,
+    width: u32,
+    height: u32,
+    stride_bytes: usize,
+    format: RasterFormat = .rgba8,
+    mime_type: []const u8 = rgba8_raster_mime_type,
+    item_id: []const u8 = "",
+    source_fingerprint: ?[]const u8 = null,
+    page_number: ?u32 = null,
+
+    pub fn validate(self: BorrowedRasterAttachment) !void {
+        if (self.width == 0 or self.height == 0) return error.InvalidRasterDimensions;
+        if (!std.mem.eql(u8, self.mime_type, self.format.mimeType()))
+            return error.InvalidRasterMimeType;
+        const row_bytes = std.math.mul(
+            usize,
+            @as(usize, self.width),
+            self.format.channels(),
+        ) catch return error.InvalidRasterDimensions;
+        if (self.stride_bytes < row_bytes) return error.InvalidRasterStride;
+        const required = std.math.mul(
+            usize,
+            self.stride_bytes,
+            @as(usize, self.height),
+        ) catch return error.InvalidRasterDimensions;
+        if (self.bytes.len != required) return error.InvalidRasterBuffer;
+    }
+
+    pub fn pixels(self: BorrowedRasterAttachment) !u64 {
+        return std.math.mul(u64, self.width, self.height) catch
+            error.InvalidRasterDimensions;
+    }
+
+    pub fn imageView(self: BorrowedRasterAttachment) !processing.ImageU8 {
+        try self.validate();
+        return .{
+            .data = self.bytes,
+            .width = self.width,
+            .height = self.height,
+            .format = switch (self.format) {
+                .rgba8 => .rgba8,
+            },
+            .row_stride_bytes = self.stride_bytes,
+        };
+    }
+};
+
+/// Resolve a canonical MIME essence to a format supported by the shared
+/// inference image decoder. Keeping this registry beside `detectFormat` makes
+/// capability advertisement, header inspection, and decoding use one codec
+/// contract instead of three independently maintained allowlists.
+pub fn inferenceFormatForMimeEssence(essence: []const u8) ?Format {
+    if (std.ascii.eqlIgnoreCase(essence, "image/png")) return .png;
+    if (std.ascii.eqlIgnoreCase(essence, "image/jpeg") or
+        std.ascii.eqlIgnoreCase(essence, "image/jpg")) return .jpeg;
+    if (std.ascii.eqlIgnoreCase(essence, "image/gif")) return .gif;
+    if (std.ascii.eqlIgnoreCase(essence, "image/bmp")) return .bmp;
+    if (std.ascii.eqlIgnoreCase(essence, "image/webp")) return .webp;
+    return null;
+}
+
+pub fn inferenceMimeEssenceForFormat(format: Format) ?[]const u8 {
+    return switch (format) {
+        .png => "image/png",
+        .jpeg => "image/jpeg",
+        .gif => "image/gif",
+        .bmp => "image/bmp",
+        .webp => "image/webp",
+        else => null,
+    };
+}
+
+pub fn supportsInferenceMimeEssence(essence: []const u8) bool {
+    return inferenceFormatForMimeEssence(essence) != null;
+}
+
+pub const EncodedImageInfo = struct {
+    width: u32,
+    height: u32,
+
+    pub fn pixels(self: EncodedImageInfo) !u64 {
+        return std.math.mul(u64, self.width, self.height) catch error.ImageDimensionsOverflow;
+    }
+};
+
 pub fn detectFormat(bytes: []const u8) Format {
     if (png.hasSignature(bytes)) return .png;
     if (jpeg2000.box.hasSignature(bytes)) return .jpeg2000_jp2;
@@ -38,6 +155,45 @@ pub fn detectFormat(bytes: []const u8) Format {
     if (bmp.hasSignature(bytes)) return .bmp;
     if (webp.hasSignature(bytes)) return .webp;
     return .unknown;
+}
+
+/// Inspect untrusted image headers without allocating decoded pixels. This is
+/// the shared admission primitive used by planners, local executors, and the
+/// distributed inference boundary so aggregate decoded-pixel limits have one
+/// meaning everywhere.
+pub fn inspectEncoded(bytes: []const u8) !EncodedImageInfo {
+    switch (detectFormat(bytes)) {
+        .png => {
+            if (bytes.len < 24) return error.InvalidImageEncoding;
+            const width = std.mem.readInt(u32, bytes[16..20], .big);
+            const height = std.mem.readInt(u32, bytes[20..24], .big);
+            if (width == 0 or height == 0) return error.InvalidImageEncoding;
+            return .{ .width = width, .height = height };
+        },
+        .jpeg => {
+            const info = jpeg.probe(bytes) catch return error.InvalidImageEncoding;
+            return .{ .width = info.width, .height = info.height };
+        },
+        .gif => {
+            if (bytes.len < 10) return error.InvalidImageEncoding;
+            const width = std.mem.readInt(u16, bytes[6..8], .little);
+            const height = std.mem.readInt(u16, bytes[8..10], .little);
+            if (width == 0 or height == 0) return error.InvalidImageEncoding;
+            return .{ .width = width, .height = height };
+        },
+        .bmp => {
+            const info = bmp.probe(bytes) catch return error.InvalidImageEncoding;
+            return .{ .width = info.width, .height = info.height };
+        },
+        .webp => {
+            const info = webp.probe(bytes) catch return error.InvalidImageEncoding;
+            return .{
+                .width = info.width orelse return error.InvalidImageEncoding,
+                .height = info.height orelse return error.InvalidImageEncoding,
+            };
+        },
+        else => return error.UnsupportedImageEncoding,
+    }
 }
 
 test {
@@ -63,4 +219,25 @@ test "detectFormat signatures" {
     try std.testing.expectEqual(Format.jpeg2000_j2k, detectFormat(&.{ 0xFF, 0x4F, 0xFF, 0x51 }));
     try std.testing.expectEqual(Format.jpeg2000_jp2, detectFormat(&.{ 0x00, 0x00, 0x00, 0x0C, 'j', 'P', ' ', ' ', 0x0D, 0x0A, 0x87, 0x0A }));
     try std.testing.expectEqual(Format.unknown, detectFormat("hello"));
+}
+
+test "inference MIME registry contains only decodable formats" {
+    try std.testing.expectEqual(Format.png, inferenceFormatForMimeEssence("image/png").?);
+    try std.testing.expectEqual(Format.jpeg, inferenceFormatForMimeEssence("IMAGE/JPG").?);
+    try std.testing.expectEqualStrings("image/gif", inferenceMimeEssenceForFormat(.gif).?);
+    try std.testing.expect(supportsInferenceMimeEssence("image/bmp"));
+    try std.testing.expect(!supportsInferenceMimeEssence("image/tiff"));
+    try std.testing.expect(inferenceMimeEssenceForFormat(.jpeg2000_jp2) == null);
+}
+
+test "inspectEncoded reports dimensions without decoding pixels" {
+    var header = [_]u8{0} ** 24;
+    @memcpy(header[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, header[16..20], 320, .big);
+    std.mem.writeInt(u32, header[20..24], 200, .big);
+    const info = try inspectEncoded(&header);
+    try std.testing.expectEqual(@as(u32, 320), info.width);
+    try std.testing.expectEqual(@as(u32, 200), info.height);
+    try std.testing.expectEqual(@as(u64, 64_000), try info.pixels());
+    try std.testing.expectError(error.UnsupportedImageEncoding, inspectEncoded("not an image"));
 }

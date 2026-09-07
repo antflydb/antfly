@@ -25,6 +25,7 @@ pub const RouteMatch = struct {
     data: ?*anyopaque,
     params: []const RouteParam,
     max_body_size: ?usize,
+    stream_request_body: bool,
 };
 
 /// Handler function type — canonical definition lives in server.zig.
@@ -38,6 +39,7 @@ const Route = struct {
     handler: Handler,
     data: ?*anyopaque = null,
     max_body_size: ?usize = null,
+    stream_request_body: bool = false,
 };
 
 const Segment = union(enum) {
@@ -91,19 +93,33 @@ pub const Router = struct {
 
     /// Adds a route to the router.
     pub fn add(self: *Self, method: types.Method, pattern: []const u8, handler: anytype) !void {
-        return self.addWithDataAndBodyLimit(method, pattern, handler, null, null);
+        return self.addWithOptions(method, pattern, handler, null, null, false);
     }
 
     /// Adds a route with borrowed opaque request data.
     pub fn addWithData(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: ?*anyopaque) !void {
-        return self.addWithDataAndBodyLimit(method, pattern, handler, data, null);
+        return self.addWithOptions(method, pattern, handler, data, null, false);
     }
 
     pub fn addWithBodyLimit(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, max_body_size: usize) !void {
-        return self.addWithDataAndBodyLimit(method, pattern, handler, null, max_body_size);
+        return self.addWithOptions(method, pattern, handler, null, max_body_size, false);
     }
 
-    fn addWithDataAndBodyLimit(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: ?*anyopaque, max_body_size: ?usize) !void {
+    /// Opt a route into dispatch after fixed-length request headers. The
+    /// application may then consume the body incrementally through Context.
+    pub fn addStreaming(self: *Self, method: types.Method, pattern: []const u8, handler: anytype) !void {
+        return self.addWithOptions(method, pattern, handler, null, null, true);
+    }
+
+    fn addWithOptions(
+        self: *Self,
+        method: types.Method,
+        pattern: []const u8,
+        handler: anytype,
+        data: ?*anyopaque,
+        max_body_size: ?usize,
+        stream_request_body: bool,
+    ) !void {
         const segments = try self.parsePattern(pattern);
         errdefer self.allocator.free(segments);
         for (self.routesForConst(method)) |route| {
@@ -116,6 +132,7 @@ pub const Router = struct {
             .handler = Handler.from(handler),
             .data = data,
             .max_body_size = max_body_size,
+            .stream_request_body = stream_request_body,
         });
         if (max_body_size != null) {
             self.body_limited_route_count += 1;
@@ -203,6 +220,7 @@ pub const Router = struct {
                     .data = route.data,
                     .params = params_buf[0..param_count],
                     .max_body_size = route.max_body_size,
+                    .stream_request_body = route.stream_request_body,
                 };
             }
         }
@@ -217,6 +235,15 @@ pub const Router = struct {
             if (self.matchRoute(route, path, &params_buf) != null) return route.max_body_size;
         }
         return null;
+    }
+
+    pub fn streamsRequestBody(self: *const Self, method: types.Method, path: []const u8) bool {
+        var params_buf: [16]RouteParam = undefined;
+        for (self.routesForConst(method)) |route| {
+            if (self.matchRoute(route, path, &params_buf) != null)
+                return route.stream_request_body;
+        }
+        return false;
     }
 
     pub fn hasBodyLimits(self: *const Self) bool {
@@ -414,6 +441,22 @@ test "Router exposes route-specific body limits" {
     // matching route is unbounded even though a later limited route also matches.
     try std.testing.expectEqual(@as(?usize, null), router.bodySizeLimit(.PUT, "/overlap/7"));
     try std.testing.expectEqual(@as(?usize, null), router.bodySizeLimit(.GET, "/bounded/7"));
+}
+
+test "Router exposes request streaming only for opted-in routes" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.addStreaming(.POST, "/stream/:id", handler);
+    try router.add(.POST, "/buffered", handler);
+    try std.testing.expect(router.streamsRequestBody(.POST, "/stream/7"));
+    try std.testing.expect(!router.streamsRequestBody(.POST, "/buffered"));
+    try std.testing.expect(!router.streamsRequestBody(.GET, "/stream/7"));
 }
 
 test "Router multiple parameters" {

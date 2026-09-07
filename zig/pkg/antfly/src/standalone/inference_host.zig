@@ -22,8 +22,11 @@ const inference = @import("inference_server");
 const inference_bridge = @import("inference_bridge.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const inference_api = @import("inference_api");
+const inference_chunker = @import("inference_chunker");
+const chunking_types = @import("../chunking/types.zig");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
@@ -42,6 +45,10 @@ pub const LinkedInferenceState = struct {
     route_validator: httpx.Router,
     route_manifest_mutex: std.atomic.Mutex = .unlocked,
     route_manifest_ready: bool = false,
+    /// Model-free invocation seam used by ABI conformance tests. Production
+    /// states leave this null and dispatch directly to `node`.
+    read_encoded_images_override: ?ReadEncodedImagesHandler = null,
+    read_raster_images_override: ?ReadRasterImagesHandler = null,
 };
 
 /// Stable, ref-counted copy of the standalone resource-owner capability. The
@@ -111,6 +118,44 @@ const ProviderResponseState = struct {
     json: []u8,
 };
 
+pub const ReadEncodedImagesHandler = struct {
+    ptr: *anyopaque,
+    read_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: antfly.readers.EncodedRequest,
+    ) anyerror![]antfly.readers.Result,
+
+    fn read(
+        self: @This(),
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: antfly.readers.EncodedRequest,
+    ) ![]antfly.readers.Result {
+        return try self.read_fn(self.ptr, alloc, model, request);
+    }
+};
+
+pub const ReadRasterImagesHandler = struct {
+    ptr: *anyopaque,
+    read_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: antfly.readers.RasterRequest,
+    ) anyerror!antfly.readers.BatchResult,
+
+    fn read(
+        self: @This(),
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        request: antfly.readers.RasterRequest,
+    ) !antfly.readers.BatchResult {
+        return try self.read_fn(self.ptr, alloc, model, request);
+    }
+};
+
 test "standalone linked inference ABI validates the supported function-table prefix" {
     try std.testing.expect(inference_bridge.validContext(
         inference_bridge.RouteManifestContext,
@@ -135,6 +180,29 @@ test "standalone linked inference ABI validates the supported function-table pre
     try std.testing.expect(inference_bridge.validFunctionTable(&table, inference_bridge.Capability.provider));
 }
 
+test "standalone provider ABI rejects cancellation before dispatch" {
+    const Canceled = struct {
+        fn requested(_: ?*const anyopaque) callconv(.c) u8 {
+            return 1;
+        }
+    };
+    var marker: u8 = 0;
+    var response_handle: ?*anyopaque = null;
+    var response_json: inference_bridge.String = undefined;
+    const context = inference_bridge.ProviderInvokeContext{
+        .abi_version = inference_bridge.abi_version,
+        .handle = undefined,
+        .operation = 0,
+        .request_json = inference_bridge.String.init(""),
+        .deadline_ns = std.math.maxInt(u64),
+        .has_deadline = 1,
+        .out_response_handle = &response_handle,
+        .out_response_json = &response_json,
+        .cancellation = .{ .context = &marker, .is_cancelled = Canceled.requested },
+    };
+    try std.testing.expectError(error.Canceled, linkedInferenceInvokeProvider(&context));
+}
+
 const ModelTextsRequest = struct {
     model: []const u8,
     texts: []const []const u8,
@@ -145,9 +213,127 @@ const ModelTextsRequest = struct {
 const ModelPartsRequest = struct {
     model: []const u8,
     parts: []const antfly.template.ContentPart,
+    attachment_count: usize = 0,
     task_type: ?[]const u8 = null,
     instruction: ?[]const u8 = null,
 };
+
+fn validateProviderAttachmentRefs(
+    payload_len: usize,
+    ref_ptr: ?[*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+) !void {
+    if (ref_len != payload_len) return error.InvalidArguments;
+    if (ref_len > 0 and ref_ptr == null) return error.InvalidArguments;
+    const refs = if (ref_ptr) |ptr| ptr[0..ref_len] else &.{};
+    for (refs, 0..) |ref, i| {
+        if (ref.attachment_index >= payload_len) return error.InvalidArguments;
+        for (refs[0..i]) |prior| {
+            if (prior.attachment_index == ref.attachment_index) return error.InvalidArguments;
+        }
+    }
+}
+
+fn providerAttachmentRefForAttachment(
+    refs: [*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+    attachment_index: usize,
+) ?inference_bridge.ProviderAttachmentRef {
+    for (refs[0..ref_len]) |ref| if (ref.attachment_index == attachment_index) return ref;
+    return null;
+}
+
+fn providerAttachmentRefForItem(
+    refs: [*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+    item_index: usize,
+) ?inference_bridge.ProviderAttachmentRef {
+    for (refs[0..ref_len]) |ref| if (ref.item_index == item_index) return ref;
+    return null;
+}
+
+fn decodeProviderEmbeddingParts(
+    alloc: std.mem.Allocator,
+    parts: []const antfly.template.ContentPart,
+    expected_count: usize,
+    payload_ptr: ?[*]const inference_bridge.ProviderBinaryPayload,
+    payload_len: usize,
+    ref_ptr: ?[*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+) ![]antfly.template.ContentPart {
+    if (expected_count != payload_len or ref_len != payload_len) return error.InvalidArguments;
+    if (payload_len > 0 and payload_ptr == null) return error.InvalidArguments;
+    try validateProviderAttachmentRefs(payload_len, ref_ptr, ref_len);
+    const out = try alloc.alloc(antfly.template.ContentPart, parts.len);
+    errdefer alloc.free(out);
+    var payload_index: usize = 0;
+    for (parts, out, 0..) |part, *decoded, item_index| switch (part) {
+        .binary => |binary| {
+            if (payload_len == 0) {
+                decoded.* = part;
+                continue;
+            }
+            if (binary.data.len != 0 or payload_index >= payload_len) return error.InvalidArguments;
+            const ref = providerAttachmentRefForItem(ref_ptr.?, ref_len, item_index) orelse return error.InvalidArguments;
+            const payload = payload_ptr.?[ref.attachment_index];
+            const attachment = antfly.inference.work.Attachment{
+                .bytes = payload.bytes.slice(),
+                .content_type = payload.content_type.slice(),
+            };
+            try attachment.validate();
+            if (!mimeDeclarationsCompatible(binary.mime_type, attachment.content_type)) return error.InvalidArguments;
+            decoded.* = .{ .binary = .{
+                .mime_type = attachment.content_type,
+                .data = attachment.bytes,
+            } };
+            payload_index += 1;
+        },
+        else => decoded.* = part,
+    };
+    if (payload_index != payload_len) return error.InvalidArguments;
+    return out;
+}
+
+test "standalone embedding ABI reconstructs borrowed binary parts" {
+    const raw = [_]u8{ 1, 2, 3, 4 };
+    const parts = [_]antfly.template.ContentPart{
+        .{ .text = "caption" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &.{} } },
+    };
+    const payloads = [_]inference_bridge.ProviderBinaryPayload{.{
+        .bytes = inference_bridge.String.init(&raw),
+        .content_type = inference_bridge.String.init("image/png"),
+    }};
+    const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 1 }};
+    const decoded = try decodeProviderEmbeddingParts(std.testing.allocator, &parts, 1, &payloads, 1, &refs, 1);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("caption", decoded[0].text);
+    try std.testing.expectEqual(@intFromPtr(raw[0..].ptr), @intFromPtr(decoded[1].binary.data.ptr));
+    try std.testing.expectEqualSlices(u8, &raw, decoded[1].binary.data);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        decodeProviderEmbeddingParts(std.testing.allocator, &parts, 2, &payloads, 1, &refs, 1),
+    );
+}
+
+test "standalone attachment ABI maps several payloads to one generator item" {
+    const first = [_]u8{1};
+    const second = [_]u8{2};
+    const payloads = [_]inference_bridge.ProviderBinaryPayload{
+        .{ .bytes = inference_bridge.String.init(&first), .content_type = inference_bridge.String.init("image/png") },
+        .{ .bytes = inference_bridge.String.init(&second), .content_type = inference_bridge.String.init("image/png") },
+    };
+    const refs = [_]inference_bridge.ProviderAttachmentRef{
+        .{ .attachment_index = 1, .item_index = 0, .item_id = inference_bridge.OptionalString.init("request-7") },
+        .{ .attachment_index = 0, .item_index = 0, .item_id = inference_bridge.OptionalString.init("request-7") },
+    };
+    const attachments = try decodeProviderAttachments(std.testing.allocator, 2, &payloads, 2, &refs, 2);
+    defer std.testing.allocator.free(attachments);
+    try std.testing.expectEqualSlices(u8, &first, attachments[0].bytes);
+    try std.testing.expectEqualSlices(u8, &second, attachments[1].bytes);
+    try std.testing.expectEqualStrings("request-7", attachments[0].identity.item_id);
+    try std.testing.expectEqual(@as(usize, 0), refs[0].item_index);
+}
 
 const RerankTextsRequest = struct {
     model: []const u8,
@@ -158,10 +344,165 @@ const RerankTextsRequest = struct {
 const GenerateTextRequest = antfly.inference.types.GenerateTextRequest;
 const GenerateMessagesRequest = antfly.inference.types.GenerateMessagesRequest;
 
+const GenerateMessagesWithAttachmentsRequest = struct {
+    model: []const u8,
+    messages: []const antfly.inference.ChatMessage,
+    attachment_count: usize,
+};
+
+const ModelCapabilitiesRequest = struct {
+    model: []const u8,
+    task: antfly.inference.work.Task,
+};
+
 const ReadImagesRequest = struct {
     model: []const u8,
     request: antfly.readers.Request,
 };
+
+const ReadEncodedImagesRequest = inference_bridge.ReadEncodedImagesRequest;
+const ReadRasterImagesRequest = inference_bridge.ReadRasterImagesRequest;
+
+pub const DecodedReadEncodedImagesRequest = struct {
+    metadata: std.json.Parsed(ReadEncodedImagesRequest),
+    images: []antfly.readers.EncodedImage,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.images);
+        self.metadata.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const DecodedReadRasterImagesRequest = struct {
+    metadata: std.json.Parsed(ReadRasterImagesRequest),
+    images: []antfly.readers.RasterImage,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.images);
+        self.metadata.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Decode the exact JSON-plus-borrowed-binary representation used by the
+/// standalone provider ABI. The redundant image count prevents a malformed
+/// context from silently changing request cardinality.
+pub fn decodeReadEncodedImagesProviderRequest(
+    alloc: std.mem.Allocator,
+    request_json: []const u8,
+    payload_ptr: ?[*]const inference_bridge.ProviderBinaryPayload,
+    payload_len: usize,
+    ref_ptr: ?[*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+) !DecodedReadEncodedImagesRequest {
+    var metadata = try std.json.parseFromSlice(ReadEncodedImagesRequest, alloc, request_json, .{
+        .ignore_unknown_fields = true,
+    });
+    errdefer metadata.deinit();
+    if (metadata.value.image_count != payload_len or ref_len != payload_len) return error.InvalidArguments;
+    if (payload_len > 0 and payload_ptr == null) return error.InvalidArguments;
+    try validateProviderAttachmentRefs(payload_len, ref_ptr, ref_len);
+
+    const images = try alloc.alloc(antfly.readers.EncodedImage, payload_len);
+    errdefer alloc.free(images);
+    if (payload_ptr) |payloads| {
+        for (images, 0..) |*image, i| {
+            const ref = providerAttachmentRefForItem(ref_ptr.?, ref_len, i) orelse return error.InvalidArguments;
+            const payload = payloads[ref.attachment_index];
+            image.* = .{
+                .bytes = payload.bytes.slice(),
+                .mime_type = payload.content_type.slice(),
+                .item_id = ref.item_id.slice() orelse "",
+                .source_fingerprint = ref.source_fingerprint.slice(),
+                .page_number = if (ref.has_page_number != 0) ref.page_number else null,
+            };
+        }
+    }
+    try antfly.readers.validateEncodedRequest(.{ .images = images });
+    return .{ .metadata = metadata, .images = images };
+}
+
+pub fn decodeReadRasterImagesProviderRequest(
+    alloc: std.mem.Allocator,
+    request_json: []const u8,
+    payload_ptr: ?[*]const inference_bridge.ProviderBinaryPayload,
+    payload_len: usize,
+    ref_ptr: ?[*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+) !DecodedReadRasterImagesRequest {
+    var metadata = try std.json.parseFromSlice(ReadRasterImagesRequest, alloc, request_json, .{
+        .ignore_unknown_fields = true,
+    });
+    errdefer metadata.deinit();
+    if (metadata.value.raster_count != payload_len or
+        metadata.value.rasters.len != payload_len or ref_len != payload_len)
+        return error.InvalidArguments;
+    if (payload_len > 0 and payload_ptr == null) return error.InvalidArguments;
+    try validateProviderAttachmentRefs(payload_len, ref_ptr, ref_len);
+    const refs = if (ref_ptr) |ptr| ptr[0..ref_len] else &.{};
+    for (refs, 0..) |ref, index| {
+        if (ref.item_index >= payload_len) return error.InvalidArguments;
+        for (refs[0..index]) |prior| {
+            if (prior.item_index == ref.item_index) return error.InvalidArguments;
+        }
+    }
+
+    const images = try alloc.alloc(antfly.readers.RasterImage, payload_len);
+    errdefer alloc.free(images);
+    if (payload_ptr) |payloads| {
+        for (images, metadata.value.rasters, 0..) |*image, raster, i| {
+            const ref = providerAttachmentRefForItem(ref_ptr.?, ref_len, i) orelse
+                return error.InvalidArguments;
+            const payload = payloads[ref.attachment_index];
+            image.* = .{
+                .bytes = payload.bytes.slice(),
+                .width = raster.width,
+                .height = raster.height,
+                .stride_bytes = raster.stride_bytes,
+                .format = raster.format,
+                .mime_type = payload.content_type.slice(),
+                .item_id = ref.item_id.slice() orelse "",
+                .source_fingerprint = ref.source_fingerprint.slice(),
+                .page_number = if (ref.has_page_number != 0) ref.page_number else null,
+            };
+        }
+    }
+    try antfly.readers.validateRasterRequest(.{ .images = images });
+    return .{ .metadata = metadata, .images = images };
+}
+
+fn decodeProviderAttachments(
+    alloc: std.mem.Allocator,
+    expected_count: usize,
+    payload_ptr: ?[*]const inference_bridge.ProviderBinaryPayload,
+    payload_len: usize,
+    ref_ptr: ?[*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+) ![]antfly.inference.work.Attachment {
+    if (expected_count != payload_len or ref_len != payload_len) return error.InvalidArguments;
+    if (payload_len > 0 and payload_ptr == null) return error.InvalidArguments;
+    try validateProviderAttachmentRefs(payload_len, ref_ptr, ref_len);
+    const attachments = try alloc.alloc(antfly.inference.work.Attachment, payload_len);
+    errdefer alloc.free(attachments);
+    if (payload_ptr) |payloads| {
+        for (attachments, 0..) |*attachment, i| {
+            const ref = providerAttachmentRefForAttachment(ref_ptr.?, ref_len, i) orelse return error.InvalidArguments;
+            const payload = payloads[ref.attachment_index];
+            attachment.* = .{
+                .bytes = payload.bytes.slice(),
+                .content_type = payload.content_type.slice(),
+                .identity = .{
+                    .item_id = ref.item_id.slice() orelse "",
+                    .source_fingerprint = ref.source_fingerprint.slice(),
+                    .page_number = if (ref.has_page_number != 0) ref.page_number else null,
+                },
+            };
+            try attachment.validate();
+        }
+    }
+    return attachments;
+}
 
 const TranscribeAudioRequest = struct {
     model: []const u8,
@@ -171,6 +512,52 @@ const TranscribeAudioRequest = struct {
 const ExtractRequest = struct {
     model: []const u8,
     request: antfly.extracting.Request,
+    attachment_count: usize = 0,
+};
+
+fn decodeExtractionAttachments(
+    alloc: std.mem.Allocator,
+    input_count: usize,
+    expected_count: usize,
+    payload_ptr: ?[*]const inference_bridge.ProviderBinaryPayload,
+    payload_len: usize,
+    ref_ptr: ?[*]const inference_bridge.ProviderAttachmentRef,
+    ref_len: usize,
+) ![]antfly.extracting.Attachment {
+    if (expected_count != payload_len or ref_len != payload_len) return error.InvalidArguments;
+    if (payload_len > 0 and (payload_ptr == null or ref_ptr == null)) return error.InvalidArguments;
+    try validateProviderAttachmentRefs(payload_len, ref_ptr, ref_len);
+    const attachments = try alloc.alloc(antfly.extracting.Attachment, payload_len);
+    errdefer alloc.free(attachments);
+    if (payload_ptr) |payloads| for (attachments, 0..) |*attachment, i| {
+        const ref = providerAttachmentRefForAttachment(ref_ptr.?, ref_len, i) orelse return error.InvalidArguments;
+        if (ref.item_index >= input_count) return error.InvalidArguments;
+        const payload = payloads[ref.attachment_index];
+        if (payload.content_type.len == 0) return error.InvalidArguments;
+        attachment.* = .{
+            .input_index = ref.item_index,
+            .bytes = payload.bytes.slice(),
+            .mime_type = payload.content_type.slice(),
+        };
+    };
+    return attachments;
+}
+
+const ChunkInputRequest = struct {
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    attachment_count: usize = 0,
+};
+
+const RewriteTextsRequest = struct {
+    model: []const u8,
+    inputs: []const []const u8,
+};
+
+const ClassifyTextsRequest = struct {
+    model: []const u8,
+    request: antfly.inference.managed_embedder.ClassificationRequest,
 };
 
 const ResolvedWarmModels = struct {
@@ -432,6 +819,7 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
 }
 
 pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void {
+    try checkProviderInvokeControls(context);
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
     const operation = std.enums.fromInt(inference_bridge.ProviderOperation, context.operation) orelse
         return error.UnsupportedOperation;
@@ -516,11 +904,21 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .embed_dense_parts, .embed_dense_parts_with_context => blk: {
             var parsed = try std.json.parseFromSlice(ModelPartsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            const parts = try decodeProviderEmbeddingParts(
+                alloc,
+                parsed.value.parts,
+                parsed.value.attachment_count,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer alloc.free(parts);
             const result = try localAntflyEmbedDensePartsWithExecutionContext(
                 &state.node,
                 alloc,
                 parsed.value.model,
-                parsed.value.parts,
+                parts,
                 state.io,
                 execution_control,
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
@@ -535,6 +933,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rerank_texts => blk: {
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .rerank, parsed.value.documents, parsed.value.query.len, parsed.value.documents.len, 0);
             const result = try state.node.rerankTextsDirectWithContext(
                 alloc,
                 state.io,
@@ -550,6 +949,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .generate_text => blk: {
             var parsed = try std.json.parseFromSlice(GenerateTextRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .generate, parsed.value.contents, 0, 0, 0);
             const outcome = try state.node.generateTextDirectForProvider(
                 alloc,
                 parsed.value.model,
@@ -567,6 +967,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer parsed.deinit();
             const result = try localAntflyGenerateMessages(
                 &state.node,
+                state.io,
                 alloc,
                 parsed.value.model,
                 parsed.value.messages,
@@ -574,6 +975,35 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 execution_control,
             );
             defer alloc.free(result);
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .generate_messages_with_attachments => blk: {
+            var parsed = try std.json.parseFromSlice(GenerateMessagesWithAttachmentsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const attachments = try decodeProviderAttachments(
+                alloc,
+                parsed.value.attachment_count,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer alloc.free(attachments);
+            const result = try localAntflyGenerateMessagesWithAttachments(
+                &state.node,
+                state.io,
+                alloc,
+                parsed.value.model,
+                parsed.value.messages,
+                attachments,
+            );
+            defer alloc.free(result);
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .model_capabilities => blk: {
+            var parsed = try std.json.parseFromSlice(ModelCapabilitiesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const result = try localModelCapabilities(&state.node, state.io, parsed.value.model, parsed.value.task);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .read_images => blk: {
@@ -586,9 +1016,199 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             }
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
+        .read_encoded_images, .read_encoded_images_reported => blk: {
+            var decoded = try decodeReadEncodedImagesProviderRequest(
+                alloc,
+                request_json,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer decoded.deinit(alloc);
+            const encoded_request = antfly.readers.EncodedRequest{
+                .images = decoded.images,
+                .prompt = decoded.metadata.value.prompt,
+                .max_tokens = decoded.metadata.value.max_tokens,
+                .source_fingerprint = decoded.metadata.value.source_fingerprint,
+            };
+            const ReadCancellation = struct {
+                fn requested(raw: *const anyopaque) bool {
+                    const view: *const http_abi.CancellationView = @ptrCast(@alignCast(raw));
+                    return view.requested();
+                }
+            };
+            const executor_cancellation = inference.server.ExecutorCancellation{
+                .ptr = &context.cancellation,
+                .is_cancelled_fn = ReadCancellation.requested,
+            };
+            // The override is an injected test executor with no model catalog.
+            // Every production path resolves and enforces the concrete model
+            // contract inside this ABI boundary.
+            if (state.read_encoded_images_override == null) {
+                const read_capabilities = try localModelCapabilities(
+                    &state.node,
+                    state.io,
+                    decoded.metadata.value.model,
+                    .read,
+                );
+                try validateEncodedReadCapabilities(read_capabilities, encoded_request);
+            }
+            if (operation == .read_encoded_images_reported and state.read_encoded_images_override == null) {
+                var batch = try state.node.readEncodedImagesReportedDirectWithContext(
+                    alloc,
+                    decoded.metadata.value.model,
+                    encoded_request,
+                    deadline_ns,
+                    executor_cancellation,
+                );
+                defer batch.deinit(alloc);
+                break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});
+            }
+            const result = if (state.read_encoded_images_override) |handler|
+                try handler.read(alloc, decoded.metadata.value.model, encoded_request)
+            else result: {
+                const batch = try state.node.readEncodedImagesReportedDirectWithContext(
+                    alloc,
+                    decoded.metadata.value.model,
+                    encoded_request,
+                    deadline_ns,
+                    executor_cancellation,
+                );
+                break :result batch.items;
+            };
+            if (operation == .read_encoded_images_reported) {
+                var batch = antfly.readers.BatchResult{
+                    .items = result,
+                    .execution = .{ .requested_items = result.len, .serial_items = result.len },
+                };
+                defer batch.deinit(alloc);
+                break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});
+            }
+            defer {
+                for (result) |*item| antfly.readers.deinitResult(alloc, item);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .read_raster_images_reported => blk: {
+            var decoded = try decodeReadRasterImagesProviderRequest(
+                alloc,
+                request_json,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer decoded.deinit(alloc);
+            const raster_request = antfly.readers.RasterRequest{
+                .images = decoded.images,
+                .prompt = decoded.metadata.value.prompt,
+                .max_tokens = decoded.metadata.value.max_tokens,
+                .source_fingerprint = decoded.metadata.value.source_fingerprint,
+            };
+            const ReadCancellation = struct {
+                fn requested(raw: *const anyopaque) bool {
+                    const view: *const http_abi.CancellationView = @ptrCast(@alignCast(raw));
+                    return view.requested();
+                }
+            };
+            const executor_cancellation = inference.server.ExecutorCancellation{
+                .ptr = &context.cancellation,
+                .is_cancelled_fn = ReadCancellation.requested,
+            };
+            if (state.read_raster_images_override == null) {
+                const capabilities = try localModelCapabilities(
+                    &state.node,
+                    state.io,
+                    decoded.metadata.value.model,
+                    .read,
+                );
+                if (!capabilities.borrowed_rasters) return error.BorrowedRasterUnsupported;
+                var pixels: u64 = 0;
+                for (decoded.images) |raster| {
+                    pixels = std.math.add(u64, pixels, try raster.pixels()) catch
+                        return error.InferenceDecodedPixelsExceeded;
+                }
+                try capabilities.validateInvocation(.read, .{
+                    .item_count = decoded.images.len,
+                    .modalities = .{ .image = true },
+                    .text_bytes = if (raster_request.prompt) |prompt| prompt.len else 0,
+                    .max_text_bytes_per_item = if (raster_request.prompt) |prompt| prompt.len else 0,
+                    .requested_output_tokens_per_item = if (raster_request.max_tokens) |tokens|
+                        if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
+                    else
+                        0,
+                    .decoded_pixels = pixels,
+                    .max_media_parts_per_item = 1,
+                });
+            }
+            var batch = if (state.read_raster_images_override) |handler|
+                try handler.read(alloc, decoded.metadata.value.model, raster_request)
+            else
+                try state.node.readRasterImagesReportedDirectWithContext(
+                    alloc,
+                    decoded.metadata.value.model,
+                    raster_request,
+                    deadline_ns,
+                    executor_cancellation,
+                );
+            defer batch.deinit(alloc);
+            if (batch.items.len != raster_request.images.len)
+                return error.InvalidReaderResponse;
+            try batch.execution.validate(batch.items.len);
+            break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});
+        },
+        .embed_dense_rasters => blk: {
+            var decoded = try decodeReadRasterImagesProviderRequest(
+                alloc,
+                request_json,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer decoded.deinit(alloc);
+            const capabilities = try localModelCapabilities(
+                &state.node,
+                state.io,
+                decoded.metadata.value.model,
+                .embed,
+            );
+            if (!capabilities.borrowed_rasters or !capabilities.supports(.{ .image = true }))
+                return error.BorrowedRasterUnsupported;
+            var pixels: u64 = 0;
+            for (decoded.images) |raster| {
+                pixels = std.math.add(u64, pixels, try raster.pixels()) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
+            try capabilities.validateInvocation(.embed, .{
+                .item_count = decoded.images.len,
+                .modalities = .{ .image = true },
+                .decoded_pixels = pixels,
+                .max_media_parts_per_item = 1,
+            });
+            const vectors = try state.node.embedDenseRastersDirectWithContext(
+                alloc,
+                state.io,
+                deadline_ns,
+                decoded.metadata.value.model,
+                decoded.images,
+            );
+            defer {
+                for (vectors) |vector| alloc.free(vector);
+                alloc.free(vectors);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, vectors, .{});
+        },
         .transcribe_audio => blk: {
             var parsed = try std.json.parseFromSlice(TranscribeAudioRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            const transcribe_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .transcribe);
+            try transcribe_capabilities.validateInvocation(.transcribe, .{
+                .item_count = 1,
+                .modalities = .{ .audio = true },
+            });
             var result = try state.node.transcribeAudioDirectWithControl(alloc, parsed.value.model, parsed.value.request, execution_control);
             defer antfly.transcribing.deinitResponse(alloc, &result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
@@ -596,9 +1216,170 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .extract => blk: {
             var parsed = try std.json.parseFromSlice(ExtractRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            var result = try state.node.extractDirectWithControl(alloc, parsed.value.model, parsed.value.request, execution_control);
+            if (parsed.value.request.attachments.len != 0) return error.InvalidArguments;
+            const attachments = try decodeExtractionAttachments(
+                alloc,
+                parsed.value.request.inputs.len,
+                parsed.value.attachment_count,
+                context.binary_payloads,
+                context.binary_payloads_len,
+                context.attachment_refs,
+                context.attachment_refs_len,
+            );
+            defer alloc.free(attachments);
+            var request = parsed.value.request;
+            request.attachments = attachments;
+            var extract_shape = antfly.inference.work.InvocationShape{
+                .item_count = request.inputs.len,
+                .modalities = if (attachments.len > 0) .{ .image = true } else .{ .text = true },
+                .schema_bytes = request.schema_json.len,
+                .max_media_parts_per_item = if (attachments.len > 0) 1 else 0,
+            };
+            for (request.inputs) |input| {
+                extract_shape.text_bytes = std.math.add(usize, extract_shape.text_bytes, input.content_json.len) catch
+                    return error.InferenceTextBytesExceeded;
+                extract_shape.max_text_bytes_per_item = @max(extract_shape.max_text_bytes_per_item, input.content_json.len);
+            }
+            const extract_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .extract);
+            for (attachments) |attachment| {
+                try extract_capabilities.validateMimeType(attachment.mime_type);
+                extract_shape.encoded_media_bytes = std.math.add(
+                    usize,
+                    extract_shape.encoded_media_bytes,
+                    attachment.bytes.len,
+                ) catch return error.InferenceEncodedBytesExceeded;
+                const pixels = try antfly.inference.work.encodedImagePixels(attachment.mime_type, attachment.bytes);
+                extract_shape.decoded_pixels = std.math.add(u64, extract_shape.decoded_pixels, pixels) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
+            try extract_capabilities.validateInvocation(.extract, extract_shape);
+            var result = try state.node.extractDirectWithControl(alloc, parsed.value.model, request, execution_control);
             defer result.deinit();
             break :blk try std.json.Stringify.valueAlloc(alloc, result.json, .{});
+        },
+        .chunk_input => blk: {
+            var parsed = try std.json.parseFromSlice(ChunkInputRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            var input = parsed.value.input;
+            switch (input) {
+                .text => if (parsed.value.attachment_count != 0 or context.binary_payloads_len != 0 or context.attachment_refs_len != 0)
+                    return error.InvalidArguments,
+                .binary => |*binary| {
+                    if (parsed.value.attachment_count != 1 or context.binary_payloads_len != 1 or
+                        context.attachment_refs_len != 1 or context.binary_payloads == null)
+                        return error.InvalidArguments;
+                    try validateProviderAttachmentRefs(1, context.attachment_refs, context.attachment_refs_len);
+                    const ref = providerAttachmentRefForItem(context.attachment_refs.?, 1, 0) orelse return error.InvalidArguments;
+                    const payload = context.binary_payloads.?[ref.attachment_index];
+                    if (binary.data.len != 0 or !mimeDeclarationsCompatible(binary.mime_type, payload.content_type.slice()))
+                        return error.InvalidArguments;
+                    binary.data = payload.bytes.slice();
+                },
+            }
+            const cfg = parsed.value.config;
+            const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
+            var chunk_shape = antfly.inference.work.InvocationShape{ .item_count = 1 };
+            switch (input) {
+                .text => |text_value| {
+                    chunk_shape.modalities.text = true;
+                    chunk_shape.text_bytes = text_value.len;
+                    chunk_shape.max_text_bytes_per_item = text_value.len;
+                    try chunk_capabilities.validateMimeType("text/plain");
+                },
+                .binary => |binary| {
+                    chunk_shape.encoded_media_bytes = binary.data.len;
+                    chunk_shape.max_media_parts_per_item = 1;
+                    const essence = antfly.inference.work.mimeTypeEssence(binary.mime_type) catch
+                        return error.UnsupportedInferenceMimeType;
+                    if (std.ascii.startsWithIgnoreCase(essence, "audio/"))
+                        chunk_shape.modalities.audio = true
+                    else if (std.ascii.startsWithIgnoreCase(essence, "image/"))
+                        chunk_shape.modalities.image = true
+                    else
+                        chunk_shape.modalities.document = true;
+                    try chunk_capabilities.validateMimeType(binary.mime_type);
+                },
+            }
+            try chunk_capabilities.validateInvocation(.chunk, chunk_shape);
+            const result = try state.node.chunkInputDirectWithContext(deadline_ns, alloc, parsed.value.model, input, .{
+                .model = if (cfg.model.len > 0) cfg.model else "fixed",
+                .max_chunks = if (cfg.max_chunks > 0) @intCast(cfg.max_chunks) else 50,
+                .threshold = cfg.threshold,
+                .text = .{
+                    .target_tokens = cfg.defaultedTargetTokens(),
+                    .overlap_tokens = cfg.defaultedOverlapTokens(),
+                    .separator = cfg.defaultedSeparator(),
+                },
+                .audio = .{
+                    .window_duration_ms = if (cfg.audio.window_duration_ms > 0) cfg.audio.window_duration_ms else 30_000,
+                    .overlap_duration_ms = cfg.audio.overlap_duration_ms,
+                },
+            });
+            defer inference_chunker.types.freeChunks(alloc, result);
+            // JSON parsing allocates text/data in the receiving allocator. Mark
+            // the wire copy as owning those allocations, then restore the
+            // borrowed direct result before its local destructor runs.
+            const ownership = try alloc.alloc(struct { mime_type: bool, text: bool, data: bool }, result.len);
+            defer alloc.free(ownership);
+            for (result, ownership) |*chunk, *original| {
+                original.* = .{
+                    .mime_type = chunk.owns_mime_type,
+                    .text = chunk.owns_text,
+                    .data = chunk.owns_data,
+                };
+                chunk.owns_mime_type = true;
+                chunk.owns_text = chunk.text != null;
+                chunk.owns_data = chunk.data != null;
+            }
+            defer for (result, ownership) |*chunk, original| {
+                chunk.owns_mime_type = original.mime_type;
+                chunk.owns_text = original.text;
+                chunk.owns_data = original.data;
+            };
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .rewrite_texts => blk: {
+            var parsed = try std.json.parseFromSlice(RewriteTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .rewrite, parsed.value.inputs, 0, 0, 0);
+            const result = try state.node.rewriteTextsDirect(alloc, parsed.value.model, parsed.value.inputs);
+            defer {
+                for (result) |item| alloc.free(item);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .classify_texts => blk: {
+            var parsed = try std.json.parseFromSlice(ClassifyTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const request = parsed.value.request;
+            // Classification is an internal extraction executor, not a public
+            // inference task. Resolve the physical classifier bucket while
+            // enforcing the canonical extraction contract.
+            try validateLinkedTextInvocationInScope(
+                &state.node,
+                state.io,
+                parsed.value.model,
+                .extract,
+                "classifiers",
+                request.texts,
+                0,
+                request.labels.len,
+                0,
+            );
+            const result = try state.node.classifyTextsDirect(
+                alloc,
+                parsed.value.model,
+                request.texts,
+                request.labels,
+                request.hypothesis_template,
+                request.multi_label,
+            );
+            defer {
+                for (result) |item| alloc.free(item);
+                alloc.free(result);
+            }
+            break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .list_models_json => blk: {
             const result = try state.node.listModelsJsonAlloc(alloc, state.io);
@@ -607,11 +1388,18 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         },
     };
     errdefer alloc.free(response_json);
+    try checkProviderInvokeControls(context);
     try execution_control.update(.serializing, 1, 1);
     const response = try alloc.create(ProviderResponseState);
     response.* = .{ .alloc = alloc, .json = response_json };
     context.out_response_handle.* = response;
     context.out_response_json.* = inference_bridge.String.init(response_json);
+}
+
+fn checkProviderInvokeControls(context: *const inference_bridge.ProviderInvokeContext) !void {
+    if (context.cancellation.requested()) return error.Canceled;
+    if (context.has_deadline != 0 and platform_time.monotonicNs() >= context.deadline_ns)
+        return error.Timeout;
 }
 
 fn providerGenerationContent(outcome: inference.server.ProviderGenerationOutcome) ![]u8 {
@@ -1156,6 +1944,57 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     instruction: ?[]const u8,
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    const capabilities = try localModelCapabilities(node, io, model, .embed);
+    var shape = antfly.inference.work.InvocationShape{ .item_count = parts.len };
+    for (parts) |part| switch (part) {
+        .text => |text| {
+            shape.modalities.text = true;
+            shape.text_bytes = std.math.add(usize, shape.text_bytes, text.len) catch
+                return error.InferenceTextBytesExceeded;
+            shape.max_text_bytes_per_item = @max(shape.max_text_bytes_per_item, text.len);
+            try capabilities.validateMimeType("text/plain");
+        },
+        .media_url => |url| {
+            shape.modalities.image = true;
+            shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
+            if (try antfly.inference.work.parseInlineDataUri(url)) |_| {
+                const next_encoded = std.math.add(usize, shape.encoded_media_bytes, url.len) catch
+                    return error.InferenceEncodedBytesExceeded;
+                if (capabilities.batch.max_encoded_media_bytes) |limit| {
+                    if (next_encoded > limit) return error.InferenceEncodedBytesExceeded;
+                }
+                var decoded = try antfly.inference.work.decodeInlineDataUriAlloc(alloc, url);
+                defer decoded.deinit(alloc);
+                try capabilities.validateMimeType(decoded.mime_type);
+                shape.encoded_media_bytes = next_encoded;
+                const pixels = try antfly.inference.work.encodedImagePixels(decoded.mime_type, decoded.data);
+                shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
+        },
+        .binary => |media| {
+            try capabilities.validateMimeType(media.mime_type);
+            const is_image = mimeEssenceStartsWith(media.mime_type, "image/");
+            if (is_image) {
+                shape.modalities.image = true;
+            } else if (mimeEssenceStartsWith(media.mime_type, "audio/")) {
+                shape.modalities.audio = true;
+            } else if (mimeEssencesEqual(media.mime_type, "application/pdf")) {
+                shape.modalities.document = true;
+            } else if (mimeEssencesEqual(media.mime_type, "text/plain")) {
+                shape.modalities.text = true;
+            } else return error.UnsupportedInferenceMimeType;
+            shape.encoded_media_bytes = std.math.add(usize, shape.encoded_media_bytes, media.data.len) catch
+                return error.InferenceEncodedBytesExceeded;
+            if (is_image) {
+                const pixels = try antfly.inference.work.encodedImagePixels(media.mime_type, media.data);
+                shape.decoded_pixels = std.math.add(u64, shape.decoded_pixels, pixels) catch
+                    return error.InferenceDecodedPixelsExceeded;
+            }
+            shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
+        },
+    };
+    try capabilities.validateInvocation(.embed, shape);
     const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
     defer alloc.free(direct_parts);
     return try node.embedDensePartsDirectWithExecutionControlAndTask(
@@ -1253,6 +2092,7 @@ fn localAntflyGenerateText(
 
 fn localAntflyGenerateMessages(
     ptr: *anyopaque,
+    io: std.Io,
     alloc: std.mem.Allocator,
     model: []const u8,
     messages: []const antfly.inference.ChatMessage,
@@ -1261,13 +2101,26 @@ fn localAntflyGenerateMessages(
 ) anyerror![]u8 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     if (messages.len == 0) return error.InvalidGenerationRequest;
-    const preflight = try preflightLocalGenerateMessages(messages);
+    const capabilities = try localModelCapabilities(node, io, model, .generate);
+    const preflight = try preflightLocalGenerateMessagesInternal(messages, null, capabilities);
+    try validateLocalGenerateCapabilities(
+        capabilities,
+        preflight,
+        0,
+        std.math.cast(usize, options.max_tokens) orelse return error.InvalidGeneratorConfig,
+    );
     var admission = try node.beginDirectGenerateAdmission(preflight, options.max_tokens);
     admission.execution_control = control;
     defer admission.deinit();
 
     var converted = try convertLocalGenerateMessages(alloc, messages, preflight.decoded_media_bytes);
     defer converted.deinit(alloc);
+    try validateLocalGenerateCapabilities(
+        capabilities,
+        preflight,
+        try localGenerateDecodedPixels(converted.messages),
+        std.math.cast(usize, options.max_tokens) orelse return error.InvalidGeneratorConfig,
+    );
     const outcome = try node.generateMessagesDirectAdmittedForProvider(
         alloc,
         model,
@@ -1275,6 +2128,421 @@ fn localAntflyGenerateMessages(
         &admission,
     );
     return try providerGenerationContent(outcome);
+}
+
+fn localAntflyGenerateMessagesWithAttachments(
+    ptr: *anyopaque,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const antfly.inference.ChatMessage,
+    attachments: []const antfly.inference.work.Attachment,
+) anyerror![]u8 {
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    if (messages.len == 0) return error.InvalidGenerationRequest;
+    const capabilities = try localModelCapabilities(node, io, model, .generate);
+    const preflight = try preflightLocalGenerateMessagesInternal(messages, attachments, capabilities);
+    try validateLocalGenerateCapabilities(capabilities, preflight, 0, 256);
+    var admission = try node.beginDirectGenerateAdmission(preflight, 256);
+    defer admission.deinit();
+
+    var converted = try convertLocalGenerateMessagesInternal(alloc, messages, preflight.decoded_media_bytes, attachments);
+    defer converted.deinit(alloc);
+    try validateLocalGenerateCapabilities(
+        capabilities,
+        preflight,
+        try localGenerateDecodedPixels(converted.messages),
+        256,
+    );
+    return try node.generateMessagesDirectAdmitted(alloc, model, converted.messages, &admission);
+}
+
+fn validateLocalGenerateCapabilities(
+    capabilities: antfly.inference.work.InferenceCapabilities,
+    preflight: inference.server.Node.DirectGeneratePreflight,
+    decoded_pixels: u64,
+    requested_output_tokens: usize,
+) !void {
+    try capabilities.validateInvocation(.generate, .{
+        .item_count = 1,
+        .modalities = .{
+            .text = preflight.text_bytes > 0,
+            .image = preflight.image_count > 0,
+            .audio = preflight.has_audio,
+        },
+        .encoded_media_bytes = preflight.encoded_media_bytes,
+        .decoded_pixels = decoded_pixels,
+        .max_media_parts_per_item = preflight.media_count,
+        .text_bytes = preflight.text_bytes,
+        .max_text_bytes_per_item = preflight.text_bytes,
+        .requested_output_tokens_per_item = requested_output_tokens,
+    });
+}
+
+fn localGenerateDecodedPixels(messages: []const inference.pipelines.GenerationMessage) !u64 {
+    var decoded_pixels: u64 = 0;
+    for (messages) |message| if (message.image_bytes) |images| {
+        for (images) |image| {
+            const info = inference.pipelines.image.inspectEncodedForInference(image, null) catch
+                return error.InvalidInferenceMedia;
+            decoded_pixels = std.math.add(u64, decoded_pixels, try info.pixels()) catch
+                return error.InferenceDecodedPixelsExceeded;
+        }
+    };
+    return decoded_pixels;
+}
+
+/// The provider ABI is an executor boundary, not a trusted shortcut around
+/// model admission. Callers normally preflight through Runtime, but plugins and
+/// future linked clients may invoke the stable ABI directly.
+fn validateEncodedReadCapabilities(
+    capabilities: antfly.inference.work.InferenceCapabilities,
+    request: antfly.readers.EncodedRequest,
+) !void {
+    var encoded_media_bytes: usize = 0;
+    var decoded_pixels: u64 = 0;
+    for (request.images) |image| {
+        try capabilities.validateMimeType(image.mime_type);
+        const resident = try antfly.inference.work.AttachmentTransport.borrowed_binary.wireSize(
+            image.bytes.len,
+            image.mime_type.len,
+        );
+        encoded_media_bytes = std.math.add(usize, encoded_media_bytes, resident) catch
+            return error.InferenceEncodedBytesExceeded;
+        const pixels = try antfly.inference.work.encodedImagePixels(image.mime_type, image.bytes);
+        decoded_pixels = std.math.add(u64, decoded_pixels, pixels) catch
+            return error.InferenceDecodedPixelsExceeded;
+    }
+    const output_tokens: usize = if (request.max_tokens) |tokens|
+        if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
+    else
+        0;
+    const prompt_bytes = if (request.prompt) |prompt| prompt.len else 0;
+    try capabilities.validateInvocation(.read, .{
+        .item_count = request.images.len,
+        .modalities = if (request.images.len > 0) .{ .image = true } else .{},
+        .encoded_media_bytes = encoded_media_bytes,
+        .decoded_pixels = decoded_pixels,
+        .max_media_parts_per_item = if (request.images.len > 0) 1 else 0,
+        .text_bytes = prompt_bytes,
+        .max_text_bytes_per_item = prompt_bytes,
+        // Zero means unknown here. The linked reader owns the tokenizer and
+        // enforces its exact, fully rendered prompt before model execution.
+        .max_input_tokens_per_item = 0,
+        .requested_output_tokens_per_item = output_tokens,
+    });
+}
+
+test "encoded reader ABI enforces resolved model capabilities" {
+    var bytes = [_]u8{0} ** 24;
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, bytes[16..20], 2, .big);
+    std.mem.writeInt(u32, bytes[20..24], 3, .big);
+    const image = antfly.readers.EncodedImage{ .bytes = &bytes, .mime_type = "image/png" };
+    const capabilities = antfly.inference.work.InferenceCapabilities{
+        .task = .read,
+        .input_modalities = .{ .image = true },
+        .accepted_mime_types = .{ .image_png = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .none,
+            .preferred_items = 1,
+            .max_items = 1,
+            .max_encoded_media_bytes = bytes.len,
+            .max_decoded_pixels = 6,
+            .max_media_parts_per_item = 1,
+        },
+        .task_limits = .{ .max_output_tokens_per_item = 4 },
+        .output = .read_result,
+    };
+    try validateEncodedReadCapabilities(capabilities, .{ .images = &.{image}, .max_tokens = 4 });
+    try std.testing.expectError(
+        error.InferenceBatchTooLarge,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{ image, image } }),
+    );
+    const oversized = bytes ++ [_]u8{0};
+    try std.testing.expectError(
+        error.InferenceEncodedBytesExceeded,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{.{ .bytes = &oversized, .mime_type = "image/png" }} }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedInferenceMimeType,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{.{ .bytes = &bytes, .mime_type = "image/jpeg" }} }),
+    );
+    try std.testing.expectError(
+        error.InferenceOutputTokensExceeded,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{image}, .max_tokens = 5 }),
+    );
+    var too_many_pixels = bytes;
+    std.mem.writeInt(u32, too_many_pixels[16..20], 3, .big);
+    try std.testing.expectError(
+        error.InferenceDecodedPixelsExceeded,
+        validateEncodedReadCapabilities(capabilities, .{ .images = &.{.{ .bytes = &too_many_pixels, .mime_type = "image/png" }} }),
+    );
+}
+
+fn validateLinkedTextInvocation(
+    node: *inference.server.Node,
+    io: std.Io,
+    model: []const u8,
+    task: antfly.inference.work.Task,
+    items: []const []const u8,
+    additional_text_bytes: usize,
+    candidates: usize,
+    schema_bytes: usize,
+) !void {
+    return validateLinkedTextInvocationInScope(
+        node,
+        io,
+        model,
+        task,
+        null,
+        items,
+        additional_text_bytes,
+        candidates,
+        schema_bytes,
+    );
+}
+
+fn validateLinkedTextInvocationInScope(
+    node: *inference.server.Node,
+    io: std.Io,
+    model: []const u8,
+    task: antfly.inference.work.Task,
+    scope_override: ?[]const u8,
+    items: []const []const u8,
+    additional_text_bytes: usize,
+    candidates: usize,
+    schema_bytes: usize,
+) !void {
+    const capabilities = try localModelCapabilitiesInScope(node, io, model, task, scope_override);
+    try capabilities.validateMimeType("text/plain");
+    var shape = antfly.inference.work.InvocationShape{
+        .item_count = if (task == .generate) 1 else switch (capabilities.result_cardinality) {
+            .one_per_item => items.len,
+            .one_per_request => 1,
+        },
+        .modalities = .{ .text = true },
+        .text_bytes = additional_text_bytes,
+        .max_text_bytes_per_item = additional_text_bytes,
+        .max_candidates_per_request = candidates,
+        .schema_bytes = schema_bytes,
+    };
+    for (items) |item| {
+        shape.text_bytes = std.math.add(usize, shape.text_bytes, item.len) catch
+            return error.InferenceTextBytesExceeded;
+        shape.max_text_bytes_per_item = @max(shape.max_text_bytes_per_item, item.len);
+    }
+    try capabilities.validateInvocation(task, shape);
+}
+
+fn localModelCapabilities(
+    node: *inference.server.Node,
+    io: std.Io,
+    model: []const u8,
+    task: antfly.inference.work.Task,
+) !antfly.inference.work.InferenceCapabilities {
+    return localModelCapabilitiesInScope(node, io, model, task, null);
+}
+
+fn localModelCapabilitiesInScope(
+    node: *inference.server.Node,
+    io: std.Io,
+    model: []const u8,
+    task: antfly.inference.work.Task,
+    scope_override: ?[]const u8,
+) !antfly.inference.work.InferenceCapabilities {
+    if (task == .chunk and
+        (std.mem.eql(u8, model, "fixed") or
+            std.mem.eql(u8, model, "fixed_bert") or
+            std.mem.eql(u8, model, "fixed_bpe") or
+            std.mem.eql(u8, model, "fixed-bert-tokenizer")))
+    {
+        var accepted_mime_types = antfly.inference.work.MimeTypes{
+            .text_plain = true,
+            .image_png = true,
+            .image_jpeg = true,
+            .image_webp = true,
+            .audio_wav = true,
+        };
+        try accepted_mime_types.add("image/gif");
+        return .{
+            .task = .chunk,
+            .input_modalities = .{ .text = true, .image = true, .audio = true },
+            .accepted_mime_types = accepted_mime_types,
+            .input_granularity = .item,
+            .batch = .{
+                .mode = .none,
+                .preferred_items = 1,
+                .max_items = 1,
+                .max_encoded_media_bytes = inference.server.requestMediaMaxBytes(node),
+                .max_decoded_pixels = inference.server.requestMediaMaxDecodedPixels(node, 1),
+                .max_media_parts_per_item = 1,
+            },
+            .output = .chunks,
+            .result_cardinality = .one_per_request,
+            .prompt_policy = .model_default,
+            .borrowed_attachments = true,
+        };
+    }
+    const scope = scope_override orelse switch (task) {
+        .read => "readers",
+        .generate => "generators",
+        .embed => "embedders",
+        .rerank => "rerankers",
+        .chunk => "chunkers",
+        .extract => "extractors",
+        .rewrite => "rewriters",
+        .transcribe => "transcribers",
+    };
+    const model_path = try node.resolveModelPath(io, if (model.len > 0) model else null, scope);
+    defer node.allocator.free(model_path);
+    var manifest = try inference.models.manifest.loadFromDir(node.allocator, model_path);
+    defer manifest.deinit();
+
+    var modalities = antfly.inference.work.Modalities{};
+    for (manifest.inputs) |input| {
+        if (std.mem.eql(u8, input, "text")) modalities.text = true;
+        if (std.mem.eql(u8, input, "image")) modalities.image = true;
+        if (std.mem.eql(u8, input, "audio")) modalities.audio = true;
+        if (std.mem.eql(u8, input, "document") or std.mem.eql(u8, input, "pdf")) modalities.document = true;
+    }
+    // Older manifests may omit explicit inputs. Use resolved architecture
+    // metadata, never the user-provided model name, for compatibility.
+    if (@as(u8, @bitCast(modalities)) == 0) switch (task) {
+        .read => modalities.image = true,
+        .generate => {
+            modalities.text = true;
+            modalities.image = manifest.gguf_projector_path != null;
+        },
+        .embed => {
+            modalities.text = true;
+            modalities.image = manifest.native_arch_hint == .clip;
+            modalities.audio = manifest.native_arch_hint == .clap;
+        },
+        .rerank, .chunk, .rewrite => modalities.text = true,
+        .extract => modalities.text = true,
+        .transcribe => modalities.audio = true,
+    };
+
+    const executor_modalities = inference.server.resolvedExecutorModalities(
+        @tagName(task),
+        modalities.text,
+        modalities.image,
+        modalities.audio,
+        modalities.document,
+    );
+    modalities = .{
+        .text = executor_modalities.text,
+        .image = executor_modalities.image,
+        .audio = executor_modalities.audio,
+        .document = executor_modalities.document,
+    };
+
+    const task_max_items = inference.server.resolvedTaskMaxItems(@tagName(task));
+    const max_images = if (!modalities.image)
+        0
+    else if (task == .generate)
+        std.math.mul(usize, task_max_items, inference.server.max_generate_media_parts_per_item) catch std.math.maxInt(usize)
+    else
+        task_max_items;
+    const resolved_batch = try inference.server.resolveInferenceBatchCapabilities(
+        @tagName(task),
+        manifest.capabilities,
+        inference.server.resolvedExecutorBatchImplementation(
+            @tagName(task),
+            inference.server.resolvedExecutorKind(@tagName(task), &manifest),
+        ),
+        inference.server.requestMediaMaxBytes(node),
+        if (max_images > 0) inference.server.requestMediaMaxDecodedPixels(node, max_images) else 0,
+        modalities.image,
+        modalities.audio,
+        modalities.document,
+    );
+    const output = std.meta.stringToEnum(
+        antfly.inference.work.OutputKind,
+        inference.server.resolvedTaskOutput(@tagName(task)),
+    ).?;
+    var result = antfly.inference.work.InferenceCapabilities{
+        .task = task,
+        .input_modalities = modalities,
+        .accepted_mime_types = .{
+            .text_plain = modalities.text,
+            .application_pdf = modalities.document,
+            .image_png = modalities.image,
+            .image_jpeg = modalities.image,
+            .image_webp = modalities.image,
+            .audio_wav = modalities.audio,
+            .audio_mpeg = modalities.audio,
+        },
+        .input_granularity = if (modalities.document)
+            .document
+        else if (modalities.image)
+            .page
+        else if (modalities.text and (task == .read or task == .generate or task == .embed))
+            .chunk
+        else
+            .item,
+        .batch = .{
+            .mode = switch (resolved_batch.mode) {
+                .none => .none,
+                .serial_compatibility => .serial_compatibility,
+                .native => .native,
+            },
+            .preferred_items = resolved_batch.preferred_items,
+            .max_items = resolved_batch.max_items,
+            .max_encoded_media_bytes = resolved_batch.max_encoded_media_bytes,
+            .max_decoded_pixels = resolved_batch.max_decoded_pixels,
+            .max_media_parts_per_item = resolved_batch.max_media_parts_per_item,
+            .per_item_failures = resolved_batch.per_item_failures,
+        },
+        .image_transform = if (inference.server.resolvedImageTransform(@tagName(task), &manifest)) |transform| .{
+            .target_width = transform.target_width,
+            .target_height = transform.target_height,
+            .resize_mode = switch (transform.resize_mode) {
+                .stretch => .stretch,
+                .cover_center_crop => .cover_center_crop,
+            },
+            .resample = switch (transform.resample) {
+                .nearest => .nearest,
+                .bilinear => .bilinear,
+                .bicubic => .bicubic,
+            },
+        } else null,
+        .task_limits = .{
+            .max_text_bytes_per_item = resolved_batch.max_text_bytes_per_item,
+            .max_input_tokens_per_item = resolved_batch.max_input_tokens_per_item,
+            .max_output_tokens_per_item = resolved_batch.max_output_tokens_per_item,
+            .max_candidates_per_request = resolved_batch.max_candidates_per_request,
+            .max_schema_bytes = resolved_batch.max_schema_bytes,
+        },
+        .output = output,
+        .result_cardinality = std.meta.stringToEnum(
+            antfly.inference.work.ResultCardinality,
+            inference.server.resolvedTaskResultCardinality(@tagName(task)),
+        ).?,
+        .prompt_policy = std.meta.stringToEnum(
+            antfly.inference.work.PromptPolicy,
+            inference.server.resolvedTaskPromptPolicy(@tagName(task)),
+        ).?,
+        .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
+        .borrowed_rasters = (task == .read and manifest.native_arch_hint == .florence) or
+            (task == .embed and modalities.image),
+    };
+    for (manifest.capabilities) |capability| {
+        const prefix = "inference.mime_type=";
+        if (std.mem.startsWith(u8, capability, prefix)) {
+            const mime_type = capability[prefix.len..];
+            if (mimeEssenceStartsWith(mime_type, "image/") and
+                !inference.pipelines.image.supportsMimeEssence(mime_type))
+            {
+                return error.InvalidInferenceCapabilities;
+            }
+            try result.accepted_mime_types.add(mime_type);
+        }
+    }
+    try result.validate();
+    return result;
 }
 
 fn localAntflyReadImages(
@@ -1333,6 +2601,7 @@ const LocalGenerateMediaDescriptor = struct {
     mime_type: []const u8,
     encoded_bytes: usize,
     decoded_bytes: usize,
+    is_data_uri: bool = false,
 };
 
 pub const LocalGenerateDecodeBudget = struct {
@@ -1350,26 +2619,45 @@ fn inspectLocalGenerateDataUri(
 ) !LocalGenerateMediaDescriptor {
     var mime_type = declared_mime_type orelse "application/octet-stream";
     var payload = raw;
-    if (std.mem.startsWith(u8, raw, "data:")) {
-        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.UnsupportedGeneratorProvider;
-        const meta = raw["data:".len..comma];
-        if (!std.mem.endsWith(u8, meta, ";base64")) return error.UnsupportedGeneratorProvider;
-        const embedded_mime = meta[0 .. meta.len - ";base64".len];
-        if (embedded_mime.len > 0) {
-            if (declared_mime_type) |declared| {
-                if (!std.mem.eql(u8, declared, embedded_mime)) return error.UnsupportedGeneratorProvider;
-            }
-            mime_type = embedded_mime;
+    var is_data_uri = false;
+    var decoded_bytes: usize = undefined;
+    if (antfly.inference.work.hasDataUriScheme(raw)) {
+        const parsed = (try antfly.inference.work.parseInlineDataUri(raw)) orelse
+            return error.UnsupportedGeneratorProvider;
+        if (declared_mime_type) |declared| {
+            if (!mimeDeclarationsCompatible(declared, parsed.mime_type))
+                return error.UnsupportedGeneratorProvider;
         }
-        payload = raw[comma + 1 ..];
+        mime_type = parsed.mime_type;
+        payload = parsed.payload;
+        decoded_bytes = parsed.decoded_size;
+        is_data_uri = true;
+    } else {
+        decoded_bytes = try antfly.inference.work.validateCanonicalStandardBase64(payload);
     }
 
     return .{
         .payload = payload,
         .mime_type = mime_type,
         .encoded_bytes = raw.len,
-        .decoded_bytes = try std.base64.standard.Decoder.calcSizeForSlice(payload),
+        .decoded_bytes = decoded_bytes,
+        .is_data_uri = is_data_uri,
     };
+}
+
+fn mimeEssencesEqual(a: []const u8, b: []const u8) bool {
+    const a_essence = antfly.inference.work.mimeTypeEssence(a) catch return false;
+    const b_essence = antfly.inference.work.mimeTypeEssence(b) catch return false;
+    return std.ascii.eqlIgnoreCase(a_essence, b_essence);
+}
+
+fn mimeDeclarationsCompatible(declared: []const u8, attachment: []const u8) bool {
+    return antfly.inference.work.mediaTypesCompatible(declared, attachment);
+}
+
+fn mimeEssenceStartsWith(value: []const u8, prefix: []const u8) bool {
+    const essence = antfly.inference.work.mimeTypeEssence(value) catch return false;
+    return std.ascii.startsWithIgnoreCase(essence, prefix);
 }
 
 fn addLocalGenerateBytes(total: *usize, amount: usize) !void {
@@ -1381,8 +2669,8 @@ fn addLocalGenerateMediaPreflight(
     descriptor: LocalGenerateMediaDescriptor,
     image_only: bool,
 ) !void {
-    const is_image = std.mem.startsWith(u8, descriptor.mime_type, "image/");
-    const is_audio = std.mem.startsWith(u8, descriptor.mime_type, "audio/");
+    const is_image = mimeEssenceStartsWith(descriptor.mime_type, "image/");
+    const is_audio = mimeEssenceStartsWith(descriptor.mime_type, "audio/");
     if (!is_image and (image_only or !is_audio)) return error.UnsupportedGeneratorProvider;
 
     try addLocalGenerateBytes(&preflight.encoded_media_bytes, descriptor.encoded_bytes);
@@ -1398,26 +2686,57 @@ fn addLocalGenerateMediaPreflight(
 pub fn preflightLocalGenerateMessages(
     messages: []const antfly.inference.ChatMessage,
 ) !inference.server.Node.DirectGeneratePreflight {
+    return try preflightLocalGenerateMessagesInternal(messages, null, null);
+}
+
+fn preflightLocalGenerateMessagesInternal(
+    messages: []const antfly.inference.ChatMessage,
+    attachments: ?[]const antfly.inference.work.Attachment,
+    capabilities: ?antfly.inference.work.InferenceCapabilities,
+) !inference.server.Node.DirectGeneratePreflight {
     var preflight: inference.server.Node.DirectGeneratePreflight = .{};
+    var attachment_index: usize = 0;
     for (messages) |message| {
         const content = message.content orelse continue;
         switch (content) {
             .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
             .parts => |parts| for (parts) |part| switch (part) {
                 .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
-                .image_url => |image_url| try addLocalGenerateMediaPreflight(
-                    &preflight,
-                    try inspectLocalGenerateDataUri(image_url.url, null),
-                    true,
-                ),
-                .media => |media| try addLocalGenerateMediaPreflight(
-                    &preflight,
-                    try inspectLocalGenerateDataUri(media.url orelse media.data, media.mime_type),
-                    false,
-                ),
+                .image_url => |image_url| {
+                    const descriptor = try inspectLocalGenerateDataUri(image_url.url, null);
+                    if (capabilities) |resolved| try resolved.validateMimeType(descriptor.mime_type);
+                    try addLocalGenerateMediaPreflight(&preflight, descriptor, true);
+                },
+                .media => |media| {
+                    const raw = media.url orelse media.data;
+                    if (raw.len == 0 and attachments != null) {
+                        if (attachment_index >= attachments.?.len) return error.InvalidArguments;
+                        const attachment = attachments.?[attachment_index];
+                        try attachment.validate();
+                        if (capabilities) |resolved| try resolved.validateMimeType(attachment.content_type);
+                        if (media.mime_type.len > 0 and !mimeDeclarationsCompatible(media.mime_type, attachment.content_type))
+                            return error.InvalidArguments;
+                        try addLocalGenerateMediaPreflight(&preflight, .{
+                            .payload = attachment.bytes,
+                            .mime_type = attachment.content_type,
+                            .encoded_bytes = attachment.bytes.len,
+                            .decoded_bytes = attachment.bytes.len,
+                        }, false);
+                        attachment_index += 1;
+                    } else {
+                        const descriptor = try inspectLocalGenerateDataUri(raw, media.mime_type);
+                        if (capabilities) |resolved| try resolved.validateMimeType(descriptor.mime_type);
+                        try addLocalGenerateMediaPreflight(
+                            &preflight,
+                            descriptor,
+                            false,
+                        );
+                    }
+                },
             },
         }
     }
+    if (attachments) |values| if (attachment_index != values.len) return error.InvalidArguments;
     return preflight;
 }
 
@@ -1426,15 +2745,26 @@ pub fn convertLocalGenerateMessages(
     messages: []const antfly.inference.ChatMessage,
     decoded_media_bytes: usize,
 ) !LocalGenerateMessages {
+    return try convertLocalGenerateMessagesInternal(alloc, messages, decoded_media_bytes, null);
+}
+
+fn convertLocalGenerateMessagesInternal(
+    alloc: std.mem.Allocator,
+    messages: []const antfly.inference.ChatMessage,
+    decoded_media_bytes: usize,
+    attachments: ?[]const antfly.inference.work.Attachment,
+) !LocalGenerateMessages {
     var out = LocalGenerateMessages{
         .messages = try alloc.alloc(inference.pipelines.GenerationMessage, messages.len),
     };
     errdefer out.deinit(alloc);
 
     var decode_budget = LocalGenerateDecodeBudget{ .remaining_bytes = decoded_media_bytes };
+    var attachment_index: usize = 0;
     for (messages, 0..) |message, i|
-        out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message, &decode_budget);
+        out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message, &decode_budget, attachments, &attachment_index);
     if (decode_budget.remaining_bytes != 0) return error.InvalidGenerationAdmission;
+    if (attachments) |values| if (attachment_index != values.len) return error.InvalidArguments;
     return out;
 }
 
@@ -1443,6 +2773,8 @@ fn convertLocalGenerateMessage(
     owner: *LocalGenerateMessages,
     message: antfly.inference.ChatMessage,
     decode_budget: *LocalGenerateDecodeBudget,
+    attachments: ?[]const antfly.inference.work.Attachment,
+    attachment_index: *usize,
 ) !inference.pipelines.GenerationMessage {
     const role = message.role.toSlice();
     const content = message.content orelse {
@@ -1463,7 +2795,7 @@ fn convertLocalGenerateMessage(
             text_owned = false;
             break :blk .{ .role = role, .content = text };
         },
-        .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts, decode_budget),
+        .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts, decode_budget, attachments, attachment_index),
     };
 }
 
@@ -1473,6 +2805,8 @@ fn convertLocalGenerateParts(
     role: []const u8,
     parts: []const antfly.inference.ContentPart,
     decode_budget: *LocalGenerateDecodeBudget,
+    attachments: ?[]const antfly.inference.work.Attachment,
+    attachment_index: *usize,
 ) !inference.pipelines.GenerationMessage {
     var text_buf = std.ArrayListUnmanaged(u8).empty;
     errdefer text_buf.deinit(alloc);
@@ -1495,9 +2829,10 @@ fn convertLocalGenerateParts(
                 const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
-                if (!std.mem.startsWith(u8, decoded.mime_type, "image/")) {
+                if (!mimeEssenceStartsWith(decoded.mime_type, "image/")) {
                     return error.UnsupportedGeneratorProvider;
                 }
+                _ = try antfly.inference.work.encodedImagePixels(decoded.mime_type, decoded.data);
                 try images.append(alloc, decoded.data);
                 try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                 try owner.owned_media.append(alloc, decoded.data);
@@ -1505,15 +2840,34 @@ fn convertLocalGenerateParts(
             },
             .media => |media| {
                 const raw = media.url orelse media.data;
+                if (raw.len == 0 and attachments != null) {
+                    if (attachment_index.* >= attachments.?.len) return error.InvalidArguments;
+                    const attachment = attachments.?[attachment_index.*];
+                    try attachment.validate();
+                    if (media.mime_type.len > 0 and !mimeDeclarationsCompatible(media.mime_type, attachment.content_type))
+                        return error.InvalidArguments;
+                    try decode_budget.reserve(attachment.bytes.len);
+                    if (mimeEssenceStartsWith(attachment.content_type, "image/")) {
+                        _ = try antfly.inference.work.encodedImagePixels(attachment.content_type, attachment.bytes);
+                        try images.append(alloc, attachment.bytes);
+                        try out_parts.append(alloc, .{ .image = images.items.len - 1 });
+                    } else if (mimeEssenceStartsWith(attachment.content_type, "audio/")) {
+                        try audio.append(alloc, attachment.bytes);
+                        try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
+                    } else return error.UnsupportedGeneratorProvider;
+                    attachment_index.* += 1;
+                    continue;
+                }
                 const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type, decode_budget);
                 var decoded_owned = true;
                 errdefer if (decoded_owned) alloc.free(decoded.data);
-                if (std.mem.startsWith(u8, decoded.mime_type, "image/")) {
+                if (mimeEssenceStartsWith(decoded.mime_type, "image/")) {
+                    _ = try antfly.inference.work.encodedImagePixels(decoded.mime_type, decoded.data);
                     try images.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .image = images.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
                     decoded_owned = false;
-                } else if (std.mem.startsWith(u8, decoded.mime_type, "audio/")) {
+                } else if (mimeEssenceStartsWith(decoded.mime_type, "audio/")) {
                     try audio.append(alloc, decoded.data);
                     try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
@@ -1577,10 +2931,63 @@ pub fn decodeLocalGenerateDataUri(
 ) !DecodedLocalMedia {
     const descriptor = try inspectLocalGenerateDataUri(raw, declared_mime_type);
     try decode_budget.reserve(descriptor.decoded_bytes);
+    if (descriptor.is_data_uri) {
+        var decoded = try antfly.inference.work.decodeInlineDataUriAlloc(alloc, raw);
+        errdefer decoded.deinit(alloc);
+        if (decoded.data.len != descriptor.decoded_bytes or
+            !mimeDeclarationsCompatible(descriptor.mime_type, decoded.mime_type))
+            return error.InvalidGenerationAdmission;
+        alloc.free(decoded.mime_type);
+        const data = decoded.data;
+        decoded = undefined;
+        return .{ .data = data, .mime_type = descriptor.mime_type };
+    }
     const decoded = try alloc.alloc(u8, descriptor.decoded_bytes);
     errdefer alloc.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, descriptor.payload);
     return .{ .data = decoded, .mime_type = descriptor.mime_type };
+}
+
+test "linked generator validates concrete MIME and decoded pixels" {
+    const uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const messages = [_]antfly.inference.ChatMessage{.{
+        .role = .user,
+        .content = .{ .parts = &.{.{ .image_url = .{ .url = uri } }} },
+    }};
+    var capabilities = antfly.inference.work.InferenceCapabilities{
+        .task = .generate,
+        .input_modalities = .{ .text = true, .image = true },
+        .accepted_mime_types = .{ .text_plain = true, .image_jpeg = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .serial_compatibility,
+            .preferred_items = 1,
+            .max_items = 1,
+            .max_encoded_media_bytes = uri.len,
+            .max_decoded_pixels = 5,
+            .max_media_parts_per_item = 1,
+        },
+        .output = .generated_text,
+    };
+    try std.testing.expectError(
+        error.UnsupportedInferenceMimeType,
+        preflightLocalGenerateMessagesInternal(&messages, null, capabilities),
+    );
+
+    capabilities.accepted_mime_types = .{ .text_plain = true, .image_png = true };
+    const preflight = try preflightLocalGenerateMessagesInternal(&messages, null, capabilities);
+    try validateLocalGenerateCapabilities(capabilities, preflight, 0, 256);
+    var converted = try convertLocalGenerateMessages(
+        std.testing.allocator,
+        &messages,
+        preflight.decoded_media_bytes,
+    );
+    defer converted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 6), try localGenerateDecodedPixels(converted.messages));
+    try std.testing.expectError(
+        error.InferenceDecodedPixelsExceeded,
+        validateLocalGenerateCapabilities(capabilities, preflight, 6, 256),
+    );
 }
 
 // ---------------------------------------------------------------

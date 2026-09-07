@@ -8,6 +8,7 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference = @import("types.zig");
+const inference_work = @import("work.zig");
 const credential_source_identity = @import("../common/credential_source_identity.zig");
 const provider_defaults = @import("../common/provider_defaults.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
@@ -67,6 +68,72 @@ pub const CredentialSource = union(enum) {
     default,
     profile: ProfileCredentialSource,
     web_identity: WebIdentityCredentialSource,
+};
+
+/// One absolute control context shared by credential discovery and the model
+/// invocation. Computing a residual timeout for every network hop prevents a
+/// credential refresh from restarting the caller's timeout budget.
+const RequestContext = struct {
+    deadline_ns: ?i96 = null,
+    cancellation: ?CancellationToken = null,
+
+    fn init(io: std.Io, timeout_ms: ?u64, cancellation: ?CancellationToken) RequestContext {
+        return initAt(std.Io.Timestamp.now(io, .awake), timeout_ms, cancellation);
+    }
+
+    fn initAt(now: std.Io.Timestamp, timeout_ms: ?u64, cancellation: ?CancellationToken) RequestContext {
+        const deadline_ns: ?i96 = if (timeout_ms) |timeout|
+            if (timeout == 0)
+                null
+            else
+                now.toNanoseconds() +| (std.math.mul(i96, @intCast(timeout), std.time.ns_per_ms) catch std.math.maxInt(i96))
+        else
+            null;
+        return .{ .deadline_ns = deadline_ns, .cancellation = cancellation };
+    }
+
+    fn isBounded(self: RequestContext) bool {
+        return self.deadline_ns != null or self.cancellation != null;
+    }
+
+    fn check(self: RequestContext, io: std.Io) !void {
+        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (self.deadline_ns) |deadline| {
+            if (std.Io.Timestamp.now(io, .awake).toNanoseconds() >= deadline) return error.Timeout;
+        }
+    }
+
+    fn remainingTimeoutMs(self: RequestContext, io: std.Io) !?u64 {
+        return self.remainingTimeoutMsAt(std.Io.Timestamp.now(io, .awake));
+    }
+
+    fn remainingTimeoutMsAt(self: RequestContext, now: std.Io.Timestamp) !?u64 {
+        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const deadline = self.deadline_ns orelse return null;
+        const remaining_ns = deadline - now.toNanoseconds();
+        if (remaining_ns <= 0) return error.Timeout;
+        return @intCast(@max(
+            @as(i96, 1),
+            @divTrunc(remaining_ns +| std.time.ns_per_ms - 1, std.time.ns_per_ms),
+        ));
+    }
+
+    fn httpCancellation(self: RequestContext) ?httpx.CancellationToken {
+        const token = self.cancellation orelse return null;
+        const ptr = token.ptr orelse return null;
+        const callback = token.is_cancelled_fn orelse return null;
+        return httpx.CancellationToken.fromCallback(ptr, callback);
+    }
+
+    fn waitForRefresh(self: RequestContext, io: std.Io) !void {
+        try self.check(io);
+        const remaining_ms = try self.remainingTimeoutMs(io);
+        const poll_ms: u64 = @min(remaining_ms orelse 5, 5);
+        io.sleep(.fromMilliseconds(@intCast(@max(poll_ms, 1))), .awake) catch |err| switch (err) {
+            error.Canceled => return error.Cancelled,
+        };
+        try self.check(io);
+    }
 };
 
 pub const CredentialCache = struct {
@@ -139,33 +206,69 @@ pub const CredentialCache = struct {
     }
 
     pub fn get(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8) !Credentials {
-        return try self.getForSource(alloc, http, region, .default);
+        return try self.getWithContext(alloc, std.heap.smp_allocator, http, region, .{});
     }
 
     pub fn getForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
-        var lease = try self.getLeaseForSourceWithIo(alloc, http, null, region, source);
+        return try self.getForSourceWithContext(alloc, std.heap.smp_allocator, http, region, source, .{});
+    }
+
+    fn getWithContext(self: *CredentialCache, result_alloc: std.mem.Allocator, cache_alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, context: RequestContext) !Credentials {
+        var lease = try self.getLeaseForSourceWithContext(cache_alloc, http, region, .default, context);
         defer lease.release();
-        return try lease.credentials().clone(alloc);
+        return try lease.credentials().clone(result_alloc);
+    }
+
+    fn getForSourceWithContext(self: *CredentialCache, result_alloc: std.mem.Allocator, cache_alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource, context: RequestContext) !Credentials {
+        var lease = try self.getLeaseForSourceWithContext(cache_alloc, http, region, source, context);
+        defer lease.release();
+        return try lease.credentials().clone(result_alloc);
     }
 
     /// Returns a ref-counted immutable credential snapshot. Storage clients use
     /// this path so cached requests avoid serialized key copies and heap churn;
     /// the lease keeps credentials alive across signing even when a concurrent
-    /// refresh replaces the cache entry.
-    pub fn getLeaseForSource(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Lease {
-        return try self.getLeaseForSourceWithIo(alloc, http, null, region, source);
+    /// refresh replaces the cache entry. The allocator argument remains for API
+    /// compatibility; cache-owned snapshots always use the process thread-safe
+    /// allocator because they outlive requests and cross worker threads.
+    pub fn getLeaseForSource(self: *CredentialCache, _: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Lease {
+        return try self.getLeaseForSourceWithContext(std.heap.smp_allocator, http, region, source, .{});
+    }
+
+    fn getLeaseForSourceWithContext(self: *CredentialCache, alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource, context: RequestContext) !Lease {
+        return try self.getLeaseForSourceWithContextAndIo(alloc, http, null, region, source, context);
     }
 
     pub fn getLeaseForSourceWithIo(
+        self: *CredentialCache,
+        _: std.mem.Allocator,
+        http: *httpx.Client,
+        filesystem_io: ?std.Io,
+        region: []const u8,
+        source: CredentialSource,
+    ) !Lease {
+        return try self.getLeaseForSourceWithContextAndIo(
+            std.heap.smp_allocator,
+            http,
+            filesystem_io,
+            region,
+            source,
+            .{},
+        );
+    }
+
+    fn getLeaseForSourceWithContextAndIo(
         self: *CredentialCache,
         alloc: std.mem.Allocator,
         http: *httpx.Client,
         filesystem_io: ?std.Io,
         region: []const u8,
         source: CredentialSource,
+        context: RequestContext,
     ) !Lease {
         const source_key = credentialSourceKey(region, source);
         const io = try self.bindIo(http.io);
+        try context.check(io);
         self.mutex.lockUncancelable(io);
         if (self.closing) {
             self.mutex.unlock(io);
@@ -199,14 +302,24 @@ pub const CredentialCache = struct {
                         return .{ .snapshot = snapshot };
                     }
                 }
-                self.refreshed.waitUncancelable(io, &self.mutex);
-                self.mutex.unlock(io);
+                if (context.isBounded()) {
+                    self.mutex.unlock(io);
+                    try context.waitForRefresh(io);
+                } else {
+                    self.refreshed.waitUncancelable(io, &self.mutex);
+                    self.mutex.unlock(io);
+                }
                 continue;
             }
             self.refreshing = true;
             self.mutex.unlock(io);
 
-            var fresh = resolveCredentialsUncachedWithIo(alloc, http, filesystem_io, region, source) catch |err| {
+            var fresh = resolveCredentialsUncachedWithContextAndIo(alloc, http, filesystem_io, region, source, context) catch |err| {
+                const request_aborted = err == error.Timeout or err == error.Cancelled or err == error.Canceled;
+                if (request_aborted) {
+                    self.finishFailedRefresh(io);
+                    return err;
+                }
                 const fallback_now = currentUnixSeconds() catch |clock_err| {
                     self.finishFailedRefresh(io);
                     return clock_err;
@@ -369,6 +482,7 @@ pub const Options = struct {
     truncate: []const u8 = "",
     dimension: u32 = 0,
     cancellation: ?CancellationToken = null,
+    timeout_ms: ?u64 = null,
 };
 
 pub const Provider = struct {
@@ -379,7 +493,11 @@ pub const Provider = struct {
     credential_cache: ?*CredentialCache = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, options: Options) Provider {
-        return .{ .allocator = allocator, .http = http, .options = options };
+        return .{
+            .allocator = allocator,
+            .http = http,
+            .options = options,
+        };
     }
 
     pub fn initWithCredentialCache(allocator: std.mem.Allocator, http: *httpx.Client, options: Options, credential_cache: *CredentialCache) Provider {
@@ -396,9 +514,18 @@ pub const Provider = struct {
     }
 
     pub fn embedText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) !inference.EmbedResult {
+        return try self.embedTextWithContext(
+            alloc,
+            model,
+            texts,
+            RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation),
+        );
+    }
+
+    fn embedTextWithContext(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_context: RequestContext) !inference.EmbedResult {
         const request_format = try resolveRequestFormat(model, self.options.request_format);
         if (request_format == .cohere_v3 or request_format == .cohere_v4) {
-            return try self.embedCohereText(alloc, model, texts, request_format);
+            return try self.embedCohereText(alloc, model, texts, request_format, request_context);
         }
 
         const vectors = try alloc.alloc([]const f32, texts.len);
@@ -413,7 +540,7 @@ pub const Provider = struct {
             const arena = arena_state.allocator();
 
             const body = try textEmbeddingBody(arena, request_format, text, self.options.dimension);
-            var result = try self.invokeEmbeddingsValue(alloc, model, .{ .object = body });
+            var result = try self.invokeEmbeddingsValue(alloc, model, .{ .object = body }, request_context);
             defer result.deinit();
             if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
             vectors[i] = try alloc.dupe(f32, result.vectors[0]);
@@ -423,33 +550,43 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
+        const request_context = RequestContext.init(self.http.io, self.options.timeout_ms, self.options.cancellation);
         const request_format = try resolveRequestFormat(model, self.options.request_format);
         if (request_format == .titan_multimodal) {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
-            return try self.invokeEmbeddingsValue(alloc, model, .{ .object = try titanMultimodalBody(arena, parts, self.options.dimension) });
+            return try self.invokeEmbeddingsValue(alloc, model, .{ .object = try titanMultimodalBody(arena, parts, self.options.dimension) }, request_context);
         }
         if (request_format == .cohere_v4) {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
-            return try self.invokeEmbeddingsValue(alloc, model, .{ .object = try cohereV4Body(arena, parts, self.options.input_type, self.options.truncate, self.options.dimension) });
+            return try self.invokeEmbeddingsValue(alloc, model, .{ .object = try cohereV4Body(arena, parts, self.options.input_type, self.options.truncate, self.options.dimension) }, request_context);
         }
         const flattened = try flattenPartsToText(alloc, parts);
         defer alloc.free(flattened);
-        return try self.embedText(alloc, model, &.{flattened});
+        return try self.embedTextWithContext(alloc, model, &.{flattened}, request_context);
     }
 
-    fn invokeEmbeddingsValue(self: *Provider, alloc: std.mem.Allocator, model: []const u8, body_value: std.json.Value) !inference.EmbedResult {
+    fn invokeEmbeddingsValue(self: *Provider, alloc: std.mem.Allocator, model: []const u8, body_value: std.json.Value, request_context: RequestContext) !inference.EmbedResult {
         const json_body = try httpx.json.Json.stringify(alloc, body_value);
         defer alloc.free(json_body);
-        return try self.invokeEmbeddingsJson(alloc, model, json_body);
+        return try self.invokeEmbeddingsJson(alloc, model, json_body, request_context);
     }
 
-    fn invokeEmbeddingsJson(self: *Provider, alloc: std.mem.Allocator, model: []const u8, json_body: []const u8) !inference.EmbedResult {
+    fn invokeEmbeddingsJson(self: *Provider, alloc: std.mem.Allocator, model: []const u8, json_body: []const u8, request_context: RequestContext) !inference.EmbedResult {
         const cache = self.credential_cache orelse &self.owned_credential_cache;
-        var creds = try cache.getForSource(alloc, self.http, self.options.region, self.options.credential_source);
+        // Cached snapshots outlive this invocation and may be refreshed by a
+        // concurrent request. Never allocate them from the caller's arena.
+        var creds = try cache.getForSourceWithContext(
+            alloc,
+            std.heap.smp_allocator,
+            self.http,
+            self.options.region,
+            self.options.credential_source,
+            request_context,
+        );
         defer creds.deinit(alloc);
 
         const endpoint = try endpointBaseAlloc(alloc, self.options.endpoint);
@@ -468,10 +605,9 @@ pub const Provider = struct {
             .attempt_observer = self.options.attempt_observer,
             .headers = signed,
             .body = json_body,
-            .cancellation = if (self.options.cancellation) |token|
-                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
+            .timeout_ms = try request_context.remainingTimeoutMs(self.http.io),
+            .cookies_enabled = false,
+            .cancellation = request_context.httpCancellation(),
         });
         defer resp.deinit();
         if (!resp.ok()) return mapStatus(resp.status.code);
@@ -479,9 +615,9 @@ pub const Provider = struct {
         return try parseEmbeddingResponse(alloc, response_body);
     }
 
-    fn embedCohereText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_format: RequestFormat) !inference.EmbedResult {
+    fn embedCohereText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_format: RequestFormat, request_context: RequestContext) !inference.EmbedResult {
         if (texts.len <= cohere_max_batch_size) {
-            return try self.embedCohereTextBatch(alloc, model, texts, request_format);
+            return try self.embedCohereTextBatch(alloc, model, texts, request_format, request_context);
         }
 
         var out = std.ArrayListUnmanaged([]const f32).empty;
@@ -493,7 +629,7 @@ pub const Provider = struct {
         var offset: usize = 0;
         while (offset < texts.len) {
             const end = @min(texts.len, offset + cohere_max_batch_size);
-            var result = try self.embedCohereTextBatch(alloc, model, texts[offset..end], request_format);
+            var result = try self.embedCohereTextBatch(alloc, model, texts[offset..end], request_format, request_context);
             {
                 errdefer result.deinit();
                 try out.ensureUnusedCapacity(alloc, result.vectors.len);
@@ -508,7 +644,7 @@ pub const Provider = struct {
         return .{ .vectors = vectors, .dimension = dimension, .allocator = alloc };
     }
 
-    fn embedCohereTextBatch(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_format: RequestFormat) !inference.EmbedResult {
+    fn embedCohereTextBatch(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_format: RequestFormat, request_context: RequestContext) !inference.EmbedResult {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -521,14 +657,15 @@ pub const Provider = struct {
         try body.put(arena, "input_type", .{ .string = if (self.options.input_type.len > 0) self.options.input_type else "search_document" });
         if (self.options.truncate.len > 0) try body.put(arena, "truncate", .{ .string = self.options.truncate });
         if (self.options.dimension > 0 and request_format == .cohere_v4) try body.put(arena, "output_dimension", .{ .integer = self.options.dimension });
-        return try self.invokeEmbeddingsValue(alloc, model, .{ .object = body });
+        return try self.invokeEmbeddingsValue(alloc, model, .{ .object = body }, request_context);
     }
 };
 
 /// Fetch the Bedrock control-plane foundation-models listing for a region.
 /// Returns the raw JSON response body; the caller owns it.
 pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, endpoint_override: ?[]const u8, timeout_ms: u64) ![]u8 {
-    var creds = try resolveCredentialsUncached(alloc, http, region, .default);
+    const request_context = RequestContext.init(http.io, timeout_ms, null);
+    var creds = try resolveCredentialsUncached(alloc, http, region, .default, request_context);
     defer creds.deinit(alloc);
 
     const default_endpoint = try std.fmt.allocPrint(alloc, "https://bedrock.{s}.amazonaws.com", .{region});
@@ -544,7 +681,11 @@ pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Clie
     const signed = try signRequestHeadersAlloc(alloc, creds, region, "GET", host, path, "");
     defer freeHeaderPairs(alloc, signed);
 
-    var resp = try http.request(.GET, url, .{ .headers = signed, .timeout_ms = timeout_ms });
+    var resp = try http.request(.GET, url, .{
+        .headers = signed,
+        .timeout_ms = try request_context.remainingTimeoutMs(http.io),
+        .cookies_enabled = false,
+    });
     defer resp.deinit();
     if (!resp.ok()) return mapStatus(resp.status.code);
     const body = resp.body orelse return error.EmptyResponse;
@@ -595,7 +736,7 @@ fn titanMultimodalBody(alloc: std.mem.Allocator, parts: []const template_mod.Con
             if (std.mem.trim(u8, text, " \t\r\n").len > 0) saw_content = true;
         },
         .binary => |binary| {
-            if (!std.mem.startsWith(u8, binary.mime_type, "image/")) return error.UnsupportedMediaType;
+            if (!std.ascii.startsWithIgnoreCase(binary.mime_type, "image/")) return error.UnsupportedMediaType;
             if (image_seen) return error.TooManyImages;
             image_seen = true;
             const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
@@ -661,7 +802,7 @@ fn cohereV4Body(alloc: std.mem.Allocator, parts: []const template_mod.ContentPar
             try content.append(.{ .object = obj });
         },
         .binary => |binary| {
-            if (!std.mem.startsWith(u8, binary.mime_type, "image/")) return error.UnsupportedMediaType;
+            if (!std.ascii.startsWithIgnoreCase(binary.mime_type, "image/")) return error.UnsupportedMediaType;
             const data_uri = try imageDataUriAlloc(alloc, binary.mime_type, binary.data);
             var image_url = std.json.ObjectMap.empty;
             errdefer image_url.deinit(alloc);
@@ -718,23 +859,20 @@ fn imageDataUriAlloc(alloc: std.mem.Allocator, mime_type: []const u8, data: []co
 }
 
 fn bedrockImageDataUri(alloc: std.mem.Allocator, url: []const u8) !template_mod.ContentPart.BinaryContent {
-    if (!std.mem.startsWith(u8, url, "data:")) return error.RemoteMediaRequired;
-    const after_data = url[5..];
-    const base64_marker = ";base64,";
-    const sep_idx = std.mem.indexOf(u8, after_data, base64_marker) orelse return error.InvalidDataURI;
-    const mime_type_slice = after_data[0..sep_idx];
-    if (!std.mem.startsWith(u8, mime_type_slice, "image/")) return error.UnsupportedMediaType;
-
-    const mime_type = try alloc.dupe(u8, mime_type_slice);
-    errdefer alloc.free(mime_type);
-
-    const encoded = after_data[sep_idx + base64_marker.len ..];
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidDataURI;
-    const data = try alloc.alloc(u8, decoded_len);
-    errdefer alloc.free(data);
-    std.base64.standard.Decoder.decode(data, encoded) catch return error.InvalidDataURI;
-
-    return .{ .mime_type = mime_type, .data = data };
+    if (!inference_work.hasDataUriScheme(url)) return error.RemoteMediaRequired;
+    var decoded = inference_work.decodeInlineDataUriAlloc(alloc, url) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDataURI,
+    };
+    errdefer decoded.deinit(alloc);
+    if (!std.ascii.startsWithIgnoreCase(decoded.mime_type, "image/"))
+        return error.UnsupportedMediaType;
+    const result = template_mod.ContentPart.BinaryContent{
+        .mime_type = decoded.mime_type,
+        .data = decoded.data,
+    };
+    decoded = undefined;
+    return result;
 }
 
 fn flattenPartsToText(alloc: std.mem.Allocator, parts: []const template_mod.ContentPart) ![]u8 {
@@ -797,20 +935,40 @@ fn vectorFromJson(alloc: std.mem.Allocator, value: std.json.Value) ![]const f32 
     return vector;
 }
 
-fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource) !Credentials {
-    return try resolveCredentialsUncachedWithIo(alloc, http, null, region, source);
+fn credentialHttpRequest(
+    http: *httpx.Client,
+    context: RequestContext,
+    method: httpx.Method,
+    url: []const u8,
+    options_in: httpx.RequestOptions,
+) !httpx.Response {
+    try context.check(http.io);
+    var options = options_in;
+    options.timeout_ms = try context.remainingTimeoutMs(http.io);
+    options.cookies_enabled = false;
+    options.cancellation = context.httpCancellation();
+    return http.request(method, url, options) catch |err| switch (err) {
+        error.Timeout, error.Cancelled, error.Canceled => err,
+        else => error.MissingAwsCredentials,
+    };
 }
 
-fn resolveCredentialsUncachedWithIo(
+fn resolveCredentialsUncached(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, source: CredentialSource, context: RequestContext) !Credentials {
+    return try resolveCredentialsUncachedWithContextAndIo(alloc, http, null, region, source, context);
+}
+
+fn resolveCredentialsUncachedWithContextAndIo(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
     filesystem_io: ?std.Io,
     region: []const u8,
     source: CredentialSource,
+    context: RequestContext,
 ) !Credentials {
+    try context.check(http.io);
     return switch (source) {
         .profile => |profile| try credentialsFromSharedFiles(alloc, filesystem_io, profile.name, profile.shared_credentials_file),
-        .web_identity => |identity| try credentialsFromWebIdentity(alloc, http, filesystem_io, region, identity),
+        .web_identity => |identity| try credentialsFromWebIdentity(alloc, http, filesystem_io, region, identity, context),
         .default => blk: {
             if (getEnvOwned(alloc, "AWS_ACCESS_KEY_ID")) |access| {
                 errdefer alloc.free(access);
@@ -819,12 +977,22 @@ fn resolveCredentialsUncachedWithIo(
                 const token = getEnvOwned(alloc, "AWS_SESSION_TOKEN");
                 break :blk .{ .access_key_id = access, .secret_access_key = secret, .session_token = token };
             }
-            if (credentialsFromWebIdentityFromEnv(alloc, http, filesystem_io, region)) |creds| break :blk creds else |_| {}
+            if (credentialsFromWebIdentityFromEnv(alloc, http, filesystem_io, region, context)) |creds| break :blk creds else |err| switch (err) {
+                error.Timeout, error.Cancelled, error.Canceled => return err,
+                else => {},
+            }
             const profile = getEnvOwned(alloc, "AWS_PROFILE") orelse try alloc.dupe(u8, "default");
             defer alloc.free(profile);
             if (credentialsFromSharedFiles(alloc, filesystem_io, profile, null)) |creds| break :blk creds else |_| {}
-            if (credentialsFromEcsMetadata(alloc, http, filesystem_io)) |creds| break :blk creds else |_| {}
-            if (credentialsFromInstanceMetadata(alloc, http)) |creds| break :blk creds else |_| {}
+            try context.check(http.io);
+            if (credentialsFromEcsMetadata(alloc, http, filesystem_io, context)) |creds| break :blk creds else |err| switch (err) {
+                error.Timeout, error.Cancelled, error.Canceled => return err,
+                else => {},
+            }
+            if (credentialsFromInstanceMetadata(alloc, http, context)) |creds| break :blk creds else |err| switch (err) {
+                error.Timeout, error.Cancelled, error.Canceled => return err,
+                else => {},
+            }
             return error.MissingAwsCredentials;
         },
     };
@@ -889,7 +1057,7 @@ fn parseProfileCredentials(alloc: std.mem.Allocator, data: []const u8, profile: 
     };
 }
 
-fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8) !Credentials {
+fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8, context: RequestContext) !Credentials {
     const role_arn = getEnvOwned(alloc, "AWS_ROLE_ARN") orelse return error.MissingAwsCredentials;
     defer alloc.free(role_arn);
     const token_file = getEnvOwned(alloc, "AWS_WEB_IDENTITY_TOKEN_FILE") orelse return error.MissingAwsCredentials;
@@ -903,10 +1071,11 @@ fn credentialsFromWebIdentityFromEnv(alloc: std.mem.Allocator, http: *httpx.Clie
         .token_file = token_file,
         .session_name = session_name,
         .sts_endpoint = sts_endpoint,
-    });
+    }, context);
 }
 
-fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8, identity: WebIdentityCredentialSource) !Credentials {
+fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, region: []const u8, identity: WebIdentityCredentialSource, context: RequestContext) !Credentials {
+    try context.check(http.io);
     const token = try webIdentityTokenFileAlloc(alloc, filesystem_io, identity.token_file);
     defer alloc.free(token);
 
@@ -926,7 +1095,7 @@ fn credentialsFromWebIdentity(alloc: std.mem.Allocator, http: *httpx.Client, fil
     defer alloc.free(body);
 
     const headers = [_]HeaderPair{.{ "content-type", "application/x-www-form-urlencoded" }};
-    var resp = http.request(.POST, sts_endpoint, .{ .headers = &headers, .body = body }) catch return error.MissingAwsCredentials;
+    var resp = try credentialHttpRequest(http, context, .POST, sts_endpoint, .{ .headers = &headers, .body = body });
     defer resp.deinit();
     if (!resp.ok()) return error.MissingAwsCredentials;
     const response_body = resp.body orelse return error.MissingAwsCredentials;
@@ -945,7 +1114,7 @@ fn webIdentityTokenFileAlloc(
         return error.MissingAwsCredentials;
 }
 
-fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io) !Credentials {
+fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, context: RequestContext) !Credentials {
     const full_uri = getEnvOwned(alloc, "AWS_CONTAINER_CREDENTIALS_FULL_URI");
     const relative_uri = if (full_uri == null) getEnvOwned(alloc, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") else null;
     defer if (full_uri) |value| alloc.free(value);
@@ -962,14 +1131,15 @@ fn credentialsFromEcsMetadata(alloc: std.mem.Allocator, http: *httpx.Client, fil
     const auth_token = containerAuthorizationToken(alloc, filesystem_io);
     defer if (auth_token) |value| alloc.free(value);
     const headers = if (auth_token) |token| &[_]HeaderPair{.{ "authorization", token }} else &[_]HeaderPair{};
-    var resp = http.request(.GET, url, .{ .headers = headers }) catch return error.MissingAwsCredentials;
+    var resp = try credentialHttpRequest(http, context, .GET, url, .{ .headers = headers });
     defer resp.deinit();
     if (!resp.ok()) return error.MissingAwsCredentials;
     const body = resp.body orelse return error.MissingAwsCredentials;
     return try parseMetadataCredentials(alloc, body);
 }
 
-fn credentialsFromInstanceMetadata(alloc: std.mem.Allocator, http: *httpx.Client) !Credentials {
+fn credentialsFromInstanceMetadata(alloc: std.mem.Allocator, http: *httpx.Client, context: RequestContext) !Credentials {
+    try context.check(http.io);
     if (getEnvOwned(alloc, "AWS_EC2_METADATA_DISABLED")) |disabled| {
         defer alloc.free(disabled);
         if (std.ascii.eqlIgnoreCase(disabled, "true")) return error.MissingAwsCredentials;
@@ -979,7 +1149,10 @@ fn credentialsFromInstanceMetadata(alloc: std.mem.Allocator, http: *httpx.Client
     const base = try endpointBaseAlloc(alloc, endpoint);
     defer alloc.free(base);
 
-    const token = imdsToken(alloc, http, base) catch null;
+    const token = imdsToken(alloc, http, base, context) catch |err| switch (err) {
+        error.Timeout, error.Cancelled, error.Canceled => return err,
+        else => null,
+    };
     defer if (token) |value| alloc.free(value);
     if (token == null) {
         if (getEnvOwned(alloc, "AWS_EC2_METADATA_V1_DISABLED")) |disabled| {
@@ -991,7 +1164,7 @@ fn credentialsFromInstanceMetadata(alloc: std.mem.Allocator, http: *httpx.Client
 
     const role_url = try std.fmt.allocPrint(alloc, "{s}/latest/meta-data/iam/security-credentials/", .{base});
     defer alloc.free(role_url);
-    var role_resp = http.request(.GET, role_url, .{ .headers = headers }) catch return error.MissingAwsCredentials;
+    var role_resp = try credentialHttpRequest(http, context, .GET, role_url, .{ .headers = headers });
     defer role_resp.deinit();
     if (!role_resp.ok()) return error.MissingAwsCredentials;
     const role_body = role_resp.body orelse return error.MissingAwsCredentials;
@@ -1002,18 +1175,18 @@ fn credentialsFromInstanceMetadata(alloc: std.mem.Allocator, http: *httpx.Client
     defer alloc.free(encoded_role);
     const creds_url = try std.fmt.allocPrint(alloc, "{s}/latest/meta-data/iam/security-credentials/{s}", .{ base, encoded_role });
     defer alloc.free(creds_url);
-    var creds_resp = http.request(.GET, creds_url, .{ .headers = headers }) catch return error.MissingAwsCredentials;
+    var creds_resp = try credentialHttpRequest(http, context, .GET, creds_url, .{ .headers = headers });
     defer creds_resp.deinit();
     if (!creds_resp.ok()) return error.MissingAwsCredentials;
     const body = creds_resp.body orelse return error.MissingAwsCredentials;
     return try parseMetadataCredentials(alloc, body);
 }
 
-fn imdsToken(alloc: std.mem.Allocator, http: *httpx.Client, endpoint: []const u8) ![]u8 {
+fn imdsToken(alloc: std.mem.Allocator, http: *httpx.Client, endpoint: []const u8, context: RequestContext) ![]u8 {
     const url = try std.fmt.allocPrint(alloc, "{s}/latest/api/token", .{endpoint});
     defer alloc.free(url);
     const headers = [_]HeaderPair{.{ "x-aws-ec2-metadata-token-ttl-seconds", "21600" }};
-    var resp = try http.request(.PUT, url, .{ .headers = &headers, .body = "" });
+    var resp = try credentialHttpRequest(http, context, .PUT, url, .{ .headers = &headers, .body = "" });
     defer resp.deinit();
     if (!resp.ok()) return error.MissingAwsCredentials;
     const body = resp.body orelse return error.MissingAwsCredentials;
@@ -1268,6 +1441,23 @@ pub fn testBedrockSigningClockUsesUnixWallTime() !void {
 
     try std.testing.expect(actual >= before);
     try std.testing.expect(actual <= after);
+
+    const started = std.Io.Timestamp.fromNanoseconds(10 * std.time.ns_per_ms);
+    const bounded = RequestContext.initAt(started, 7, null);
+    try std.testing.expectEqual(
+        @as(?u64, 2),
+        try bounded.remainingTimeoutMsAt(std.Io.Timestamp.fromNanoseconds(15 * std.time.ns_per_ms)),
+    );
+    try std.testing.expectError(
+        error.Timeout,
+        bounded.remainingTimeoutMsAt(std.Io.Timestamp.fromNanoseconds(17 * std.time.ns_per_ms)),
+    );
+    const unbounded = RequestContext.initAt(started, 0, null);
+    try std.testing.expectEqual(@as(?u64, null), try unbounded.remainingTimeoutMsAt(started));
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancelled_context = RequestContext.initAt(started, 7, CancellationToken.fromAtomic(&cancelled));
+    try std.testing.expectError(error.Cancelled, cancelled_context.remainingTimeoutMsAt(started));
 }
 
 pub fn testBedrockSigningDatesUseCalendarMonthNumbers() !void {
@@ -1727,6 +1917,17 @@ test "titan multimodal body accepts data URI and rejects remote URL" {
 
 test "cohere v4 body accepts data URI and rejects remote URL" {
     try testCohereV4BodyAcceptsDataUriAndRejectsRemoteUrl();
+}
+
+test "bedrock image media uses shared RFC 2397 decoding" {
+    const alloc = std.testing.allocator;
+    const binary = try bedrockImageDataUri(alloc, "DATA:IMAGE/PNG,%01%02");
+    defer {
+        alloc.free(@constCast(binary.mime_type));
+        alloc.free(@constCast(binary.data));
+    }
+    try std.testing.expectEqualStrings("IMAGE/PNG", binary.mime_type);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, binary.data);
 }
 
 test "titan multimodal body combines text and rejects multiple images" {

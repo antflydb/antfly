@@ -2006,6 +2006,8 @@ pub fn build(b: *std.Build) void {
             .ml_tabular = ml_tabular_mod,
             .onnx_graph = inference_onnx_graph_mod,
             .pjrt = inference_pjrt_mod,
+            .audio_openapi = audio_openapi_mod,
+            .s3_openapi = s3_openapi_mod,
             .generating_openapi = generating_openapi_mod,
             .extraction_openapi = extraction_openapi_mod,
             .extracting = extracting_mod,
@@ -2039,21 +2041,8 @@ pub fn build(b: *std.Build) void {
     );
     hf_tokenizer_test_step.dependOn(&run_hf_tokenizer_tests.step);
 
-    const transcribing_mod = b.createModule(.{
-        .root_source_file = b.path("lib/transcribing/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    transcribing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
-    transcribing_mod.addImport("httpx", httpx_mod);
-    transcribing_mod.addImport("inference_api", inference_api_mod);
-    transcribing_mod.addImport("antfly_scraping", scraping_mod);
-    transcribing_mod.addImport("antfly_google", google_mod);
-    const reader_config_mod = b.createModule(.{
-        .root_source_file = b.path("lib/readers/src/config.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const transcribing_mod = inference_graph.transcribing_mod;
+    const reader_config_mod = inference_graph.reader_config_mod;
     const readers_mod = b.createModule(.{
         .root_source_file = b.path("lib/readers/src/mod.zig"),
         .target = target,
@@ -2063,8 +2052,10 @@ pub fn build(b: *std.Build) void {
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
     readers_mod.addImport("antfly_reader_config", reader_config_mod);
+    readers_mod.addImport("antfly_scraping", scraping_mod);
+    readers_mod.addImport("antfly_image", image_mod);
     inference_server_mod.addImport("antfly_readers", readers_mod);
-    inference_server_mod.addImport("antfly_transcribing", transcribing_mod);
+    inference_server_mod.addImport("antfly_reader_config", reader_config_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
     const synthesizing_mod = b.createModule(.{
         .root_source_file = b.path("lib/synthesizing/src/mod.zig"),
@@ -2157,6 +2148,39 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = sanitize_thread,
     });
     antfly_imports.configure(b, lib_mod, false, link_libc);
+
+    // A production-mode executable (builtin.is_test == false) keeps the large
+    // unit-test graph on its lightweight PDF stub while still exercising the
+    // native document-extraction coordinator against a real PDF fixture.
+    const pdf_ocr_integration_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/pdf_ocr_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pdf_integration_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("lib/pdf/integration_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pdf_ocr_integration_mod.addImport("pdf_integration_fixture", pdf_integration_fixture_mod);
+    production_antfly_imports.configure(b, pdf_ocr_integration_mod, false, link_libc);
+    const pdf_ocr_integration = b.addExecutable(.{
+        .name = "pdf-ocr-integration",
+        .root_module = pdf_ocr_integration_mod,
+    });
+    const run_pdf_ocr_integration = b.addRunArtifact(pdf_ocr_integration);
+    const pdf_ocr_integration_step = b.step(
+        "pdf-ocr-integration-test",
+        "Run native PDF rendering and encoded reader batching through the OCR coordinator",
+    );
+    pdf_ocr_integration_step.dependOn(&run_pdf_ocr_integration.step);
+    const run_pdf_model_qualification = b.addRunArtifact(pdf_ocr_integration);
+    run_pdf_model_qualification.addArg("--qualify-real");
+    const pdf_model_qualification_step = b.step(
+        "pdf-model-qualification-test",
+        "Run opt-in real Florence/Gemma4/ClipClap PDF qualification against ANTFLY_PDF_QUALIFICATION_URL",
+    );
+    pdf_model_qualification_step.dependOn(&run_pdf_model_qualification.step);
 
     const lib_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
@@ -2294,6 +2318,7 @@ pub fn build(b: *std.Build) void {
         metadata_openapi_mod,
         reranking_mod,
         objectstore_mod,
+        httpx_mod,
         platform_mod,
         chunking_mod,
         bloom_mod,
@@ -2379,6 +2404,7 @@ pub fn build(b: *std.Build) void {
         metadata_openapi_mod,
         reranking_mod,
         wasm_objectstore_mod,
+        httpx_mod,
         wasm_platform_mod,
         chunking_mod,
         wasm_bloom_mod,
@@ -3212,6 +3238,7 @@ pub fn build(b: *std.Build) void {
     const run_lib_pdf_tests = b.addRunArtifact(lib_pdf_tests);
     const lib_pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
     lib_pdf_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_pdf_test_step.dependOn(&run_pdf_ocr_integration.step);
 
     const lib_image_bench_build_options = b.addOptions();
     const lib_image_spng_paths = detectSpngPaths(b, target);
@@ -3497,7 +3524,31 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend", "local generation budgets", "local generation bridge", "asset producer runtime", "provider quotas", "vertex provider" },
+        .filters = &.{
+            "generating backend",
+            "local generation budgets",
+            "local generation bridge",
+            "generating backend factory executes fallback chain across providers",
+            "asset producer runtime",
+            "asset producer raw raster selection requires local physical capability and borrows pixels",
+            "asset producer destroys returned values",
+            "asset producer media invocation memory fails closed",
+            "asset producer enforces media allocator and result contracts",
+            "asset producer enforces invocation contracts",
+            "asset producer bounds invocation contract resolution",
+            "encoded reader chunks obey model item and byte limits",
+            "media part item embedding",
+            "managed embedder",
+            "inference capabilities",
+            "batch capabilities",
+            "work identity and execution reports",
+            "bounded invocation allocator",
+            "remote Antfly",
+            "antfly chunk request frames borrowed binary input",
+            "capability lease HTTP fields own storage",
+            "provider quotas",
+            "vertex provider",
+        },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
@@ -3721,7 +3772,9 @@ pub fn build(b: *std.Build) void {
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
+        "remote capability invalidation fences active discovery",
         "managed embedder dimension probe validation modes",
+        "managed embedding request overlays borrow capability cache synchronization",
         "managed embedder rejects malformed provider vectors",
         "managed embedder rejects unsupported execution namespaces",
         "managed embedder separates index and artifact lookup namespaces",
@@ -3734,6 +3787,26 @@ pub fn build(b: *std.Build) void {
         "catalog ownership rejects duplicate executable owners and endpoint mismatches",
         "metadata http client preserves artifact dependency conflicts",
         "managed embedder preserves coverage policy in storage config",
+        "managed embedder admission follows the selected attachment transport",
+        "managed embedder partitions and validates inline image data URIs",
+        "attachment transport separates wire and peak resident representations",
+        "bounded invocation allocator",
+        "inline data URI parser validates canonical metadata",
+        "antfly embed parts uses the framed attachment transport",
+        "antfly embed parts request sizing is exact for escaped strings",
+        "antfly dense JSON response cleanup is allocation-failure safe",
+        "remote generator batch streams attachments into one exact JSON body",
+        "capability lease HTTP fields own storage",
+        "asset producer runtime rejects empty borrowed media",
+        "asset producer runtime derives coherent logical and wire result ceilings",
+        "asset producer runtime applies result ceilings to non-model producers",
+        "remote chunk runtime services do not require a local callback provider",
+        "asset producer media invocation memory fails closed",
+        "asset producer enforces media allocator and result contracts",
+        "asset producer enforces invocation contracts",
+        "asset producer bounds invocation contract resolution",
+        "media part item embedding",
+        "PDF render budget reserves the complete invocation peak",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
@@ -4970,6 +5043,8 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
             "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
             "asset preparation is lazy and byte bounded across retryable provider batches",
+            "asset planning groups interleaved providers",
+            "shared PDF",
             "storage.db.db.test.db io_threaded executor processes indexed writes",
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",
@@ -5000,25 +5075,38 @@ pub fn build(b: *std.Build) void {
             "enrichment visibility wait is cancelable",
             "enrichment visibility wait observes borrowed request cancellation",
             "foreground enrichment rejects providers without a bounded-operation contract",
+            "PDF output allowance makes window size quality neutral",
+            "PDF raw raster output credit exactly bounds pixels and provider peak",
+            "PDF window output allocator enforces one ceiling across concurrent workers",
+            "PDF image embedding has a media-sized batch byte default",
+            "PDF composite lease releases admission between invocation windows",
+            "PDF composite lease admits two future overlap windows atomically",
+            "prepared document source cache isolates credentials and reuses bytes",
+            "prepared document cache single-flights concurrent PDF variants and drains leases",
+            "document unit spool admits replay memory before opening a read transaction",
+            "document publication spool reads ordered segments with one transaction",
+            "document publication spool admits replay memory before opening a read transaction",
             "context-aware embedder receives the request lifetime and fails closed when absent",
             "inference timeout policy avoids inline retry storms",
             "inference recovery is scoped by model and backend",
             "asset inference recovery uses one identity from plan through provider call",
             "post-provider deadline records timeout recovery before returning",
-            "document extraction reserves PDF decoder peak memory atomically",
-            "PDF decoder reservation composes with every live slice owner",
-            "PDF decoder credit and OCR transient allocations compose without double charging",
-            "reserved PDF working set is bounded without duplicate resource charges",
             "budgeted document download composes with materialization accounting",
             "retained document collection allocations compose with the hard working-set cap",
             "document replay payloads are admitted before persistent allocation",
             "document extraction generated OCR bypasses unsupported native batch",
+            "document extraction generated OCR rejects malformed envelopes before apply",
+            "document extraction generated OCR applies unit updates transactionally",
+            "asset batch fallback isolates malformed envelope and preserves typed mixed results",
+            "asset batch fallback keeps the logical request retry budget",
             "document-wide OCR resource failure preserves units and marks pending pages",
             "OCR pending metadata construction is allocation-failure safe",
             "OCR text selection preserves dense embedded numeric tables",
             "numeric recall limits preserve embedded text without exhausting scratch memory",
             "PDF render quality warning preserves prior diagnostics and fallback reason",
             "PDF render deadline installs an active monotonic cancellation probe",
+            "OCR control-plane batch ceiling is absolute",
+            "generated media staging follows pending work",
             "generated text provider config is validated while parsing extraction config",
             "PDF text regions use reconstructed output spans",
             "public enrichment validation rejects invalid execution and producer config",
@@ -5073,6 +5161,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",
             "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
+            "storage.db.db.test.db generated replay atomically promotes staged artifacts",
         },
     });
     const run_lib_db_enrichment_replay_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_replay_tests);
@@ -7449,6 +7538,10 @@ pub fn build(b: *std.Build) void {
         "classified batch reservation distinguishes size from contention",
         "aggregate host memory admission is atomic across slices",
         "bounded observer growth grants aggregate slice and host capacity atomically",
+        "owned split reservations prevent concurrent headroom theft",
+        "owned split reservations reclaim before partial fallback",
+        "owned split secondary credit transfers into a budgeted allocator",
+        "pinned split credit survives idle allocation windows",
         "logical inference slices can charge only physical host memory",
         "batch release accounting errors fail closed",
         "single release and observer mismatch cannot debit unrelated memory",
@@ -7838,8 +7931,12 @@ pub fn build(b: *std.Build) void {
             "standalone runtime module compiles",
             "standalone runtime local generator accepts media url data uris",
             "standalone runtime local dense embed preserves borrowed binary media",
+            "standalone encoded reader ABI round trips borrowed payloads",
+            "standalone raster reader ABI preserves borrowed strided pages and identity",
+            "encoded reader ABI enforces resolved model capabilities",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
+            "linked generator validates concrete MIME and decoded pixels",
             "standalone inference middleware reuses public API authentication",
             "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
@@ -7913,6 +8010,12 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // This root intentionally links the complete standalone runtime and
+        // embedded inference ABI. The merged document executors plus execution
+        // control peak near 7.6 GiB in macOS debug codegen, so publish an
+        // honest scheduler reservation with normal variance headroom. Linux
+        // retains the measured aggregate default.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 9 else 7) * 1024 * 1024 * 1024,
     });
     const lib_standalone_runtime_test_step = b.step("lib-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
@@ -7985,6 +8088,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
+    unit_test_step.dependOn(&run_pdf_ocr_integration.step);
     unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
@@ -8256,6 +8360,8 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly-json", json_mod);
+    index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
+    index_manager_test_mod.addImport("antfly_image", image_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
@@ -8571,6 +8677,10 @@ pub fn build(b: *std.Build) void {
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
+    // Sparse lifecycle tests reach BackendRuntime through shared storage code;
+    // its lazy PDF lane is part of that module graph even when the test itself
+    // does not render a document.
+    sparse_test_mod.addImport("antfly_pdf", pdf_mod);
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
     });
@@ -11238,6 +11348,31 @@ pub fn build(b: *std.Build) void {
             setStripRecursively(role_mod, &visited);
         }
     }
+
+    // Exercise the real production archive boundary for encoded-image reads.
+    // The probe resolves only the exported C function table, so it cannot
+    // accidentally pass by importing inference_host.zig into the test root.
+    const linked_inference_abi_integration_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/inference_abi_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    linked_inference_abi_integration_mod.link_libc = link_libc;
+    addMacosSdkPaths(b, linked_inference_abi_integration_mod, target);
+    const linked_inference_abi_integration = b.addExecutable(.{
+        .name = "linked-inference-abi-integration",
+        .root_module = linked_inference_abi_integration_mod,
+    });
+    linked_inference_abi_integration.root_module.linkLibrary(
+        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?,
+    );
+    const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
+    const linked_inference_abi_integration_step = b.step(
+        "linked-inference-abi-integration-test",
+        "Run the production-linked inference function-table and binary-payload ABI probe",
+    );
+    linked_inference_abi_integration_step.dependOn(&run_linked_inference_abi_integration.step);
+    lib_standalone_runtime_test_step.dependOn(&run_linked_inference_abi_integration.step);
 
     for (runtime_library_link_order) |unit| {
         antfly_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);

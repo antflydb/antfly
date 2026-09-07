@@ -14,11 +14,13 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const pdf = @import("antfly_pdf");
 const platform = @import("antfly_platform");
 const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const threaded_connect_io = @import("../common/threaded_connect_io.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
+const bounded_worker_lane = @import("../common/bounded_worker_lane.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -451,10 +453,14 @@ const LsmOwnerCloneRegistry = struct {
 
 pub const Backend = runtime_backend.Backend;
 pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
-pub const default_io_concurrent_limit: u32 = threaded_io_limits.service;
+pub const default_io_concurrent_limit: u32 = threaded_io_limits.backend_runtime_durable_background;
 
 pub const Config = struct {
     backend: Backend = runtime_backend.defaultExecutorBackend(),
+    /// Value-semantic executor limits. Separate lanes preserve isolation for
+    /// nested submissions; validation keeps their simultaneously activatable
+    /// total and every individual lane under the aggregate process ceiling.
+    lane_limits: threaded_io_limits.BackendRuntimeLaneLimits = .{},
     /// Optional caller-owned synchronous filesystem authority. Manual
     /// runtimes use this for lifecycle locks and durable metadata without
     /// acquiring a worker executor. It must outlive the runtime.
@@ -617,10 +623,21 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
         // ceiling prevents any lane from converting a transient fan-out spike
         // into an unbounded kernel-thread/stack reservation ratchet.
         io_impl.* = Io.Threaded.init(alloc, .{
+            .async_limit = boundedIoAsyncLimit(concurrent_limit),
             .concurrent_limit = .limited(concurrent_limit),
         });
         return io_impl;
     }
+}
+
+/// `std.Io.Threaded` controls `async` and `concurrent` fan-out independently.
+/// CPU stages use `Group.async`, so leaving the async side at its default would
+/// bypass the runtime lane's configured backstop. Keep at most one async worker
+/// per additional detected CPU; the caller always runs one task inline.
+fn boundedIoAsyncLimit(concurrent_limit: u32) Io.Limit {
+    if (comptime builtin.single_threaded) return .nothing;
+    const cpu_count = std.Thread.getCpuCount() catch return .limited(concurrent_limit);
+    return .limited(@min(@as(usize, concurrent_limit), cpu_count -| 1));
 }
 
 fn deinitIoLane(alloc: Allocator, io_impl: *IoImpl) void {
@@ -722,6 +739,7 @@ const OwnerRegistry = struct {
 pub const BackendRuntime = struct {
     alloc: Allocator,
     backend: Backend,
+    lane_limits: threaded_io_limits.BackendRuntimeLaneLimits,
     next_owner_id: AtomicU64,
     retired_generation_cleanup_owner_id: u64,
     owner_registry: *OwnerRegistry,
@@ -734,11 +752,17 @@ pub const BackendRuntime = struct {
     /// not become the process-wide authority for unrelated operations.
     threaded_network_io_vtable: ?*Io.VTable = null,
     io_impl: ?*IoImpl = null,
-    raft_inbound_io_impl: ?*IoImpl = null,
-    raft_outbound_io_impl: ?*IoImpl = null,
-    api_io_impl: ?*IoImpl = null,
-    inference_io_impl: ?*IoImpl = null,
-    control_io_impl: ?*IoImpl = null,
+    /// Specialized executor lanes are activated on first use. The runtime is
+    /// their sole owner; this mutex serializes first publication and teardown
+    /// never starts until the corresponding public lease gates are closed.
+    lane_init_mutex: std.atomic.Mutex = .unlocked,
+    lanes_closing: bool = false,
+    raft_inbound_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    raft_outbound_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    api_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    inference_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
+    pdf_render_executor: std.atomic.Value(?*bounded_worker_lane.Executor) = .init(null),
+    control_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     api_lane_gate: LaneLeaseGate = .{},
     api_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     api_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
@@ -747,6 +771,10 @@ pub const BackendRuntime = struct {
     inference_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     inference_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
     inference_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    pdf_render_lane_gate: LaneLeaseGate = .{},
+    pdf_render_lane_peak_leases: std.atomic.Value(usize) = .init(0),
+    pdf_render_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
+    pdf_render_lane_rejections_total: std.atomic.Value(u64) = .init(0),
     control_lane_gate: LaneLeaseGate = .{},
     control_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     control_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
@@ -757,6 +785,7 @@ pub const BackendRuntime = struct {
 
     pub fn init(alloc: Allocator, config: Config) !BackendRuntime {
         try runtime_backend.ensureExecutorBackendAvailable(config.backend);
+        try config.lane_limits.validate();
 
         const owner_registry = try alloc.create(OwnerRegistry);
         errdefer alloc.destroy(owner_registry);
@@ -773,6 +802,7 @@ pub const BackendRuntime = struct {
         var runtime = BackendRuntime{
             .alloc = alloc,
             .backend = config.backend,
+            .lane_limits = config.lane_limits,
             .next_owner_id = .init(retired_generation_cleanup_owner_id + 1),
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
@@ -787,21 +817,10 @@ pub const BackendRuntime = struct {
             if (comptime builtin.os.tag == .freestanding) {
                 return error.UnsupportedPlatform;
             } else {
-                const io_impl = try initIoLane(alloc, threaded_io_limits.service);
+                const io_impl = try initIoLane(alloc, config.lane_limits.durable_background);
                 errdefer deinitIoLane(alloc, io_impl);
-                const raft_inbound_io_impl = try initIoLane(alloc, threaded_io_limits.service);
-                errdefer deinitIoLane(alloc, raft_inbound_io_impl);
-                const raft_outbound_io_impl = try initIoLane(alloc, threaded_io_limits.service);
-                errdefer deinitIoLane(alloc, raft_outbound_io_impl);
-                const api_io_impl = try initIoLane(alloc, threaded_io_limits.service);
-                errdefer deinitIoLane(alloc, api_io_impl);
-                const inference_io_impl = try initIoLane(alloc, threaded_io_limits.inference);
-                errdefer deinitIoLane(alloc, inference_io_impl);
-                const control_io_impl = try initIoLane(alloc, threaded_io_limits.service);
-                errdefer deinitIoLane(alloc, control_io_impl);
                 const threaded_network_io_vtable = try threaded_connect_io.createVTable(alloc, io_impl);
                 errdefer alloc.destroy(threaded_network_io_vtable);
-
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
                 threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, owner_registry);
@@ -810,11 +829,6 @@ pub const BackendRuntime = struct {
 
                 runtime.io_impl = io_impl;
                 runtime.threaded_network_io_vtable = threaded_network_io_vtable;
-                runtime.raft_inbound_io_impl = raft_inbound_io_impl;
-                runtime.raft_outbound_io_impl = raft_outbound_io_impl;
-                runtime.api_io_impl = api_io_impl;
-                runtime.inference_io_impl = inference_io_impl;
-                runtime.control_io_impl = control_io_impl;
                 runtime.threaded_jobs = threaded_jobs;
                 runtime.durable_jobs = threaded_jobs.lane();
             }
@@ -824,6 +838,14 @@ pub const BackendRuntime = struct {
     }
 
     pub fn deinit(self: *BackendRuntime) void {
+        // Publish the activation fence before closing lease admission. A
+        // caller that committed a gate acquisition just before shutdown may
+        // finish against an already-published lane, but no unused executor can
+        // be constructed once teardown has begun (including the ungated raft
+        // directions, whose callers obey the runtime lifetime contract).
+        lockAtomic(&self.lane_init_mutex);
+        self.lanes_closing = true;
+        self.lane_init_mutex.unlock();
         // Close every lane before waiting for any one of them. Otherwise a
         // borrower could continue entering a later lane while teardown drains
         // an earlier one. These waits are production lifetime enforcement,
@@ -832,34 +854,34 @@ pub const BackendRuntime = struct {
         const coordinator_io = self.io();
         self.api_lane_gate.close();
         self.inference_lane_gate.close();
+        self.pdf_render_lane_gate.close();
         self.control_lane_gate.close();
         self.api_lane_gate.waitDrained(coordinator_io);
         self.inference_lane_gate.waitDrained(coordinator_io);
+        self.pdf_render_lane_gate.waitDrained(coordinator_io);
         self.control_lane_gate.waitDrained(coordinator_io);
         if (self.threaded_jobs) |jobs| {
             jobs.deinit();
             self.alloc.destroy(jobs);
             self.threaded_jobs = null;
         }
-        if (self.api_io_impl) |io_impl| {
+        if (self.api_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.api_io_impl = null;
         }
-        if (self.inference_io_impl) |io_impl| {
+        if (self.inference_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.inference_io_impl = null;
         }
-        if (self.control_io_impl) |io_impl| {
-            deinitIoLane(self.alloc, io_impl);
-            self.control_io_impl = null;
+        if (self.pdf_render_executor.swap(null, .acq_rel)) |executor| {
+            executor.destroy();
         }
-        if (self.raft_outbound_io_impl) |io_impl| {
+        if (self.control_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.raft_outbound_io_impl = null;
         }
-        if (self.raft_inbound_io_impl) |io_impl| {
+        if (self.raft_outbound_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
-            self.raft_inbound_io_impl = null;
+        }
+        if (self.raft_inbound_io_impl.swap(null, .acq_rel)) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
         }
         if (self.io_impl) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -963,27 +985,45 @@ pub const BackendRuntime = struct {
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return if (self.raft_inbound_io_impl) |io_impl| io_impl.io() else self.io();
+        return if (self.raftInboundIoImpl()) |io_impl| io_impl.io() else null;
     }
 
     pub fn raftInboundIoImpl(self: *BackendRuntime) ?*IoImpl {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return self.raft_inbound_io_impl orelse self.io_impl;
+        if (self.backend == .manual) return self.io_impl;
+        return self.ensureSpecializedIoLane(&self.raft_inbound_io_impl, self.lane_limits.raft_inbound);
     }
 
     pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return if (self.raft_outbound_io_impl) |io_impl| self.threadedNetworkIo(io_impl) else self.io();
+        return if (self.raftOutboundIoImpl()) |io_impl| self.threadedNetworkIo(io_impl) else null;
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return self.raft_outbound_io_impl orelse self.io_impl;
+        if (self.backend == .manual) return self.io_impl;
+        return self.ensureSpecializedIoLane(&self.raft_outbound_io_impl, self.lane_limits.raft_outbound);
     }
 
     pub fn apiIoImpl(self: *BackendRuntime) ?*IoImpl {
         if (comptime builtin.os.tag == .freestanding) return null;
-        return self.api_io_impl orelse self.io_impl;
+        if (self.backend == .manual) return self.io_impl;
+        return self.ensureSpecializedIoLane(&self.api_io_impl, self.lane_limits.api);
+    }
+
+    fn ensureSpecializedIoLane(
+        self: *BackendRuntime,
+        slot: *std.atomic.Value(?*IoImpl),
+        concurrent_limit: u32,
+    ) ?*IoImpl {
+        if (slot.load(.acquire)) |io_impl| return io_impl;
+        lockAtomic(&self.lane_init_mutex);
+        defer self.lane_init_mutex.unlock();
+        if (self.lanes_closing) return null;
+        if (slot.load(.acquire)) |io_impl| return io_impl;
+        const io_impl = initIoLane(self.alloc, concurrent_limit) catch return null;
+        slot.store(io_impl, .release);
+        return io_impl;
     }
 
     /// Returns the API executor interface without exposing its implementation.
@@ -1050,7 +1090,7 @@ pub const BackendRuntime = struct {
         return .{
             .runtime = self,
             .borrowed_io = borrowed_io,
-            .concurrent_capacity = threaded_io_limits.service,
+            .concurrent_capacity = self.lane_limits.api,
         };
     }
 
@@ -1063,18 +1103,27 @@ pub const BackendRuntime = struct {
     /// archive retains a copy of the interface until its node is destroyed.
     pub fn inferenceIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        const io_impl = self.inference_io_impl orelse self.io_impl orelse return null;
+        const io_impl = if (self.backend == .manual)
+            self.io_impl orelse return null
+        else
+            self.ensureSpecializedIoLane(&self.inference_io_impl, self.lane_limits.inference) orelse return null;
         return self.threadedNetworkIo(io_impl);
     }
 
     pub const InferenceLaneLease = struct {
         runtime: *BackendRuntime,
         borrowed_io: Io,
+        concurrent_capacity: u32,
         released: bool = false,
 
         pub fn io(self: *const InferenceLaneLease) Io {
             std.debug.assert(!self.released);
             return self.borrowed_io;
+        }
+
+        pub fn concurrentCapacity(self: *const InferenceLaneLease) u32 {
+            std.debug.assert(!self.released);
+            return self.concurrent_capacity;
         }
 
         pub fn release(self: *InferenceLaneLease) void {
@@ -1093,11 +1142,119 @@ pub const BackendRuntime = struct {
         const borrowed_io = self.inferenceIo() orelse return error.BackendRuntimeUnavailable;
         updateAtomicMax(&self.inference_lane_peak_leases, leases);
         _ = self.inference_lane_acquisitions_total.fetchAdd(1, .monotonic);
-        return .{ .runtime = self, .borrowed_io = borrowed_io };
+        return .{
+            .runtime = self,
+            .borrowed_io = borrowed_io,
+            .concurrent_capacity = self.lane_limits.inference,
+        };
     }
 
     pub fn outstandingInferenceLeases(self: *const BackendRuntime) usize {
         return self.inference_lane_gate.active();
+    }
+
+    fn ensurePdfRenderExecutor(self: *BackendRuntime) ?*bounded_worker_lane.Executor {
+        if (comptime builtin.os.tag == .freestanding or builtin.single_threaded) return null;
+        if (self.backend == .manual) return null;
+        if (self.pdf_render_executor.load(.acquire)) |executor| return executor;
+        lockAtomic(&self.lane_init_mutex);
+        defer self.lane_init_mutex.unlock();
+        if (self.lanes_closing) return null;
+        if (self.pdf_render_executor.load(.acquire)) |executor| return executor;
+        const detected_cpus = std.Thread.getCpuCount() catch self.lane_limits.pdf_render;
+        const worker_count = @max(
+            @as(usize, 1),
+            @min(@as(usize, self.lane_limits.pdf_render), detected_cpus),
+        );
+        const retained_overhead = std.math.mul(
+            usize,
+            threaded_io_limits.pdf_render_retained_scratch_bytes_per_worker,
+            worker_count,
+        ) catch return null;
+        const physical_scratch_limit = std.math.add(
+            usize,
+            threaded_io_limits.pdf_render_window_scratch_bytes,
+            retained_overhead,
+        ) catch return null;
+        const executor = bounded_worker_lane.Executor.create(self.alloc, .{
+            .worker_count = worker_count,
+            .queue_capacity = worker_count * 2,
+            .max_scratch_bytes = physical_scratch_limit,
+            .retained_scratch_bytes_per_worker = threaded_io_limits.pdf_render_retained_scratch_bytes_per_worker,
+        }) catch return null;
+        self.pdf_render_executor.store(executor, .release);
+        return executor;
+    }
+
+    /// Lease for the fixed PDF CPU lane. Unlike an inference `std.Io` lease,
+    /// jobs submitted through this value execute on stable physical workers
+    /// with thread-confined scratch reset after each job.
+    pub const PdfRenderLaneLease = struct {
+        runtime: *BackendRuntime,
+        borrowed_executor: *bounded_worker_lane.Executor,
+        released: bool = false,
+
+        pub fn executor(self: *const PdfRenderLaneLease) *bounded_worker_lane.Executor {
+            std.debug.assert(!self.released);
+            return self.borrowed_executor;
+        }
+
+        pub fn concurrentCapacity(self: *const PdfRenderLaneLease) usize {
+            return self.executor().concurrentCapacity();
+        }
+
+        /// Erased PDF-library view of this lease. The returned executor borrows
+        /// the lease and must not escape it. Per-window scratch is clamped to
+        /// the runtime policy even when a caller supplies a larger PDF option.
+        pub fn pageExecutor(self: *const PdfRenderLaneLease) pdf.PageRenderExecutor {
+            return .{
+                .ptr = self.executor(),
+                .concurrent_capacity = self.concurrentCapacity(),
+                .run_batch_fn = runPdfPageBatch,
+            };
+        }
+
+        fn runPdfPageBatch(
+            ptr: *anyopaque,
+            contexts: []const *anyopaque,
+            run: *const fn (context: *anyopaque, scratch: Allocator) void,
+            max_scratch_bytes: usize,
+        ) anyerror!pdf.PageRenderExecutor.BatchStats {
+            const lane_executor: *bounded_worker_lane.Executor = @ptrCast(@alignCast(ptr));
+            const stats = try lane_executor.runBatch(
+                contexts,
+                run,
+                @min(max_scratch_bytes, threaded_io_limits.pdf_render_window_scratch_bytes),
+            );
+            return .{ .peak_parallelism = stats.peak_parallelism };
+        }
+
+        pub fn release(self: *PdfRenderLaneLease) void {
+            if (self.released) return;
+            self.released = true;
+            self.runtime.pdf_render_lane_gate.release(self.runtime.io());
+        }
+    };
+
+    pub fn acquirePdfRenderLane(self: *BackendRuntime) !PdfRenderLaneLease {
+        const leases = self.pdf_render_lane_gate.tryAcquire() orelse {
+            _ = self.pdf_render_lane_rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        };
+        errdefer self.pdf_render_lane_gate.release(self.io());
+        const executor = self.ensurePdfRenderExecutor() orelse return error.BackendRuntimeUnavailable;
+        updateAtomicMax(&self.pdf_render_lane_peak_leases, leases);
+        _ = self.pdf_render_lane_acquisitions_total.fetchAdd(1, .monotonic);
+        return .{ .runtime = self, .borrowed_executor = executor };
+    }
+
+    pub fn outstandingPdfRenderLeases(self: *const BackendRuntime) usize {
+        return self.pdf_render_lane_gate.active();
+    }
+
+    pub fn pdfRenderExecutorStats(self: *const BackendRuntime) ?bounded_worker_lane.Stats {
+        const executor = self.pdf_render_executor.load(.acquire) orelse return null;
+        return executor.snapshotStats();
     }
 
     /// Reserved control-plane executor for health, metrics, and shutdown
@@ -1105,18 +1262,27 @@ pub const BackendRuntime = struct {
     /// overload cannot consume the runtime's last observable control path.
     pub fn controlIo(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
-        const io_impl = self.control_io_impl orelse self.io_impl orelse return null;
+        const io_impl = if (self.backend == .manual)
+            self.io_impl orelse return null
+        else
+            self.ensureSpecializedIoLane(&self.control_io_impl, self.lane_limits.control) orelse return null;
         return io_impl.io();
     }
 
     pub const ControlLaneLease = struct {
         runtime: *BackendRuntime,
         borrowed_io: Io,
+        concurrent_capacity: u32,
         released: bool = false,
 
         pub fn io(self: *const ControlLaneLease) Io {
             std.debug.assert(!self.released);
             return self.borrowed_io;
+        }
+
+        pub fn concurrentCapacity(self: *const ControlLaneLease) u32 {
+            std.debug.assert(!self.released);
+            return self.concurrent_capacity;
         }
 
         pub fn release(self: *ControlLaneLease) void {
@@ -1135,7 +1301,11 @@ pub const BackendRuntime = struct {
         const borrowed_io = self.controlIo() orelse return error.BackendRuntimeUnavailable;
         updateAtomicMax(&self.control_lane_peak_leases, leases);
         _ = self.control_lane_acquisitions_total.fetchAdd(1, .monotonic);
-        return .{ .runtime = self, .borrowed_io = borrowed_io };
+        return .{
+            .runtime = self,
+            .borrowed_io = borrowed_io,
+            .concurrent_capacity = self.lane_limits.control,
+        };
     }
 
     pub fn outstandingControlLeases(self: *const BackendRuntime) usize {
@@ -1143,6 +1313,7 @@ pub const BackendRuntime = struct {
     }
 
     pub const LaneStats = struct {
+        limits: threaded_io_limits.BackendRuntimeLaneLimits,
         api_active_leases: usize,
         api_peak_leases: usize,
         api_acquisitions_total: u64,
@@ -1151,6 +1322,11 @@ pub const BackendRuntime = struct {
         inference_peak_leases: usize,
         inference_acquisitions_total: u64,
         inference_rejections_total: u64,
+        pdf_render_active_leases: usize,
+        pdf_render_peak_leases: usize,
+        pdf_render_acquisitions_total: u64,
+        pdf_render_rejections_total: u64,
+        pdf_render_executor: ?bounded_worker_lane.Stats,
         control_active_leases: usize,
         control_peak_leases: usize,
         control_acquisitions_total: u64,
@@ -1159,6 +1335,7 @@ pub const BackendRuntime = struct {
 
     pub fn laneStats(self: *const BackendRuntime) LaneStats {
         return .{
+            .limits = self.lane_limits,
             .api_active_leases = self.api_lane_gate.active(),
             .api_peak_leases = self.api_lane_peak_leases.load(.acquire),
             .api_acquisitions_total = self.api_lane_acquisitions_total.load(.acquire),
@@ -1167,6 +1344,11 @@ pub const BackendRuntime = struct {
             .inference_peak_leases = self.inference_lane_peak_leases.load(.acquire),
             .inference_acquisitions_total = self.inference_lane_acquisitions_total.load(.acquire),
             .inference_rejections_total = self.inference_lane_rejections_total.load(.acquire),
+            .pdf_render_active_leases = self.pdf_render_lane_gate.active(),
+            .pdf_render_peak_leases = self.pdf_render_lane_peak_leases.load(.acquire),
+            .pdf_render_acquisitions_total = self.pdf_render_lane_acquisitions_total.load(.acquire),
+            .pdf_render_rejections_total = self.pdf_render_lane_rejections_total.load(.acquire),
+            .pdf_render_executor = self.pdfRenderExecutorStats(),
             .control_active_leases = self.control_lane_gate.active(),
             .control_peak_leases = self.control_lane_peak_leases.load(.acquire),
             .control_acquisitions_total = self.control_lane_acquisitions_total.load(.acquire),
@@ -1213,7 +1395,7 @@ pub const BackendRuntimeHandle = struct {
 
     pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
         if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        const filesystem_io = try initIoLane(alloc, threaded_io_limits.service);
+        const filesystem_io = try initIoLane(alloc, threaded_io_limits.backend_runtime_durable_background);
         errdefer deinitIoLane(alloc, filesystem_io);
         var handle = try init(alloc, .{
             .backend = .manual,
@@ -2083,7 +2265,19 @@ test "backend runtime API lane leases expose and release the interface" {
     defer handle.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), handle.ptr().outstandingApiLeases());
+    try std.testing.expect(handle.ptr().api_io_impl.load(.acquire) == null);
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire) == null);
+    try std.testing.expect(handle.ptr().control_io_impl.load(.acquire) == null);
+    try std.testing.expect(handle.ptr().raft_inbound_io_impl.load(.acquire) == null);
+    try std.testing.expect(handle.ptr().raft_outbound_io_impl.load(.acquire) == null);
     var first = try handle.ptr().acquireApiLane();
+    try std.testing.expectEqual(handle.ptr().lane_limits.api, first.concurrentCapacity());
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(handle.ptr().lane_limits.api),
+        handle.ptr().api_io_impl.load(.acquire).?.concurrent_limit,
+    );
+    try std.testing.expect(handle.ptr().api_io_impl.load(.acquire) != null);
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire) == null);
     var second = try handle.ptr().acquireApiLane();
     try std.testing.expectEqual(@as(usize, 2), handle.ptr().outstandingApiLeases());
     const active_stats = handle.ptr().laneStats();
@@ -2118,6 +2312,8 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
 
     while (!runtime.api_lane_gate.isClosed()) std.Thread.yield() catch {};
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireApiLane());
+    try std.testing.expect(runtime.inferenceIo() == null);
+    try std.testing.expect(runtime.inference_io_impl.load(.acquire) == null);
     try std.testing.expect(!deinitialized.load(.acquire));
     lease.release();
     deinit_thread.join();
@@ -2154,7 +2350,9 @@ test "backend runtime control lane leases are isolated from API leases" {
     try std.testing.expectEqual(@as(u64, 1), stats.control_acquisitions_total);
     _ = api.io();
     _ = control.io();
-    try std.testing.expect(handle.ptr().api_io_impl.? != handle.ptr().control_io_impl.?);
+    try std.testing.expectEqual(handle.ptr().lane_limits.api, api.concurrentCapacity());
+    try std.testing.expectEqual(handle.ptr().lane_limits.control, control.concurrentCapacity());
+    try std.testing.expect(handle.ptr().api_io_impl.load(.acquire).? != handle.ptr().control_io_impl.load(.acquire).?);
 }
 
 test "backend runtime inference lane has an isolated bounded executor" {
@@ -2163,22 +2361,206 @@ test "backend runtime inference lane has an isolated bounded executor" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer handle.deinit();
 
+    // Both the executor object and its eventual worker team are lazy and
+    // runtime-owned.
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire) == null);
     var inference = try handle.ptr().acquireInferenceLane();
     defer inference.release();
     const inference_io = inference.io();
+    try std.testing.expectEqual(handle.ptr().lane_limits.inference, inference.concurrentCapacity());
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire).?.worker_threads.load(.acquire) == null);
     try std.testing.expectEqual(@as(usize, 1), handle.ptr().outstandingInferenceLeases());
     const stats = handle.ptr().laneStats();
     try std.testing.expectEqual(@as(usize, 1), stats.inference_peak_leases);
     try std.testing.expectEqual(@as(u64, 1), stats.inference_acquisitions_total);
-    try std.testing.expect(handle.ptr().inference_io_impl.? != handle.ptr().api_io_impl.?);
+    try std.testing.expect(handle.ptr().api_io_impl.load(.acquire) == null);
+    var api = try handle.ptr().acquireApiLane();
+    defer api.release();
+    try std.testing.expect(handle.ptr().inference_io_impl.load(.acquire).? != handle.ptr().api_io_impl.load(.acquire).?);
     try std.testing.expectEqual(
-        std.Io.Limit.limited(threaded_io_limits.inference),
-        handle.ptr().inference_io_impl.?.concurrent_limit,
+        std.Io.Limit.limited(handle.ptr().lane_limits.inference),
+        handle.ptr().inference_io_impl.load(.acquire).?.concurrent_limit,
+    );
+    try std.testing.expect(
+        @intFromEnum(handle.ptr().inference_io_impl.load(.acquire).?.async_limit) <= handle.ptr().lane_limits.inference,
     );
     try std.testing.expect(inference_io.vtable == handle.ptr().threaded_network_io_vtable.?);
     try std.testing.expect(
-        inference_io.vtable.netConnectIp != handle.ptr().inference_io_impl.?.io().vtable.netConnectIp,
+        inference_io.vtable.netConnectIp != handle.ptr().inference_io_impl.load(.acquire).?.io().vtable.netConnectIp,
     );
+}
+
+test "backend runtime PDF render lane is lazy, bounded, and observable" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    try std.testing.expect(runtime.pdf_render_executor.load(.acquire) == null);
+    try std.testing.expect(runtime.laneStats().pdf_render_executor == null);
+
+    var lease = try runtime.acquirePdfRenderLane();
+    defer lease.release();
+    try std.testing.expect(runtime.pdf_render_executor.load(.acquire) != null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.outstandingPdfRenderLeases());
+    try std.testing.expect(lease.concurrentCapacity() > 0);
+    try std.testing.expect(lease.concurrentCapacity() <= threaded_io_limits.pdf_render);
+
+    const Counter = struct {
+        completed: std.atomic.Value(usize) = .init(0),
+
+        fn run(context: *anyopaque, scratch: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const bytes = scratch.alloc(u8, 4096) catch unreachable;
+            @memset(bytes, 0xa5);
+            _ = self.completed.fetchAdd(1, .monotonic);
+        }
+    };
+    var counter = Counter{};
+    const page_executor = lease.pageExecutor();
+    _ = try page_executor.runBatch(&.{ @ptrCast(&counter), @ptrCast(&counter) }, Counter.run, 64 * 1024);
+    try std.testing.expectEqual(@as(usize, 2), counter.completed.load(.acquire));
+    const stats = runtime.laneStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.pdf_render_active_leases);
+    try std.testing.expectEqual(@as(usize, 1), stats.pdf_render_peak_leases);
+    try std.testing.expectEqual(@as(u64, 1), stats.pdf_render_acquisitions_total);
+    try std.testing.expectEqual(@as(u64, 2), stats.pdf_render_executor.?.completed_jobs);
+    try std.testing.expect(stats.pdf_render_executor.?.retained_scratch_bytes <=
+        threaded_io_limits.pdf_render_retained_scratch_bytes_per_worker * lease.concurrentCapacity());
+}
+
+test "backend runtime publishes one PDF render lane under concurrent first lease" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    const caller_count = 8;
+    var published = [_]?*bounded_worker_lane.Executor{null} ** caller_count;
+    var failures = [_]?anyerror{null} ** caller_count;
+    var threads: [caller_count]std.Thread = undefined;
+    for (&threads, &published, &failures) |*thread, *observed, *failure| thread.* = try std.Thread.spawn(.{}, struct {
+        fn run(target: *BackendRuntime, result: *?*bounded_worker_lane.Executor, failed: *?anyerror) void {
+            var lease = target.acquirePdfRenderLane() catch |err| {
+                failed.* = err;
+                return;
+            };
+            result.* = lease.executor();
+            lease.release();
+        }
+    }.run, .{ runtime, observed, failure });
+    for (threads) |thread| thread.join();
+    const expected = runtime.pdf_render_executor.load(.acquire).?;
+    for (published, failures) |observed, failure| {
+        try std.testing.expect(failure == null);
+        try std.testing.expectEqual(expected, observed.?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), runtime.outstandingPdfRenderLeases());
+    try std.testing.expectEqual(@as(u64, caller_count), runtime.laneStats().pdf_render_acquisitions_total);
+}
+
+test "backend runtime shutdown drains PDF render leases before worker destruction" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    const runtime = handle.ptr();
+    var lease = try runtime.acquirePdfRenderLane();
+    var deinitialized = std.atomic.Value(bool).init(false);
+    const deinit_thread = try std.Thread.spawn(.{}, struct {
+        fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
+            h.deinit();
+            done.store(true, .release);
+        }
+    }.run, .{ &handle, &deinitialized });
+
+    while (!runtime.pdf_render_lane_gate.isClosed()) std.Thread.yield() catch {};
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquirePdfRenderLane());
+    try std.testing.expect(!deinitialized.load(.acquire));
+    lease.release();
+    deinit_thread.join();
+    try std.testing.expect(deinitialized.load(.acquire));
+}
+
+test "backend runtime publishes one lazy inference lane under concurrent first use" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    try std.testing.expect(runtime.inference_io_impl.load(.acquire) == null);
+
+    const caller_count = 16;
+    var published = [_]?*IoImpl{null} ** caller_count;
+    var threads: [caller_count]std.Thread = undefined;
+    for (&threads, &published) |*thread, *observed| {
+        thread.* = try std.Thread.spawn(.{}, struct {
+            fn run(target: *BackendRuntime, result: *?*IoImpl) void {
+                _ = target.inferenceIo();
+                result.* = target.inference_io_impl.load(.acquire);
+            }
+        }.run, .{ runtime, observed });
+    }
+    for (threads) |thread| thread.join();
+
+    const expected = runtime.inference_io_impl.load(.acquire) orelse
+        return error.TestUnexpectedResult;
+    for (published) |observed| try std.testing.expectEqual(expected, observed.?);
+}
+
+test "backend runtime async lane limit is CPU aware" {
+    if (builtin.single_threaded) {
+        try std.testing.expectEqual(std.Io.Limit.nothing, boundedIoAsyncLimit(8));
+        return;
+    }
+    const expected = if (std.Thread.getCpuCount()) |cpu_count|
+        std.Io.Limit.limited(@min(@as(usize, 8), cpu_count -| 1))
+    else |_|
+        std.Io.Limit.limited(8);
+    try std.testing.expectEqual(expected, boundedIoAsyncLimit(8));
+}
+
+test "backend runtime honors reduced per-lane limits under the aggregate ceiling" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+
+    const limits = threaded_io_limits.BackendRuntimeLaneLimits{
+        .durable_background = 3,
+        .api = 5,
+        .raft_inbound = 2,
+        .raft_outbound = 2,
+        .inference = 4,
+        .control = 1,
+        .pdf_render = 1,
+    };
+    try limits.validate();
+    try std.testing.expect(limits.total() <= threaded_io_limits.backend_runtime_aggregate);
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .io_threaded,
+        .lane_limits = limits,
+    });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+
+    try std.testing.expectEqual(limits, runtime.laneStats().limits);
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.durable_background), runtime.io_impl.?.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.raft_inbound), runtime.raftInboundIoImpl().?.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.raft_outbound), runtime.raftOutboundIoImpl().?.concurrent_limit);
+    var api_lease = try runtime.acquireApiLane();
+    defer api_lease.release();
+    var inference_lease = try runtime.acquireInferenceLane();
+    defer inference_lease.release();
+    var control_lease = try runtime.acquireControlLane();
+    defer control_lease.release();
+    var pdf_lease = try runtime.acquirePdfRenderLane();
+    defer pdf_lease.release();
+    try std.testing.expectEqual(limits.api, api_lease.concurrentCapacity());
+    try std.testing.expectEqual(limits.inference, inference_lease.concurrentCapacity());
+    try std.testing.expectEqual(limits.control, control_lease.concurrentCapacity());
+    try std.testing.expectEqual(@as(usize, limits.pdf_render), pdf_lease.concurrentCapacity());
+
+    try std.testing.expectError(error.InvalidBackendRuntimeLaneLimits, BackendRuntimeHandle.init(
+        std.testing.allocator,
+        .{ .lane_limits = .{ .control = 0 } },
+    ));
 }
 
 test "backend runtime separates native operation IO from outbound network IO" {
@@ -2234,7 +2616,7 @@ test "backend runtime exposes native API filesystem IO separately" {
     defer handle.deinit();
 
     const api_io = handle.ptr().apiFilesystemIo().?;
-    try std.testing.expect(api_io.vtable == handle.ptr().api_io_impl.?.io().vtable);
+    try std.testing.expect(api_io.vtable == handle.ptr().api_io_impl.load(.acquire).?.io().vtable);
     try std.testing.expect(api_io.vtable == handle.ptr().apiIo().?.vtable);
     try std.testing.expect(api_io.vtable != handle.ptr().apiNetworkIo().?.vtable);
     try std.testing.expect(handle.ptr().filesystemIo().?.vtable == handle.ptr().io_impl.?.io().vtable);

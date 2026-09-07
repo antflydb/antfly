@@ -8,13 +8,13 @@ const antfly_s3_openapi = @import("antfly_s3_openapi");
 pub const AntflySTTConfig = struct {
     /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    /// Transcriber model name (e.g., 'openai/whisper-tiny'). If empty, uses default.
-    model: ?[]const u8 = null,
+    /// Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny').
+    model: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "api_url", "api_url", true },
-        .{ "model", "model", true },
+        .{ "model", "model", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -31,10 +31,8 @@ pub const AntflySTTConfig = struct {
             try jw.objectField("api_url");
             try jw.write(value);
         }
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
+        try jw.objectField("model");
+        try jw.write(self.model);
         try jw.endObject();
     }
 };

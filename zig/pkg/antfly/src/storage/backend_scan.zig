@@ -204,6 +204,72 @@ pub fn scanPrefix(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix
     return try scanPrefixCursor(alloc, &cur, prefix);
 }
 
+pub const PrefixKeyPage = struct {
+    keys: [][]u8,
+    has_more: bool,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.keys) |key| alloc.free(key);
+        alloc.free(self.keys);
+        self.* = undefined;
+    }
+};
+
+/// Copy at most `limit` keys. Callers may delete or process this page and scan
+/// the prefix again, keeping invisible maintenance work memory-bounded.
+pub fn scanPrefixKeysPage(
+    alloc: std.mem.Allocator,
+    store: *backend_erased.Store,
+    prefix: []const u8,
+    limit: usize,
+) !PrefixKeyPage {
+    if (limit == 0) return error.InvalidScanLimit;
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var cur = try txn.openCursor();
+    defer cur.close();
+
+    var results = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (results.items) |key| alloc.free(key);
+        results.deinit(alloc);
+    }
+    var entry = try cur.seekAtOrAfter(prefix);
+    while (entry) |kv| {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+        if (results.items.len == limit) return .{
+            .keys = try results.toOwnedSlice(alloc),
+            .has_more = true,
+        };
+        const key = try alloc.dupe(u8, kv.key);
+        errdefer alloc.free(key);
+        try results.append(alloc, key);
+        entry = try cur.next();
+    }
+    return .{
+        .keys = try results.toOwnedSlice(alloc),
+        .has_more = false,
+    };
+}
+
+/// Copy only keys and fail before caller memory can grow beyond `limit`.
+/// This is intended for bounded all-at-once paths that never inspect values.
+pub fn scanPrefixKeysLimited(
+    alloc: std.mem.Allocator,
+    store: *backend_erased.Store,
+    prefix: []const u8,
+    limit: usize,
+) ![][]u8 {
+    var page = try scanPrefixKeysPage(alloc, store, prefix, limit);
+    if (page.has_more) {
+        page.deinit(alloc);
+        return error.ScanLimitExceeded;
+    }
+    const keys = page.keys;
+    page.keys = &.{};
+    return keys;
+}
+
 fn scanPrefixCursor(alloc: std.mem.Allocator, cur: *backend_erased.Cursor, prefix: []const u8) ![]OwnedKVPair {
     var results = std.ArrayListUnmanaged(OwnedKVPair).empty;
     errdefer {

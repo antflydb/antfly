@@ -1076,6 +1076,27 @@ pub const DocStore = struct {
         payload: []const u8,
     };
 
+    pub const KeyPromotion = struct {
+        source_key: []const u8,
+        destination_key: []const u8,
+    };
+
+    /// Builds one value from the same write transaction used for key
+    /// promotions. This lets callers serialize promotion source values while
+    /// they are still borrowed and commit the derived write atomically.
+    pub const TransactionalWriteBuilder = struct {
+        ptr: *anyopaque,
+        key: []const u8,
+        build: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror![]u8,
+    };
+
+    /// Read-only predicate evaluated inside the exact write transaction that
+    /// performs promotions and replay publication.
+    pub const TransactionalGuard = struct {
+        ptr: *anyopaque,
+        validate: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void,
+    };
+
     fn putBatchWithReplayOnceWithOptions(
         self: *DocStore,
         writes: []const KVPair,
@@ -1148,6 +1169,102 @@ pub const DocStore = struct {
 
     pub fn putBatchWithReplay(self: *DocStore, io: ?std.Io, writes: []const KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
         try self.putBatchWithReplayWithOptions(io, writes, deletes, replay, .{});
+    }
+
+    fn putBatchWithPromotionsAndReplayOnce(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+        transactional_write: ?TransactionalWriteBuilder,
+        transactional_guard: ?TransactionalGuard,
+    ) !usize {
+        var batch = try self.beginWriteBatchWithOptions(.{});
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
+        const built_value = if (transactional_write) |builder|
+            try builder.build(builder.ptr, self.alloc, &txn)
+        else
+            null;
+        defer if (built_value) |value| self.alloc.free(value);
+        if (transactional_write) |builder| try txn.put(builder.key, built_value.?);
+        var promoted_bytes: usize = 0;
+        for (promotions) |promotion| {
+            const value = txn.get(promotion.source_key) catch |err| switch (err) {
+                error.NotFound => return error.InvalidKeyPromotion,
+                else => return err,
+            };
+            promoted_bytes = std.math.add(usize, promoted_bytes, value.len) catch
+                return error.KeyPromotionBytesOverflow;
+            try txn.put(promotion.destination_key, value);
+            try txn.delete(promotion.source_key);
+        }
+        for (deletes) |key| {
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        for (writes) |kv| try txn.put(kv.key, kv.value);
+        if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
+        // Recheck immediately before commit. A guard may contain a wall-clock
+        // lease expiry, and building a large replay value can outlive the tenure
+        // even though no competing writer can modify the record mid-transaction.
+        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
+        try batch.commit();
+        return promoted_bytes;
+    }
+
+    /// Atomically moves existing values to canonical keys while committing the
+    /// accompanying mutations and replay record. Promotion values remain
+    /// borrowed from the write transaction, so document-sized generations do
+    /// not require a second heap copy.
+    pub fn putBatchWithPromotionsAndReplay(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+    ) !usize {
+        return try self.putBatchWithPromotionsReplayAndBuiltWrite(io, writes, deletes, promotions, replay, null, null);
+    }
+
+    pub fn putBatchWithPromotionsReplayAndBuiltWrite(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+        transactional_write: ?TransactionalWriteBuilder,
+        transactional_guard: ?TransactionalGuard,
+    ) !usize {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const promoted_bytes = self.putBatchWithPromotionsAndReplayOnce(
+                writes,
+                deletes,
+                promotions,
+                replay,
+                transactional_write,
+                transactional_guard,
+            ) catch |err| switch (err) {
+                error.WriterLocked => {
+                    if (attempt >= writer_locked_retry_count) return err;
+                    backoffWriterLockRetry(io);
+                    continue;
+                },
+                else => return err,
+            };
+            if (replay) |entry| {
+                self.markReplayIndexAvailable();
+                self.observeCommittedReplaySequence(entry.sequence);
+            }
+            return promoted_bytes;
+        }
     }
 
     /// Update the in-memory replay watermark after a replay entry was committed

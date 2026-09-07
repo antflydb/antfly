@@ -33,6 +33,7 @@ pub const Stats = struct {
     lease_acquire_failures: u64 = 0,
     lost_leases: u64 = 0,
     last_acquired_ms: u64 = 0,
+    lease_epoch: u64 = 0,
 };
 
 pub const State = struct {
@@ -45,6 +46,8 @@ pub const State = struct {
     lease_acquire_failures: u64,
     lost_leases: u64,
     last_acquired_ms: u64,
+    lease_epoch: u64,
+    lease_expires_at_ms: u64,
 
     pub fn init(alloc: Allocator, store: anytype, key: []const u8, config: Config) !State {
         return .{
@@ -57,6 +60,8 @@ pub const State = struct {
             .lease_acquire_failures = 0,
             .lost_leases = 0,
             .last_acquired_ms = 0,
+            .lease_epoch = 0,
+            .lease_expires_at_ms = 0,
         };
     }
 
@@ -74,9 +79,11 @@ pub const State = struct {
         }
 
         const had_lease = self.has_lease;
-        const acquired = try self.lease.tryAcquire(self.owner_id, now_ms, self.lease_ttl_ms);
-        if (acquired) {
+        const acquired = try self.lease.tryAcquireFenced(self.owner_id, now_ms, self.lease_ttl_ms);
+        if (acquired.acquired) {
             self.has_lease = true;
+            self.lease_epoch = acquired.epoch;
+            self.lease_expires_at_ms = acquired.expires_at_ms;
             if (!had_lease) {
                 self.acquisition_count += 1;
                 self.last_acquired_ms = now_ms;
@@ -88,19 +95,49 @@ pub const State = struct {
         return false;
     }
 
+    pub fn heartbeat(self: *State, now_ms: u64) !bool {
+        if (!self.lease_owned) return true;
+        if (!self.has_lease or self.lease_epoch == 0) return false;
+        const renewed = try self.lease.renewFenced(
+            self.owner_id,
+            self.lease_epoch,
+            now_ms,
+            self.lease_ttl_ms,
+        );
+        if (!renewed) {
+            self.noteAcquireFailure();
+            return false;
+        }
+        self.lease_expires_at_ms = std.math.add(u64, now_ms, self.lease_ttl_ms) catch std.math.maxInt(u64);
+        return true;
+    }
+
+    pub fn heartbeatIfDue(self: *State, now_ms: u64) !bool {
+        if (!self.lease_owned) return true;
+        if (!self.has_lease or self.lease_epoch == 0) return false;
+        const renew_margin = @max(@as(u64, 1), self.lease_ttl_ms / 2);
+        if (self.lease_expires_at_ms > now_ms and self.lease_expires_at_ms - now_ms > renew_margin)
+            return true;
+        return try self.heartbeat(now_ms);
+    }
+
     pub fn noteAcquireFailure(self: *State) void {
         self.lease_acquire_failures += 1;
         if (self.has_lease and self.lease_owned) {
             self.has_lease = false;
+            self.lease_epoch = 0;
+            self.lease_expires_at_ms = 0;
             self.lost_leases += 1;
         }
     }
 
     pub fn release(self: *State) void {
         if (self.lease_owned and self.has_lease) {
-            _ = self.lease.release(self.owner_id) catch false;
+            _ = self.lease.releaseFenced(self.owner_id, self.lease_epoch) catch false;
         }
         self.has_lease = !self.lease_owned;
+        self.lease_epoch = 0;
+        self.lease_expires_at_ms = 0;
     }
 
     pub fn stats(self: *const State) Stats {
@@ -111,6 +148,7 @@ pub const State = struct {
             .lease_acquire_failures = self.lease_acquire_failures,
             .lost_leases = self.lost_leases,
             .last_acquired_ms = self.last_acquired_ms,
+            .lease_epoch = self.lease_epoch,
         };
     }
 };

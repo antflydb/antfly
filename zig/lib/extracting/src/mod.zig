@@ -51,6 +51,12 @@ pub const Config = struct {
     url: []const u8 = "",
     api_key: ?[]const u8 = null,
     bearer_token: ?[]const u8 = null,
+    capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
+    /// Runtime-resolved Antfly transport capability. This is deliberately not
+    /// parsed from user configuration: only a successful capability lease may
+    /// enable the task-neutral binary attachment envelope.
+    framed_attachments: bool = false,
     schema_json: []const u8 = "",
     options_json: []const u8 = "",
 
@@ -59,6 +65,8 @@ pub const Config = struct {
         if (self.url.len > 0) alloc.free(@constCast(self.url));
         if (self.api_key) |api_key| alloc.free(@constCast(api_key));
         if (self.bearer_token) |bearer_token| alloc.free(@constCast(bearer_token));
+        if (self.capability_token) |capability_token| alloc.free(@constCast(capability_token));
+        if (self.capability_revision) |revision| alloc.free(@constCast(revision));
         if (self.schema_json.len > 0) alloc.free(@constCast(self.schema_json));
         if (self.options_json.len > 0) alloc.free(@constCast(self.options_json));
         self.* = undefined;
@@ -86,6 +94,18 @@ pub const Request = struct {
     inputs: []const Input,
     schema_json: []const u8 = "",
     options_json: []const u8 = "",
+    /// Borrowed binary media associated with one logical input. Embedded
+    /// providers preserve these bytes across the native boundary; HTTP
+    /// providers encode them only while constructing the final wire request.
+    attachments: []const Attachment = &.{},
+    /// Route-owned hard response ceiling for bounded orchestration.
+    max_response_bytes: ?usize = null,
+};
+
+pub const Attachment = struct {
+    input_index: usize,
+    bytes: []const u8,
+    mime_type: []const u8,
 };
 
 pub const Response = struct {
@@ -247,6 +267,9 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
         .url = url,
         .api_key = api_key,
         .bearer_token = bearer_token,
+        .capability_token = null,
+        .capability_revision = null,
+        .framed_attachments = false,
         .schema_json = schema_json,
         .options_json = options_json,
     };
@@ -261,20 +284,45 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .url = if (cfg.url.len > 0) try alloc.dupe(u8, cfg.url) else "",
         .api_key = if (cfg.api_key) |value| try alloc.dupe(u8, value) else null,
         .bearer_token = if (cfg.bearer_token) |value| try alloc.dupe(u8, value) else null,
+        .capability_token = if (cfg.capability_token) |value| try alloc.dupe(u8, value) else null,
+        .capability_revision = if (cfg.capability_revision) |value| try alloc.dupe(u8, value) else null,
+        .framed_attachments = cfg.framed_attachments,
         .schema_json = try alloc.dupe(u8, cfg.schema_json),
         .options_json = try alloc.dupe(u8, cfg.options_json),
     };
 }
 
+pub const RemoteOptions = struct {
+    source_table: []const u8 = "",
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
+};
+
 pub fn initExtractor(alloc: Allocator, http: *httpx.Client, cfg: Config) !Extractor {
+    return initExtractorWithOptions(alloc, http, cfg, .{});
+}
+
+fn initExtractorWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Extractor {
     return switch (cfg.provider) {
-        .antfly, .pioneer, .openai => try HttpExtractorState.init(alloc, http, cfg),
+        .antfly, .pioneer, .openai => try HttpExtractorState.init(alloc, http, cfg, options),
         .mock => error.UnsupportedExtractionProvider,
     };
 }
 
 pub fn extractWithConfig(alloc: Allocator, http: *httpx.Client, cfg: Config, req: Request) !Response {
     const extractor = try initExtractor(alloc, http, cfg);
+    defer extractor.deinit();
+    return try extractor.extract(alloc, req);
+}
+
+pub fn extractWithConfigAndOptions(
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    req: Request,
+    options: RemoteOptions,
+) !Response {
+    const extractor = try initExtractorWithOptions(alloc, http, cfg, options);
     defer extractor.deinit();
     return try extractor.extract(alloc, req);
 }
@@ -296,14 +344,27 @@ const HttpExtractorState = struct {
     alloc: Allocator,
     http: *httpx.Client,
     cfg: Config,
+    source_table: ?[]u8 = null,
+    timeout_ms: ?u64 = null,
+    cancellation: ?httpx.CancellationToken = null,
 
-    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Extractor {
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Extractor {
         const state = try alloc.create(HttpExtractorState);
         errdefer alloc.destroy(state);
+        // Source routing is an Antfly-internal protocol. Never forward it to
+        // third-party extractor endpoints that happen to share this adapter.
+        const source_table = if (cfg.provider == .antfly and options.source_table.len > 0)
+            try alloc.dupe(u8, options.source_table)
+        else
+            null;
+        errdefer if (source_table) |value| alloc.free(value);
         state.* = .{
             .alloc = alloc,
             .http = http,
             .cfg = try cloneConfig(alloc, cfg),
+            .source_table = source_table,
+            .timeout_ms = options.timeout_ms,
+            .cancellation = options.cancellation,
         };
         return .{ .ptr = state, .vtable = &.{ .extract = extract, .deinit = deinit } };
     }
@@ -311,13 +372,35 @@ const HttpExtractorState = struct {
     fn deinit(ptr: *anyopaque) void {
         const self: *HttpExtractorState = @ptrCast(@alignCast(ptr));
         self.cfg.deinit(self.alloc);
+        if (self.source_table) |source_table| self.alloc.free(source_table);
         self.alloc.destroy(self);
     }
 
     fn extract(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *HttpExtractorState = @ptrCast(@alignCast(ptr));
-        const body = try requestJsonAlloc(alloc, self.cfg, req);
-        defer alloc.free(body);
+        const metadata = try requestJsonAlloc(alloc, self.cfg, req);
+        defer alloc.free(metadata);
+        const use_framed_transport = self.cfg.provider == .antfly and
+            self.cfg.framed_attachments and req.attachments.len > 0;
+        var framed_body: ?httpx.attachment_envelope.EncodedSegments = null;
+        defer if (framed_body) |*body| body.deinit();
+        if (use_framed_transport) {
+            const attachments = try alloc.alloc(httpx.attachment_envelope.Attachment, req.attachments.len);
+            defer alloc.free(attachments);
+            var attachment_index: usize = 0;
+            for (req.inputs, 0..) |_, input_index| {
+                for (req.attachments) |attachment| {
+                    if (attachment.input_index != input_index) continue;
+                    attachments[attachment_index] = .{
+                        .mime_type = attachment.mime_type,
+                        .data = attachment.bytes,
+                    };
+                    attachment_index += 1;
+                }
+            }
+            std.debug.assert(attachment_index == attachments.len);
+            framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments);
+        }
 
         const base = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
             .antfly => "http://127.0.0.1:8080",
@@ -338,22 +421,48 @@ const HttpExtractorState = struct {
             auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
             try headers.append(alloc, .{ "Authorization", auth_header.? });
         }
+        if (self.source_table) |source_table|
+            try headers.append(alloc, .{ "X-Antfly-Source-Table", source_table });
+        if (self.cfg.capability_token) |token|
+            try headers.append(alloc, .{ "X-Antfly-Capability-Token", token });
+        if (self.cfg.capability_revision) |revision|
+            try headers.append(alloc, .{ "X-Antfly-Capability-Revision", revision });
 
-        var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
+        if (use_framed_transport)
+            try headers.append(alloc, .{ "Content-Type", httpx.attachment_envelope.content_type });
+        var resp = try self.http.post(url, .{
+            .json = if (use_framed_transport) null else metadata,
+            .borrowed_body_segments = if (framed_body) |body| body.segments else null,
+            .headers = headers.items,
+            .timeout_ms = self.timeout_ms,
+            .max_response_size = req.max_response_bytes,
+            .cancellation = self.cancellation,
+        });
         defer resp.deinit();
-        if (!resp.ok()) return error.ExtractionRequestFailed;
+        if (!resp.ok()) return if (responseCapabilityStale(resp))
+            error.InferenceCapabilitiesStale
+        else
+            error.ExtractionRequestFailed;
         const payload = resp.body orelse return error.EmptyExtractionResponse;
         const canonical = try canonicalResponseJsonAlloc(alloc, payload);
         return .{ .allocator = alloc, .json = canonical };
     }
 };
 
+fn responseCapabilityStale(response: httpx.Response) bool {
+    if (response.status.code != 409) return false;
+    const value = response.headers.get("X-Antfly-Capability-Stale") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
+}
+
 fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
+    try validateAttachments(req);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"model\":");
     try appendJsonString(alloc, &out, cfg.model);
     try out.appendSlice(alloc, ",\"inputs\":[");
+    var attachment_cursor: usize = 0;
     for (req.inputs, 0..) |input, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.append(alloc, '{');
@@ -365,7 +474,16 @@ fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
         }
         if (!first) try out.append(alloc, ',');
         try out.appendSlice(alloc, "\"content\":");
-        try out.appendSlice(alloc, input.content_json);
+        const content_json = try inputContentJsonAlloc(
+            alloc,
+            req,
+            i,
+            input.content_json,
+            cfg.provider == .antfly and cfg.framed_attachments,
+            &attachment_cursor,
+        );
+        defer alloc.free(content_json);
+        try out.appendSlice(alloc, content_json);
         if (input.tokens_json) |tokens_json| {
             try out.appendSlice(alloc, ",\"tokens\":");
             try out.appendSlice(alloc, tokens_json);
@@ -386,6 +504,72 @@ fn requestJsonAlloc(alloc: Allocator, cfg: Config, req: Request) ![]u8 {
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn inputContentJsonAlloc(
+    alloc: Allocator,
+    req: Request,
+    input_index: usize,
+    original: []const u8,
+    framed_attachments: bool,
+    attachment_cursor: *usize,
+) ![]u8 {
+    var attachment_count: usize = 0;
+    for (req.attachments) |attachment| {
+        if (attachment.input_index == input_index) attachment_count += 1;
+    }
+    if (attachment_count == 0) return try alloc.dupe(u8, original);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, original, .{});
+    defer parsed.deinit();
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var emitted = false;
+    if (parsed.value == .array) {
+        for (parsed.value.array.items) |part| {
+            if (emitted) try out.append(alloc, ',');
+            const encoded = try std.json.Stringify.valueAlloc(alloc, part, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+            emitted = true;
+        }
+    } else if (parsed.value == .string and parsed.value.string.len > 0) {
+        try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
+        try appendJsonString(alloc, &out, parsed.value.string);
+        try out.append(alloc, '}');
+        emitted = true;
+    } else if (parsed.value != .string) return error.InvalidExtractionContent;
+    for (req.attachments) |attachment| {
+        if (attachment.input_index != input_index) continue;
+        if (emitted) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
+        try appendJsonString(alloc, &out, attachment.mime_type);
+        try out.appendSlice(alloc, ",\"data\":");
+        if (framed_attachments) {
+            const reference = try std.fmt.allocPrint(alloc, "attachment:{d}", .{attachment_cursor.*});
+            defer alloc.free(reference);
+            try appendJsonString(alloc, &out, reference);
+            attachment_cursor.* += 1;
+        } else {
+            const encoded_len = std.base64.standard.Encoder.calcSize(attachment.bytes.len);
+            const encoded = try alloc.alloc(u8, encoded_len);
+            defer alloc.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, attachment.bytes);
+            try appendJsonString(alloc, &out, encoded);
+        }
+        try out.append(alloc, '}');
+        emitted = true;
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn validateAttachments(req: Request) !void {
+    for (req.attachments) |attachment| {
+        if (attachment.input_index >= req.inputs.len or attachment.mime_type.len == 0 or attachment.bytes.len == 0)
+            return error.InvalidExtractionAttachment;
+    }
 }
 
 fn canonicalResponseJsonAlloc(alloc: Allocator, payload: []const u8) ![]u8 {
@@ -485,6 +669,50 @@ test "extracting first result returns asset value" {
     defer alloc.free(value);
     try std.testing.expect(std.mem.indexOf(u8, value, "\"entities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, value, "\"object\"") == null);
+}
+
+test "extracting HTTP boundary encodes borrowed media only in final content" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const inputs = [_]Input{.{ .content_json = "\"ocr prompt\"" }};
+    const attachments = [_]Attachment{.{ .input_index = 0, .bytes = &bytes, .mime_type = "image/png" }};
+    var attachment_cursor: usize = 0;
+    const content = try inputContentJsonAlloc(std.testing.allocator, .{
+        .inputs = &inputs,
+        .attachments = &attachments,
+    }, 0, inputs[0].content_json, false, &attachment_cursor);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"mime_type\":\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"data\":\"AQID\"") != null);
+}
+
+test "extracting framed boundary uses canonical attachment references" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const inputs = [_]Input{.{ .content_json = "\"ocr prompt\"" }};
+    const attachments = [_]Attachment{.{ .input_index = 0, .bytes = &bytes, .mime_type = "image/png" }};
+    const body = try requestJsonAlloc(std.testing.allocator, .{
+        .provider = .antfly,
+        .model = "extractor",
+        .framed_attachments = true,
+    }, .{
+        .inputs = &inputs,
+        .attachments = &attachments,
+    });
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"data\":\"attachment:0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "AQID") == null);
+}
+
+test "extracting HTTP boundary rejects attachments without a logical input" {
+    const bytes = [_]u8{1};
+    const attachments = [_]Attachment{.{ .input_index = 0, .bytes = &bytes, .mime_type = "image/png" }};
+    try std.testing.expectError(error.InvalidExtractionAttachment, requestJsonAlloc(std.testing.allocator, .{
+        .provider = .antfly,
+        .model = "extractor",
+    }, .{
+        .inputs = &.{},
+        .attachments = &attachments,
+    }));
 }
 
 fn expectExtractRequest(req: httpx.testing_mod.RequestInfo) !void {

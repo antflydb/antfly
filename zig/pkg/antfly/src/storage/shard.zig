@@ -144,49 +144,118 @@ fn decodeSplitState(data: []const u8) ?SplitState {
 ///   writes: [key_len:u32 LE][key][val_len:u32 LE][val] ...
 ///   deletes: [key_len:u32 LE][key] ...
 pub fn encodeSplitDeltaAlloc(alloc: Allocator, timestamp: u64, writes: []const KVPair, deletes: []const []const u8) ![]u8 {
-    // Calculate total size
-    var size: usize = 16; // timestamp + num_writes + num_deletes
+    return try encodeSplitDeltaCombinedAlloc(alloc, timestamp, writes, deletes, &.{}, null);
+}
+
+/// Encode ordinary writes plus values borrowed from promotion source keys in
+/// the caller's write transaction. Only the final encoded delta is allocated;
+/// document-sized promotion values are never copied into an intermediate list.
+pub fn encodeSplitDeltaWithPromotionsAlloc(
+    alloc: Allocator,
+    timestamp: u64,
+    writes: []const KVPair,
+    deletes: []const []const u8,
+    promotions: []const DocStore.KeyPromotion,
+    txn: *DocStore.Batch.BatchTxn,
+) ![]u8 {
+    return try encodeSplitDeltaCombinedAlloc(alloc, timestamp, writes, deletes, promotions, txn);
+}
+
+pub fn splitDeltaWithPromotionsEncodedSize(
+    writes: []const KVPair,
+    deletes: []const []const u8,
+    promotions: []const DocStore.KeyPromotion,
+    txn: *DocStore.Batch.BatchTxn,
+) !usize {
+    return try splitDeltaCombinedEncodedSize(writes, deletes, promotions, txn);
+}
+
+fn splitDeltaCombinedEncodedSize(
+    writes: []const KVPair,
+    deletes: []const []const u8,
+    promotions: []const DocStore.KeyPromotion,
+    maybe_txn: ?*DocStore.Batch.BatchTxn,
+) !usize {
+    if (promotions.len > 0 and maybe_txn == null) return error.InvalidSplitDeltaPromotion;
+    const write_count = std.math.add(usize, writes.len, promotions.len) catch
+        return error.SplitDeltaTooLarge;
+    if (write_count > std.math.maxInt(u32) or deletes.len > std.math.maxInt(u32))
+        return error.SplitDeltaTooLarge;
+
+    var size: usize = 16;
     for (writes) |kv| {
-        size += 4 + kv.key.len + 4 + kv.value.len;
+        if (kv.key.len > std.math.maxInt(u32) or kv.value.len > std.math.maxInt(u32))
+            return error.SplitDeltaTooLarge;
+        size = std.math.add(usize, size, 8) catch return error.SplitDeltaTooLarge;
+        size = std.math.add(usize, size, kv.key.len) catch return error.SplitDeltaTooLarge;
+        size = std.math.add(usize, size, kv.value.len) catch return error.SplitDeltaTooLarge;
+    }
+    for (promotions) |promotion| {
+        const value = try maybe_txn.?.get(promotion.source_key);
+        if (promotion.destination_key.len > std.math.maxInt(u32) or value.len > std.math.maxInt(u32))
+            return error.SplitDeltaTooLarge;
+        size = std.math.add(usize, size, 8) catch return error.SplitDeltaTooLarge;
+        size = std.math.add(usize, size, promotion.destination_key.len) catch return error.SplitDeltaTooLarge;
+        size = std.math.add(usize, size, value.len) catch return error.SplitDeltaTooLarge;
     }
     for (deletes) |key| {
-        size += 4 + key.len;
+        if (key.len > std.math.maxInt(u32)) return error.SplitDeltaTooLarge;
+        size = std.math.add(usize, size, 4) catch return error.SplitDeltaTooLarge;
+        size = std.math.add(usize, size, key.len) catch return error.SplitDeltaTooLarge;
     }
+    return size;
+}
+
+fn encodeSplitDeltaCombinedAlloc(
+    alloc: Allocator,
+    timestamp: u64,
+    writes: []const KVPair,
+    deletes: []const []const u8,
+    promotions: []const DocStore.KeyPromotion,
+    maybe_txn: ?*DocStore.Batch.BatchTxn,
+) ![]u8 {
+    const write_count = std.math.add(usize, writes.len, promotions.len) catch
+        return error.SplitDeltaTooLarge;
+    const size = try splitDeltaCombinedEncodedSize(writes, deletes, promotions, maybe_txn);
 
     const buf = try alloc.alloc(u8, size);
     errdefer alloc.free(buf);
     var pos: usize = 0;
-
     std.mem.writeInt(u64, buf[pos..][0..8], timestamp, .little);
     pos += 8;
-
-    const nw: u32 = @intCast(writes.len);
-    @memcpy(buf[pos..][0..4], std.mem.asBytes(&std.mem.nativeToLittle(u32, nw)));
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(write_count), .little);
     pos += 4;
-    const nd: u32 = @intCast(deletes.len);
-    @memcpy(buf[pos..][0..4], std.mem.asBytes(&std.mem.nativeToLittle(u32, nd)));
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(deletes.len), .little);
     pos += 4;
 
     for (writes) |kv| {
-        const kl: u32 = @intCast(kv.key.len);
-        @memcpy(buf[pos..][0..4], std.mem.asBytes(&std.mem.nativeToLittle(u32, kl)));
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(kv.key.len), .little);
         pos += 4;
         @memcpy(buf[pos..][0..kv.key.len], kv.key);
         pos += kv.key.len;
-        const vl: u32 = @intCast(kv.value.len);
-        @memcpy(buf[pos..][0..4], std.mem.asBytes(&std.mem.nativeToLittle(u32, vl)));
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(kv.value.len), .little);
         pos += 4;
         @memcpy(buf[pos..][0..kv.value.len], kv.value);
         pos += kv.value.len;
     }
+    for (promotions) |promotion| {
+        const value = try maybe_txn.?.get(promotion.source_key);
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(promotion.destination_key.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..promotion.destination_key.len], promotion.destination_key);
+        pos += promotion.destination_key.len;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(value.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..value.len], value);
+        pos += value.len;
+    }
     for (deletes) |key| {
-        const kl: u32 = @intCast(key.len);
-        @memcpy(buf[pos..][0..4], std.mem.asBytes(&std.mem.nativeToLittle(u32, kl)));
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(key.len), .little);
         pos += 4;
         @memcpy(buf[pos..][0..key.len], key);
         pos += key.len;
     }
-
+    std.debug.assert(pos == buf.len);
     return buf;
 }
 
@@ -557,6 +626,16 @@ pub const ShardManager = struct {
         return self.delta_seq;
     }
 
+    /// Reserve the next delta key for a caller that will write the encoded
+    /// delta through the same DocStore transaction as its primary mutation.
+    pub fn reserveSplitDeltaKey(self: *ShardManager, key_buf: *[19]u8) ![]const u8 {
+        if (self.split_state == null or self.split_state.?.phase != .splitting)
+            return error.SplitInProgress;
+        self.delta_seq = std.math.add(u64, self.delta_seq, 1) catch
+            return error.SplitDeltaSequenceOverflow;
+        return deltaKey(key_buf, self.delta_seq);
+    }
+
     /// Phase 1: Validate split key is in range, set PREPARE phase.
     pub fn prepareSplit(self: *ShardManager, split_key: []const u8) !void {
         try validatePrepareSplit(self.byte_range, self.split_state, split_key);
@@ -677,15 +756,10 @@ pub const ShardManager = struct {
 
     /// Append a split delta (changes that happened during split).
     pub fn appendSplitDelta(self: *ShardManager, timestamp: u64, writes: []const KVPair, deletes: []const []const u8) !void {
-        if (self.split_state == null) return error.SplitInProgress;
-        if (self.split_state.?.phase != .splitting) return error.SplitInProgress;
-
-        self.delta_seq += 1;
+        var key_buf: [19]u8 = undefined;
+        const key = try self.reserveSplitDeltaKey(&key_buf);
         const encoded = try encodeSplitDeltaAlloc(self.alloc, timestamp, writes, deletes);
         defer self.alloc.free(encoded);
-
-        var key_buf: [19]u8 = undefined;
-        const key = deltaKey(&key_buf, self.delta_seq);
         try storePut(self, key, encoded);
     }
 

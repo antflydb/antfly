@@ -17,14 +17,18 @@ const httpx = @import("httpx");
 const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
-const RequestContext = @import("../inference/request_context.zig").RequestContext;
+const RequestContext = @import("../inference/execution_context.zig").RequestContext;
 const openai_provider = @import("../inference/openai.zig");
 const antfly_provider = @import("../inference/local.zig");
 const vertex_provider = @import("../inference/vertex.zig");
 const common_secrets = @import("../common/secrets.zig");
+const execution_context = @import("../inference/execution_context.zig");
+const platform_time = @import("antfly_platform").time;
 const provider_limits = @import("../common/provider_limits.zig");
 const credential_identity = @import("../common/credential_source_identity.zig");
 const provider_defaults = @import("../common/provider_defaults.zig");
+
+const remote_generate_max_timeout_ms: u64 = 300_000;
 
 pub const Role = lib.Role;
 pub const ContentPart = lib.ContentPart;
@@ -51,6 +55,9 @@ pub const BackendFactory = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     inference_api_key: ?[]const u8 = null,
+    max_response_bytes: ?usize = null,
+    source_table: []const u8 = "",
+    execution: execution_context.Context = .{},
     request_context: ?RequestContext = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
 
@@ -70,6 +77,9 @@ pub const BackendFactory = struct {
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
         inference_api_key: ?[]const u8 = null,
+        max_response_bytes: ?usize = null,
+        source_table: []const u8 = "",
+        execution: execution_context.Context = .{},
         request_context: ?RequestContext = null,
         limits: *provider_limits.Registry = &provider_limits.process_registry,
     };
@@ -79,12 +89,18 @@ pub const BackendFactory = struct {
         http: *httpx.Client,
         options: Options,
     ) BackendFactory {
+        var execution = options.execution;
+        if (execution.routing.source_table.len == 0)
+            execution.routing.source_table = options.source_table;
         return .{
             .alloc = alloc,
             .http = http,
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
             .inference_api_key = options.inference_api_key,
+            .max_response_bytes = options.max_response_bytes,
+            .source_table = options.source_table,
+            .execution = execution,
             .request_context = options.request_context,
             .limits = options.limits,
         };
@@ -99,7 +115,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.request_context, self.limits);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits);
     }
 };
 
@@ -107,10 +123,13 @@ const BackendState = struct {
     quota: ?provider_limits.Handle = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     alloc: std.mem.Allocator,
+    io: ?std.Io = null,
     cfg: GeneratorConfig,
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
+    max_response_bytes: ?usize = null,
+    execution: execution_context.Context = .{},
     request_context: ?RequestContext = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
@@ -127,6 +146,8 @@ const BackendState = struct {
         embedded_antfly_provider: ?managed_embedder.AntflyProvider,
         secret_store: ?*common_secrets.FileStore,
         inference_api_key: ?[]const u8,
+        max_response_bytes: ?usize,
+        execution: execution_context.Context,
         request_context: ?RequestContext,
         limits: *provider_limits.Registry,
     ) !lib.Generator {
@@ -136,6 +157,7 @@ const BackendState = struct {
         state.limits = limits;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         state.alloc = alloc;
+        state.io = http.io;
         state.cfg = cfg;
         state.api_key = switch (cfg.provider) {
             .antfly => try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key orelse inference_api_key, "ANTFLY_INFERENCE_API_KEY"),
@@ -145,6 +167,8 @@ const BackendState = struct {
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
+        state.max_response_bytes = max_response_bytes;
+        state.execution = execution;
         state.request_context = request_context;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
@@ -180,8 +204,14 @@ const BackendState = struct {
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
                 .{ .embedded_antfly = embedded_antfly_provider.? }
-            else
-                .{ .remote_antfly = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082") },
+            else blk: {
+                var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082");
+                errdefer provider.deinit();
+                try provider.setSourceTable(execution.routing.source_table);
+                if (cfg.capability_token) |token| try provider.setCapabilityToken(token);
+                if (cfg.capability_revision) |revision| try provider.setCapabilityRevision(revision);
+                break :blk .{ .remote_antfly = provider };
+            },
             else => return error.UnsupportedGeneratorProvider,
         };
 
@@ -266,17 +296,7 @@ const BackendState = struct {
             }
         }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
-        if (policy.tokens_per_minute != 0) {
-            if (self.cfg.max_tokens <= 0) return error.InvalidRateLimitPolicy;
-            for (messages) |message| {
-                if (message.content) |content| switch (content) {
-                    .text => {},
-                    .parts => |parts| for (parts) |part| {
-                        if (part != .text) return error.UnsupportedMediaTokenBudget;
-                    },
-                };
-            }
-        }
+        try validateGenerationMessagesTokenBudget(self.cfg, messages);
         if (self.provider == .embedded_antfly and policy.enabled()) return error.UnsupportedLocalRateLimit;
         var temporary: ?provider_limits.Handle = if (std.mem.eql(u8, model, self.cfg.model))
             null
@@ -303,6 +323,7 @@ const BackendState = struct {
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
@@ -315,32 +336,55 @@ const BackendState = struct {
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
+                const response_limit = if (self.execution.max_response_bytes) |execution_limit|
+                    if (self.max_response_bytes) |family_limit| @min(execution_limit, family_limit) else execution_limit
+                else
+                    self.max_response_bytes;
+                provider.setMaxResponseBytes(response_limit);
+                provider.setRequestCancellation(self.execution.cancellation);
+                provider.setRequestTimeoutMs(try self.execution.remainingTimeoutMs(
+                    platform_time.monotonicNs(),
+                    remote_generate_max_timeout_ms,
+                ));
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .vertex => |*provider| blk: {
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .gemini => |*provider| blk: {
                 provider.setMaxTokens(self.cfg.max_tokens);
+                provider.setMaxResponseBytes(self.max_response_bytes);
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
                 const options = try inference.GenerationOptions.fromMaxTokens(self.cfg.max_tokens);
-                if (self.request_context) |context| {
-                    try context.check();
-                    if (local.generate_messages_with_context) |generate_messages| {
-                        const content = try generate_messages(local.ptr, alloc, model, messages, options, context);
-                        break :blk inference.GenerateResult{
-                            .content = content,
-                            .allocator = alloc,
-                        };
-                    }
-                } else if (local.generate_messages) |generate_messages| {
-                    const content = try generate_messages(local.ptr, alloc, model, messages, options);
+                const linked_context = self.request_context orelse self.execution.requestContext(
+                    self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
+                );
+                if (local.generate_messages_with_context) |generate_messages| {
+                    const content = try managed_embedder.AntflyProviderBoundary.call(
+                        "generate_messages_with_context",
+                        local.boundary_dispatch,
+                        generate_messages,
+                        .{ local.ptr, alloc, model, messages, options, linked_context },
+                    );
+                    break :blk inference.GenerateResult{
+                        .content = content,
+                        .allocator = alloc,
+                    };
+                }
+                if (local.generate_messages) |generate_messages| {
+                    const content = try managed_embedder.AntflyProviderBoundary.call(
+                        "generate_messages",
+                        local.boundary_dispatch,
+                        generate_messages,
+                        .{ local.ptr, alloc, model, messages, options },
+                    );
                     break :blk inference.GenerateResult{
                         .content = content,
                         .allocator = alloc,
@@ -354,13 +398,22 @@ const BackendState = struct {
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
-                const content = if (self.request_context) |context| blk_content: {
-                    const generate_text = local.generate_text_with_context orelse return error.UncancellableInferenceProvider;
-                    break :blk_content try generate_text(local.ptr, alloc, model, roles, contents, options, context);
-                } else blk_content: {
-                    const generate_text = local.generate_text orelse return error.UnsupportedGeneratorProvider;
-                    break :blk_content try generate_text(local.ptr, alloc, model, roles, contents, options);
-                };
+                const content = if (local.generate_text_with_context) |generate_text|
+                    try managed_embedder.AntflyProviderBoundary.call(
+                        "generate_text_with_context",
+                        local.boundary_dispatch,
+                        generate_text,
+                        .{ local.ptr, alloc, model, roles, contents, options, linked_context },
+                    )
+                else if (local.generate_text) |generate_text|
+                    try managed_embedder.AntflyProviderBoundary.call(
+                        "generate_text",
+                        local.boundary_dispatch,
+                        generate_text,
+                        .{ local.ptr, alloc, model, roles, contents, options },
+                    )
+                else
+                    return error.UnsupportedGeneratorProvider;
                 break :blk inference.GenerateResult{
                     .content = content,
                     .allocator = alloc,
@@ -876,6 +929,61 @@ pub fn generateAntflyTextBatchResponse(
             null,
         .attempt_observer = state.quota.?.limiter().observer(output_tokens),
     });
+}
+
+/// Acquire the task-scoped provider quota used by custom Antfly generation
+/// transports (for example framed multimodal batches). This keeps quota
+/// identity and credential-source semantics identical to the normal generator
+/// backend while allowing the caller to retain its richer wire format.
+pub fn acquireGenerationQuota(
+    alloc: std.mem.Allocator,
+    cfg: GeneratorConfig,
+    options: BackendFactory.Options,
+) !provider_limits.Handle {
+    try cfg.validate();
+    if (cfg.provider != .antfly or cfg.url.len == 0)
+        return error.InvalidGeneratorConfig;
+    const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
+    var secret = try common_secrets.SecretValue.initConfigOrEnv(
+        alloc,
+        cfg.api_key orelse options.inference_api_key,
+        "ANTFLY_INFERENCE_API_KEY",
+    );
+    defer secret.deinit(alloc);
+    return options.limits.acquire(.{
+        .operation = .generation,
+        .endpoint = .{
+            .provider = .antfly,
+            .endpoint = cfg.url,
+            .model = cfg.model,
+            .credentials = credential_identity.fromSecretValue(secret),
+        },
+    }, policy);
+}
+
+pub fn generationOutputTokenBudget(cfg: GeneratorConfig, count: usize) !u64 {
+    return generationOutputBudget(cfg, count);
+}
+
+pub fn validateGenerationOutputTokenBudget(cfg: GeneratorConfig, count: usize) !void {
+    const output_tokens = try generationOutputBudget(cfg, count);
+    const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
+    if (policy.tokens_per_minute != 0 and output_tokens > policy.tokens_per_minute)
+        return error.ProviderTokenBudgetExceeded;
+}
+
+pub fn validateGenerationMessagesTokenBudget(cfg: GeneratorConfig, messages: []const ChatMessage) !void {
+    try validateGenerationOutputTokenBudget(cfg, 1);
+    const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
+    if (policy.tokens_per_minute == 0) return;
+    for (messages) |message| {
+        if (message.content) |content| switch (content) {
+            .text => {},
+            .parts => |parts| for (parts) |part| {
+                if (part != .text) return error.UnsupportedMediaTokenBudget;
+            },
+        };
+    }
 }
 
 test "generating backend batch preserves cancellation alongside quota policy" {

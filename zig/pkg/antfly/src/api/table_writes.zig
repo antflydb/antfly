@@ -764,6 +764,7 @@ const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
+const remote_capabilities = @import("../inference/remote_capabilities.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
@@ -5024,6 +5025,7 @@ const HostedManagedDbCache = struct {
     replica_root_dir: []u8,
     mutex: std.atomic.Mutex = .unlocked,
     write_cache: ProvisionedTableWriteCache,
+    remote_capability_cache: remote_capabilities.Cache,
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
     drop_cleanup_source: ?*ProvisionedTableWriteSource = null,
     index_control_source: ?*ProvisionedTableWriteSource = null,
@@ -5034,6 +5036,10 @@ const HostedManagedDbCache = struct {
         cache.* = .{
             .replica_root_dir = try alloc.dupe(u8, replica_root_dir),
             .write_cache = ProvisionedTableWriteCache.init(alloc),
+            .remote_capability_cache = remote_capabilities.Cache.init(
+                alloc,
+                std.Io.Threaded.global_single_threaded.io(),
+            ),
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
         };
         return cache;
@@ -5096,6 +5102,7 @@ pub fn closeHostedManagedDbCacheForRoot(replica_root_dir: []const u8) void {
     }
     lockAtomic(&cache.mutex);
     cache.write_cache.deinit();
+    cache.remote_capability_cache.deinit();
     cache.runtime_status_cache.deinit();
     cache.mutex.unlock();
     alloc.free(cache.replica_root_dir);
@@ -8063,6 +8070,7 @@ pub const ProvisionedTableWriteSource = struct {
     // standalone owners leave this null and perform the bounded local DB step.
     structural_reconcile_dispatcher: ?metadata_mod.ShardDbAdapter = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
@@ -8462,9 +8470,20 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         provider: ?managed_embedder.AntflyProvider,
     ) *ProvisionedTableWriteSource {
-        self.antfly_provider = provider;
-        if (self.write_cache) |cache| cache.antfly_provider = provider;
-        if (self.startup_write_cache) |cache| cache.antfly_provider = provider;
+        self.antfly_provider = providerWithRemoteCapabilityCache(provider, self.remote_capability_cache);
+        if (self.write_cache) |cache| cache.antfly_provider = self.antfly_provider;
+        if (self.startup_write_cache) |cache| cache.antfly_provider = self.antfly_provider;
+        return self;
+    }
+
+    pub fn withRemoteCapabilityCache(
+        self: *ProvisionedTableWriteSource,
+        cache: ?*remote_capabilities.Cache,
+    ) *ProvisionedTableWriteSource {
+        self.remote_capability_cache = cache;
+        self.antfly_provider = providerWithRemoteCapabilityCache(self.antfly_provider, cache);
+        if (self.write_cache) |write_cache| write_cache.antfly_provider = self.antfly_provider;
+        if (self.startup_write_cache) |write_cache| write_cache.antfly_provider = self.antfly_provider;
         return self;
     }
 
@@ -12892,6 +12911,7 @@ pub const ProvisionedTableWriteSource = struct {
             effective_open_options.destination_authorizer = self.destination_authorizer;
             effective_open_options.schema_json_before_index_load = prepared_open.?.schema_json;
             effective_open_options.inference_api_url = self.inference_api_url;
+            effective_open_options.remote_capability_cache = self.remote_capability_cache;
             effective_open_options.ha_write_gate = self.ha_write_gate;
             effective_open_options.ha_async_effect_mirror = effective_ha_mirror;
             effective_open_options.ha_async_batch_mirror = effective_ha_mirror;
@@ -18858,7 +18878,9 @@ pub const ProvisionedTableWriteSource = struct {
                         indexes_json,
                         self.backend_runtime,
                         self.antfly_provider,
+                        self.remote_capability_cache,
                         self.inference_api_url,
+                        table_name,
                         self.secret_store,
                         self.remote_content,
                     );
@@ -19712,7 +19734,9 @@ pub const ProvisionedTableWriteSource = struct {
                             indexes_json,
                             self.backend_runtime,
                             self.antfly_provider,
+                            self.remote_capability_cache,
                             self.inference_api_url,
+                            table_name,
                             self.secret_store,
                             self.remote_content,
                         );
@@ -23595,6 +23619,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         return self;
     }
 
+    /// The hosted root owns one capability cache for both durable enrichment
+    /// and query-time model work. Sharing it keeps discovery, stale-lease
+    /// invalidation, and route generations coherent across read/write paths.
+    pub fn remoteCapabilityCache(self: *HostedProvisionedTableWriteSource) !*remote_capabilities.Cache {
+        const cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        return &cache.remote_capability_cache;
+    }
+
     pub fn withInternalServiceAuth(
         self: *HostedProvisionedTableWriteSource,
         secret: ?[]const u8,
@@ -23685,21 +23717,30 @@ pub const HostedProvisionedTableWriteSource = struct {
         cache: *HostedManagedDbCache,
     ) void {
         cache.write_cache.backend_runtime = self.backend_runtime;
-        cache.write_cache.antfly_provider = self.antfly_provider;
+        cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(
+            self.antfly_provider,
+            &cache.remote_capability_cache,
+        );
         cache.write_cache.inference_api_url = self.inference_api_url;
         cache.write_cache.secret_store = self.secret_store;
         cache.write_cache.remote_content = self.remote_content;
 
-        if (cache.drop_cleanup_source) |owner| self.syncPersistentSourceConfigLocked(owner);
+        if (cache.drop_cleanup_source) |owner| self.syncPersistentSourceConfigLocked(owner, cache);
+        if (cache.index_control_source) |owner| self.syncPersistentSourceConfigLocked(owner, cache);
     }
 
     fn syncPersistentSourceConfigLocked(
         self: *HostedProvisionedTableWriteSource,
         owner: *ProvisionedTableWriteSource,
+        cache: *HostedManagedDbCache,
     ) void {
         owner.catalog = self.catalog;
         owner.backend_runtime = self.backend_runtime;
-        owner.antfly_provider = self.antfly_provider;
+        owner.remote_capability_cache = &cache.remote_capability_cache;
+        owner.antfly_provider = providerWithRemoteCapabilityCache(
+            self.antfly_provider,
+            &cache.remote_capability_cache,
+        );
         owner.inference_api_url = self.inference_api_url;
         owner.group_visible_root_generation = self.group_visible_root_generation;
         owner.secret_store = self.secret_store;
@@ -23767,7 +23808,10 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         if (self.backend_runtime) |runtime| cache.write_cache.backend_runtime = runtime;
-        cache.write_cache.antfly_provider = self.antfly_provider;
+        cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(
+            self.antfly_provider,
+            &cache.remote_capability_cache,
+        );
         cache.write_cache.inference_api_url = self.inference_api_url;
         cache.write_cache.secret_store = self.secret_store;
         cache.write_cache.remote_content = self.remote_content;
@@ -23904,6 +23948,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .destination_authorizer = self.destination_authorizer,
                     .schema_json_before_index_load = prepared_open.?.schema_json,
                     .inference_api_url = cache.write_cache.inference_api_url,
+                    .remote_capability_cache = &cache.remote_capability_cache,
                     .ha_write_gate = cache.write_cache.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -24065,11 +24110,11 @@ pub const HostedProvisionedTableWriteSource = struct {
             const control_plane = try std.heap.page_allocator.create(ProvisionedTableWriteSource);
             errdefer std.heap.page_allocator.destroy(control_plane);
             control_plane.* = ProvisionedTableWriteSource.init(self.replica_root_dir, self.catalog);
-            control_plane.backend_runtime = self.backend_runtime;
             control_plane.runtime_status_cache = &cache.runtime_status_cache;
             _ = control_plane.withStructuralReconcileDispatcher(dispatcher);
             cache.index_control_source = control_plane;
         }
+        self.syncPersistentOwnerConfigLocked(cache);
         return cache.index_control_source.?;
     }
 
@@ -26731,7 +26776,9 @@ fn applyIndexCreateToCachedDb(
     index_name: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
+    source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
@@ -26741,7 +26788,9 @@ fn applyIndexCreateToCachedDb(
         indexes_json,
         backend_runtime,
         antfly_provider,
+        remote_capability_cache,
         inference_api_url,
+        source_table,
         secret_store,
         remote_content,
     );
@@ -26753,6 +26802,7 @@ fn applyIndexCreateToCachedDb(
         .embedding_options = .{
             .antfly_provider = antfly_provider,
             .inference_api_url = inference_api_url,
+            .source_table = source_table,
         },
     });
     try db.resumeEnrichmentRuntimeAfterReconfigure("managed index activation", index_name);
@@ -26857,7 +26907,7 @@ fn reconcileCachedLocalTableIndexCreate(
         defer if (cached_active) cached.deinit(alloc);
         cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
 
-        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.inference_api_url, self.secret_store, self.remote_content) catch |err| {
+        applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.remote_capability_cache, self.inference_api_url, table_name, self.secret_store, self.remote_content) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
             return err;
@@ -26915,7 +26965,9 @@ fn reconcileCachedLocalTableIndexDrop(
             metadata.indexes_json,
             self.backend_runtime,
             self.antfly_provider,
+            self.remote_capability_cache,
             self.inference_api_url,
+            table_name,
             self.secret_store,
             self.remote_content,
         ) catch |err| {
@@ -27016,7 +27068,9 @@ fn putCachedLocalArtifactEnrichment(
                 metadata.indexes_json,
                 self.backend_runtime,
                 self.antfly_provider,
+                self.remote_capability_cache,
                 self.inference_api_url,
+                table_name,
                 self.secret_store,
                 self.remote_content,
             ) catch |err| break :blk err;
@@ -27084,7 +27138,9 @@ fn dropCachedLocalArtifactEnrichment(
                 metadata.indexes_json,
                 self.backend_runtime,
                 self.antfly_provider,
+                self.remote_capability_cache,
                 self.inference_api_url,
+                table_name,
                 self.secret_store,
                 self.remote_content,
             ) catch |err| break :blk err;
@@ -28385,6 +28441,7 @@ const ManagedDbOpenOptions = struct {
     /// DB to any cache or caller.
     reconcile_for_replicated_apply: bool = false,
     inference_api_url: ?[]const u8 = null,
+    remote_capability_cache: ?*remote_capabilities.Cache = null,
     ha_write_gate: ?db_mod.HAWriteGate = null,
     ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
@@ -28412,15 +28469,17 @@ const ManagedDbEnrichmentSet = struct {
     dense: ?db_embedder.DenseEmbedder = null,
     sparse: ?db_embedder.SparseEmbedder = null,
     asset_runtime: ?*asset_producer_runtime.Runtime = null,
+    chunk_provider: ?db_mod.enrichment_runtime.ChunkProvider = null,
     generated: bool = false,
 
-    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         if (self.dense) |owned| owned.deinit(allocator);
         if (self.sparse) |owned| owned.deinit(allocator);
         if (self.asset_runtime) |runtime| {
             runtime.deinit();
             allocator.destroy(runtime);
         }
+        if (self.chunk_provider) |*provider| provider.deinit();
     }
 
     fn enabled(self: @This()) bool {
@@ -28432,6 +28491,7 @@ const ManagedDbEnrichmentSet = struct {
             .dense_embedder = self.dense,
             .sparse_embedder = self.sparse,
             .asset_producer = if (self.asset_runtime) |runtime| runtime.ownedProducer() else null,
+            .chunk_provider = self.chunk_provider,
             .enable_without_producers = self.generated,
         };
     }
@@ -28440,6 +28500,7 @@ const ManagedDbEnrichmentSet = struct {
         self.dense = null;
         self.sparse = null;
         self.asset_runtime = null;
+        self.chunk_provider = null;
         self.generated = false;
     }
 
@@ -28450,12 +28511,80 @@ const ManagedDbEnrichmentSet = struct {
     }
 };
 
+fn providerWithRemoteCapabilityCache(
+    provider: ?managed_embedder.AntflyProvider,
+    cache: ?*remote_capabilities.Cache,
+) ?managed_embedder.AntflyProvider {
+    var bound = provider orelse return null;
+    if (cache) |resolved| bound.remote_capability_cache = resolved;
+    return bound;
+}
+
+fn chunkProviderForRuntime(
+    alloc: std.mem.Allocator,
+    provider: ?managed_embedder.AntflyProvider,
+    io: ?std.Io,
+    remote_capability_cache: ?*remote_capabilities.Cache,
+    inference_api_url: ?[]const u8,
+    source_table: []const u8,
+) !?db_mod.enrichment_runtime.ChunkProvider {
+    const resolved_cache = if (provider) |resolved|
+        resolved.remote_capability_cache orelse remote_capability_cache
+    else
+        remote_capability_cache;
+    const callback = if (provider) |resolved| resolved.chunk_input else null;
+    const context_callback = if (provider) |resolved| resolved.chunk_input_with_context else null;
+    if (callback == null and context_callback == null and io == null and resolved_cache == null and inference_api_url == null)
+        return null;
+
+    var result = db_mod.enrichment_runtime.ChunkProvider{
+        .execution = .{
+            .default_endpoint = inference_api_url,
+            .capability_cache = resolved_cache,
+            .io = io,
+            .routing = .{ .source_table = source_table },
+        },
+    };
+    if (provider) |resolved| if (callback) |chunk_input| {
+        result.ptr = resolved.ptr;
+        result.boundary_dispatch = resolved.boundary_dispatch;
+        result.chunk_input_callback = @ptrCast(chunk_input);
+    };
+    if (provider) |resolved| if (context_callback) |chunk_input| {
+        result.ptr = resolved.ptr;
+        result.boundary_dispatch = resolved.boundary_dispatch;
+        result.chunk_input_with_context_callback = @ptrCast(chunk_input);
+    };
+    var owned = try result.ownExecutionStrings(alloc);
+    errdefer owned.deinit();
+    if (io) |runtime_io| try owned.attachOwnedHttpClient(runtime_io);
+    return owned;
+}
+
+test "remote chunk runtime services do not require a local callback provider" {
+    var cache: remote_capabilities.Cache = undefined;
+    var context = (try chunkProviderForRuntime(std.testing.allocator, null, null, &cache, "http://inference", "docs")) orelse
+        return error.TestExpectedRemoteChunkContext;
+    defer context.deinit();
+    try std.testing.expect(context.ptr == null);
+    try std.testing.expect(context.boundary_dispatch == null);
+    try std.testing.expect(context.chunk_input_callback == null);
+    try std.testing.expect(context.chunk_input_with_context_callback == null);
+    try std.testing.expect(context.execution.capability_cache.? == &cache);
+    try std.testing.expect(context.execution.http_client == null);
+    try std.testing.expectEqualStrings("http://inference", context.execution.default_endpoint.?);
+    try std.testing.expectEqualStrings("docs", context.execution.routing.source_table);
+    try std.testing.expect(try chunkProviderForRuntime(std.testing.allocator, null, null, null, null, "") == null);
+}
+
 fn createManagedDbEnrichments(
     allocator: std.mem.Allocator,
     raw_indexes_json: []const u8,
     runtime: ?*db_mod.background_runtime.BackendRuntime,
     local_provider: ?managed_embedder.AntflyProvider,
+    remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
+    source_table: []const u8,
     store: ?*common_secrets.FileStore,
     remote: ?*const scraping.RemoteContentConfig,
 ) !ManagedDbEnrichmentSet {
@@ -28464,24 +28593,30 @@ fn createManagedDbEnrichments(
     // enrichment never falls back to the process-global single-threaded I/O,
     // where starting that watchdog correctly returns ConcurrencyUnavailable.
     const managed_io = if (runtime) |backend| backend.io() else null;
-    const asset_runtime = if (try indexesJsonNeedsAssetProducer(allocator, raw_indexes_json)) blk: {
+    var result = ManagedDbEnrichmentSet{};
+    errdefer result.deinit(allocator);
+    result.asset_runtime = if (try indexesJsonNeedsAssetProducer(allocator, raw_indexes_json)) blk: {
         const io = managed_io orelse return error.MissingBackendRuntimeIo;
         break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
             .antfly_provider = local_provider,
             .inference_api_url = inference_api_url,
             .secret_store = store,
+            .remote_capability_cache = remote_capability_cache,
+            .source_table = source_table,
         });
     } else null;
-    errdefer if (asset_runtime) |owned| {
-        owned.deinit();
-        allocator.destroy(owned);
-    };
-    return .{
-        .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
-        .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
-        .asset_runtime = asset_runtime,
-        .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
-    };
+    result.dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url, .source_table = source_table });
+    result.sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url, .source_table = source_table });
+    result.chunk_provider = try chunkProviderForRuntime(
+        allocator,
+        local_provider,
+        managed_io,
+        remote_capability_cache,
+        inference_api_url,
+        source_table,
+    );
+    result.generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json);
+    return result;
 }
 
 fn reconfigureManagedDbEnrichments(
@@ -28490,7 +28625,9 @@ fn reconfigureManagedDbEnrichments(
     indexes_json: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
+    source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
@@ -28500,13 +28637,16 @@ fn reconfigureManagedDbEnrichments(
         indexes_json,
         backend_runtime,
         antfly_provider,
+        remote_capability_cache,
         inference_api_url,
+        source_table,
         secret_store,
         remote_content,
     );
     try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json, .{
         .antfly_provider = antfly_provider,
         .inference_api_url = inference_api_url,
+        .source_table = source_table,
     });
 }
 
@@ -28516,7 +28656,9 @@ fn reconfigureManagedDbEnrichmentRuntime(
     indexes_json: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
+    source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
@@ -28525,11 +28667,13 @@ fn reconfigureManagedDbEnrichmentRuntime(
         indexes_json,
         backend_runtime,
         antfly_provider,
+        remote_capability_cache,
         inference_api_url,
+        source_table,
         secret_store,
         remote_content,
     );
-    errdefer enrichments.deinit(db.runtime_alloc);
+    defer enrichments.deinit(db.runtime_alloc);
     // An empty replacement is meaningful: dropping the last managed producer
     // must retire the old provider instead of leaving an unused runtime alive.
     try db.reconfigureEnrichmentRuntime(enrichments.takeConfig());
@@ -28541,7 +28685,9 @@ fn reconfigureManagedDbEnrichmentRuntimePaused(
     indexes_json: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
+    source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
@@ -28550,11 +28696,13 @@ fn reconfigureManagedDbEnrichmentRuntimePaused(
         indexes_json,
         backend_runtime,
         antfly_provider,
+        remote_capability_cache,
         inference_api_url,
+        source_table,
         secret_store,
         remote_content,
     );
-    errdefer enrichments.deinit(db.runtime_alloc);
+    defer enrichments.deinit(db.runtime_alloc);
     try db.reconfigureEnrichmentRuntimePaused(enrichments.takeConfig());
 }
 
@@ -28613,8 +28761,11 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         reconcile_options.ha_async_batch_mirror = null;
         reconcile_options.ha_async_metadata_mirror = null;
     }
-    var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
-    errdefer enrichments.deinit(alloc);
+    var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.remote_capability_cache, options.inference_api_url, options.source_table, secret_store, remote_content);
+    // takeConfig() clears every transferred owner. An unconditional defer is
+    // therefore both the success-path cleanup for an unused provider-only set
+    // and the error-path cleanup for a partially constructed replacement.
+    defer enrichments.deinit(alloc);
 
     const openDb = struct {
         fn run(
@@ -28955,12 +29106,20 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         // request work runs against the stabilized post-reconcile state.
         db.close();
         db_open = false;
+        // `enrichments` is a move-only owner. The initial open consumes and
+        // clears it when producers are enabled, but a provider-only set keeps
+        // its chunk provider until this scope releases it. Do that before
+        // replacing the aggregate; assignment would otherwise discard its
+        // owned routing strings and HTTP client.
+        enrichments.deinit(alloc);
         enrichments = try createManagedDbEnrichments(
             alloc,
             indexes_json,
             backend_runtime,
             antfly_provider,
+            options.remote_capability_cache,
             options.inference_api_url,
+            options.source_table,
             secret_store,
             remote_content,
         );
@@ -29143,7 +29302,7 @@ test "provisioning does not require asset producer for copy graph shorthand asse
 test "provisioning detects document extraction OCR as model backed" {
     const alloc = std.testing.allocator;
     try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
-        \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\"}}}}"}]}]
+        \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}"}]}]
     ));
     // PDF OCR fallback is enabled by default, so an otherwise-empty document
     // extraction config still needs the model-backed asset producer.

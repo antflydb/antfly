@@ -11,7 +11,6 @@ from ..models.inference_models_response_object import InferenceModelsResponseObj
 if TYPE_CHECKING:
     from ..models.inference_backend_runtimes import InferenceBackendRuntimes
     from ..models.inference_models_response_chunkers import InferenceModelsResponseChunkers
-    from ..models.inference_models_response_classifiers import InferenceModelsResponseClassifiers
     from ..models.inference_models_response_data_item import InferenceModelsResponseDataItem
     from ..models.inference_models_response_embedders import InferenceModelsResponseEmbedders
     from ..models.inference_models_response_extractors import InferenceModelsResponseExtractors
@@ -35,7 +34,6 @@ class InferenceModelsResponse:
         backends (InferenceBackendRuntimes): Runtime backends compiled into this inference server.
         chunkers (InferenceModelsResponseChunkers): Available chunking models (always includes "fixed")
         rerankers (InferenceModelsResponseRerankers): Available reranking models
-        classifiers (InferenceModelsResponseClassifiers): Available zero-shot classification models
         embedders (InferenceModelsResponseEmbedders): Available embedding models from models_dir/embedders/
         extractors (InferenceModelsResponseExtractors): Available extractor models (models with 'extraction' capability)
         generators (InferenceModelsResponseGenerators): Available generator/LLM models from models_dir/generators/
@@ -50,7 +48,6 @@ class InferenceModelsResponse:
     backends: InferenceBackendRuntimes
     chunkers: InferenceModelsResponseChunkers
     rerankers: InferenceModelsResponseRerankers
-    classifiers: InferenceModelsResponseClassifiers
     embedders: InferenceModelsResponseEmbedders
     extractors: InferenceModelsResponseExtractors
     generators: InferenceModelsResponseGenerators
@@ -76,8 +73,6 @@ class InferenceModelsResponse:
 
         rerankers = self.rerankers.to_dict()
 
-        classifiers = self.classifiers.to_dict()
-
         embedders = self.embedders.to_dict()
 
         extractors = self.extractors.to_dict()
@@ -100,7 +95,6 @@ class InferenceModelsResponse:
                 "backends": backends,
                 "chunkers": chunkers,
                 "rerankers": rerankers,
-                "classifiers": classifiers,
                 "embedders": embedders,
                 "extractors": extractors,
                 "generators": generators,
@@ -116,7 +110,6 @@ class InferenceModelsResponse:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_backend_runtimes import InferenceBackendRuntimes
         from ..models.inference_models_response_chunkers import InferenceModelsResponseChunkers
-        from ..models.inference_models_response_classifiers import InferenceModelsResponseClassifiers
         from ..models.inference_models_response_data_item import InferenceModelsResponseDataItem
         from ..models.inference_models_response_embedders import InferenceModelsResponseEmbedders
         from ..models.inference_models_response_extractors import InferenceModelsResponseExtractors
@@ -144,8 +137,6 @@ class InferenceModelsResponse:
 
         rerankers = InferenceModelsResponseRerankers.from_dict(d.pop("rerankers"))
 
-        classifiers = InferenceModelsResponseClassifiers.from_dict(d.pop("classifiers"))
-
         embedders = InferenceModelsResponseEmbedders.from_dict(d.pop("embedders"))
 
         extractors = InferenceModelsResponseExtractors.from_dict(d.pop("extractors"))
@@ -165,7 +156,6 @@ class InferenceModelsResponse:
             backends=backends,
             chunkers=chunkers,
             rerankers=rerankers,
-            classifiers=classifiers,
             embedders=embedders,
             extractors=extractors,
             generators=generators,

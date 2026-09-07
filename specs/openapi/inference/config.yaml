@@ -363,81 +363,6 @@ components:
               type: string
           description: Rewritten texts (array of arrays, one per input, multiple per beam)
 
-    # Classifier Types (Zero-Shot Classification)
-    ClassifyRequest:
-      type: object
-      required:
-        - model
-        - texts
-        - labels
-      properties:
-        model:
-          type: string
-          description: Name of classifier model from models_dir/classifiers/
-          example: "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
-        texts:
-          type: array
-          items:
-            type: string
-          description: Texts to classify
-          example: ["I love this product!", "The service was terrible."]
-        labels:
-          type: array
-          items:
-            type: string
-          description: |
-            Candidate labels for zero-shot classification.
-            The model will predict which label(s) best describe each text.
-          example: ["positive", "negative", "neutral"]
-        hypothesis_template:
-          type: string
-          description: |
-            Custom hypothesis template for NLI-based classification.
-            Use "{}" as placeholder for the label.
-            Default: "This example is {}."
-          example: "This text expresses a {} sentiment."
-        multi_label:
-          type: boolean
-          default: false
-          description: |
-            If true, allows multiple labels per text (independent scoring).
-            If false (default), scores are normalized across labels.
-
-    ClassifyResult:
-      type: object
-      required:
-        - label
-        - score
-      properties:
-        label:
-          type: string
-          description: The predicted class/category
-          example: "positive"
-        score:
-          type: number
-          format: float
-          description: Confidence score (0.0 to 1.0)
-          example: 0.95
-
-    ClassifyResponse:
-      type: object
-      required:
-        - model
-        - classifications
-      properties:
-        model:
-          type: string
-          description: Name of model used for classification
-        classifications:
-          type: array
-          items:
-            type: array
-            items:
-              $ref: "#/components/schemas/ClassifyResult"
-          description: |
-            Array of classification results (one per input text).
-            Each result is an array of ClassifyResult sorted by score descending.
-
     # Reader Types (OCR/Document Understanding)
     ReadRequest:
       type: object
@@ -548,11 +473,13 @@ components:
     TranscribeRequest:
       type: object
       required:
+        - model
         - audio
       properties:
         model:
           type: string
-          description: Name of transcriber model from models_dir/transcribers/
+          minLength: 1
+          description: Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
           example: "openai/whisper-tiny"
         audio:
           type: string
@@ -610,7 +537,6 @@ components:
         - generators
         - extractors
         - rewriters
-        - classifiers
         - readers
         - transcribers
       properties:
@@ -641,11 +567,6 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/ModelInfo'
           description: Available reranking models
-        classifiers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/ModelInfo'
-          description: Available zero-shot classification models
         embedders:
           type: object
           additionalProperties:
@@ -1416,7 +1337,7 @@ components:
           example: "~/.antfly/inference/ml"
         content_security:
           $ref: "../shared/scraping.yaml#/components/schemas/ContentSecurityConfig"
-          description: "Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline."
+          description: "Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline."
         s3_credentials:
           $ref: "../shared/s3.yaml#/components/schemas/Credentials"
           description: "S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail."

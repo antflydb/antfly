@@ -32,9 +32,31 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             pub const CancellationProbe = struct {
                 context: ?*const anyopaque = null,
                 is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
+
+                pub fn check(self: CancellationProbe) !void {
+                    if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
+                }
+            };
+
+            pub const RenderForkTemplate = struct {
+                pub fn instantiate(_: *const RenderForkTemplate, _: Allocator, _: CancellationProbe) anyerror!Reader {
+                    return error.PdfExtractionUnavailable;
+                }
+
+                pub fn deinit(_: *RenderForkTemplate) void {}
+
+                pub fn refreshFrom(_: *RenderForkTemplate, _: *Reader, _: CancellationProbe) anyerror!void {}
             };
 
             pub const Reader = struct {
+                pub fn allocator(_: *const Reader) Allocator {
+                    return std.heap.page_allocator;
+                }
+
+                pub fn cancellationProbe(_: *const Reader) CancellationProbe {
+                    return .{};
+                }
+
                 pub fn init(_: Allocator, _: []const u8) anyerror!Reader {
                     return error.PdfExtractionUnavailable;
                 }
@@ -47,9 +69,15 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                     return error.PdfExtractionUnavailable;
                 }
 
+                pub fn prepareRenderForkTemplate(_: *Reader, _: Allocator, _: CancellationProbe) anyerror!RenderForkTemplate {
+                    return .{};
+                }
+
                 pub fn deinit(_: *Reader) void {}
 
                 pub fn setCancellationProbe(_: *Reader, _: CancellationProbe) void {}
+
+                pub fn setDecodeLimits(_: *Reader, _: DecodeLimits) anyerror!void {}
 
                 pub fn pageCount(_: *Reader) anyerror!usize {
                     return 0;
@@ -138,9 +166,89 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             quality: RenderQuality = .native,
             diagnostics: ?PageRenderDiagnostics = null,
         };
+        pub const RenderedPageRaster = @import("antfly_pdf").RenderedPageRaster;
+        pub const RenderedPageRasterBatch = @import("antfly_pdf").RenderedPageRasterBatch;
 
         pub const RenderQuality = enum { native, degraded, compatibility_backend };
         pub const RenderProfile = enum { exact, ocr };
+        // Keep the erased executor ABI identical in unit/minimal builds even
+        // though the rendering functions themselves are stubbed.
+        pub const PageRenderExecutor = @import("antfly_pdf").PageRenderExecutor;
+        pub const PageRenderRequest = struct {
+            page_number: usize,
+            requested_dpi: u16 = 150,
+            max_pixels: u64 = 40_000_000,
+            max_dimension: u32 = 4096,
+            preferred_width: ?u32 = null,
+            preferred_height: ?u32 = null,
+            max_output_bytes: ?usize = null,
+            min_output_dimension: u32 = 1,
+            max_output_attempts: u8 = 8,
+        };
+        pub const PageRenderGeometry = struct {
+            effective_dpi: u16,
+            width: u32,
+            height: u32,
+            pixels: u64,
+        };
+        pub const PreparedPageRenderPlan = struct {
+            request_value: PageRenderRequest,
+            geometry_value: PageRenderGeometry,
+
+            pub fn request(self: @This()) PageRenderRequest {
+                return self.request_value;
+            }
+
+            pub fn geometry(self: @This()) PageRenderGeometry {
+                return self.geometry_value;
+            }
+
+            pub fn withMaxOutputBytes(self: @This(), max_output_bytes: ?usize) @This() {
+                var updated = self;
+                updated.request_value.max_output_bytes = max_output_bytes;
+                return updated;
+            }
+        };
+        pub const PageRenderBatchOptions = struct {
+            max_batch_pages: usize = 8,
+            max_parallel_pages: usize = 1,
+            max_inflight_pixels: u64 = 50_000_000,
+            max_inflight_bytes: usize = 512 * 1024 * 1024,
+            max_retained_png_bytes: usize = 64 * 1024 * 1024,
+            max_retained_raster_bytes: usize = 256 * 1024 * 1024,
+            bytes_per_pixel_reserve: usize = 12,
+            profile: RenderProfile = .ocr,
+            cancellation: reader.CancellationProbe = .{},
+            executor: ?PageRenderExecutor = null,
+            fork_template: ?*reader.RenderForkTemplate = null,
+            concurrent_output_allocator: ?Allocator = null,
+            executor_io: ?std.Io = null,
+        };
+
+        pub const default_render_bytes_per_pixel_reserve: usize = 12;
+        pub const PageRenderResult = struct {
+            page_number: usize,
+            rendered: ?RenderedPagePng = null,
+            failure: ?anyerror = null,
+            render_elapsed_ns: u64 = 0,
+        };
+        pub const RenderedPageBatch = struct {
+            results: []PageRenderResult,
+            requested_parallelism: usize,
+            peak_launched_workers: usize,
+            peak_parallelism: usize,
+            peak_admitted_pixels: u64,
+            peak_admitted_bytes: usize,
+            thread_spawn_fallbacks: usize,
+
+            pub fn deinit(self: *RenderedPageBatch, alloc: Allocator) void {
+                for (self.results) |result| {
+                    if (result.rendered) |rendered| alloc.free(rendered.png);
+                }
+                alloc.free(self.results);
+                self.* = undefined;
+            }
+        };
         pub const TextFallbackReason = enum {
             missing_font,
             unsupported_font,
@@ -164,6 +272,30 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         }
 
         pub fn renderParsedPagePngAdaptiveWithProfileAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64, _: u32, _: RenderProfile) anyerror!RenderedPagePng {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn renderParsedPagesBatchAlloc(_: Allocator, _: *reader.Reader, _: []const PageRenderRequest, _: PageRenderBatchOptions) anyerror!RenderedPageBatch {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn renderPreparedPagesBatchAlloc(_: Allocator, _: *reader.Reader, _: []const PreparedPageRenderPlan, _: PageRenderBatchOptions) anyerror!RenderedPageBatch {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn renderPreparedPagesRasterBatchAlloc(_: Allocator, _: *reader.Reader, _: []const PreparedPageRenderPlan, _: PageRenderBatchOptions) anyerror!RenderedPageRasterBatch {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn estimatePreparedPageRenderWaveScratchBytes(_: *const reader.Reader, _: []const PreparedPageRenderPlan, _: usize, _: usize) anyerror!usize {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn planParsedPageRenderGeometry(_: *reader.Reader, _: PageRenderRequest) anyerror!PageRenderGeometry {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn prepareParsedPageRenderPlan(_: *reader.Reader, _: PageRenderRequest) anyerror!PreparedPageRenderPlan {
             return error.PdfRenderingUnavailable;
         }
     }
@@ -196,7 +328,7 @@ pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.Re
 }
 
 pub fn inlineDataUriSourceTooLarge(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !bool {
-    if (!std.mem.startsWith(u8, source_text, "data:")) return false;
+    if (!scraping.data_uri.hasScheme(source_text)) return false;
     const decoded_len = scraping.dataUriDecodedSize(source_text) catch return false;
     return @as(u64, @intCast(decoded_len)) > effectiveRemoteContentMaxDownloadSize(remote_content);
 }
@@ -316,6 +448,18 @@ pub fn effectiveOcrConfigJson(config: Config) []const u8 {
     return if (config.ocr_config_json.len > 0) config.ocr_config_json else default_ocr_config_json;
 }
 
+pub const OcrExecutor = enum {
+    reader,
+    generator,
+};
+
+pub fn ocrProducerType(config: Config) @import("asset_producer.zig").ProducerType {
+    return switch (config.ocr_executor) {
+        .reader => .reader,
+        .generator => .generator,
+    };
+}
+
 pub fn ocrEnabledForRoute(config: Config, route_type: []const u8) bool {
     return config.ocr_enabled or
         (config.ocr_pdf_fallback_enabled and std.mem.eql(u8, route_type, "pdf"));
@@ -326,7 +470,17 @@ pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_numbe
 }
 
 pub const RenderedPdfPage = pdf.RenderedPagePng;
+pub const RenderedPdfPageRaster = pdf.RenderedPageRaster;
+pub const PdfPageRenderRequest = pdf.PageRenderRequest;
+pub const PdfPageRenderGeometry = pdf.PageRenderGeometry;
+pub const PreparedPdfPageRenderPlan = pdf.PreparedPageRenderPlan;
+pub const PdfPageRenderExecutor = pdf.PageRenderExecutor;
+pub const PdfPageRenderBatchOptions = pdf.PageRenderBatchOptions;
+pub const default_pdf_render_bytes_per_pixel_reserve = pdf.default_render_bytes_per_pixel_reserve;
+pub const RenderedPdfPageBatch = pdf.RenderedPageBatch;
+pub const RenderedPdfPageRasterBatch = pdf.RenderedPageRasterBatch;
 pub const PdfCancellationProbe = pdf.reader.CancellationProbe;
+pub const PdfDecodeLimits = pdf.reader.DecodeLimits;
 
 /// A stack-owned monotonic deadline suitable for synchronous native PDF
 /// parsing and rendering. The owner must keep this value alive for as long as
@@ -349,7 +503,7 @@ pub const PdfRenderDeadline = struct {
     }
 };
 
-pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendered: RenderedPdfPage) !void {
+pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendered: anytype) !void {
     if (rendered.quality == .native) return;
     const fallback_groups = if (rendered.diagnostics) |diagnostics| diagnostics.fallback_text_groups else 0;
     const fallback_reason = if (rendered.diagnostics) |diagnostics|
@@ -367,6 +521,7 @@ pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendere
 
 pub const PdfRenderSession = struct {
     parsed: pdf.reader.Reader,
+    render_fork_template: ?pdf.reader.RenderForkTemplate = null,
 
     pub fn init(alloc: Allocator, pdf_bytes: []const u8) !PdfRenderSession {
         return try initWithDecodeLimits(alloc, pdf_bytes, .{});
@@ -380,7 +535,18 @@ pub const PdfRenderSession = struct {
         return .{ .parsed = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(alloc, pdf_bytes, decode_limits, cancellation) };
     }
 
+    /// Build a task-local render session over a prepared document's immutable
+    /// xref, trailer, and page index. The prepared source must outlive this
+    /// session; mutable decode caches and diagnostics remain independently
+    /// owned by `alloc`. The caller must finish `prepareForBatchRendering`
+    /// before publishing the source to other task executors.
+    pub fn initFromPrepared(alloc: Allocator, source: *PdfRenderSession, cancellation: PdfCancellationProbe) !PdfRenderSession {
+        try source.ensureRenderForkTemplate(cancellation);
+        return .{ .parsed = try source.render_fork_template.?.instantiate(alloc, cancellation) };
+    }
+
     pub fn deinit(self: *PdfRenderSession) void {
+        if (self.render_fork_template) |*template| template.deinit();
         self.parsed.deinit();
         self.* = undefined;
     }
@@ -389,12 +555,76 @@ pub const PdfRenderSession = struct {
         self.parsed.setCancellationProbe(probe);
     }
 
+    pub fn setDecodeLimits(self: *PdfRenderSession, decode_limits: pdf.reader.DecodeLimits) !void {
+        if (self.render_fork_template) |*template| template.deinit();
+        self.render_fork_template = null;
+        try self.parsed.setDecodeLimits(decode_limits);
+    }
+
+    pub fn prepareForBatchRendering(self: *PdfRenderSession) !void {
+        try self.ensureRenderForkTemplate(self.parsed.cancellationProbe());
+    }
+
+    pub fn pageCount(self: *PdfRenderSession) !usize {
+        return try self.parsed.pageCount();
+    }
+
+    pub fn planPageRenderGeometry(self: *PdfRenderSession, request: PdfPageRenderRequest) !PdfPageRenderGeometry {
+        return try pdf.planParsedPageRenderGeometry(&self.parsed, request);
+    }
+
+    pub fn preparePageRenderPlan(self: *PdfRenderSession, request: PdfPageRenderRequest) !PreparedPdfPageRenderPlan {
+        return try pdf.prepareParsedPageRenderPlan(&self.parsed, request);
+    }
+
+    pub fn estimatePreparedWaveScratchBytes(
+        self: *const PdfRenderSession,
+        plans: []const PreparedPdfPageRenderPlan,
+        max_parallel_pages: usize,
+        bytes_per_pixel_reserve: usize,
+    ) !usize {
+        return try pdf.estimatePreparedPageRenderWaveScratchBytes(
+            &self.parsed,
+            plans,
+            max_parallel_pages,
+            bytes_per_pixel_reserve,
+        );
+    }
+
     pub fn renderPagePngAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
         return try pdf.renderParsedPagePngAlloc(alloc, &self.parsed, page_number, dpi, max_pixels);
     }
 
     pub fn renderPagePngAdaptiveAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64, max_dimension: u32) !RenderedPdfPage {
         return try pdf.renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &self.parsed, page_number, dpi, max_pixels, max_dimension, .ocr);
+    }
+
+    pub fn renderPagesBatchAlloc(self: *PdfRenderSession, alloc: Allocator, requests: []const PdfPageRenderRequest, options: PdfPageRenderBatchOptions) !RenderedPdfPageBatch {
+        try self.ensureRenderForkTemplate(options.cancellation);
+        var cached_options = options;
+        cached_options.fork_template = &self.render_fork_template.?;
+        return try pdf.renderParsedPagesBatchAlloc(alloc, &self.parsed, requests, cached_options);
+    }
+
+    pub fn renderPreparedPagesBatchAlloc(self: *PdfRenderSession, alloc: Allocator, plans: []const PreparedPdfPageRenderPlan, options: PdfPageRenderBatchOptions) !RenderedPdfPageBatch {
+        try self.ensureRenderForkTemplate(options.cancellation);
+        var cached_options = options;
+        cached_options.fork_template = &self.render_fork_template.?;
+        return try pdf.renderPreparedPagesBatchAlloc(alloc, &self.parsed, plans, cached_options);
+    }
+
+    pub fn renderPreparedPagesRasterBatchAlloc(self: *PdfRenderSession, alloc: Allocator, plans: []const PreparedPdfPageRenderPlan, options: PdfPageRenderBatchOptions) !RenderedPdfPageRasterBatch {
+        try self.ensureRenderForkTemplate(options.cancellation);
+        var cached_options = options;
+        cached_options.fork_template = &self.render_fork_template.?;
+        return try pdf.renderPreparedPagesRasterBatchAlloc(alloc, &self.parsed, plans, cached_options);
+    }
+
+    fn ensureRenderForkTemplate(self: *PdfRenderSession, cancellation: PdfCancellationProbe) !void {
+        if (self.render_fork_template) |*template|
+            try template.refreshFrom(&self.parsed, cancellation)
+        else
+            self.render_fork_template = try self.parsed.prepareRenderForkTemplate(self.parsed.allocator(), cancellation);
     }
 };
 
@@ -407,6 +637,14 @@ pub fn ocrPagePartsJsonAlloc(alloc: Allocator, config: Config, route_type: []con
     return try std.json.Stringify.valueAlloc(alloc, .{
         .{ .type = "text", .text = prompt },
         .{ .type = "media", .mime_type = "image/png", .data = encoded },
+        .{ .type = "metadata", .schema = "antfly.document_generated_text_request.v1", .route_type = route_type, .source_content_type = source_content_type, .unit_id = unit.unit_id, .page_number = unit.page_number, .page_label = unit.page_label, .page_bbox = unit.page_bbox, .page_rotation = unit.page_rotation },
+    }, .{});
+}
+
+pub fn ocrPagePartsMetadataJsonAlloc(alloc: Allocator, config: Config, route_type: []const u8, source_content_type: []const u8, unit: Unit) ![]u8 {
+    const prompt = effectiveOcrPrompt(config);
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .{ .type = "text", .text = prompt },
         .{ .type = "metadata", .schema = "antfly.document_generated_text_request.v1", .route_type = route_type, .source_content_type = source_content_type, .unit_id = unit.unit_id, .page_number = unit.page_number, .page_label = unit.page_label, .page_bbox = unit.page_bbox, .page_rotation = unit.page_rotation },
     }, .{});
 }
@@ -544,6 +782,11 @@ pub const Config = struct {
     // explicit document-extraction configuration disables it.
     ocr_pdf_fallback_enabled: bool = true,
     ocr_mode: OcrMode = .auto,
+    ocr_executor: OcrExecutor = .reader,
+    /// Prompt semantics are part of the configured task contract. Keeping the
+    /// resolved policy here prevents execution from guessing behavior from a
+    /// provider or model name.
+    ocr_prompt_policy: OcrPromptPolicy = .florence,
     ocr_config_json: []const u8 = "",
     ocr_render_dpi: u16 = 150,
     ocr_max_rendered_pixels: u64 = 40_000_000,
@@ -558,6 +801,9 @@ pub const Config = struct {
     /// Runtime-owned safety policy. This is deliberately not parsed from the
     /// producer JSON, so a document cannot raise the node's decode budget.
     pdf_decode_limits: pdf.reader.DecodeLimits = .{},
+    pdf_render_max_parallel_pages: usize = 1,
+    pdf_render_max_inflight_pixels: u64 = 50_000_000,
+    pdf_render_max_inflight_bytes: usize = 256 * 1024 * 1024,
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         if (self.filename.len > 0) alloc.free(@constCast(self.filename));
@@ -588,16 +834,21 @@ pub const OcrMode = enum {
     always,
 };
 
+pub const OcrPromptPolicy = enum {
+    generic,
+    florence,
+};
+
 pub const default_ocr_prompt = "Transcribe this page faithfully. Preserve reading order, headings, lists, and table structure. Render tables as Markdown with one row per visual row. Do not summarize, infer, or omit text. Return only the transcription.";
 pub const florence_ocr_prompt = "<OCR>";
 pub const florence_ocr_canonical_prompt = "What is the text in the image?";
 
 pub fn effectiveOcrPrompt(config: Config) []const u8 {
     if (config.ocr_prompt.len > 0) return config.ocr_prompt;
-    if (isFlorenceModel(config.ocr_model) or
-        (config.ocr_pdf_fallback_enabled and config.ocr_config_json.len == 0))
-        return florence_ocr_prompt;
-    return default_ocr_prompt;
+    return switch (config.ocr_prompt_policy) {
+        .generic => default_ocr_prompt,
+        .florence => florence_ocr_prompt,
+    };
 }
 
 fn isFlorenceModel(model: []const u8) bool {
@@ -1128,9 +1379,14 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.ocr_enabled = configured_ocr_fallback orelse false;
     config.ocr_pdf_fallback_enabled = configured_ocr_fallback orelse true;
     config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
-    if (config.ocr_config_json.len > 0) try validateReaderConfigJson(alloc, config.ocr_config_json);
     if (has_explicit_ocr_config) config.ocr_pdf_fallback_enabled = config.ocr_enabled;
     try parseOcrOptions(alloc, object, &config);
+    if (config.ocr_executor == .generator and config.ocr_config_json.len == 0)
+        return error.InvalidDocumentExtractionConfig;
+    if (config.ocr_config_json.len > 0) switch (config.ocr_executor) {
+        .reader => try validateReaderConfigJson(alloc, config.ocr_config_json),
+        .generator => try validateGeneratorConfigJson(alloc, config.ocr_config_json),
+    };
     config.transcription_enabled = (try boolField(object, "transcribe_audio")) orelse false;
     config.transcription_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "transcription", &config.transcription_enabled);
     config.route_preset = try parseRoutePreset(object);
@@ -1150,7 +1406,16 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     const value = object.get("ocr") orelse return;
     if (value != .object) return;
     const ocr = value.object;
-    try rejectUnknownFields(ocr, &.{ "enabled", "config", "mode", "render_dpi", "max_rendered_pixels", "max_rendered_dimension", "prompt", "quality" });
+    try rejectUnknownFields(ocr, &.{ "enabled", "executor", "config", "mode", "render_dpi", "max_rendered_pixels", "max_rendered_dimension", "prompt", "prompt_policy", "quality" });
+    if (ocr.get("executor")) |executor| {
+        if (executor != .string) return error.InvalidDocumentExtractionConfig;
+        config.ocr_executor = if (std.mem.eql(u8, executor.string, "reader"))
+            .reader
+        else if (std.mem.eql(u8, executor.string, "generator"))
+            .generator
+        else
+            return error.InvalidDocumentExtractionConfig;
+    }
     if (ocr.get("mode")) |mode| {
         if (mode != .string) return error.InvalidDocumentExtractionConfig;
         config.ocr_mode = if (std.mem.eql(u8, mode.string, "auto"))
@@ -1177,6 +1442,27 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
             if (model != .string) return error.InvalidDocumentExtractionConfig;
             config.ocr_model = try alloc.dupe(u8, model.string);
         };
+    }
+    if (ocr.get("prompt_policy")) |policy| {
+        if (policy != .string) return error.InvalidDocumentExtractionConfig;
+        config.ocr_prompt_policy = if (std.mem.eql(u8, policy.string, "generic"))
+            .generic
+        else if (std.mem.eql(u8, policy.string, "florence"))
+            .florence
+        else
+            return error.InvalidDocumentExtractionConfig;
+    } else {
+        // Backward compatibility is resolved once while parsing. Runtime
+        // execution consumes only the explicit policy above.
+        if (config.ocr_executor == .reader and config.ocr_config_json.len > 0 and isFlorenceModel(config.ocr_model)) {
+            std.log.warn("OCR prompt policy inferred as florence for compatibility; configure ocr.prompt_policy explicitly model={s}", .{config.ocr_model});
+        }
+        config.ocr_prompt_policy = if (config.ocr_executor == .generator)
+            .generic
+        else if (config.ocr_config_json.len == 0 or isFlorenceModel(config.ocr_model))
+            .florence
+        else
+            .generic;
     }
     if (ocr.get("prompt")) |prompt| {
         if (prompt != .string) return error.InvalidDocumentExtractionConfig;
@@ -1310,6 +1596,39 @@ fn validateReaderConfigJson(alloc: Allocator, raw: []const u8) !void {
         else => return error.InvalidDocumentExtractionConfig,
     };
     defer parsed.deinit();
+    parsed.value.validate() catch return error.InvalidDocumentExtractionConfig;
+}
+
+fn validateGeneratorConfigJson(alloc: Allocator, raw: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDocumentExtractionConfig,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionConfig;
+    const object = parsed.value.object;
+    const provider = object.get("provider") orelse return error.InvalidDocumentExtractionConfig;
+    const model = object.get("model") orelse return error.InvalidDocumentExtractionConfig;
+    if (provider != .string or model != .string or model.string.len == 0)
+        return error.InvalidDocumentExtractionConfig;
+    const known_provider = std.mem.eql(u8, provider.string, "antfly") or
+        std.mem.eql(u8, provider.string, "openai") or
+        std.mem.eql(u8, provider.string, "ollama") or
+        std.mem.eql(u8, provider.string, "vertex") or
+        std.mem.eql(u8, provider.string, "gemini");
+    if (!known_provider) return error.InvalidDocumentExtractionConfig;
+    if (object.get("max_tokens")) |value| {
+        if (value != .integer or value.integer <= 0) return error.InvalidDocumentExtractionConfig;
+    }
+    inline for (&.{ "temperature", "top_p", "frequency_penalty", "presence_penalty" }) |field| {
+        if (object.get(field)) |value| switch (value) {
+            .integer, .float => {},
+            else => return error.InvalidDocumentExtractionConfig,
+        };
+    }
+    if (object.get("top_k")) |value| {
+        if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionConfig;
+    }
 }
 
 fn parseRoutesAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]Route {
@@ -1878,6 +2197,74 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
     var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
 
+    return extractParsedPdfStreaming(alloc, &parsed, content_type, ocr_mode, quality_config, sink);
+}
+
+/// Stream units from an already prepared PDF. This is the task-neutral bridge
+/// used when text inspection and page rendering share one immutable document
+/// index inside a bounded operation.
+pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
+    return extractParsedPdfStreaming(alloc, &session.parsed, content_type, ocr_mode, quality_config, sink);
+}
+
+/// Task-neutral text inspection. OCR selection, offsets, prompts and output
+/// are intentionally absent; each consumer applies its own policy afterward.
+pub const PdfPageText = struct {
+    text: []u8,
+    text_regions: []TextRegion = &.{},
+    warning: ?[]u8 = null,
+    bbox: @FieldType(Unit, "page_bbox") = null,
+    rotation: @FieldType(Unit, "page_rotation") = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.text);
+        alloc.free(self.text_regions);
+        if (self.warning) |warning| alloc.free(warning);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: *const @This(), alloc: Allocator) !@This() {
+        const text = try alloc.dupe(u8, self.text);
+        errdefer alloc.free(text);
+        const regions = try alloc.dupe(TextRegion, self.text_regions);
+        errdefer alloc.free(regions);
+        return .{ .text = text, .text_regions = regions, .warning = if (self.warning) |w| try alloc.dupe(u8, w) else null, .bbox = self.bbox, .rotation = self.rotation };
+    }
+};
+
+pub const PdfPageTextCache = struct {
+    ptr: *anyopaque,
+    load_fn: *const fn (*anyopaque, Allocator, usize) anyerror!?PdfPageText,
+    store_fn: *const fn (*anyopaque, usize, PdfPageText) anyerror!void,
+};
+
+pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
+    return extractParsedPdfStreamingWithTextCache(alloc, &session.parsed, content_type, ocr_mode, quality_config, sink, cache);
+}
+
+fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize, cache: ?PdfPageTextCache) !PdfPageText {
+    if (cache) |c| if (try c.load_fn(c.ptr, alloc, page_num)) |page| return page;
+    const candidate = try extractPdfPageTextBestEffort(alloc, parsed, page_num);
+    const analysis = candidate.analysis;
+    defer {
+        for (analysis.runs) |*run| run.deinit(alloc);
+        if (analysis.runs.len > 0) alloc.free(analysis.runs);
+    }
+    var result = PdfPageText{ .text = analysis.text, .warning = candidate.warning };
+    errdefer result.deinit(alloc);
+    result.text_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, result.text);
+    const box = parsed.extractPageBox(page_num) catch null;
+    result.bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null;
+    result.rotation = parsed.extractPageRotation(page_num) catch null;
+    if (cache) |c| try c.store_fn(c.ptr, page_num, result);
+    return result;
+}
+
+fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
+    return extractParsedPdfStreamingWithTextCache(alloc, parsed, content_type, ocr_mode, quality_config, sink, null);
+}
+
+fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
     const page_count = try parsed.pageCount();
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
 
@@ -1887,21 +2274,18 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         const force_ocr = ocr_mode == .always;
         // Keep embedded text even in forced mode so OCR is not a blind
         // replacement for usable born-digital content.
-        const candidate = try extractPdfPageTextBestEffort(alloc, &parsed, page_num);
-        const analysis = candidate.analysis;
-        defer {
-            for (analysis.runs) |*run| run.deinit(alloc);
-            if (analysis.runs.len > 0) alloc.free(analysis.runs);
-        }
-        var text = analysis.text;
+        var page = try inspectPdfPageText(alloc, parsed, page_num, cache);
+        defer page.deinit(alloc);
+        var text = page.text;
+        page.text = &.{};
         errdefer alloc.free(text);
-        var text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
+        var text_regions = page.text_regions;
+        page.text_regions = &.{};
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
-        var extraction_warning: ?[]u8 = candidate.warning;
+        var extraction_warning = page.warning;
+        page.warning = null;
         errdefer if (extraction_warning) |value| alloc.free(value);
         const page_text_len = text.len;
-        const page_box = parsed.extractPageBox(page_num) catch null;
-        const page_rotation = parsed.extractPageRotation(page_num) catch null;
         const char_start = std.math.cast(u32, cursor);
         const char_end = std.math.cast(u32, cursor + page_text_len);
         const quality = assessOcrQuality(text, quality_config);
@@ -1930,8 +2314,8 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
             .extraction_warning = extraction_warning,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
-            .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
-            .page_rotation = page_rotation,
+            .page_bbox = page.bbox,
+            .page_rotation = page.rotation,
             .text_regions = text_regions,
             .char_start = char_start,
             .char_end = char_end,
@@ -1985,6 +2369,25 @@ fn extractPdfTextRegionsFromRunsAlloc(
 
 test "PDF text regions use reconstructed output spans" {
     const alloc = std.testing.allocator;
+    const CloneCheck = struct {
+        fn run(a: Allocator) !void {
+            const page = PdfPageText{
+                .text = @constCast("Text"),
+                .text_regions = @constCast(&[_]TextRegion{.{ .span = .{ 0, 4 }, .bbox = .{ 1, 2, 3, 4 } }}),
+                .warning = @constCast("partial extraction"),
+                .bbox = .{ 0, 0, 400, 500 },
+                .rotation = 90,
+            };
+            var cloned = try page.clone(a);
+            defer cloned.deinit(a);
+            try std.testing.expectEqualStrings(page.text, cloned.text);
+            try std.testing.expectEqualStrings(page.warning.?, cloned.warning.?);
+            try std.testing.expectEqualSlices(TextRegion, page.text_regions, cloned.text_regions);
+            try std.testing.expectEqual(page.bbox, cloned.bbox);
+            try std.testing.expectEqual(page.rotation, cloned.rotation);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, CloneCheck.run, .{});
     const runs = [_]pdf.reader.TextRun{
         .{
             .text = "Heading ",
@@ -3787,7 +4190,7 @@ test "document extraction parses generated OCR and transcription config" {
     var config = try parseConfig(alloc,
         \\{
         \\  "ocr_fallback": true,
-        \\  "ocr": {"config": {"provider": "antfly"}},
+        \\  "ocr": {"config": {"provider": "antfly", "model": "antflydb/Florence-2-base"}},
         \\  "transcription": {"enabled": true, "config": {"provider": "mock-transcriber"}}
         \\}
     );
@@ -3809,7 +4212,7 @@ test "document extraction defaults OCR to PDF routes and accepts explicit image 
     try std.testing.expect(!ocrEnabledForRoute(defaults, "image"));
     try std.testing.expectEqualStrings(default_ocr_config_json, effectiveOcrConfigJson(defaults));
 
-    var image_enabled = try parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"antfly\"}}}");
+    var image_enabled = try parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}");
     defer image_enabled.deinit(alloc);
     try std.testing.expect(ocrEnabledForRoute(image_enabled, "image"));
 
@@ -4134,7 +4537,10 @@ test "PDF render quality warning preserves prior diagnostics and fallback reason
         .width = 1,
         .height = 1,
         .quality = .degraded,
-        .diagnostics = .{ .fallback_text_groups = 2, .first_fallback_reason = .outline_too_complex },
+        .diagnostics = @as(?pdf.PageRenderDiagnostics, .{
+            .fallback_text_groups = 2,
+            .first_fallback_reason = .outline_too_complex,
+        }),
     });
     try std.testing.expectEqualStrings("existing;pdf_render_quality:degraded:fallback_groups=2:reason=outline_too_complex", unit.extraction_warning.?);
 }
@@ -4166,6 +4572,55 @@ test "OCR options parse configurable thresholds resolution model and explicit pr
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
         \\{"ocr":{"enabled":true,"max_rendered_dimension":511,"config":{"provider":"antfly"}}}
     ));
+}
+
+test "document extraction validates generator-backed OCR with generator contract" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"executor":"generator","prompt":"Transcribe exactly","config":{"provider":"antfly","model":"google/gemma-4-mm"}}}
+    );
+    defer config.deinit(alloc);
+    try std.testing.expectEqual(OcrExecutor.generator, config.ocr_executor);
+    try std.testing.expectEqual(OcrPromptPolicy.generic, config.ocr_prompt_policy);
+    try std.testing.expectEqualStrings("google/gemma-4-mm", config.ocr_model);
+    try std.testing.expectEqualStrings("Transcribe exactly", effectiveOcrPrompt(config));
+    try std.testing.expectEqual(
+        @import("asset_producer.zig").ProducerType.generator,
+        ocrProducerType(config),
+    );
+
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionConfig,
+        parseConfig(alloc, "{\"ocr\":{\"enabled\":true,\"executor\":\"generator\"}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDocumentExtractionConfig,
+        parseConfig(alloc, "{\"ocr\":{\"enabled\":true,\"executor\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"\"}}}"),
+    );
+}
+
+test "OCR prompt policy is explicit after compatibility parsing" {
+    const alloc = std.testing.allocator;
+    var florence = try parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"config":{"provider":"antfly","model":"antflydb/Florence-2-base"}}}
+    );
+    defer florence.deinit(alloc);
+    try std.testing.expectEqual(OcrPromptPolicy.florence, florence.ocr_prompt_policy);
+    try std.testing.expectEqualStrings(florence_ocr_prompt, effectiveOcrPrompt(florence));
+
+    var generic_reader = try parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"config":{"provider":"antfly","model":"some-reader"}}}
+    );
+    defer generic_reader.deinit(alloc);
+    try std.testing.expectEqual(OcrPromptPolicy.generic, generic_reader.ocr_prompt_policy);
+    try std.testing.expectEqualStrings(default_ocr_prompt, effectiveOcrPrompt(generic_reader));
+
+    var explicit = try parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"prompt_policy":"generic","config":{"provider":"antfly","model":"antflydb/Florence-2-base"}}}
+    );
+    defer explicit.deinit(alloc);
+    try std.testing.expectEqual(OcrPromptPolicy.generic, explicit.ocr_prompt_policy);
+    try std.testing.expectEqualStrings(default_ocr_prompt, effectiveOcrPrompt(explicit));
 }
 
 test "generated text provider config is validated while parsing extraction config" {
@@ -4242,6 +4697,7 @@ test "OCR page request preserves explicit and generic reader prompts" {
         const generic = try ocrPagePartsJsonAlloc(alloc, .{
             .ocr_config_json = "{\"provider\":\"generic-reader\"}",
             .ocr_model = "generic/vision-reader",
+            .ocr_prompt_policy = .generic,
         }, "pdf", "application/pdf", unit, "png");
         defer alloc.free(generic);
         try std.testing.expect(std.mem.indexOf(u8, generic, "Render tables as Markdown") != null);

@@ -22,21 +22,12 @@ const reading_pipeline_mod = @import("../pipelines/reading.zig");
 const image = @import("../pipelines/image.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const reader_types = @import("types.zig");
-const c_file = @import("../util/c_file.zig");
 const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
+const antfly_image = @import("antfly_image");
+const vision_config = @import("vision_config.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
-pub const PreprocessorConfig = struct {
-    image_size: usize = 384,
-    image_seq_length: usize = 0,
-    resample: image.Resample = .bilinear,
-    image_mean: [3]f32 = .{ 0.5, 0.5, 0.5 },
-    image_std: [3]f32 = .{ 0.5, 0.5, 0.5 },
-    pix2struct_max_patches: usize = 0,
-    pix2struct_patch_height: usize = 0,
-    pix2struct_patch_width: usize = 0,
-    pix2struct_do_normalize: bool = false,
-};
+pub const PreprocessorConfig = vision_config.PreprocessorConfig;
 
 pub const LoadedVisionReader = struct {
     allocator: std.mem.Allocator,
@@ -69,12 +60,11 @@ pub const LoadedVisionReader = struct {
         control: ?InferenceExecutionControl,
     ) !LoadedVisionReader {
         if (control) |active| try active.check();
-        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-
         if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
             defer allocator.free(paths.encoder);
             defer allocator.free(paths.decoder);
 
+            const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
             var loader = try model_manager.componentLoaderForPaths(
                 model_path,
                 session_manager.preferred_backends,
@@ -92,6 +82,21 @@ pub const LoadedVisionReader = struct {
         };
         errdefer model_handle.release();
         const model = model_handle.get();
+        var reader = try loadFromBorrowedModel(allocator, model_path, model);
+        reader.loaded_model_handle = model_handle;
+        return reader;
+    }
+
+    /// Construct the lightweight reader wrapper around an already fenced
+    /// immutable model generation. The caller must retain its ModelHandle until
+    /// this reader is deinitialized.
+    pub fn loadFromBorrowedModel(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        model: *model_manager_mod.LoadedModel,
+    ) !LoadedVisionReader {
+        const runtime_config = model.florence_reader_config orelse return error.IncompleteFlorence2Bundle;
+        const dec_config = runtime_config.decoder;
         const florence_config = session_factory.getFlorenceConfig(model.session) orelse {
             std.log.err(
                 "reader model resolved without a Florence session requested_path={s} loaded_path={s} backend={s}",
@@ -99,8 +104,7 @@ pub const LoadedVisionReader = struct {
             );
             return error.InvalidModelForReading;
         };
-        const preproc_path = model.manifest.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
-        const preproc = try loadPreprocessorConfigFile(allocator, preproc_path);
+        const preproc = runtime_config.preprocessor;
         if (preproc.image_size != @as(usize, florence_config.image_size)) {
             std.log.err("Florence preprocessor image size {d} does not match model image size {d}", .{ preproc.image_size, florence_config.image_size });
             return error.InvalidPreprocessorConfig;
@@ -113,8 +117,8 @@ pub const LoadedVisionReader = struct {
             .dec_config = dec_config,
             .preproc = preproc,
             .loaded_model = model,
-            .loaded_model_handle = model_handle,
             .owns_sessions = false,
+            .florence_final_logits_bias_zero = runtime_config.final_logits_bias_zero,
         };
     }
 
@@ -262,9 +266,28 @@ pub const LoadedVisionReader = struct {
         return reader_pipeline.readBatch(image_datas);
     }
 
+    pub fn readRawBatchReported(self: *LoadedVisionReader, image_datas: []const []const u8, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadBatchResult {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.readBatchReported(image_datas);
+    }
+
+    pub fn readBorrowedRasterBatchReported(
+        self: *LoadedVisionReader,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        options: reader_types.ReadOptions,
+    ) !reading_pipeline_mod.ReadBatchResult {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.readBorrowedRasterBatchReported(rasters);
+    }
+
     pub fn readDecodedRaw(self: *LoadedVisionReader, img: image.Image, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
         var reader_pipeline = try self.pipeline(options);
         return reader_pipeline.readDecoded(img);
+    }
+
+    pub fn inputTokenCount(self: *LoadedVisionReader, options: reader_types.ReadOptions) !usize {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.inputTokenCount();
     }
 
     pub fn snapshotMetalGeneratedQuantStats(self: *LoadedVisionReader, allocator: std.mem.Allocator) metal_generated_quant_stats.Stats {
@@ -302,8 +325,9 @@ pub const LoadedVisionReader = struct {
                 .pix2struct_do_normalize = self.preproc.pix2struct_do_normalize,
                 .prompt = options.prompt,
                 .source_fingerprint = options.source_fingerprint,
+                .preprocess_io = if (self.loaded_model) |model| model.executor_io else null,
             },
-            &self.florence_final_logits_bias_zero,
+            self.florence_final_logits_bias_zero,
         );
         reader_pipeline.execution_control = options.execution_control;
         return reader_pipeline;
@@ -343,105 +367,7 @@ pub fn isSupportedManifest(man: manifest_mod.ModelManifest) bool {
         (man.gguf_path != null or man.safetensors_path != null or man.safetensors_index_path != null);
 }
 
-pub fn loadPreprocessorConfig(allocator: std.mem.Allocator, model_dir: []const u8) PreprocessorConfig {
-    const path = std.fmt.allocPrint(allocator, "{s}/preprocessor_config.json", .{model_dir}) catch return .{};
-    defer allocator.free(path);
-
-    return loadPreprocessorConfigFile(allocator, path) catch .{};
-}
-
-fn loadPreprocessorConfigFile(allocator: std.mem.Allocator, path: []const u8) !PreprocessorConfig {
-    const data = try c_file.readFile(allocator, path);
-    defer allocator.free(data);
-
-    var config = PreprocessorConfig{};
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidPreprocessorConfig;
-
-    const obj = parsed.value.object;
-    if (obj.get("size")) |size_val| {
-        if (jsonValueGetSize(size_val)) |v| config.image_size = v;
-    } else if (obj.get("crop_size")) |crop_val| {
-        if (jsonValueGetSize(crop_val)) |v| config.image_size = v;
-    }
-    if (obj.get("image_seq_length")) |v| {
-        if (jsonValueGetUsize(v)) |parsed_int| config.image_seq_length = parsed_int;
-    }
-    if (obj.get("resample")) |v| {
-        if (jsonValueGetUsize(v)) |parsed_int| {
-            config.resample = switch (parsed_int) {
-                3 => .bicubic,
-                2 => .bilinear,
-                0 => .nearest,
-                else => .bilinear,
-            };
-        }
-    }
-    if (obj.get("image_mean")) |v| {
-        if (jsonValueGetFloatArray3(v)) |mean| config.image_mean = mean;
-    }
-    if (obj.get("image_std")) |v| {
-        if (jsonValueGetFloatArray3(v)) |stddev| config.image_std = stddev;
-    }
-    if (obj.get("max_patches")) |v| {
-        if (jsonValueGetUsize(v)) |parsed_int| config.pix2struct_max_patches = parsed_int;
-    }
-    if (obj.get("do_normalize")) |v| {
-        switch (v) {
-            .bool => |parsed_bool| config.pix2struct_do_normalize = parsed_bool,
-            else => {},
-        }
-    }
-    if (obj.get("patch_size")) |v| {
-        if (v == .object) {
-            if (v.object.get("height")) |height_val| {
-                if (jsonValueGetUsize(height_val)) |parsed_int| config.pix2struct_patch_height = parsed_int;
-            }
-            if (v.object.get("width")) |width_val| {
-                if (jsonValueGetUsize(width_val)) |parsed_int| config.pix2struct_patch_width = parsed_int;
-            }
-        }
-    }
-
-    return config;
-}
-
-fn jsonValueGetSize(val: std.json.Value) ?usize {
-    return switch (val) {
-        .integer => |i| @intCast(i),
-        .object => |obj| blk: {
-            if (obj.get("height")) |h| {
-                if (jsonValueGetUsize(h)) |parsed| break :blk parsed;
-            }
-            if (obj.get("width")) |w| {
-                if (jsonValueGetUsize(w)) |parsed| break :blk parsed;
-            }
-            break :blk null;
-        },
-        else => null,
-    };
-}
-
-fn jsonValueGetUsize(val: std.json.Value) ?usize {
-    return switch (val) {
-        .integer => |i| @intCast(i),
-        else => null,
-    };
-}
-
-fn jsonValueGetFloatArray3(val: std.json.Value) ?[3]f32 {
-    if (val != .array or val.array.items.len < 3) return null;
-    var result: [3]f32 = undefined;
-    for (0..3) |i| {
-        result[i] = switch (val.array.items[i]) {
-            .float => |f| @floatCast(f),
-            .integer => |n| @floatFromInt(n),
-            else => return null,
-        };
-    }
-    return result;
-}
+pub const loadPreprocessorConfig = vision_config.loadPreprocessorConfig;
 
 test "vision reader supports gguf-backed native Florence directories" {
     const allocator = std.testing.allocator;

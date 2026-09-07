@@ -35,9 +35,32 @@ pub const ImageU8 = struct {
     width: u32,
     height: u32,
     format: PixelFormat,
+    /// Zero selects the tightly packed width*channels layout. A non-zero
+    /// stride permits borrowing renderer-owned rows without repacking them.
+    row_stride_bytes: usize = 0,
 
     pub fn channels(self: ImageU8) usize {
         return @intFromEnum(self.format);
+    }
+
+    pub fn rowStride(self: ImageU8) !usize {
+        const packed_row = std.math.mul(usize, self.width, self.channels()) catch
+            return error.InvalidImageBuffer;
+        const stride = if (self.row_stride_bytes == 0) packed_row else self.row_stride_bytes;
+        if (stride < packed_row) return error.InvalidImageBuffer;
+        return stride;
+    }
+
+    pub fn validate(self: ImageU8) !void {
+        if (self.width == 0 or self.height == 0) return error.InvalidImageBuffer;
+        const stride = try self.rowStride();
+        const last_row_offset = std.math.mul(usize, self.height - 1, stride) catch
+            return error.InvalidImageBuffer;
+        const packed_row = std.math.mul(usize, self.width, self.channels()) catch
+            return error.InvalidImageBuffer;
+        const required = std.math.add(usize, last_row_offset, packed_row) catch
+            return error.InvalidImageBuffer;
+        if (self.data.len < required) return error.InvalidImageBuffer;
     }
 };
 
@@ -62,6 +85,29 @@ pub fn preprocessDecodedWithResample(
     resample: Resample,
 ) ![]f32 {
     return preprocessDecodedRectWithResample(allocator, img, target_size, target_size, mean, std_dev, resample);
+}
+
+/// Write normalized CHW pixels directly into caller-owned batch storage.
+pub fn preprocessDecodedWithResampleInto(
+    allocator: std.mem.Allocator,
+    img: ImageU8,
+    output: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    resample: Resample,
+) !void {
+    return preprocessDecodedRectScaledWithResampleInto(
+        allocator,
+        img,
+        output,
+        target_size,
+        target_size,
+        mean,
+        std_dev,
+        1.0 / 255.0,
+        resample,
+    );
 }
 
 /// Convert a decoded RGB/RGBA image into normalized CHW f32 layout with explicit width and height.
@@ -109,9 +155,7 @@ pub fn preprocessDecodedRectScaledWithResample(
     rescale_factor: f32,
     resample: Resample,
 ) ![]f32 {
-    const source_pixels = std.math.mul(usize, img.width, img.height) catch return error.InvalidImageDimensions;
-    const expected_min = std.math.mul(usize, source_pixels, img.channels()) catch return error.InvalidImageDimensions;
-    if (img.data.len < expected_min) return error.InvalidImageBuffer;
+    try img.validate();
 
     const tw: usize = target_width;
     const th: usize = target_height;
@@ -121,25 +165,60 @@ pub fn preprocessDecodedRectScaledWithResample(
     const result = try allocator.alloc(f32, result_len);
     errdefer allocator.free(result);
 
-    if (solidRgb(img)) |rgb| {
+    try preprocessDecodedRectScaledWithResampleInto(
+        allocator,
+        img,
+        result,
+        target_width,
+        target_height,
+        mean,
+        std_dev,
+        rescale_factor,
+        resample,
+    );
+    return result;
+}
+
+pub fn preprocessDecodedRectScaledWithResampleInto(
+    allocator: std.mem.Allocator,
+    img: ImageU8,
+    result: []f32,
+    target_width: u32,
+    target_height: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+    resample: Resample,
+) !void {
+    try img.validate();
+    var resolved_img = img;
+    resolved_img.row_stride_bytes = try img.rowStride();
+
+    const tw: usize = target_width;
+    const th: usize = target_height;
+    const output_len = std.math.mul(usize, 3, std.math.mul(usize, tw, th) catch return error.InvalidImageBuffer) catch
+        return error.InvalidImageBuffer;
+    if (result.len != output_len) return error.InvalidImageBuffer;
+
+    if (solidRgb(resolved_img)) |rgb| {
         fillSolidChw(result, tw, th, rgb, mean, std_dev, rescale_factor);
-        return result;
+        return;
     }
 
-    const src_w: f32 = @floatFromInt(img.width);
-    const src_h: f32 = @floatFromInt(img.height);
+    const src_w: f32 = @floatFromInt(resolved_img.width);
+    const src_h: f32 = @floatFromInt(resolved_img.height);
     const scale_x = src_w / @as(f32, @floatFromInt(tw));
     const scale_y = src_h / @as(f32, @floatFromInt(th));
 
     if (resample == .bilinear) {
-        preprocessDecodedRectBilinearInterleaved(img, result, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
-        return result;
+        preprocessDecodedRectBilinearInterleaved(resolved_img, result, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
+        return;
     }
 
     if (resample == .pillow_bicubic) {
         try preprocessDecodedRectPillowBicubic(
             allocator,
-            img,
+            resolved_img,
             result,
             tw,
             th,
@@ -147,19 +226,17 @@ pub fn preprocessDecodedRectScaledWithResample(
             std_dev,
             rescale_factor,
         );
-        return result;
+        return;
     }
 
     for (0..th) |y| {
         for (0..tw) |x| {
             for (0..3) |ch| {
-                const val = sampleResized(img, x, y, ch, scale_x, scale_y, resample);
+                const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample);
                 result[ch * th * tw + y * tw + x] = normalizeSample(val, mean[ch], std_dev[ch], rescale_factor);
             }
         }
     }
-
-    return result;
 }
 
 pub fn computeAspectFitWidth(src_width: u32, src_height: u32, target_height: u32, max_width: u32) u32 {
@@ -212,15 +289,16 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     resample: Resample,
     pad_rgb: [3]u8,
 ) ![]f32 {
-    const expected_min = @as(usize, img.width) * @as(usize, img.height) * img.channels();
-    if (img.data.len < expected_min) return error.InvalidImageBuffer;
+    try img.validate();
+    var resolved_img = img;
+    resolved_img.row_stride_bytes = try img.rowStride();
 
     const tw: usize = max_width;
     const th: usize = target_height;
     const result = try allocator.alloc(f32, 3 * tw * th);
     errdefer allocator.free(result);
 
-    const content_width = computeAspectFitWidth(img.width, img.height, target_height, max_width);
+    const content_width = computeAspectFitWidth(resolved_img.width, resolved_img.height, target_height, max_width);
     const cw: usize = content_width;
 
     for (0..3) |ch| {
@@ -228,20 +306,20 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
         @memset(result[ch * th * tw .. (ch + 1) * th * tw], pad_val);
     }
 
-    const src_w: f32 = @floatFromInt(img.width);
-    const src_h: f32 = @floatFromInt(img.height);
+    const src_w: f32 = @floatFromInt(resolved_img.width);
+    const src_h: f32 = @floatFromInt(resolved_img.height);
     const scale_x = src_w / @as(f32, @floatFromInt(cw));
     const scale_y = src_h / @as(f32, @floatFromInt(th));
 
     if (resample == .bilinear) {
-        preprocessDecodedRectKeepAspectPadRightBilinearSimd(img, result, cw, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
+        preprocessDecodedRectKeepAspectPadRightBilinearSimd(resolved_img, result, cw, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
         return result;
     }
 
     for (0..th) |y| {
         for (0..cw) |x| {
             for (0..3) |ch| {
-                const val = sampleResized(img, x, y, ch, scale_x, scale_y, resample);
+                const val = sampleResized(resolved_img, x, y, ch, scale_x, scale_y, resample);
                 result[ch * th * tw + y * tw + x] = normalizeSample(val, mean[ch], std_dev[ch], rescale_factor);
             }
         }
@@ -358,8 +436,9 @@ fn preprocessDecodedRectBilinearInterleaved(
         const y1 = clampIndex(@as(i32, @intCast(y0)) + 1, img.height);
         const fy = src_y - @as(f32, @floatFromInt(y0));
         const wy0 = 1.0 - fy;
-        const row0 = @as(usize, y0) * @as(usize, img.width) * channels;
-        const row1 = @as(usize, y1) * @as(usize, img.width) * channels;
+        std.debug.assert(img.row_stride_bytes > 0);
+        const row0 = @as(usize, y0) * img.row_stride_bytes;
+        const row1 = @as(usize, y1) * img.row_stride_bytes;
         const dst_row = y * tw;
 
         for (0..tw) |x| {
@@ -390,13 +469,17 @@ fn preprocessDecodedRectBilinearInterleaved(
 
 fn solidRgb(img: ImageU8) ?[3]u8 {
     const channels = img.channels();
-    const pixel_count = @as(usize, img.width) * @as(usize, img.height);
-    if (pixel_count == 0 or img.data.len < pixel_count * channels) return null;
+    img.validate() catch return null;
+    const stride = img.row_stride_bytes;
+    if (stride == 0) return null;
 
     const rgb = [3]u8{ img.data[0], img.data[1], img.data[2] };
-    for (1..pixel_count) |i| {
-        const idx = i * channels;
-        if (img.data[idx] != rgb[0] or img.data[idx + 1] != rgb[1] or img.data[idx + 2] != rgb[2]) return null;
+    for (0..@as(usize, img.height)) |y| {
+        for (0..@as(usize, img.width)) |x| {
+            if (x == 0 and y == 0) continue;
+            const idx = y * stride + x * channels;
+            if (img.data[idx] != rgb[0] or img.data[idx + 1] != rgb[1] or img.data[idx + 2] != rgb[2]) return null;
+        }
     }
     return rgb;
 }
@@ -476,7 +559,9 @@ fn clampIndexVec(idx: @Vector(4, i32), dim: u32) @Vector(4, i32) {
 }
 
 fn pixelAt(img: ImageU8, x: u32, y: u32, ch: usize) f32 {
-    const idx = (@as(usize, y) * @as(usize, img.width) + @as(usize, x)) * img.channels() + ch;
+    std.debug.assert(img.row_stride_bytes > 0);
+    const idx = @as(usize, y) * img.row_stride_bytes +
+        @as(usize, x) * img.channels() + ch;
     return @floatFromInt(img.data[idx]);
 }
 
@@ -743,6 +828,86 @@ test "preprocess decoded rgba ignores alpha" {
     try std.testing.expectApproxEqAbs(@as(f32, 10.0 / 255.0), out[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 20.0 / 255.0), out[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 30.0 / 255.0), out[2], 1e-6);
+}
+
+test "packed and padded-stride RGBA preprocessing are equivalent" {
+    const alloc = std.testing.allocator;
+    const packed_rgba = [_]u8{
+        255, 0, 0,   255, 0, 255, 0, 255,
+        0,   0, 255, 255, 7, 8,   9, 255,
+    };
+    const padded_rgba = [_]u8{
+        255, 0, 0,   255, 0, 255, 0, 255, 91, 92, 93, 94,
+        0,   0, 255, 255, 7, 8,   9, 255, 81, 82, 83, 84,
+    };
+    const packed_result = try preprocessDecodedWithResample(
+        alloc,
+        .{ .data = &packed_rgba, .width = 2, .height = 2, .format = .rgba8 },
+        5,
+        .{ 0.1, 0.2, 0.3 },
+        .{ 0.7, 0.8, 0.9 },
+        .bilinear,
+    );
+    defer alloc.free(packed_result);
+    const strided_result = try preprocessDecodedWithResample(
+        alloc,
+        .{
+            .data = &padded_rgba,
+            .width = 2,
+            .height = 2,
+            .format = .rgba8,
+            .row_stride_bytes = 12,
+        },
+        5,
+        .{ 0.1, 0.2, 0.3 },
+        .{ 0.7, 0.8, 0.9 },
+        .bilinear,
+    );
+    defer alloc.free(strided_result);
+    try std.testing.expectEqualSlices(f32, packed_result, strided_result);
+}
+
+test "preprocess decoded into caller batch storage matches allocating path" {
+    const alloc = std.testing.allocator;
+    const rgba = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   128,
+        0,   0,   255, 64,
+        255, 255, 255, 0,
+    };
+    const image = ImageU8{ .data = &rgba, .width = 2, .height = 2, .format = .rgba8 };
+    const expected = try preprocessDecodedWithResample(
+        alloc,
+        image,
+        3,
+        .{ 0.5, 0.5, 0.5 },
+        .{ 0.5, 0.5, 0.5 },
+        .bilinear,
+    );
+    defer alloc.free(expected);
+    var actual: [27]f32 = undefined;
+    try preprocessDecodedWithResampleInto(
+        alloc,
+        image,
+        &actual,
+        3,
+        .{ 0.5, 0.5, 0.5 },
+        .{ 0.5, 0.5, 0.5 },
+        .bilinear,
+    );
+    try std.testing.expectEqualSlices(f32, expected, &actual);
+    try std.testing.expectError(
+        error.InvalidImageBuffer,
+        preprocessDecodedWithResampleInto(
+            alloc,
+            image,
+            actual[0..26],
+            3,
+            .{ 0.5, 0.5, 0.5 },
+            .{ 0.5, 0.5, 0.5 },
+            .bilinear,
+        ),
+    );
 }
 
 test "preprocess decoded rect returns non-square chw output" {

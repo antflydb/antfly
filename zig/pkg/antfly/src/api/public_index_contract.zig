@@ -594,7 +594,9 @@ pub fn isAllowedIndexExecutionField(field: []const u8) bool {
 }
 
 pub fn isAllowedExecutionPolicyField(field: []const u8) bool {
-    return std.mem.eql(u8, field, "batch_items") or std.mem.eql(u8, field, "batch_bytes");
+    return std.mem.eql(u8, field, "batch_items") or
+        std.mem.eql(u8, field, "batch_bytes") or
+        std.mem.eql(u8, field, "max_document_pages");
 }
 
 fn isCommonField(field: []const u8) bool {

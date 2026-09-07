@@ -546,15 +546,17 @@ export class InferenceClient {
    * Transcribe audio to text (speech-to-text)
    *
    * @param audio - Base64-encoded audio data (WAV, MP3, FLAC, etc.)
-   * @param options - Optional parameters
-   * @param options.model - Name of transcriber model (e.g., "openai/whisper-tiny")
+   * @param options - Transcription parameters
+   * @param options.model - Required transcriber model name (e.g., "openai/whisper-tiny")
    * @param options.language - Force specific language for transcription
    * @returns TranscribeResponse with transcribed text and metadata
    *
    * @example Basic transcription
    * ```typescript
    * const audioBase64 = fs.readFileSync('audio.wav').toString('base64');
-   * const result = await client.transcribe(audioBase64);
+   * const result = await client.transcribe(audioBase64, {
+   *   model: "openai/whisper-tiny"
+   * });
    * console.log(result.text); // "Hello, how are you today?"
    * ```
    *
@@ -568,13 +570,13 @@ export class InferenceClient {
    */
   async transcribe(
     audio: string,
-    options?: { model?: string; language?: string }
+    options: { model: string; language?: string }
   ): Promise<TranscribeResponse> {
     const { data, error, response } = await this.client.POST("/ai/v1/transcribe", {
       body: {
         audio,
-        model: options?.model,
-        language: options?.language,
+        model: options.model,
+        language: options.language,
       },
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);

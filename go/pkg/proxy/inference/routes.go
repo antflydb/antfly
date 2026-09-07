@@ -16,6 +16,7 @@
 package proxy
 
 import (
+	"fmt"
 	"hash/fnv"
 	"regexp"
 	"sort"
@@ -26,12 +27,18 @@ import (
 
 // Route represents a compiled InferenceProxy for fast matching
 type Route struct {
-	Name     string
-	Priority int32
+	// Namespace is the immutable routing scope for every destination in this
+	// route. Empty namespace denotes explicitly global standalone pools.
+	// Namespace and Name together form the route identity and the stable salt for
+	// deterministic weighted selection; Name is never parsed for scope.
+	Namespace string
+	Name      string
+	Priority  int32
 
-	// Compiled matchers
+	// Declarative matchers. The manager compiles private programs when it owns
+	// an installed route snapshot.
 	Operations          map[OperationType]bool
-	ModelPatterns       []*regexp.Regexp
+	ModelPatterns       []*RegexPattern
 	HeaderMatchers      map[string]*StringMatcher
 	SourceTables        map[string]bool
 	SourceOrganizations map[string]bool
@@ -59,11 +66,73 @@ type Route struct {
 // OperationType for matching
 type OperationType string
 
+// RegexSyntax is part of route policy identity. Go's regexp.String omits
+// whether a program was compiled as POSIX or switched to leftmost-longest, so
+// retaining only *regexp.Regexp cannot support authoritative change detection.
+type RegexSyntax string
+
+const (
+	RegexLeftmostFirst   RegexSyntax = "leftmost-first"
+	RegexLeftmostLongest RegexSyntax = "leftmost-longest"
+	RegexPOSIX           RegexSyntax = "posix"
+)
+
+// RegexPattern is the declarative route representation. compiled is owned by
+// the installed immutable snapshot and never exposed as mutable policy state.
+type RegexPattern struct {
+	Expression string
+	Syntax     RegexSyntax
+	compiled   *regexp.Regexp
+}
+
+func CompileRegexPattern(expression string, syntax RegexSyntax) (*RegexPattern, error) {
+	pattern := &RegexPattern{Expression: expression, Syntax: syntax}
+	compiled, err := pattern.compile()
+	if err != nil {
+		return nil, err
+	}
+	pattern.compiled = compiled
+	return pattern, nil
+}
+
+func MustRegexPattern(expression string) *RegexPattern {
+	pattern, err := CompileRegexPattern(expression, RegexLeftmostFirst)
+	if err != nil {
+		panic(err)
+	}
+	return pattern
+}
+
+func (p *RegexPattern) compile() (*regexp.Regexp, error) {
+	if p == nil {
+		return nil, nil
+	}
+	switch p.Syntax {
+	case "", RegexLeftmostFirst:
+		return regexp.Compile(p.Expression)
+	case RegexLeftmostLongest:
+		compiled, err := regexp.Compile(p.Expression)
+		if err != nil {
+			return nil, err
+		}
+		compiled.Longest()
+		return compiled, nil
+	case RegexPOSIX:
+		return regexp.CompilePOSIX(p.Expression)
+	default:
+		return nil, fmt.Errorf("unsupported regex syntax %q", p.Syntax)
+	}
+}
+
+func (p *RegexPattern) Matches(value string) bool {
+	return p != nil && p.compiled != nil && p.compiled.MatchString(value)
+}
+
 // StringMatcher for header matching
 type StringMatcher struct {
 	Exact  string
 	Prefix string
-	Regex  *regexp.Regexp
+	Regex  *RegexPattern
 }
 
 func (m *StringMatcher) Matches(value string) bool {
@@ -73,7 +142,7 @@ func (m *StringMatcher) Matches(value string) bool {
 	if m.Prefix != "" && strings.HasPrefix(value, m.Prefix) {
 		return true
 	}
-	if m.Regex != nil && m.Regex.MatchString(value) {
+	if m.Regex != nil && m.Regex.Matches(value) {
 		return true
 	}
 	return false
@@ -238,8 +307,9 @@ type RouteRequest struct {
 
 // RouteManager manages all routes and performs matching
 type RouteManager struct {
-	routes []*Route // Sorted by priority (descending)
-	mu     sync.RWMutex
+	routes     []*Route // Sorted by priority (descending)
+	generation uint64
+	mu         sync.RWMutex
 }
 
 // NewRouteManager creates a new RouteManager
@@ -249,47 +319,376 @@ func NewRouteManager() *RouteManager {
 	}
 }
 
-// AddRoute adds a route (routes are re-sorted by priority)
-func (rm *RouteManager) AddRoute(route *Route) {
+// UpsertRoute adds or replaces a route (routes are re-sorted by priority). It
+// deliberately owns an immutable copy of the declarative policy: informer
+// resyncs and equivalent updates preserve both the routing generation and live
+// rate-limiter state, while later caller mutations cannot alter installed
+// routing policy behind the generation fence.
+func (rm *RouteManager) UpsertRoute(route *Route) (bool, error) {
+	if route == nil {
+		return false, nil
+	}
+	candidate, err := prepareRoute(route, true)
+	if err != nil {
+		return false, err
+	}
+
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	// Remove existing route with same name
+	// Remove the existing route with the same namespace/name identity.
 	newRoutes := make([]*Route, 0, len(rm.routes)+1)
 	for _, r := range rm.routes {
-		if r.Name != route.Name {
-			newRoutes = append(newRoutes, r)
+		if r.Namespace == candidate.Namespace && r.Name == candidate.Name {
+			if routePolicyEqual(r, candidate) {
+				return false, nil
+			}
+			// The token bucket is mutable runtime state, not declarative policy.
+			// Preserve it across unrelated policy changes when its configuration
+			// is unchanged.
+			if rateLimiterPolicyEqual(r.RateLimiter, candidate.RateLimiter) {
+				candidate.RateLimiter = r.RateLimiter
+			}
+			continue
 		}
+		newRoutes = append(newRoutes, r)
 	}
-	newRoutes = append(newRoutes, route)
+	newRoutes = append(newRoutes, candidate)
 
-	// Sort by priority (descending), then by name (ascending) for stable ordering
+	// Sort by priority (descending), then by complete identity for stable ordering.
 	sort.Slice(newRoutes, func(i, j int) bool {
 		if newRoutes[i].Priority != newRoutes[j].Priority {
 			return newRoutes[i].Priority > newRoutes[j].Priority
+		}
+		if newRoutes[i].Namespace != newRoutes[j].Namespace {
+			return newRoutes[i].Namespace < newRoutes[j].Namespace
 		}
 		return newRoutes[i].Name < newRoutes[j].Name
 	})
 
 	rm.routes = newRoutes
+	rm.generation++
+	return true, nil
 }
 
-// RemoveRoute removes a route by name
-func (rm *RouteManager) RemoveRoute(name string) {
+func prepareRoute(route *Route, ownRateLimiter bool) (*Route, error) {
+	cloned := cloneRoute(route, ownRateLimiter)
+	for index, pattern := range cloned.ModelPatterns {
+		if pattern == nil {
+			return nil, fmt.Errorf("model pattern %d must not be nil", index)
+		}
+		if pattern.Syntax == "" {
+			pattern.Syntax = RegexLeftmostFirst
+		}
+		compiled, err := pattern.compile()
+		if err != nil {
+			return nil, fmt.Errorf("invalid model pattern %q: %w", pattern.Expression, err)
+		}
+		pattern.compiled = compiled
+	}
+	for name, matcher := range cloned.HeaderMatchers {
+		if matcher == nil {
+			return nil, fmt.Errorf("header matcher for %q must not be nil", name)
+		}
+		if matcher.Regex == nil {
+			continue
+		}
+		if matcher.Regex.Syntax == "" {
+			matcher.Regex.Syntax = RegexLeftmostFirst
+		}
+		compiled, err := matcher.Regex.compile()
+		if err != nil {
+			return nil, fmt.Errorf("invalid header pattern %q for %q: %w", matcher.Regex.Expression, name, err)
+		}
+		matcher.Regex.compiled = compiled
+	}
+	return cloned, nil
+}
+
+func cloneRoute(route *Route, ownRateLimiter bool) *Route {
+	if route == nil {
+		return nil
+	}
+	cloned := *route
+	cloned.Operations = cloneBoolMap(route.Operations)
+	cloned.ModelPatterns = cloneRegexps(route.ModelPatterns)
+	cloned.HeaderMatchers = cloneStringMatchers(route.HeaderMatchers)
+	cloned.SourceTables = cloneBoolMap(route.SourceTables)
+	cloned.SourceOrganizations = cloneBoolMap(route.SourceOrganizations)
+	cloned.SourceProjects = cloneBoolMap(route.SourceProjects)
+	cloned.SourceAPIKeys = cloneBoolMap(route.SourceAPIKeys)
+	cloned.TimeWindow = cloneTimeWindow(route.TimeWindow)
+	cloned.Destinations = cloneDestinations(route.Destinations)
+	cloned.Fallback = cloneFallback(route.Fallback)
+	cloned.RetryOnStatuses = cloneBoolMap(route.RetryOnStatuses)
+	if ownRateLimiter && route.RateLimiter != nil {
+		cloned.RateLimiter = cloneRateLimiterPolicy(route.RateLimiter)
+	}
+	// Match snapshots share only the synchronized token-bucket runtime. Every
+	// declarative map, slice, matcher, and condition is independently owned.
+	return &cloned
+}
+
+func cloneRateLimiterPolicy(source *RateLimiter) *RateLimiter {
+	if source == nil {
+		return nil
+	}
+	return &RateLimiter{
+		rate:        source.rate,
+		burstSize:   source.burstSize,
+		tokens:      float64(source.burstSize),
+		lastUpdate:  time.Now(),
+		perModel:    source.perModel,
+		modelLimits: make(map[string]*modelLimit),
+	}
+}
+
+func cloneBoolMap[K comparable](source map[K]bool) map[K]bool {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[K]bool, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneRegexps(source []*RegexPattern) []*RegexPattern {
+	if source == nil {
+		return nil
+	}
+	cloned := make([]*RegexPattern, len(source))
+	for i, pattern := range source {
+		if pattern != nil {
+			patternCopy := *pattern
+			cloned[i] = &patternCopy
+		}
+	}
+	return cloned
+}
+
+func cloneStringMatchers(source map[string]*StringMatcher) map[string]*StringMatcher {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]*StringMatcher, len(source))
+	for name, matcher := range source {
+		if matcher == nil {
+			cloned[name] = nil
+			continue
+		}
+		matcherCopy := *matcher
+		if matcher.Regex != nil {
+			regexCopy := *matcher.Regex
+			matcherCopy.Regex = &regexCopy
+		}
+		cloned[name] = &matcherCopy
+	}
+	return cloned
+}
+
+func cloneTimeWindow(source *TimeWindow) *TimeWindow {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.Days = cloneBoolMap(source.Days)
+	return &cloned
+}
+
+func cloneDestinations(source []Destination) []Destination {
+	if source == nil {
+		return nil
+	}
+	cloned := make([]Destination, len(source))
+	for i := range source {
+		cloned[i] = source[i]
+		cloned[i].QueueDepthCondition = cloneThreshold(source[i].QueueDepthCondition)
+		cloned[i].ReplicaCondition = cloneThreshold(source[i].ReplicaCondition)
+		cloned[i].LatencyCondition = cloneThreshold(source[i].LatencyCondition)
+		cloned[i].TimeCondition = cloneTimeWindow(source[i].TimeCondition)
+	}
+	return cloned
+}
+
+func cloneThreshold(source *ThresholdCondition) *ThresholdCondition {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	return &cloned
+}
+
+func cloneFallback(source *Fallback) *Fallback {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	return &cloned
+}
+
+func routePolicyEqual(left, right *Route) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.Namespace != right.Namespace || left.Name != right.Name || left.Priority != right.Priority ||
+		left.RetryAttempts != right.RetryAttempts || left.RetryTimeout != right.RetryTimeout ||
+		left.RetryOnRequestErrs != right.RetryOnRequestErrs || left.RetryOnCanceled != right.RetryOnCanceled ||
+		!boolMapEqual(left.Operations, right.Operations) ||
+		!boolMapEqual(left.SourceTables, right.SourceTables) ||
+		!boolMapEqual(left.SourceOrganizations, right.SourceOrganizations) ||
+		!boolMapEqual(left.SourceProjects, right.SourceProjects) ||
+		!boolMapEqual(left.SourceAPIKeys, right.SourceAPIKeys) ||
+		!boolMapEqual(left.RetryOnStatuses, right.RetryOnStatuses) ||
+		!regexpSliceEqual(left.ModelPatterns, right.ModelPatterns) ||
+		!stringMatcherMapEqual(left.HeaderMatchers, right.HeaderMatchers) ||
+		!timeWindowEqual(left.TimeWindow, right.TimeWindow) ||
+		!destinationSliceEqual(left.Destinations, right.Destinations) ||
+		!fallbackEqual(left.Fallback, right.Fallback) ||
+		!rateLimiterPolicyEqual(left.RateLimiter, right.RateLimiter) {
+		return false
+	}
+	return true
+}
+
+func boolMapEqual[K comparable](left, right map[K]bool) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if other, ok := right[key]; !ok || other != value {
+			return false
+		}
+	}
+	return true
+}
+
+func regexpSliceEqual(left, right []*RegexPattern) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] == nil || right[i] == nil {
+			if left[i] != right[i] {
+				return false
+			}
+			continue
+		}
+		if left[i].Expression != right[i].Expression || left[i].Syntax != right[i].Syntax {
+			return false
+		}
+	}
+	return true
+}
+
+func stringMatcherMapEqual(left, right map[string]*StringMatcher) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for name, matcher := range left {
+		other, ok := right[name]
+		if !ok || !stringMatcherEqual(matcher, other) {
+			return false
+		}
+	}
+	return true
+}
+
+func stringMatcherEqual(left, right *StringMatcher) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.Exact != right.Exact || left.Prefix != right.Prefix {
+		return false
+	}
+	if left.Regex == nil || right.Regex == nil {
+		return left.Regex == right.Regex
+	}
+	return left.Regex.Expression == right.Regex.Expression && left.Regex.Syntax == right.Regex.Syntax
+}
+
+func timeWindowEqual(left, right *TimeWindow) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.StartHour == right.StartHour && left.StartMinute == right.StartMinute &&
+		left.EndHour == right.EndHour && left.EndMinute == right.EndMinute &&
+		boolMapEqual(left.Days, right.Days)
+}
+
+func thresholdEqual(left, right *ThresholdCondition) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Operator == right.Operator && left.Value == right.Value
+}
+
+func destinationSliceEqual(left, right []Destination) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].Pool != right[i].Pool || left[i].Weight != right[i].Weight ||
+			left[i].RequireModelLoaded != right[i].RequireModelLoaded ||
+			!thresholdEqual(left[i].QueueDepthCondition, right[i].QueueDepthCondition) ||
+			!thresholdEqual(left[i].ReplicaCondition, right[i].ReplicaCondition) ||
+			!thresholdEqual(left[i].LatencyCondition, right[i].LatencyCondition) ||
+			!timeWindowEqual(left[i].TimeCondition, right[i].TimeCondition) {
+			return false
+		}
+	}
+	return true
+}
+
+func fallbackEqual(left, right *Fallback) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
+}
+
+func rateLimiterPolicyEqual(left, right *RateLimiter) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.rate == right.rate && left.burstSize == right.burstSize && left.perModel == right.perModel
+}
+
+// RemoveRoute removes a route by its complete namespace/name identity.
+func (rm *RouteManager) RemoveRoute(namespace, name string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	newRoutes := make([]*Route, 0, len(rm.routes))
 	for _, r := range rm.routes {
-		if r.Name != name {
+		if r.Namespace != namespace || r.Name != name {
 			newRoutes = append(newRoutes, r)
 		}
 	}
-	rm.routes = newRoutes
+	if len(newRoutes) != len(rm.routes) {
+		rm.routes = newRoutes
+		rm.generation++
+	}
+}
+
+// Generation identifies the immutable routing policy snapshot currently
+// installed in this manager. Capability leases bind to this value so a policy
+// update cannot silently reinterpret an already planned invocation.
+func (rm *RouteManager) Generation() uint64 {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.generation
 }
 
 // Match finds the first matching route for a request
 func (rm *RouteManager) Match(req *RouteRequest) *Route {
+	return cloneRoute(rm.matchInstalled(req), false)
+}
+
+// matchInstalled returns a manager-owned immutable snapshot for the internal
+// proxy hot path. It must never escape through an exported result.
+func (rm *RouteManager) matchInstalled(req *RouteRequest) *Route {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
@@ -299,6 +698,158 @@ func (rm *RouteManager) Match(req *RouteRequest) *Route {
 		}
 	}
 	return nil
+}
+
+// MatchAtGeneration linearizes a routing decision against the policy snapshot
+// used for capability discovery. A false result means the caller must refresh
+// its capability lease before executing.
+func (rm *RouteManager) MatchAtGeneration(req *RouteRequest, generation uint64) (*Route, bool) {
+	route, current := rm.matchInstalledAtGeneration(req, generation)
+	return cloneRoute(route, false), current
+}
+
+func (rm *RouteManager) matchInstalledAtGeneration(req *RouteRequest, generation uint64) (*Route, bool) {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	if rm.generation != generation {
+		return nil, false
+	}
+	for _, route := range rm.routes {
+		if rm.matchRoute(route, req) {
+			return route, true
+		}
+	}
+	return nil, true
+}
+
+// RouteCohort describes the pools that a future execution may reach. Matched
+// distinguishes a route cohort from the absence of any applicable route, and
+// Terminal records that a definite route makes the default pool and every
+// lower-priority route unreachable. A terminal route may intentionally expose
+// no pools (for example, a reject fallback).
+type RouteCohort struct {
+	Pools       []string
+	PoolTargets []RoutePoolTarget
+	Matched     bool
+	Terminal    bool
+	Generation  uint64
+}
+
+// RoutePoolTarget is the namespace-qualified identity of a routed pool. Pools
+// remains on RouteCohort as a legacy name-only projection; discovery,
+// activation, and execution must use PoolTargets because Kubernetes pool names
+// are only unique within a namespace.
+type RoutePoolTarget struct {
+	Namespace string
+	Pool      string
+}
+
+// PotentialCohortFor returns the route cohort that can handle an operation and
+// model. Missing source/header context is treated as unknown rather than as a
+// negative match. Routes stay priority ordered: all possibly matching routes
+// are included until a definite match makes every lower-priority route
+// unreachable. Time windows remain possible for the lifetime of a capability
+// lease because discovery and execution may straddle a window boundary.
+func (rm *RouteManager) PotentialCohortFor(req *RouteRequest) RouteCohort {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	seen := make(map[string]bool)
+	seenTargets := make(map[RoutePoolTarget]bool)
+	cohort := RouteCohort{Generation: rm.generation}
+	appendRoutePools := func(out []string, route *Route) []string {
+		namespace := route.Namespace
+		for _, destination := range route.Destinations {
+			if destination.Pool != "" && !seen[destination.Pool] {
+				seen[destination.Pool] = true
+				out = append(out, destination.Pool)
+			}
+			target := RoutePoolTarget{Namespace: namespace, Pool: destination.Pool}
+			if target.Pool != "" && !seenTargets[target] {
+				seenTargets[target] = true
+				cohort.PoolTargets = append(cohort.PoolTargets, target)
+			}
+		}
+		if route.Fallback != nil && route.Fallback.Action == "redirect" && route.Fallback.RedirectPool != "" && !seen[route.Fallback.RedirectPool] {
+			seen[route.Fallback.RedirectPool] = true
+			out = append(out, route.Fallback.RedirectPool)
+		}
+		if route.Fallback != nil && route.Fallback.Action == "redirect" && route.Fallback.RedirectPool != "" {
+			target := RoutePoolTarget{Namespace: namespace, Pool: route.Fallback.RedirectPool}
+			if !seenTargets[target] {
+				seenTargets[target] = true
+				cohort.PoolTargets = append(cohort.PoolTargets, target)
+			}
+		}
+		return out
+	}
+	for _, route := range rm.routes {
+		if len(route.Operations) > 0 && !route.Operations[req.Operation] {
+			continue
+		}
+		if len(route.ModelPatterns) > 0 {
+			matched := false
+			for _, pattern := range route.ModelPatterns {
+				if pattern.Matches(req.Model) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		possible := false
+		impossible := false
+		for headerName, matcher := range route.HeaderMatchers {
+			value, present := lookupHeader(req.Headers, headerName)
+			if !present {
+				possible = true
+				continue
+			}
+			if !matcher.Matches(value) {
+				impossible = true
+				break
+			}
+		}
+		if impossible {
+			continue
+		}
+		matchSource := func(value string, accepted map[string]bool) bool {
+			if len(accepted) == 0 {
+				return true
+			}
+			if value == "" {
+				possible = true
+				return true
+			}
+			return accepted[value]
+		}
+		if !matchSource(req.SourceTable, route.SourceTables) ||
+			!matchSource(req.SourceOrganization, route.SourceOrganizations) ||
+			!matchSource(req.SourceProject, route.SourceProjects) ||
+			!matchSource(req.SourceAPIKey, route.SourceAPIKeys) {
+			continue
+		}
+		if route.TimeWindow != nil {
+			// Even a currently exact time match can change while the issued lease
+			// remains live, so retain both this route and the next definite route.
+			possible = true
+		}
+		cohort.Matched = true
+		cohort.Pools = appendRoutePools(cohort.Pools, route)
+		if !possible {
+			cohort.Terminal = true
+			return cohort
+		}
+	}
+	return cohort
+}
+
+// PotentialPoolsFor is retained for source compatibility.
+// Deprecated: use PotentialCohortFor so a terminal route cannot be confused
+// with the absence of a matching route.
+func (rm *RouteManager) PotentialPoolsFor(req *RouteRequest) []string {
+	return rm.PotentialCohortFor(req).Pools
 }
 
 func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
@@ -313,7 +864,7 @@ func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 	if len(route.ModelPatterns) > 0 {
 		matched := false
 		for _, pattern := range route.ModelPatterns {
-			if pattern.MatchString(req.Model) {
+			if pattern.Matches(req.Model) {
 				matched = true
 				break
 			}
@@ -325,7 +876,7 @@ func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 
 	// Match headers (if specified)
 	for headerName, matcher := range route.HeaderMatchers {
-		value, exists := req.Headers[headerName]
+		value, exists := lookupHeader(req.Headers, headerName)
 		if !exists || !matcher.Matches(value) {
 			return false
 		}
@@ -369,13 +920,19 @@ func (rm *RouteManager) matchRoute(route *Route, req *RouteRequest) bool {
 // SelectDestination chooses a destination from a matched route
 // based on weights and conditions
 func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, registry *ModelRegistry) (*Destination, error) {
+	return rm.selectDestinationWithin(route, req, registry, nil)
+}
+
+// selectDestinationWithin applies route weights and conditions only to pools
+// containing a currently healthy endpoint from the immutable capability lease.
+func (rm *RouteManager) selectDestinationWithin(route *Route, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef) (*Destination, error) {
 	// Collect eligible destinations
 	eligible := make([]Destination, 0)
 	totalWeight := int32(0)
 
 	for _, dest := range route.Destinations {
 		// Check conditions
-		if !rm.evaluateConditions(&dest, req, registry) {
+		if !rm.evaluateConditionsInNamespaceWithin(&dest, req, registry, route.Namespace, allowed) {
 			continue
 		}
 
@@ -391,18 +948,33 @@ func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, regis
 // A destination with healthy endpoints is runtime-ineligible, not cold, and
 // must fall through without spending the activation timeout.
 func (rm *RouteManager) SelectActivationDestination(route *Route, req *RouteRequest, registry *ModelRegistry, enabled func(string) bool) *Destination {
+	return rm.selectActivationDestinationWithin(route, req, registry, nil, enabled)
+}
+
+func (rm *RouteManager) selectActivationDestinationWithin(route *Route, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef, enabled func(string) bool) *Destination {
 	eligible := make([]Destination, 0, len(route.Destinations))
 	totalWeight := int32(0)
+	namespace := route.Namespace
 	for _, destination := range route.Destinations {
-		if !enabled(destination.Pool) ||
+		if (allowed != nil && !endpointRefsContainNamespacedPool(allowed, namespace, destination.Pool)) ||
+			!enabled(destination.Pool) ||
 			!staticDestinationEligible(&destination, req) ||
-			registry.PoolConditionStats(destination.Pool, req.Model).HealthyEndpoints != 0 {
+			registry.poolConditionStatsInNamespaceWithin(namespace, destination.Pool, req.Model, allowed).HealthyEndpoints != 0 {
 			continue
 		}
 		eligible = append(eligible, destination)
 		totalWeight += destination.Weight
 	}
 	return selectWeightedDestination(route, req, eligible, totalWeight)
+}
+
+func endpointRefsContainNamespacedPool(refs map[string]endpointRef, namespace, pool string) bool {
+	for _, ref := range refs {
+		if endpointMatchesNamespace(ref.endpoint, namespace) && ref.endpoint.pool == pool {
+			return true
+		}
+	}
+	return false
 }
 
 func selectWeightedDestination(route *Route, req *RouteRequest, eligible []Destination, totalWeight int32) *Destination {
@@ -429,7 +1001,16 @@ func staticDestinationEligible(dest *Destination, req *RouteRequest) bool {
 }
 
 func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest, registry *ModelRegistry) bool {
-	return rm.evaluateConditionStats(dest, req, registry.PoolConditionStats(dest.Pool, req.Model))
+	return rm.evaluateConditionsWithin(dest, req, registry, nil)
+}
+
+func (rm *RouteManager) evaluateConditionsWithin(dest *Destination, req *RouteRequest, registry *ModelRegistry, allowed map[string]endpointRef) bool {
+	return rm.evaluateConditionsInNamespaceWithin(dest, req, registry, "", allowed)
+}
+
+func (rm *RouteManager) evaluateConditionsInNamespaceWithin(dest *Destination, req *RouteRequest, registry *ModelRegistry, namespace string, allowed map[string]endpointRef) bool {
+	stats := registry.poolConditionStatsInNamespaceWithin(namespace, dest.Pool, req.Model, allowed)
+	return rm.evaluateConditionStats(dest, req, stats)
 }
 
 func (rm *RouteManager) evaluateConditionStats(dest *Destination, req *RouteRequest, stats PoolConditionStats) bool {
@@ -474,14 +1055,14 @@ func (rm *RouteManager) evaluateConditionStats(dest *Destination, req *RouteRequ
 }
 
 // CompileModelPattern compiles a model pattern with wildcards to a regex
-func CompileModelPattern(pattern string) (*regexp.Regexp, error) {
+func CompileModelPattern(pattern string) (*RegexPattern, error) {
 	// Escape regex special chars except *
 	escaped := regexp.QuoteMeta(pattern)
 	// Convert * to .*
 	regexPattern := strings.ReplaceAll(escaped, `\*`, `.*`)
 	// Anchor the pattern
 	regexPattern = "^" + regexPattern + "$"
-	return regexp.Compile(regexPattern)
+	return CompileRegexPattern(regexPattern, RegexLeftmostFirst)
 }
 
 // ParseThresholdCondition parses conditions like ">50", ">=100", "<10"
@@ -586,6 +1167,8 @@ func parseFloatInternal(s string, v *float64, n *int) (bool, error) {
 
 func weightedSelectionValue(route *Route, req *RouteRequest, totalWeight int32) int32 {
 	h := fnv.New32a()
+	_, _ = h.Write([]byte(route.Namespace))
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(route.Name))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(req.Model))

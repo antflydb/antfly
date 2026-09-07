@@ -6833,11 +6833,13 @@ paths:
         batching will use the same request item shape with `mode: async`.
 
 
-        Batch generation is text-only. Image or other multimodal content parts are
+        Batch generation accepts bounded image and audio content parts. Media is
 
-        rejected per item as `UNSUPPORTED_MULTIMODAL` before media fetch or model loading;
+        validated and admitted before model dispatch; models without compatible
 
-        other item failures remain independently reported.
+        multimodal capabilities return an independent per-item error without
+
+        failing sibling requests.
       operationId: generateBatchContent
       requestBody:
         required: true
@@ -7101,7 +7103,11 @@ paths:
 
         multimodal reranking, image `/extract`, and the embedded read, extract, and dense
 
-        embedding APIs. Batch generation rejects multimodal content before media fetch.
+        embedding APIs. Batch generation accepts bounded image and audio media parts,
+
+        applies the same aggregate encoded-byte and decoded-image admission before model
+
+        execution, and rejects malformed or unsupported parts before dispatch.
       operationId: readImages
       requestBody:
         required: true
@@ -18424,6 +18430,12 @@ components:
           minimum: 1
           format: uint64
           description: Approximate maximum source bytes to process in one batch for this operation.
+        max_document_pages:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          format: uint32
+          description: Maximum PDF pages admitted for one request-atomic document operation.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
@@ -18599,9 +18611,13 @@ components:
       properties:
         target_tokens:
           type: integer
+          minimum: 0
+          maximum: 1000000
           description: Target number of tokens per chunk.
         overlap_tokens:
           type: integer
+          minimum: 0
+          maximum: 1000000
           description: Number of tokens to overlap between consecutive chunks. Helps maintain context
             across chunk boundaries. Only used by fixed-size chunkers.
         separator:
@@ -18614,9 +18630,13 @@ components:
       properties:
         window_duration_ms:
           type: integer
+          minimum: 0
+          maximum: 86400000
           description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
         overlap_duration_ms:
           type: integer
+          minimum: 0
+          maximum: 86400000
           description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
     ChunkOptions:
       type: object
@@ -18625,10 +18645,14 @@ components:
       properties:
         max_chunks:
           type: integer
+          minimum: 0
+          maximum: 4096
           description: Maximum number of chunks to generate per document.
         threshold:
           type: number
           format: float
+          minimum: 0
+          maximum: 1
           description: Confidence threshold for model-based chunking (0.0-1.0).
         text:
           $ref: '#/components/schemas/TextChunkOptions'
@@ -18732,7 +18756,9 @@ components:
               example: fixed
             max_chunks:
               type: integer
-              minimum: 1
+              minimum: 0
+              maximum: 4096
+              description: Maximum number of chunks to generate per document. Zero uses the chunker default.
             threshold:
               type: number
               format: float
@@ -26517,6 +26543,9 @@ components:
           description: Name of model used for reading
         usage:
           $ref: '#/components/schemas/InferenceGenerateUsage'
+        execution:
+          $ref: '#/components/schemas/InferenceBatchExecutionReport'
+          description: Observed execution path. Omitted by older compatible servers.
     InferenceReadObject:
       allOf:
         - $ref: '#/components/schemas/InferenceReadResult'
@@ -26535,11 +26564,14 @@ components:
     InferenceTranscribeRequest:
       type: object
       required:
+        - model
         - audio
       properties:
         model:
           type: string
-          description: Name of transcriber model from models_dir/transcribers/
+          minLength: 1
+          description: Explicit name of the transcriber model from models_dir/transcribers/. Required
+            so direct and distributed execution resolve the same model.
           example: openai/whisper-tiny
         audio:
           type: string
@@ -26622,7 +26654,6 @@ components:
         - generators
         - extractors
         - rewriters
-        - classifiers
         - readers
         - transcribers
       properties:
@@ -26653,11 +26684,6 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/InferenceModelInfo'
           description: Available reranking models
-        classifiers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/InferenceModelInfo'
-          description: Available zero-shot classification models
         embedders:
           type: object
           additionalProperties:
@@ -27207,6 +27233,39 @@ components:
           type: integer
         failed:
           type: integer
+    InferenceBatchExecutionReport:
+      type: object
+      required:
+        - requested_items
+        - native_batches
+        - native_items
+        - serial_items
+        - rejected_items
+        - fallback_items
+      properties:
+        requested_items:
+          type: integer
+          minimum: 0
+        native_batches:
+          type: integer
+          minimum: 0
+        native_items:
+          type: integer
+          minimum: 0
+        serial_items:
+          type: integer
+          minimum: 0
+        rejected_items:
+          type: integer
+          minimum: 0
+          description: Items rejected before model execution by validation, resolution, or admission.
+        fallback_items:
+          type: integer
+          minimum: 0
+        fallback_reason:
+          type: string
+          nullable: true
+      description: Observed executor behavior, not a capability prediction.
     InferenceGenerateBatchResponse:
       type: object
       required:
@@ -27224,6 +27283,9 @@ components:
             $ref: '#/components/schemas/InferenceGenerateBatchResultItem'
         summary:
           $ref: '#/components/schemas/InferenceGenerateBatchSummary'
+        execution:
+          $ref: '#/components/schemas/InferenceBatchExecutionReport'
+          description: Observed execution path. Omitted by older compatible servers.
     InferenceGenerateChoice:
       type: object
       required:
@@ -27683,17 +27745,18 @@ components:
             remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled,
             IP literals and every address resolved from an allowlisted DNS hostname must be globally routable,
             and the connection is pinned to a vetted address. Setting it to false explicitly opts into
-            private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded
-            and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes,
-            and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity;
-            zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved
-            before fetch, while inline sources use their actual encoded size. Accepted image inputs also
-            undergo header-only dimension and aggregate decoded-pixel admission before model execution.
-            Batch generation rejects multimodal content before fetch. Embedded direct transcription and
-            extraction use the configured encoded-media per-call ceiling, and direct dense embedding also
-            applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty
-            inference policy may first inherit a nonempty remote_content security policy, which is then
-            merged over this baseline.
+            private and special destinations. Across generate, dense embed, multimodal rerank, and batch
+            generation, downloaded and inline encoded media is capped cumulatively per request at the
+            lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests
+            is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media.
+            Remote URL byte potential is reserved before fetch, while inline sources use their actual
+            encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel
+            admission before model execution. Batch generation accepts bounded image and audio media parts
+            and rejects malformed or unsupported parts before dispatch. Embedded direct transcription
+            and extraction use the configured encoded-media per-call ceiling, and direct dense embedding
+            also applies pre-allocation and decoded-image admission. In unified Antfly configuration,
+            an empty inference policy may first inherit a nonempty remote_content security policy, which
+            is then merged over this baseline.
         s3_credentials:
           $ref: '#/components/schemas/InferenceCredentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
@@ -27930,10 +27993,10 @@ components:
         max_image_dimension:
           type: integer
           description: Maximum source-image width or height for accepted inference image inputs, including
-            generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded
-            direct APIs. Headers exceeding this limit are rejected before model execution; images are
-            not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping
-            consumers do not enforce this setting.
+            generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`,
+            and their embedded direct APIs. Headers exceeding this limit are rejected before model execution;
+            images are not resized. Batch generation applies the same image-header admission before model
+            execution. Non-inference scraping consumers do not enforce this setting.
           minimum: 1
         allowed_paths:
           type: array
@@ -28646,6 +28709,7 @@ components:
         inputs:
           type: array
           minItems: 1
+          maxItems: 128
           items:
             $ref: '#/components/schemas/ExtractionInput'
         schema:
@@ -28777,9 +28841,13 @@ components:
       properties:
         window_duration_ms:
           type: integer
+          minimum: 0
+          maximum: 86400000
           description: 'Window duration in milliseconds for fixed-window audio chunking (default: 30000).'
         overlap_duration_ms:
           type: integer
+          minimum: 0
+          maximum: 86400000
           description: 'Overlap duration in milliseconds between audio chunks (default: 0).'
         vad:
           $ref: '#/components/schemas/VADOptions'
@@ -28798,10 +28866,14 @@ components:
           example: fixed
         max_chunks:
           type: integer
+          minimum: 0
+          maximum: 4096
           description: Maximum number of chunks to generate per document.
         threshold:
           type: number
           format: float
+          minimum: 0
+          maximum: 1
           description: Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models
             and VAD audio models.
         text:

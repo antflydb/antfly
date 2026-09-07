@@ -10336,11 +10336,14 @@ pub const ExecutionPolicy = struct {
     batch_items: ?i64 = null,
     /// Approximate maximum source bytes to process in one batch for this operation.
     batch_bytes: ?i64 = null,
+    /// Maximum PDF pages admitted for one request-atomic document operation.
+    max_document_pages: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "batch_items", "batch_items", true },
         .{ "batch_bytes", "batch_bytes", true },
+        .{ "max_document_pages", "max_document_pages", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10359,6 +10362,10 @@ pub const ExecutionPolicy = struct {
         }
         if (self.batch_bytes) |value| {
             try jw.objectField("batch_bytes");
+            try jw.write(value);
+        }
+        if (self.max_document_pages) |value| {
+            try jw.objectField("max_document_pages");
             try jw.write(value);
         }
         try jw.endObject();
@@ -17753,6 +17760,46 @@ pub const InferenceBackendRuntimes = struct {
     }
 };
 
+/// Observed executor behavior, not a capability prediction.
+pub const InferenceBatchExecutionReport = struct {
+    requested_items: i64,
+    native_batches: i64,
+    native_items: i64,
+    serial_items: i64,
+    /// Items rejected before model execution by validation, resolution, or admission.
+    rejected_items: i64,
+    fallback_items: i64,
+    fallback_reason: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("requested_items");
+        try jw.write(self.requested_items);
+        try jw.objectField("native_batches");
+        try jw.write(self.native_batches);
+        try jw.objectField("native_items");
+        try jw.write(self.native_items);
+        try jw.objectField("serial_items");
+        try jw.write(self.serial_items);
+        try jw.objectField("rejected_items");
+        try jw.write(self.rejected_items);
+        try jw.objectField("fallback_items");
+        try jw.write(self.fallback_items);
+        switch (self.fallback_reason) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fallback_reason");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fallback_reason");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Binary media content with format-specific metadata.
 pub const InferenceBinaryContent = struct {
     /// Base64-encoded binary data (valid WAV, PNG, etc.)
@@ -18248,7 +18295,7 @@ pub const InferenceConfig = struct {
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?InferenceContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?InferenceCredentials = null,
@@ -18478,7 +18525,7 @@ pub const InferenceContentSecurityConfig = struct {
     max_download_size_bytes: ?i64 = null,
     /// Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
     download_timeout_seconds: ?i64 = null,
-    /// Maximum source-image width or height for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting.
+    /// Maximum source-image width or height for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation applies the same image-header admission before model execution. Non-inference scraping consumers do not enforce this setting.
     max_image_dimension: ?i64 = null,
     /// Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,
@@ -19047,6 +19094,39 @@ pub const InferenceGenerateBatchResponse = struct {
     object: []const u8,
     data: []const InferenceGenerateBatchResultItem,
     summary: InferenceGenerateBatchSummary,
+    /// Observed execution path. Omitted by older compatible servers.
+    execution: ?InferenceBatchExecutionReport = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "summary", "summary", false },
+        .{ "execution", "execution", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("summary");
+        try jw.write(self.summary);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const InferenceGenerateBatchResultItem = struct {
@@ -20091,8 +20171,6 @@ pub const InferenceModelsResponse = struct {
     chunkers: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available reranking models
     rerankers: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available zero-shot classification models
-    classifiers: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available embedding models from models_dir/embedders/
     embedders: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available extractor models (models with 'extraction' capability)
@@ -20415,6 +20493,42 @@ pub const InferenceReadResponse = struct {
     /// Name of model used for reading
     model: []const u8,
     usage: InferenceGenerateUsage,
+    /// Observed execution path. Omitted by older compatible servers.
+    execution: ?InferenceBatchExecutionReport = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "model", "model", false },
+        .{ "usage", "usage", false },
+        .{ "execution", "execution", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const InferenceReadResult = struct {
@@ -20588,7 +20702,7 @@ pub const InferenceRuntimeConfig = struct {
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?InferenceContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?InferenceCredentials = null,
@@ -20963,8 +21077,8 @@ pub const InferenceTranscribeObject = struct {
 };
 
 pub const InferenceTranscribeRequest = struct {
-    /// Name of transcriber model from models_dir/transcribers/
-    model: ?[]const u8 = null,
+    /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
+    model: []const u8,
     /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
@@ -20972,7 +21086,7 @@ pub const InferenceTranscribeRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
+        .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
     };
@@ -20987,10 +21101,8 @@ pub const InferenceTranscribeRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
+        try jw.objectField("model");
+        try jw.write(self.model);
         try jw.objectField("audio");
         try jw.write(self.audio);
         if (self.language) |value| {
