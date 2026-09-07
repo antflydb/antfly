@@ -2587,6 +2587,22 @@ fn requireRelationalConsumerFields(prepared: *mapper.PreparedRelationalWrite, sc
     }
 }
 
+fn relationalPreparationWorkers(writes: []const types.BatchWrite, durable_rows: ?*const std.StringHashMapUnmanaged([]const u8)) usize {
+    var input_bytes: usize = 0;
+    for (writes) |write| {
+        input_bytes +|= write.key.len;
+        input_bytes +|= write.value.len;
+        if (durable_rows) |rows| if (rows.get(write.key)) |row| {
+            // Commit/recovery carries only reserved fields in write.value.
+            // Packed bytes still require authentication, copying and extraction.
+            input_bytes +|= row.len;
+        };
+    }
+    if (input_bytes < 512 * 1024) return 1;
+    const size_workers = input_bytes / (256 * 1024) + @intFromBool(input_bytes % (256 * 1024) != 0);
+    return @max(1, @min(8, @min(writes.len, size_workers)));
+}
+
 fn prepareRelationalRows(
     allocator_guard: *PreparedRowAllocator,
     io: ?std.Io,
@@ -2751,15 +2767,12 @@ fn prepareRelationalRows(
         }
     };
 
-    var input_bytes: usize = 0;
-    for (writes) |write| input_bytes +|= write.key.len + write.value.len;
-    const size_workers = @max(@as(usize, 1), (input_bytes + 256 * 1024 - 1) / (256 * 1024));
     // A handful of very large rows is just as CPU-heavy as a large row count.
     // Size the task group from both independent rows and input bytes; the
     // backend runtime already bounds the shared worker pool, while this local
     // ceiling prevents one request from monopolizing it.
-    const desired_workers = @min(@as(usize, 8), @min(writes.len, size_workers));
-    const parallel = io != null and desired_workers > 1 and input_bytes >= 512 * 1024;
+    const desired_workers = relationalPreparationWorkers(writes, durable_rows);
+    const parallel = io != null and desired_workers > 1;
     var ctx = Context{
         .alloc = allocator_guard.allocator(),
         .scratch_child = allocator_guard.allocator(),
@@ -5049,6 +5062,7 @@ pub const DB = struct {
     relational_columns_building: std.atomic.Value(bool) = .init(false),
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
     relational_column_maintenance: relational_columns.Maintenance = .{},
+    artifact_metadata_retry_after_ns: u64 = 0,
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
@@ -26595,22 +26609,30 @@ pub const DB = struct {
 
     fn artifactRepairMetadataWorkerMain(self: *DB) void {
         while (true) {
-            const active = self.artifactRepairMetadataRebuildPending() or
+            const active = (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns and self.artifactRepairMetadataRebuildPending()) or
                 (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
             if (!self.sleepArtifactRepairMetadataWorker(if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns)) return;
             if (self.artifact_repair_metadata_stop.load(.acquire)) return;
-            _ = self.runArtifactRepairMetadataMaintenancePass() catch |err| {
-                if (err == error.PortableRuntimeActivationPending) continue;
+            self.runIndependentMaintenancePass();
+        }
+    }
+
+    fn runIndependentMaintenancePass(self: *DB) void {
+        self.enforcePortableRuntimeGate() catch return;
+        if (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns) {
+            _ = self.runArtifactRepairMetadataMaintenancePass() catch |err| failed: {
+                if (err == error.PortableRuntimeActivationPending) return;
+                self.artifact_metadata_retry_after_ns = platform_time.monotonicNs() +| artifact_repair_metadata_poll_ns;
                 std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
-                continue;
-            };
-            // Drain a time/range budget, then yield to other owner work. A
-            // backlog uses the active cadence rather than the idle poll.
-            _ = self.runRelationalColumnMaintenancePass() catch |err| switch (err) {
-                error.Canceled, error.PreparedGenerationChanged, error.ResourceBudgetExceeded => {},
-                else => std.log.warn("relational column maintenance failed: {s}", .{@errorName(err)}),
+                break :failed false;
             };
         }
+        // Drain a time/range budget, then yield to other owner work. A
+        // backlog uses the active cadence rather than the idle poll.
+        _ = self.runRelationalColumnMaintenancePass() catch |err| switch (err) {
+            error.Canceled, error.PreparedGenerationChanged, error.ResourceBudgetExceeded => {},
+            else => std.log.warn("relational column maintenance failed: {s}", .{@errorName(err)}),
+        };
     }
 
     pub fn runRelationalColumnMaintenancePass(self: *DB) !usize {
@@ -62773,6 +62795,218 @@ test "relational columnar existence and null projection do not fetch payload rec
     try std.testing.expect(db.relational_columns_rebuild_requested.load(.acquire));
 }
 
+fn drainTestRelationalMaintenance(db: *DB) !void {
+    var passes: usize = 0;
+    while (try db.rebuildRelationalColumns()) {
+        passes += 1;
+        try std.testing.expect(passes < 200);
+    }
+}
+
+test "relational durable preparation sizes workers from packed bytes" {
+    const alloc = std.testing.allocator;
+    const packed_bytes = try alloc.alloc(u8, 512 * 1024);
+    defer alloc.free(packed_bytes);
+    var rows = std.StringHashMapUnmanaged([]const u8).empty;
+    defer rows.deinit(alloc);
+    const writes = [_]types.BatchWrite{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" }, .{ .key = "c", .value = "{}" } };
+    try rows.put(alloc, "a", packed_bytes);
+    try rows.put(alloc, "b", packed_bytes);
+    try std.testing.expectEqual(@as(usize, 1), relationalPreparationWorkers(&writes, null));
+    try std.testing.expectEqual(@as(usize, 3), relationalPreparationWorkers(&writes, &rows));
+    try std.testing.expectEqual(@as(usize, 1), relationalPreparationWorkers(writes[0..1], &rows));
+}
+
+test "relational columnar cleanup resumes published pages without rebuilding or clearing racing writes" {
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend|
+        try testRelationalCleanupBackend(backend);
+}
+
+fn testRelationalCleanupBackend(backend: PrimaryBackend) !void {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" }, .{ .key = "c", .value = "{\"n\":3}" } } });
+    relational_columns.test_cleanup_page_limit = 1;
+    defer relational_columns.test_cleanup_page_limit = null;
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    try std.testing.expectEqual(@as(u64, 1), db.relational_column_maintenance.dirty_markers_cleared.load(.monotonic));
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"n\":9}" }} });
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    try std.testing.expectEqual(@as(u64, 0), db.relational_column_maintenance.blocks_written.load(.monotonic));
+    const dirty = try std.mem.concat(alloc, u8, &.{ internal_keys.relational_columnar_dirty_prefix, "b" });
+    defer alloc.free(dirty);
+    const token = try db.core.store.get(alloc, dirty);
+    defer alloc.free(token);
+    try drainTestRelationalMaintenance(&db);
+    var stats: types.ColumnarScanStats = .{};
+    var result = try db.scan(alloc, "", "", .{ .include_documents = true, .fields = &.{"n"}, .include_all_fields = false, .filter_query_json = "{\"term\":{\"n\":9}}", .columnar_stats = &stats });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.documents.len);
+    try std.testing.expectEqual(@as(u64, 0), stats.dirty_ranges_read);
+}
+
+test "relational columnar delete waves coalesce adjacent underfilled ranges" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const writes = try scratch.alloc(types.BatchWrite, 1024);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    for (writes, 0..) |*write, i| {
+        write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = "{\"n\":1}" };
+        if (i % 256 != 0) try deletes.append(scratch, write.key);
+    }
+    try db.batch(.{ .writes = writes });
+    try drainTestRelationalMaintenance(&db);
+    // Separate waves reach idle between deletes. Occupancy metadata must
+    // survive queue consumption so future neighbors can still merge.
+    for (0..4) |wave| {
+        try db.batch(.{ .deletes = deletes.items[wave * 255 ..][0..255] });
+        try drainTestRelationalMaintenance(&db);
+        if (wave == 0) {
+            db.close();
+            db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        }
+    }
+    var stats: types.ColumnarScanStats = .{};
+    var result = try db.scan(alloc, "", "", .{ .include_documents = true, .fields = &.{"n"}, .include_all_fields = false, .columnar_stats = &stats });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), result.documents.len);
+    try std.testing.expectEqual(@as(u64, 1), stats.blocks_read);
+    try std.testing.expectEqual(@as(u64, 0), stats.dirty_ranges_read);
+    try std.testing.expect(db.relational_column_maintenance.ranges_merged.load(.monotonic) >= 3);
+}
+
+test "relational columnar deleted insertion burst has bounded cleanup and complete coverage" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{.{ .key = "z", .value = "{\"n\":7}" }} });
+    try drainTestRelationalMaintenance(&db);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const writes = try scratch.alloc(types.BatchWrite, 2050);
+    const deletes = try scratch.alloc([]const u8, writes.len);
+    for (writes, deletes, 0..) |*write, *key, i| {
+        key.* = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i});
+        write.* = .{ .key = key.*, .value = "{\"n\":1}" };
+    }
+    try db.batch(.{ .writes = writes });
+    try db.batch(.{ .deletes = deletes });
+    const before = db.relational_column_maintenance.dirty_markers_cleared.load(.monotonic);
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    try std.testing.expect(db.relational_column_maintenance.dirty_markers_cleared.load(.monotonic) - before <= 1024);
+    var passes: usize = 0;
+    while (true) {
+        var result = try db.scan(alloc, "", "", .{ .include_documents = true, .fields = &.{"n"}, .include_all_fields = false });
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), result.documents.len);
+        try std.testing.expectEqualStrings("z", result.documents[0].id);
+        try std.testing.expect(!db.relational_columns_rebuild_requested.load(.acquire));
+        if (!try db.rebuildRelationalColumns()) break;
+        passes += 1;
+        try std.testing.expect(passes < 50);
+    }
+}
+
+test "relational columnar epoch boundaries respect a one block maintenance quantum" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "c", .value = "{\"n\":3}" } } });
+    try db.setSchema(.{ .version = 2, .storage_mode = .relational, .relational_columns = &columns });
+    try drainTestRelationalMaintenance(&db);
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} });
+    relational_columns.test_compaction_block_limit = 1;
+    defer relational_columns.test_compaction_block_limit = null;
+    const before = db.relational_column_maintenance.blocks_written.load(.monotonic);
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    try std.testing.expectEqual(@as(u64, 1), db.relational_column_maintenance.blocks_written.load(.monotonic) - before);
+    var result = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"} });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), result.documents.len);
+    try drainTestRelationalMaintenance(&db);
+    try std.testing.expect(!db.relational_columns_rebuild_requested.load(.acquire));
+}
+
+test "relational columnar obsolete generation GC is bounded and resumes after restart" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} });
+    try drainTestRelationalMaintenance(&db);
+    for (0..260) |i| {
+        const key = try std.fmt.allocPrint(alloc, "\x00\x00__columnar__:blocks:0000000000000000:{d:0>4}", .{i});
+        defer alloc.free(key);
+        try db.core.store.put(key, "obsolete");
+    }
+    try std.testing.expect(try db.rebuildRelationalColumns());
+    try std.testing.expectEqual(@as(u64, 256), db.relational_column_maintenance.gc_records_deleted.load(.monotonic));
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    try drainTestRelationalMaintenance(&db);
+    try std.testing.expectEqual(@as(u64, 4), db.relational_column_maintenance.gc_records_deleted.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), db.relational_column_maintenance.blocks_written.load(.monotonic));
+}
+
+test "relational columnar maintenance survives unrelated artifact corruption and backoff" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} });
+    const issue = try internal_keys.artifactRepairIssueKeyAlloc(alloc, "bad", "embedding", "bad");
+    defer alloc.free(issue);
+    try db.core.store.put(issue, "malformed");
+    const ready = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
+    defer alloc.free(ready);
+    try db.core.store.putBatch(&.{}, &.{ready});
+    db.runIndependentMaintenancePass();
+    try std.testing.expect(db.artifact_metadata_retry_after_ns > platform_time.monotonicNs());
+    try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > 0);
+    const retry = db.artifact_metadata_retry_after_ns;
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }} });
+    db.runIndependentMaintenancePass();
+    try std.testing.expectEqual(retry, db.artifact_metadata_retry_after_ns);
+    try std.testing.expect(db.relational_column_maintenance.ranges_compacted.load(.monotonic) > 0);
+}
+
 test "relational columnar maintenance advances past hot ranges across restart" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -62789,6 +63023,7 @@ test "relational columnar maintenance advances past hot ranges across restart" {
     for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = "{\"n\":1}" };
     try db.batch(.{ .writes = writes });
     try std.testing.expect(try db.rebuildRelationalColumns());
+    try drainTestRelationalMaintenance(&db);
     try db.batch(.{ .writes = &.{ .{ .key = "k0000", .value = "{\"n\":2}" }, .{ .key = "k0256", .value = "{\"n\":2}" }, .{ .key = "k0512", .value = "{\"n\":2}" } } });
     const HotWriter = struct {
         db: *DB,
@@ -62807,8 +63042,7 @@ test "relational columnar maintenance advances past hot ranges across restart" {
     try std.testing.expect(try db.rebuildRelationalColumns());
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
-    try std.testing.expect(try db.rebuildRelationalColumns());
-    try std.testing.expect(try db.rebuildRelationalColumns());
+    for (0..8) |_| _ = try db.rebuildRelationalColumns();
     var stats: types.ColumnarScanStats = .{};
     var cold = try db.scan(alloc, "k0256", "", .{ .inclusive_from = true, .columnar_stats = &stats });
     defer cold.deinit(alloc);
@@ -62871,7 +63105,7 @@ test "relational columnar generations preserve scans and compact dirty ranges" {
         initialized += 1;
     }
     try std.testing.expect(try db.rebuildRelationalColumns());
-    try std.testing.expect(!try db.rebuildRelationalColumns());
+    try drainTestRelationalMaintenance(&db);
     var columnar_stats: types.ColumnarScanStats = .{};
     var pruned = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .filter_query_json = "{\"numeric_range\":{\"field\":\"n\",\"min\":597}}", .columnar_stats = &columnar_stats });
     defer pruned.deinit(alloc);
@@ -63151,7 +63385,7 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     try std.testing.expect(try db.rebuildRelationalColumns());
-    try std.testing.expect(!try db.rebuildRelationalColumns());
+    try drainTestRelationalMaintenance(&db);
 
     // Retire all rows, including entire directory ranges and its first range.
     var all = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = true });

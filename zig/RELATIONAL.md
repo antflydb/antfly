@@ -367,12 +367,23 @@ updates leave the accelerator live. Schema changes invalidate the generation.
 Bulk-capable backends append dirty tokens in the same ingest arena as primary
 rows, preserving direct ingestion without per-row sorted-map insertion.
 
-Maintenance compacts one dirty range at a time, staging at most 64 replacement
-blocks per pass. Large insertion bursts split into bounded passes while the
+Maintenance compacts a dirty range and up to seven eligible neighbors, staging
+at most 64 replacement blocks per pass and yielding at block boundaries after
+50 ms. Dirty-image capture is independently capped at 1,024 records or 256 KiB;
+large delete bursts therefore yield even when there are no live output rows.
+Large insertion bursts split into bounded passes while the
 uncovered suffix retains its old block and dirty markers. Publication replaces
 the affected directory entries and retires old blocks atomically. Compare-and-
 clear removes only dirty images represented by the published snapshot: a
-racing write keeps its marker. A durable build token fences concurrent builders
+racing write keeps its marker. Checksummed cleanup pages are staged before
+publication; the directory and cleanup job become visible in one transaction.
+The common one-page case compare-clears within publication itself, avoiding
+both a journal write and a separate cleanup commit.
+Each cleanup transaction compare-clears at most 256 images (or a 256 KiB page)
+and deletes that page atomically. Restart resumes at the first remaining page
+without rebuilding published rows or retaining their source snapshot. Initial
+generation creation still streams the full primary snapshot and cleanup journal;
+its post-publication cleanup is incremental. A durable build token fences concurrent builders
 and makes canceled/crashed staging reclaimable on restart. Whole-store namespace
 replacement is fenced separately. Retired blocks remain available to pinned
 MVCC readers. Only initial creation, schema replacement, or corrupt-derived-data
@@ -387,6 +398,24 @@ bounded range builds), using a 100 ms active cadence while work remains and a
 five-second idle/resource-pressure backoff. DB statistics expose pending work,
 its observed age, backoff state, pass duration, failures, compacted ranges and
 written blocks without a catalog scan.
+
+Underfilled blocks (fewer than 128 rows and less than 512 KiB of source rows)
+retain durable occupancy markers. A separate merge queue is consumed when no
+dirty range needs service; reaching idle does not discard occupancy information.
+Later delete waves can merge with earlier underfilled neighbors. Coalescing
+uses compatible schema epochs, the same bounded builder and atomic directory
+publication as dirty compaction. GC deletes at most 256 records or 256 KiB of
+keys per quantum; revoked staging tokens remain in a durable garbage job until
+their entire prefix is reclaimed. The deletion itself is the resumable cursor.
+
+Artifact metadata repair and column maintenance have independent failure and
+backoff handling behind the shared portable-runtime activation gate. An artifact
+decode failure cannot starve column maintenance or create a hot retry loop.
+Maintenance statistics additionally expose rows written, ranges merged, dirty
+markers cleared and GC records deleted; rows/blocks written measure output
+occupancy and can be compared with mutation volume to assess write amplification.
+Durable transaction preparation includes packed AROW bytes, not just reserved
+JSON sidecars, when sizing its bounded `std.Io` task group.
 
 ### Query path
 

@@ -2567,6 +2567,10 @@ pub const ColumnarMaintenanceStats = struct {
     passes: u64 = 0,
     ranges_compacted: u64 = 0,
     blocks_written: u64 = 0,
+    rows_written: u64 = 0,
+    ranges_merged: u64 = 0,
+    dirty_markers_cleared: u64 = 0,
+    gc_records_deleted: u64 = 0,
     failures: u64 = 0,
     last_pass_ns: u64 = 0,
 };
