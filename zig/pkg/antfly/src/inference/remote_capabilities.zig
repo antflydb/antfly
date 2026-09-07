@@ -193,6 +193,22 @@ pub const Cache = struct {
         return (try self.getOrDiscoverLease(http, inference_url, model, operation, headers)).capabilities;
     }
 
+    /// Admission-sensitive executors must not refresh a catalog using a
+    /// response grant sized for numeric vectors. A miss returns to planning,
+    /// where bounded catalog discovery and its single-flight ownership live.
+    /// Catalog TTL controls discovery, not the lifetime of an admitted plan.
+    /// The endpoint validates the bound execution lease on every request. An
+    /// active long document must not replay merely because discovery is due.
+    pub fn executionLease(self: *Cache, inference_url: []const u8, model: []const u8, operation: work.Operation, headers: []const [2][]const u8) !CapabilityLease {
+        const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
+        defer self.alloc.free(key);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closing) return error.CapabilityCacheClosed;
+        const entry = self.entries.get(key) orelse return error.InferenceCapabilitiesStale;
+        return .{ .capabilities = entry.value, .routing_token = entry.routing_token, .descriptor_revision = entry.descriptor_revision };
+    }
+
     pub fn getOrDiscoverLease(
         self: *Cache,
         http: *httpx.Client,
@@ -810,6 +826,7 @@ const ExactWireCapabilities = struct {
     prompt_policy: work.PromptPolicy,
     borrowed_attachments: bool,
     framed_attachments: bool,
+    numeric_responses_v1: bool,
     image_transform: ?work.ImageTransform = null,
     task_limits: work.TaskResourceLimits = .{},
 };
@@ -966,6 +983,10 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         if (value != .bool) return error.InvalidInferenceCapabilities;
         break :blk value.bool;
     } else false;
+    const numeric_responses_v1 = if (object.get("numeric_responses_v1")) |value| blk: {
+        if (value != .bool) return error.InvalidInferenceCapabilities;
+        break :blk value.bool;
+    } else false;
     return .{
         .modalities = .{
             .text = hasString(modality_values, "text"),
@@ -980,6 +1001,7 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         .prompt_policy = prompt_policy,
         .borrowed_attachments = borrowed_value.bool,
         .framed_attachments = framed_attachments,
+        .numeric_responses_v1 = numeric_responses_v1,
         .image_transform = try parseImageTransform(object),
         .task_limits = if (version >= 4) try parseTaskResourceLimits(object) else .{},
     };
@@ -1059,6 +1081,7 @@ pub fn parseModelCapabilities(
         // even if a misconfigured upstream publishes its local ABI fact.
         .borrowed_attachments = false,
         .framed_attachments = if (exact) |value| value.framed_attachments else false,
+        .numeric_responses_v1 = if (exact) |value| value.numeric_responses_v1 else false,
     };
     if (resolved == null) if (capability_values) |values| {
         for (values.items) |value| {
@@ -1209,12 +1232,22 @@ test "remote Antfly capability cache retains and invalidates routing token with 
     }
 
     const lease = try cache.getOrDiscoverLease(&http, "http://proxy", "model", .rerank, headers);
+    const fresh = try cache.executionLease("http://proxy", "model", .rerank, headers);
+    try std.testing.expectEqual(lease.routing_token, fresh.routing_token);
     const retained = lease.routing_token orelse
         return error.TestExpectedRoutingToken;
     try std.testing.expectEqualStrings("route-lease", retained.slice());
     const retained_revision = lease.descriptor_revision orelse return error.TestExpectedCapabilityRevision;
     try std.testing.expectEqualStrings(revision.slice(), retained_revision.slice());
+    {
+        cache.mutex.lockUncancelable(cache.io);
+        defer cache.mutex.unlock(cache.io);
+        cache.entries.getPtr(key).?.expires_at_ns = 0;
+    }
+    const execution = try cache.executionLease("http://proxy", "model", .rerank, headers);
+    try std.testing.expectEqual(lease.routing_token, execution.routing_token);
     try cache.invalidate("http://proxy", "model", .rerank, headers);
+    try std.testing.expectError(error.InferenceCapabilitiesStale, cache.executionLease("http://proxy", "model", .rerank, headers));
     try std.testing.expectError(
         error.InferenceCapabilitiesUnavailable,
         cache.routingToken("http://proxy", "model", .rerank, headers),
@@ -1389,6 +1422,14 @@ test "remote Antfly capability v4 negotiates framed attachment transport" {
     const capabilities = (try parseModelCapabilities(std.testing.allocator, payload, "clipclap", .embed)).?;
     try std.testing.expect(capabilities.framed_attachments);
     try std.testing.expect(!capabilities.borrowed_attachments);
+    try std.testing.expect(!capabilities.numeric_responses_v1);
+    const numeric_payload = try std.mem.replaceOwned(u8, std.testing.allocator, payload, "\"framed_attachments\":true", "\"framed_attachments\":true,\"numeric_responses_v1\":true");
+    defer std.testing.allocator.free(numeric_payload);
+    const numeric = (try parseModelCapabilities(std.testing.allocator, numeric_payload, "clipclap", .embed)).?;
+    try std.testing.expect(numeric.numeric_responses_v1);
+    const malformed = try std.mem.replaceOwned(u8, std.testing.allocator, numeric_payload, "\"numeric_responses_v1\":true", "\"numeric_responses_v1\":1");
+    defer std.testing.allocator.free(malformed);
+    try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, malformed, "clipclap", .embed));
 }
 
 test "remote Antfly exact capabilities reject image MIME unsupported by local codec" {

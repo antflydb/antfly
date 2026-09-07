@@ -849,6 +849,9 @@ pub const InferenceCapabilities = struct {
     /// envelope. Unlike borrowed_attachments, this is a wire capability and
     /// is therefore safe to advertise across process boundaries.
     framed_attachments: bool = false,
+    /// The HTTP route guarantees AFN1 dense/score responses when requested
+    /// exclusively. Version 1 has a fixed 4-MiB frame ceiling.
+    numeric_responses_v1: bool = false,
     /// Linked-process executor has a concrete borrowed raw-raster entrypoint.
     /// This is never inferred from image modality or encoded attachment support.
     borrowed_rasters: bool = false,

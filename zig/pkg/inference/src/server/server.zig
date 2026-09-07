@@ -18449,6 +18449,7 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
     defer parsed.deinit();
     const capabilities = parsed.value.object.get("inference_capabilities").?.object;
     try std.testing.expect(capabilities.get("framed_attachments").?.bool);
+    try std.testing.expect(!capabilities.get("numeric_responses_v1").?.bool);
     const modalities = capabilities.get("input_modalities").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), modalities.len);
     const mime_types = capabilities.get("accepted_mime_types").?.array.items;
@@ -18578,6 +18579,8 @@ fn appendResolvedInferenceCapabilities(
         std.mem.eql(u8, resolved_task, "chunk") or
         std.mem.eql(u8, resolved_task, "transcribe") or
         std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
+    try buf.appendSlice(allocator, ",\"numeric_responses_v1\":");
+    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
     try buf.appendSlice(allocator, ",\"image_transform\":");
     if (if (accepts_image) image_transform else null) |transform| {
         const encoded = try std.fmt.allocPrint(
@@ -19547,6 +19550,7 @@ test "standalone inference catalog validates extensible MIME against executor co
     defer parsed.deinit();
     const resolved = parsed.value.object.get("inference_capabilities") orelse return error.TestUnexpectedResult;
     try std.testing.expect(resolved.object.get("framed_attachments").?.bool);
+    try std.testing.expect(resolved.object.get("numeric_responses_v1").?.bool);
     const mime_values = resolved.object.get("accepted_mime_types").?.array.items;
     var found_gif = false;
     for (mime_values) |value| if (std.mem.eql(u8, value.string, "image/gif")) {

@@ -1580,7 +1580,7 @@ pub const ManagedEmbedder = struct {
             const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset);
             const chunk = items[offset..end];
             try validateDensePartItemInvocation(alloc, capabilities, attachment_transport, chunk);
-            const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims);
+            const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims, capabilities);
             defer alloc.free(chunk_vectors);
             for (chunk_vectors) |vector| {
                 vectors[initialized] = vector;
@@ -1724,14 +1724,20 @@ pub const ManagedEmbedder = struct {
             outer,
             std.math.add(usize, item_envelopes, commas) catch return error.InferenceEncodedBytesExceeded,
         ) catch return error.InferenceEncodedBytesExceeded;
-        // The HTTP response is capped at 4 MiB. Typed JSON float arrays can be
+        // Legacy HTTP responses are capped at 4 MiB. Typed JSON arrays can be
         // denser than their source text and the arena retains geometric-growth
         // allocations until parsing finishes. Reserve a conservative complete
         // response/parser peak in addition to the expected parsed/final vector
         // copies. A bounded allowance covers URL/header/TLS/client control.
+        // Numeric plans require a matching bound lease at execution and cannot
+        // discover or parse JSON within this smaller, shape-bound allowance.
+        const response_bytes = if (local == null and entry.provider == .antfly and dims != 0 and resolved_capabilities.?.numeric_responses_v1)
+            try numericDenseResponseLimit(shape.item_count, dims)
+        else
+            remote_embedding_max_response_bytes;
         const response_and_parser = if (local != null and local.?.typed_dense_results) 0 else std.math.mul(
             usize,
-            remote_embedding_max_response_bytes,
+            response_bytes,
             remote_embedding_response_resident_multiplier,
         ) catch return error.InferenceEncodedBytesExceeded;
         const vector_copies = std.math.mul(usize, vector_bytes, 2) catch
@@ -2024,6 +2030,12 @@ fn embeddingOperationDeadline(entry: *const ManagedEmbeddingEntry) u64 {
 const remote_embedding_max_response_bytes: usize = 4 << 20;
 const remote_embedding_response_resident_multiplier: usize = 8;
 const remote_embedding_transport_control_bytes: usize = 256 << 10;
+
+fn numericDenseResponseLimit(items: usize, dims: usize) !usize {
+    // Leave room for bounded admission/stale-route error envelopes without
+    // allocating a catalog or a success-response JSON parser in this grant.
+    return @max(4096, try httpx.numeric_response.frameSize(items, dims));
+}
 
 fn ensureEntryDeadline(entry: *const ManagedEmbeddingEntry) !void {
     if (entry.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
@@ -5721,6 +5733,7 @@ fn embedPartItemsWithEntry(
     entry: *const ManagedEmbeddingEntry,
     items: []const template_mod.ContentPart,
     dims: u32,
+    planned_capabilities: inference_work.InferenceCapabilities,
 ) ![]const []const f32 {
     if (items.len == 0) return try alloc.alloc([]const f32, 0);
     if (!isAntflyProvider(entry.provider)) return error.UnsupportedEmbeddingProvider;
@@ -5769,7 +5782,16 @@ fn embedPartItemsWithEntry(
     }
     const capability_headers = capability_header_storage[0..capability_header_count];
     const capability_cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
-    _ = try bindRemoteEmbeddingPartsLease(
+    if (planned_capabilities.numeric_responses_v1 and dims != 0) {
+        const lease = try capability_cache.executionLease(entry.base_url, entry.model, .embed, capability_headers);
+        const live = lease.capabilities orelse return error.InferenceCapabilitiesStale;
+        if (!std.meta.eql(live, planned_capabilities)) return error.InferenceCapabilitiesStale;
+        try validateDensePartItemInvocation(alloc, live, if (live.framed_attachments) .framed_binary else .base64_payload, items);
+        provider.setFramedAttachments(live.framed_attachments);
+        if (lease.routing_token) |token| try provider.setCapabilityToken(token.slice());
+        if (lease.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
+        provider.numeric_dense_dimensions = dims;
+    } else _ = try bindRemoteEmbeddingPartsLease(
         alloc,
         entry,
         http,
@@ -5780,6 +5802,7 @@ fn embedPartItemsWithEntry(
         true,
     );
     try applyAntflyEmbeddingRequestControls(entry, &provider, operation_deadline_ns);
+    if (provider.numeric_dense_dimensions != null) provider.setMaxResponseBytes(try numericDenseResponseLimit(items.len, dims));
 
     var result = provider.embedParts(alloc, entry.model, items) catch |err| switch (err) {
         error.EmptyResponse => return error.EmptyEmbeddingResponse,
@@ -6987,6 +7010,16 @@ test "managed embedder media planning is pure and typed results avoid JSON reser
     const shape = db_embedder.DensePartInvocationShape{ .item_count = 4 };
     const remote = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, caps);
     try std.testing.expectEqual(inference_work.AttachmentTransport.framed_binary, remote.attachment_transport);
+    var numeric_caps = caps;
+    numeric_caps.numeric_responses_v1 = true;
+    const numeric = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, numeric_caps);
+    try std.testing.expectEqual((remote_embedding_max_response_bytes - try numericDenseResponseLimit(4, 384)) * remote_embedding_response_resident_multiplier, remote.allocator_limit_bytes - numeric.allocator_limit_bytes);
+    try std.testing.expect(numeric.allocator_limit_bytes < 384 * 1024);
+    try std.testing.expectEqual(@as(usize, 4096), try numericDenseResponseLimit(1, 384));
+    try std.testing.expectError(error.NumericResponseTooLarge, numericDenseResponseLimit(1024, 4096));
+    const unknown = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 0, numeric_caps);
+    const unknown_json = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 0, caps);
+    try std.testing.expectEqual(unknown_json.allocator_limit_bytes, unknown.allocator_limit_bytes);
     try std.testing.expectError(error.EmbeddingCapabilitiesUnavailable, ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, null));
     entry[0].antfly_provider = local.provider();
     const json = try ManagedEmbedder.densePartInvocationMemory(&managed, "visual", shape, 384, caps);

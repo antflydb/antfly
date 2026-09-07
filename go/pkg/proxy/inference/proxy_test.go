@@ -4871,6 +4871,50 @@ func TestCapabilityLeaseRefreshReusesImmutableSnapshot(t *testing.T) {
 	}
 }
 
+func TestCapabilityLeaseValidUseRenewsIdleTimeoutWithoutDiscovery(t *testing.T) {
+	t.Parallel()
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "primary"}, Logger: zap.NewNop()})
+	const address = "http://reader.internal"
+	p.registry.RegisterEndpoint(address, "primary", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, address, "read", "owner/reader")
+	endpoints := capabilityEndpointSet(p.registry, p.router.ResolveEndpointCandidates("owner/reader", "primary", nil, "read"))
+	token, err := issueReaderCapabilityLease(p, "owner/reader", "revision-a", "Bearer caller", endpoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setExpiry := func(expiry time.Time) {
+		p.capabilityLeaseMu.Lock()
+		defer p.capabilityLeaseMu.Unlock()
+		lease := p.capabilityLeases[token]
+		lease.expiresAt = expiry
+		p.capabilityLeases[token] = lease
+	}
+	expiry := time.Now().Add(time.Minute)
+	setExpiry(expiry)
+	if err := p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "Bearer wrong"); err == nil {
+		t.Fatal("wrong caller renewed a lease")
+	}
+	if !p.capabilityLeases[token].expiresAt.Equal(expiry) {
+		t.Fatal("rejected request changed idle timeout")
+	}
+	if err := p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "Bearer caller"); err != nil {
+		t.Fatal(err)
+	}
+	if !p.capabilityLeases[token].expiresAt.After(expiry) {
+		t.Fatal("valid execution did not renew idle timeout")
+	}
+	if len(p.capabilityLeases) != 1 || len(p.capabilityLeaseByID) != 1 {
+		t.Fatal("execution minted a new lease")
+	}
+	setExpiry(time.Now().Add(-time.Second))
+	if err := p.validateCapabilityLease(token, "revision-a", "owner/reader", "read", "Bearer caller"); err == nil {
+		t.Fatal("expired idle lease was revived")
+	}
+	if _, retained := p.capabilityLeases[token]; retained {
+		t.Fatal("expired lease remains retained")
+	}
+}
+
 func TestCapabilityLeaseIssuancePurgesObsoleteRouteGenerations(t *testing.T) {
 	t.Parallel()
 
@@ -5702,6 +5746,22 @@ func TestConservativeCapabilitiesV4RequiresEveryEndpointToSupportFramedAttachmen
 	malformed["framed_attachments"] = "yes"
 	if _, ok := conservativeInferenceCapabilities(base(&trueValue), malformed); ok {
 		t.Fatal("malformed framed attachment capability was accepted")
+	}
+	left, right := base(&trueValue), base(&trueValue)
+	left["numeric_responses_v1"] = true
+	right["numeric_responses_v1"] = true
+	merged, ok = conservativeInferenceCapabilities(left, right)
+	if !ok || merged["numeric_responses_v1"] != true {
+		t.Fatalf("uniform numeric support was not preserved: %#v", merged)
+	}
+	delete(right, "numeric_responses_v1")
+	merged, ok = conservativeInferenceCapabilities(left, right)
+	if !ok || merged["numeric_responses_v1"] != false {
+		t.Fatalf("mixed-version numeric support was not weakened: %#v", merged)
+	}
+	right["numeric_responses_v1"] = "yes"
+	if _, ok := conservativeInferenceCapabilities(left, right); ok {
+		t.Fatal("malformed numeric response capability was accepted")
 	}
 }
 

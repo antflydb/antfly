@@ -309,6 +309,9 @@ pub const Provider = struct {
     presence_penalty: ?f32 = null,
     max_response_bytes: ?usize = null,
     framed_attachments: bool = false,
+    /// Non-null means the caller admitted only an exact numeric result. JSON
+    /// fallback is forbidden before parsing, even if a server ignores Accept.
+    numeric_dense_dimensions: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -456,7 +459,7 @@ pub const Provider = struct {
     fn numericRequestOptions(self: *Provider, options: httpx.RequestOptions) httpx.RequestOptions {
         var result = options;
         const count = if (options.headers) |headers| headers.len else 0;
-        self.request_header_storage[count] = .{ "Accept", httpx.numeric_response.accept };
+        self.request_header_storage[count] = .{ "Accept", if (self.numeric_dense_dimensions != null) httpx.numeric_response.content_type else httpx.numeric_response.accept };
         result.headers = self.request_header_storage[0 .. count + 1];
         return result;
     }
@@ -690,9 +693,10 @@ pub const Provider = struct {
         const body = resp.body orelse return error.EmptyResponse;
         if (resp.contentType()) |ct| {
             if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
-                const view = try httpx.numeric_response.parse(body, .dense, expected_count, null);
+                const view = try httpx.numeric_response.parse(body, .dense, expected_count, self.numeric_dense_dimensions);
                 return .{ .vectors = try view.denseAlloc(alloc), .dimension = view.columns, .allocator = alloc };
             }
+            if (self.numeric_dense_dimensions != null) return error.InferenceCapabilitiesStale;
             if (std.mem.startsWith(u8, ct, "application/octet-stream")) {
                 if (body.len < 16 or std.mem.readInt(u64, body[0..8], .little) != expected_count)
                     return error.InvalidEmbeddingResponse;
@@ -708,6 +712,7 @@ pub const Provider = struct {
             }
         }
 
+        if (self.numeric_dense_dimensions != null) return error.InferenceCapabilitiesStale;
         var result = try parseDenseJsonResponseAlloc(alloc, body);
         errdefer result.deinit();
         if (result.vectors.len != expected_count) return error.InvalidEmbeddingResponse;
@@ -1027,17 +1032,19 @@ test "antfly embed request carries retrieval task and instruction" {
 }
 
 test "antfly embed parts lends raw binary through its request envelope" {
-    return testEmbedPartsRequestRoundTrip(false);
+    return testEmbedPartsRequestRoundTrip(false, false);
 }
 
 test "antfly numeric responses negotiate dense and score frames with JSON fallback" {
-    try testEmbedPartsRequestRoundTrip(false);
-    try testEmbedPartsRequestRoundTrip(true);
+    try testEmbedPartsRequestRoundTrip(false, false);
+    try testEmbedPartsRequestRoundTrip(true, false);
+    try testEmbedPartsRequestRoundTrip(true, true);
+    try testEmbedPartsRequestRoundTrip(false, true);
     try testRerankScoresResponse(false);
     try testRerankScoresResponse(true);
 }
 
-fn testEmbedPartsRequestRoundTrip(binary_response: bool) !void {
+fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime required: bool) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1047,7 +1054,7 @@ fn testEmbedPartsRequestRoundTrip(binary_response: bool) !void {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqual(httpx.Method.POST, req.method);
             try std.testing.expectEqualStrings("/embed", req.path);
-            try std.testing.expectEqualStrings(httpx.numeric_response.accept, req.header("Accept") orelse return error.TestExpectedAccept);
+            try std.testing.expectEqualStrings(if (required) httpx.numeric_response.content_type else httpx.numeric_response.accept, req.header("Accept") orelse return error.TestExpectedAccept);
             try std.testing.expectEqualStrings(
                 httpx.attachment_envelope.content_type,
                 req.header("Content-Type") orelse return error.TestExpectedContentType,
@@ -1080,14 +1087,21 @@ fn testEmbedPartsRequestRoundTrip(binary_response: bool) !void {
 
     const Fiber = struct {
         fn run(a: std.mem.Allocator, test_io: std.Io, base: []const u8, ok_out: *bool, dim_out: *usize, err_out: *anyerror) std.Io.Cancelable!void {
-            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+            var bounded = @import("work.zig").BoundedInvocationAllocator.init(a, 384 * 1024);
+            const request_alloc = if (required) bounded.allocator() else a;
+            defer std.debug.assert(bounded.live_bytes == 0);
+            var client = httpx.Client.initWithConfig(request_alloc, test_io, .{ .keep_alive = false });
             defer client.deinit();
 
-            var provider = Provider.init(a, &client, base);
+            var provider = Provider.init(request_alloc, &client, base);
             defer provider.deinit();
             provider.setFramedAttachments(true);
+            if (required) {
+                provider.numeric_dense_dimensions = 3;
+                provider.setMaxResponseBytes(4096);
+            }
 
-            var result = provider.embedParts(a, "clipclap", &.{
+            var result = provider.embedParts(request_alloc, "clipclap", &.{
                 .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
             }) catch |e| {
                 err_out.* = e;
@@ -1105,6 +1119,11 @@ fn testEmbedPartsRequestRoundTrip(binary_response: bool) !void {
     try ts.handleOne();
     group.await(io) catch {};
 
+    if (required and !binary_response) {
+        try std.testing.expect(!result_ok);
+        try std.testing.expectEqual(error.InferenceCapabilitiesStale, result_err);
+        return;
+    }
     if (!result_ok) {
         std.debug.print("embed parts fiber error: {}\n", .{result_err});
         return error.TestUnexpectedResult;

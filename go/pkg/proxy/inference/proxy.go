@@ -3275,6 +3275,18 @@ func (p *Proxy) validatedCapabilityLease(token, revision, model string, operatio
 		}
 		allowed[address] = endpoint
 	}
+	// Execution leases have an idle timeout, independent of catalog freshness.
+	// Renew only after validating identity, authorization, routing generation,
+	// and endpoint incarnations. Never recreate a concurrently revoked lease.
+	p.capabilityLeaseMu.Lock()
+	current, retained := p.capabilityLeases[token]
+	if !retained || current.identity != lease.identity {
+		p.capabilityLeaseMu.Unlock()
+		return validatedCapabilityLease{}, staleCapabilityResolutionError("inference capability lease is stale")
+	}
+	current.expiresAt = time.Now().Add(capabilityLeaseTTL)
+	p.capabilityLeases[token] = current
+	p.capabilityLeaseMu.Unlock()
 	return validatedCapabilityLease{
 		endpoints:       allowed,
 		routeGeneration: lease.routeGeneration,
@@ -3785,6 +3797,12 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 			// every eligible upstream endpoint accepts it. Absence is the
 			// rolling-upgrade-compatible spelling of false.
 			result["framed_attachments"] = aFramed && bFramed
+			aNumeric, aok := optionalInferenceCapabilityBool(a, "numeric_responses_v1")
+			bNumeric, bok := optionalInferenceCapabilityBool(b, "numeric_responses_v1")
+			if !aok || !bok {
+				return nil, false
+			}
+			result["numeric_responses_v1"] = aNumeric && bNumeric
 			aLimits, aok := a["task_limits"].(map[string]any)
 			bLimits, bok := b["task_limits"].(map[string]any)
 			if !aok || !bok {
@@ -3978,6 +3996,9 @@ func validExactInferenceCapabilities(capabilities map[string]any, version int) b
 		return false
 	}
 	if _, ok := optionalInferenceCapabilityBool(capabilities, "framed_attachments"); !ok {
+		return false
+	}
+	if _, ok := optionalInferenceCapabilityBool(capabilities, "numeric_responses_v1"); !ok {
 		return false
 	}
 	if version >= 4 {

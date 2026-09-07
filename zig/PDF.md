@@ -342,9 +342,12 @@ not a document-wide cache or a claim of order-independent render sharing.
   cleanup transaction. Both rows and registry are store-local metadata outside
   document ranges, so shard range transfer cannot separate temporary results
   from their recovery metadata. They never participate in public artifact scans.
-- Fan-out is synchronous on the enrichment thread, before prefetch. Renderer
-  workers never enter enrichment state or concurrently use another consumer's
-  PDF session. There is no document-sized rendered-image cache.
+- Planning and publication stay on the enrichment thread. Synchronous text
+  peers run first; bounded embedding jobs hold independent grants and drain
+  before owner inference. Optional next-window rendering may overlap the final
+  admitted embedding cohort. Renderer workers never enter enrichment state or
+  concurrently use another consumer's PDF session. There is no document-sized
+  rendered-image cache.
 
 Owned key collections retain their allocator extent: growing lists free their
 elements and deinitialize the list by capacity; exact owned slices use slice
@@ -3406,7 +3409,7 @@ The hardening above follows these long-term rules:
     Synchronous, joined scopes may still reuse idle owner credit. Optional
     sharing that cannot obtain its additional grant declines without taking
     the owner's reserved capacity. Alternate PNG storage is released as soon
-    as its peers finish, before owner inference or prefetch. Tests allocate from
+    as its peers finish, before owner inference. Tests allocate from
     the real owner grant while a full independent peer grant remains live and
     verify ledger release.
 157. **Implemented after completion-order review:** the bounded inference job
@@ -3430,12 +3433,50 @@ The hardening above follows these long-term rules:
     decoders also reject malformed lengths and clean up partial allocations.
     Response-construction allocation sweeps also cover the shared HTTP header
     helper; failed list growth releases both copied header fields.
-    This removes JSON float serialization/parsing on negotiated calls, not the
-    conservative remote admission allowance: discovery/route validation and
-    old-node JSON fallback still share that allowance. Shrinking it requires
-    separately bounded discovery and a capability-bound response contract.
+    Legacy calls retain their conservative JSON admission allowance. Planned
+    numeric-only document embeddings use the capability-bound contract below.
     Hardware throughput and peak-RSS qualification remain separate from these
     deterministic scheduling and wire regressions.
+160. **Implemented after admission/backpressure review:** peer invocation
+    memory is a queue limit, not an enrollment failure. When an independent
+    grant is denied, the coordinator retires in-flight work and retries before
+    abandoning window sharing. Backing-allocator OOM is not retried. Completed
+    jobs are fenced, published and freed immediately during final draining as
+    well as queue refill. Only explicit `QueueFull` jobs remain for the existing
+    single serial retry after active model invocations drain. Cancellation joins
+    remaining borrowers before freeing media and does not become an ordinary
+    per-consumer error. Tight-ledger and slow-peer regressions cover release.
+161. **Implemented after prefetch-order review:** synchronous text peers run
+    before embedding peers. Once every remaining peer and the owner hold their
+    invocation grants, a one-shot hook launches optional next-window rendering
+    before the final embedding drain. No further consumer admission competes
+    with that prefetch. Its own composite lease admits scratch and retained
+    output against the same global ledger; rejection preserves synchronous
+    preparation at the next boundary. The hook copies its callback/context to
+    the existing executor, adds no pool, and cannot launch twice. A provider
+    waiting for the launch verifies actual overlap rather than launch order.
+162. **Implemented after numeric-response admission review:** additive v4
+    `numeric_responses_v1` describes AFN1 dense/score support and its fixed
+    4-MiB protocol ceiling. Distributed catalogs advertise it only when every
+    eligible upstream supports it; absence means false during rolling upgrades.
+    The document embedding planner sizes responses from the expected item count
+    and vector dimensions, with a 4-KiB error-envelope floor, conservative HTTP
+    buffering allowance, vector copies and separate transport control overhead.
+    Execution obtains an exactly matching cached descriptor/route lease;
+    it never discovers a catalog inside this smaller invocation grant. An
+    invalidated, missing or changed lease returns to planning, whose single-flight
+    catalog fetch has its own 4-MiB response bound. The request requires AFN1
+    exclusively and validates dimensions/cardinality before allocation. A JSON
+    success response invalidates the lease without entering the JSON parser.
+    Legacy routes select the old JSON budget before admission. For example,
+    four 384-dimensional vectors now require under 384 KiB of non-media
+    invocation credit rather than the previous 32-MiB response allowance alone.
+    This is an admission calculation, not a measured RSS or throughput claim.
+    Catalog refresh TTL is not an execution deadline: an active PDF continues
+    using its descriptor-bound lease, validated on every proxy request. Valid
+    use renews the five-minute idle timeout after checking authorization,
+    routing generation and endpoint incarnations, without resurrecting revoked
+    leases. Idle expiry and topology/descriptor changes still require replan.
 
 The detailed PDF renderer design below remains normative for the
 `PreparedDocument -> PageImage` transformation. References to Florence describe

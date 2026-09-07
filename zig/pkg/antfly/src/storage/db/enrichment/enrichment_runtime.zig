@@ -6352,8 +6352,8 @@ fn scavengeSharedPdfConsumerAttempts(runtime: *EnrichmentRuntime) !void {
 }
 
 /// One enrichment-thread owner fans a rendered window out to later compatible
-/// consumers. A structured window group may overlap the owner invocation;
-/// only typed results survive its join, in private storage.
+/// consumers. Peers drain before owner inference; an independently admitted
+/// next render window may overlap the final peer cohort.
 const SharedPdfWindowScheduler = struct {
     runtime: *EnrichmentRuntime,
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
@@ -6525,7 +6525,7 @@ const SharedPdfWindowScheduler = struct {
         text_source: ?TextSource,
         window_lease: ?*PdfWindowCompositeLease,
     ) !void {
-        var work = try self.begin(source_identity, source_sha, raw, page_count, transform, rendered, credentials, text_source, window_lease);
+        var work = try self.begin(source_identity, source_sha, raw, page_count, transform, rendered, credentials, text_source, window_lease, null);
         defer WindowWork.cancel(&work);
         try WindowWork.finish(&work);
     }
@@ -6561,6 +6561,7 @@ const SharedPdfWindowScheduler = struct {
         credentials: []const u8,
         text_source: ?TextSource,
         window_lease: ?*PdfWindowCompositeLease,
+        prefetch: ?*PdfWindowPrefetchStart,
     ) !?*WindowWork {
         if (self.current + 1 >= self.requests.len) return null;
         try self.ensureConsumers();
@@ -6575,10 +6576,9 @@ const SharedPdfWindowScheduler = struct {
             self.runtime.retry_error_has_request_identity = previous_retry_identity;
         }
         // Executor capacity is not model admission. Without an aggregate
-        // provider permit, join embedding peers before synchronous consumers
-        // (including the owner) enter inference. Page buffers remain shared.
-        for ([_]bool{ false, true }) |text_pass| {
-            if (text_pass) try work.jobs.flush();
+        // provider permit, finish synchronous text consumers before embedding
+        // peers. This leaves no unadmitted peer work when prefetch starts.
+        for ([_]bool{ true, false }) |text_pass| {
             for (self.current + 1..self.requests.len) |index| {
                 const consumer = &self.consumers.?[index];
                 if (consumer.err != null) continue;
@@ -6659,14 +6659,18 @@ const SharedPdfWindowScheduler = struct {
                         consumer.enabled = false;
                         continue;
                     }
-                    if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                    if (EmbeddingJobs.isGroupAbort(err)) return err;
                     consumer.err = err;
                 };
             }
         }
+        // The owner and all remaining peers already hold independent grants.
+        // Optional rendering can only claim the remaining memory; its normal
+        // admission failure falls back to serial preparation at the boundary.
+        if (prefetch) |start| start.start();
         try work.jobs.flush();
         // Only peers need the lossless alternate representation. Release it
-        // before owner inference/prefetch can consume the next memory grant.
+        // before owner inference; next-window rendering may already be active.
         work.png.deinit();
         return work;
     }
@@ -6761,7 +6765,7 @@ const SharedPdfWindowScheduler = struct {
                 .rendered = rendered,
                 // An asynchronous invocation must never borrow/freeze the
                 // owner's allocator, even while the owner is currently idle.
-                .invocation = try PdfWindowConsumerLease.initIndependent(std.heap.smp_allocator, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, required +| stage_id.len),
+                .invocation = try self.admit(consumer, required +| stage_id.len),
                 .group = self,
                 .guard = runtime.active_provider_guard,
                 .cancellation = runtime.config.cancellation,
@@ -6798,6 +6802,50 @@ const SharedPdfWindowScheduler = struct {
             return true;
         }
 
+        // Memory is a queue limit just like executor capacity. Retiring a peer
+        // can make room without discarding this consumer's shared page window.
+        fn admit(self: *@This(), consumer: *Consumer, required: usize) !PdfWindowConsumerLease {
+            const runtime = self.scheduler.runtime;
+            while (true) {
+                if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
+                if (consumer.err) |err| return err;
+                return PdfWindowConsumerLease.initIndependent(std.heap.smp_allocator, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, required) catch |err| {
+                    if (err != error.DocumentExtractionWorkingSetTooLarge or self.count == 0) return err;
+                    try self.retireOne();
+                    continue;
+                };
+            }
+        }
+
+        fn isGroupAbort(err: anyerror) bool {
+            return err == error.Canceled or err == error.Cancelled or
+                isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker;
+        }
+
+        // Publish on the coordinator and release the grant immediately. The
+        // group is deliberately not atomic: healthy siblings stage independently.
+        fn retireCompleted(self: *@This(), slot: *?*Job, publish: bool) !void {
+            const job = slot.*.?;
+            const runtime = self.scheduler.runtime;
+            const fingerprint = runtime.active_failure_fingerprint;
+            const retry_identity = runtime.retry_error_has_request_identity;
+            defer {
+                setActiveFailureFingerprint(runtime, fingerprint);
+                runtime.retry_error_has_request_identity = retry_identity;
+                job.deinit(runtime.alloc);
+                slot.* = null;
+                self.count -= 1;
+            }
+            setActiveFailureFingerprint(runtime, requestFailureFingerprint(job.request));
+            if (publish) if (job.output) |output| self.scheduler.commitEmbeddingOutput(job.invocation.allocator(), job.consumer, job.request, job.source_sha, job.stage_id, output) catch |err| {
+                job.err = err;
+            };
+            if (job.err) |err| {
+                if (isGroupAbort(err)) return err;
+                if (err == error.DocumentExtractionWorkingSetTooLarge or err == error.OutOfMemory) job.consumer.enabled = false else job.consumer.err = err;
+            }
+        }
+
         // Refill after any completion, not after the slowest member of a wave.
         // Reset before scanning so a concurrent completion cannot be lost.
         fn retireOne(self: *@This()) !void {
@@ -6809,27 +6857,9 @@ const SharedPdfWindowScheduler = struct {
                     job.future = null;
                     // Drain the cohort before a bounded serial retry on an
                     // explicit admission denial; never retry arbitrary errors.
-                    if (job.err != null and (job.err.? == error.QueueFull or
-                        isEnrichmentControlError(job.err.?) or enrichmentErrorDisposition(job.err.?) == .fatal_worker))
+                    if (job.err != null and (job.err.? == error.QueueFull or isGroupAbort(job.err.?)))
                         return self.flush();
-                    const runtime = self.scheduler.runtime;
-                    const fingerprint = runtime.active_failure_fingerprint;
-                    const retry_identity = runtime.retry_error_has_request_identity;
-                    defer {
-                        setActiveFailureFingerprint(runtime, fingerprint);
-                        runtime.retry_error_has_request_identity = retry_identity;
-                        job.deinit(runtime.alloc);
-                        slot.* = null;
-                        self.count -= 1;
-                    }
-                    setActiveFailureFingerprint(runtime, requestFailureFingerprint(job.request));
-                    if (job.output) |output| self.scheduler.commitEmbeddingOutput(job.invocation.allocator(), job.consumer, job.request, job.source_sha, job.stage_id, output) catch |err| {
-                        job.err = err;
-                    };
-                    if (job.err) |err| {
-                        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
-                        if (err == error.DocumentExtractionWorkingSetTooLarge or err == error.OutOfMemory) job.consumer.enabled = false else job.consumer.err = err;
-                    }
+                    try self.retireCompleted(slot, true);
                     return;
                 };
                 try self.completed.wait(self.lane.?.io());
@@ -6837,13 +6867,6 @@ const SharedPdfWindowScheduler = struct {
         }
 
         fn flush(self: *@This()) !void {
-            const runtime = self.scheduler.runtime;
-            const fingerprint = runtime.active_failure_fingerprint;
-            const retry_identity = runtime.retry_error_has_request_identity;
-            defer {
-                setActiveFailureFingerprint(runtime, fingerprint);
-                runtime.retry_error_has_request_identity = retry_identity;
-            }
             var first_fatal: ?anyerror = null;
             const retry_admission = !self.serial and self.count > 1;
             // Release every model permit before retrying an admission-denied
@@ -6853,13 +6876,16 @@ const SharedPdfWindowScheduler = struct {
             var remaining = self.count;
             while (remaining != 0) {
                 self.completed.reset();
-                for (self.jobs, 0..) |entry, i| if (entry) |job| {
+                for (&self.jobs, 0..) |*slot, i| if (slot.*) |job| {
                     if (joined[i] or !job.done.load(.acquire)) continue;
                     if (job.future) |*future| future.await(self.lane.?.io());
                     job.future = null;
                     joined[i] = true;
                     remaining -= 1;
-                    if (job.err) |err| if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) {
+                    // Only admission-denied jobs need to survive until every
+                    // active invocation releases its model permit.
+                    if (retry_admission and first_fatal == null and job.err != null and job.err.? == error.QueueFull) continue;
+                    self.retireCompleted(slot, first_fatal == null) catch |err| {
                         if (first_fatal == null) first_fatal = err;
                         for (self.jobs) |pending| if (pending) |other| other.canceled.store(true, .release);
                     };
@@ -6868,29 +6894,16 @@ const SharedPdfWindowScheduler = struct {
             }
             for (&self.jobs) |*slot| {
                 const job = slot.* orelse continue;
-                defer {
-                    job.deinit(runtime.alloc);
-                    slot.* = null;
-                }
                 if (retry_admission and first_fatal == null and job.err != null and job.err.? == error.QueueFull) {
                     self.serial = true;
                     job.err = null;
                     job.run();
                 }
-                setActiveFailureFingerprint(runtime, requestFailureFingerprint(job.request));
-                if (first_fatal == null) if (job.output) |output| self.scheduler.commitEmbeddingOutput(job.invocation.allocator(), job.consumer, job.request, job.source_sha, job.stage_id, output) catch |err| {
-                    job.err = err;
+                self.retireCompleted(slot, first_fatal == null) catch |err| {
+                    if (first_fatal == null) first_fatal = err;
                 };
-                if (job.err) |err| {
-                    if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) {
-                        if (first_fatal == null) {
-                            first_fatal = err;
-                            for (self.jobs) |pending| if (pending) |other| other.canceled.store(true, .release);
-                        }
-                    } else if (err == error.DocumentExtractionWorkingSetTooLarge or err == error.OutOfMemory) job.consumer.enabled = false else job.consumer.err = err;
-                }
             }
-            self.count = 0;
+            std.debug.assert(self.count == 0);
             if (first_fatal) |err| return err;
         }
 
@@ -7109,7 +7122,7 @@ const SharedPdfWindowScheduler = struct {
         }
     }
 
-    fn beginOcr(self: *@This(), source_url: []const u8, source: TextSource, page_count: usize, policy: GeneratedTextBatchPolicy, window: *RuntimePdfRenderWindow) !?*WindowWork {
+    fn beginOcr(self: *@This(), source_url: []const u8, source: TextSource, page_count: usize, policy: GeneratedTextBatchPolicy, window: *RuntimePdfRenderWindow, prefetch: ?*PdfWindowPrefetchStart) !?*WindowWork {
         const cache = self.prepared_sources orelse return null;
         if (self.current + 1 >= self.requests.len) return null;
         var borrowed = try cache.lookup(source_url, if (source.config.credentials.len > 0) source.config.credentials else null) orelse return null;
@@ -7118,7 +7131,7 @@ const SharedPdfWindowScheduler = struct {
         return try self.begin(prepared.source_identity, &prepared.content_sha256, self.raw_doc orelse return null, page_count, SharedPdfTransform.init(source.config, policy.max_pixels, policy.preferred_image_width, policy.preferred_image_height, window.page_output_bytes_cap, window.batch == .raster), switch (window.batch) {
             .encoded => |batch| .{ .encoded = batch },
             .raster => |batch| .{ .raster = batch },
-        }, source.config.credentials, source, window.lease);
+        }, source.config.credentials, source, window.lease, prefetch);
     }
 
     fn consumeText(self: *@This(), consumer: *Consumer, index: usize, source: TextSource, rendered: PdfEmbeddingRenderedWindow, window_lease: ?*PdfWindowCompositeLease, pending_mask: ?[]const bool) !void {
@@ -7846,6 +7859,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         active: std.atomic.Value(bool) = .init(false),
         admission_denied: std.atomic.Value(bool) = .init(false),
         wait_for_cancel: bool = false,
+        prefetch_started: ?*const std.atomic.Value(bool) = null,
         worker_failure: ?anyerror = null,
         text_calls: usize = 0,
         embed_calls: usize = 0,
@@ -7921,6 +7935,11 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             try context.check();
             if (self.worker_failure) |err| return err;
             const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+            if (self.prefetch_started) |started| while (!started.load(.acquire)) {
+                try context.check();
+                if (platform_time.monotonicNs() > deadline) return error.PrefetchDidNotOverlapPeers;
+                std.Thread.yield() catch {};
+            };
             while (self.wait_for_cancel) {
                 try context.check();
                 if (@import("antfly_platform").time.monotonicNs() > deadline) return error.SharedConsumerWasNotCanceled;
@@ -8102,7 +8121,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         defer scheduler.consumers.?[1].enabled = true;
         defer scheduler.consumers.?[2].enabled = true;
         const owner_digest = [_]u8{10} ** 32;
-        var owner_work = try scheduler.begin(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &owner_digest, "{}", 2, transform, .{ .encoded = batch }, "", parallel_source, window_lease);
+        var owner_work = try scheduler.begin(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &owner_digest, "{}", 2, transform, .{ .encoded = batch }, "", parallel_source, window_lease, null);
         defer SharedPdfWindowScheduler.WindowWork.cancel(&owner_work);
         try std.testing.expect(owner_work != null);
         const owner_alloc = if (window_lease) |lease| lease.allocator() else alloc;
@@ -8176,6 +8195,97 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             const failed_digest = [_]u8{11} ** 32;
             try std.testing.expectError(error.Canceled, scheduler.consumeEmbedding(&scheduler.consumers.?[4], requests[4], &failed_digest, .{ .encoded = batch }, 2, window_lease, null, &jobs));
             try std.testing.expectEqual(@as(usize, 0), jobs.count);
+            try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+        }
+        for ([_]bool{ false, true }) |flush_test| {
+            // Admission must drain grants, and final flush must release a
+            // completed sibling while another invocation is still running.
+            var budgets = resource_manager_mod.Options.defaultBudgets();
+            budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 120 };
+            var tight = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+            defer tight.deinit(alloc);
+            const previous_manager = runtime.config.resource_manager;
+            runtime.config.resource_manager = &tight;
+            defer runtime.config.resource_manager = previous_manager;
+            var jobs = SharedPdfWindowScheduler.EmbeddingJobs{ .scheduler = &scheduler };
+            defer jobs.deinit();
+            jobs.lane = try backend_handle.ptr().acquireInferenceLane();
+            var empty = batch;
+            empty.results = &.{};
+            for (0..2) |i| {
+                const job = try alloc.create(SharedPdfWindowScheduler.EmbeddingJobs.Job);
+                job.* = .{
+                    .embedder = runtime.config.dense_embedder.?,
+                    .request = requests[4],
+                    .consumer = &scheduler.consumers.?[4],
+                    .source_sha = &digest,
+                    .stage_id = &.{},
+                    .rendered = .{ .encoded = empty },
+                    .invocation = try PdfWindowConsumerLease.initIndependent(alloc, &tight, 60),
+                    .guard = runtime.active_provider_guard,
+                    .cancellation = runtime.config.cancellation,
+                    .group = &jobs,
+                    .done = .init(!flush_test or i == 1),
+                };
+                jobs.jobs[i] = job;
+                jobs.count += 1;
+            }
+            if (flush_test) {
+                const Slow = struct {
+                    fn run(job: *SharedPdfWindowScheduler.EmbeddingJobs.Job, manager_ptr: *resource_manager_mod.ResourceManager) void {
+                        defer {
+                            job.done.store(true, .release);
+                            job.group.completed.set(job.group.lane.?.io());
+                        }
+                        const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+                        while (manager_ptr.sliceStats(.document_extraction_working_set).used_bytes > 60) {
+                            if (platform_time.monotonicNs() > deadline) {
+                                job.err = error.CompletedGrantWasRetained;
+                                return;
+                            }
+                            std.Thread.yield() catch {};
+                        }
+                    }
+                };
+                jobs.jobs[0].?.future = try jobs.lane.?.io().concurrent(Slow.run, .{ jobs.jobs[0].?, &tight });
+                try jobs.flush();
+                try std.testing.expect(scheduler.consumers.?[4].err == null);
+            } else {
+                var admitted = try jobs.admit(&scheduler.consumers.?[4], 100);
+                try std.testing.expectEqual(@as(u64, 100), tight.sliceStats(.document_extraction_working_set).used_bytes);
+                admitted.deinit();
+                try std.testing.expect(scheduler.consumers.?[4].enabled);
+                try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, jobs.admit(&scheduler.consumers.?[4], 121));
+            }
+            try std.testing.expectEqual(@as(usize, 0), jobs.count);
+            try std.testing.expectEqual(@as(u64, 0), tight.sliceStats(.document_extraction_working_set).used_bytes);
+        }
+        {
+            // Peers cannot finish until the launch hook runs. This detects a
+            // prefetch accidentally moved behind the final cohort barrier.
+            const Start = struct {
+                fn run(raw: *anyopaque) void {
+                    const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                    flag.store(true, .release);
+                }
+            };
+            var started: std.atomic.Value(bool) = .init(false);
+            const lane = try backend_handle.ptr().acquireInferenceLane();
+            var owned_lane = lane;
+            defer owned_lane.release();
+            var future: ?Io.Future(void) = null;
+            defer if (future) |*task| task.await(lane.io());
+            var prefetch = PdfWindowPrefetchStart{ .io = lane.io(), .context = &started, .run_fn = Start.run, .future = &future };
+            harness.wait_for_cancel = false;
+            harness.single_slot = false;
+            harness.prefetch_started = &started;
+            defer harness.prefetch_started = null;
+            const prefetch_digest = [_]u8{12} ** 32;
+            var work = try scheduler.begin(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &prefetch_digest, "{}", 2, transform, .{ .encoded = batch }, "", null, window_lease, &prefetch);
+            defer SharedPdfWindowScheduler.WindowWork.cancel(&work);
+            try std.testing.expect(started.load(.acquire));
+            try std.testing.expect(scheduler.consumers.?[4].err == null);
+            try SharedPdfWindowScheduler.WindowWork.finish(&work);
             try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
         }
     }
@@ -13562,6 +13672,28 @@ const RuntimePdfRenderWindowPreparer = struct {
     }
 };
 
+/// A one-shot launch hook, not another executor. The callback and context are
+/// copied into the task so this stack-local hook need not survive the launch.
+const PdfWindowPrefetchStart = struct {
+    io: ?Io,
+    context: *anyopaque,
+    run_fn: *const fn (*anyopaque) void,
+    future: *?Io.Future(void),
+    started: bool = false,
+
+    fn start(self: *@This()) void {
+        if (self.started) return;
+        self.started = true;
+        const io = self.io orelse return;
+        std.debug.assert(self.future.* == null);
+        self.future.* = io.concurrent(run, .{ self.run_fn, self.context }) catch null;
+    }
+
+    fn run(callback: *const fn (*anyopaque) void, context: *anyopaque) void {
+        callback(context);
+    }
+};
+
 const RuntimePdfRenderWindowPrefetch = struct {
     preparer: *const RuntimePdfRenderWindowPreparer,
     start_index: usize,
@@ -13569,7 +13701,8 @@ const RuntimePdfRenderWindowPrefetch = struct {
     window: ?RuntimePdfRenderWindow = null,
     err: ?anyerror = null,
 
-    fn run(self: *@This()) void {
+    fn run(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
         self.window = self.preparer.prepare(self.start_index) catch |err| {
             self.err = err;
             return;
@@ -13812,28 +13945,27 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                     logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, pdf_render_window.?.unit_indices, &pdf_render_window.?, null, window_started_ns);
                     pdf_render_cursor = 0;
 
+                    const next_start_index = pdf_render_window.?.unit_indices[pdf_render_window.?.unit_indices.len - 1] +| 1;
+                    std.debug.assert(pdf_prefetch_job.window == null);
+                    pdf_prefetch_job = .{
+                        .preparer = preparer,
+                        .start_index = next_start_index,
+                        .started_ns = runtime.config.clock.nowRealtimeNs(),
+                    };
+                    var prefetch = PdfWindowPrefetchStart{
+                        .io = if (next_start_index < units.len and generatedPdfRenderPrefetchBatches() != 0) pdf_prefetch_io else null,
+                        .context = &pdf_prefetch_job,
+                        .run_fn = RuntimePdfRenderWindowPrefetch.run,
+                        .future = &pdf_prefetch_future,
+                    };
                     if (runtime.shared_pdf_windows) |shared| shared_work = try shared.beginOcr(source_url, .{
                         .config = config,
                         .content_type = source_content_type,
                         .fingerprint = source_fingerprint,
                         .units = units,
                         .indices = pdf_render_window.?.unit_indices,
-                    }, try preparer.coordinator.session.pageCount(), admitted_batch_policy, &pdf_render_window.?);
-
-                    const next_start_index = pdf_render_window.?.unit_indices[pdf_render_window.?.unit_indices.len - 1] +| 1;
-                    if (next_start_index < units.len and generatedPdfRenderPrefetchBatches() != 0) if (pdf_prefetch_io) |io| {
-                        std.debug.assert(pdf_prefetch_future == null);
-                        std.debug.assert(pdf_prefetch_job.window == null);
-                        pdf_prefetch_job = .{
-                            .preparer = preparer,
-                            .start_index = next_start_index,
-                            .started_ns = runtime.config.clock.nowRealtimeNs(),
-                        };
-                        // Executor saturation is an optimization miss, not a
-                        // document failure; the next boundary falls back to
-                        // synchronous preparation.
-                        pdf_prefetch_future = io.concurrent(RuntimePdfRenderWindowPrefetch.run, .{&pdf_prefetch_job}) catch null;
-                    };
+                    }, try preparer.coordinator.session.pageCount(), admitted_batch_policy, &pdf_render_window.?, &prefetch);
+                    prefetch.start(); // also covers no compatible peer scheduler
                 }
                 if (pdf_render_window.?.unit_indices[pdf_render_cursor] != idx) return error.InvalidPdfRenderWindow;
                 planned_parts_json = pdf_render_window.?.planned_parts_json[pdf_render_cursor];
@@ -19829,7 +19961,8 @@ const PdfEmbeddingWindowPrefetch = struct {
     window: ?PdfEmbeddingPreparedWindow = null,
     err: ?anyerror = null,
 
-    fn run(self: *@This()) void {
+    fn run(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
         self.window = self.preparer.prepare(self.first_item) catch |err| {
             self.err = err;
             return;
@@ -20346,6 +20479,15 @@ fn processPdfPageImageEmbeddingWithAllocator(
     while (current_window) |*current| {
         try heartbeatEnrichmentLease(runtime);
         try checkProviderFailureGuard(runtime);
+        const next_first_item = current.first_item + current.count;
+        std.debug.assert(prefetch_job.window == null);
+        prefetch_job = .{ .preparer = &window_preparer, .first_item = next_first_item };
+        var prefetch = PdfWindowPrefetchStart{
+            .io = if (next_first_item < pending_pages.items.len and prefetch_batches != 0) prefetch_io else null,
+            .context = &prefetch_job,
+            .run_fn = PdfEmbeddingWindowPrefetch.run,
+            .future = &prefetch_future,
+        };
         var shared_work = if (runtime.shared_pdf_windows) |shared| try shared.begin(
             prepared_source.source_identity,
             &prepared_source.content_sha256,
@@ -20356,20 +20498,10 @@ fn processPdfPageImageEmbeddingWithAllocator(
             "",
             null,
             current.lease,
+            &prefetch,
         ) else null;
         defer SharedPdfWindowScheduler.WindowWork.cancel(&shared_work);
-        const next_first_item = current.first_item + current.count;
-        if (next_first_item < pending_pages.items.len and prefetch_batches != 0) if (prefetch_io) |io| {
-            std.debug.assert(prefetch_future == null);
-            std.debug.assert(prefetch_job.window == null);
-            prefetch_job = .{
-                .preparer = &window_preparer,
-                .first_item = next_first_item,
-            };
-            // Prefetch is an optimization. Executor saturation or a temporary
-            // task-spawn failure must preserve the synchronous baseline.
-            prefetch_future = io.concurrent(PdfEmbeddingWindowPrefetch.run, .{&prefetch_job}) catch null;
-        };
+        prefetch.start();
 
         const lease = current.lease;
         const rendered = &current.rendered;
