@@ -297,9 +297,28 @@ pub const BatchRequest = struct {
     /// Internal identity context for receiver-side merge copy and rollback
     /// batches. Public batch parsing never sets it.
     merge_replication: ?MergeReplicationContext = null,
+    /// Authoritative document-scoped store rows, not original write inputs.
+    /// Ordered after primary copy and before the receiver completion checkpoint.
+    merge_artifacts: []const BatchWrite = &.{},
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
 };
+
+pub fn validateMergeArtifacts(req: BatchRequest) !void {
+    if (req.merge_artifacts.len == 0) return;
+    if (req.merge_replication == null or req.merge_checkpoint != null or
+        req.split_checkpoint != null or req.split_replication != null or
+        req.split_transition != null or req.merge_source_transition != null or
+        req.writes.len != 0 or req.deletes.len != 0 or req.transaction != null or
+        req.transforms.len != 0 or req.predicates.len != 0 or
+        req.graph_writes.len != 0 or req.graph_deletes.len != 0)
+        return error.InvalidBatchRequest;
+    const keys = @import("../internal_keys.zig");
+    for (req.merge_artifacts) |row| {
+        if (!keys.isGraphEdgeArtifactKey(row.key) and !keys.isEmbeddingArtifactKey(row.key) and
+            !keys.isDerivedEmbeddingArtifactKey(row.key)) return error.InvalidBatchRequest;
+    }
+}
 
 pub const GraphEdgeWrite = struct {
     index_name: []const u8,

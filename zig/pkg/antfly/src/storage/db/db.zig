@@ -6741,6 +6741,11 @@ pub const DB = struct {
     fn projectedBatchLsmAdmissionBytes(req: types.BatchRequest) u64 {
         var payload_bytes: u64 = 0;
         var operations: u64 = 0;
+        for (req.merge_artifacts) |write| {
+            payload_bytes +|= @intCast(write.key.len);
+            payload_bytes +|= @intCast(write.value.len);
+            operations +|= 1;
+        }
         for (req.writes) |write| {
             payload_bytes +|= @intCast(write.key.len);
             payload_bytes +|= @intCast(write.value.len);
@@ -7232,6 +7237,7 @@ pub const DB = struct {
     }
 
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        try types.validateMergeArtifacts(req);
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (!opts.bypass_ha_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
         var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
@@ -7273,6 +7279,17 @@ pub const DB = struct {
                     apply_mutex_held = false;
                     return;
                 },
+            }
+        }
+
+        if (req.merge_artifacts.len > 0) {
+            if (!req.merge_replication.?.identity_namespace.eql(self.core.identity_namespace))
+                return error.DocIdentityNamespaceMismatch;
+            for (req.merge_artifacts) |row| {
+                const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, row.key)) orelse
+                    return error.InvalidBatchRequest;
+                defer self.alloc.free(owner);
+                if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
             }
         }
 
@@ -7689,6 +7706,10 @@ pub const DB = struct {
         }
 
         try store_writes.appendSlice(self.alloc, timestamp_writes.items);
+        for (req.merge_artifacts) |row| {
+            try store_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
+            try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, row.key);
+        }
         for (explicit_embedding_artifact_writes.items) |write| {
             try store_writes.append(self.alloc, .{
                 .key = write.key,
@@ -7789,7 +7810,7 @@ pub const DB = struct {
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
         }
-        if (explicit_embedding_artifact_writes.items.len > 0 or
+        if (req.merge_artifacts.len > 0 or explicit_embedding_artifact_writes.items.len > 0 or
             explicit_graph_artifact_writes.items.len > 0 or
             precomputed_generated.artifact_writes.len > 0)
         {
@@ -19209,6 +19230,117 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.index_manager.syncAll(force);
+    }
+
+    /// Raw primary outcomes for a transition snapshot. Do not use public scan
+    /// projection here: it can hydrate derived fields into the returned JSON.
+    pub fn mergeDocumentsPage(self: *DB, alloc: Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) ![]types.BatchWrite {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        const lower = if (after_key) |key| try internal_keys.documentKeyAlloc(alloc, key) else try documentRangeLowerAlloc(alloc, byte_range.start);
+        defer alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try documentRangeUpperAlloc(alloc, byte_range.end) else null;
+        defer if (upper) |key| alloc.free(key);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var rows = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var bytes: usize = 0;
+        var next = try cursor.seekAtOrAfter(lower);
+        while (next) |row| : (next = try cursor.next()) {
+            if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
+            if (!internal_keys.isPrimaryDocumentKey(row.key)) continue;
+            const key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, row.key)).?;
+            errdefer alloc.free(key);
+            if (after_key) |after| if (std.mem.order(u8, key, after) != .gt) {
+                alloc.free(key);
+                continue;
+            };
+            const value = try alloc.dupe(u8, row.value);
+            errdefer alloc.free(value);
+            try rows.append(alloc, .{ .key = key, .value = value });
+            bytes +|= key.len +| value.len;
+            if (rows.items.len >= 128 or bytes >= 1024 * 1024) break;
+        }
+        return rows.toOwnedSlice(alloc);
+    }
+
+    /// Returns a bounded page of authoritative artifacts under a transition
+    /// lease. The continuation is an exclusive physical store key. One large
+    /// row may exceed the byte budget so pagination always makes progress.
+    pub fn mergeArtifactsPage(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        after_key: ?[]const u8,
+    ) ![]types.BatchWrite {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        const lower = try documentRangeLowerAlloc(alloc, byte_range.start);
+        defer alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try documentRangeUpperAlloc(alloc, byte_range.end) else null;
+        defer if (upper) |key| alloc.free(key);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var rows = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var bytes: usize = 0;
+        var next = try cursor.seekAtOrAfter(after_key orelse lower);
+        while (next) |row| : (next = try cursor.next()) {
+            if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
+            if (after_key) |key| if (std.mem.order(u8, row.key, key) != .gt) continue;
+            if (!isMergeArtifactKey(row.key)) continue;
+            const value = if (internal_keys.isGraphEdgeArtifactKey(row.key)) graph: {
+                const edge = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, row.key)) orelse return error.InvalidBatchRequest;
+                defer {
+                    alloc.free(edge.doc_key);
+                    alloc.free(edge.index_name);
+                    alloc.free(edge.edge_type);
+                    alloc.free(edge.target_doc_key);
+                }
+                const index = self.core.index_manager.graphIndex(edge.index_name) orelse continue;
+                var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, row.value);
+                defer decoded.deinit(alloc);
+                if (enrichment_artifact_codec.isLegacyUnboundGraphEdge(row.value)) continue;
+                if (decoded.generation != index.config.coverage_generation and
+                    !enrichment_artifact_codec.isPortableUnboundGraphEdge(row.value)) continue;
+                // Authenticate against the donor generation, then mark the
+                // edge portable. Receiver replay binds its own generation;
+                // copying the donor generation would silently discard it.
+                break :graph try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(
+                    alloc,
+                    decoded.weight,
+                    decoded.created_at,
+                    decoded.updated_at,
+                    decoded.metadata_json,
+                );
+            } else try alloc.dupe(u8, row.value);
+            errdefer alloc.free(value);
+            const key = try alloc.dupe(u8, row.key);
+            errdefer alloc.free(key);
+            try rows.append(alloc, .{ .key = key, .value = value });
+            bytes +|= key.len +| value.len;
+            if (rows.items.len >= 128 or bytes >= 1024 * 1024) break;
+        }
+        return rows.toOwnedSlice(alloc);
     }
 
     /// Imports donor-owned derived artifacts into a live merge receiver while
@@ -33504,6 +33636,12 @@ fn isMetadataKey(key: []const u8) bool {
         internal_keys.isTtlKey(key);
 }
 
+fn isMergeArtifactKey(key: []const u8) bool {
+    return internal_keys.isGraphEdgeArtifactKey(key) or
+        internal_keys.isEmbeddingArtifactKey(key) or
+        internal_keys.isDerivedEmbeddingArtifactKey(key);
+}
+
 fn isPrimaryDocumentStoreKey(key: []const u8) bool {
     return internal_keys.isPrimaryDocumentKey(key);
 }
@@ -33695,6 +33833,10 @@ fn encodeThinReplayRecordPayload(
 
     for (changed_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+        if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .dense_vector);
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
+        }
         if (internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
         if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         if (internal_keys.isAssetArtifactKey(key)) {
@@ -84536,6 +84678,88 @@ test "db document _edges reconcile graph state and preserve base document with d
 
     try std.testing.expectEqual(@as(u32, 1), after.total_hits);
     try std.testing.expectEqualStrings("doc:c", after.hits[0].id);
+}
+
+test "db replicated merge artifacts preserve graph dense sparse projections across replay and reopen" {
+    const alloc = std.testing.allocator;
+    var donor_path_buf: [256]u8 = undefined;
+    const donor_path = tempPath(&donor_path_buf);
+    defer cleanupTempDir(donor_path);
+    var donor = try DB.open(alloc, std.mem.span(donor_path), .{});
+    defer donor.close();
+    const configs = [_]types.IndexConfig{
+        .{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" },
+        .{ .name = "sp_v1", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" },
+        .{ .name = "gr_v1", .kind = .graph, .config_json = "{}" },
+    };
+    for (configs) |config| try donor.addIndex(config);
+    try donor.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1]},\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:b\"}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    const rows = try donor.mergeArtifactsPage(alloc, .{ .start = "", .end = "" }, null);
+    defer {
+        for (rows) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    const end_page = try donor.mergeArtifactsPage(alloc, .{ .start = "", .end = "" }, rows[rows.len - 1].key);
+    defer alloc.free(end_page);
+    try std.testing.expectEqual(@as(usize, 0), end_page.len);
+    const primary = (try donor.get(alloc, "doc:a")).?;
+    defer alloc.free(primary);
+    // Exercise both a live indexed receiver and a replica that restarts with
+    // artifact replay still pending.
+    for ([_]bool{ true, false }) |start_workers| {
+        var receiver_path_buf: [256]u8 = undefined;
+        const receiver_path = tempPath(&receiver_path_buf);
+        defer cleanupTempDir(receiver_path);
+        {
+            var receiver = try DB.open(alloc, std.mem.span(receiver_path), .{ .start_index_workers = start_workers });
+            defer receiver.close();
+            for (configs) |config| try receiver.addIndex(config);
+            try receiver.batch(.{
+                .writes = &.{ .{ .key = "doc:a", .value = primary }, .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" } },
+                .sync_level = .full_index,
+            });
+            const req: types.BatchRequest = .{
+                .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = receiver.core.identity_namespace },
+                .merge_artifacts = rows,
+            };
+            const identity: RaftAppliedEntryIdentity = .{ .term = 1, .index = 10 };
+            try receiver.batchRaftReplicatedApply(req, identity);
+            try receiver.batchRaftReplicatedApply(req, identity);
+            if (start_workers) {
+                try receiver.runUntilIdle();
+                try expectMergeArtifactSearches(alloc, &receiver);
+            }
+        }
+        var reopened = try DB.open(alloc, std.mem.span(receiver_path), .{});
+        defer reopened.close();
+        try reopened.runUntilIdle();
+        try expectMergeArtifactSearches(alloc, &reopened);
+    }
+}
+
+fn expectMergeArtifactSearches(alloc: Allocator, db: *DB) !void {
+    var dense = try db.search(alloc, .{ .index_name = "dv_v1", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
+    defer dense.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dense.hits.len);
+    try std.testing.expectEqualStrings("doc:a", dense.hits[0].id);
+    var sparse = try db.search(alloc, .{ .index_name = "sp_v1", .query = .{ .sparse_knn = .{ .indices = &.{7}, .values = &.{1}, .k = 1 } }, .limit = 1 });
+    defer sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sparse.hits.len);
+    try std.testing.expectEqualStrings("doc:a", sparse.hits[0].id);
+    var graph = try db.search(alloc, .{ .query = .{ .graph = .{ .query_type = .neighbors, .index_name = "gr_v1", .start_nodes = .{ .keys = &.{"doc:a"} }, .params = .{ .edge_types = &.{"links"} } } }, .limit = 10 });
+    defer graph.deinit();
+    try std.testing.expectEqual(@as(usize, 1), graph.hits.len);
+    try std.testing.expectEqualStrings("doc:b", graph.hits[0].id);
 }
 
 test "db document _embeddings update vector index and strip stored special fields" {

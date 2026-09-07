@@ -2575,9 +2575,10 @@ VOPR work has found concrete production and harness defects:
   regression proves the retry/action path on `VoprIo`.
 - Production merge catch-up parsed only legacy `put:`/`del:` entries, while
   current DataServer Raft logs retain JSON batch envelopes. A merge could
-  therefore finalize without replaying current writes. Merge replay now
-  decodes the production envelope, skips protocol barriers, preserves Raft and
-  within-request operation order, and retains legacy compatibility.
+  therefore finalize without copying current writes. The initial envelope
+  decoder was subsequently superseded by the committed-outcome snapshot and
+  artifact transfer described in "Merge Outcome and Artifact Preservation"
+  below: raw requests are not a safe materialized-effects log.
 - Receiver byte-range coverage was being used as implicit proof that merge
   bootstrap had completed. That is unsound when the receiver already covers
   the donor or metadata changes precede the data copy. Merge state now persists
@@ -3349,6 +3350,56 @@ coordinator coverage passes nine. The production rebuild and formatting checks
 pass, as do all 21 selected public deadline/join/graph/semantic E2Es. These
 local checks cover the reported Linux CI abort; they do not claim
 that a new remote CI run has completed.
+
+### Merge Outcome and Artifact Preservation (2026-09-07)
+
+The follow-up review found two data-preservation defects beyond import lock
+scope: replicated merge copied only primary JSON, losing stripped graph and
+explicit dense/sparse inputs; local bootstrap replayed historical requests over
+an already-current snapshot, while its tail decoder ignored transforms,
+predicates, and transaction outcomes.
+
+Live local merge now reads raw primary outcomes from the transition-leased
+donor DB. Bootstrap and catch-up replace the donor-owned receiver slice, then
+copy current artifacts before advancing the watermark. They do not replay old
+inserts, transforms, aborted prepares, or failed conditional writes. Offline
+coordinators still require an already-reconciled primary projection. Local
+artifact import uses the durable batch/index journal rather than mutating live
+index projections outside that journal.
+
+Replicated merge refreshes the receiver slice using receiver-key deletion
+proposals, current primary writes, and bounded artifact pages. It no longer
+depends on retained request history for tombstones. Private `_merge_artifacts`
+commands carry binary-safe store rows with receiver identity, reject public,
+unscoped, mixed-mutation, and non-artifact payloads, account for admission bytes,
+and persist artifacts, replay work, and the Raft apply receipt together. Durable
+protocol v5 activation prevents older replicas from silently ignoring them.
+Every receiver replica applies these commands before the completion checkpoint.
+
+Embedding-only changes notify dense and sparse replay. Graph export authenticates
+the donor's current index generation and emits portable edges that receiver
+replay binds to its own generation; retired-generation edges are not revived.
+Primary and artifact export pages stop at 128 rows or approximately 1 MiB,
+allowing one oversized row for progress. Receiver range clearing and the offline
+projection path retain their existing whole-range allocation; this is not a
+claim that every transition phase is memory-bounded.
+
+Regressions cover bootstrap and tail transforms, aborted and rejected
+conditional prepares, delete/recreate, removal of stale documents, preservation
+of the receiver base range, binary payload round trips and rejection, vector
+and graph searches after replay/reopen, and production DataServer graph merge
+through rollback, fresh retry, finalization, and receiver reopen on `VoprIo`.
+Broader disjoint-placement, artifact-heavy snapshot-install, and overlapping
+failure campaigns remain roadmap work, not newly proven by these focused tests.
+
+Validation: the data-storage suite passes 68 tests and the merge-coordinator
+filter passes ten. The artifact/reopen, wire-validation, production graph-merge,
+and transaction-outcome regressions pass in ReleaseSafe. The three-production-
+owner merge/split record-and-replay history and lifecycle protocol check pass
+without skips after granting local listener access. The production build,
+formatting checks, and all 21 selected public deadline/join/graph/semantic E2Es
+pass. GitHub reported no CI checks for the prior PR head at validation time;
+these are local results, not a claim of completed remote CI.
 
 ### Current Answer: Coverage, Parity, and Completeness
 

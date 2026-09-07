@@ -22,6 +22,7 @@ pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_time
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
 pub const merge_transition_protocol_version = internal_batch_forwarding.raft_batch_merge_transition_protocol_version;
 pub const split_delta_predecessor_protocol_version = internal_batch_forwarding.raft_batch_split_delta_predecessor_protocol_version;
+pub const merge_artifacts_protocol_version = internal_batch_forwarding.raft_batch_merge_artifacts_protocol_version;
 
 pub const OwnedReplicatedBatch = struct {
     table_name: []u8,
@@ -114,7 +115,8 @@ test "raft protocol barrier is fail closed for legacy batch parsers" {
     try std.testing.expect(activation_barrier_protocol_version > timestamp_protocol_version);
     try std.testing.expect(merge_transition_protocol_version > activation_barrier_protocol_version);
     try std.testing.expect(split_delta_predecessor_protocol_version > merge_transition_protocol_version);
-    try std.testing.expectEqual(protocol_version, split_delta_predecessor_protocol_version);
+    try std.testing.expect(merge_artifacts_protocol_version > split_delta_predecessor_protocol_version);
+    try std.testing.expectEqual(protocol_version, merge_artifacts_protocol_version);
     const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
     defer std.testing.allocator.free(encoded);
 
@@ -292,6 +294,35 @@ test "raft batch round trips merge replay identity with checkpoint" {
     try std.testing.expectEqual(@as(u64, 41), replication.donor_group_id);
     try std.testing.expectEqual(@as(u64, 42), replication.receiver_group_id);
     try std.testing.expect(replication.identity_namespace.eql(namespace));
+}
+
+test "raft batch round trips merge artifacts and rejects public or unscoped payloads" {
+    const alloc = std.testing.allocator;
+    const keys = @import("../storage/internal_keys.zig");
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense");
+    defer alloc.free(key);
+    const artifacts = [_]db_mod.types.BatchWrite{.{ .key = key, .value = "\x00\xff\x01opaque" }};
+    const req: db_mod.types.BatchRequest = .{
+        .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 } },
+        .merge_artifacts = &artifacts,
+    };
+    const encoded = try encode(alloc, "docs", req);
+    defer alloc.free(encoded);
+    var decoded = try decode(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.merge_artifacts.len);
+    try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
+    try std.testing.expectEqualSlices(u8, artifacts[0].value, decoded.batch.req.merge_artifacts[0].value);
+    const body = try batch_api.encodeBatchRequest(alloc, req);
+    defer alloc.free(body);
+    try std.testing.expectError(error.InvalidBatchRequest, batch_api.parseBatchRequest(alloc, body));
+    try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", .{ .merge_artifacts = &artifacts }));
+    var mixed = req;
+    mixed.writes = &.{.{ .key = "doc:a", .value = "{}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", mixed));
+    var metadata = req;
+    metadata.merge_artifacts = &.{.{ .key = "\x00\x00__metadata__:unsafe", .value = "{}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", metadata));
 }
 
 test "raft batch round trips merge source transition" {

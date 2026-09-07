@@ -32498,6 +32498,7 @@ fn validateMergeReplicationForApply(
     req: db_mod.types.BatchRequest,
     group_id: u64,
 ) !?doc_identity.Namespace {
+    try db_mod.types.validateMergeArtifacts(req);
     const replication = req.merge_replication orelse return null;
     if (replication.transition_id == 0 or replication.donor_group_id == 0 or
         replication.receiver_group_id == 0 or

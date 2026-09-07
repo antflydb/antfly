@@ -4892,6 +4892,8 @@ pub fn build(b: *std.Build) void {
         "raft batch round trips internal merge checkpoint",
         "raft batch round trips merge replay identity with checkpoint",
         "raft batch round trips merge source transition",
+        "raft batch round trips merge artifacts",
+        "db replicated merge artifacts",
         "db replicated merge checkpoints persist phase range and watermark across reopen",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
@@ -5118,7 +5120,7 @@ pub fn build(b: *std.Build) void {
         "db merge coordinator opt-in applies configured receiver identity namespace",
         "db merge coordinator finalize persists across reopen",
         "db merge coordinator requires durable bootstrap evidence for a pre-covering receiver",
-        "merge replay decodes production raft batch envelopes in request order",
+        "db merge coordinator copies committed outcomes without replaying transforms or aborted intents",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
     };

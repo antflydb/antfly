@@ -301,10 +301,12 @@ pub const Destination = struct {
         alloc: std.mem.Allocator,
         donor_range: db_types.ByteRange,
         donor_entries: []const shard_state_store.AppliedDataKV,
-        donor_applied_index: u64,
     ) !void {
         const current_range = self.db.getRange();
         try self.db.updateRange(mergeRanges(current_range, donor_range));
+        // Replace the donor-owned slice, including deletions and removed
+        // artifacts. The receiver's original range is untouched.
+        try self.deleteDocsInRange(alloc, donor_range);
 
         if (donor_entries.len > 0) {
             const writes = try alloc.alloc(db_types.BatchWrite, donor_entries.len);
@@ -317,7 +319,6 @@ pub const Destination = struct {
             }
             try self.db.batch(.{ .writes = writes });
         }
-        try self.db.setSplitDeltaFinalSeq(donor_applied_index);
     }
 
     pub fn applyDeltas(self: *Destination, alloc: std.mem.Allocator, deltas: []const shard_mod.SplitDelta) !void {
@@ -426,34 +427,6 @@ pub const Destination = struct {
                 .deletes = deletes.items,
             });
         }
-    }
-
-    pub fn applyMergeReplay(
-        self: *Destination,
-        alloc: std.mem.Allocator,
-        donor_range: db_types.ByteRange,
-        operations: []const ReplayOperation,
-        donor_applied_index: u64,
-    ) !void {
-        _ = alloc;
-        // Preserve Raft order here instead of coalescing the log into one DB
-        // batch. Repeated writes to the same document are valid across log
-        // entries, and special fields such as `_edges` have replacement
-        // semantics whose intermediate deletes must not be lost.
-        for (operations) |op| switch (op) {
-            .put => |put| {
-                if (!donor_range.contains(put.key)) continue;
-                try self.db.batch(.{ .writes = &.{.{
-                    .key = put.key,
-                    .value = put.value,
-                }} });
-            },
-            .delete => |key| {
-                if (!donor_range.contains(key)) continue;
-                try self.db.batch(.{ .deletes = &.{key} });
-            },
-        };
-        try self.db.setSplitDeltaFinalSeq(donor_applied_index);
     }
 };
 
@@ -1005,16 +978,47 @@ pub const MergeCoordinator = struct {
         defer range_state.freeRange(self.alloc, donor_range);
         if (self.bootstrap_complete) return false;
 
-        const donor_entries = try self.donor.groupState(self.alloc, self.donor_group_id);
-        defer shard_state_store.freeGroupStateEntries(self.alloc, donor_entries);
+        const donor_applied_index = try self.copyCurrentDonorSnapshot(donor_range);
+        self.bootstrap_complete = true;
+        self.bootstrap_applied_index = donor_applied_index;
+        try self.persistMergeState();
+        return true;
+    }
+
+    fn copyCurrentDonorSnapshot(self: *MergeCoordinator, donor_range: db_types.ByteRange) !u64 {
         const donor_applied_index = try self.donorAppliedIndex();
-        try self.receiver.applyMergeBootstrap(self.alloc, .{
-            .start = donor_range.start,
-            .end = donor_range.end,
-        }, donor_entries, donor_applied_index);
+        if (self.donor_lease) |lease| {
+            // A live DB is authoritative for transforms, predicates and 2PC
+            // outcomes. The raw Raft request/projection is not an effects log.
+            if (try lease.db.hasTopologySensitiveTransactions()) return error.TransactionConflict;
+            try self.receiver.db.updateRange(mergeRanges(self.receiver.getRange(), donor_range));
+            try self.receiver.deleteDocsInRange(self.alloc, donor_range);
+            var after_key: ?[]u8 = null;
+            defer if (after_key) |key| self.alloc.free(key);
+            while (true) {
+                const rows = try lease.db.mergeDocumentsPage(self.alloc, donor_range, after_key);
+                defer {
+                    for (rows) |row| {
+                        self.alloc.free(row.key);
+                        self.alloc.free(row.value);
+                    }
+                    self.alloc.free(rows);
+                }
+                if (rows.len == 0) break;
+                try self.receiver.db.batch(.{ .writes = rows });
+                const next_after = try self.alloc.dupe(u8, rows[rows.len - 1].key);
+                if (after_key) |key| self.alloc.free(key);
+                after_key = next_after;
+            }
+        } else {
+            // Offline coordinators consume an already reconciled projection.
+            const entries = try self.donor.groupState(self.alloc, self.donor_group_id);
+            defer shard_state_store.freeGroupStateEntries(self.alloc, entries);
+            try self.receiver.applyMergeBootstrap(self.alloc, donor_range, entries);
+        }
 
         if (self.donor_lease) |lease| {
-            try self.receiver.db.importMergeRangeFromTransitionDonor(lease.db, .{
+            try self.copyDonorArtifacts(lease.db, .{
                 .start = donor_range.start,
                 .end = donor_range.end,
             });
@@ -1026,37 +1030,45 @@ pub const MergeCoordinator = struct {
             donor_db_options.prefer_existing_identity_namespace = true;
             var donor_db = try db_mod.DB.open(self.alloc, self.donor_root_dir, donor_db_options);
             defer donor_db.close();
-            try self.receiver.db.importMergeRangeFromTransitionDonor(&donor_db, .{
+            try self.copyDonorArtifacts(&donor_db, .{
                 .start = donor_range.start,
                 .end = donor_range.end,
             });
         }
 
-        // The authoritative apply projection intentionally contains primary
-        // documents only. Production Raft batches can carry document special
-        // fields (`_edges`, explicit embeddings, and future derived inputs)
-        // which DB.batch strips after materializing their derived state. Replay
-        // the retained committed requests through the ordinary DB path so a
-        // merge does not silently publish a primary-only receiver.
-        const donor_log = try self.donor.appliedNormalEntries(self.alloc, self.donor_group_id);
-        defer freeAppliedNormalEntries(self.alloc, donor_log);
-        var replay_ops = std.ArrayListUnmanaged(ReplayOperation).empty;
-        defer {
-            freeReplayOperations(self.alloc, replay_ops.items);
-            replay_ops.deinit(self.alloc);
+        // Publish the watermark only after both documents and artifacts are
+        // durable. Never replay retained requests over this current snapshot.
+        try self.receiver.db.setSplitDeltaFinalSeq(donor_applied_index);
+        return donor_applied_index;
+    }
+
+    fn copyDonorArtifacts(self: *MergeCoordinator, donor_db: *db_mod.DB, donor_range: db_types.ByteRange) !void {
+        var after_key: ?[]u8 = null;
+        defer if (after_key) |key| self.alloc.free(key);
+        while (true) {
+            const rows = try donor_db.mergeArtifactsPage(self.alloc, donor_range, after_key);
+            defer {
+                for (rows) |row| {
+                    self.alloc.free(row.key);
+                    self.alloc.free(row.value);
+                }
+                self.alloc.free(rows);
+            }
+            if (rows.len == 0) break;
+            try self.receiver.db.batch(.{
+                .merge_artifacts = rows,
+                .merge_replication = .{
+                    .transition_id = self.transition_id,
+                    .donor_group_id = self.donor_group_id,
+                    .receiver_group_id = self.receiver_group_id,
+                    .identity_namespace = self.receiver.db.core.identity_namespace,
+                },
+                .sync_level = .full_index,
+            });
+            const next_after = try self.alloc.dupe(u8, rows[rows.len - 1].key);
+            if (after_key) |key| self.alloc.free(key);
+            after_key = next_after;
         }
-        for (donor_log) |entry| {
-            if (entry.index > donor_applied_index) break;
-            try appendReplayOperations(self.alloc, entry.data, &replay_ops);
-        }
-        try self.receiver.applyMergeReplay(self.alloc, .{
-            .start = donor_range.start,
-            .end = donor_range.end,
-        }, replay_ops.items, donor_applied_index);
-        self.bootstrap_complete = true;
-        self.bootstrap_applied_index = donor_applied_index;
-        try self.persistMergeState();
-        return true;
     }
 
     pub fn catchUp(self: *MergeCoordinator) !usize {
@@ -1068,33 +1080,9 @@ pub const MergeCoordinator = struct {
         if (!receiverCoversDonor(self.receiver.getRange(), donor_range)) return 0;
 
         const after_index = try self.receiver.appliedDeltaSequence(self.alloc);
-        const donor_entries = try self.donor.appliedNormalEntries(self.alloc, self.donor_group_id);
-        defer {
-            for (donor_entries) |entry| self.alloc.free(@constCast(entry.data));
-            self.alloc.free(donor_entries);
-        }
-
-        var replay_ops = std.ArrayListUnmanaged(ReplayOperation).empty;
-        defer {
-            freeReplayOperations(self.alloc, replay_ops.items);
-            replay_ops.deinit(self.alloc);
-        }
-
-        var applied: usize = 0;
-        var max_index = after_index;
-        for (donor_entries) |entry| {
-            if (entry.index <= after_index) continue;
-            try appendReplayOperations(self.alloc, entry.data, &replay_ops);
-            max_index = @max(max_index, entry.index);
-            applied += 1;
-        }
-
-        if (max_index == after_index) return 0;
-        try self.receiver.applyMergeReplay(self.alloc, .{
-            .start = donor_range.start,
-            .end = donor_range.end,
-        }, replay_ops.items, max_index);
-        return applied;
+        if (try self.donorAppliedIndex() <= after_index) return 0;
+        const copied_index = try self.copyCurrentDonorSnapshot(donor_range);
+        return @intCast(copied_index - after_index);
     }
 
     pub fn status(self: *MergeCoordinator) !range_transition.MergeStatus {
@@ -1216,14 +1204,6 @@ pub const SplitSyncStatus = range_transition.SplitStatus;
 
 pub const MergeSyncStatus = range_transition.MergeStatus;
 
-const ReplayOperation = union(enum) {
-    put: struct {
-        key: []u8,
-        value: []u8,
-    },
-    delete: []u8,
-};
-
 fn freeConfig(alloc: std.mem.Allocator, cfg: data_store.RaftApplyStoreConfig) void {
     if (cfg.root_dir.len > 0) alloc.free(@constCast(cfg.root_dir));
 }
@@ -1259,107 +1239,6 @@ fn receiverCoversDonor(receiver: db_types.ByteRange, donor: db_types.ByteRange) 
     const starts_ok = receiver.start.len == 0 or donor.start.len == 0 or std.mem.order(u8, receiver.start, donor.start) != .gt;
     const ends_ok = receiver.end.len == 0 or donor.end.len == 0 or std.mem.order(u8, receiver.end, donor.end) != .lt;
     return starts_ok and ends_ok;
-}
-
-fn appendLegacyReplayOperation(
-    alloc: std.mem.Allocator,
-    data: []const u8,
-    operations: *std.ArrayListUnmanaged(ReplayOperation),
-) !void {
-    if (std.mem.startsWith(u8, data, "put:")) {
-        const rest = data["put:".len..];
-        const eq = std.mem.indexOfScalar(u8, rest, '=') orelse return error.InvalidAppliedDataOperation;
-        const key = try alloc.dupe(u8, rest[0..eq]);
-        errdefer alloc.free(key);
-        const value = try alloc.dupe(u8, rest[eq + 1 ..]);
-        errdefer alloc.free(value);
-        const op: ReplayOperation = .{
-            .put = .{
-                .key = key,
-                .value = value,
-            },
-        };
-        try operations.append(alloc, op);
-        return;
-    }
-    if (std.mem.startsWith(u8, data, "del:")) {
-        const op: ReplayOperation = .{ .delete = try alloc.dupe(u8, data["del:".len..]) };
-        errdefer freeReplayOperation(alloc, op);
-        try operations.append(alloc, op);
-    }
-}
-
-fn appendReplayOperations(
-    alloc: std.mem.Allocator,
-    data: []const u8,
-    operations: *std.ArrayListUnmanaged(ReplayOperation),
-) !void {
-    if (!data_raft_batch.looksLikeEnvelope(data)) {
-        return appendLegacyReplayOperation(alloc, data, operations);
-    }
-
-    var decoded = try data_raft_batch.decode(alloc, data);
-    defer decoded.deinit(alloc);
-    if (decoded.protocol_barrier_version != null) return;
-
-    for (decoded.batch.req.writes) |write| {
-        const key = try alloc.dupe(u8, write.key);
-        errdefer alloc.free(key);
-        const value = try alloc.dupe(u8, write.value);
-        errdefer alloc.free(value);
-        const op: ReplayOperation = .{ .put = .{ .key = key, .value = value } };
-        try operations.append(alloc, op);
-    }
-    for (decoded.batch.req.deletes) |key| {
-        const op: ReplayOperation = .{ .delete = try alloc.dupe(u8, key) };
-        errdefer freeReplayOperation(alloc, op);
-        try operations.append(alloc, op);
-    }
-}
-
-fn freeReplayOperation(alloc: std.mem.Allocator, op: ReplayOperation) void {
-    switch (op) {
-        .put => |put| {
-            alloc.free(put.key);
-            alloc.free(put.value);
-        },
-        .delete => |key| alloc.free(key),
-    }
-}
-
-fn freeReplayOperations(alloc: std.mem.Allocator, operations: []const ReplayOperation) void {
-    for (operations) |op| freeReplayOperation(alloc, op);
-}
-
-fn freeAppliedNormalEntries(alloc: std.mem.Allocator, entries: []data_store.AppliedNormalEntry) void {
-    for (entries) |entry| alloc.free(@constCast(entry.data));
-    alloc.free(entries);
-}
-
-test "merge replay decodes production raft batch envelopes in request order" {
-    const alloc = std.testing.allocator;
-    const encoded = try data_raft_batch.encode(alloc, "docs", .{
-        .writes = &.{
-            .{ .key = "doc:a", .value = "{\"v\":1}" },
-            .{ .key = "doc:c", .value = "{\"v\":2}" },
-        },
-        .deletes = &.{"doc:b"},
-    });
-    defer alloc.free(encoded);
-
-    var operations = std.ArrayListUnmanaged(ReplayOperation).empty;
-    defer {
-        freeReplayOperations(alloc, operations.items);
-        operations.deinit(alloc);
-    }
-    try appendReplayOperations(alloc, encoded, &operations);
-
-    try std.testing.expectEqual(@as(usize, 3), operations.items.len);
-    try std.testing.expectEqualStrings("doc:a", operations.items[0].put.key);
-    try std.testing.expectEqualStrings("{\"v\":1}", operations.items[0].put.value);
-    try std.testing.expectEqualStrings("doc:c", operations.items[1].put.key);
-    try std.testing.expectEqualStrings("{\"v\":2}", operations.items[1].put.value);
-    try std.testing.expectEqualStrings("doc:b", operations.items[2].delete);
 }
 
 test "db split destination read-only open does not create missing root" {
@@ -2190,6 +2069,101 @@ test "db split coordinator remains closed after failed reopen" {
         try std.testing.expectError(error.SplitCoordinatorDestinationClosed, coordinator.status());
         try std.testing.expectError(error.SplitCoordinatorDestinationClosed, coordinator.syncOnce());
     }
+}
+
+test "db merge coordinator copies committed outcomes without replaying transforms or aborted intents" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const donor_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-outcomes-donor", .{tmp.sub_path});
+    defer alloc.free(donor_root);
+    const receiver_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-outcomes-receiver", .{tmp.sub_path});
+    defer alloc.free(receiver_root);
+    var donor_db = try db_mod.DB.open(alloc, donor_root, .{ .start_index_workers = false });
+    defer donor_db.close();
+    try donor_db.updateRange(.{ .start = "doc:m", .end = "doc:z" });
+    try donor_db.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{}" });
+    var donor = try data_store.RaftApplyStore.init(alloc, .{ .root_dir = donor_root });
+    defer donor.deinit();
+    const Helpers = struct {
+        fn release(_: *anyopaque) void {}
+        fn append(store: *data_store.RaftApplyStore, index: u64, req: db_types.BatchRequest) !void {
+            const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", req);
+            defer std.testing.allocator.free(encoded);
+            const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = encoded }});
+            defer std.testing.allocator.free(entries);
+            try store.snapshotBuilder().applyBatch(.{ .group_id = 141, .commit_index = index, .entries_bytes = entries });
+        }
+        fn expectCount(receiver: *db_mod.DB, count: i64) !void {
+            const raw = (try receiver.get(std.testing.allocator, "doc:t")).?;
+            defer std.testing.allocator.free(raw);
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(count, parsed.value.object.get("count").?.integer);
+            try std.testing.expect((try receiver.get(std.testing.allocator, "doc:u")) == null);
+            const edges = try receiver.getEdges(std.testing.allocator, "gr_v1", "doc:t", "links", .out);
+            defer @import("../../graph/graph.zig").GraphIndex.freeEdges(std.testing.allocator, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+            try std.testing.expectEqualStrings("doc:y", edges[0].target);
+        }
+    };
+    const range_entry = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") }});
+    defer alloc.free(range_entry);
+    try donor.snapshotBuilder().applyBatch(.{ .group_id = 141, .commit_index = 1, .entries_bytes = range_entry });
+    const original: db_types.BatchRequest = .{ .writes = &.{.{ .key = "doc:t", .value = "{\"count\":0,\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:y\"}]}}}" }} };
+    const increment: db_types.BatchRequest = .{ .transforms = &.{.{ .key = "doc:t", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }} };
+    try donor_db.batch(original);
+    try Helpers.append(&donor, 2, original);
+    try donor_db.batch(increment);
+    try Helpers.append(&donor, 3, increment);
+    const txn = try donor_db.beginTransaction(100);
+    const intent_writes = [_]db_types.BatchWrite{.{ .key = "doc:u", .value = "{\"aborted\":true}" }};
+    const intents = [_]db_types.TransactionWrite{.{ .key = intent_writes[0].key, .value = intent_writes[0].value }};
+    try donor_db.writeTransaction(txn, .{ .writes = &intents });
+    try Helpers.append(&donor, 4, .{ .writes = &intent_writes, .transaction = .{ .prepare = .{ .txn_id = txn, .topology_epoch = 1 } } });
+    try donor_db.abortTransaction(txn, 101);
+    try Helpers.append(&donor, 5, .{ .transaction = .{ .resolve = .{ .txn_id = txn, .status = .aborted, .commit_version = 101 } } });
+
+    var coord = try MergeCoordinator.init(alloc, .{
+        .donor_root_dir = donor_root,
+        .receiver_root_dir = receiver_root,
+        .donor_group_id = 141,
+        .receiver_group_id = 142,
+        .donor_store = &donor,
+        .donor_lease = .{ .db = &donor_db, .ctx = &donor_db, .release_fn = Helpers.release },
+    });
+    defer coord.deinit();
+    try coord.receiver.db.updateRange(.{ .start = "doc:a", .end = "doc:m" });
+    try coord.receiver.db.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{}" });
+    try coord.receiver.db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{}" }} });
+    try coord.acceptDonorRange();
+    try std.testing.expect(try coord.ensureReceiverBootstrapped());
+    try Helpers.expectCount(coord.receiver.db, 1);
+
+    // Tail refresh must also use outcomes: delete/recreate then transform,
+    // plus a failed conditional prepare whose raw writes remain in the log.
+    try donor_db.batch(.{ .deletes = &.{"doc:t"} });
+    try Helpers.append(&donor, 6, .{ .deletes = &.{"doc:t"} });
+    try donor_db.batch(original);
+    try Helpers.append(&donor, 7, original);
+    try donor_db.batch(increment);
+    try Helpers.append(&donor, 8, increment);
+    const failed_txn = try donor_db.beginTransaction(200);
+    const predicates = [_]db_types.TransactionVersionPredicate{.{ .key = "doc:u", .expected_version = 999 }};
+    try std.testing.expectError(error.VersionConflict, donor_db.writeTransaction(failed_txn, .{ .writes = &intents, .predicates = &predicates }));
+    try Helpers.append(&donor, 9, .{ .writes = &intent_writes, .predicates = &predicates, .transaction = .{ .prepare = .{ .txn_id = failed_txn, .topology_epoch = 1 } } });
+    try donor_db.abortTransaction(failed_txn, 201);
+    try Helpers.append(&donor, 10, .{ .transaction = .{ .resolve = .{ .txn_id = failed_txn, .status = .aborted, .commit_version = 201 } } });
+    try std.testing.expectEqual(@as(usize, 5), try coord.catchUp());
+    try Helpers.expectCount(coord.receiver.db, 1);
+    try donor_db.batch(.{ .deletes = &.{"doc:t"} });
+    try Helpers.append(&donor, 11, .{ .deletes = &.{"doc:t"} });
+    try std.testing.expectEqual(@as(usize, 1), try coord.catchUp());
+    try std.testing.expect((try coord.receiver.get(alloc, "doc:t")) == null);
+    const preserved = (try coord.receiver.get(alloc, "doc:b")).?;
+    defer alloc.free(preserved);
+    try std.testing.expectEqualStrings("{}", preserved);
+    try std.testing.expectEqual(@as(usize, 0), try coord.catchUp());
 }
 
 test "db merge coordinator bootstraps receiver for donor range" {

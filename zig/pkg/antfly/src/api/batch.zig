@@ -37,6 +37,7 @@ pub const OwnedBatchRequest = struct {
     merge_receiver_base_end: ?[]u8 = null,
     merge_range_start: ?[]u8 = null,
     merge_range_end: ?[]u8 = null,
+    merge_artifacts: ?std.json.Parsed([]const db_mod.types.BatchWrite) = null,
     req: db_mod.types.BatchRequest = .{},
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
@@ -67,6 +68,7 @@ pub const OwnedBatchRequest = struct {
         if (self.merge_receiver_base_end) |value| alloc.free(value);
         if (self.merge_range_start) |value| alloc.free(value);
         if (self.merge_range_end) |value| alloc.free(value);
+        if (self.merge_artifacts) |*value| value.deinit();
         self.* = undefined;
     }
 
@@ -315,6 +317,21 @@ fn parseBatchRequestWithOptions(
         };
     };
 
+    var merge_artifacts: ?std.json.Parsed([]const db_mod.types.BatchWrite) = null;
+    errdefer if (merge_artifacts) |*value| value.deinit();
+    if (root.get("_merge_artifacts")) |value| {
+        if (!allow_internal or merge_replication == null) return error.InvalidBatchRequest;
+        merge_artifacts = try std.json.parseFromValue([]const db_mod.types.BatchWrite, alloc, value, .{ .allocate = .alloc_always });
+        try db_mod.types.validateMergeArtifacts(.{
+            .merge_replication = merge_replication,
+            .merge_artifacts = merge_artifacts.?.value,
+            .writes = writes,
+            .deletes = deletes,
+            .transforms = transforms,
+            .predicates = predicates,
+        });
+    }
+
     var transition_key: ?[]u8 = null;
     errdefer if (transition_key) |value| alloc.free(value);
     const split_transition: ?db_mod.types.SplitTransitionMutation = transition: {
@@ -529,6 +546,7 @@ fn parseBatchRequestWithOptions(
         return error.InvalidBatchRequest;
     }
     if (merge_checkpoint) |checkpoint| {
+        if (merge_artifacts != null) return error.InvalidBatchRequest;
         if (split_checkpoint != null or split_replication != null or split_transition != null or
             merge_source_transition != null or
             transforms.len != 0 or predicates.len != 0 or writes.len != 0 or
@@ -562,6 +580,7 @@ fn parseBatchRequestWithOptions(
         .merge_receiver_base_end = merge_receiver_base_end,
         .merge_range_start = merge_range_start,
         .merge_range_end = merge_range_end,
+        .merge_artifacts = merge_artifacts,
         .req = .{
             .writes = writes,
             .deletes = deletes,
@@ -572,6 +591,7 @@ fn parseBatchRequestWithOptions(
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
             .merge_replication = merge_replication,
+            .merge_artifacts = if (merge_artifacts) |value| value.value else &.{},
             .split_transition = split_transition,
             .merge_source_transition = merge_source_transition,
             .merge_checkpoint = merge_checkpoint,
@@ -590,6 +610,7 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    try db_mod.types.validateMergeArtifacts(req);
     if (req.graph_writes.len > 0 or req.graph_deletes.len > 0 or (req.predicates.len > 0 and req.transaction == null)) {
         return error.UnsupportedBatchRequestEncoding;
     }
@@ -647,6 +668,10 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.print("{f}", .{std.json.fmt(key, .{})});
     }
     try writer.writeAll("]");
+    if (req.merge_artifacts.len > 0) {
+        // Byte arrays preserve binary keys and opaque payloads exactly.
+        try writer.print(",\"_merge_artifacts\":{f}", .{std.json.fmt(req.merge_artifacts, .{ .emit_strings_as_arrays = true })});
+    }
     if (req.transforms.len > 0) {
         try writer.writeAll(",\"transforms\":[");
         for (req.transforms, 0..) |transform, i| {

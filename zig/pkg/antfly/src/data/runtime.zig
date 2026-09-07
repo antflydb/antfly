@@ -9228,6 +9228,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.merge_artifacts.len > 0) return data_raft_batch.merge_artifacts_protocol_version;
         if (req.split_replication) |replication| {
             if (replication.operation == .delta and replication.previous_sequence != null)
                 return data_raft_batch.split_delta_predecessor_protocol_version;
@@ -12937,52 +12938,6 @@ pub const DataServer = struct {
         return error.MergeReceiverProjectionAdvanced;
     }
 
-    fn replicateMergeDeleteHistory(
-        self: *DataServer,
-        source_store: *antfly.data.RaftApplyStore,
-        donor_group_id: u64,
-        receiver_group_id: u64,
-        donor_range: antfly.db.types.ByteRange,
-        table_name: []const u8,
-        replication: antfly.db.types.MergeReplicationContext,
-    ) !void {
-        const entries = try source_store.appliedNormalEntries(self.alloc, donor_group_id);
-        defer {
-            for (entries) |entry| self.alloc.free(@constCast(entry.data));
-            self.alloc.free(entries);
-        }
-        for (entries) |entry| {
-            if (!data_raft_batch.looksLikeEnvelope(entry.data)) {
-                if (std.mem.startsWith(u8, entry.data, "del:")) {
-                    const key = entry.data["del:".len..];
-                    if (donor_range.contains(key)) {
-                        try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
-                            .deletes = &.{key},
-                            .sync_level = .write,
-                            .merge_replication = replication,
-                        }, .{ .discovery = .cached });
-                    }
-                }
-                continue;
-            }
-            var decoded = try data_raft_batch.decode(self.alloc, entry.data);
-            defer decoded.deinit(self.alloc);
-            var deletes = std.ArrayListUnmanaged([]const u8).empty;
-            defer deletes.deinit(self.alloc);
-            try deletes.ensureTotalCapacity(self.alloc, decoded.batch.req.deletes.len);
-            for (decoded.batch.req.deletes) |key| {
-                if (donor_range.contains(key)) deletes.appendAssumeCapacity(key);
-            }
-            if (deletes.items.len != 0) {
-                try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
-                    .deletes = deletes.items,
-                    .sync_level = .write,
-                    .merge_replication = replication,
-                }, .{ .discovery = .cached });
-            }
-        }
-    }
-
     fn replicateMergeSnapshotWrites(
         self: *DataServer,
         source_store: *antfly.data.RaftApplyStore,
@@ -13058,16 +13013,15 @@ pub const DataServer = struct {
             table_contract,
         );
 
-        // Deletes are replayed before the authoritative snapshot. A document
-        // deleted and later recreated is therefore restored by the snapshot;
-        // a document deleted after an earlier copy remains absent.
-        try self.replicateMergeDeleteHistory(
-            source_store,
+        // Refresh the receiver's donor-owned slice, not historical requests:
+        // retained transaction intents and truncated tombstones are not a
+        // reliable record of committed deletions.
+        try self.replicateMergeRollbackDeletes(
+            transition_id,
             donor_group_id,
             receiver_group_id,
             donor_range,
-            table_contract.table_name,
-            replication,
+            table_contract,
         );
         try self.replicateMergeSnapshotWrites(
             source_store,
@@ -13077,6 +13031,26 @@ pub const DataServer = struct {
             table_contract.table_name,
             replication,
         );
+        var after_artifact: ?[]u8 = null;
+        defer if (after_artifact) |key| self.alloc.free(key);
+        while (true) {
+            const rows = try donor_db.mergeArtifactsPage(self.alloc, donor_range, after_artifact);
+            defer {
+                for (rows) |row| {
+                    self.alloc.free(row.key);
+                    self.alloc.free(row.value);
+                }
+                self.alloc.free(rows);
+            }
+            if (rows.len == 0) break;
+            try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_contract.table_name, .{
+                .merge_artifacts = rows,
+                .merge_replication = replication,
+            }, .{ .discovery = .cached });
+            const next_after = try self.alloc.dupe(u8, rows[rows.len - 1].key);
+            if (after_artifact) |key| self.alloc.free(key);
+            after_artifact = next_after;
+        }
         try self.replicateMergeReceiverCheckpoint(
             mergeReceiverCheckpoint(
                 transition_id,
@@ -24940,6 +24914,10 @@ test "data raft merge observation derives from replicated source and receiver ma
 
 test "data raft source lifecycle commands bypass document db apply while receiver checkpoints apply" {
     try std.testing.expectEqual(
+        data_raft_batch.merge_artifacts_protocol_version,
+        DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
+    );
+    try std.testing.expectEqual(
         data_raft_batch.timestamp_protocol_version,
         DataServer.requiredRaftBatchProtocolVersion(.{}),
     );
@@ -34868,7 +34846,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
     const contract: antfly.metadata.TransitionTableContract = .{
         .table_id = 7,
         .table_name = "docs",
-        .indexes_json = "{}",
+        .indexes_json = "{\"gr_v1\":{\"type\":\"graph\"}}",
         .source_identity = .{ .shard_id = 71, .range_id = 711 },
         .target_identity = .{ .shard_id = 72, .range_id = 721 },
     };
@@ -34969,10 +34947,11 @@ test "production DataServer replicated merge actions run on VoprIo" {
         });
         defer donor.close();
         try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &donor, contract.schema_json);
+        try donor.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{}" });
         try donor.updateRange(.{ .start = "doc:a", .end = "doc:m" });
         try donor.batch(.{ .writes = &.{.{
             .key = "doc:b",
-            .value = "{\"side\":\"donor\"}",
+            .value = "{\"side\":\"donor\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:z\"}]}}}",
         }} });
     }
     const receiver_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root, 72);
@@ -34991,6 +34970,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
         });
         defer receiver.close();
         try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &receiver, contract.schema_json);
+        try receiver.addIndex(.{ .name = "gr_v1", .kind = .graph, .config_json = "{}" });
         try receiver.updateRange(.{ .start = "doc:m", .end = "" });
         try receiver.batch(.{ .writes = &.{.{
             .key = "doc:z",
@@ -35215,6 +35195,11 @@ test "production DataServer replicated merge actions run on VoprIo" {
         return error.MissingReceiverDocument;
     defer alloc.free(receiver_doc);
     try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", receiver_doc);
+    try receiver.runUntilIdle();
+    const edges = try receiver.getEdges(alloc, "gr_v1", "doc:b", "links", .out);
+    defer @import("../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:z", edges[0].target);
     try sim.ensureNoCapabilityViolation();
 }
 
