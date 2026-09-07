@@ -2978,55 +2978,62 @@ scenarios and operational tooling rather than missing foundational
 infrastructure. They are not a second numbered phase plan and are not
 dependencies of the already implemented domain suites.
 
-### Open Runtime Correctness Review (2026-09-06)
+### Runtime Correctness Review and Fixes (2026-09-06)
 
-The focused review at `6fe629d2e` found the following unresolved correctness
-defects. These take priority over expanding scenario breadth. Passing existing
-replay tests does not establish std.Io contract conformance; a wrong runtime
-behavior can replay exactly. The review did not certify the entire branch.
+The focused review at `6fe629d2e` reproduced four correctness defects; all four
+are now fixed with regression tests. Passing replay tests alone does not
+establish std.Io contract conformance: a wrong runtime behavior can replay
+exactly. This focused review does not certify the entire branch.
 
-1. **P1 — Raw cross-archive executor borrows still transport local errors.**
-   `runtime_native_abi.IoBorrow.get` validates layout and copies the original
-   `std.Io` vtable. `api/kernel_exports.zig` and
-   `standalone/inference_host.zig` consume that executor in independent runtime
-   archives. A separate provider/consumer diagnostic using the real `IoBorrow`
-   reproduced `FileNotFound` becoming `WriteFailed` (provider error number 1,
-   consumer `FileNotFound` number 33). The secret-store owner dispatcher fixes
-   that store, not arbitrary executor borrows. Keep error-returning I/O and
-   task completion in the executor's owning compilation unit, or implement an
-   explicit error-safe executor bridge, with independent-archive regressions
-   for cancellation, file/network failures, and task results. Same-unit layout
-   tests are insufficient. The API HTTP body/stream callbacks already use
-   explicit status enums; their status transport is not the raw-I/O defect.
-2. **P1 — Group cancellation drops callbacks that own cleanup.**
-   `vopr_io_task.Kernel.groupCancel` calls `discardUnstartedGroupTasks`.
-   Submitting a callback with a cleanup defer and cancelling before its first
-   transition leaves that cleanup unexecuted. Zig 0.16 Threaded instead enters
-   the callback with cancellation pending; cancellation is delivered at an I/O
-   cancellation point. Remove the discard behavior and drain queued callbacks
-   as well as entered fibers. Replace the existing test that expects queued
-   work never to run with ownership-release and cancellation-point tests.
-3. **P2 — Group argument alignment is ignored.**
-   `vopr_io_task.Kernel.groupConcurrentInternal` discards `context_alignment`
-   and packs the payload directly after its wrapper. A diagnostic requesting
-   64-byte alignment received a pointer with offset 16 modulo 64. Honor the
-   requested alignment and padding, or reject unsupported concurrent work
-   before accepting ownership and use the documented eager async fallback.
-   Check both group entry points and differently aligned arguments/results.
-4. **P1 — Cancellation can complete protected sleeps early.**
-   `Task.requestCancel` makes sleeping tasks runnable even when cancellation
-   protection is blocked. `sleepCurrent` resumes and returns success because
-   `checkCancel` suppresses the error. A task sleeping for 100 virtual
-   nanoseconds inside a protected region completed before that deadline when
-   cancellation was requested. Preserve the blocked wait until its real wake
-   condition, then deliver pending cancellation after protection is removed.
-   Cover timed sleep and protected synchronization/external waits separately.
+1. **P1 — Cross-archive executor error identity (fixed).** Raw `IoBorrow`
+   vtables reproduced `FileNotFound` becoming `WriteFailed` in a separately
+   compiled consumer. `runtime_io_abi.zig` now dispatches through the executor's
+   owning compilation unit and translates errors by name, including nested
+   operation results, completed batch entries, and cached file-reader errors.
+   File-reader and locked-stderr wrappers use local vtables. Task callbacks
+   retain their own compilation-unit result handling. API request handlers own
+   a synchronous receiver; inference keeps its receiver at a stable address
+   until shutdown. Same-unit calls retain a direct fast path. This is a private,
+   version-checked, same-toolchain bridge, not a general cross-version Zig ABI;
+   native ABI version 3 rejects old borrows. Existing HTTP callback status enums
+   and the secret-store owner dispatcher remain separate safe boundaries.
+2. **P1 — Group cancellation skipped ownership cleanup (fixed).** Queued
+   callbacks now enter with cancellation pending and drain alongside entered
+   fibers. Their cleanup defers run, including callbacks added while the group
+   is cancelling. Awaiting an empty group releases its token before delivering
+   cancellation. The previous regression that expected queued work to disappear
+   now requires callback entry and cleanup. The durable-job VOPR adapter checks
+   cancellation after installing its cleanup defer, so closing an owner still
+   skips queued job bodies without relying on the scheduler to discard callbacks
+   or on a second manual cleanup path.
+3. **P2 — Group argument alignment (fixed).** Context storage includes alignment
+   padding. Alignments above the supported 16-byte storage alignment are
+   rejected before concurrent ownership transfer; `Group.async` uses its eager
+   fallback. Tests cover 16-byte padding, 64-byte concurrent rejection, and
+   correctly aligned eager async arguments.
+4. **P1 — Protected waits completed early on cancellation (fixed).** A pending
+   request no longer wakes a cancellation-protected task or an uncancelable
+   futex wait. Protected sleep reaches its real deadline and pending cancellation
+   is delivered after unblocking. Protected group awaits likewise do not
+   prematurely propagate cancellation to children. Dedicated regressions cover
+   the timed-sleep deadline and a futex that remains parked until an actual wake.
 
-Verification in this review: the reusable library's existing 155 tests passed
-in Debug and ReleaseSafe, while independent targeted diagnostics reproduced
-the defects above. The secret-store archive gate was expanded from one to
-three tests, covering layered rotation, retained reader values, malformed and
-missing replacements, and injected cancellation without mutation. The recent
+VoprIo model version 8 records the changed cancellation semantics in backend
+identity; histories from the old model must be freshly recorded, not migrated.
+The reusable library now passes 160 tests in Debug and ReleaseSafe, including
+five new `vopr_io_contract_test.zig` regressions. `zig build runtime-io-abi-test`
+compiles its provider and consumer independently to test file/network errors,
+cancellation, batch and reader state, and task results across real error domains;
+all four tests pass in Debug and ReleaseSafe.
+The Antfly `vopr-runtime-test` adapter gate passes all 18 tests, including the
+durable-job close/pause/reopen regressions, alongside `vopr-contract-test`.
+The secret-store archive gate was expanded from one to three tests, covering
+layered rotation, retained reader values, malformed and missing replacements,
+and injected cancellation without mutation; config and secret reload gates
+also pass. The production `make zig-build`, 17 previously failing managed
+embedding/artifact/backup E2E cases, Go SDK tests, and repository formatting
+check pass after merging `origin/main`. These focused gates are not a claim of
+a fresh aggregate `vopr-test` or full-platform CI run. The recent
 extension fixture now owns its committed projection; the merge-adjusted
 DataServer fixtures explicitly retain a host-filesystem differential boundary.
 Neither is evidence of fully virtual storage coverage. No additional replay

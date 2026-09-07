@@ -35,6 +35,9 @@ pub const Lane = struct {
                 self.job.deinit(self.job.ptr);
                 self.finished = true;
             }
+            // Group cancellation still enters this ownership wrapper. Reject
+            // cancelled queued work only after installing its cleanup defer.
+            try self.lane.io.checkCancel();
             self.job.run(self.job.ptr) catch |err| {
                 if (err == error.Canceled or err == error.Cancelled)
                     return error.Canceled;
@@ -163,12 +166,8 @@ pub const Lane = struct {
         for (self.entries.items, 0..) |entry, index| {
             if (entry == target) {
                 _ = self.entries.swapRemove(index);
-                // A group canceled before its function starts never enters
-                // Entry.run, so the production job still owns its deinit hook.
-                if (!target.finished) {
-                    target.job.deinit(target.job.ptr);
-                    target.finished = true;
-                }
+                // Await/cancel must drain the wrapper and its cleanup defer.
+                std.debug.assert(target.finished);
                 self.allocator.destroy(target);
                 return;
             }

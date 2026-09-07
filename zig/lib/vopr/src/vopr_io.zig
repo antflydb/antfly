@@ -25,7 +25,7 @@ const process_mod = @import("vopr_io_process.zig");
 const task_mod = @import("vopr_io_task.zig");
 const transition = @import("transition.zig");
 
-pub const model_version: u32 = 7;
+pub const model_version: u32 = 8;
 
 pub const Capability = enum(u6) {
     eager_async,
@@ -2069,7 +2069,7 @@ test "VoprIo groups and futex wake ordering remain scheduler visible" {
     try sim.ensureNoCapabilityViolation();
 }
 
-test "VoprIo root group cancellation discards queued work and drains entered work" {
+test "VoprIo root group cancellation enters queued work and drains entered work" {
     const Shared = struct {
         io: std.Io,
         queued_ran: bool = false,
@@ -2097,7 +2097,7 @@ test "VoprIo root group cancellation discards queued work and drains entered wor
     var queued_group: std.Io.Group = .init;
     queued_group.async(shared.io, Shared.queued, .{&shared});
     queued_group.cancel(shared.io);
-    try std.testing.expect(!shared.queued_ran);
+    try std.testing.expect(shared.queued_ran);
     try std.testing.expect(sim.scheduler().quiescent());
 
     var entered_group: std.Io.Group = .init;

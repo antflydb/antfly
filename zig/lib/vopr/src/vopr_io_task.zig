@@ -107,10 +107,8 @@ const Task = struct {
     result_offset: usize,
     result_len: usize,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    /// False until the fiber has entered its user callback. A group canceled
-    /// from the harness may discard members which never started, matching the
-    /// synchronous `std.Io.Group.cancel` contract without running canceled
-    /// work merely to tear its fiber down.
+    /// False until the fiber has entered its user callback. Cancellation must
+    /// still enter queued callbacks: they own their arguments and cleanup.
     started: bool = false,
     status: Status = .runnable,
     awaiter: ?*Task = null,
@@ -152,6 +150,10 @@ const Task = struct {
 
     fn requestCancel(self: *Task) void {
         self.cancel_requested = true;
+        // A pending request cannot complete an uncancelable wait. In
+        // particular, waking a protected sleep would return success early.
+        if (self.cancel_protection == .blocked or self.cancel_acknowledged or
+            (self.status == .waiting_futex and self.futex_uncancelable)) return;
         if (self.status == .waiting_group) {
             if (self.waiting_on_group) |group| self.kernel.cancelGroupTasks(group);
         }
@@ -409,32 +411,39 @@ pub const Kernel = struct {
         context_alignment: std.mem.Alignment,
         start: *const fn (context: *const anyopaque) void,
     ) !void {
-        _ = context_alignment;
+        // Future storage supports up to this alignment. Async callers can
+        // fall back eagerly; concurrent callers must reject before ownership
+        // transfer rather than accepting a misaligned argument buffer.
+        if (!context_alignment.compare(.lte, .fromByteUnits(storage_alignment)))
+            return error.VoprIoTaskAlignmentUnsupported;
         const Wrapper = struct {
             original: *const fn (*const anyopaque) void,
             context_len: usize,
+            context_offset: usize,
 
             fn run(raw: *const anyopaque, _: *anyopaque) void {
                 const header: *const @This() = @ptrCast(@alignCast(raw));
                 const bytes: [*]const u8 = @ptrCast(header);
-                header.original(bytes[@sizeOf(@This())..][0..header.context_len].ptr);
+                header.original(bytes[header.context_offset..][0..header.context_len].ptr);
             }
         };
 
+        const context_offset = context_alignment.forward(@sizeOf(Wrapper));
         const owned_context = try self.allocator.alignedAlloc(
             u8,
-            .of(Wrapper),
-            @sizeOf(Wrapper) + context.len,
+            .fromByteUnits(storage_alignment),
+            context_offset + context.len,
         );
         defer self.allocator.free(owned_context);
         const wrapper: *Wrapper = @ptrCast(owned_context.ptr);
-        wrapper.* = .{ .original = start, .context_len = context.len };
-        @memcpy(owned_context[@sizeOf(Wrapper)..], context);
+        wrapper.* = .{ .original = start, .context_len = context.len, .context_offset = context_offset };
+        @memcpy(owned_context[context_offset..], context);
 
         const group = try self.getOrCreateGroup(public_group);
         errdefer self.discardGroupIfEmpty(group);
         const task = try self.createTask(0, .@"1", owned_context, .of(Wrapper), Wrapper.run, group);
         errdefer self.removeAndDestroyTask(task);
+        if (group.cancel_requested) task.requestCancel();
         try group.tasks.append(self.allocator, task);
     }
 
@@ -447,21 +456,23 @@ pub const Kernel = struct {
             group.awaiter = awaiter;
             awaiter.waiting_on_group = group;
             awaiter.status = .waiting_group;
-            if (awaiter.cancel_requested) self.cancelGroupTasks(group);
+            if (awaiter.cancel_requested and !awaiter.cancel_acknowledged and awaiter.cancel_protection == .unblocked)
+                self.cancelGroupTasks(group);
             self.yieldCurrent(awaiter);
             awaiter.waiting_on_group = null;
             group.awaiter = null;
-            if (group.tasks.items.len != 0 and awaiter.cancel_requested) self.cancelGroupTasks(group);
+            if (group.tasks.items.len != 0 and awaiter.cancel_requested and
+                !awaiter.cancel_acknowledged and awaiter.cancel_protection == .unblocked)
+                self.cancelGroupTasks(group);
         }
-        if (self.currentTask()) |task| try task.checkCancel();
         self.destroyGroup(group);
+        if (self.currentTask()) |task| try task.checkCancel();
     }
 
     pub fn groupCancel(self: *Kernel, public_group: *std.Io.Group, token: *anyopaque) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
         self.cancelGroupTasks(group);
-        self.discardUnstartedGroupTasks(group);
         while (group.tasks.items.len != 0) {
             const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
             if (group.awaiter != null) return error.InvalidVoprIoGroup;
@@ -992,17 +1003,6 @@ pub const Kernel = struct {
         _ = self;
         group.cancel_requested = true;
         for (group.tasks.items) |task| task.requestCancel();
-    }
-
-    fn discardUnstartedGroupTasks(self: *Kernel, group: *GroupState) void {
-        var index = group.tasks.items.len;
-        while (index != 0) {
-            index -= 1;
-            const task = group.tasks.items[index];
-            if (task.started) continue;
-            _ = group.tasks.orderedRemove(index);
-            self.removeAndDestroyTask(task);
-        }
     }
 
     fn hasFutexWaiter(self: *const Kernel, ptr: *const u32) bool {

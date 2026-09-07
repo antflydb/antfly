@@ -332,4 +332,5 @@ test {
     _ = vopr_io_process;
     _ = vopr_io_scenario_test;
     _ = vopr_io_task;
+    _ = @import("vopr_io_contract_test.zig");
 }
