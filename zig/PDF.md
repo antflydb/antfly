@@ -139,6 +139,18 @@ Dependency-establishing copy and document-extraction requests remain in their
 normal ordered path.
 
 Within a document group, the enrichment thread owns a shared-window scheduler.
+Before collecting OCR pages it resolves compatible consumers and chooses a
+bounded common-multiple render width. A four-item OCR executor can therefore
+produce a sixteen-page shared window for a compatible visual embedder, while
+still invoking OCR in batches of at most four. The optional widening ceiling
+is `ANTFLY_ENRICHMENT_PDF_SHARED_WINDOW_MAX_PAGES` (default 32, absolute maximum
+128); it does not change the OCR model batch ceiling or provider request limits.
+Collection remains byte-bounded and flushes its current prefix if lookahead
+allocation is denied. Generated units transfer ownership into the execution
+slice rather than duplicating all retained text and regions. Renderer geometry,
+pixel ceilings, and composite memory admission can shorten any planned window.
+Memory contracts are requested only for legal model sub-batches; their summed
+ceilings conservatively account for the larger retained render window.
 Before dispatching an owner's rendered window or starting speculative render
 prefetch, it offers the borrowed pages to later compatible consumers. Physical
 compatibility includes source identity and credentials, DPI, pixel/dimension
@@ -172,9 +184,15 @@ and decode limits. Model names, prompts, and result types are not render keys.
   document can still be shared. This conservative admission rule may forgo
   sharing when pixels/bytes would independently force small batches; it keeps
   the normal bounded traversal and does not retain images across windows or
-  reorder dependency-establishing requests. Any future joint-window planner
-  must admit the complete shared media window and each executor's incremental
-  peak before widening windows, and retain this independent fallback.
+  reorder dependency-establishing requests. Joint-width planning retains this
+  fallback: the media window receives composite admission, and each executor
+  must acquire its incremental peak before consuming the borrowed pages.
+- Typed OCR replay tracks staged page bounds per consumer, separately from the
+  neutral text-cache registry. A consumer with no staged results performs no
+  replay admission or reads. Populated ranges are copied in byte/item-bounded
+  segments under one read transaction, then decoded after the transaction closes.
+  Read contention remains retryable; denied optional replay memory falls back
+  to ordinary execution without discarding already restored siblings.
 - Page embedders stage vectors in their existing source-hashed, lease-epoch
   namespace. Final or staged matching vectors are skipped before inference.
   Pending page descriptors are compacted before byte/pixel/item partitioning,
@@ -3115,9 +3133,14 @@ The hardening above follows these long-term rules:
     replay file; it does not delay the first upstream byte until the entire
     upload has been received. Transport `Close` is nonblocking and only marks
     the attempt closed; the forwarding owner then serializes after any active
-    read and seals the admitted spool exactly once before a retry opens an
-    independent section reader. This avoids deadlocking an early upstream
-    response against a client upload while preserving replay errors. Framed v1
+    read. Only an actual retry decision seals the admitted spool, under the
+    request/attempt deadline and a maximum 30-second sealing deadline.
+    Cancellation and terminal responses interrupt incomplete socket reads using
+    a read deadline; they never drain the remaining upload. Custom response
+    writers without deadline support must expose an interruptible request body.
+    Cancellation callbacks and active reads join before replay storage is freed.
+    Opening a retry is read-only and cannot restart a failed or incomplete seal.
+    Framed v1
     requires its exact descriptor-derived
     `Content-Length`; descriptor/length mismatches and ambiguous chunked framing
     fail before routing, while a physically truncated tail fails request

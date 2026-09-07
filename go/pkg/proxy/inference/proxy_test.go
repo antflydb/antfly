@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -4187,6 +4189,108 @@ func TestProxyFramedAdmissionReleasesOnEveryFailure(t *testing.T) {
 			}
 			p.bodyAdmission.Release(17)
 		})
+	}
+}
+
+func TestFramedForwardNeverDrainsTerminalOrCanceledUpload(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		p := NewProxy(Config{Logger: zap.NewNop()})
+		tail := &blockingProxyReader{started: make(chan struct{}), release: make(chan struct{})}
+		replay := &proxyStreamingReplayBody{prefix: []byte("prefix"), tail: tail, total: 7, spillDir: t.TempDir()}
+		if err := replay.Prepare(2); err != nil {
+			t.Fatal(err)
+		}
+		p.registry.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if canceled {
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			}
+			return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("denied")), Request: r}, nil
+		})}
+		req := httptest.NewRequest(http.MethodPost, "/ai/v1/read", nil)
+		ctx, cancel := context.WithCancel(req.Context())
+		req = req.WithContext(ctx)
+		if canceled {
+			cancel()
+		}
+		done := make(chan error, 1)
+		go func() {
+			response, err := p.forwardRequestWithRetry(req, replay, &Endpoint{address: "http://reader.internal"}, &Route{RetryAttempts: 2}, true)
+			if response != nil {
+				response.Body.Close()
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if canceled && !errors.Is(err, context.Canceled) {
+				t.Errorf("canceled error=%v", err)
+			}
+			if !canceled && err != nil {
+				t.Errorf("terminal response error=%v", err)
+			}
+		case <-tail.started:
+			close(tail.release)
+			<-done
+			t.Error("terminal forwarding tried to drain upload")
+		case <-time.After(time.Second):
+			close(tail.release)
+			<-done
+			t.Error("terminal forwarding did not terminate")
+		}
+		cancel()
+		replay.Close()
+	}
+}
+
+func TestFramedTerminalResponseInterruptsStalledSocketUpload(t *testing.T) {
+	p := NewProxy(Config{DefaultPool: RoutePoolTarget{Pool: "cpu"}, Logger: zap.NewNop()})
+	p.registry.RegisterEndpoint("http://reader.internal", "cpu", WorkloadTypeGeneral)
+	advertiseModelOperation(p.registry, "http://reader.internal", "read", "owner/reader")
+	metadata := []byte(`{"model":"owner/reader","images":[{"url":"attachment:0"}]}`)
+	body := testProxyAttachmentEnvelope(metadata, testProxyAttachment{mime: "image/png", data: []byte{1}})
+	prefix, _, err := readProxyAttachmentRoutingPrefix(bytes.NewReader(body), int64(len(body)), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan struct{})
+	p.registry.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if _, err := io.CopyN(io.Discard, req.Body, int64(len(prefix))); err != nil {
+			return nil, err
+		}
+		go func() { defer close(readDone); _, _ = req.Body.Read(make([]byte, 1)) }()
+		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("denied")), Request: req}, nil
+	})}
+	server := httptest.NewServer(http.HandlerFunc(p.handleRead))
+	defer server.Close()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = fmt.Fprintf(conn, "POST /ai/v1/read HTTP/1.1\r\nHost: localhost\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n", proxyAttachmentEnvelopeContentType, len(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(prefix); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately never send the attachment tail.
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d", response.StatusCode)
+	}
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("upload reader was not joined")
 	}
 }
 

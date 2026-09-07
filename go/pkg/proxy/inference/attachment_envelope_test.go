@@ -16,8 +16,11 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -114,7 +117,9 @@ func TestProxyStreamingReplayBodyTeesFirstAttemptAndSealsOnFinish(t *testing.T) 
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.(interface{ Finish() error }).Finish(); err != nil {
+	if err := first.(interface {
+		Finish(context.Context, bool) error
+	}).Finish(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	if replay.spooled != int64(len(body)) {
@@ -154,11 +159,13 @@ func TestProxyStreamingReplayBodyRetainsSealFailure(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	finalizer := first.(interface{ Finish() error })
-	if err := finalizer.Finish(); err == nil {
+	finalizer := first.(interface {
+		Finish(context.Context, bool) error
+	})
+	if err := finalizer.Finish(context.Background(), true); err == nil {
 		t.Fatal("expected a truncated replay body to fail while sealing")
 	}
-	if err := finalizer.Finish(); err == nil {
+	if err := finalizer.Finish(context.Background(), true); err == nil {
 		t.Fatal("expected repeated Finish to retain the sealing failure")
 	}
 }
@@ -187,6 +194,38 @@ func TestProxyStreamingAttemptCloseDoesNotBlockOnActiveRead(t *testing.T) {
 		t.Fatal("Close blocked behind an active request-body read")
 	}
 	close(reader.release)
+	<-readDone
+}
+
+func TestReplayFinishCancellationInterruptsAndJoinsActiveRead(t *testing.T) {
+	reader := &blockingProxyReader{started: make(chan struct{}), release: make(chan struct{})}
+	var interruptOnce sync.Once
+	replay := &proxyStreamingReplayBody{prefix: []byte("prefix"), tail: reader, total: 7, spillDir: t.TempDir(), interrupt: func() { interruptOnce.Do(func() { close(reader.release) }) }}
+	defer replay.Close()
+	if err := replay.Prepare(2); err != nil {
+		t.Fatal(err)
+	}
+	body, err := replay.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan struct{})
+	go func() { defer close(readDone); _, _ = io.Copy(io.Discard, body) }()
+	<-reader.started
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- body.(*proxyStreamingAttemptBody).Finish(ctx, true) }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("finish error=%v", err)
+		}
+	case <-time.After(time.Second):
+		replay.interrupt()
+		<-done
+		t.Fatal("Finish failed to interrupt active read")
+	}
 	<-readDone
 }
 

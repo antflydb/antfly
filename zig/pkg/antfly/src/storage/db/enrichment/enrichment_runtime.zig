@@ -572,6 +572,14 @@ fn effectiveGeneratedOcrBatchMaxItems(configured: usize) usize {
     return std.math.clamp(configured, 1, generated_ocr_absolute_batch_max_items);
 }
 
+fn generatedPdfSharedWindowMaxPages() usize {
+    const default: usize = 32;
+    if (comptime builtin.os.tag == .freestanding) return default;
+    const raw = getenv("ANTFLY_ENRICHMENT_PDF_SHARED_WINDOW_MAX_PAGES") orelse return default;
+    const configured = std.fmt.parseUnsigned(usize, raw, 10) catch return default;
+    return std.math.clamp(configured, 1, generated_ocr_absolute_batch_max_items);
+}
+
 test "OCR control-plane batch ceiling is absolute" {
     try std.testing.expectEqual(@as(usize, 1), effectiveGeneratedOcrBatchMaxItems(0));
     try std.testing.expectEqual(@as(usize, 64), effectiveGeneratedOcrBatchMaxItems(64));
@@ -669,10 +677,16 @@ test "PDF image embedding has a media-sized batch byte default" {
 
 const GeneratedTextBatchPolicy = struct {
     max_items: usize,
+    /// Shared preparation width; never changes the executing model's limits.
+    render_items: ?usize = null,
     max_bytes: usize,
     max_pixels: u64 = std.math.maxInt(u64),
     preferred_image_width: ?u32 = null,
     preferred_image_height: ?u32 = null,
+
+    fn collectionItems(self: @This()) usize {
+        return self.render_items orelse self.max_items;
+    }
 };
 
 fn requestGeneratedTextBatchPolicy(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) GeneratedTextBatchPolicy {
@@ -6258,6 +6272,19 @@ fn sharedPdfWindowPreservesBatching(window_items: usize, document_items: usize, 
     return window_items == document_items or window_items % consumer_items == 0;
 }
 
+fn sharedPdfWindowWidth(owner: usize, peer: usize, ceiling: usize) usize {
+    if (owner == 0 or peer == 0) return owner;
+    var a = owner;
+    var b = peer;
+    while (b != 0) {
+        const remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    const combined = std.math.mul(usize, owner / a, peer) catch return owner;
+    return if (combined <= ceiling) combined else owner;
+}
+
 /// Called only by the single-flight replay owner, after acquiring its lease
 /// and before constructing any document scheduler. The registry is atomically
 /// written with the first spool rows and removed only after their cleanup.
@@ -6293,6 +6320,7 @@ const SharedPdfWindowScheduler = struct {
     spool_attempt_key: ?[]u8 = null,
     spool_dirty: bool = false,
     spool_registered: bool = false,
+    typed_replay_transactions: usize = 0,
 
     const TextSource = struct {
         config: document_extraction_mod.Config,
@@ -6309,6 +6337,8 @@ const SharedPdfWindowScheduler = struct {
         err: ?anyerror = null,
         source_identity: ?[32]u8 = null,
         text: bool = false,
+        staged_text_min: usize = std.math.maxInt(usize),
+        staged_text_max: usize = 0,
         owned_config: bool = false,
         config: document_extraction_mod.Config = .{},
         capabilities: inference_work.InferenceCapabilities = undefined,
@@ -6348,6 +6378,41 @@ const SharedPdfWindowScheduler = struct {
         return if (self.consumers) |consumers| consumers[index].completed else false;
     }
 
+    fn ensureConsumers(self: *@This()) !void {
+        if (self.consumers != null) return;
+        const consumers = try self.runtime.alloc.alloc(Consumer, self.requests.len);
+        @memset(consumers, .{});
+        self.consumers = consumers;
+    }
+
+    /// Resolve optional peers before collecting/rendering a window. The
+    /// bounded LCM preserves every enrolled model's batch width. Actual byte,
+    /// pixel and composite memory admission may still shrink the window.
+    fn planTextWindow(self: *@This(), raw: []const u8, policy: GeneratedTextBatchPolicy) !usize {
+        if (self.current + 1 >= self.requests.len) return policy.max_items;
+        if (terminalFailureEnvelopeIntersects(terminalFailureEnvelopeSnapshot(self.runtime), self.sequence, self.sequence)) return policy.max_items;
+        try self.ensureConsumers();
+        const owner = &self.consumers.?[self.current];
+        if (!owner.prepared) try self.prepareConsumer(owner, self.requests[self.current], raw);
+        if (!owner.enabled or !owner.text) return policy.max_items;
+        var width = owner.max_items;
+        for (self.current + 1..self.requests.len) |index| {
+            const peer = &self.consumers.?[index];
+            if (!peer.prepared) self.prepareConsumer(peer, self.requests[index], raw) catch |err| {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                continue;
+            };
+            if (!peer.enabled or peer.err != null or
+                !std.meta.eql(owner.source_identity, peer.source_identity) or
+                !std.mem.eql(u8, owner.config.credentials, peer.config.credentials) or
+                !std.meta.eql(owner.transform, peer.transform)) continue;
+            if (peer.text and (owner.config.ocr_mode != peer.config.ocr_mode or
+                !std.meta.eql(owner.config.ocr_quality, peer.config.ocr_quality))) continue;
+            width = sharedPdfWindowWidth(width, peer.max_items, generatedPdfSharedWindowMaxPages());
+        }
+        return if (width > owner.max_items) width else policy.max_items;
+    }
+
     fn cleanupSpool(self: *@This()) !void {
         try clearPrivateStorePrefix(self.runtime, self.runtime.alloc, &self.runtime.store, self.spool_root.?);
         // Keep the registry row until every result row has been removed. A
@@ -6355,6 +6420,10 @@ const SharedPdfWindowScheduler = struct {
         try storePutPrivateBatchWithRetry(self.runtime, &self.runtime.store, &.{}, &.{self.spool_attempt_key.?});
         self.spool_dirty = false;
         self.spool_registered = false;
+        if (self.consumers) |consumers| for (consumers) |*consumer| {
+            consumer.staged_text_min = std.math.maxInt(usize);
+            consumer.staged_text_max = 0;
+        };
     }
 
     fn prepareConsumer(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !void {
@@ -6409,11 +6478,7 @@ const SharedPdfWindowScheduler = struct {
         window_lease: ?*PdfWindowCompositeLease,
     ) !void {
         if (self.current + 1 >= self.requests.len) return;
-        if (self.consumers == null) {
-            const consumers = try self.runtime.alloc.alloc(Consumer, self.requests.len);
-            @memset(consumers, .{});
-            self.consumers = consumers;
-        }
+        try self.ensureConsumers();
         const previous_fingerprint = self.runtime.active_failure_fingerprint;
         const previous_retry_identity = self.runtime.retry_error_has_request_identity;
         defer {
@@ -6601,30 +6666,78 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn restoreTextUnit(self: *@This(), alloc: Allocator, unit: *document_extraction_mod.Unit) !void {
-        if (!self.spool_dirty) return;
-        const key = try self.textKey(alloc, self.current, unit.page_number orelse return);
-        defer alloc.free(key);
-        const Reader = struct {
-            runtime: *EnrichmentRuntime,
-            alloc: Allocator,
-            fn read(ctx: *@This(), k: []const u8) ![]u8 {
-                var txn = try ctx.runtime.store.beginRead();
-                defer txn.abort();
-                return ctx.alloc.dupe(u8, try txn.get(k));
+        return self.restoreTextUnits(alloc, @as([*]document_extraction_mod.Unit, @ptrCast(unit))[0..1]);
+    }
+
+    fn restoreTextUnits(self: *@This(), alloc: Allocator, units: []document_extraction_mod.Unit) !void {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            return self.restoreTextUnitsOnce(alloc, units) catch |err| {
+                // Reuse is optional; preserve ordinary bounded execution when
+                // its temporary replay segment cannot fit. Already restored
+                // siblings remain valid and need not be executed again.
+                if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) return;
+                if (err != error.WriterLocked or attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            };
+        }
+    }
+
+    fn restoreTextUnitsOnce(self: *@This(), alloc: Allocator, units: []document_extraction_mod.Unit) !void {
+        const consumers = self.consumers orelse return;
+        const consumer = consumers[self.current];
+        if (consumer.staged_text_max == 0) return;
+        var cursor: usize = 0;
+        while (cursor < units.len) {
+            while (cursor < units.len) : (cursor += 1) {
+                const page = units[cursor].page_number orelse continue;
+                if (page >= consumer.staged_text_min and page <= consumer.staged_text_max) break;
             }
-        };
-        var reader = Reader{ .runtime = self.runtime, .alloc = alloc };
-        const value = readAllocWithRetry(&reader, key, Reader.read) catch |err| switch (err) {
-            error.NotFound => return,
-            else => return err,
-        };
-        defer alloc.free(value);
-        const parsed = try std.json.parseFromSlice(document_extraction_mod.Unit, alloc, value, .{});
-        defer parsed.deinit();
-        if (!std.mem.eql(u8, parsed.value.unit_id, unit.unit_id)) return error.InvalidPdfRenderWindow;
-        const replacement = try cloneDocumentExtractionUnit(alloc, parsed.value);
-        unit.deinit(alloc);
-        unit.* = replacement;
+            if (cursor == units.len) return;
+            const lease = try RuntimeDocumentReplaySegmentLease.create(self.runtime.alloc, self.runtime.config.resource_manager orelse self.runtime.index_manager.resource_manager);
+            defer lease.destroy();
+            const scratch = lease.allocator();
+            const Row = struct { index: usize, value: []u8 };
+            var rows = std.ArrayListUnmanaged(Row).empty;
+            defer {
+                for (rows.items) |row| scratch.free(row.value);
+                rows.deinit(scratch);
+            }
+            {
+                var txn = try self.runtime.store.beginRead();
+                defer txn.abort();
+                self.typed_replay_transactions += 1;
+                var bytes: usize = 0;
+                while (cursor < units.len and rows.items.len < runtime_document_extraction_flush_write_count) : (cursor += 1) {
+                    const unit = units[cursor];
+                    const page = unit.page_number orelse continue;
+                    if (page < consumer.staged_text_min or page > consumer.staged_text_max) continue;
+                    const key = try self.textKey(scratch, self.current, page);
+                    defer scratch.free(key);
+                    const value = txn.get(key) catch |err| switch (err) {
+                        error.NotFound => continue,
+                        else => return err,
+                    };
+                    if (rows.items.len > 0 and bytes +| value.len > runtime_document_extraction_flush_write_bytes) break;
+                    const owned = try scratch.dupe(u8, value);
+                    errdefer scratch.free(owned);
+                    try rows.append(scratch, .{ .index = cursor, .value = owned });
+                    bytes +|= value.len;
+                }
+            }
+            // The transaction is closed before parsing, destination allocation
+            // or reclamation. Only bounded serialized rows cross that boundary.
+            for (rows.items) |row| {
+                const parsed = try std.json.parseFromSlice(document_extraction_mod.Unit, scratch, row.value, .{});
+                defer parsed.deinit();
+                const unit = &units[row.index];
+                if (!std.mem.eql(u8, parsed.value.unit_id, unit.unit_id)) return error.InvalidPdfRenderWindow;
+                const replacement = try cloneDocumentExtractionUnit(alloc, parsed.value);
+                unit.deinit(alloc);
+                unit.* = replacement;
+            }
+        }
     }
 
     fn emitOcr(self: *@This(), source_url: []const u8, source: TextSource, page_count: usize, policy: GeneratedTextBatchPolicy, window: *RuntimePdfRenderWindow) !void {
@@ -6775,6 +6888,10 @@ const SharedPdfWindowScheduler = struct {
             // Register atomically with the first typed rows, so recovery never
             // needs to search documents that have no outstanding PDF attempt.
             try self.storeSpoolRows(alloc, &writes);
+            for (units.items) |unit| {
+                consumer.staged_text_min = @min(consumer.staged_text_min, unit.page_number.?);
+                consumer.staged_text_max = @max(consumer.staged_text_max, unit.page_number.?);
+            }
         }
     }
 
@@ -7183,6 +7300,9 @@ test "shared PDF transform identity includes decoder and spatial limits" {
 }
 
 test "shared PDF windows preserve wider consumer batches" {
+    try std.testing.expectEqual(@as(usize, 16), sharedPdfWindowWidth(4, 16, 32));
+    try std.testing.expectEqual(@as(usize, 12), sharedPdfWindowWidth(4, 6, 32));
+    try std.testing.expectEqual(@as(usize, 16), sharedPdfWindowWidth(16, 6, 32));
     try std.testing.expect(!sharedPdfWindowPreservesBatching(1, 32, 16));
     try std.testing.expect(!sharedPdfWindowPreservesBatching(8, 32, 16));
     try std.testing.expect(sharedPdfWindowPreservesBatching(16, 32, 16));
@@ -7301,6 +7421,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         embed_calls: usize = 0,
         last_embed_items: usize = 0,
         failed_calls: usize = 0,
+        largest_memory_request: usize = 0,
 
         fn borrowed(self: *@This(), bytes: []const u8) !void {
             for (self.pages.results) |page| if (page.rendered.?.png.ptr == bytes.ptr) return;
@@ -7315,7 +7436,9 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         fn canBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
             return false;
         }
-        fn memory(_: *anyopaque, _: Allocator, requests: []const asset_producer_mod.Request) !inference_work.InvocationMemoryPlan {
+        fn memory(raw: *anyopaque, _: Allocator, requests: []const asset_producer_mod.Request) !inference_work.InvocationMemoryPlan {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.largest_memory_request = @max(self.largest_memory_request, requests.len);
             return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 1024 * 1024, .allocator_limit_bytes = 1024 * 1024, .max_result_bytes_per_item = 4096, .max_result_bytes = requests.len * 4096 };
         }
         fn dense(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
@@ -7412,6 +7535,18 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     }
     scheduler.consumers.?[2].config.ocr_executor = .generator;
     scheduler.consumers.?[5].transform.width = 123;
+    {
+        // Enrollment chooses a common width without modifying either model's
+        // execution limit, even when the narrow consumer runs first.
+        scheduler.consumers.?[0] = .{ .prepared = true, .enabled = true, .text = true, .source_identity = scheduler.consumers.?[1].source_identity, .config = config, .transform = transform, .max_items = 4 };
+        scheduler.consumers.?[1].max_items = 16;
+        const planned = try scheduler.planTextWindow("{}", .{ .max_items = 4, .max_bytes = 64 * 1024 * 1024 });
+        try std.testing.expectEqual(@as(usize, 16), planned);
+        try std.testing.expectEqual(@as(usize, 4), scheduler.consumers.?[0].max_items);
+        try std.testing.expectEqual(@as(usize, 16), scheduler.consumers.?[1].max_items);
+        scheduler.consumers.?[0] = .{};
+        scheduler.consumers.?[1].max_items = 1;
+    }
     var units = [_]document_extraction_mod.Unit{
         try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }),
         try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") }),
@@ -7433,9 +7568,15 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     try std.testing.expectEqual(@as(usize, 4), harness.text_calls);
     try std.testing.expectEqual(@as(usize, 2), harness.embed_calls);
     try std.testing.expectEqualStrings("pending_ocr", units[0].extraction_status.?);
+    // Global spool activity (including neutral rows) is not evidence of any
+    // typed output for this owner. Skip admission and all store transactions.
+    try scheduler.restoreTextUnits(alloc, &units);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.typed_replay_transactions);
     scheduler.current = 1;
     try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, producer, config, .{ .max_items = 2, .max_bytes = 64 * 1024 * 1024 }, "https://example.test/source.pdf", "content-identity", "pdf", "application/pdf", &units, .ocr, null);
     try std.testing.expect(std.mem.startsWith(u8, units[0].text, "Reader"));
+    try std.testing.expect(std.mem.startsWith(u8, units[1].text, "Reader"));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.typed_replay_transactions);
     scheduler.current = 2;
     try scheduler.restoreTextUnit(alloc, &units[0]);
     try std.testing.expect(std.mem.startsWith(u8, units[0].text, "Generator"));
@@ -7599,6 +7740,16 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     }
 
     if (text_session) |session| {
+        {
+            harness.largest_memory_request = 0;
+            var rendered = try renderRuntimePdfWindow(&runtime, alloc, producer, session, config, config.pdf_render_max_inflight_bytes, .{ .max_items = 1, .render_items = 2, .max_bytes = 64 * 1024 * 1024 }, .reader, "{}", "pdf", "application/pdf", "render-sharing", &.{
+                .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") },
+                .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") },
+            }, 0, false, .{});
+            defer rendered.deinit();
+            try std.testing.expectEqual(@as(usize, 2), rendered.unit_indices.len);
+            try std.testing.expectEqual(@as(usize, 1), harness.largest_memory_request);
+        }
         const Sink = struct {
             alloc: Allocator,
             count: usize = 0,
@@ -9487,7 +9638,13 @@ fn processDocumentExtractionAsset(
     var extraction_lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
     try extraction_lease_guard.start();
     defer extraction_lease_guard.stop();
-    const batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request);
+    var batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request);
+    if (source_is_pdf) if (runtime.shared_pdf_windows) |shared| {
+        batch_policy.render_items = shared.planTextWindow(raw_doc, batch_policy) catch |err| blk: {
+            if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+            break :blk batch_policy.max_items;
+        };
+    };
     const configured_pdf_decode_limits = config.pdf_decode_limits;
     const configured_pdf_render_inflight_bytes = config.pdf_render_max_inflight_bytes;
     var page_text_spool: ?RuntimePdfPageTextSpool = null;
@@ -11774,6 +11931,24 @@ fn renderPreparedPdfRasterWindowBatchAlloc(
     return try session.renderPreparedPagesRasterBatchAlloc(alloc, plans, options);
 }
 
+/// Plan only legal model sub-batches. Summing their ceilings is conservative
+/// for sequential execution and covers retained outputs across the window.
+fn pdfRenderWindowInvocationMemory(producer: asset_producer_mod.Producer, alloc: Allocator, requests: []const asset_producer_mod.Request, model_items: usize) !inference_work.InvocationMemoryPlan {
+    if (requests.len <= model_items) return producer.invocationMemoryForRequests(alloc, requests);
+    var total = try producer.invocationMemoryForRequests(alloc, requests[0..model_items]);
+    var cursor = model_items;
+    while (cursor < requests.len) {
+        const end = cursor + @min(model_items, requests.len - cursor);
+        const next = try producer.invocationMemoryForRequests(alloc, requests[cursor..end]);
+        if (total.attachment_transport != next.attachment_transport or total.allocator_owner != next.allocator_owner) return error.InferenceInvocationMemoryUnavailable;
+        inline for (.{ "fixed_bytes", "allocator_limit_bytes", "max_result_bytes" }) |field|
+            @field(total, field) = std.math.add(usize, @field(total, field), @field(next, field)) catch return error.DocumentExtractionWorkingSetTooLarge;
+        total.max_result_bytes_per_item = @max(total.max_result_bytes_per_item, next.max_result_bytes_per_item);
+        cursor = end;
+    }
+    return total;
+}
+
 fn renderRuntimePdfWindow(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -11794,7 +11969,7 @@ fn renderRuntimePdfWindow(
 ) !RuntimePdfRenderWindow {
     var invocation_cancellation: AssetInvocationCancellation = undefined;
     const invocation_producer = scopedAssetProducer(runtime, producer, &invocation_cancellation);
-    const max_pages = @max(@as(usize, 1), @min(batch_policy.max_items, generatedOcrBatchMaxItems()));
+    const max_pages = @max(@as(usize, 1), @min(batch_policy.collectionItems(), generated_ocr_absolute_batch_max_items));
     var requests = std.ArrayListUnmanaged(document_extraction_mod.PdfPageRenderRequest).empty;
     defer requests.deinit(alloc);
     var unit_indices = std.ArrayListUnmanaged(usize).empty;
@@ -11889,9 +12064,11 @@ fn renderRuntimePdfWindow(
                 .media = if (use_borrowed_rasters) &.{} else prototype_media[i .. i + 1],
             };
         }
-        const full_invocation_memory = try invocation_producer.invocationMemoryForRequests(
+        const full_invocation_memory = try pdfRenderWindowInvocationMemory(
+            invocation_producer,
             alloc,
             prototype_requests,
+            batch_policy.max_items,
         );
         for (singleton_allowances, prepared_plans, 0..) |*allowance, plan, i| {
             allowance.* = if (use_borrowed_rasters)
@@ -11917,10 +12094,17 @@ fn renderRuntimePdfWindow(
             const invocation_memory = if (candidate_count == prototype_requests.len)
                 full_invocation_memory
             else
-                try invocation_producer.invocationMemoryForRequests(
+                try pdfRenderWindowInvocationMemory(
+                    invocation_producer,
                     alloc,
                     prototype_requests[0..candidate_count],
+                    batch_policy.max_items,
                 );
+            // This is retained render-window transport credit, not permission
+            // to send a larger model request. Execution still flushes at the
+            // unchanged per-model byte and item ceilings.
+            const model_batches = (candidate_count + batch_policy.max_items - 1) / batch_policy.max_items;
+            const render_wire_limit = std.math.mul(usize, batch_policy.max_bytes, model_batches) catch return error.DocumentExtractionWorkingSetTooLarge;
             const retained_raw_bytes = retained_prefix[candidate_count];
             const required_output_bytes = if (use_borrowed_rasters)
                 try pdfRasterInvocationOutputReservationBytes(
@@ -11929,7 +12113,7 @@ fn renderRuntimePdfWindow(
                 )
             else
                 try pdfInvocationOutputReservationBytes(
-                    batch_policy.max_bytes,
+                    render_wire_limit,
                     invocation_memory,
                     "image/png".len,
                     candidate_count,
@@ -11991,7 +12175,7 @@ fn renderRuntimePdfWindow(
                 splitOwnedPdfInvocationMemoryBudget(
                     lease.scratchBytesPerWindow(),
                     lease.outputBytesPerWindow(),
-                    batch_policy.max_bytes,
+                    render_wire_limit,
                     invocation_memory,
                     "image/png".len,
                     candidate_count,
@@ -12161,10 +12345,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     };
     if (!enabled) return;
     if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
-        if (runtime.shared_pdf_windows) |shared| for (units) |*unit| {
-            if (unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr"))
-                try shared.restoreTextUnit(alloc, unit);
-        };
+        if (runtime.shared_pdf_windows) |shared| try shared.restoreTextUnits(alloc, units);
         const has_pending = for (units) |unit| {
             if (unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) break true;
         } else false;
@@ -13635,7 +13816,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
         const unit_bytes = runtimeDocumentExtractionUnitOwnedBytes(unit.*);
         const generated_bytes = if (generated_kind != null) unit_bytes else 0;
         if (self.pending_generated_units.items.len > 0 and
-            (self.pending_generated_units.items.len >= self.batch_policy.max_items or
+            (self.pending_generated_units.items.len >= self.batch_policy.collectionItems() or
                 addUsizeSaturating(self.pending_total_bytes, unit_bytes) > self.batch_policy.max_bytes or
                 addUsizeSaturating(self.pending_generated_bytes, generated_bytes) > self.batch_policy.max_bytes))
         {
@@ -13649,20 +13830,35 @@ const RuntimeDocumentExtractionCollectContext = struct {
             try self.finalizeUnit(unit, false);
             return;
         }
-        var cloned = try cloneDocumentExtractionUnit(self.alloc, unit.*);
-        var owns_cloned = true;
-        errdefer if (owns_cloned) cloned.deinit(self.alloc);
-        try self.pending_generated_units.append(self.alloc, cloned);
-        errdefer _ = self.pending_generated_units.pop();
-        try self.pending_generated_mask.append(self.alloc, generated_kind != null);
-        owns_cloned = false;
+        self.appendPendingUnit(unit.*, generated_kind != null) catch |err| {
+            if (err != error.OutOfMemory or self.pending_generated_units.items.len == 0 or self.batch_policy.render_items == null) return err;
+            // Optional lookahead must not require more inspection memory than
+            // baseline execution. Flush the admitted prefix and retry once.
+            try self.flushPendingGeneratedText();
+            if (generated_kind == null) {
+                try self.finalizeUnit(unit, false);
+                return;
+            }
+            self.pending_generated_kind = generated_kind;
+            try self.appendPendingUnit(unit.*, true);
+        };
         self.pending_total_bytes = addUsizeSaturating(self.pending_total_bytes, unit_bytes);
         self.pending_generated_bytes = addUsizeSaturating(self.pending_generated_bytes, generated_bytes);
-        if (self.pending_generated_units.items.len >= self.batch_policy.max_items or
+        if (self.pending_generated_units.items.len >= self.batch_policy.collectionItems() or
             self.pending_total_bytes >= self.batch_policy.max_bytes)
         {
             try self.flushPendingGeneratedText();
         }
+    }
+
+    fn appendPendingUnit(self: *@This(), unit: document_extraction_mod.Unit, generated: bool) !void {
+        var cloned = try cloneDocumentExtractionUnit(self.alloc, unit);
+        var owns_cloned = true;
+        errdefer if (owns_cloned) cloned.deinit(self.alloc);
+        try self.pending_generated_units.append(self.alloc, cloned);
+        errdefer _ = self.pending_generated_units.pop();
+        try self.pending_generated_mask.append(self.alloc, generated);
+        owns_cloned = false;
     }
 
     fn finalizeUnit(self: *@This(), unit: *document_extraction_mod.Unit, generated: bool) !void {
@@ -13703,9 +13899,13 @@ const RuntimeDocumentExtractionCollectContext = struct {
             defer self.alloc.free(generated_batch);
             var initialized: usize = 0;
             defer for (generated_batch[0..initialized]) |*unit| unit.deinit(self.alloc);
-            for (self.pending_generated_units.items, self.pending_generated_mask.items) |unit, generated| {
+            for (self.pending_generated_units.items, self.pending_generated_mask.items) |*unit, generated| {
                 if (!generated) continue;
-                generated_batch[initialized] = try cloneDocumentExtractionUnit(self.alloc, unit);
+                // Transfer ownership into the contiguous execution slice.
+                // Shared lookahead must not duplicate every retained page's
+                // text/regions immediately before memory admission.
+                generated_batch[initialized] = unit.*;
+                unit.* = .{ .unit_id = &.{}, .unit_type = &.{}, .text = &.{}, .method = &.{} };
                 initialized += 1;
             }
             try completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(

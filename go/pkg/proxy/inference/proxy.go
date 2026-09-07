@@ -4348,6 +4348,9 @@ type proxyStreamingReplayBody struct {
 	spillPath string
 	spooled   int64
 	prepared  bool
+	replayErr error
+	// Interrupt the incoming socket read, not merely the outgoing body wrapper.
+	interrupt func()
 }
 
 func (b *proxyStreamingReplayBody) Len() int64 { return b.total }
@@ -4394,6 +4397,7 @@ type proxyStreamingAttemptBody struct {
 	body       *proxyStreamingReplayBody
 	reader     io.Reader
 	readMu     sync.Mutex
+	readBytes  int64
 	closed     atomic.Bool
 	finishOnce sync.Once
 	finishErr  error
@@ -4408,24 +4412,60 @@ func (b *proxyStreamingAttemptBody) Read(p []byte) (int, error) {
 	if b.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-	return b.reader.Read(p)
+	n, err := b.reader.Read(p)
+	b.readBytes += int64(n)
+	return n, err
 }
 
 func (b *proxyStreamingAttemptBody) Close() error {
 	// net/http is allowed to close a request body asynchronously after
 	// RoundTrip returns. Close must therefore be nonblocking and must never
 	// compete with an active socket read. The forwarding owner calls Finish
-	// after Do returns to serialize and seal the replay file exactly once.
+	// after Do returns to join reads and, only for a retry, seal the replay.
 	b.closed.Store(true)
 	return nil
 }
 
-func (b *proxyStreamingAttemptBody) Finish() error {
+func (b *proxyStreamingAttemptBody) Finish(ctx context.Context, retry bool) error {
 	b.closed.Store(true)
 	b.finishOnce.Do(func() {
+		defer func() { b.body.replayErr = b.finishErr }()
+		// The callback is joined before returning, so it never outlives the
+		// response writer, request body, or replay file it can interrupt.
+		interrupted := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			defer close(interrupted)
+			if b.body.interrupt != nil {
+				b.body.interrupt()
+			}
+		})
+		defer func() {
+			if !stop() {
+				<-interrupted
+			}
+		}()
+		if !retry && b.body.interrupt != nil {
+			incomplete := true
+			if b.readMu.TryLock() {
+				incomplete = b.readBytes != b.body.total
+				b.readMu.Unlock()
+			}
+			if incomplete {
+				b.body.interrupt()
+			}
+		}
 		b.readMu.Lock()
 		defer b.readMu.Unlock()
-		b.finishErr = b.body.sealReplay()
+		if err := ctx.Err(); err != nil {
+			b.finishErr = err
+			return
+		}
+		if retry {
+			b.finishErr = b.body.sealReplay()
+			if err := ctx.Err(); err != nil {
+				b.finishErr = err
+			}
+		}
 	})
 	return b.finishErr
 }
@@ -4451,6 +4491,9 @@ func (b *proxyStreamingReplayBody) sealReplay() error {
 }
 
 func (b *proxyStreamingReplayBody) Open() (io.ReadCloser, error) {
+	if b.replayErr != nil {
+		return nil, b.replayErr
+	}
 	if b.spill != nil {
 		if !b.opened {
 			b.opened = true
@@ -4464,8 +4507,10 @@ func (b *proxyStreamingReplayBody) Open() (io.ReadCloser, error) {
 			)
 			return &proxyStreamingAttemptBody{body: b, reader: reader}, nil
 		}
-		if err := b.sealReplay(); err != nil {
-			return nil, err
+		// Opening a retry is read-only. Only deadline-aware Finish may
+		// consume the incoming socket; a failed seal must never restart here.
+		if b.spooled != b.total {
+			return nil, errInvalidProxyAttachmentEnvelope
 		}
 		return io.NopCloser(io.NewSectionReader(b.spill, 0, b.total)), nil
 	}
@@ -4474,7 +4519,7 @@ func (b *proxyStreamingReplayBody) Open() (io.ReadCloser, error) {
 	}
 	b.opened = true
 	remaining := b.total - int64(len(b.prefix))
-	return io.NopCloser(io.MultiReader(bytes.NewReader(b.prefix), io.LimitReader(b.tail, remaining))), nil
+	return &proxyStreamingAttemptBody{body: b, reader: io.MultiReader(bytes.NewReader(b.prefix), io.LimitReader(b.tail, remaining))}, nil
 }
 
 func (b *proxyStreamingReplayBody) Close() error {
@@ -4523,6 +4568,13 @@ func (p *Proxy) proxyFramedRequest(w http.ResponseWriter, r *http.Request, opera
 		tail:     r.Body,
 		total:    r.ContentLength,
 		spillDir: p.spoolDir,
+		interrupt: func() {
+			// Closing net/http's incoming body can itself wait on a socket
+			// read. A read deadline actively wakes it without blocking here.
+			if err := http.NewResponseController(w).SetReadDeadline(time.Now()); err != nil {
+				_ = r.Body.Close() // custom handlers must supply an interruptible body
+			}
+		},
 	}
 	defer replay.Close()
 	p.proxyRequestWithReplayBody(w, r, operation, start, routing, routingPayload, replay)
@@ -4624,7 +4676,7 @@ func (p *Proxy) proxyRequestWithReplayBody(w http.ResponseWriter, r *http.Reques
 		}
 
 		forwardingLease := lease.BeginForwarding()
-		resp, reqErr := p.forwardRequest(r, replay, endpoint, matchedRoute)
+		resp, reqErr := p.forwardRequestWithRetry(r, replay, endpoint, matchedRoute, attempt+1 < attempts)
 		if reqErr != nil {
 			forwardingLease.Finish()
 			lastErr = reqErr
@@ -5742,6 +5794,10 @@ func (p *Proxy) UnregisterEndpoint(address string) {
 }
 
 func (p *Proxy) forwardRequest(r *http.Request, replay proxyReplayBody, endpoint *Endpoint, route *Route) (*http.Response, error) {
+	return p.forwardRequestWithRetry(r, replay, endpoint, route, route != nil && route.RetryAttempts > 1)
+}
+
+func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody, endpoint *Endpoint, route *Route, canRetry bool) (*http.Response, error) {
 	attemptCtx := r.Context()
 	var cancel context.CancelFunc
 	if route != nil && route.RetryTimeout > 0 {
@@ -5776,8 +5832,17 @@ func (p *Proxy) forwardRequest(r *http.Request, replay proxyReplayBody, endpoint
 	resp, err := p.registry.client.Do(outReq)
 	_ = body.Close()
 	finishErr := error(nil)
-	if finalizer, ok := body.(interface{ Finish() error }); ok {
-		finishErr = finalizer.Finish()
+	if finalizer, ok := body.(interface {
+		Finish(context.Context, bool) error
+	}); ok {
+		retry := canRetry && r.Context().Err() == nil &&
+			((err != nil && shouldRetryRequestError(route, err)) ||
+				(err == nil && resp != nil && shouldRetryStatus(route, resp.StatusCode)))
+		// A retry may need bytes the upstream never consumed. Give that
+		// work a finite deadline too; terminal responses never drain them.
+		finishCtx, finishCancel := context.WithTimeout(attemptCtx, 30*time.Second)
+		finishErr = finalizer.Finish(finishCtx, retry)
+		finishCancel()
 	}
 	if err == nil && finishErr != nil {
 		if resp != nil && resp.Body != nil {
