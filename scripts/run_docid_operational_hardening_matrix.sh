@@ -80,17 +80,18 @@ run_case() {
 }
 
 if [[ "$RUN_FULL_TARGET" == "1" ]]; then
-  run_case docid-operational-hardening-test zig build \
+  run_case integration-db-raft-hardening zig build \
     --build-file "$ZIG_BUILD_FILE" \
     --cache-dir "$ZIG_CACHE_DIR" \
     --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
-    docid-operational-hardening-test
+    integration-test lib-db-test raft-test \
+    lib-metadata-transition-chaos-test lib-metadata-public-chaos-test lib-lsm-backend-chaos-test
 else
-  run_case docid-lifecycle-test zig build \
+  run_case integration-db-raft-suites zig build \
     --build-file "$ZIG_BUILD_FILE" \
     --cache-dir "$ZIG_CACHE_DIR" \
     --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
-    docid-lifecycle-test
+    integration-test lib-db-test raft-test
 
   if [[ "$RUN_CHAOS" == "1" ]]; then
     run_case lib-metadata-transition-chaos-test zig build \

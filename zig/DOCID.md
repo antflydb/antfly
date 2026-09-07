@@ -1494,18 +1494,18 @@ Status as of 2026-05-19:
   fast local matrix; the default non-smoke matrix is a bounded developer
   evidence run, and larger release-scale runs should override the
   `DOCID_QUERY_MATRIX_*` case sizes and `DOCID_QUERY_MATRIX_MAX_ORDINAL_RATIO`.
-  `zig build docid-lifecycle-test` is now the durable focused hardening target
-  for lifecycle cutover, mixed-version, distributed snapshot, cache, compaction,
-  and near-capacity boundary coverage. `scripts/run_docid_lifecycle_matrix.sh`
-  wraps that target, focused DB/storage checks, and the DOCID query matrix into
+  Lifecycle cutover, mixed-version, distributed snapshot, cache, compaction,
+  and near-capacity boundary checks run in the owning suites:
+  `zig build integration-test lib-db-test raft-test`.
+  `scripts/run_docid_lifecycle_matrix.sh` wraps those suites,
+  focused DB/storage checks, and the DOCID query matrix into
   timestamped evidence under `bench/results/docid-lifecycle-matrix/`; it
   defaults to smoke-sized query evidence and can be expanded with
   `DOCID_LIFECYCLE_MATRIX_SMOKE=0`.
-  `zig build docid-operational-hardening-test` is the broader operational
-  evidence target: it chains the focused lifecycle gate with metadata
-  split/merge restart/partition chaos, public split/merge traffic chaos, and
-  LSM backend compaction chaos. `scripts/run_docid_operational_hardening_matrix.sh`
-  wraps the same work into timestamped logs under
+  `scripts/run_docid_operational_hardening_matrix.sh` combines the owning
+  integration/DB/Raft suites with metadata split/merge restart/partition chaos,
+  public split/merge traffic chaos, and LSM backend compaction chaos.
+  It records timestamped logs under
   `bench/results/docid-operational-hardening/`; set
   `DOCID_OPERATIONAL_MATRIX_RUN_SCALE=1` to add the large public-query
   performance matrix, and set `DOCID_OPERATIONAL_MATRIX_RUN_FULL_TARGET=1` when
@@ -2143,11 +2143,12 @@ Status as of 2026-05-19:
   `ResolvedDocSet` values and applies them against hit ordinals when every hit
   carries `doc_ordinal`, keeping the last postprocessing filter stage from
   reintroducing public-ID membership checks for ordinal-complete pages. This
-  boundary is now covered by the focused `lib-db-result-shape-test` build step,
-  which imports the DB result-shaping module explicitly and verifies that
+  boundary is covered by the internal result-shaping tests included in
+  `lib-db-test` and `lib-db-query-test`. They import the DB result-shaping
+  module explicitly and verify that
   native public-ID constraints are resolved once, then applied against hit
-  ordinals without stored-field loads. The DOCID gate now depends on that step
-  and includes the stored-pattern fail-closed regressions for missing or
+  ordinals without stored-field loads. The owning DB suite also includes
+  the stored-pattern fail-closed regressions for missing or
   unsupported ordinal projection. Remote vector-worker offload now also
   fails closed when handed an in-memory
   `ResolvedDocFilter`; the worker envelope has no cross-process representation

@@ -85,17 +85,14 @@ run_case() {
   fi
 }
 
-run_case docid-lifecycle-test zig build \
+# Select each owning suite once; the former lifecycle target was also a
+# dependency of the operational target and repeated the same checks here.
+run_case integration-db-raft-hardening zig build \
   --build-file "$ZIG_BUILD_FILE" \
   --cache-dir "$ZIG_CACHE_DIR" \
   --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
-  docid-lifecycle-test
-
-run_case docid-operational-hardening-test zig build \
-  --build-file "$ZIG_BUILD_FILE" \
-  --cache-dir "$ZIG_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
-  docid-operational-hardening-test
+  integration-test lib-db-test raft-test \
+  lib-metadata-transition-chaos-test lib-metadata-public-chaos-test lib-lsm-backend-chaos-test
 
 if [[ "$RUN_SCALE" == "1" ]]; then
   run_case docid-perf-scale-matrix env \
