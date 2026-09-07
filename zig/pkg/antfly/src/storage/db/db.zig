@@ -2016,7 +2016,7 @@ const EnrichmentAppendContext = struct {
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
-    identity_visibility_owner_slot: ?*const std.atomic.Value(?*DB) = null,
+    identity_visibility: ?*db_core.IdentityVisibilityState = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
@@ -2044,7 +2044,7 @@ const EnrichmentAppendContext = struct {
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
             .ha_write_gate = self.ha_write_gate,
-            .identity_visibility_owner_slot = self.identity_visibility_owner_slot,
+            .identity_visibility = self.identity_visibility,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
@@ -2090,7 +2090,7 @@ const BatchExecutionContext = struct {
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
-    identity_visibility_owner_slot: ?*const std.atomic.Value(?*DB) = null,
+    identity_visibility: ?*db_core.IdentityVisibilityState = null,
 };
 
 const ReplayApplyContext = struct {
@@ -2106,7 +2106,6 @@ const ReplayApplyContextBatch = struct {
 const TtlCleanupContext = struct {
     batch: BatchExecutionContext,
     grace_period_ns: u64,
-    identity_visibility_owner: std.atomic.Value(?*DB) = std.atomic.Value(?*DB).init(null),
 };
 
 /// Stable owner for transaction recovery callbacks. `DB.open` returns its
@@ -2116,6 +2115,9 @@ const TtlCleanupContext = struct {
 /// address until the worker has joined during close.
 const TransactionRecoveryLocalContext = struct {
     stable_owner: ?*DB = null,
+    /// A recovery call borrows replaceable providers for its entire mutation.
+    /// Reconfiguration takes this lock before retiring any provider runtime.
+    provider_mutex: Io.Mutex = .init,
     /// Borrowed split state published under the core apply lock. The public DB
     /// wrapper is movable, so its `shadow` field is not a stable source for the
     /// recovery owner allocated during open.
@@ -4077,20 +4079,6 @@ pub const DB = struct {
     flushing_bulk_ingest_coalescer: bool = false,
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
-    identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
-    // Memoizes the resolved live-doc set for broad (.all) live filtering at a
-    // single identity read generation. Visibility at a fixed generation is
-    // stable, so the entry only turns over when queries arrive at a newer
-    // generation. Guarded by its own mutex because published-path queries do
-    // not hold the apply lock.
-    live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
-    live_doc_set_cache_generation: ?u64 = null,
-    live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
-    nonvisible_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
-    nonvisible_doc_set_cache_generation: ?u64 = null,
-    nonvisible_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
-    nonvisible_doc_set_cache_overflow: bool = false,
-    nonvisible_doc_set_cache_entries: AtomicU64 = AtomicU64.init(0),
     // Status snapshots are reconstructed from durable state on every poll, so
     // volatile worker observations need an independently owned cache. Keeping
     // it on the resident DB (rather than inside a returned DBStats value) lets
@@ -4188,6 +4176,7 @@ pub const DB = struct {
             .repair_replay_mutex = resources.repair_replay_mutex,
             .log_mutex = resources.log_mutex,
             .identity_namespace = resources.identity_namespace,
+            .identity_visibility = &self.core.identity_visibility,
             .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
             .executor = self.executor,
             .io = self.backend_runtime.io(),
@@ -4892,9 +4881,6 @@ pub const DB = struct {
     }
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
-        if (hook != null) {
-            self.bindTtlIdentityVisibilityOwner();
-        }
         var pending_hook: ?QueryVisibilityHook = null;
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
         self.async_context.query_visibility_hook = hook;
@@ -4977,23 +4963,6 @@ pub const DB = struct {
         }
     }
 
-    fn bindTtlIdentityVisibilityOwner(self: *DB) void {
-        const ttl_ctx = self.ttl_cleanup_context orelse return;
-        ttl_ctx.identity_visibility_owner.store(self, .release);
-
-        // DB.open returns the wrapper by value, so optional runtimes are
-        // initialized before a managed writer reaches its stable cache
-        // address. Refresh any TTL mutation that may have landed during that
-        // move window when the serving layer attaches its visibility hook.
-        lockApply(self);
-        defer self.core.unlockApply();
-        if (doc_identity.visibilitySummaryFromStore(self.core.store) catch null) |summary| {
-            self.identity_visibility_summary_cache = summary;
-            self.clearLiveDocSetCache();
-            self.clearNonVisibleDocSetCache();
-        }
-    }
-
     fn prepareTransactionRecoveryOwner(self: *DB) !void {
         const ctx = self.transaction_recovery_local_context orelse return;
         if (ctx.stable_owner != null) return;
@@ -5001,23 +4970,16 @@ pub const DB = struct {
         const stable_owner = try self.runtime_alloc.create(DB);
         stable_owner.* = self.*;
         // The snapshot shares durable/core/runtime pointers, but it must not
-        // alias wrapper-owned caches, maps, or mutex state. Recovery never
-        // participates in caller bulk-ingest sessions and rebuilds visibility
-        // from the shared store when needed.
+        // alias wrapper-owned caches, maps, or mutex state. Visibility is
+        // owned by the shared core. Replaceable enrichment state is borrowed
+        // from the shared async context only while provider_mutex is held.
         stable_owner.bulk_ingest_coalescer = .{};
         stable_owner.flushing_bulk_ingest_coalescer = false;
         stable_owner.bulk_ingest_identity_all_new = false;
         stable_owner.bulk_ingest_identity_state = .{};
         stable_owner.bulk_ingest_seen_doc_keys = .{};
-        stable_owner.identity_visibility_summary_cache = null;
-        stable_owner.live_doc_set_cache_mutex = .unlocked;
-        stable_owner.live_doc_set_cache_generation = null;
-        stable_owner.live_doc_set_cache_set = null;
-        stable_owner.nonvisible_doc_set_cache_mutex = .unlocked;
-        stable_owner.nonvisible_doc_set_cache_generation = null;
-        stable_owner.nonvisible_doc_set_cache_set = null;
-        stable_owner.nonvisible_doc_set_cache_overflow = false;
-        stable_owner.nonvisible_doc_set_cache_entries = AtomicU64.init(0);
+        stable_owner.enrichment_runtime = null;
+        stable_owner.enrichment_append_context = null;
         ctx.stable_owner = stable_owner;
     }
 
@@ -5339,6 +5301,11 @@ pub const DB = struct {
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
 
+        const recovery = self.transaction_recovery_local_context;
+        const recovery_io = self.backend_runtime.io();
+        if (recovery) |ctx| ctx.provider_mutex.lockUncancelable(recovery_io.?);
+        defer if (recovery) |ctx| ctx.provider_mutex.unlock(recovery_io.?);
+
         var owned_cfg = cfg;
         var cfg_owned = true;
         errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
@@ -5529,7 +5496,7 @@ pub const DB = struct {
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
-        ttl_ctx.batch.identity_visibility_owner_slot = &ttl_ctx.identity_visibility_owner;
+        ttl_ctx.batch.identity_visibility = &self.core.identity_visibility;
         const runtime = try self.runtime_alloc.create(ttl_runtime_mod.TtlRuntime);
         errdefer self.runtime_alloc.destroy(runtime);
         runtime.* = try ttl_runtime_mod.TtlRuntime.init(
@@ -5719,21 +5686,11 @@ pub const DB = struct {
     }
 
     fn clearLiveDocSetCache(self: *DB) void {
-        lockAtomic(&self.live_doc_set_cache_mutex);
-        defer self.live_doc_set_cache_mutex.unlock();
-        if (self.live_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
-        self.live_doc_set_cache_set = null;
-        self.live_doc_set_cache_generation = null;
+        self.core.identity_visibility.clearLive();
     }
 
     fn clearNonVisibleDocSetCache(self: *DB) void {
-        lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-        defer self.nonvisible_doc_set_cache_mutex.unlock();
-        if (self.nonvisible_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
-        self.nonvisible_doc_set_cache_set = null;
-        self.nonvisible_doc_set_cache_generation = null;
-        self.nonvisible_doc_set_cache_overflow = false;
-        self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+        self.core.identity_visibility.clearNonvisible();
     }
 
     fn clearEmbeddingActivityCache(self: *DB) void {
@@ -8219,7 +8176,7 @@ pub const DB = struct {
             } else if (append_derived_replay) deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&ha_ctx, replay_payload));
         }
         if (pending_identity_visibility_summary) |summary| {
-            self.identity_visibility_summary_cache = summary;
+            self.core.identity_visibility.summary = summary;
             self.clearLiveDocSetCache();
             self.clearNonVisibleDocSetCache();
         }
@@ -8430,7 +8387,7 @@ pub const DB = struct {
         if (!try self.primaryUserNamespaceIsEmptyLocked()) return;
         if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
             self.bulk_ingest_identity_state = state;
-            self.identity_visibility_summary_cache = state.visibility_summary;
+            self.core.identity_visibility.summary = state.visibility_summary;
             self.clearLiveDocSetCache();
             self.clearNonVisibleDocSetCache();
             self.bulk_ingest_identity_all_new = true;
@@ -27461,7 +27418,7 @@ pub const DB = struct {
         // being overlaid, so refresh the maintained O(1) identity summary at
         // the same apply-lock boundary before publishing live counters.
         var identity_stats = try doc_identity.fastStatsFromStore(self.core.store);
-        applyCachedIdentityVisibilitySummary(&identity_stats, self.identity_visibility_summary_cache);
+        applyCachedIdentityVisibilitySummary(&identity_stats, self.core.identity_visibility.summary);
         runtime_stats.source_doc_count = identity_stats.live_ordinals;
         runtime_stats.doc_identity = dbDocIdentityStats(identity_stats, self.core.identity_namespace);
         try self.hydrateDerivedCoverageIdentities(stats_alloc, runtime_stats.indexes);
@@ -27722,7 +27679,7 @@ pub const DB = struct {
 
     fn currentIdentityReadGeneration(self: *DB) !u64 {
         var current_generation = self.core.nextDerivedSequence();
-        if (self.identity_visibility_summary_cache) |summary| {
+        if (self.core.identity_visibility.summary) |summary| {
             return @max(current_generation, doc_identity.latestGenerationFromSummary(summary));
         }
         if (try doc_identity.latestGenerationFromSummaryFast(self.core.store)) |identity_generation| {
@@ -27739,7 +27696,7 @@ pub const DB = struct {
     }
 
     fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
-        return self.visibility_runtime_stats.snapshot(self.nonvisible_doc_set_cache_entries.load(.monotonic));
+        return self.visibility_runtime_stats.snapshot(self.core.identity_visibility.nonvisible_entries.load(.monotonic));
     }
 
     const DocIdentityCoverage = struct {
@@ -27787,7 +27744,7 @@ pub const DB = struct {
         // previous durable summary until the bulk window is published. Runtime
         // owners must publish the maintained live summary rather than making
         // status wait for a flush or fall back to a primary scan.
-        applyCachedIdentityVisibilitySummary(&raw_identity_stats, self.identity_visibility_summary_cache);
+        applyCachedIdentityVisibilitySummary(&raw_identity_stats, self.core.identity_visibility.summary);
         const identity_stats = dbDocIdentityStats(raw_identity_stats, self.core.identity_namespace);
         // Operational status is polled frequently. Identity metadata is the
         // normal O(1) source of the live document count; retain the legacy
@@ -30354,10 +30311,10 @@ pub const DB = struct {
             return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
         };
         {
-            lockAtomic(&self.live_doc_set_cache_mutex);
-            defer self.live_doc_set_cache_mutex.unlock();
-            if (self.live_doc_set_cache_generation == gen) {
-                if (self.live_doc_set_cache_set) |*cached| {
+            lockAtomic(&self.core.identity_visibility.live_mutex);
+            defer self.core.identity_visibility.live_mutex.unlock();
+            if (self.core.identity_visibility.live_generation == gen) {
+                if (self.core.identity_visibility.live_set) |*cached| {
                     return try doc_set.cloneAlloc(alloc, cached);
                 }
             }
@@ -30365,11 +30322,11 @@ pub const DB = struct {
         var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
-            lockAtomic(&self.live_doc_set_cache_mutex);
-            defer self.live_doc_set_cache_mutex.unlock();
-            if (self.live_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.live_doc_set_cache_set = cloned;
-            self.live_doc_set_cache_generation = gen;
+            lockAtomic(&self.core.identity_visibility.live_mutex);
+            defer self.core.identity_visibility.live_mutex.unlock();
+            if (self.core.identity_visibility.live_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.live_set = cloned;
+            self.core.identity_visibility.live_generation = gen;
         } else |_| {
             // Caching is best-effort; the computed set is still returned.
         }
@@ -30401,14 +30358,14 @@ pub const DB = struct {
             );
         };
         {
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_generation == gen) {
-                if (self.nonvisible_doc_set_cache_overflow) {
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_generation == gen) {
+                if (self.core.identity_visibility.nonvisible_overflow) {
                     self.visibility_runtime_stats.recordCacheHit();
                     return null;
                 }
-                if (self.nonvisible_doc_set_cache_set) |*cached| {
+                if (self.core.identity_visibility.nonvisible_set) |*cached| {
                     self.visibility_runtime_stats.recordCacheHit();
                     return try doc_set.cloneAlloc(alloc, cached);
                 }
@@ -30427,25 +30384,25 @@ pub const DB = struct {
             // Overflow (more non-visible docs than the budget) is also worth
             // remembering, so each query does not rescan before falling back
             // to the include-set path.
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.nonvisible_doc_set_cache_set = null;
-            self.nonvisible_doc_set_cache_generation = gen;
-            self.nonvisible_doc_set_cache_overflow = true;
-            self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.nonvisible_set = null;
+            self.core.identity_visibility.nonvisible_generation = gen;
+            self.core.identity_visibility.nonvisible_overflow = true;
+            self.core.identity_visibility.nonvisible_entries.store(0, .monotonic);
             return null;
         };
         self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.nonvisible_doc_set_cache_set = cloned;
-            self.nonvisible_doc_set_cache_generation = gen;
-            self.nonvisible_doc_set_cache_overflow = false;
-            self.nonvisible_doc_set_cache_entries.store(1, .monotonic);
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.nonvisible_set = cloned;
+            self.core.identity_visibility.nonvisible_generation = gen;
+            self.core.identity_visibility.nonvisible_overflow = false;
+            self.core.identity_visibility.nonvisible_entries.store(1, .monotonic);
         } else |_| {
             // Caching is best-effort; the computed set is still returned.
         }
@@ -30519,7 +30476,7 @@ pub const DB = struct {
     }
 
     fn allDocsVisibleSummaryFastMaybe(self: *DB, generation: ?u64) !?bool {
-        if (self.identity_visibility_summary_cache) |summary| {
+        if (self.core.identity_visibility.summary) |summary| {
             return doc_identity.allVisibleFromSummary(summary, generation);
         }
         return try doc_identity.allVisibleFromSummaryFast(self.core.store, generation);
@@ -41948,13 +41905,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         .payload = replay_payload,
     });
     if (pending_identity_visibility_summary) |summary| {
-        if (ctx.identity_visibility_owner_slot) |slot| {
-            if (slot.load(.acquire)) |owner| {
-                owner.identity_visibility_summary_cache = summary;
-                owner.clearLiveDocSetCache();
-                owner.clearNonVisibleDocSetCache();
-            }
-        }
+        if (ctx.identity_visibility) |visibility| visibility.publish(summary);
     }
     var deferred_ha_gates = HADeferredCommitGates.begin(ctx);
     defer deferred_ha_gates.releaseTransition();
@@ -54077,6 +54028,11 @@ fn resolveRecoveredLocalTransaction(
 ) anyerror!void {
     const local_ctx: *TransactionRecoveryLocalContext = @ptrCast(@alignCast(ctx));
     const db = local_ctx.stable_owner orelse return error.TransactionRecoveryOwnerUnbound;
+    const io = db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+    try local_ctx.provider_mutex.lock(io);
+    defer local_ctx.provider_mutex.unlock(io);
+    db.enrichment_runtime = db.async_context.enrichment_runtime;
+    defer db.enrichment_runtime = null;
     try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
 }
 
@@ -57708,7 +57664,7 @@ test "db operational stats prefer the maintained live identity summary" {
         .primary_backend = .{ .mem = .{} },
     });
     defer db.close();
-    db.identity_visibility_summary_cache = .{
+    db.core.identity_visibility.summary = .{
         .live_ordinals = 1,
         .max_created_generation = 3,
     };
@@ -58183,13 +58139,13 @@ test "db caches identity visibility summary after local writes" {
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
     });
-    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(db.core.identity_visibility.summary != null);
     try std.testing.expect(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
 
     try db.batch(.{
         .deletes = &.{"doc:a"},
     });
-    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(db.core.identity_visibility.summary != null);
     try std.testing.expect(!(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
 }
 
@@ -59697,7 +59653,7 @@ test "db non chunked search paths apply broad live doc filter" {
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -73527,7 +73483,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -78056,7 +78012,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -88990,7 +88946,7 @@ test "db managed admission ignores stale zero identity cache" {
 
     // Model a primary commit followed by an HA mirror failure before runtime
     // cache publication. Admission authority must remain the primary store.
-    db.identity_visibility_summary_cache = .{};
+    db.core.identity_visibility.summary = .{};
     try std.testing.expect((try db.admitManagedFullTextIndex(.{
         .name = "full_text_index_v1",
         .kind = .full_text,
@@ -100578,8 +100534,6 @@ test "db ttl delete callback atomically removes dense artifacts and updates repa
         .batch = db.batchContext(),
         .grace_period_ns = 0,
     };
-    ttl_ctx.identity_visibility_owner.store(&db, .release);
-    ttl_ctx.batch.identity_visibility_owner_slot = &ttl_ctx.identity_visibility_owner;
     const candidate_key = try alloc.dupe(u8, "doc:expired");
     defer alloc.free(candidate_key);
     const candidates = [_]ttl_runtime_mod.DeleteCandidate{.{
@@ -103022,6 +102976,160 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:recovered_orphan", result.hits[0].id);
+}
+
+test "db transaction recovery shares serving visibility and invalidates query caches" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
+    try std.testing.expect(&db.core.identity_visibility == &recovery.core.identity_visibility);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
+    try std.testing.expect(try db.allDocsVisibleSummaryFast(null));
+    const generation = try db.currentIdentityReadGeneration();
+    var live = try db.broadLiveDocSetCachedAlloc(alloc, generation);
+    defer live.deinit(alloc);
+    var hidden = (try db.nonVisibleDocSetCachedAlloc(alloc, generation)).?;
+    defer hidden.deinit(alloc);
+    try std.testing.expect(db.core.identity_visibility.live_generation != null);
+    try std.testing.expect(db.core.identity_visibility.nonvisible_generation != null);
+
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{ .deletes = &.{"doc:a"} });
+    const config = db.transaction_runtime.?.config;
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    const stored = try db.get(alloc, "doc:a");
+    if (stored) |value| alloc.free(value);
+    try std.testing.expect(stored == null);
+    const durable = (try doc_identity.visibilitySummaryFromStore(db.core.store)).?;
+    try std.testing.expectEqual(@as(u64, 0), durable.live_ordinals);
+    try std.testing.expectEqualDeep(durable, db.core.identity_visibility.summary.?);
+    try std.testing.expect(!try db.allDocsVisibleSummaryFast(null));
+    try std.testing.expect(db.core.identity_visibility.live_generation == null);
+    try std.testing.expect(db.core.identity_visibility.nonvisible_generation == null);
+
+    // Serving writes also replace the recovery view, rather than leaving a
+    // second cached summary that can later mask the next recovered mutation.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }} });
+    try std.testing.expectEqual(@as(u64, 1), recovery.core.identity_visibility.summary.?.live_ordinals);
+}
+
+test "db transaction recovery borrows replacement enrichment only during resolution" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var recorder = TxnResolverRecorder{};
+    var initial = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .dense_embedder = initial.interface() },
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_recovery", .kind = .full_text, .config_json = "{}" });
+    try db.prepareTransactionRecoveryOwner();
+    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const original = db.enrichment_runtime.?;
+    var replacement = embedder_mod.DeterministicDenseEmbedder{};
+    try db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = replacement.interface() });
+    try std.testing.expect(db.enrichment_runtime.? != original);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const config = db.transaction_runtime.?.config;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"recovered\"}" }},
+    });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(sequence > 0);
+    try std.testing.expectEqual(sequence, db.enrichment_runtime.?.stats().target_sequence);
+    try db.waitForCurrentSyncLevel(.full_text);
+    var result = try db.search(alloc, .{
+        .index_name = "ft_recovery",
+        .query = .{ .match = .{ .field = "_all", .text = "recovered" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+
+    // Removing the producer must also leave no dangling pointer behind.
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime == null);
+    const deleted = try db.beginTransaction(3_000);
+    try db.writeTransaction(deleted, .{ .deletes = &.{"doc:a"} });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, deleted, .committed, 4_000);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+}
+
+test "db transaction recovery provider guard survives failed enrichment replacement" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var recorder = TxnResolverRecorder{};
+    var initial = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .dense_embedder = initial.interface() },
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const original = db.enrichment_runtime.?;
+    const recovery = db.transaction_recovery_local_context.?;
+    const Fault = struct {
+        fn afterDetached(target: *DB) !void {
+            const context = target.transaction_recovery_local_context.?;
+            if (context.provider_mutex.tryLock()) {
+                context.provider_mutex.unlock(target.backend_runtime.io().?);
+                return error.TestMissingRecoveryProviderGuard;
+            }
+            return error.TestReplacementInterrupted;
+        }
+    };
+    DB.test_enrichment_reconfigure_after_detached_hook = Fault.afterDetached;
+    defer DB.test_enrichment_reconfigure_after_detached_hook = null;
+    var replacement = embedder_mod.DeterministicDenseEmbedder{};
+    try std.testing.expectError(error.TestReplacementInterrupted, db.reconfigureEnrichmentRuntimePaused(.{
+        .dense_embedder = replacement.interface(),
+    }));
+    try std.testing.expectEqual(original, db.enrichment_runtime.?);
+    try std.testing.expect(recovery.provider_mutex.tryLock());
+    recovery.provider_mutex.unlock(db.backend_runtime.io().?);
+    try std.testing.expect(recovery.stable_owner.?.enrichment_runtime == null);
+    const config = db.transaction_runtime.?.config;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"after failure\"}" }},
+    });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    try std.testing.expect(recovery.stable_owner.?.enrichment_runtime == null);
+    try std.testing.expect(recovery.provider_mutex.tryLock());
+    recovery.provider_mutex.unlock(db.backend_runtime.io().?);
 }
 
 test "db transaction recovery stable owner observes split shadow lifetime" {

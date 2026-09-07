@@ -3127,6 +3127,42 @@ same-name serverless dense-index update E2E regression also pass locally.
 The broader replay and CI limitations recorded above remain separate from
 these focused production fixes.
 
+### Shared Recovery Ownership Follow-up (2026-09-06)
+
+Review of the stable transaction-recovery wrapper found two remaining ownership
+defects: it retained a freed enrichment runtime after producer replacement,
+and recovered commits updated a private visibility summary while the serving
+wrapper continued using stale live/tombstone counts and query caches.
+
+Identity visibility now belongs to the heap-owned DB core. Serving writes,
+transaction recovery, and TTL cleanup publish into the same summary and
+invalidate the same live/non-visible query-set caches. TTL cleanup borrows this
+stable state directly, without waiting for a serving-wrapper address to be
+registered. Cache allocations are reclaimed through their owning allocator
+after the workers are joined.
+
+Recovery borrows the current enrichment runtime from the shared async context
+only for the duration of a resolution. A shared provider mutex serializes that
+borrow with replacement/removal; the recovery wrapper retains no enrichment
+pointer between calls. Failed replacement releases the mutex and preserves the
+previous provider. Private native ABI version 5 rejects the old DB/core layouts.
+
+Three regressions cover recovered deletes and bidirectional visibility,
+invalidation of both query caches, successful resolution/full-text visibility
+after provider replacement, provider removal, and failed-replacement guard
+cleanup. The 43-test transaction/TTL gate passes in Debug and ReleaseSafe,
+the enrichment-worker gate passes all 21 tests, and the four cross-archive I/O
+ABI tests pass in both modes. The production build and repository formatting
+checks also pass. Against the rebuilt binary, all 21 transaction E2E tests,
+the concurrent insert/delete publication regression, and the same-name
+serverless dense-index update regression pass (23 E2E tests total).
+
+The broader DB/index VOPR gate passes 11 of 12 tests: its managed-readiness
+scenario fails with `IndexRebuilding`. The same failure reproduces in a clean
+worktree at the pre-fix commit `20f359ab7f`, so it remains a separate existing
+limitation. These focused fixes also do not resolve the broader packet-replay
+limitation recorded above.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and
