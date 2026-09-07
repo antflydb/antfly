@@ -30262,7 +30262,7 @@ test "api http server serves query builder response envelope" {
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
 
     const query_builder_body =
-        \\{"table":"docs","intent":"find published raft articles","mode":"auto","output":"query_request","constraints":{"limit":7},"max_internal_iterations":3,"max_user_clarifications":2}
+        \\{"table":"docs","intent":"find published raft articles","mode":"auto","output":"query_request","constraints":{"limit":7},"max_internal_iterations":0,"max_user_clarifications":2}
     ;
     var resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -30278,7 +30278,7 @@ test "api http server serves query builder response envelope" {
     try std.testing.expect(parsed.value.session_id != null);
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, parsed.value.status.?);
     try std.testing.expectEqual(@as(i64, 1), parsed.value.iteration.?);
-    try std.testing.expectEqual(@as(i64, 2), parsed.value.remaining_internal_iterations.?);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.remaining_internal_iterations.?);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.remaining_user_clarifications.?);
     try std.testing.expect(parsed.value.steps != null);
     try std.testing.expectEqualStrings("query_builder", parsed.value.steps.?[0].name);
@@ -30291,6 +30291,29 @@ test "api http server serves query builder response envelope" {
     try std.testing.expectEqualStrings("full_text", parsed.value.specialist.?);
     try std.testing.expect(parsed.value.plan != null);
     try std.testing.expect(parsed.value.explanation != null);
+
+    // Positive budgets opt into model-directed planning, not the compatibility
+    // planner above. Without a generator they must fail, never silently fall
+    // back to a deterministic plan or claim successful tool execution.
+    for ([_]i64{ 1, 3, 20 }) |iterations| {
+        const tool_body = try std.json.Stringify.valueAlloc(alloc, .{
+            .table = "docs",
+            .intent = "find published raft articles",
+            .max_internal_iterations = iterations,
+        }, .{});
+        defer alloc.free(tool_body);
+        var tool_resp = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = routes.Routes.agents_query_builder,
+            .body = tool_body,
+        });
+        defer tool_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), tool_resp.status);
+        try std.testing.expectEqualStrings("application/json", tool_resp.content_type.?);
+        var failure = try std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, tool_resp.body, .{});
+        defer failure.deinit();
+        try std.testing.expectEqualStrings("query planning requires a tool-capable generator", failure.value.@"error");
+    }
 }
 
 test "api http server query builder infers semantic indexes from table metadata" {
