@@ -451,6 +451,7 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
     if (!prepared.identifies(source_graph)) return error.ArtifactIntegrityMismatch;
 
     const refs = try alloc.alloc(artifact_ref.ArtifactRef, configs.len);
+    errdefer alloc.free(refs);
     const initialized = try alloc.alloc(bool, configs.len);
     defer alloc.free(initialized);
     @memset(initialized, false);
@@ -459,7 +460,6 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
     @memset(processed, false);
     errdefer {
         for (refs, initialized) |ref, ready| if (ready) freeArtifactRef(alloc, ref);
-        alloc.free(refs);
     }
     for (configs, 0..) |config, i| {
         if (processed[i]) continue;
@@ -2278,6 +2278,26 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     var prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, shared_budget.limits);
     defer prepared.deinit(alloc);
     try std.testing.expect(prepared.identifies(source));
+    // Exercise the real publication entry point: failures in either scratch
+    // allocation must release the already allocated result array.
+    for ([_]usize{ 1, 2 }) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        var failure_budget = graph_metric_policy.Budget{ .limits = .{} };
+        try std.testing.expectError(error.OutOfMemory, publishManyFromPreparedGraphWithBudgetAlloc(
+            failing.allocator(),
+            &artifacts,
+            "graph",
+            source,
+            &one_config,
+            .none,
+            failure_budget.limits,
+            &failure_budget,
+            &prepared,
+            .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 },
+            .{},
+        ));
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
     var wrong_source = source;
     wrong_source.byte_len += 1;
     try std.testing.expect(!prepared.identifies(wrong_source));

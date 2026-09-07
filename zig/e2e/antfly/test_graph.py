@@ -1860,6 +1860,18 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
     assert batch["inserted"] == len(inserts)
     assert wait_until(predicates_ready, timeout_s=120.0, interval_s=0.25) is not None
 
+    # Index creation/reconciliation is asynchronous. full_index waits for
+    # indexed writes, not installation of a newly requested graph incarnation;
+    # predicate readiness alone does not establish graph readiness.
+    def graph_ready() -> dict | None:
+        return ready_index_status(
+            backup_api.get_index(table_name, "social"),
+            until="complete",
+            require_query_fresh=True,
+        )
+
+    assert wait_until(graph_ready, timeout_s=120.0, interval_s=0.25) is not None
+
     def node(label: str) -> dict:
         return {"filter": {"term": label, "path": "/type"}}
 

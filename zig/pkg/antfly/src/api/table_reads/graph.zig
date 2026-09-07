@@ -113,6 +113,8 @@ pub fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_
         .filter_query_json = req.filter_query_json,
         .exclusion_query_json = req.exclusion_query_json,
         .include_stored = req.include_stored,
+        .fields = req.fields,
+        .include_all_fields = req.include_all_fields,
         .resolved_doc_filter = req.resolved_doc_filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .identity_read_generation = req.identity_read_generation,
@@ -142,17 +144,7 @@ pub fn graphHydrateOnPreparedDb(
     req: distributed_graph.GraphHydrateRequest,
     search_req: db_mod.types.SearchRequest,
 ) !distributed_graph.GraphHydrateResponse {
-    if (req.incoming_index_name.len > 0) {
-        if (!req.incoming_index_identity.valid()) return error.IndexGenerationMismatch;
-        const actual = db.core.index_manager.coverageIdentityForIndex(req.incoming_index_name) orelse
-            return error.IndexGenerationMismatch;
-        if (actual.generation != req.incoming_index_identity.incarnation or
-            actual.config_fingerprint == null or
-            actual.config_fingerprint.? != req.incoming_index_identity.config_hash)
-        {
-            return error.IndexGenerationMismatch;
-        }
-    }
+    if (req.incoming_index_name.len > 0 and !req.incoming_index_identity.valid()) return error.InvalidArgument;
     const hits = if (req.include_hits)
         try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
     else
@@ -164,7 +156,10 @@ pub fn graphHydrateOnPreparedDb(
     return .{
         .hits = hits,
         .has_incoming = if (req.incoming_index_name.len > 0)
-            try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys)
+            try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys, .{
+                .generation = req.incoming_index_identity.incarnation,
+                .config_fingerprint = req.incoming_index_identity.config_hash,
+            }, req.identity_read_generation)
         else
             @constCast((&[_]bool{})[0..]),
         .incoming_index_identity = req.incoming_index_identity,

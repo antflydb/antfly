@@ -1848,6 +1848,10 @@ pub const AntflyApiHandler = struct {
     /// this is only the shared wire projection at the `httpx` boundary.
     fn sharedInternalHttpErrorSpec(err: anyerror) ?InternalHttpErrorSpec {
         return switch (err) {
+            error.IndexGenerationMismatch => .{
+                .status = 409,
+                .message = "IndexGenerationMismatch",
+            },
             error.DocIdentityNamespaceMismatch => .{
                 .status = 409,
                 .message = "doc identity namespace mismatch",
@@ -7109,6 +7113,9 @@ const SchemaReconcileWriteSource = struct {
 };
 
 test "typed internal HTTP errors preserve conflict semantics" {
+    const stale_index = AntflyApiHandler.sharedInternalHttpErrorSpec(error.IndexGenerationMismatch).?;
+    try std.testing.expectEqual(@as(u16, 409), stale_index.status);
+    try std.testing.expectEqualStrings("IndexGenerationMismatch", stale_index.message);
     const spec = AntflyApiHandler.sharedInternalHttpErrorSpec(error.DocIdentityNamespaceMismatch).?;
     try std.testing.expectEqual(@as(u16, 409), spec.status);
     try std.testing.expectEqualStrings("doc identity namespace mismatch", spec.message);

@@ -214,6 +214,14 @@ fn logicalReductionParts(len: usize) usize {
     return @min(reduction_partitions, len);
 }
 
+fn graphReductionParts(topology: Topology) usize {
+    // Stable across runtime worker counts, but sensitive to edge work.
+    return if (topology.edgeCount() >= parallel_edge_threshold)
+        @min(reduction_partitions, topology.nodeCount())
+    else
+        logicalReductionParts(topology.nodeCount());
+}
+
 /// Partition by vertices plus incident edges, not merely vertex count. This
 /// keeps power-law graphs balanced while retaining exclusive ownership of each
 /// output ordinal.
@@ -384,7 +392,7 @@ fn fillPageRankNext(
             }
         }
     };
-    const parts = logicalReductionParts(topology.nodeCount());
+    const parts = graphReductionParts(topology);
     var partials: [reduction_partitions]f64 = @splat(0);
     const width = @min(parallelWidth(topology, options), parts);
     if (width == 1) {
@@ -1042,58 +1050,60 @@ test "serverless graph metric spectral rebuild rejects support-deficient warm st
 
 test "serverless graph metric runtime fanout preserves deterministic target-owned results" {
     const alloc = std.testing.allocator;
-    const node_count: usize = parallel_vector_threshold;
-    const edge_count: usize = parallel_edge_threshold;
-    const edges = try alloc.alloc(Edge, edge_count);
-    defer alloc.free(edges);
-    for (edges, 0..) |*edge, i| {
-        edge.* = .{
-            .source = @intCast(i % node_count),
-            .target = @intCast((i * 17 + 3) % node_count),
-        };
+    for ([_]usize{ 4096, parallel_vector_threshold }) |node_count| {
+        const edge_count: usize = parallel_edge_threshold;
+        const edges = try alloc.alloc(Edge, edge_count);
+        defer alloc.free(edges);
+        for (edges, 0..) |*edge, i| {
+            edge.* = .{
+                .source = @intCast(i % node_count),
+                .target = @intCast((i * 17 + 3) % node_count),
+            };
+        }
+        var topology = try Topology.initAlloc(alloc, node_count, edges, .none);
+        defer topology.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, reduction_partitions), graphReductionParts(topology));
+        const options = Options{ .max_iterations = 3, .max_work_items = 10_000_000 };
+        var serial = try pageRankTopologyAlloc(alloc, topology, options);
+        defer serial.deinit(alloc);
+
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        var parallel_options = options;
+        parallel_options.io = io_impl.io();
+        parallel_options.max_parallelism = 4;
+        var parallel = try pageRankTopologyAlloc(alloc, topology, parallel_options);
+        defer parallel.deinit(alloc);
+        try std.testing.expectEqualSlices(f64, serial.scores, parallel.scores);
+
+        const values = try alloc.alloc(f64, node_count);
+        defer alloc.free(values);
+        const serial_incoming = try alloc.alloc(f64, node_count);
+        defer alloc.free(serial_incoming);
+        const parallel_incoming = try alloc.alloc(f64, node_count);
+        defer alloc.free(parallel_incoming);
+        const serial_outgoing = try alloc.alloc(f64, node_count);
+        defer alloc.free(serial_outgoing);
+        const parallel_outgoing = try alloc.alloc(f64, node_count);
+        defer alloc.free(parallel_outgoing);
+        for (values, 0..) |*value, i| value.* = @floatFromInt(i % 31);
+        try fillAdjacencySums(topology, values, serial_incoming, true, 1, options);
+        try fillAdjacencySums(topology, values, parallel_incoming, true, 1, parallel_options);
+        try std.testing.expectEqualSlices(f64, serial_incoming, parallel_incoming);
+        try fillAdjacencySums(topology, values, serial_outgoing, false, 1, options);
+        try fillAdjacencySums(topology, values, parallel_outgoing, false, 1, parallel_options);
+        try std.testing.expectEqualSlices(f64, serial_outgoing, parallel_outgoing);
+
+        try std.testing.expectEqual(
+            try normSquared(values, options),
+            try normSquared(values, parallel_options),
+        );
+        const serial_normalized = try alloc.dupe(f64, values);
+        defer alloc.free(serial_normalized);
+        const parallel_normalized = try alloc.dupe(f64, values);
+        defer alloc.free(parallel_normalized);
+        try normalize(serial_normalized, options);
+        try normalize(parallel_normalized, parallel_options);
+        try std.testing.expectEqualSlices(f64, serial_normalized, parallel_normalized);
     }
-    var topology = try Topology.initAlloc(alloc, node_count, edges, .none);
-    defer topology.deinit(alloc);
-    const options = Options{ .max_iterations = 3, .max_work_items = 10_000_000 };
-    var serial = try pageRankTopologyAlloc(alloc, topology, options);
-    defer serial.deinit(alloc);
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    var parallel_options = options;
-    parallel_options.io = io_impl.io();
-    parallel_options.max_parallelism = 4;
-    var parallel = try pageRankTopologyAlloc(alloc, topology, parallel_options);
-    defer parallel.deinit(alloc);
-    try std.testing.expectEqualSlices(f64, serial.scores, parallel.scores);
-
-    const values = try alloc.alloc(f64, node_count);
-    defer alloc.free(values);
-    const serial_incoming = try alloc.alloc(f64, node_count);
-    defer alloc.free(serial_incoming);
-    const parallel_incoming = try alloc.alloc(f64, node_count);
-    defer alloc.free(parallel_incoming);
-    const serial_outgoing = try alloc.alloc(f64, node_count);
-    defer alloc.free(serial_outgoing);
-    const parallel_outgoing = try alloc.alloc(f64, node_count);
-    defer alloc.free(parallel_outgoing);
-    for (values, 0..) |*value, i| value.* = @floatFromInt(i % 31);
-    try fillAdjacencySums(topology, values, serial_incoming, true, 1, options);
-    try fillAdjacencySums(topology, values, parallel_incoming, true, 1, parallel_options);
-    try std.testing.expectEqualSlices(f64, serial_incoming, parallel_incoming);
-    try fillAdjacencySums(topology, values, serial_outgoing, false, 1, options);
-    try fillAdjacencySums(topology, values, parallel_outgoing, false, 1, parallel_options);
-    try std.testing.expectEqualSlices(f64, serial_outgoing, parallel_outgoing);
-
-    try std.testing.expectEqual(
-        try normSquared(values, options),
-        try normSquared(values, parallel_options),
-    );
-    const serial_normalized = try alloc.dupe(f64, values);
-    defer alloc.free(serial_normalized);
-    const parallel_normalized = try alloc.dupe(f64, values);
-    defer alloc.free(parallel_normalized);
-    try normalize(serial_normalized, options);
-    try normalize(parallel_normalized, parallel_options);
-    try std.testing.expectEqualSlices(f64, serial_normalized, parallel_normalized);
 }

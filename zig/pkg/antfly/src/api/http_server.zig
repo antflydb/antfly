@@ -11828,10 +11828,28 @@ pub const ApiHttpServer = struct {
         const retry_poll_ns = 25 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();
         var attempts: u32 = 0;
+        var index_generation_retries: u8 = 0;
         while (true) : (attempts += 1) {
             try ensureRequestActive(req.cancellation);
             if (retryDeadlineExpired(req.execution_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
+                error.IndexGenerationMismatch => {
+                    // Release the failed query's entire snapshot before one
+                    // fresh attempt. Never retry just a reverse-edge probe:
+                    // its base scan and cached negative routes share identity.
+                    // Cap expensive graph replay independently of time-based
+                    // storage retries; ongoing reconciliation is a retryable
+                    // readiness response, not an internal failure or a loop.
+                    try ensureRequestActive(req.cancellation);
+                    const now_ns = platform_time.monotonicNs();
+                    if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
+                    if (index_generation_retries != 0) return error.IndexRebuilding;
+                    index_generation_retries += 1;
+                    const sleep_ns = boundedRetrySleepNs(req.execution_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return error.IndexRebuilding;
+                    if (sleep_ns == 0) return error.Timeout;
+                    try sleepNsCancellable(sleep_ns, req.cancellation);
+                    continue;
+                },
                 // FileNotFound surfaces when a read-only replica open races
                 // with the writer reclaiming obsolete LSM runs; reopening
                 // picks up a fresh manifest. TableReadChurn: the read cache
@@ -23114,6 +23132,52 @@ test "api http retries identity generation churn from a fresh query snapshot" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
     try std.testing.expectEqualStrings("{\"responses\":[]}", response.json);
+}
+
+test "api http index generation retry refreshes once and preserves readiness cancellation and deadlines" {
+    const FakeReads = struct {
+        attempts: usize = 0,
+        fail_count: usize = 1,
+        cancel: ?*std.atomic.Value(bool) = null,
+        cancel_at: usize = 1,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.cancel) |cancel| if (self.attempts == self.cancel_at) cancel.store(true, .release);
+            if (self.attempts <= self.fail_count) return error.IndexGenerationMismatch;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var reads = FakeReads{};
+    var response = (try ApiHttpServer.queryWithTransientReadRetry(alloc, reads.source(), "docs", .{}, .read_index, .none)).?;
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reads.attempts);
+
+    reads = .{ .fail_count = 100 };
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(alloc, reads.source(), "docs", .{}, .read_index, .none));
+    try std.testing.expectEqual(@as(usize, 2), reads.attempts);
+
+    for ([_]usize{ 1, 2 }) |cancel_at| {
+        var canceled = std.atomic.Value(bool).init(false);
+        reads = .{ .fail_count = 100, .cancel = &canceled, .cancel_at = cancel_at };
+        try std.testing.expectError(error.Cancelled, ApiHttpServer.queryWithTransientReadRetry(alloc, reads.source(), "docs", .{ .cancellation = CancellationToken.fromAtomic(&canceled) }, .read_index, .none));
+        try std.testing.expectEqual(cancel_at, reads.attempts);
+    }
+
+    reads = .{};
+    try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(alloc, reads.source(), "docs", .{ .execution_deadline_ns = 0 }, .read_index, .none));
+    try std.testing.expectEqual(@as(usize, 0), reads.attempts);
 }
 
 test "api http maps missing physical index only for rebuilding lifecycle" {

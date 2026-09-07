@@ -726,6 +726,24 @@ maintenance/coordination locks, then commits independent canonical entries.
 Small caches retain a fitting subset instead of bypassing the entire batch.
 Existing per-block durable reservations, nonblocking publication ownership,
 cross-process usage reconciliation, and abandoned-write recovery remain intact.
+Point, routing-page, and ranked top-K reads also share a process-local canonical
+block pool, bounded to 4,096 live blocks and 64 MiB of payload. Identity binds the
+artifact, checksum, extent, and authenticated block digest, never K or a candidate
+set. Missing block sets are claimed atomically before transport: a reader waits
+without holding other fill claims, preventing overlapping-query deadlocks.
+Registered waiters pin completed or failed producer state; cancellation does not
+cancel another reader's producer, and producer failure permits takeover.
+Failed pinned entries still consume both admission limits. Ready unpinned entries
+are evictable, and warm point preparation can copy them without disk I/O or
+re-authentication. Payload bytes, live entries, and waiters are reported in
+query-cache statistics.
+Only missing contiguous runs are downloaded. If newly shared interior hits would
+require more requests than the already-admitted range budget allows, execution
+keeps its original bounded range rather than failing a query due to cache warmth.
+Ranked blocks use canonical disk identities too: changing top-K across a block
+boundary fetches the new suffix, rather than retaining overlapping prefix ranges.
+Fetch temporaries retire before contiguous result allocation, preserving the
+per-query in-flight payload bound independently of the shared pool's fixed budget.
 Overlapping candidate sets therefore reuse already-fetched blocks even when their
 routing-page sets or coalescing boundaries differ. Cached scores are decoded into
 the final result during preparation without retaining all cached payloads; they
@@ -735,6 +753,18 @@ wire format or legacy cache reader is needed.
 Parallel range payloads use a thread-safe allocator and transfer ownership
 explicitly, independently of the allocator owning returned scores or per-request
 routing arrays.
+PageRank's fixed logical reduction partitions account for edge work as well as
+vertex count. Edge-heavy graphs below the vector-parallelism threshold therefore
+use configured compute workers, while logical reduction order stays identical
+across serial and parallel execution.
+Stateful reverse-edge probes validate the catalog's index incarnation and config
+fingerprint, plus the source shard's read generation, under the storage apply
+lease that protects the reverse snapshot, including probes without hydration.
+An index replacement cannot certify old negative answers under a new routing
+cache identity. Index-incarnation mismatches retain their identity across native
+and remote HTTP boundaries. Public queries release the failed snapshot and retry the
+whole query at most once, respecting cancellation and deadlines; continued
+reconciliation returns the existing retryable `index_rebuilding` response.
 No storage or decode operation runs under the cache lock. Warm point
 and top-k reads avoid footer I/O and full-index decoding. Decode-cache hits,
 misses, and retained bytes are exposed in query-cache statistics.

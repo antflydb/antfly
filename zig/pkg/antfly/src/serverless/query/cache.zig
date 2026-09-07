@@ -66,6 +66,9 @@ pub const QueryCacheStats = struct {
     decoded_graph_metric_routing_hits: u64 = 0,
     decoded_graph_metric_routing_misses: u64 = 0,
     decoded_graph_metric_routing_bytes: u64 = 0,
+    shared_graph_metric_block_bytes: u64 = 0,
+    shared_graph_metric_block_entries: u64 = 0,
+    shared_graph_metric_block_waiters: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
     writes: u64 = 0,
@@ -222,6 +225,7 @@ pub const QueryCache = struct {
     usage: CacheUsage = .{},
     stats: QueryCacheStats = .{},
     graph_metric_routing: graph_metric_routing_cache.Cache = .{},
+    graph_metric_blocks: @import("authenticated_block_fills.zig").Cache = .{},
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !QueryCache {
         return try initWithConfig(alloc, root_dir, .{});
@@ -281,6 +285,7 @@ pub const QueryCache = struct {
 
     pub fn deinit(self: *QueryCache) void {
         self.graph_metric_routing.deinit();
+        self.graph_metric_blocks.deinit();
         var io_impl = threadedIo();
         defer io_impl.deinit();
         const coordination_locked = blk: {
@@ -311,6 +316,10 @@ pub const QueryCache = struct {
         stats.decoded_graph_metric_routing_hits = routing.hits;
         stats.decoded_graph_metric_routing_misses = routing.misses;
         stats.decoded_graph_metric_routing_bytes = routing.bytes;
+        const blocks = self.graph_metric_blocks.snapshot();
+        stats.shared_graph_metric_block_bytes = blocks.bytes;
+        stats.shared_graph_metric_block_entries = blocks.entries;
+        stats.shared_graph_metric_block_waiters = blocks.waiters;
         return stats;
     }
 
@@ -768,6 +777,13 @@ pub const QueryCache = struct {
 
         const block_class = classifyBlockId(block_id);
         const payload_block_class = classifyPayloadBlockId(block_id);
+        const key = @import("authenticated_block_fills.zig").blockKey(artifact_id, expected_checksum, offset, len, block_checksum);
+        if (try self.graph_metric_blocks.copyIfReadyAlloc(result_alloc, key)) |value| {
+            errdefer result_alloc.free(value);
+            try cancellation.check();
+            recordBlockHit(self, block_class, payload_block_class);
+            return value;
+        }
         const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
         defer self.alloc.free(block_path);
         const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, block_path, len, cancellation) catch |err| switch (err) {

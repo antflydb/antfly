@@ -3606,6 +3606,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
     if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
@@ -4204,6 +4205,10 @@ test "api http client preserves group doc identity conflicts" {
     conflict_executor.body = "identity read generation changed";
     try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupGraphExpand(base_uri, 7, "docs", "{}"));
+
+    conflict_executor.body = "IndexGenerationMismatch";
+    try std.testing.expectError(error.IndexGenerationMismatch, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.IndexGenerationMismatch, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
 
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";

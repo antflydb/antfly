@@ -26,6 +26,7 @@ const platform_time = @import("antfly_platform").time;
 pub const Error = operation.ApiError || error{
     TopologyChanged,
     IdentityReadGenerationChanged,
+    IndexGenerationMismatch,
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
@@ -142,6 +143,7 @@ pub const Operations = struct {
             error.Cancelled, error.Canceled => error.Canceled,
             error.TopologyChanged => error.TopologyChanged,
             error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
+            error.IndexGenerationMismatch => error.IndexGenerationMismatch,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
             error.CatalogRoutingUnavailable,
@@ -830,6 +832,7 @@ pub const Operations = struct {
         return (reads.graphHydrateGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
+                error.InvalidArgument => error.InvalidArgument,
                 error.UnknownGroup, error.TableNotFound => error.NotFound,
                 else => error.Internal,
             };
@@ -1546,6 +1549,7 @@ test "typed internal query workers preserve identity generation validation" {
 
 test "typed internal group reads preserve retryable resident storage failures" {
     const alloc = std.testing.allocator;
+    try std.testing.expectEqual(error.IndexGenerationMismatch, Operations.mapCommonReadError(error.IndexGenerationMismatch).?);
     try std.testing.expectEqual(
         error.DeadlineExceeded,
         Operations.mapCommonReadError(error.CatalogRoutingSnapshotTimeout).?,

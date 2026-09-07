@@ -1179,10 +1179,14 @@ fn acquireRouting(
     return .{ .entry = entry };
 }
 
-const MetricRangeKind = enum { score, reserved_score, routing };
+const MetricRangeKind = enum { score, reserved_score, routing, ranked };
 
 fn metricBlockId(buf: []u8, kind: MetricRangeKind, block_index: usize) ![]const u8 {
-    return std.fmt.bufPrint(buf, "graph-metric-{s}-{d}-exact", .{ if (kind == .routing) "routing" else "score", block_index });
+    return std.fmt.bufPrint(buf, "graph-metric-{s}-{d}-exact", .{ switch (kind) {
+        .routing => "routing",
+        .ranked => "ranked",
+        .score, .reserved_score => "score",
+    }, block_index });
 }
 
 fn fetchMetricRangeAlloc(
@@ -1196,68 +1200,113 @@ fn fetchMetricRangeAlloc(
 ) ![]u8 {
     if (kind != .reserved_score) try session.chargeGraphMetricRange(range.len);
     if (segment_version != metric_segment.wire_version) return error.InvalidGraphMetricSegment;
+    if (range.len == 0 or range.len > coalesced_score_window_bytes) return error.InvalidGraphMetricSegment;
     if (range.first_block > range.last_block or range.last_block >= entries.len) return error.InvalidGraphMetricSegment;
-    if (range.first_block == range.last_block) {
-        const entry = entries[range.first_block];
-        if (entry.offset != range.offset or entry.len != range.len) return error.InvalidGraphMetricSegment;
-        var block_id_buf: [64]u8 = undefined;
-        const block_id = metricBlockId(&block_id_buf, kind, entry.block_index) catch
-            return error.InvalidGraphMetricSegment;
-        return session.fetchArtifactAuthenticatedBlockAlloc(
-            metric_index,
-            block_id,
-            range.offset,
-            range.len,
-            &entry.checksum,
-        ) catch |err| switch (err) {
-            error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
-            else => |other| other,
-        };
+    const selected = entries[range.first_block .. range.last_block + 1];
+    var covered: u64 = range.offset;
+    for (selected) |entry| {
+        if (entry.offset != covered or entry.len == 0) return error.InvalidGraphMetricSegment;
+        covered = std.math.add(u64, covered, entry.len) catch return error.InvalidGraphMetricSegment;
     }
-    const subranges = try alloc.alloc(runtime_mod.AuthenticatedSubrange, range.last_block - range.first_block + 1);
-    defer alloc.free(subranges);
-    var covered: usize = 0;
-    for (entries[range.first_block .. range.last_block + 1], 0..) |entry, index| {
-        if (entry.offset < range.offset) return error.InvalidGraphMetricSegment;
-        const relative_offset = std.math.cast(usize, entry.offset - range.offset) orelse return error.InvalidGraphMetricSegment;
-        if (relative_offset != covered) return error.InvalidGraphMetricSegment;
-        subranges[index] = .{
-            .relative_offset = relative_offset,
-            .len = entry.len,
-            .checksum = entry.checksum,
-        };
-        covered = std.math.add(usize, covered, entry.len) catch return error.InvalidGraphMetricSegment;
+    if (covered - range.offset != range.len) return error.InvalidGraphMetricSegment;
+    const cache = session.cache orelse return fetchCanonicalRunAlloc(alloc, session, metric_index, selected);
+    const fills = @import("authenticated_block_fills.zig");
+    const specs = try alloc.alloc(fills.Cache.Spec, selected.len);
+    defer alloc.free(specs);
+    const artifact = session.artifactRef(metric_index) orelse return error.ArtifactNotFound;
+    for (selected, specs) |entry, *spec| {
+        spec.* = .{ .key = fills.blockKey(artifact.artifact_id, artifact.checksum, entry.offset, entry.len, &entry.checksum), .len = entry.len };
     }
-    if (covered != range.len) return error.InvalidGraphMetricSegment;
-    {
-        const bytes = session.fetchArtifactAuthenticatedRangeUncachedAlloc(metric_index, range.offset, range.len, subranges) catch |err| switch (err) {
-            error.ArtifactIntegrityMismatch => return error.InvalidGraphMetricSegment,
+    var batch = try cache.graph_metric_blocks.acquire(cache.alloc, alloc, specs, session.io, session.cancellation);
+    defer batch.deinit();
+    const missing = try alloc.alloc(bool, selected.len);
+    defer alloc.free(missing);
+    @memset(missing, false);
+    for (selected, batch.items, missing) |entry, item, *miss| {
+        try session.checkCancellation();
+        if (!item.producer) continue;
+        var id_buf: [64]u8 = undefined;
+        const id = try metricBlockId(&id_buf, kind, entry.block_index);
+        if (try session.readCachedAuthenticatedBlockAlloc(alloc, metric_index, id, entry.offset, entry.len, &entry.checksum)) |bytes| {
+            defer alloc.free(bytes);
+            @memcpy(item.buffer(), bytes);
+        } else miss.* = true;
+    }
+    var runs: usize = 0;
+    var prior_missing = false;
+    for (missing) |miss| {
+        if (miss and !prior_missing) runs += 1;
+        prior_missing = miss;
+    }
+    // Reuse newly shared hits without weakening the already-reserved budget.
+    // If splitting needs unavailable requests, retain the admitted full range.
+    var full_range = false;
+    if (runs > 1) {
+        session.reserveGraphMetricRanges(runs - 1, 0) catch |err| switch (err) {
+            error.GraphMetricQueryBudgetExceeded => full_range = true,
             else => return err,
         };
-        errdefer session.alloc.free(bytes);
-        // Authenticate the entire transport response before publishing any
-        // canonical block. Never retain candidate-specific combined ranges.
-        if (session.cache != null) {
-            const batch_limit = runtime_mod.max_authenticated_publication_blocks;
-            var publications: [batch_limit]runtime_mod.AuthenticatedBlockPublication = undefined;
-            var ids: [batch_limit][64]u8 = undefined;
-            var start: usize = 0;
-            while (start < subranges.len) {
-                const end = @min(start + batch_limit, subranges.len);
-                for (entries[range.first_block + start .. range.first_block + end], subranges[start..end], 0..) |entry, subrange, i| {
-                    publications[i] = .{
-                        .block_id = try metricBlockId(&ids[i], kind, entry.block_index),
-                        .offset = entry.offset,
-                        .contents = bytes[subrange.relative_offset..][0..entry.len],
-                        .checksum = entry.checksum,
-                    };
-                }
-                try session.cacheAuthenticatedBlocks(metric_index, publications[0 .. end - start]);
-                start = end;
+    }
+    var start: usize = 0;
+    while (start < selected.len) {
+        if (!full_range and !missing[start]) {
+            start += 1;
+            continue;
+        }
+        var end = if (full_range) selected.len else start + 1;
+        if (!full_range) while (end < selected.len and missing[end]) : (end += 1) {};
+        const bytes = try fetchCanonicalRunAlloc(alloc, session, metric_index, selected[start..end]);
+        defer session.alloc.free(bytes);
+        for (selected[start..end], batch.items[start..end]) |entry, item| {
+            if (item.producer) {
+                const offset: usize = @intCast(entry.offset - selected[start].offset);
+                @memcpy(item.buffer(), bytes[offset..][0..entry.len]);
             }
         }
-        return bytes;
+        start = end;
     }
+    // Fetch temporaries have retired before allocating the contiguous result.
+    const output = try session.alloc.alloc(u8, range.len);
+    errdefer session.alloc.free(output);
+    // All newly produced units are authenticated before waiters see them.
+    const limit = runtime_mod.max_authenticated_publication_blocks;
+    var publications: [limit]runtime_mod.AuthenticatedBlockPublication = undefined;
+    var ids: [limit][64]u8 = undefined;
+    var count: usize = 0;
+    for (selected, batch.items, missing) |entry, item, miss| {
+        const offset: usize = @intCast(entry.offset - range.offset);
+        @memcpy(output[offset..][0..entry.len], item.bytes());
+        if (!miss) continue;
+        publications[count] = .{
+            .block_id = try metricBlockId(&ids[count], kind, entry.block_index),
+            .offset = entry.offset,
+            .contents = item.bytes(),
+            .checksum = entry.checksum,
+        };
+        count += 1;
+        if (count == limit) {
+            try session.cacheAuthenticatedBlocks(metric_index, publications[0..count]);
+            count = 0;
+        }
+    }
+    if (count != 0) try session.cacheAuthenticatedBlocks(metric_index, publications[0..count]);
+    try session.checkCancellation();
+    batch.publish(session.io);
+    return output;
+}
+
+fn fetchCanonicalRunAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, metric_index: usize, entries: []const metric_segment.codec.RoutingEntry) ![]u8 {
+    const subranges = try alloc.alloc(runtime_mod.AuthenticatedSubrange, entries.len);
+    defer alloc.free(subranges);
+    var len: usize = 0;
+    for (entries, subranges) |entry, *subrange| {
+        subrange.* = .{ .relative_offset = len, .len = entry.len, .checksum = entry.checksum };
+        len = std.math.add(usize, len, entry.len) catch return error.InvalidGraphMetricSegment;
+    }
+    return session.fetchArtifactAuthenticatedRangeUncachedAlloc(metric_index, entries[0].offset, len, subranges) catch |err| switch (err) {
+        error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
+        else => |other| other,
+    };
 }
 
 const FetchedMetricRanges = struct {
@@ -1359,28 +1408,23 @@ fn fetchRankedScoreBlocksAlloc(
     session: *runtime_mod.QuerySession,
     metric_index: usize,
     entries: []const metric_segment.codec.RankedRoutingEntry,
+    first_block: usize,
 ) ![]u8 {
-    if (entries.len == 0) return try alloc.alloc(u8, 0);
-    const range_offset = entries[0].offset;
-    var range_len: usize = 0;
-    const subranges = try alloc.alloc(runtime_mod.AuthenticatedSubrange, entries.len);
-    defer alloc.free(subranges);
-    for (entries, 0..) |entry, index| {
+    if (entries.len == 0) return try session.alloc.alloc(u8, 0);
+    const canonical = try alloc.alloc(metric_segment.codec.RoutingEntry, entries.len);
+    defer alloc.free(canonical);
+    var len: usize = 0;
+    for (entries, canonical, 0..) |entry, *block, i| {
         if (entry.len == 0 or entry.len > metric_segment.codec.max_ranked_score_block_bytes) return error.InvalidGraphMetricSegment;
-        const relative_offset = std.math.cast(usize, entry.offset -| range_offset) orelse return error.InvalidGraphMetricSegment;
-        if (relative_offset != range_len) return error.InvalidGraphMetricSegment;
-        subranges[index] = .{
-            .relative_offset = relative_offset,
-            .len = entry.len,
-            .checksum = entry.checksum,
-        };
-        range_len = std.math.add(usize, range_len, entry.len) catch return error.GraphMetricQueryBudgetExceeded;
+        block.* = .{ .first_node_id = "", .block_index = first_block + i, .offset = entry.offset, .len = entry.len, .checksum = entry.checksum };
+        len = std.math.add(usize, len, entry.len) catch return error.InvalidGraphMetricSegment;
     }
-    try session.chargeGraphMetricRange(range_len);
-    return session.fetchArtifactAuthenticatedRangeAlloc(metric_index, range_offset, range_len, subranges) catch |err| switch (err) {
-        error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
-        else => |other| other,
-    };
+    return fetchMetricRangeAlloc(alloc, session, metric_index, metric_segment.wire_version, canonical, .{
+        .first_block = 0,
+        .last_block = canonical.len - 1,
+        .offset = canonical[0].offset,
+        .len = len,
+    }, .ranked);
 }
 
 fn planAllScoreFetchRangesAlloc(
@@ -1519,7 +1563,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
                 range_bytes = std.math.add(usize, range_bytes, entry_len) catch return error.GraphMetricQueryBudgetExceeded;
             }
             const range_entries = routing.ranked_entries[block_cursor..range_end];
-            const ranked_payload = try fetchRankedScoreBlocksAlloc(alloc, session, metric_index, range_entries);
+            const ranked_payload = try fetchRankedScoreBlocksAlloc(alloc, session, metric_index, range_entries, block_cursor);
             defer session.alloc.free(ranked_payload);
             for (range_entries) |entry| {
                 try session.checkCancellation();
@@ -2159,6 +2203,9 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         footer_offset: usize,
         root_offset: usize,
         range_calls: std.atomic.Value(usize) = .init(0),
+        range_bytes: std.atomic.Value(usize) = .init(0),
+        blocked_offset: ?u64 = null,
+        release_reads: std.atomic.Value(bool) = .init(true),
         control_calls: std.atomic.Value(usize) = .init(0),
         required_controls_before_scores: usize = 0,
         verify_calls: std.atomic.Value(usize) = .init(0),
@@ -2178,6 +2225,12 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         fn getRangeAlloc(ptr: *anyopaque, result_alloc: Allocator, _: []const u8, offset: u64, len: usize) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.range_calls.fetchAdd(1, .monotonic);
+            _ = self.range_bytes.fetchAdd(len, .monotonic);
+            if (self.blocked_offset) |blocked| {
+                if (offset == blocked) while (!self.release_reads.load(.acquire)) {
+                    try std.Options.debug_io.sleep(.fromMilliseconds(1), .awake);
+                };
+            }
             const start = std.math.cast(usize, offset) orelse return error.InvalidRange;
             if (start > self.payload.len or len > self.payload.len - start) return error.InvalidRange;
             const touches_point_index = start < self.root_offset and start + len > self.footer_offset;
@@ -2425,6 +2478,75 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
     try std.testing.expectEqual(@as(?f64, last_value), second_cached.scores[0]);
     try std.testing.expectEqual(@as(u64, if (paged) 2 else 1), cache.graph_metric_routing.hits);
     try std.testing.expectEqual(@as(u64, if (paged) 2 else 1), session.graph_metric_read_budget.decoded_blocks);
+    if (score_count == metric_segment.score_block_entries + 1) {
+        var ranked = try metric_segment.codec.decodeRoutingRootAlloc(alloc, payload[state.root_offset..], payload.len, metric_segment.wire_version, .none);
+        defer ranked.deinit(alloc);
+        const io = io_impl.io();
+        state.blocked_offset = ranked.ranked_entries[0].offset;
+        state.release_reads.store(false, .release);
+        session.graph_metric_read_budget = .{};
+        state.range_calls.store(0, .monotonic);
+        var children = [_]runtime_mod.QuerySession{ session.forkGraphMetricRead(std.heap.smp_allocator), session.forkGraphMetricRead(std.heap.smp_allocator) };
+        defer for (&children) |*child| child.deinit();
+        for (&children) |*child| child.io = io;
+        const Worker = struct {
+            fn run(child: *runtime_mod.QuerySession, entries: []const metric_segment.codec.RankedRoutingEntry, output: *?[]u8, failure: *?anyerror) void {
+                output.* = fetchRankedScoreBlocksAlloc(std.heap.smp_allocator, child, 1, entries, 0) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+            }
+        };
+        var outputs: [2]?[]u8 = @splat(null);
+        defer for (outputs) |output| if (output) |bytes| std.heap.smp_allocator.free(bytes);
+        var failures: [2]?anyerror = @splat(null);
+        var group: std.Io.Group = .init;
+        // Always unblock and join before destroying any worker-owned state.
+        defer {
+            state.release_reads.store(true, .release);
+            group.await(io) catch {};
+            state.blocked_offset = null;
+        }
+        group.async(io, Worker.run, .{ &children[0], ranked.ranked_entries[0..1], &outputs[0], &failures[0] });
+        for (0..1000) |_| {
+            if (state.range_calls.load(.monotonic) != 0) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        group.async(io, Worker.run, .{ &children[1], ranked.ranked_entries[0..1], &outputs[1], &failures[1] });
+        for (0..1000) |_| {
+            if (cache.graph_metric_blocks.snapshot().waiters != 0) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        const shared = cache.graph_metric_blocks.snapshot().waiters;
+        state.release_reads.store(true, .release);
+        try group.await(io);
+        try std.testing.expectEqual(@as(usize, 1), shared);
+        for (failures) |failure| if (failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), state.range_calls.load(.monotonic));
+        try std.testing.expectEqualSlices(u8, outputs[0].?, outputs[1].?);
+
+        // Changing K must download only the newly needed canonical block.
+        state.range_bytes.store(0, .monotonic);
+        session.graph_metric_read_budget = .{};
+        var top_two = try topAlloc(alloc, &session, "graph_idx", "rank", 257);
+        defer top_two.deinit(alloc);
+        // Root/control may still require a disk read but no object-store read.
+        // The small-index point path has not leased the ranked-only root yet.
+        const root_cost = metric_segment.codec.routingRootLen(score_count);
+        try std.testing.expect(state.range_bytes.load(.monotonic) <= ranked.ranked_entries[1].len + root_cost);
+        try std.testing.expect(state.range_bytes.load(.monotonic) >= ranked.ranked_entries[1].len);
+        state.range_bytes.store(0, .monotonic);
+        session.graph_metric_read_budget = .{};
+        var warm_top_one = try topAlloc(alloc, &session, "graph_idx", "rank", 1);
+        defer warm_top_one.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), state.range_bytes.load(.monotonic));
+        cache.graph_metric_blocks.deinit();
+        cache.graph_metric_blocks = .{};
+        session.graph_metric_read_budget = .{};
+        var disk_top = try topAlloc(alloc, &session, "graph_idx", "rank", 257);
+        defer disk_top.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), state.range_bytes.load(.monotonic));
+    }
     if (paged) {
         session.graph_metric_read_budget = .{};
         state.range_calls.store(0, .monotonic);

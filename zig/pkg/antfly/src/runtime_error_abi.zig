@@ -347,6 +347,7 @@ pub const Detail = enum(c_int) {
     unsupported_generator_provider,
     generate_request_failed,
     generation_rate_limit,
+    index_generation_mismatch,
 };
 
 pub const Status = extern struct {
@@ -432,6 +433,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.NotLeader => status(.retryable, .not_leader),
         error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
         error.TopologyChanged => status(.retryable, .topology_changed),
+        error.IndexGenerationMismatch => status(.retryable, .index_generation_mismatch),
         error.IdentityReadGenerationChanged => status(.conflict, .identity_read_generation_changed),
         error.DocIdentityNamespaceMismatch => status(.conflict, .doc_identity_namespace_mismatch),
         error.TableGenerationChanged => status(.conflict, .table_generation_changed),
@@ -767,6 +769,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .internal_failure => "InternalFailure",
         .not_leader => "NotLeader",
         .topology_changed => "TopologyChanged",
+        .index_generation_mismatch => "IndexGenerationMismatch",
         .identity_read_generation_changed => "IdentityReadGenerationChanged",
         .doc_identity_namespace_mismatch => "DocIdentityNamespaceMismatch",
         .table_generation_changed => "TableGenerationChanged",
@@ -1015,6 +1018,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 }
 
 test "stable status preserves public boundary semantics" {
+    try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.IndexGenerationMismatch).code);
     try std.testing.expect(Status.ok.isOk());
     try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
     try std.testing.expectEqual(error.TableVisibilityTimeout, errorFromStatus(statusFromError(error.TableVisibilityTimeout)));

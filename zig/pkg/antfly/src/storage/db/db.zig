@@ -32236,9 +32236,23 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: []const u8,
         keys: []const []const u8,
+        expected: index_manager_mod.IndexManager.CoverageIdentity,
+        identity_read_generation: ?u64,
     ) ![]bool {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
+        // Validate under the same apply lease as the reverse snapshot. A
+        // out-of-lease check can race index replacement and certify an
+        // old index's negative answers under the new incarnation's cache key.
+        if (expected.generation == 0 or expected.config_fingerprint == null)
+            return error.InvalidArgument;
+        const actual = self.core.index_manager.coverageIdentityForIndex(index_name) orelse
+            return error.IndexGenerationMismatch;
+        if (actual.generation != expected.generation or actual.config_fingerprint != expected.config_fingerprint)
+            return error.IndexGenerationMismatch;
+        // Reverse-only probes skip document hydration, but their routing
+        // cache keys still bind the source shard's document/read generation.
+        _ = try self.currentIdentityReadGenerationForRequest(identity_read_generation);
         const graph_entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
         return try graph_entry.index.hasIncomingEdgesManyAlloc(alloc, keys);
     }
@@ -94088,6 +94102,32 @@ test "db unfiltered graph search retains algebraic execution" {
     return error.TestExpectedEqual;
 }
 
+test "db reverse graph probe rejects a deleted or replaced index incarnation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const cfg = types.IndexConfig{ .name = "graph_idx", .kind = .graph, .config_json = "{}" };
+    try db.addIndex(cfg);
+    const previous = db.core.index_manager.coverageIdentityForIndex("graph_idx").?;
+    try std.testing.expect(try db.deleteIndex("graph_idx"));
+    // Even an empty probe must not certify a missing or replacement index.
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "graph_idx", &.{}, previous, null));
+    // Same-name admission waits for the retired incarnation's asynchronous
+    // artifact cleanup. Join its owner instead of racing it or sleeping.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try db.addIndex(cfg);
+    const current = db.core.index_manager.coverageIdentityForIndex("graph_idx").?;
+    try std.testing.expect(previous.generation != current.generation);
+    try std.testing.expectEqual(previous.config_fingerprint, current.config_fingerprint);
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "graph_idx", &.{"absent"}, previous, null));
+    const incoming = try db.graphHasIncomingEdgesForInternalRead(alloc, "graph_idx", &.{"absent"}, current, null);
+    defer alloc.free(incoming);
+    try std.testing.expectEqualSlices(bool, &.{false}, incoming);
+}
+
 test "db graph search filters result nodes and hidden traversal intermediates" {
     const alloc = std.testing.allocator;
 
@@ -94170,10 +94210,23 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
         try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"tenant\":\"visible\"") != null);
     }
 
+    const graph_identity = db.core.index_manager.coverageIdentityForIndex("gr_v1").?;
+    var stale_graph_identity = graph_identity;
+    stale_graph_identity.generation ^= 1;
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "gr_v1", &.{"n:b"}, stale_graph_identity, null));
+    stale_graph_identity = graph_identity;
+    stale_graph_identity.config_fingerprint = graph_identity.config_fingerprint.? ^ 1;
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "gr_v1", &.{"n:b"}, stale_graph_identity, null));
+    try std.testing.expectError(error.IndexGenerationMismatch, db.graphHasIncomingEdgesForInternalRead(alloc, "missing", &.{"n:b"}, graph_identity, null));
+    try std.testing.expectError(error.InvalidArgument, db.graphHasIncomingEdgesForInternalRead(alloc, "gr_v1", &.{"n:b"}, .{ .generation = 0, .config_fingerprint = null }, null));
+    const read_generation = try db.currentIdentityReadGenerationForRequest(null);
+    try std.testing.expectError(error.IdentityReadGenerationChanged, db.graphHasIncomingEdgesForInternalRead(alloc, "gr_v1", &.{"n:b"}, graph_identity, read_generation ^ 1));
     const incoming = try db.graphHasIncomingEdgesForInternalRead(
         alloc,
         "gr_v1",
         &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
+        graph_identity,
+        read_generation,
     );
     defer alloc.free(incoming);
     try std.testing.expectEqualSlices(

@@ -7195,19 +7195,7 @@ fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrat
 }
 
 fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.types.SearchRequest {
-    return .{
-        .query = .{ .match_all = {} },
-        .filter_query_json = req.filter_query_json,
-        .exclusion_query_json = req.exclusion_query_json,
-        .include_stored = req.include_stored,
-        .fields = req.fields,
-        .include_all_fields = req.include_all_fields,
-        .resolved_doc_filter = req.resolved_doc_filter,
-        .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
-        .identity_read_generation = req.identity_read_generation,
-        .execution_deadline_ns = distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
-        .cancellation = req.cancellation,
-    };
+    return table_read_graph.graphHydrateSearchRequest(req);
 }
 
 fn graphHydrateOnOpenDb(
@@ -7244,37 +7232,7 @@ fn graphHydrateOnPreparedDb(
     req: distributed_graph.GraphHydrateRequest,
     search_req: db_mod.types.SearchRequest,
 ) !distributed_graph.GraphHydrateResponse {
-    if (req.incoming_index_name.len > 0) {
-        if (!req.incoming_index_identity.valid()) return error.IndexGenerationMismatch;
-        const actual = db.core.index_manager.coverageIdentityForIndex(req.incoming_index_name) orelse
-            return error.IndexGenerationMismatch;
-        if (actual.generation != req.incoming_index_identity.incarnation or
-            actual.config_fingerprint == null or
-            actual.config_fingerprint.? != req.incoming_index_identity.config_hash)
-        {
-            return error.IndexGenerationMismatch;
-        }
-    }
-    const hits = if (req.include_hits)
-        try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
-    else
-        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-    errdefer {
-        for (hits) |*hit| hit.deinit(alloc);
-        if (hits.len > 0) alloc.free(hits);
-    }
-    return .{
-        .hits = hits,
-        .has_incoming = if (req.incoming_index_name.len > 0)
-            try db.graphHasIncomingEdgesForInternalRead(
-                alloc,
-                req.incoming_index_name,
-                req.keys,
-            )
-        else
-            @constCast((&[_]bool{})[0..]),
-        .incoming_index_identity = req.incoming_index_identity,
-    };
+    return table_read_graph.graphHydrateOnPreparedDb(alloc, db, req, search_req);
 }
 
 fn canonicalGroupedMatchExpansionPlanAlloc(
