@@ -1846,7 +1846,7 @@ test "loadParser detects tool token convention from GGUF tokenizer metadata" {
     }};
     const prompt = try parser.formatToolsPrompt(allocator, &tools);
     defer allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool>lookup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool>declaration:lookup") != null);
 
     const update = try parser.feed("<|tool_call>call:lookup{id:42}<tool_call|>");
     try std.testing.expectEqual(@as(usize, 1), update.new_calls.len);

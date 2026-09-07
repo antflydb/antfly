@@ -1666,6 +1666,98 @@ test "model-directed retrieval delegates full DSL refinement with a shared gener
     }
 }
 
+test "model-directed nested planning reserves pending siblings within the shared tool cap" {
+    const Fake = struct {
+        builder_mask: u4,
+        outer_turns: usize = 0,
+        builds: usize = 0,
+        planning_limit: usize = 0,
+        planning_calls: usize = 0,
+        searches: usize = 0,
+
+        fn build(ptr: *anyopaque, alloc: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.builds += 1;
+            self.planning_limit = @intCast(request.max_internal_iterations.?);
+            // Exercise the actual planner, including its tool accounting and
+            // shared generation runner, rather than fabricating result steps.
+            return query_builder_agent.buildQueryBuilderResponseWithContext(alloc, request, .{
+                .schema_fields = &.{"title"},
+                .runtime_query_request_validator = .{ .ptr = ptr, .vtable = &.{ .validate_query_request = validate } },
+            }, generator);
+        }
+
+        fn validate(_: *anyopaque, _: std.mem.Allocator, request: QueryRequest) !?[]const u8 {
+            try std.testing.expectEqualStrings("docs", request.table.?);
+            try std.testing.expect(request.full_text_search != null);
+            return null;
+        }
+
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.searches += 1;
+            return .{ .json = try alloc.dupe(u8,
+                \\{"responses":[{"status":200,"hits":{"hits":[{"_id":"a","_score":1,"_source":{"title":"evidence"}}]}}]}
+            ) };
+        }
+
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.indexOf(u8, chain[0].generator.tools_json.?, "submit_query") != null) {
+                self.planning_calls += 1;
+                const submit = self.planning_calls == self.planning_limit;
+                const calls = try alloc.alloc(generating.ToolCall, 1);
+                calls[0] = .{
+                    .id = try std.fmt.allocPrint(alloc, "planning-{d}", .{self.planning_calls}),
+                    .name = try alloc.dupe(u8, if (submit) "submit_query" else "describe_table"),
+                    .arguments = try alloc.dupe(u8, if (submit)
+                        \\{"query_request":{"full_text_search":{"match":"evidence","field":"title"}}}
+                    else
+                        "{}"),
+                };
+                return .{ .allocator = alloc, .content = try alloc.dupe(u8, ""), .tool_calls = calls };
+            }
+            const turn = self.outer_turns;
+            self.outer_turns += 1;
+            if (turn >= 2) return .{ .allocator = alloc, .content = try alloc.dupe(u8, "Answer from evidence") };
+            const calls = try alloc.alloc(generating.ToolCall, if (turn == 0) 8 else 4);
+            for (calls, 0..) |*call, i| {
+                const build_query = turn == 1 and (self.builder_mask & (@as(u4, 1) << @as(u2, @intCast(i)))) != 0;
+                call.* = .{
+                    .id = try std.fmt.allocPrint(alloc, "outer-{d}-{d}", .{ turn, i }),
+                    .name = try alloc.dupe(u8, if (build_query) "build_query" else "search"),
+                    .arguments = try alloc.dupe(u8, if (build_query)
+                        \\{"query_index":0,"intent":"Find evidence"}
+                    else
+                        \\{"query_index":0}
+                    ),
+                };
+            }
+            return .{ .allocator = alloc, .content = try alloc.dupe(u8, ""), .tool_calls = calls };
+        }
+    };
+    // Vary the planner's position and include two planners in one batch. The
+    // first can use eight nested calls; subsequent planners have no budget and
+    // must return feedback without entering the zero-budget legacy planner.
+    for ([_]u4{ 1, 2, 4, 8, 3, 9 }) |mask| {
+        var fake = Fake{ .builder_mask = mask };
+        const body =
+            \\{"query":"Find evidence","queries":[{"table":"docs","full_text_search":{"match":"evidence","field":"title"}}],"stream":false,"max_internal_iterations":20,"generator":{"provider":"antfly","model":"test"},"steps":{"generation":{"enabled":true}}}
+        ;
+        const encoded = try executeJson(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query, .build_query = Fake.build } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+        defer std.testing.allocator.free(encoded);
+        var result = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(AgentStatus.completed, result.value.status);
+        try std.testing.expectEqual(@as(?i64, 20), result.value.tool_calls_made);
+        try std.testing.expectEqual(@as(usize, 1), fake.builds);
+        try std.testing.expectEqual(@as(usize, 8), fake.planning_limit);
+        try std.testing.expectEqual(@as(usize, 8), fake.planning_calls);
+        try std.testing.expectEqual(@as(usize, 12 - @as(usize, @popCount(mask))), fake.searches);
+        try std.testing.expectEqual(@as(usize, 3), fake.outer_turns);
+    }
+}
+
 test "model-directed canonical DSL tool policy uses execution normalization" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"bool":{"must":[{"match":"anatomy","field":"title"}],"filter":[{"term":"tenant-a","field":"tenant"}]}}
@@ -1801,7 +1893,13 @@ fn executeModelTools(
             }
             return outcome;
         }
-        for (calls) |call| {
+        for (calls, 0..) |call, call_index| {
+            // Check again at execution time: a preceding delegated planner can
+            // consume calls after this assistant batch was accepted.
+            if (outcome.calls >= 20) {
+                outcome.exhausted = true;
+                return outcome;
+            }
             outcome.calls += 1;
             if (std.mem.eql(u8, call.name, "build_query")) {
                 const args = std.json.parseFromSlice(struct { query_index: usize, intent: []const u8 }, arena, call.arguments, .{}) catch {
@@ -1813,9 +1911,17 @@ fn executeModelTools(
                     try rejectModelToolCall(arena, steps, live, &history, call, try std.json.Stringify.valueAlloc(arena, .{ .error_message = "Use an allowed query_index and a nonempty intent of at most 8192 bytes", .allowed_query_indices = allowed_indices.items }, .{}));
                     continue;
                 }
-                if (budget.used >= rounds or outcome.calls >= 20) {
+                if (budget.used >= rounds) {
                     outcome.exhausted = true;
                     return outcome;
+                }
+                // Reserve every accepted sibling, including other build_query
+                // calls, before lending the remaining budget to this planner.
+                const pending_calls: i64 = @intCast(calls.len - call_index - 1);
+                const planning_calls = 20 - outcome.calls - pending_calls;
+                if (planning_calls <= 0) {
+                    try rejectModelToolCall(arena, steps, live, &history, call, "{\"error\":\"No remaining tool-call budget for delegated planning\"}");
+                    continue;
                 }
                 const scope = request.queries[index];
                 var constraints = JsonObject{};
@@ -1832,7 +1938,7 @@ fn executeModelTools(
                     .table = scope.table,
                     .constraints = constraints,
                     .generator = generating.openApiFromConfig(base_chain[0].generator),
-                    .max_internal_iterations = @min(rounds - budget.used, 20 - outcome.calls),
+                    .max_internal_iterations = @min(rounds - budget.used, planning_calls),
                 }, .{ .ptr = &budget, .vtable = &.{ .execute_chain = AgentGenerationBudget.generate } }) catch |err| switch (err) {
                     error.AgentToolLimitExceeded => {
                         outcome.rounds = budget.used;
