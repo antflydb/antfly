@@ -139,18 +139,33 @@ Dependency-establishing copy and document-extraction requests remain in their
 normal ordered path.
 
 Within a document group, the enrichment thread owns a shared-window scheduler.
-Before collecting OCR pages it resolves compatible consumers and chooses a
-bounded common-multiple render width. A four-item OCR executor can therefore
-produce a sixteen-page shared window for a compatible visual embedder, while
-still invoking OCR in batches of at most four. The optional widening ceiling
+Before collecting OCR pages or preparing an embedding window it resolves
+compatible consumers and chooses a bounded common-multiple render width. A
+four-item OCR executor or page embedder can therefore produce a sixteen-page
+shared window for a compatible visual embedder, while still invoking its own
+model in batches of at most four. Image-only owners do not enroll OCR peers
+without the embedded-text metadata needed by their selection policy.
+The optional widening ceiling
 is `ANTFLY_ENRICHMENT_PDF_SHARED_WINDOW_MAX_PAGES` (default 32, absolute maximum
 128); it does not change the OCR model batch ceiling or provider request limits.
 Collection remains byte-bounded and flushes its current prefix if lookahead
 allocation is denied. Generated units transfer ownership into the execution
 slice rather than duplicating all retained text and regions. Renderer geometry,
 pixel ceilings, and composite memory admission can shorten any planned window.
+After a widening denial, candidates descend through whole owner batch widths
+before trying sub-batch prefixes. Pixel-limited prefixes follow the same rule.
+This preserves native owner batches when a wider consumer cannot be enrolled.
+Embedding owners partition borrowed descriptors by their own item/byte/pixel
+limits and stage each successful sub-batch before moving to the next one.
 Memory contracts are requested only for legal model sub-batches; their summed
 ceilings conservatively account for the larger retained render window.
+Remote reader, generator, and extractor memory plans use the same task/model/
+authentication-scoped capability cache as execution to select framed versus
+legacy transport. Compatible remote singleton generators use the batch media
+transport too; unsupported batch configurations retain data-URI accounting.
+Generator planning reuses its parsed, routed configuration for compatibility
+and capability resolution rather than duplicating config trees within the
+bounded contract-resolution allocator.
 Before dispatching an owner's rendered window or starting speculative render
 prefetch, it offers the borrowed pages to later compatible consumers. Physical
 compatibility includes source identity and credentials, DPI, pixel/dimension
@@ -3135,8 +3150,15 @@ The hardening above follows these long-term rules:
     the attempt closed; the forwarding owner then serializes after any active
     read. Only an actual retry decision seals the admitted spool, under the
     request/attempt deadline and a maximum 30-second sealing deadline.
-    Cancellation and terminal responses interrupt incomplete socket reads using
-    a read deadline; they never drain the remaining upload. Custom response
+    Framed HTTP/1 handlers enable full duplex so forwarding an early response
+    cannot implicitly drain its upload. The returned response owns the attempt
+    context through body close, including any configured attempt deadline.
+    Terminal upload interruption runs only after the upstream response body is
+    copied/closed: a net/http incoming read error also cancels the request
+    context and must not invalidate a response still being forwarded. Genuine
+    cancellation remains attached throughout forwarding. Cancellation and
+    terminal cleanup interrupt incomplete socket reads using a read deadline;
+    they never drain the remaining upload. Custom response
     writers without deadline support must expose an interruptible request body.
     Cancellation callbacks and active reads join before replay storage is freed.
     Opening a retry is read-only and cannot restart a failed or incomplete seal.

@@ -4538,6 +4538,11 @@ func (b *proxyStreamingReplayBody) Close() error {
 }
 
 func (p *Proxy) proxyFramedRequest(w http.ResponseWriter, r *http.Request, operation string, start time.Time, routing RoutingContext) {
+	// A terminal upstream response may arrive before its upload completes.
+	// Forward that response without net/http draining the incoming body first;
+	// the response owner interrupts and joins upload reads after response copy.
+	// HTTP/2 is already full duplex and may report ErrNotSupported here.
+	_ = http.NewResponseController(w).EnableFullDuplex()
 	// The bounded metadata prefix is the only request-sized allocation retained
 	// by the routing proxy. Media stays on the socket for a single attempt; a
 	// retry-enabled route uses a bounded temporary replay file.
@@ -5798,12 +5803,19 @@ func (p *Proxy) forwardRequest(r *http.Request, replay proxyReplayBody, endpoint
 }
 
 func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody, endpoint *Endpoint, route *Route, canRetry bool) (*http.Response, error) {
-	attemptCtx := r.Context()
+	var attemptCtx context.Context
 	var cancel context.CancelFunc
 	if route != nil && route.RetryTimeout > 0 {
-		attemptCtx, cancel = context.WithTimeout(attemptCtx, route.RetryTimeout)
-		defer cancel()
+		attemptCtx, cancel = context.WithTimeout(r.Context(), route.RetryTimeout)
+	} else {
+		attemptCtx, cancel = context.WithCancel(r.Context())
 	}
+	responseOwnsAttempt := false
+	defer func() {
+		if !responseOwnsAttempt {
+			cancel()
+		}
+	}()
 
 	targetURL, err := url.Parse(endpoint.address)
 	if err != nil {
@@ -5831,24 +5843,40 @@ func (p *Proxy) forwardRequestWithRetry(r *http.Request, replay proxyReplayBody,
 
 	resp, err := p.registry.client.Do(outReq)
 	_ = body.Close()
-	finishErr := error(nil)
-	if finalizer, ok := body.(interface {
-		Finish(context.Context, bool) error
-	}); ok {
-		retry := canRetry && r.Context().Err() == nil &&
-			((err != nil && shouldRetryRequestError(route, err)) ||
-				(err == nil && resp != nil && shouldRetryStatus(route, resp.StatusCode)))
-		// A retry may need bytes the upstream never consumed. Give that
-		// work a finite deadline too; terminal responses never drain them.
-		finishCtx, finishCancel := context.WithTimeout(attemptCtx, 30*time.Second)
-		finishErr = finalizer.Finish(finishCtx, retry)
-		finishCancel()
+	finishUpload := func(retry bool) error {
+		if finalizer, ok := body.(interface {
+			Finish(context.Context, bool) error
+		}); ok {
+			finishCtx, finishCancel := context.WithTimeout(attemptCtx, 30*time.Second)
+			defer finishCancel()
+			return finalizer.Finish(finishCtx, retry)
+		}
+		return nil
 	}
+	retry := canRetry && r.Context().Err() == nil &&
+		((err != nil && shouldRetryRequestError(route, err)) ||
+			(err == nil && resp != nil && shouldRetryStatus(route, resp.StatusCode)))
+	if err == nil && resp != nil && !retry {
+		// Interrupting net/http's incoming read also cancels r.Context().
+		// Do it only after the terminal response has been consumed/closed,
+		// never while its upstream body still depends on that context.
+		resp.Body = &forwardingBody{ReadCloser: resp.Body, finish: func() {
+			_ = finishUpload(false)
+			cancel()
+		}}
+		responseOwnsAttempt = true
+		return resp, nil
+	}
+	finishErr := finishUpload(retry)
 	if err == nil && finishErr != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
 		return nil, finishErr
+	}
+	if err == nil && resp != nil {
+		resp.Body = &forwardingBody{ReadCloser: resp.Body, finish: cancel}
+		responseOwnsAttempt = true
 	}
 	return resp, err
 }

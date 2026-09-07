@@ -536,7 +536,7 @@ pub const Runtime = struct {
                         return error.InferenceInvocationMemoryUnavailable;
                     break :blk if (binary) .borrowed_binary else .data_uri;
                 }
-                break :blk .data_uri;
+                break :blk remoteAttachmentTransport(try self.readerCapabilities(alloc, cfg), .data_uri);
             },
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
@@ -552,10 +552,12 @@ pub const Runtime = struct {
                         return error.InferenceInvocationMemoryUnavailable;
                     break :blk .data_uri;
                 }
-                // The host sends one base64 batch body. Any serial fallback
-                // reported by a distributed inference node is admitted by that
-                // node and must not be charged against this host process.
-                break :blk .base64_payload;
+                // Use the same model/task/auth-scoped capability cache as
+                // execution. A remote node owns its model memory; this host
+                // owns only the selected transport and bounded response.
+                if (!self.canGenerateBatchWithConfig(parsed, requests)) break :blk .data_uri;
+                const caps = try self.generatorCapabilities(alloc, parsed.generator);
+                break :blk remoteAttachmentTransport(caps, if (caps == null) .data_uri else .base64_payload);
             },
             .extractor => blk: {
                 var parsed = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
@@ -568,7 +570,7 @@ pub const Runtime = struct {
                     if (local.extract == null and local.extract_with_context == null)
                         return error.InferenceInvocationMemoryUnavailable;
                 }
-                break :blk extractorAttachmentTransport(parsed);
+                break :blk if (remote) remoteAttachmentTransport(try self.extractorCapabilities(alloc, parsed), extractorAttachmentTransport(parsed)) else extractorAttachmentTransport(parsed);
             },
             .transcriber => blk: {
                 var parsed = try std.json.parseFromSlice(transcribing.Config, alloc, requests[0].config_json, .{
@@ -902,46 +904,7 @@ pub const Runtime = struct {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
-                if (parsed.generator.provider == .antfly and parsed.generator.url.len == 0) {
-                    const local = self.antfly_provider orelse break :blk null;
-                    break :blk try self.linkedModelCapabilities(alloc, local, parsed.generator.model, .generate);
-                }
-                if (parsed.generator.provider == .antfly and parsed.generator.url.len > 0) {
-                    var secret = try common_secrets.SecretValue.initConfigOrEnv(
-                        alloc,
-                        parsed.generator.api_key,
-                        "ANTFLY_INFERENCE_API_KEY",
-                    );
-                    defer secret.deinit(alloc);
-                    const token = secret.resolveOwned(alloc, self.secret_store) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => break :blk null,
-                    };
-                    defer if (token) |value| alloc.free(value);
-                    var auth_value: ?[]u8 = null;
-                    defer if (auth_value) |value| alloc.free(value);
-                    var header_storage: [2][2][]const u8 = undefined;
-                    var header_count: usize = 0;
-                    if (token) |value| {
-                        auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
-                        header_storage[header_count] = .{ "Authorization", auth_value.? };
-                        header_count += 1;
-                    }
-                    header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
-                    const headers = header_storage[0..header_count];
-                    break :blk self.capabilityCache().getOrDiscoverWithContext(
-                        self.http,
-                        parsed.generator.url,
-                        parsed.generator.model,
-                        .generate_batch,
-                        headers,
-                        self.execution.waitContext(),
-                    ) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => null,
-                    };
-                }
-                break :blk null;
+                break :blk try self.generatorCapabilities(alloc, parsed.generator);
             },
             .extractor => blk: {
                 var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
@@ -1128,14 +1091,20 @@ pub const Runtime = struct {
 
     fn canGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
         if (!requestsShareRoute(requests)) return false;
+        var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
+        defer parsed.deinit(alloc);
+        try self.routeGeneratorConfig(alloc, &parsed.generator);
+        return self.canGenerateBatchWithConfig(parsed, requests);
+    }
+
+    // Planning already owns a parsed, routed configuration. Reuse it so the
+    // bounded contract resolver need not retain a second JSON/config tree.
+    fn canGenerateBatchWithConfig(self: *Runtime, parsed: GeneratorProducerConfig, requests: []const asset_producer.Request) bool {
         var all_have_media = true;
         for (requests) |request| {
             if (request.media.len > 0 and !request.inline_media_trusted) return false;
             all_have_media = all_have_media and request.media.len > 0;
         }
-        var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
-        defer parsed.deinit(alloc);
-        try self.routeGeneratorConfig(alloc, &parsed.generator);
         const cfg = parsed.generator;
         const local_serial = all_have_media and cfg.provider == .antfly and cfg.url.len == 0 and
             self.antfly_provider != null and
@@ -1150,6 +1119,42 @@ pub const Runtime = struct {
             cfg.tools_json == null and
             cfg.tool_choice_json == null and
             parsed.tool_output == .content;
+    }
+
+    fn generatorCapabilities(self: *Runtime, alloc: Allocator, cfg: generating_runtime.GeneratorConfig) !?inference_work.InferenceCapabilities {
+        if (cfg.provider != .antfly) return null;
+        if (cfg.url.len == 0) {
+            const local = self.antfly_provider orelse return null;
+            return try self.linkedModelCapabilities(alloc, local, cfg.model, .generate);
+        }
+        var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, "ANTFLY_INFERENCE_API_KEY");
+        defer secret.deinit(alloc);
+        const token = secret.resolveOwned(alloc, self.secret_store) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        defer if (token) |value| alloc.free(value);
+        var auth_value: ?[]u8 = null;
+        defer if (auth_value) |value| alloc.free(value);
+        var header_storage: [2][2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (token) |value| {
+            auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value});
+            header_storage[header_count] = .{ "Authorization", auth_value.? };
+            header_count += 1;
+        }
+        header_count = try self.execution.routing.appendHeaders(&header_storage, header_count);
+        return self.capabilityCache().getOrDiscoverWithContext(
+            self.http,
+            cfg.url,
+            cfg.model,
+            .generate_batch,
+            header_storage[0..header_count],
+            self.execution.waitContext(),
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
     }
 
     fn canExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
@@ -1811,10 +1816,7 @@ pub const Runtime = struct {
         var start: usize = 0;
         while (start < requests.len) {
             try self.execution.check(platform.time.monotonicNs());
-            const attachment_transport: inference_work.AttachmentTransport = if (capabilities.framed_attachments)
-                .framed_binary
-            else
-                .base64_payload;
+            const attachment_transport = remoteAttachmentTransport(capabilities, .base64_payload);
             const end = try generatorBatchEnd(alloc, capabilities, attachment_transport, requests, start);
             const chunk = requests[start..end];
             try validateGeneratorInvocation(alloc, capabilities, attachment_transport, chunk);
@@ -2211,13 +2213,25 @@ pub const Runtime = struct {
         return try asset_producer.producedBatchFromOutputs(alloc, requests, out, reader_execution);
     }
 
-    fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    fn generate(self: *Runtime, alloc: Allocator, request: asset_producer.Request) anyerror![]u8 {
         var parsed_cfg = try parseGeneratorProducerConfig(alloc, request.config_json);
         defer parsed_cfg.deinit(alloc);
         try self.routeGeneratorConfig(alloc, &parsed_cfg.generator);
         var cfg = parsed_cfg.generator;
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
+
+        // A singleton borrowed-media request must use the same transport as
+        // its memory plan, not expand back into data URIs on a serial path.
+        if (request.media.len > 0 and cfg.provider == .antfly and cfg.url.len > 0 and
+            self.canGenerateBatchWithConfig(parsed_cfg, &.{request}))
+        {
+            if (try self.generatorCapabilities(alloc, cfg) != null) {
+                const outputs = try self.tryGenerateBatch(alloc, &.{request});
+                defer alloc.free(outputs);
+                return outputs[0];
+            }
+        }
 
         const local_attachments = cfg.provider == .antfly and cfg.url.len == 0 and
             self.antfly_provider != null and
@@ -2530,10 +2544,8 @@ pub const Runtime = struct {
             var decoded_pixels: u64 = 0;
             const transport: inference_work.AttachmentTransport = if (local_reader)
                 .borrowed_binary
-            else if (resolved.framed_attachments)
-                .framed_binary
             else
-                .data_uri;
+                remoteAttachmentTransport(resolved, .data_uri);
             use_framed_transport = transport == .framed_binary;
             for (request.images) |image| {
                 try resolved.validateMimeType(image.mime_type);
@@ -3375,6 +3387,10 @@ fn inlineImagePixelsAlloc(
     return try inference_work.encodedImagePixels(declared_mime_type, decoded);
 }
 
+fn remoteAttachmentTransport(capabilities: ?inference_work.InferenceCapabilities, fallback: inference_work.AttachmentTransport) inference_work.AttachmentTransport {
+    return if (capabilities != null and capabilities.?.framed_attachments) .framed_binary else fallback;
+}
+
 fn extractorAttachmentTransport(cfg: extracting.Config) inference_work.AttachmentTransport {
     return if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl()))
         .borrowed_binary
@@ -3864,26 +3880,133 @@ test "asset producer runtime media accounting follows attachment transport" {
     try std.testing.expectEqual(@as(usize, 32), extractor_encoded.encoded_media_bytes);
 }
 
-test "remote generator planning charges the host batch transport and route response limit" {
+test "asset producer runtime remote planning uses resolved framed transport" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
-    defer client.deinit();
-    var runtime = Runtime.init(alloc, &client);
-    defer runtime.deinit();
-    const bytes = [_]u8{ 1, 2, 3 };
-    const request = asset_producer.Request{
-        .producer_type = .generator,
-        .config_json = "{\"provider\":\"antfly\",\"model\":\"gemma4\",\"url\":\"http://127.0.0.1:8080\"}",
-        .source_text = "",
-        .inline_media_trusted = true,
-        .media = &.{.{ .bytes = &bytes, .mime_type = "image/png" }},
-    };
-    const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
-    try std.testing.expectEqual(inference_work.AttachmentTransport.base64_payload, plan.attachment_transport);
-    try std.testing.expect(plan.fixed_bytes < client.maxResponseSize());
-    try std.testing.expectEqual(@as(usize, 1 << 20), plan.max_result_bytes);
+    for ([_]bool{ false, true }) |framed| {
+        inline for (.{ .reader, .generator, .extractor }) |kind| {
+            const group = switch (kind) {
+                .reader => "readers",
+                .generator => "generators",
+                .extractor => "extractors",
+                else => unreachable,
+            };
+            const task = switch (kind) {
+                .reader => "read",
+                .generator => "generate",
+                .extractor => "extract",
+                else => unreachable,
+            };
+            const output = switch (kind) {
+                .reader => "read_result",
+                .generator => "generated_text",
+                .extractor => "extraction",
+                else => unreachable,
+            };
+            const descriptor = try std.json.Stringify.valueAlloc(alloc, .{
+                .inputs = [_][]const u8{ "text", "image" },
+                .inference_capabilities = .{
+                    .version = 4,
+                    .task = task,
+                    .input_modalities = [_][]const u8{ "text", "image" },
+                    .accepted_mime_types = [_][]const u8{ "text/plain", "image/png" },
+                    .input_granularity = "page",
+                    .output = output,
+                    .result_cardinality = "one_per_item",
+                    .prompt_policy = "explicit",
+                    .borrowed_attachments = false,
+                    .framed_attachments = framed,
+                    .task_limits = .{ .max_text_bytes_per_item = null, .max_input_tokens_per_item = null, .max_output_tokens_per_item = null, .max_candidates_per_request = null, .max_schema_bytes = null },
+                    .batch = .{ .mode = "native", .preferred_items = 4, .max_items = 8, .max_encoded_media_bytes = 1048576, .max_decoded_pixels = 16777216, .max_media_parts_per_item = 1, .per_item_failures = true },
+                },
+            }, .{});
+            defer alloc.free(descriptor);
+            const catalog = try std.fmt.allocPrint(alloc, "{{\"{s}\":{{\"vision\":{s}}}}}", .{ group, descriptor });
+            defer alloc.free(catalog);
+            const Assert = struct {
+                fn binary(req: httpx.testing_mod.RequestInfo) !void {
+                    var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, req.body, .{});
+                    defer envelope.deinit();
+                }
+                fn json(req: httpx.testing_mod.RequestInfo) !void {
+                    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+                    defer parsed.deinit();
+                }
+            };
+            var server = try httpx.TestServer.start(alloc, io_impl.io(), &.{
+                .{ .method = .GET, .path = "/ai/v1/models", .respond = .{ .body = catalog } },
+                .{ .method = .POST, .path = "/generate/batch", .assert_request = if (framed) Assert.binary else Assert.json, .respond = .{ .body =
+                \\{"object":"generate.batch","data":[{"custom_id":"0","index":0,"response":{"id":"gen-0","object":"chat.completion","created":1,"model":"vision","choices":[{"index":0,"message":{"role":"assistant","content":"generated"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}],"summary":{"total":1,"succeeded":1,"failed":0},"execution":{"requested_items":1,"native_batches":0,"native_items":0,"serial_items":1,"fallback_items":0}}
+                } },
+            });
+            defer server.deinit();
+            var server_error: ?anyerror = null;
+            var server_group = std.Io.Group.init;
+            const Serve = struct {
+                fn run(s: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+                    while (true) s.handleOne() catch |err| {
+                        if (err != error.Canceled) failure.* = err;
+                        return;
+                    };
+                }
+            };
+            try server_group.concurrent(io_impl.io(), Serve.run, .{ &server, &server_error });
+            defer server_group.cancel(io_impl.io());
+            var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+            defer client.deinit();
+            var runtime = Runtime.init(alloc, &client);
+            defer runtime.deinit();
+            const config = try std.fmt.allocPrint(alloc, "{{\"provider\":\"antfly\",\"model\":\"vision\",\"url\":\"{s}\"}}", .{server.baseUrl()});
+            defer alloc.free(config);
+            var png = [_]u8{0} ** 24;
+            @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+            std.mem.writeInt(u32, png[16..20], 2, .big);
+            std.mem.writeInt(u32, png[20..24], 3, .big);
+            const request = asset_producer.Request{ .producer_type = kind, .config_json = config, .source_text = "", .inline_media_trusted = true, .media = &.{.{ .bytes = &png, .mime_type = "image/png" }} };
+            // The test HTTP server is explicitly driven; prime discovery on
+            // a worker, then prove repeated planner lookups use that snapshot.
+            var discovery_error: ?anyerror = null;
+            var discovery = std.Io.Group.init;
+            const Discover = struct {
+                fn run(r: *Runtime, req: asset_producer.Request, failure: *?anyerror) std.Io.Cancelable!void {
+                    _ = r.producer().capabilitiesForRequests(r.alloc, &.{req}) catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                }
+            };
+            try discovery.concurrent(io_impl.io(), Discover.run, .{ &runtime, request, &discovery_error });
+            try discovery.await(io_impl.io());
+            if (discovery_error) |err| return err;
+            const caps = (try runtime.producer().capabilitiesForRequests(alloc, &.{request})).?;
+            try std.testing.expectEqual(framed, caps.framed_attachments);
+            const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
+            const fallback: inference_work.AttachmentTransport = if (kind == .reader) .data_uri else .base64_payload;
+            try std.testing.expectEqual(if (framed) inference_work.AttachmentTransport.framed_binary else fallback, plan.attachment_transport);
+            if (kind == .generator) try std.testing.expect(plan.fixed_bytes < client.maxResponseSize());
+            if (kind == .generator) {
+                var generated: ?[]u8 = null;
+                var generation_error: ?anyerror = null;
+                var generation_group = std.Io.Group.init;
+                const Generate = struct {
+                    fn run(r: *Runtime, req: asset_producer.Request, result: *?[]u8, failure: *?anyerror) std.Io.Cancelable!void {
+                        result.* = r.producer().produce(r.alloc, req) catch |err| {
+                            failure.* = err;
+                            return;
+                        };
+                    }
+                };
+                try generation_group.concurrent(io_impl.io(), Generate.run, .{ &runtime, request, &generated, &generation_error });
+                try generation_group.await(io_impl.io());
+                if (generation_error) |err| return err;
+                defer alloc.free(generated.?);
+                try std.testing.expectEqualStrings("generated", generated.?);
+            }
+            server_group.cancel(io_impl.io());
+            if (server_error) |err| return err;
+        }
+    }
 }
 
 test "asset producer runtime validates the complete base64 representation" {

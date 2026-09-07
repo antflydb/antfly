@@ -6285,6 +6285,22 @@ fn sharedPdfWindowWidth(owner: usize, peer: usize, ceiling: usize) usize {
     return if (combined <= ceiling) combined else owner;
 }
 
+/// Optional wider windows must not create model tails while a full owner
+/// batch still fits. Only descend page-by-page below one model batch.
+fn nextPdfWindowCandidate(count: usize, model_items: usize) usize {
+    std.debug.assert(model_items > 0);
+    if (count == 0) return 0;
+    return if (count > model_items) (count - 1) / model_items * model_items else count - 1;
+}
+
+test "shared PDF render admission preserves owner batch boundaries" {
+    try std.testing.expectEqual(@as(usize, 18), nextPdfWindowCandidate(24, 6));
+    try std.testing.expectEqual(@as(usize, 18), nextPdfWindowCandidate(23, 6));
+    try std.testing.expectEqual(@as(usize, 6), nextPdfWindowCandidate(12, 6));
+    try std.testing.expectEqual(@as(usize, 5), nextPdfWindowCandidate(6, 6));
+    try std.testing.expectEqual(@as(usize, 0), nextPdfWindowCandidate(1, 6));
+}
+
 /// Called only by the single-flight replay owner, after acquiring its lease
 /// and before constructing any document scheduler. The registry is atomically
 /// written with the first spool rows and removed only after their cleanup.
@@ -6388,13 +6404,13 @@ const SharedPdfWindowScheduler = struct {
     /// Resolve optional peers before collecting/rendering a window. The
     /// bounded LCM preserves every enrolled model's batch width. Actual byte,
     /// pixel and composite memory admission may still shrink the window.
-    fn planTextWindow(self: *@This(), raw: []const u8, policy: GeneratedTextBatchPolicy) !usize {
-        if (self.current + 1 >= self.requests.len) return policy.max_items;
-        if (terminalFailureEnvelopeIntersects(terminalFailureEnvelopeSnapshot(self.runtime), self.sequence, self.sequence)) return policy.max_items;
+    fn planWindow(self: *@This(), raw: []const u8, model_items: usize) !usize {
+        if (self.current + 1 >= self.requests.len) return model_items;
+        if (terminalFailureEnvelopeIntersects(terminalFailureEnvelopeSnapshot(self.runtime), self.sequence, self.sequence)) return model_items;
         try self.ensureConsumers();
         const owner = &self.consumers.?[self.current];
         if (!owner.prepared) try self.prepareConsumer(owner, self.requests[self.current], raw);
-        if (!owner.enabled or !owner.text) return policy.max_items;
+        if (!owner.enabled) return model_items;
         var width = owner.max_items;
         for (self.current + 1..self.requests.len) |index| {
             const peer = &self.consumers.?[index];
@@ -6406,11 +6422,13 @@ const SharedPdfWindowScheduler = struct {
                 !std.meta.eql(owner.source_identity, peer.source_identity) or
                 !std.mem.eql(u8, owner.config.credentials, peer.config.credentials) or
                 !std.meta.eql(owner.transform, peer.transform)) continue;
+            // Image-only producers cannot establish auto-OCR text policy.
+            if (peer.text and !owner.text) continue;
             if (peer.text and (owner.config.ocr_mode != peer.config.ocr_mode or
                 !std.meta.eql(owner.config.ocr_quality, peer.config.ocr_quality))) continue;
             width = sharedPdfWindowWidth(width, peer.max_items, generatedPdfSharedWindowMaxPages());
         }
-        return if (width > owner.max_items) width else policy.max_items;
+        return if (width > owner.max_items) width else model_items;
     }
 
     fn cleanupSpool(self: *@This()) !void {
@@ -7540,10 +7558,14 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         // execution limit, even when the narrow consumer runs first.
         scheduler.consumers.?[0] = .{ .prepared = true, .enabled = true, .text = true, .source_identity = scheduler.consumers.?[1].source_identity, .config = config, .transform = transform, .max_items = 4 };
         scheduler.consumers.?[1].max_items = 16;
-        const planned = try scheduler.planTextWindow("{}", .{ .max_items = 4, .max_bytes = 64 * 1024 * 1024 });
+        const planned = try scheduler.planWindow("{}", 4);
         try std.testing.expectEqual(@as(usize, 16), planned);
         try std.testing.expectEqual(@as(usize, 4), scheduler.consumers.?[0].max_items);
         try std.testing.expectEqual(@as(usize, 16), scheduler.consumers.?[1].max_items);
+        scheduler.consumers.?[0].text = false;
+        scheduler.consumers.?[1].text = false;
+        try std.testing.expectEqual(@as(usize, 16), try scheduler.planWindow("{}", 4));
+        scheduler.consumers.?[1].text = true;
         scheduler.consumers.?[0] = .{};
         scheduler.consumers.?[1].max_items = 1;
     }
@@ -7553,6 +7575,8 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     };
     defer for (&units) |*unit| unit.deinit(alloc);
     const source = SharedPdfWindowScheduler.TextSource{ .config = config, .content_type = "application/pdf", .fingerprint = "content-identity", .units = &units, .indices = &.{ 0, 1 } };
+    try std.testing.expectEqual(@as(usize, 1), try pdfEmbeddingWindowBatchEnd(.{ .encoded = batch }, 0, 1, 64 * 1024 * 1024, std.math.maxInt(u64), .borrowed_binary));
+    try std.testing.expectEqual(@as(usize, 2), try pdfEmbeddingWindowBatchEnd(.{ .encoded = batch }, 1, 1, 64 * 1024 * 1024, std.math.maxInt(u64), .borrowed_binary));
     const digest = [_]u8{7} ** 32;
     const resources = runtime.config.resource_manager orelse manager.resource_manager.?;
     const before = resources.sliceStats(.document_extraction_working_set).used_bytes;
@@ -7741,6 +7765,34 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
 
     if (text_session) |session| {
         {
+            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, std.heap.smp_allocator, null, 30_000, config, session);
+            defer coordinator.destroy();
+            const single = try Harness.partMemory(&harness, "visual", .{ .item_count = 1 }, 2);
+            var double = single;
+            try addPdfWindowInvocationMemory(&double, single);
+            const plans = [_]inference_work.InvocationMemoryPlan{ undefined, single, double };
+            const canceled = std.atomic.Value(bool).init(false);
+            const preparer = PdfEmbeddingWindowPreparer{
+                .runtime = &runtime,
+                .coordinator = coordinator,
+                .resource_manager = null,
+                .render_config = config,
+                .capabilities = scheduler.consumers.?[4].capabilities,
+                .batch_items = 1,
+                .render_items = 2,
+                .batch_bytes = 64 * 1024 * 1024,
+                .page_output_bytes_cap = maximum_pdf_page_inline_png_bytes,
+                .invocation_memory_by_count = &plans,
+                .pending_pages = &.{ 1, 2 },
+                .use_borrowed_rasters = false,
+                .cancel_requested = &canceled,
+            };
+            var rendered = try preparer.prepare(0);
+            defer rendered.deinit();
+            try std.testing.expectEqual(@as(usize, 2), rendered.count);
+            try std.testing.expectEqual(@as(usize, 1), try pdfEmbeddingWindowBatchEnd(rendered.rendered, 0, 1, 64 * 1024 * 1024, std.math.maxInt(u64), single.attachment_transport));
+        }
+        {
             harness.largest_memory_request = 0;
             var rendered = try renderRuntimePdfWindow(&runtime, alloc, producer, session, config, config.pdf_render_max_inflight_bytes, .{ .max_items = 1, .render_items = 2, .max_bytes = 64 * 1024 * 1024 }, .reader, "{}", "pdf", "application/pdf", "render-sharing", &.{
                 .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") },
@@ -7749,6 +7801,14 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             defer rendered.deinit();
             try std.testing.expectEqual(@as(usize, 2), rendered.unit_indices.len);
             try std.testing.expectEqual(@as(usize, 1), harness.largest_memory_request);
+            const page = rendered.batch.encoded.results[0].rendered.?;
+            const pixels = @as(u64, page.width) * page.height;
+            var limited = try renderRuntimePdfWindow(&runtime, alloc, producer, session, config, config.pdf_render_max_inflight_bytes, .{ .max_items = 1, .render_items = 2, .max_bytes = 64 * 1024 * 1024, .max_pixels = pixels }, .reader, "{}", "pdf", "application/pdf", "pixel-limited", &.{
+                .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") },
+                .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") },
+            }, 0, false, .{});
+            defer limited.deinit();
+            try std.testing.expectEqual(@as(usize, 1), limited.unit_indices.len);
         }
         const Sink = struct {
             alloc: Allocator,
@@ -9640,7 +9700,7 @@ fn processDocumentExtractionAsset(
     defer extraction_lease_guard.stop();
     var batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request);
     if (source_is_pdf) if (runtime.shared_pdf_windows) |shared| {
-        batch_policy.render_items = shared.planTextWindow(raw_doc, batch_policy) catch |err| blk: {
+        batch_policy.render_items = shared.planWindow(raw_doc, batch_policy.max_items) catch |err| blk: {
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
             break :blk batch_policy.max_items;
         };
@@ -10843,6 +10903,24 @@ const PdfEmbeddingRenderedWindow = union(enum) {
     }
 };
 
+fn pdfEmbeddingWindowBatchEnd(rendered: PdfEmbeddingRenderedWindow, start: usize, model_items: usize, max_bytes: usize, max_pixels: u64, transport: inference_work.AttachmentTransport) !usize {
+    const total = switch (rendered) {
+        inline else => |batch| batch.results.len,
+    };
+    var end = start;
+    var bytes: usize = 0;
+    var pixels: u64 = 0;
+    while (end < total and end - start < model_items) : (end += 1) {
+        const size = SharedPdfWindowScheduler.renderedPageSize(rendered, end);
+        const wire = if (rendered == .raster) 0 else try transport.batchWireSizeUpperBound(bytes +| size.bytes, "image/png".len, end - start + 1);
+        if (pixels +| size.pixels > max_pixels or wire > max_bytes) break;
+        bytes +|= size.bytes;
+        pixels +|= size.pixels;
+    }
+    if (end == start) return error.DocumentExtractionWorkingSetTooLarge;
+    return end;
+}
+
 fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -11940,13 +12018,17 @@ fn pdfRenderWindowInvocationMemory(producer: asset_producer_mod.Producer, alloc:
     while (cursor < requests.len) {
         const end = cursor + @min(model_items, requests.len - cursor);
         const next = try producer.invocationMemoryForRequests(alloc, requests[cursor..end]);
-        if (total.attachment_transport != next.attachment_transport or total.allocator_owner != next.allocator_owner) return error.InferenceInvocationMemoryUnavailable;
-        inline for (.{ "fixed_bytes", "allocator_limit_bytes", "max_result_bytes" }) |field|
-            @field(total, field) = std.math.add(usize, @field(total, field), @field(next, field)) catch return error.DocumentExtractionWorkingSetTooLarge;
-        total.max_result_bytes_per_item = @max(total.max_result_bytes_per_item, next.max_result_bytes_per_item);
+        try addPdfWindowInvocationMemory(&total, next);
         cursor = end;
     }
     return total;
+}
+
+fn addPdfWindowInvocationMemory(total: *inference_work.InvocationMemoryPlan, next: inference_work.InvocationMemoryPlan) !void {
+    if (total.attachment_transport != next.attachment_transport or total.allocator_owner != next.allocator_owner) return error.InferenceInvocationMemoryUnavailable;
+    inline for (.{ "fixed_bytes", "allocator_limit_bytes", "max_result_bytes" }) |field|
+        @field(total, field) = std.math.add(usize, @field(total, field), @field(next, field)) catch return error.DocumentExtractionWorkingSetTooLarge;
+    total.max_result_bytes_per_item = @max(total.max_result_bytes_per_item, next.max_result_bytes_per_item);
 }
 
 fn renderRuntimePdfWindow(
@@ -12007,12 +12089,14 @@ fn renderRuntimePdfWindow(
         requests.items.len,
     );
     defer alloc.free(prepared_plans);
-    const pixel_count = try preparePdfPixelPrefix(
+    var pixel_count = try preparePdfPixelPrefix(
         session,
         requests.items,
         prepared_plans,
         batch_policy.max_pixels,
     );
+    if (pixel_count < requests.items.len and pixel_count > batch_policy.max_items and pixel_count % batch_policy.max_items != 0)
+        pixel_count = nextPdfWindowCandidate(pixel_count, batch_policy.max_items);
     requests.items.len = pixel_count;
     unit_indices.items.len = pixel_count;
 
@@ -12070,7 +12154,7 @@ fn renderRuntimePdfWindow(
             prototype_requests,
             batch_policy.max_items,
         );
-        for (singleton_allowances, prepared_plans, 0..) |*allowance, plan, i| {
+        for (singleton_allowances, prepared_plans[0..requests.items.len], 0..) |*allowance, plan, i| {
             allowance.* = if (use_borrowed_rasters)
                 try pdfRgbaBytesForPixels(plan.geometry().pixels)
             else
@@ -12090,7 +12174,7 @@ fn renderRuntimePdfWindow(
         }
 
         var candidate_count = requests.items.len;
-        while (candidate_count > 0) : (candidate_count -= 1) {
+        while (candidate_count > 0) : (candidate_count = nextPdfWindowCandidate(candidate_count, batch_policy.max_items)) {
             const invocation_memory = if (candidate_count == prototype_requests.len)
                 full_invocation_memory
             else
@@ -18293,6 +18377,7 @@ const PdfEmbeddingWindowPreparer = struct {
     render_config: document_extraction_mod.Config,
     capabilities: inference_work.InferenceCapabilities,
     batch_items: usize,
+    render_items: ?usize = null,
     batch_bytes: usize,
     page_output_bytes_cap: usize,
     /// Count-indexed, route-resolved invocation plans compiled once for the
@@ -18322,7 +18407,7 @@ const PdfEmbeddingWindowPreparer = struct {
         self.coordinator.beginOperation(self.runtime.config.sync_wait_timeout_ms);
         self.coordinator.session.setCancellationProbe(self.cancellationProbe());
         if (first_item >= self.pending_pages.len) return error.InvalidPdfRenderWindow;
-        var count = @min(self.batch_items, self.pending_pages.len - first_item);
+        var count = @min(self.render_items orelse self.batch_items, self.pending_pages.len - first_item);
         const available_bytes = @min(
             try self.coordinator.availableRenderBytes(),
             self.render_config.pdf_render_max_inflight_bytes,
@@ -18350,12 +18435,15 @@ const PdfEmbeddingWindowPreparer = struct {
             count,
         );
         defer concurrent_alloc.free(prepared_plans);
+        const requested_count = count;
         count = try preparePdfPixelPrefix(
             &self.coordinator.session,
             requests[0..count],
             prepared_plans,
             model_pixel_cap,
         );
+        if (count < requested_count and count > self.batch_items and count % self.batch_items != 0)
+            count = nextPdfWindowCandidate(count, self.batch_items);
         const per_page_bytes = self.page_output_bytes_cap;
         if (per_page_bytes == 0) return error.DocumentExtractionWorkingSetTooLarge;
         const retained_prefix = try concurrent_alloc.alloc(usize, count + 1);
@@ -18375,16 +18463,18 @@ const PdfEmbeddingWindowPreparer = struct {
         var memory_budget: ?PdfRenderMemoryBudget = null;
         var render_parallel_pages: usize = 1;
         var candidate_count = count;
-        while (candidate_count > 0) : (candidate_count -= 1) {
+        while (candidate_count > 0) : (candidate_count = nextPdfWindowCandidate(candidate_count, self.batch_items)) {
             if (candidate_count >= self.invocation_memory_by_count.len)
                 return error.InferenceInvocationMemoryUnavailable;
             const invocation_memory = self.invocation_memory_by_count[candidate_count];
+            const model_batches = (candidate_count + self.batch_items - 1) / self.batch_items;
+            const render_wire_limit = std.math.mul(usize, self.batch_bytes, model_batches) catch return error.DocumentExtractionWorkingSetTooLarge;
             const retained_raw_bytes = retained_prefix[candidate_count];
             const required_output_bytes = if (self.use_borrowed_rasters)
                 try pdfRasterInvocationOutputReservationBytes(invocation_memory, retained_raw_bytes)
             else
                 try pdfInvocationOutputReservationBytes(
-                    self.batch_bytes,
+                    render_wire_limit,
                     invocation_memory,
                     "image/png".len,
                     candidate_count,
@@ -18446,7 +18536,7 @@ const PdfEmbeddingWindowPreparer = struct {
                 splitOwnedPdfInvocationMemoryBudget(
                     lease.scratchBytesPerWindow(),
                     lease.outputBytesPerWindow(),
-                    self.batch_bytes,
+                    render_wire_limit,
                     invocation_memory,
                     "image/png".len,
                     candidate_count,
@@ -18747,7 +18837,8 @@ fn processPdfPageImageEmbeddingWithAllocator(
     const policy = try enrichment_types.parseExecutionPolicyJson(metadata_alloc, request.execution_json);
     const capability_items = @max(@as(usize, 1), capabilities.batch.max_items);
     const default_items = @max(@as(usize, 1), capabilities.batch.preferred_items);
-    const batch_items = @min(policy.batch_items orelse default_items, capability_items);
+    const batch_items = @min(@min(policy.batch_items orelse default_items, capability_items), generated_ocr_absolute_batch_max_items);
+    if (batch_items == 0) return error.InvalidInferenceCapabilities;
     // Encoded routes require an exact wire ceiling. A local raw-raster route
     // is bounded by decoded pixels and its composite retained-byte lease, so
     // an encoded-media ceiling is neither required nor applied.
@@ -18838,13 +18929,23 @@ fn processPdfPageImageEmbeddingWithAllocator(
     if (page_count > max_document_pages) return error.PdfDocumentPageLimitExceeded;
     try heartbeatEnrichmentLease(runtime);
     const model_pixel_cap = capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
-    const planned_batch_items = @min(batch_items, page_count);
+    const render_items = if (runtime.shared_pdf_windows) |shared| shared.planWindow(raw, batch_items) catch |err| blk: {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+        break :blk batch_items;
+    } else batch_items;
+    const planned_batch_items = @min(render_items, page_count);
     const invocation_memory_by_count = try metadata_alloc.alloc(
         inference_work.InvocationMemoryPlan,
         planned_batch_items + 1,
     );
     defer metadata_alloc.free(invocation_memory_by_count);
     for (1..invocation_memory_by_count.len) |item_count| {
+        if (item_count > batch_items) {
+            var combined = invocation_memory_by_count[batch_items];
+            try addPdfWindowInvocationMemory(&combined, invocation_memory_by_count[item_count - batch_items]);
+            invocation_memory_by_count[item_count] = combined;
+            continue;
+        }
         invocation_memory_by_count[item_count] = try dense_embedder.partInvocationMemoryForMime(
             embedding_name,
             item_count,
@@ -18984,6 +19085,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
         .render_config = render_config,
         .capabilities = capabilities,
         .batch_items = batch_items,
+        .render_items = render_items,
         .batch_bytes = batch_bytes,
         .page_output_bytes_cap = page_output_bytes_cap,
         .invocation_memory_by_count = invocation_memory_by_count,
@@ -19043,31 +19145,45 @@ fn processPdfPageImageEmbeddingWithAllocator(
 
         const lease = current.lease;
         const rendered = &current.rendered;
-        var embedded = switch (rendered.*) {
-            .encoded => |batch| try embedRenderedPdfPageBatch(lease.allocator(), dense_embedder, embedding_name, batch, request.expected_dims),
-            .raster => |batch| try embedRenderedPdfPageRasterBatch(lease.allocator(), dense_embedder, embedding_name, batch, request.expected_dims),
-        };
-        var embedded_owned = true;
-        defer if (embedded_owned) embedded.deinit(lease.allocator());
-        try embedding_lease_guard.check();
-        try heartbeatEnrichmentLease(runtime);
+        var start: usize = 0;
+        while (start < current.count) {
+            const end = try pdfEmbeddingWindowBatchEnd(rendered.*, start, batch_items, batch_bytes, model_pixel_cap, invocation_memory_by_count[1].attachment_transport);
+            // Only borrow descriptor slices: every page stays in the shared
+            // window, while each invocation respects the owner's model limits.
+            const part: PdfEmbeddingRenderedWindow = switch (rendered.*) {
+                inline else => |batch, tag| blk: {
+                    var borrowed = batch;
+                    borrowed.results = batch.results[start..end];
+                    break :blk @unionInit(PdfEmbeddingRenderedWindow, @tagName(tag), borrowed);
+                },
+            };
+            var embedded = switch (part) {
+                .encoded => |batch| try embedRenderedPdfPageBatch(lease.allocator(), dense_embedder, embedding_name, batch, request.expected_dims),
+                .raster => |batch| try embedRenderedPdfPageRasterBatch(lease.allocator(), dense_embedder, embedding_name, batch, request.expected_dims),
+            };
+            var embedded_owned = true;
+            defer if (embedded_owned) embedded.deinit(lease.allocator());
+            try embedding_lease_guard.check();
+            try heartbeatEnrichmentLease(runtime);
 
-        if (try stagePdfPageEmbeddingWindow(runtime, metadata_alloc, request, stage_generation_id, desired_page_keys.items, page_source_hashes, embedded, &staged_page_keys, &promotion_page_keys)) |failure| {
-            std.log.warn(
-                "PDF page embedding incomplete doc={s} page={d}: {s}",
-                .{ request.doc_key, failure.page_number, @errorName(failure.err) },
-            );
-            // Successful siblings are now durably staged. Preserve the old
-            // published generation and leave coverage pending until every
-            // page succeeds; only missing stages need inference on retry.
-            return failure.err;
+            if (try stagePdfPageEmbeddingWindow(runtime, metadata_alloc, request, stage_generation_id, desired_page_keys.items, page_source_hashes, embedded, &staged_page_keys, &promotion_page_keys)) |failure| {
+                std.log.warn(
+                    "PDF page embedding incomplete doc={s} page={d}: {s}",
+                    .{ request.doc_key, failure.page_number, @errorName(failure.err) },
+                );
+                // Successful siblings are now durably staged. Preserve the old
+                // published generation and leave coverage pending until every
+                // page succeeds; only missing stages need inference on retry.
+                return failure.err;
+            }
+            try embedding_lease_guard.check();
+            // The result vectors are allocated by the window allocator. Release
+            // them before destroying the render window and its allocator owner.
+            // The conditional defer above still covers every error return.
+            embedded.deinit(lease.allocator());
+            embedded_owned = false;
+            start = end;
         }
-        try embedding_lease_guard.check();
-        // The result vectors are allocated by the window allocator. Release
-        // them before destroying the render window and its allocator owner.
-        // The conditional defer above still covers every error return.
-        embedded.deinit(lease.allocator());
-        embedded_owned = false;
         current.deinit();
         current_window = null;
         if (next_first_item >= pending_pages.items.len) break;
