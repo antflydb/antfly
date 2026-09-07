@@ -29,8 +29,10 @@ class QueryBuilderRequest:
         decisions (list[AgentDecision] | Unset): Structured answers provided by the user as part of client-carried
             continuation.
         interactive (bool | Unset): If true, the agent may return clarification questions when needed. Default: True.
-        max_internal_iterations (int | Unset): Additive bounded-agent field for the query builder. Phase 1 remains a
-            single-pass generation flow, but this field is echoed in result accounting.
+        max_internal_iterations (int | Unset): Maximum planning tool calls (0-20). Zero uses the compatibility planner.
+            A positive value enables model-directed table inspection and complete QueryRequest submission using the
+            canonical DSL parser and runtime preflight, with validation feedback for repair. It requires an Antfly or OpenAI
+            tool-capable generator and never executes database searches.
         max_user_clarifications (int | Unset): Maximum number of clarification turns the agent may request from the
             user.
         require_decision_after (int | Unset): Force a user-facing decision after this many unresolved internal passes.

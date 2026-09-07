@@ -344,6 +344,8 @@ pub const Detail = enum(c_int) {
     // inference runtime; do not reinterpret compilation-local error integers.
     incompatible_model,
     unsupported_generator_provider,
+    generate_request_failed,
+    generation_rate_limit,
     schema_in_use,
     transaction_too_large,
 };
@@ -535,6 +537,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.RerankUpstreamFailure => status(.unavailable, .rerank_upstream_failure),
         error.IncompatibleModel => status(.invalid_argument, .incompatible_model),
         error.UnsupportedGeneratorProvider => status(.unsupported, .unsupported_generator_provider),
+        error.GenerateRequestFailed => status(.unavailable, .generate_request_failed),
+        error.RateLimit => status(.retryable, .generation_rate_limit),
         error.InvalidRateLimitPolicy => status(.invalid_argument, .invalid_rate_limit_policy),
         error.ConflictingRateLimitPolicy => status(.conflict, .conflicting_rate_limit_policy),
         error.ProviderTokenBudgetExceeded => status(.invalid_argument, .provider_token_budget_exceeded),
@@ -1005,6 +1009,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .rerank_upstream_failure => "RerankUpstreamFailure",
         .incompatible_model => "IncompatibleModel",
         .unsupported_generator_provider => "UnsupportedGeneratorProvider",
+        .generate_request_failed => "GenerateRequestFailed",
+        .generation_rate_limit => "RateLimit",
         .invalid_rate_limit_policy => "InvalidRateLimitPolicy",
         .conflicting_rate_limit_policy => "ConflictingRateLimitPolicy",
         .provider_token_budget_exceeded => "ProviderTokenBudgetExceeded",
@@ -1054,6 +1060,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.RerankUpstreamFailure, errorFromStatus(statusFromError(error.RerankUpstreamFailure)));
     try std.testing.expectEqual(error.IncompatibleModel, errorFromStatus(statusFromError(error.IncompatibleModel)));
     try std.testing.expectEqual(error.UnsupportedGeneratorProvider, errorFromStatus(statusFromError(error.UnsupportedGeneratorProvider)));
+    try std.testing.expectEqual(error.GenerateRequestFailed, errorFromStatus(statusFromError(error.GenerateRequestFailed)));
+    try std.testing.expectEqual(error.RateLimit, errorFromStatus(statusFromError(error.RateLimit)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     const schema_history_status = statusFromError(error.BackupSchemaHistoryTooLarge);

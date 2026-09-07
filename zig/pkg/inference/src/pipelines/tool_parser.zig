@@ -182,13 +182,18 @@ const FunctionGemmaParser = struct {
         try buf.appendSlice(allocator, "Available tools:\n");
         for (tools) |tool| {
             try buf.appendSlice(allocator, self.tokens.start_function_decl);
+            try buf.appendSlice(allocator, "declaration:");
             try buf.appendSlice(allocator, tool.function.name);
             try buf.appendSlice(allocator, "{description:");
             try buf.appendSlice(allocator, self.tokens.escape);
             try buf.appendSlice(allocator, tool.function.description);
             try buf.appendSlice(allocator, self.tokens.escape);
             try buf.appendSlice(allocator, ",parameters:");
-            try self.formatParams(&buf, allocator, tool.function.parameters);
+            // Use Gemma's declaration notation while retaining all schema
+            // keywords, including nested constraints and union/reference types.
+            if (tool.function.parameters) |parameters| {
+                try self.formatGemma4Schema(&buf, allocator, .{ .object = parameters.map }, .schema);
+            } else try buf.appendSlice(allocator, "{}");
             try buf.append(allocator, '}');
             try buf.appendSlice(allocator, self.tokens.end_function_decl);
             try buf.append(allocator, '\n');
@@ -205,6 +210,57 @@ const FunctionGemmaParser = struct {
         try buf.append(allocator, '\n');
 
         return try buf.toOwnedSlice(allocator);
+    }
+
+    const SchemaContext = enum { schema, schema_map, value, type_name };
+
+    fn formatGemma4Schema(self: *FunctionGemmaParser, buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: std.json.Value, context: SchemaContext) std.mem.Allocator.Error!void {
+        switch (value) {
+            .object => |object| {
+                try buf.append(alloc, '{');
+                var it = object.iterator();
+                var first = true;
+                while (it.next()) |entry| {
+                    if (!first) try buf.append(alloc, ',');
+                    first = false;
+                    const key = entry.key_ptr.*;
+                    try buf.appendSlice(alloc, key);
+                    try buf.append(alloc, ':');
+                    const child: SchemaContext = if (context == .schema_map) .schema else if (context != .schema) .value else blk: {
+                        if (std.mem.eql(u8, key, "type")) break :blk .type_name;
+                        inline for (.{ "properties", "patternProperties", "$defs", "definitions", "dependentSchemas" }) |keyword| {
+                            if (std.mem.eql(u8, key, keyword)) break :blk .schema_map;
+                        }
+                        inline for (.{ "items", "prefixItems", "additionalItems", "additionalProperties", "unevaluatedProperties", "unevaluatedItems", "contains", "propertyNames", "allOf", "anyOf", "oneOf", "not", "if", "then", "else" }) |keyword| {
+                            if (std.mem.eql(u8, key, keyword)) break :blk .schema;
+                        }
+                        break :blk .value;
+                    };
+                    try self.formatGemma4Schema(buf, alloc, entry.value_ptr.*, child);
+                }
+                try buf.append(alloc, '}');
+            },
+            .array => |array| {
+                try buf.append(alloc, '[');
+                for (array.items, 0..) |item, i| {
+                    if (i != 0) try buf.append(alloc, ',');
+                    try self.formatGemma4Schema(buf, alloc, item, context);
+                }
+                try buf.append(alloc, ']');
+            },
+            .string => |string| {
+                try buf.appendSlice(alloc, self.tokens.escape);
+                if (context == .type_name) {
+                    for (string) |char| try buf.append(alloc, std.ascii.toUpper(char));
+                } else try buf.appendSlice(alloc, string);
+                try buf.appendSlice(alloc, self.tokens.escape);
+            },
+            else => {
+                const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+                defer alloc.free(encoded);
+                try buf.appendSlice(alloc, encoded);
+            },
+        }
     }
 
     fn formatParams(self: *FunctionGemmaParser, buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, parameters: ?std.json.ArrayHashMap(std.json.Value)) !void {
@@ -261,9 +317,8 @@ const FunctionGemmaParser = struct {
         }
         self.completed_tool_delta = null;
         try self.buffer.appendSlice(self.allocator, chunk);
-        _ = try self.parseBareGemma4CallMaybe();
-
         while (true) {
+            if (try self.parseBareGemma4CallMaybe()) continue;
             const content = self.buffer.items;
             const start_idx = std.mem.indexOf(u8, content, self.tokens.start_function_call) orelse break;
             const end_search_start = start_idx + self.tokens.start_function_call.len;
@@ -305,10 +360,10 @@ const FunctionGemmaParser = struct {
         const trimmed = std.mem.trim(u8, self.buffer.items, &std.ascii.whitespace);
         if (!std.mem.startsWith(u8, trimmed, "call:")) return false;
         const brace_idx = std.mem.indexOfScalar(u8, trimmed, '{') orelse return false;
-        const close_rel = std.mem.indexOfScalar(u8, trimmed[brace_idx + 1 ..], '}') orelse return false;
-        const close_idx = brace_idx + 1 + close_rel;
+        const close_idx = (try gemmaObjectEnd(trimmed, brace_idx, self.tokens.escape)) orelse return false;
         if (!try self.parseCall(trimmed[0 .. close_idx + 1])) return false;
-        self.buffer.clearRetainingCapacity();
+        const prefix_len = @intFromPtr(trimmed.ptr) - @intFromPtr(self.buffer.items.ptr);
+        compactBufferPrefix(&self.buffer, prefix_len + close_idx + 1);
         return true;
     }
 
@@ -334,18 +389,12 @@ const FunctionGemmaParser = struct {
         const func_name = parseFunctionGemmaCallName(content[0..brace_idx]) orelse return false;
         if (func_name.len == 0) return false;
 
-        var params_text = content[brace_idx + 1 ..];
+        var params_text = std.mem.trim(u8, content[brace_idx + 1 ..], &std.ascii.whitespace);
         if (params_text.len > 0 and params_text[params_text.len - 1] == '}') {
             params_text = params_text[0 .. params_text.len - 1];
         }
 
-        var params = std.ArrayListUnmanaged(ParsedParam).empty;
-        defer {
-            for (params.items) |*param| param.deinit(self.allocator);
-            params.deinit(self.allocator);
-        }
-        try self.splitParams(params_text, &params);
-        const arguments = try buildArgumentsJson(self.allocator, params.items);
+        const arguments = try normalizeGemmaArguments(self.allocator, params_text, self.tokens.escape);
         errdefer self.allocator.free(arguments);
 
         var tool_call = ToolCall{
@@ -404,37 +453,6 @@ const FunctionGemmaParser = struct {
         return true;
     }
 
-    fn splitParams(self: *FunctionGemmaParser, input: []const u8, params: *std.ArrayListUnmanaged(ParsedParam)) !void {
-        if (input.len == 0) return;
-
-        var current = std.ArrayListUnmanaged(u8).empty;
-        defer current.deinit(self.allocator);
-
-        var in_escape = false;
-        var i: usize = 0;
-        while (i < input.len) {
-            if (std.mem.startsWith(u8, input[i..], self.tokens.escape)) {
-                in_escape = !in_escape;
-                i += self.tokens.escape.len;
-                continue;
-            }
-
-            if (!in_escape and input[i] == ',') {
-                try parseParam(self.allocator, current.items, params);
-                current.clearRetainingCapacity();
-                i += 1;
-                continue;
-            }
-
-            try current.append(self.allocator, input[i]);
-            i += 1;
-        }
-
-        if (current.items.len > 0) {
-            try parseParam(self.allocator, current.items, params);
-        }
-    }
-
     fn activeToolDelta(self: *FunctionGemmaParser) !?ToolCallDeltaUpdate {
         if (!std.mem.startsWith(u8, self.buffer.items, self.tokens.start_function_call)) return null;
         const partial = self.buffer.items[self.tokens.start_function_call.len..];
@@ -460,12 +478,17 @@ const FunctionGemmaParser = struct {
             self.active_call.?.emitted_name = true;
         }
 
-        const args_snapshot = try buildPartialArgumentsJson(self.allocator, partial[brace_idx + 1 ..], self.tokens.escape);
-        defer self.allocator.free(args_snapshot);
-        if (args_snapshot.len > self.active_call.?.emitted_args_len) {
-            self.pending_argument_delta = try self.allocator.dupe(u8, args_snapshot[self.active_call.?.emitted_args_len..]);
-            self.active_call.?.emitted_args_len = args_snapshot.len;
-            delta.arguments = self.pending_argument_delta.?;
+        // Gemma4's nested values and split escape delimiters do not always
+        // have a stable JSON prefix. Emit the identity immediately and the
+        // normalized arguments atomically when the call closes.
+        if (!isGemma4ToolTokens(self.tokens)) {
+            const args_snapshot = try buildPartialArgumentsJson(self.allocator, partial[brace_idx + 1 ..], self.tokens.escape);
+            defer self.allocator.free(args_snapshot);
+            if (args_snapshot.len > self.active_call.?.emitted_args_len) {
+                self.pending_argument_delta = try self.allocator.dupe(u8, args_snapshot[self.active_call.?.emitted_args_len..]);
+                self.active_call.?.emitted_args_len = args_snapshot.len;
+                delta.arguments = self.pending_argument_delta.?;
+            }
         }
 
         if (delta.id == null and delta.arguments == null and delta.name == null) return null;
@@ -927,47 +950,6 @@ fn isRequired(params: std.json.ObjectMap, name: []const u8) bool {
     return false;
 }
 
-const ParsedParam = struct {
-    key: []const u8,
-    raw_value: []const u8,
-
-    fn deinit(self: *ParsedParam, allocator: std.mem.Allocator) void {
-        allocator.free(self.key);
-        allocator.free(self.raw_value);
-        self.* = undefined;
-    }
-};
-
-fn parseParam(allocator: std.mem.Allocator, text: []const u8, params: *std.ArrayListUnmanaged(ParsedParam)) !void {
-    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
-    if (trimmed.len == 0) return;
-    const colon_idx = std.mem.indexOfScalar(u8, trimmed, ':') orelse return;
-    const key = std.mem.trim(u8, trimmed[0..colon_idx], &std.ascii.whitespace);
-    const value = std.mem.trim(u8, trimmed[colon_idx + 1 ..], &std.ascii.whitespace);
-    if (key.len == 0) return;
-
-    try params.append(allocator, .{
-        .key = try allocator.dupe(u8, key),
-        .raw_value = try allocator.dupe(u8, value),
-    });
-}
-
-fn buildArgumentsJson(allocator: std.mem.Allocator, params: []const ParsedParam) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8).empty;
-    errdefer buf.deinit(allocator);
-
-    try buf.append(allocator, '{');
-    for (params, 0..) |param, idx| {
-        if (idx > 0) try buf.append(allocator, ',');
-        try appendJsonString(&buf, allocator, param.key);
-        try buf.append(allocator, ':');
-        try appendJsonValue(&buf, allocator, param.raw_value);
-    }
-    try buf.append(allocator, '}');
-
-    return try buf.toOwnedSlice(allocator);
-}
-
 fn jsonValueToOwnedSlice(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(allocator);
@@ -1035,6 +1017,7 @@ fn buildPartialArgumentsJson(allocator: std.mem.Allocator, raw_params: []const u
     while (i < raw_params.len) {
         while (i < raw_params.len and std.ascii.isWhitespace(raw_params[i])) : (i += 1) {}
         if (i >= raw_params.len or raw_params[i] == '}') break;
+        if (raw_params[i] == '"' or std.mem.startsWith(u8, raw_params[i..], escape_token)) break;
 
         const key_start = i;
         while (i < raw_params.len and raw_params[i] != ':') : (i += 1) {}
@@ -1043,6 +1026,10 @@ fn buildPartialArgumentsJson(allocator: std.mem.Allocator, raw_params: []const u
         i += 1;
         while (i < raw_params.len and std.ascii.isWhitespace(raw_params[i])) : (i += 1) {}
         if (key.len == 0) break;
+        // Nested Gemma objects are not JSON until their bare keys and escaped
+        // strings have been normalized. Retain the scalar prefix already sent
+        // and emit the complete container in the terminal argument delta.
+        if (i < raw_params.len and (raw_params[i] == '{' or raw_params[i] == '[')) break;
 
         var in_escape = false;
         var saw_escape = false;
@@ -1077,6 +1064,227 @@ fn buildPartialArgumentsJson(allocator: std.mem.Allocator, raw_params: []const u
     }
 
     return try buf.toOwnedSlice(allocator);
+}
+
+fn normalizeGemmaArguments(allocator: std.mem.Allocator, params: []const u8, escape_token: []const u8) ![]u8 {
+    if (params.len > 1024 * 1024 or escape_token.len == 0) return error.InvalidToolArguments;
+    var parser = GemmaArgumentParser{ .allocator = allocator, .input = params, .escape_token = escape_token };
+    defer parser.output.deinit(allocator);
+    try parser.object(0, false);
+    parser.whitespace();
+    if (parser.pos != params.len) return error.InvalidToolArguments;
+    return parser.output.toOwnedSlice(allocator);
+}
+
+/// Gemma represents strings with a special delimiter and allows bare object
+/// keys. Parse the structure, not comma-separated fragments, before exposing
+/// arguments to callers. All recursion and retained input are bounded.
+const GemmaArgumentParser = struct {
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    escape_token: []const u8,
+    pos: usize = 0,
+    output: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn whitespace(self: *@This()) void {
+        while (self.pos < self.input.len and std.ascii.isWhitespace(self.input[self.pos])) self.pos += 1;
+    }
+
+    fn consume(self: *@This(), byte: u8) !void {
+        self.whitespace();
+        if (self.pos >= self.input.len or self.input[self.pos] != byte) return error.InvalidToolArguments;
+        self.pos += 1;
+    }
+
+    fn string(self: *@This()) !void {
+        if (std.mem.startsWith(u8, self.input[self.pos..], self.escape_token)) {
+            self.pos += self.escape_token.len;
+            const end = std.mem.indexOfPos(u8, self.input, self.pos, self.escape_token) orelse return error.InvalidToolArguments;
+            try appendJsonString(&self.output, self.allocator, self.input[self.pos..end]);
+            self.pos = end + self.escape_token.len;
+        } else {
+            const start = self.pos;
+            try self.consume('"');
+            while (self.pos < self.input.len) {
+                const byte = self.input[self.pos];
+                self.pos += 1;
+                if (byte == '\\') {
+                    if (self.pos == self.input.len) return error.InvalidToolArguments;
+                    self.pos += 1;
+                } else if (byte == '"') {
+                    var parsed = try std.json.parseFromSlice([]const u8, self.allocator, self.input[start..self.pos], .{});
+                    defer parsed.deinit();
+                    try appendJsonString(&self.output, self.allocator, parsed.value);
+                    return;
+                }
+            }
+            return error.InvalidToolArguments;
+        }
+    }
+
+    fn object(self: *@This(), depth: usize, closing_brace: bool) anyerror!void {
+        if (depth > 64) return error.InvalidToolArguments;
+        try self.output.append(self.allocator, '{');
+        var first = true;
+        while (true) {
+            self.whitespace();
+            if (self.pos == self.input.len) {
+                if (closing_brace) return error.InvalidToolArguments;
+                break;
+            }
+            if (closing_brace and self.input[self.pos] == '}') {
+                self.pos += 1;
+                break;
+            }
+            if (!first) {
+                try self.consume(',');
+                try self.output.append(self.allocator, ',');
+                self.whitespace();
+            }
+            first = false;
+            if (self.pos == self.input.len) return error.InvalidToolArguments;
+            if (self.input[self.pos] == '"' or std.mem.startsWith(u8, self.input[self.pos..], self.escape_token)) {
+                try self.string();
+            } else {
+                const start = self.pos;
+                while (self.pos < self.input.len and self.input[self.pos] != ':') self.pos += 1;
+                const key = std.mem.trim(u8, self.input[start..self.pos], &std.ascii.whitespace);
+                if (key.len == 0 or std.mem.indexOfAny(u8, key, "{},[]") != null) return error.InvalidToolArguments;
+                try appendJsonString(&self.output, self.allocator, key);
+            }
+            try self.consume(':');
+            try self.output.append(self.allocator, ':');
+            try self.value(depth + 1);
+        }
+        try self.output.append(self.allocator, '}');
+    }
+
+    fn value(self: *@This(), depth: usize) anyerror!void {
+        if (depth > 64) return error.InvalidToolArguments;
+        self.whitespace();
+        if (self.pos == self.input.len) return error.InvalidToolArguments;
+        if (self.input[self.pos] == '"' or std.mem.startsWith(u8, self.input[self.pos..], self.escape_token)) return self.string();
+        if (self.input[self.pos] == '{') {
+            self.pos += 1;
+            return self.object(depth, true);
+        }
+        if (self.input[self.pos] == '[') {
+            self.pos += 1;
+            try self.output.append(self.allocator, '[');
+            var first = true;
+            while (true) {
+                self.whitespace();
+                if (self.pos == self.input.len) return error.InvalidToolArguments;
+                if (self.input[self.pos] == ']') break;
+                if (!first) {
+                    try self.consume(',');
+                    try self.output.append(self.allocator, ',');
+                }
+                first = false;
+                try self.value(depth + 1);
+            }
+            self.pos += 1;
+            return self.output.append(self.allocator, ']');
+        }
+        const start = self.pos;
+        while (self.pos < self.input.len and std.mem.indexOfScalar(u8, ",}]", self.input[self.pos]) == null) self.pos += 1;
+        const scalar = std.mem.trim(u8, self.input[start..self.pos], &std.ascii.whitespace);
+        if (scalar.len == 0) return error.InvalidToolArguments;
+        try appendJsonValue(&self.output, self.allocator, scalar);
+    }
+};
+
+// Find the outer argument boundary without mistaking nested objects or braces in
+// strings for the end of a bare Gemma call. Incomplete streamed input is not an
+// error: the caller retains it until the next feed.
+fn gemmaObjectEnd(input: []const u8, start: usize, escape_token: []const u8) !?usize {
+    if (input.len > 1024 * 1024) return error.InvalidToolArguments;
+    var depth: usize = 0;
+    var pos = start;
+    while (pos < input.len) {
+        if (escape_token.len != 0 and std.mem.startsWith(u8, input[pos..], escape_token)) {
+            const end = std.mem.indexOfPos(u8, input, pos + escape_token.len, escape_token) orelse return null;
+            pos = end + escape_token.len;
+            continue;
+        }
+        switch (input[pos]) {
+            '"' => {
+                pos += 1;
+                while (pos < input.len and input[pos] != '"') : (pos += 1) {
+                    if (input[pos] == '\\') pos += 1;
+                }
+                if (pos >= input.len) return null;
+            },
+            '{' => {
+                depth += 1;
+                if (depth > 64) return error.InvalidToolArguments;
+            },
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return pos;
+            },
+            else => {},
+        }
+        pos += 1;
+    }
+    return null;
+}
+
+test "gemma4 bare nested calls wait for the outer boundary at every byte boundary" {
+    const alloc = std.testing.allocator;
+    const raw = "call:submit_plan{mode:full_text,plan:{query:{match:<|\"|>anatomy } {<|\"|>,field:\"ti}tle\"}}}";
+    for (0..raw.len + 1) |split| {
+        var parser = Parser{ .functiongemma = .{ .allocator = alloc, .tokens = .{
+            .format = .gemma4,
+            .start_function_decl = "<|tool>",
+            .end_function_decl = "<tool|>",
+            .start_function_call = "<|tool_call>",
+            .end_function_call = "<tool_call|>",
+            .escape = "<|\"|>",
+        } } };
+        defer parser.deinit();
+        _ = try parser.feed(raw[0..split]);
+        if (split < raw.len) try std.testing.expectEqual(@as(usize, 0), parser.toolCalls().len);
+        _ = try parser.feed(raw[split..]);
+        try std.testing.expectEqual(@as(usize, 1), parser.toolCalls().len);
+        try std.testing.expectEqualStrings("{\"mode\":\"full_text\",\"plan\":{\"query\":{\"match\":\"anatomy } {\",\"field\":\"ti}tle\"}}}", parser.toolCalls()[0].function.arguments);
+        _ = try parser.feed("tail");
+        const remaining = try parser.finishText(alloc);
+        defer alloc.free(remaining);
+        try std.testing.expectEqualStrings("tail", remaining);
+    }
+}
+
+test "gemma nested tool arguments preserve containers and string scalar types" {
+    const alloc = std.testing.allocator;
+    const actual = try normalizeGemmaArguments(alloc, "mode:<|\"|>full_text<|\"|>,plan:{query:{conjuncts:[{match:<|\"|>anatomy, physiology<|\"|>,field:<|\"|>title<|\"|>},{term:<|\"|>true<|\"|>}]},limit:3,enabled:true,empty:null}", "<|\"|>");
+    defer alloc.free(actual);
+    try std.testing.expectEqualStrings("{\"mode\":\"full_text\",\"plan\":{\"query\":{\"conjuncts\":[{\"match\":\"anatomy, physiology\",\"field\":\"title\"},{\"term\":\"true\"}]},\"limit\":3,\"enabled\":true,\"empty\":null}}", actual);
+    try std.testing.expectError(error.InvalidToolArguments, normalizeGemmaArguments(alloc, "plan:{x:1", "<|\"|>"));
+}
+
+test "gemma4 nested tool argument deltas reconstruct canonical JSON at every byte boundary" {
+    const alloc = std.testing.allocator;
+    var parser = Parser{ .functiongemma = .{ .allocator = alloc, .tokens = .{
+        .format = .gemma4,
+        .start_function_decl = "<|tool>",
+        .end_function_decl = "<tool|>",
+        .start_function_call = "<|tool_call>",
+        .end_function_call = "<tool_call|>",
+        .escape = "<|\"|>",
+    } } };
+    defer parser.deinit();
+    const raw = "<|tool_call>call:submit_plan{mode:<|\"|>full_text<|\"|>,plan:{query:{match:<|\"|>anatomy, physiology<|\"|>,field:<|\"|>title<|\"|>}}}<tool_call|>";
+    var deltas: std.ArrayListUnmanaged(u8) = .empty;
+    defer deltas.deinit(alloc);
+    for (0..raw.len) |i| {
+        const update = try parser.feed(raw[i .. i + 1]);
+        if (update.active_tool_delta) |delta| if (delta.arguments) |arguments| try deltas.appendSlice(alloc, arguments);
+    }
+    try std.testing.expectEqual(@as(usize, 1), parser.toolCalls().len);
+    try std.testing.expectEqualStrings(parser.toolCalls()[0].function.arguments, deltas.items);
+    const expected = "{\"mode\":\"full_text\",\"plan\":{\"query\":{\"match\":\"anatomy, physiology\",\"field\":\"title\"}}}";
+    try std.testing.expectEqualStrings(expected, deltas.items);
 }
 
 fn appendJsonValue(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, raw: []const u8) !void {
@@ -1526,7 +1734,7 @@ test "gemma4 tool tokens format prompt and parse tool call" {
     };
     const prompt = try parser.formatToolsPrompt(allocator, &tools);
     defer allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool>lookup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool>declaration:lookup") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool_call>call:function_name") != null);
 
     const update = try parser.feed("<|tool_call>call:lookup{id:42}<tool_call|>");
@@ -1553,8 +1761,38 @@ test "gemma4 tool tokens format prompt and parse tool call" {
 
     parser.reset();
     const trailing_update = try parser.feed("call:lookup{id:42} extra text");
-    try std.testing.expectEqualStrings("", trailing_update.ready_text);
+    try std.testing.expectEqualStrings(" extra text", trailing_update.ready_text);
     try std.testing.expectEqual(@as(usize, 1), trailing_update.new_calls.len);
+
+    parser.reset();
+    const parallel_update = try parser.feed("call:lookup{id:42}\ncall:lookup{id:43}");
+    try std.testing.expectEqualStrings("", parallel_update.ready_text);
+    try std.testing.expectEqual(@as(usize, 2), parallel_update.new_calls.len);
+    try std.testing.expectEqualStrings("{\"id\":43}", parallel_update.new_calls[1].function.arguments);
+}
+
+test "gemma4 tool declarations preserve complete nested parameter schemas" {
+    const alloc = std.testing.allocator;
+    var parser = FunctionGemmaParser{ .allocator = alloc, .tokens = .{
+        .format = .gemma4,
+        .start_function_decl = "<|tool>",
+        .end_function_decl = "<tool|>",
+        .start_function_call = "<|tool_call>",
+        .end_function_call = "<tool_call|>",
+        .escape = "<|\"|>",
+    } };
+    defer parser.deinit();
+    const schema =
+        \\{"type":"object","properties":{"query_index":{"type":"integer","enum":[0,2]},"query_request":{"type":"object","properties":{"full_text_search":{"anyOf":[{"type":"object"},{"type":"string"}]},"indexes":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"required":["query_index","query_request"],"additionalProperties":false,"$defs":{"leaf":{"type":"string"}}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), alloc, schema, .{});
+    defer parsed.deinit();
+    const prompt = try parser.formatToolsPrompt(alloc, &.{.{ .function = .{ .name = "submit_query", .description = "Validate a query", .parameters = parsed.value } }});
+    defer alloc.free(prompt);
+    const expected =
+        \\parameters:{type:<|"|>OBJECT<|"|>,properties:{query_index:{type:<|"|>INTEGER<|"|>,enum:[0,2]},query_request:{type:<|"|>OBJECT<|"|>,properties:{full_text_search:{anyOf:[{type:<|"|>OBJECT<|"|>},{type:<|"|>STRING<|"|>}]},indexes:{type:<|"|>ARRAY<|"|>,items:{type:<|"|>STRING<|"|>}}},additionalProperties:false}},required:[<|"|>query_index<|"|>,<|"|>query_request<|"|>],additionalProperties:false,$defs:{leaf:{type:<|"|>STRING<|"|>}}}
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, prompt, expected) != null);
 }
 
 test "loadParser detects tool token convention from GGUF tokenizer metadata" {
@@ -1608,7 +1846,7 @@ test "loadParser detects tool token convention from GGUF tokenizer metadata" {
     }};
     const prompt = try parser.formatToolsPrompt(allocator, &tools);
     defer allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool>lookup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<|tool>declaration:lookup") != null);
 
     const update = try parser.feed("<|tool_call>call:lookup{id:42}<tool_call|>");
     try std.testing.expectEqual(@as(usize, 1), update.new_calls.len);

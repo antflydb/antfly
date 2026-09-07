@@ -7537,6 +7537,59 @@ fn canDeferStoredProjection(fields: []const []const u8) bool {
     return true;
 }
 
+/// Classify canonical query capabilities using the same normalization as execution.
+/// Agent tool policy must not infer capabilities from a partial list of DSL keys.
+pub fn publicQueryCapabilities(alloc: std.mem.Allocator, request: anytype) !struct { text: bool, filter: bool } {
+    var normalized = try normalizePublicQueryBucketsAlloc(alloc, request, 10);
+    defer normalized.deinit(alloc);
+    return .{
+        .text = normalized.full_text != null,
+        .filter = normalized.filter_text != null or normalized.exclusion_text != null or normalized.filter_query_json.len > 0 or normalized.exclusion_query_json.len > 0,
+    };
+}
+
+/// Preserve the non-scoring authority of a canonical query across agent revisions.
+/// Normalize first, and use the same bool.must classifier as execution; arbitrary
+/// scoring subtrees are never heuristically rewritten.
+pub fn canonicalQueryConstraints(alloc: std.mem.Allocator, value: std.json.Value) !struct { filter: ?std.json.Value, exclusion: ?std.json.Value } {
+    const request = metadata_openapi.QueryRequest{ .query = value };
+    const capabilities = try publicQueryCapabilities(alloc, request);
+    if (!capabilities.filter) return .{ .filter = null, .exclusion = null };
+    if (value.object.get("bool")) |boolean| {
+        var filters = std.json.Array.init(alloc);
+        if (boolean.object.get("filter")) |filter| {
+            if (filter == .array) try filters.appendSlice(filter.array.items) else try filters.append(filter);
+        }
+        if (boolean.object.get("must")) |must| {
+            const children = if (must == .array) must.array.items else &.{must};
+            for (children) |child| {
+                var scoring = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+                defer deinitTextQueryArrayList(alloc, &scoring);
+                var structured = std.ArrayListUnmanaged([]u8).empty;
+                defer deinitOwnedStringArrayList(alloc, &structured);
+                var text = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+                defer deinitTextQueryArrayList(alloc, &text);
+                try appendBoolMustClausesAlloc(alloc, child, 10, &scoring, &structured, &text);
+                if (structured.items.len > 0 or text.items.len > 0) try filters.append(child);
+            }
+        }
+        var filter: ?std.json.Value = null;
+        if (filters.items.len > 0) {
+            var root = std.json.ObjectMap.empty;
+            try root.put(alloc, "conjuncts", .{ .array = filters });
+            filter = .{ .object = root };
+        }
+        var exclusion = boolean.object.get("must_not");
+        if (exclusion != null and exclusion.? == .array) {
+            var root = std.json.ObjectMap.empty;
+            try root.put(alloc, "disjuncts", exclusion.?);
+            exclusion = .{ .object = root };
+        }
+        return .{ .filter = filter, .exclusion = exclusion };
+    }
+    return .{ .filter = if (!capabilities.text) value else null, .exclusion = null };
+}
+
 const NormalizedPublicQueryBuckets = struct {
     full_text: ?db_mod.types.TextQuery = null,
     filter_text: ?db_mod.types.TextQuery = null,

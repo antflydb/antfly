@@ -24,12 +24,14 @@ const http_abi = @import("../runtime_http_abi.zig");
 const platform_sync = @import("antfly_platform").sync;
 const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const inference_api = @import("inference_api");
+const worker_runtime = @import("inference_worker.zig");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
     /// Host-owned interface protected by standalone's inference-lane lease.
     io: std.Io,
     node: inference.server.Node,
+    worker: ?*worker_runtime.Client = null,
     warm_models: ResolvedWarmModels,
     content_security: ?std.json.Parsed(antfly.common.config.Config.ContentSecurityConfig),
     s3_credentials: ?std.json.Parsed(antfly.common.config.Config.S3CredentialsConfig),
@@ -90,6 +92,8 @@ const LinkedResourceBudgetContext = struct {
 };
 
 const InferenceRuntimeConfig = struct {
+    embedded_enabled: bool = true,
+    worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     max_concurrent_requests: ?usize = null,
     kernel_jit: inference.graph.kernel_jit.Config = .{},
     prompt_cache: inference.server.PromptCacheConfig = .{},
@@ -98,6 +102,7 @@ const InferenceRuntimeConfig = struct {
 const RouteState = struct {
     owner: *LinkedInferenceState,
     handler: httpx.Handler,
+    path: []const u8 = "",
 };
 
 const HttpResponseState = struct {
@@ -304,6 +309,10 @@ test "standalone data directory does not change the default models directory" {
 /// Creates the standalone inference implementation inside its focused codegen
 /// unit. The caller passes only ABI-safe launch settings, never CliConfig.
 pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*anyopaque {
+    return linkedInferenceCreateLocal(context, false);
+}
+
+pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext, supervised: bool) !*anyopaque {
     const data_dir = context.data_dir_ptr[0..context.data_dir_len];
     const alloc = std.heap.c_allocator;
     const io = try context.executor.get();
@@ -327,6 +336,9 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
     errdefer runtime_config.deinit();
     try runtime_config.value.kernel_jit.validate();
     try runtime_config.value.prompt_cache.validate();
+    const use_worker = !supervised and !@import("builtin").is_test and
+        runtime_config.value.embedded_enabled and
+        inference.backends.BackendRuntime.availableRequiresProcessIsolation();
 
     const state = try alloc.create(LinkedInferenceState);
     errdefer alloc.destroy(state);
@@ -364,6 +376,8 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
             .unavailable => .unavailable,
         },
         .resource_ownership = .external_required,
+        .process_termination_available = supervised,
+        .inference_proxy = use_worker,
         .tokenizer_cache = .{
             .bulk_slots_per_shard = 16 * 1024,
         },
@@ -397,7 +411,14 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
     };
     errdefer state.route_validator.deinit();
     state.node = try inference.server.Node.init(alloc, node_config);
+    errdefer state.node.deinit();
     try state.node.attachIo(state.io);
+    if (use_worker) {
+        var resolved = context.*;
+        resolved.models_dir = .init(state.node.config.models_dir);
+        resolved.ml_dir = .init(state.node.config.ml_dir);
+        state.worker = try worker_runtime.Client.create(alloc, io, &resolved);
+    }
     return state;
 }
 
@@ -425,6 +446,11 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
         resource_context.release();
         return err;
     };
+    if (state.worker) |worker| {
+        try worker.configure(context.resource_budget.*);
+        state.node.startup_preloads_materialized = true;
+        return;
+    }
     state.node.warmConfiguredModelsBeforeServing(state.alloc) catch |err| {
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
         return err;
@@ -433,6 +459,18 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
 
 pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
+    if (state.worker) |worker| {
+        // Mirror the shared local request gate before crossing the transport.
+        if (!state.node.tryAcquireRequestSlot()) return error.ResourceTemporarilyUnavailable;
+        defer state.node.releaseRequestSlot();
+        const json = try worker_runtime.invokeProvider(worker, context);
+        errdefer state.alloc.free(json);
+        const response = try state.alloc.create(ProviderResponseState);
+        response.* = .{ .alloc = state.alloc, .json = json };
+        context.out_response_handle.* = response;
+        context.out_response_json.* = .init(json);
+        return;
+    }
     const operation = std.enums.fromInt(inference_bridge.ProviderOperation, context.operation) orelse
         return error.UnsupportedOperation;
     const request_json = context.request_json.slice();
@@ -631,6 +669,21 @@ pub fn linkedInferenceDestroyProviderResponse(handle: *anyopaque) void {
 
 pub fn linkedInferenceRegisterRoutesOn(handle: *anyopaque, server: *httpx.Server) !void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    if (state.worker != null) {
+        var entries: ?[*]const inference_bridge.RouteManifestEntry = null;
+        var length: usize = 0;
+        try linkedInferenceRouteManifest(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .out_entries = &entries, .out_len = &length });
+        for (state.route_manifest.items) |entry| {
+            try server.routeWithData(switch (entry.method) {
+                .get => .GET,
+                .post => .POST,
+                .put => .PUT,
+                .delete => .DELETE,
+                .patch => .PATCH,
+            }, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+        }
+        return;
+    }
     var registrar = DirectServer{ .owner = state, .server = server };
     try state.node.registerRoutesOn(inference.server.public_api_prefix, &registrar);
     try state.node.registerAiRoutesOn(inference.server.ai_api_prefix, &registrar);
@@ -687,7 +740,7 @@ const ManifestServer = struct {
         };
         const route = try self.owner.alloc.create(RouteState);
         errdefer self.owner.alloc.destroy(route);
-        route.* = .{ .owner = self.owner, .handler = handler };
+        route.* = .{ .owner = self.owner, .handler = handler, .path = path };
         try self.owner.routes.append(self.owner.alloc, route);
         errdefer _ = self.owner.routes.pop();
         try self.owner.route_manifest.append(self.owner.alloc, .{
@@ -798,6 +851,49 @@ const DirectServer = struct {
 
 fn localInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const route: *RouteState = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRouteUnavailable));
+    if (route.owner.worker != null) {
+        var arena = std.heap.ArenaAllocator.init(context.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const headers = try alloc.alloc(http_abi.HeaderView, context.request.headers.iterator().len);
+        for (context.request.headers.iterator(), headers) |header, *out| out.* = .{ .name = .init(header.name), .value = .init(header.value) };
+        const params = try alloc.alloc(http_abi.RouteParamView, context.params.len);
+        for (context.params, params) |param, *out| out.* = .{ .name = .init(param.name), .value = .init(param.value) };
+        const request: http_abi.HttpRequestView = .{
+            .method = switch (context.request.method) {
+                .GET => .get,
+                .POST => .post,
+                .PUT => .put,
+                .DELETE => .delete,
+                .PATCH => .patch,
+                else => return error.UnsupportedOperation,
+            },
+            .path = .init(context.request.uri.path),
+            .query = .init(context.request.uri.query),
+            .headers_ptr = headers.ptr,
+            .headers_len = headers.len,
+            .params_ptr = params.ptr,
+            .params_len = params.len,
+            .body = .init(context.request.body),
+        };
+        var transport = runtime_http_bridge.Outbound{ .context = context };
+        var response_handle: ?*anyopaque = null;
+        var response_view: http_abi.HttpResponseView = undefined;
+        try linkedInferenceHandleHttp(&.{
+            .abi_version = inference_bridge.abi_version,
+            .route_handle = route,
+            .request = &request,
+            .cancellation = transport.cancellation(),
+            .body_source = transport.bodySource(),
+            .stream = transport.stream(),
+            .out_response_handle = &response_handle,
+            .out_response = &response_view,
+        });
+        const response: *HttpResponseState = @ptrCast(@alignCast(response_handle.?));
+        defer response.alloc.destroy(response);
+        defer response.alloc.free(response.header_views);
+        return response.response;
+    }
     return route.handler.invoke(context);
 }
 
@@ -836,7 +932,20 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
-    var response = try route.handler.invoke(&http_context);
+    var response = if (state.worker) |worker| remote: {
+        // Preserve admission-before-upload, including lazy streaming bodies.
+        const admitted = request.method != .get;
+        if (admitted and !state.node.tryAcquireRequestSlot()) {
+            var overloaded = httpx.Response.init(alloc, 503);
+            errdefer overloaded.deinit();
+            try overloaded.headers.append("content-type", "application/json");
+            try overloaded.headers.append("retry-after", "1");
+            overloaded.body = "{\"error\":\"inference request capacity exceeded\"}";
+            break :remote overloaded;
+        }
+        defer if (admitted) state.node.releaseRequestSlot();
+        break :remote try worker_runtime.invokeHttp(worker, route.path, context);
+    } else try route.handler.invoke(&http_context);
     errdefer response.deinit();
 
     const response_state = try alloc.create(HttpResponseState);
@@ -893,6 +1002,7 @@ pub fn linkedInferenceRequestAdmissionStats(handle: *anyopaque) inference_bridge
 pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
     const alloc = state.alloc;
+    if (state.worker) |worker| worker.deinit();
     state.node.detachPromptCacheResourceUsageObserver();
     state.node.deinit();
     if (state.resource_budget_context) |context| context.release();
@@ -1313,6 +1423,7 @@ const LocalGenerateMessages = struct {
     owned_media: std.ArrayListUnmanaged([]u8) = .empty,
     owned_slices: std.ArrayListUnmanaged([]const []const u8) = .empty,
     owned_parts: std.ArrayListUnmanaged([]inference.pipelines.GenerationMessage.ContentPart) = .empty,
+    owned_tool_calls: std.ArrayListUnmanaged([]inference.pipelines.GenerationMessage.ToolCall) = .empty,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.owned_texts.items) |text| alloc.free(text);
@@ -1323,6 +1434,8 @@ const LocalGenerateMessages = struct {
         self.owned_slices.deinit(alloc);
         for (self.owned_parts.items) |parts| alloc.free(parts);
         self.owned_parts.deinit(alloc);
+        for (self.owned_tool_calls.items) |calls| alloc.free(calls);
+        self.owned_tool_calls.deinit(alloc);
         alloc.free(self.messages);
         self.* = undefined;
     }
@@ -1400,6 +1513,13 @@ pub fn preflightLocalGenerateMessages(
 ) !inference.server.Node.DirectGeneratePreflight {
     var preflight: inference.server.Node.DirectGeneratePreflight = .{};
     for (messages) |message| {
+        if (message.tool_call_id) |id| try addLocalGenerateBytes(&preflight.text_bytes, id.len);
+        if (message.tool_calls) |calls| for (calls) |call| {
+            try addLocalGenerateBytes(&preflight.text_bytes, call.id.len);
+            try addLocalGenerateBytes(&preflight.text_bytes, "function".len);
+            try addLocalGenerateBytes(&preflight.text_bytes, call.name.len);
+            try addLocalGenerateBytes(&preflight.text_bytes, call.arguments.len);
+        };
         const content = message.content orelse continue;
         switch (content) {
             .text => |text_value| try addLocalGenerateBytes(&preflight.text_bytes, text_value.len),
@@ -1432,8 +1552,22 @@ pub fn convertLocalGenerateMessages(
     errdefer out.deinit(alloc);
 
     var decode_budget = LocalGenerateDecodeBudget{ .remaining_bytes = decoded_media_bytes };
-    for (messages, 0..) |message, i|
+    for (messages, 0..) |message, i| {
         out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message, &decode_budget);
+        out.messages[i].content_is_null = message.content == null;
+        out.messages[i].tool_call_id = message.tool_call_id;
+        if (message.tool_calls) |calls| {
+            const converted = try alloc.alloc(inference.pipelines.GenerationMessage.ToolCall, calls.len);
+            errdefer alloc.free(converted);
+            for (calls, converted) |call, *target| target.* = .{
+                .id = call.id,
+                .name = call.name,
+                .arguments = call.arguments,
+            };
+            try out.owned_tool_calls.append(alloc, converted);
+            out.messages[i].tool_calls = converted;
+        }
+    }
     if (decode_budget.remaining_bytes != 0) return error.InvalidGenerationAdmission;
     return out;
 }
@@ -1562,6 +1696,22 @@ fn convertLocalGenerateParts(
         .audio_bytes = audio_slice,
         .content_parts = content_parts,
     };
+}
+
+test "local generate message conversion preserves tool history and admission" {
+    const alloc = std.testing.allocator;
+    const messages = [_]antfly.inference.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "c1", .name = "search", .arguments = "{\"query\":\"anatomy\"}" }} },
+        .{ .role = .tool, .tool_call_id = "c1", .content = .{ .text = "AZURE-731" } },
+    };
+    const preflight = try preflightLocalGenerateMessages(&messages);
+    var converted = try convertLocalGenerateMessages(alloc, &messages, preflight.decoded_media_bytes);
+    defer converted.deinit(alloc);
+    try std.testing.expect(converted.messages[0].content_is_null);
+    try std.testing.expectEqualStrings("search", converted.messages[0].tool_calls.?[0].name);
+    try std.testing.expectEqualStrings("{\"query\":\"anatomy\"}", converted.messages[0].tool_calls.?[0].arguments);
+    try std.testing.expectEqualStrings("c1", converted.messages[1].tool_call_id.?);
+    try std.testing.expectEqual(preflight.text_bytes, converted.messages[0].textBytes() + converted.messages[1].textBytes());
 }
 
 const DecodedLocalMedia = struct {
