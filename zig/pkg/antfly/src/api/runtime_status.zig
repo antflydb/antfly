@@ -4057,12 +4057,6 @@ fn preserveArtifactVisibilityUsingLookup(
         else
             false;
         const derived_index = dst.kind == .dense_vector or dst.kind == .sparse_vector;
-        // A live owner's closed repair gate supersedes retained publication
-        // continuity. Physical vectors can survive while their generation is
-        // quarantined or awaiting replacement validation.
-        if (derived_index and incoming.metadata.source == .live_writer_publish and
-            dst.index_repair_id != null and !dst.serving_snapshot_ready and
-            !dst.index_repair_active_generation_serviceable) continue;
         const same_runtime_root = incoming.metadata.lsm_root_generation == previous.metadata.lsm_root_generation;
         const same_derived_incarnation = derived_index and
             dst.coverage_identity_ready and
@@ -4179,6 +4173,20 @@ fn preserveArtifactVisibilityUsingLookup(
                 dst.coverage_produced_count < cached.coverage_produced_count or
                 dst.coverage_skipped_count < cached.coverage_skipped_count or
                 dst.coverage_terminal_failed_count < cached.coverage_terminal_failed_count);
+        // A current live owner's closed repair gate supersedes continuity,
+        // but callback completion order cannot promote an older publication.
+        // Unstamped overlays and unrecovered successor owners still carry a
+        // live closed gate: recovery proof is required to serve, not to block.
+        // Coverage has its own stamp and cannot borrow this serving decision.
+        const current_repair_gate = derived_index and
+            incoming.metadata.source == .live_writer_publish and
+            dst.index_repair_id != null and !dst.serving_snapshot_ready and
+            !dst.index_repair_active_generation_serviceable and
+            serving_order != .older;
+        if (current_repair_gate) {
+            if (coverage_settlement_regressed) preserveIndexCoverageSettlement(dst, cached.*);
+            continue;
+        }
         const applied_regressed = serving_order == null and same_projection_identity and
             dst.replay_applied_sequence < cached.replay_applied_sequence;
         const same_projection = same_projection_identity and
@@ -10039,6 +10047,81 @@ test "live writer artifact regression keeps authoritative source deletions" {
     try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.doc_count);
+}
+
+test "live repair admission supersedes cached vector serviceability only for a current publication" {
+    const alloc = std.testing.allocator;
+    const Stamp = @import("../storage/db/publication.zig").Stamp;
+    const initial = Stamp{ .owner_epoch = 2, .revision = 10, .applied_through = 12 };
+    const older = Stamp{ .owner_epoch = 2, .revision = 9, .applied_through = 12 };
+    const newer = Stamp{ .owner_epoch = 2, .revision = 11, .applied_through = 12 };
+    const Case = struct {
+        serving: ?Stamp,
+        coverage: ?Stamp = older,
+        closed: bool = false,
+        conflict: bool = false,
+    };
+    for ([_]db_mod.types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        for ([_]Case{
+            .{ .serving = older },
+            .{ .serving = initial, .conflict = true },
+            .{ .serving = newer, .closed = true },
+            .{ .serving = newer, .coverage = initial, .conflict = true },
+            .{ .serving = .{ .owner_epoch = 1, .revision = 999, .applied_through = 12 } },
+            .{ .serving = .{ .owner_epoch = 3, .revision = 1, .applied_through = 12 }, .closed = true },
+            .{ .serving = .{ .owner_epoch = 3, .revision = 1, .applied_through = 12, .recovered_through = 12 }, .closed = true },
+            .{ .serving = null, .coverage = null, .closed = true },
+        }) |case| {
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var rows = [_]db_mod.types.DBIndexStats{.{
+                .name = "semantic",
+                .kind = kind,
+                .doc_count = 20,
+                .serving_snapshot_ready = true,
+                .serving_publication = initial,
+                .coverage_publication = initial,
+                .coverage_generation = 42,
+                .coverage_config_hash = 99,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+                .coverage_produced_count = 20,
+                .replay_applied_sequence = 12,
+                .replay_target_sequence = 12,
+            }};
+            const status = LocalTableRuntimeStatus{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+                .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = &rows },
+            };
+            _ = try cache.publishGroup(try cache.capturePublicationToken("docs"), "docs", status);
+            rows[0].serving_publication = case.serving;
+            rows[0].coverage_publication = case.coverage;
+            rows[0].serving_snapshot_ready = false;
+            rows[0].doc_count = 18;
+            rows[0].coverage_produced_count = 18;
+            rows[0].index_repair_id = 123;
+            rows[0].index_lifecycle_work_class = .initial_build;
+            rows[0].index_repair_phase = "validating";
+            // Completion callbacks obtain their cache token after sampling.
+            // A newer token must not make an older owner payload authoritative.
+            const delayed = try cache.capturePublicationToken("docs");
+            if (case.conflict) {
+                try std.testing.expectError(error.ConflictingIndexPublication, cache.publishGroup(delayed, "docs", status));
+            } else {
+                _ = try cache.publishGroup(delayed, "docs", status);
+            }
+            var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer observed.deinit(alloc);
+            const item = observed.stats.indexes[0];
+            try std.testing.expectEqual(!case.closed, item.serving_snapshot_ready);
+            try std.testing.expectEqual(@as(u64, if (case.closed) 18 else 20), item.doc_count);
+            try std.testing.expectEqual(@as(u64, 20), item.coverage_produced_count);
+            try std.testing.expectEqual(@as(?u128, if (case.closed) 123 else null), item.index_repair_id);
+            try std.testing.expectEqual(if (case.closed) case.serving else initial, item.serving_publication);
+            try std.testing.expectEqual(initial, item.coverage_publication.?);
+        }
+    }
 }
 
 test "live repair admission supersedes cached vector serviceability" {
