@@ -353,7 +353,7 @@ primary snapshot into hidden, schema-bound blocks of at most 256 rows or roughly
 1 MiB of source rows (an individual large row remains subject to the request
 budget). Per-column `TypedDocValuesWriter` instances consume AROW cells directly,
 alongside presence and null bitmaps; no JSON projection or reparsing belongs in
-this build path. ACB6 separates row metadata from independently addressed,
+this build path. ACB7 separates row metadata from independently addressed,
 checksummed per-column metadata. The root contains a sorted sparse directory
 of 64-ordinal presence pages (12 bytes per populated page); binary search
 locates only the columns a predicate/projection requests, without allocating or
@@ -361,17 +361,23 @@ decoding every column's bounds and bitmaps. Missing declared metadata is
 corruption, not a missing field. Existence predicates and null projections need neither payload I/O
 nor value-stream decoding, even for large vector/JSON columns.
 
-Payloads have independently checksummed row-group pages. The builder chooses
-a power-of-two row-group size targeting about 16 KiB of uncompressed values:
-compact scalar columns stay in one page, while wide columns get finer-grained
-pages. A single large value may exceed that target. Column metadata declares
-the group size and exact encoded bytes for every page, including zero-byte
-absent/null-only groups. Predicates load pages intersecting their surviving
+Payloads have independently checksummed row-group pages. The builder partitions
+actual cell bytes at a 16 KiB value budget, with explicit exclusive row ends and
+encoded byte sizes (10 bytes per page). Oversized values get singleton pages;
+adjacent small/null/missing values never share their payload. Scalar columns
+usually stay in one page. Directory validation requires strictly increasing
+ends, exact row coverage, and agreement between payload sizes and presence/null
+bitmaps, including zero-byte absent/null-only groups. Predicates load pages intersecting their surviving
 candidate mask; projections load only the pages containing delivered rows.
 Repeated predicates share decoded pages. The cost model charges only still-
 unread pages containing surviving values, and `payload_pages_read` exposes the
 actual I/O alongside bytes read. Publication retires every declared page
 atomically; generation reclamation also covers canceled or obsolete pages.
+Point projection resolves a row's page with binary search only on a cache miss.
+Cached typed cells are addressed directly; null/cell slots are initialized once
+per column/block. `cell_slots_initialized` and `cell_cache_hits` expose this CPU
+work independently of payload I/O. There is no per-projected-row bitmap/page
+rescan, and no compatibility decoder for previous PR-only column formats.
 
 Scan planning is metadata-first. Access-path admission happens before predicate
 payload decoding, and dirty markers remove replaced/deleted base candidates
@@ -429,20 +435,25 @@ row-keyspace change. An artifact-only owner may require reading its first record
 but child fanout does not multiply cursor steps. Owner checkpoints enforce query
 cancellation/deadlines and let builds yield after 1,024 owners or their time
 budget even without a live row. Owner-visit counters expose that work separately
-from rows read or written. Clean-range coalescing reads typed column pages from
-the same snapshot's immutable block directory, without fetching primary AROW,
-reconstructing JSON, or rescanning gaps. A bounded remapping window preserves
+from rows read or written. Covered-range maintenance merges typed column pages
+with the same snapshot's ordered dirty journal. Only live deltas fetch primary
+AROW; replaced/deleted base rows are masked before column payload loading.
+Unchanged rows never fetch primary AROW or reconstruct JSON. Tombstones consume
+bounded owner checkpoints but require no primary lookup. A bounded remapping window preserves
 semantic hashes, timestamps, physical-size accounting, absent/null cells, and
 schema identity while transposing one source column at a time into the builder.
 Decoded source pages outlive destination flushes; the writer owns copied cells
 before the source scope closes. Publication, dirty-token compare-clear, retained
 suffixes, cancellation, and restart use the same existing commit fences.
 Maintenance exposes `covered_rows_read` and `primary_rows_read` separately so
-the reduction in primary I/O is measurable. Column pages are still re-encoded
+the reduction in primary I/O is measurable for both dirty compaction and clean
+coalescing. Column pages are still re-encoded
 when row ordinals change; this is not compressed-page concatenation.
 Thus neither an empty prefix nor an orphan-heavy gap after a live row can
-repeatedly consume the budget before the worker reaches its successor. Dirty
-and uncovered ranges continue to use the bounded owner cursor.
+repeatedly consume the budget before the worker reaches its successor. Uncovered
+bootstrap ranges continue to use the bounded owner cursor. Dirty journal and
+typed-source readers retain one snapshot; publication compare-clears only the
+captured dirty images, so writes racing preparation remain visible as overlays.
 
 Bulk-capable backends append dirty tokens in the same ingest arena as primary
 rows, preserving direct ingestion without per-row sorted-map insertion.

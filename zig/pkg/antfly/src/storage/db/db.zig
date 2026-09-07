@@ -62977,6 +62977,71 @@ test "relational columnar selected payload pages bound wide projection reads" {
     }
 }
 
+test "relational columnar skew pages and sparse delta merges bound physical work" {
+    const alloc = std.testing.allocator;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{
+            .{ .name = "n", .path = "n", .column_type = .integer },
+            .{ .name = "payload", .path = "payload", .column_type = .string, .allows_null = true },
+        };
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const large = try scratch.alloc(u8, 512 * 1024);
+        var random = std.Random.DefaultPrng.init(123);
+        for (large) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+        const writes = try scratch.alloc(types.BatchWrite, 128);
+        for (writes, 0..) |*write, i| write.* = .{
+            .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}),
+            .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d},\"payload\":\"{s}\"}}", .{ i, if (i == 1) large else "small" }),
+        };
+        try db.batch(.{ .writes = writes });
+        try drainTestRelationalMaintenance(&db);
+        for ([_][]const u8{ "", "{\"term\":{\"payload\":\"small\"}}" }) |filter| {
+            var stats: types.ColumnarScanStats = .{};
+            var one = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .limit = 1, .filter_query_json = filter, .columnar_stats = &stats });
+            defer one.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), one.documents.len);
+            try std.testing.expectEqualStrings("{\"payload\":\"small\"}", one.documents[0].json);
+            try std.testing.expectEqual(@as(u64, 1), stats.payload_pages_read);
+            try std.testing.expect(stats.payload_bytes_read < 1024);
+        }
+        const primary_before = db.relational_column_maintenance.primary_rows_read.load(.monotonic);
+        const covered_before = db.relational_column_maintenance.covered_rows_read.load(.monotonic);
+        try db.batch(.{ .writes = &.{
+            .{ .key = "k0000", .value = "{\"n\":-1,\"payload\":\"updated\"}" },
+            .{ .key = "k0010a", .value = "{\"n\":500,\"payload\":null}" },
+        }, .deletes = &.{ "k0001", "k0127" } });
+        const options: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{ "n", "payload" }, .include_content_hashes = true };
+        var before = try db.scan(alloc, "", "", options);
+        defer before.deinit(alloc);
+        try drainTestRelationalMaintenance(&db);
+        try std.testing.expectEqual(@as(u64, 2), db.relational_column_maintenance.primary_rows_read.load(.monotonic) - primary_before);
+        try std.testing.expect(db.relational_column_maintenance.covered_rows_read.load(.monotonic) > covered_before);
+        var stats: types.ColumnarScanStats = .{};
+        var measured = options;
+        measured.columnar_stats = &stats;
+        var after = try db.scan(alloc, "", "", measured);
+        defer after.deinit(alloc);
+        try std.testing.expectEqualDeep(before.documents, after.documents);
+        try std.testing.expectEqualDeep(before.hashes, after.hashes);
+        try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
+        try std.testing.expectEqual(@as(u64, 2 * 127), stats.cell_slots_initialized);
+        try std.testing.expect(stats.cell_cache_hits > 127);
+        db.close();
+        db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        var reopened = try db.scan(alloc, "", "", options);
+        defer reopened.deinit(alloc);
+        try std.testing.expectEqualDeep(after.documents, reopened.documents);
+    }
+}
+
 test "relational columnar row cursor skips artifact fanout and preserves binary owners" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {

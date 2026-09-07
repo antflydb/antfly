@@ -8653,6 +8653,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.publication.",
             "storage.db.query_metrics.",
             "storage.db.range_state.",
+            "storage.db.relational_columns.",
             "storage.db.relational_store.",
             "storage.db.schema_cache_admission.",
             "storage.db.schema_registry.",

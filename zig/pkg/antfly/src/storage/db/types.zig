@@ -1120,6 +1120,8 @@ pub const LookupResult = struct {
 };
 
 pub const ColumnarScanStats = struct {
+    cell_slots_initialized: u64 = 0,
+    cell_cache_hits: u64 = 0,
     payload_pages_read: u64 = 0,
     primary_owners_examined: u64 = 0,
     used: bool = false,
