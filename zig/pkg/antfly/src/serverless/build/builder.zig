@@ -3519,11 +3519,15 @@ fn buildGraphMetricArtifactRefsAlloc(
     io: ?std.Io,
     max_parallelism: usize,
 ) ![]manifest_mod.ArtifactRef {
-    var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
-    errdefer {
-        for (refs.items) |ref| freeArtifactRef(alloc, ref);
+    var refs = std.ArrayListUnmanaged(?manifest_mod.ArtifactRef).empty;
+    defer {
+        for (refs.items) |maybe_ref| if (maybe_ref) |ref| freeArtifactRef(alloc, ref);
         refs.deinit(alloc);
     }
+    var requests = std.ArrayListUnmanaged(lake_graph_metric.PublicationRequest).empty;
+    defer requests.deinit(alloc);
+    var destinations = std.ArrayListUnmanaged(usize).empty;
+    defer destinations.deinit(alloc);
 
     const previous_specs = if (current) |manifest|
         graph_metric_config.parseIndexSpecsAlloc(alloc, manifest.stats.indexes_json) catch |err| switch (err) {
@@ -3541,12 +3545,6 @@ fn buildGraphMetricArtifactRefsAlloc(
 
     const graph_metric_limits = lake_graph_metric.Limits{};
     var graph_metric_budget = graph_metric_policy.Budget{ .limits = graph_metric_limits };
-    // Named graph indexes produced from materialized documents intentionally
-    // alias one content-addressed topology payload. Keep a single authenticated
-    // decode hot across those aliases; replacing it rather than accumulating a
-    // map preserves O(one graph) peak memory for external/mixed callers too.
-    var prepared_graph: ?lake_graph_metric.PreparedGraphArtifact = null;
-    defer if (prepared_graph) |*prepared| prepared.deinit(alloc);
     for (specs) |spec| {
         try cancellation.check();
         const graph_ref = findArtifactRefByName(graph_refs, .graph_segment, spec.index_name) orelse continue;
@@ -3565,11 +3563,6 @@ fn buildGraphMetricArtifactRefsAlloc(
         defer alloc.free(resolved);
         @memset(resolved, null);
         errdefer for (resolved) |maybe_ref| if (maybe_ref) |ref| freeArtifactRef(alloc, ref);
-
-        var dirty_configs = std.ArrayListUnmanaged(@import("../../graph/graph.zig").GraphMetricConfig).empty;
-        defer dirty_configs.deinit(alloc);
-        var dirty_indexes = std.ArrayListUnmanaged(usize).empty;
-        defer dirty_indexes.deinit(alloc);
 
         for (spec.configs, 0..) |config, config_index| {
             const previous_config = findGraphMetricConfig(previous_specs, spec.index_name, config.name);
@@ -3595,133 +3588,49 @@ fn buildGraphMetricArtifactRefsAlloc(
                 }
             }
             if (!reused) {
-                try dirty_configs.append(alloc, config);
-                try dirty_indexes.append(alloc, config_index);
-            }
-        }
-
-        if (dirty_configs.items.len == 0) {
-            try refs.ensureUnusedCapacity(alloc, resolved.len);
-            for (resolved) |*maybe_ref| {
-                refs.appendAssumeCapacity(maybe_ref.*.?);
-                maybe_ref.* = null;
-            }
-            continue;
-        }
-
-        const built = build: {
-            graph_metric_budget.chargeGraphPayload(graph_ref.artifact_id, graph_ref.checksum, graph_ref.byte_len) catch break :build try lake_graph_metric.publishRejectedManyAlloc(
-                alloc,
-                artifacts,
-                spec.index_name,
-                graph_ref,
-                dirty_configs.items,
-                cancellation,
-                .build_budget_exceeded,
-                graph_metric_limits,
-                effective_provenance,
-            );
-            if (prepared_graph == null or !prepared_graph.?.identifies(graph_ref)) {
-                if (prepared_graph) |*prepared| prepared.deinit(alloc);
-                prepared_graph = null;
-                prepared_graph = lake_graph_metric.prepareGraphArtifactAlloc(
-                    alloc,
-                    artifacts,
-                    graph_ref,
-                    cancellation,
-                    graph_metric_limits,
-                ) catch |err| switch (err) {
-                    error.GraphMetricBuildBudgetExceeded => break :build try lake_graph_metric.publishRejectedManyAlloc(
-                        alloc,
-                        artifacts,
-                        spec.index_name,
-                        graph_ref,
-                        dirty_configs.items,
-                        cancellation,
-                        .build_budget_exceeded,
-                        graph_metric_limits,
-                        effective_provenance,
-                    ),
-                    else => return err,
+                var request = lake_graph_metric.PublicationRequest{
+                    .graph_index_name = spec.index_name,
+                    .source_graph = graph_ref,
+                    .config = config,
+                    .provenance = effective_provenance,
                 };
-            }
-            const prior_metrics = try alloc.alloc(?manifest_mod.ArtifactRef, dirty_configs.items.len);
-            defer alloc.free(prior_metrics);
-            @memset(prior_metrics, null);
-            if (current) |manifest| {
-                for (dirty_configs.items, 0..) |config, i| {
+                if (current) |manifest| {
                     const name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
                     defer alloc.free(name);
-                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, name)) |index|
-                        prior_metrics[i] = manifest.artifacts[index];
-                }
-            }
-            break :build lake_graph_metric.publishManyFromPreparedGraphWithWarmStartsAlloc(
-                alloc,
-                artifacts,
-                spec.index_name,
-                graph_ref,
-                dirty_configs.items,
-                prior_metrics,
-                cancellation,
-                graph_metric_limits,
-                &graph_metric_budget,
-                &prepared_graph.?,
-                effective_provenance,
-                .{
-                    .io = io,
-                    .max_parallelism = if (io == null) 1 else max_parallelism,
-                },
-            ) catch |err| switch (err) {
-                error.GraphMetricBuildBudgetExceeded => try lake_graph_metric.publishRejectedManyAlloc(
-                    alloc,
-                    artifacts,
-                    spec.index_name,
-                    graph_ref,
-                    dirty_configs.items,
-                    cancellation,
-                    .build_budget_exceeded,
-                    graph_metric_limits,
-                    effective_provenance,
-                ),
-                else => return err,
-            };
-        };
-        var built_refs_moved: usize = 0;
-        defer {
-            for (built[built_refs_moved..]) |ref| lake_graph_metric.freeArtifactRef(alloc, ref);
-            alloc.free(built);
-        }
-        for (built, dirty_indexes.items) |*ref, config_index| {
-            if (topology_unchanged) {
-                if (current) |manifest| {
-                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, ref.name)) |metric_index| {
-                        const previous_metric = manifest.artifacts[metric_index];
-                        // edge_generation identifies the topology snapshot,
-                        // not the metric configuration. Config-only rebuilds
-                        // therefore retain it while advancing publication and
-                        // computation provenance.
-                        if (previous_metric.edge_generation != 0) ref.edge_generation = previous_metric.edge_generation;
-                        const previous_config = findGraphMetricConfig(previous_specs, spec.index_name, spec.configs[config_index].name);
-                        const config_unchanged = previous_config != null and
-                            lake_graph_metric.configFingerprint(previous_config.?) == lake_graph_metric.configFingerprint(spec.configs[config_index]);
-                        if (config_unchanged) {
-                            if (previous_metric.published_generation != 0) ref.published_generation = previous_metric.published_generation;
-                            if (previous_metric.computed_at_ms != 0) ref.computed_at_ms = previous_metric.computed_at_ms;
+                    if (findNamedArtifactIndex(manifest, .graph_metric_segment, name)) |metric_index| {
+                        const prior = manifest.artifacts[metric_index];
+                        request.prior_artifact = prior;
+                        if (topology_unchanged) {
+                            if (prior.edge_generation != 0) request.provenance.edge_generation = prior.edge_generation;
+                            if (config_unchanged) {
+                                if (prior.published_generation != 0) request.provenance.published_generation = prior.published_generation;
+                                if (prior.computed_at_ms != 0) request.provenance.computed_at_ms = prior.computed_at_ms;
+                            }
                         }
                     }
                 }
+                try requests.append(alloc, request);
+                try destinations.append(alloc, refs.items.len + config_index);
             }
-            resolved[config_index] = ref.*;
-            built_refs_moved += 1;
         }
         try refs.ensureUnusedCapacity(alloc, resolved.len);
         for (resolved) |*maybe_ref| {
-            refs.appendAssumeCapacity(maybe_ref.*.?);
+            refs.appendAssumeCapacity(maybe_ref.*);
             maybe_ref.* = null;
         }
     }
-    return try refs.toOwnedSlice(alloc);
+    const built = try lake_graph_metric.publishRequestsAlloc(alloc, artifacts, requests.items, cancellation, graph_metric_limits, &graph_metric_budget, .{
+        .io = io,
+        .max_parallelism = if (io == null) 1 else max_parallelism,
+    });
+    defer alloc.free(built);
+    for (built, destinations.items) |ref, destination| refs.items[destination] = ref;
+    const result = try alloc.alloc(manifest_mod.ArtifactRef, refs.items.len);
+    for (refs.items, result) |*maybe_ref, *ref| {
+        ref.* = maybe_ref.*.?;
+        maybe_ref.* = null;
+    }
+    return result;
 }
 
 fn findGraphMetricConfig(

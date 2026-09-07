@@ -20,6 +20,7 @@ const CancellationToken = @import("../../common/cancellation.zig").CancellationT
 const fs_paths = @import("../../common/fs_paths.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 const graph_metric_routing_cache = @import("graph_metric_routing_cache.zig");
+const block_persistence = @import("authenticated_block_persistence.zig");
 
 // v2 invalidates range/block entries written before provider identities were
 // pinned across verification and fetch. Full entries remain cheap to rebuild
@@ -69,6 +70,10 @@ pub const QueryCacheStats = struct {
     shared_graph_metric_block_bytes: u64 = 0,
     shared_graph_metric_block_entries: u64 = 0,
     shared_graph_metric_block_waiters: u64 = 0,
+    graph_metric_persistence_bytes: u64 = 0,
+    graph_metric_persistence_jobs: u64 = 0,
+    graph_metric_persistence_failures: u64 = 0,
+    graph_metric_persistence_bypasses: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
     writes: u64 = 0,
@@ -226,6 +231,8 @@ pub const QueryCache = struct {
     stats: QueryCacheStats = .{},
     graph_metric_routing: graph_metric_routing_cache.Cache = .{},
     graph_metric_blocks: @import("authenticated_block_fills.zig").Cache = .{},
+    persistence_mu: std.atomic.Mutex = .unlocked,
+    persistence: ?*block_persistence.Worker = null,
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !QueryCache {
         return try initWithConfig(alloc, root_dir, .{});
@@ -284,6 +291,7 @@ pub const QueryCache = struct {
     }
 
     pub fn deinit(self: *QueryCache) void {
+        if (self.persistence) |worker| worker.deinit();
         self.graph_metric_routing.deinit();
         self.graph_metric_blocks.deinit();
         var io_impl = threadedIo();
@@ -320,7 +328,40 @@ pub const QueryCache = struct {
         stats.shared_graph_metric_block_bytes = blocks.bytes;
         stats.shared_graph_metric_block_entries = blocks.entries;
         stats.shared_graph_metric_block_waiters = blocks.waiters;
+        lockAtomic(&self.persistence_mu);
+        defer self.persistence_mu.unlock();
+        if (self.persistence) |worker| {
+            const io = worker.io_impl.io();
+            worker.mu.lockUncancelable(io);
+            defer worker.mu.unlock(io);
+            stats.graph_metric_persistence_bytes = worker.bytes;
+            stats.graph_metric_persistence_jobs = worker.outstanding;
+            stats.graph_metric_persistence_failures += worker.failures;
+            stats.graph_metric_persistence_bypasses += worker.bypasses;
+        }
         return stats;
+    }
+
+    pub fn retainAuthenticatedBlocks(self: *QueryCache, artifact_id: []const u8, byte_len: u64, checksum: []const u8, blocks: []const AuthenticatedBlockPublication) void {
+        const accepted = enqueue: {
+            lockAtomic(&self.persistence_mu);
+            defer self.persistence_mu.unlock();
+            if (self.persistence == null) self.persistence = block_persistence.Worker.create(self) catch break :enqueue false;
+            _ = self.persistence.?.enqueue(artifact_id, byte_len, checksum, blocks) catch break :enqueue false;
+            break :enqueue true;
+        };
+        if (!accepted) {
+            lockAtomic(&self.stats_mu);
+            self.stats.graph_metric_persistence_bypasses += 1;
+            self.stats_mu.unlock();
+        }
+    }
+
+    pub fn drainGraphMetricPersistence(self: *QueryCache) void {
+        lockAtomic(&self.persistence_mu);
+        const worker = self.persistence;
+        self.persistence_mu.unlock();
+        if (worker) |value| value.drain();
     }
 
     pub fn getOrFetchAlloc(self: *QueryCache, artifacts: *artifacts_mod.ArtifactStore, artifact_id: []const u8) ![]u8 {
@@ -2739,6 +2780,41 @@ test "serverless query cache supports relative cache directories" {
     defer alloc.free(payload);
     try std.testing.expectEqualStrings("relative", payload);
     try std.testing.expectEqual(@as(u64, payload.len), cache.statsSnapshot().current_bytes);
+}
+
+test "serverless query cache persistence bounds outstanding jobs and owns request bytes" {
+    const alloc = std.testing.allocator;
+    var root_buf: [256]u8 = undefined;
+    const root = tmpPath(&root_buf, "cache-authenticated-async");
+    defer cleanupTmp(root);
+    var cache = try QueryCache.init(alloc, std.mem.span(root));
+    defer cache.deinit();
+    const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const artifact_id = "sha256:" ++ checksum;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+    var bytes = "data".*;
+    const block = AuthenticatedBlockPublication{ .block_id = "graph-metric-score-0-exact", .offset = 0, .contents = &bytes, .checksum = digest };
+    // Simulate slow disk coordination. Enqueueing all 32 jobs must complete
+    // while publication is blocked, and the next job must bypass retention.
+    lockAtomic(&cache.maintenance_mu);
+    {
+        defer cache.maintenance_mu.unlock();
+        for (0..block_persistence.max_jobs + 1) |_| cache.retainAuthenticatedBlocks(artifact_id, 4, checksum, &.{block});
+        const stats = cache.statsSnapshot();
+        try std.testing.expectEqual(@as(u64, block_persistence.max_jobs), stats.graph_metric_persistence_jobs);
+        try std.testing.expectEqual(@as(u64, 1), stats.graph_metric_persistence_bypasses);
+        try std.testing.expect(stats.graph_metric_persistence_bytes <= block_persistence.max_bytes);
+        @memset(&bytes, 'x');
+    }
+    cache.drainGraphMetricPersistence();
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), stats.graph_metric_persistence_jobs);
+    try std.testing.expectEqual(@as(u64, 0), stats.graph_metric_persistence_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.graph_metric_persistence_failures);
+    const stored = (try cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact_id, block.block_id, 4, checksum, &digest, 0, 4, .none)).?;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings("data", stored);
 }
 
 test "serverless query cache batches authenticated publication with one eviction pass" {

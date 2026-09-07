@@ -190,11 +190,11 @@ const reduction_partitions: usize = 16;
 
 fn parallelWidth(topology: Topology, options: Options) usize {
     if (options.io == null or options.max_parallelism < 2 or
-        topology.edgeCount() < parallel_edge_threshold or topology.nodeCount() < 2)
+        topology.edgeCount() < parallel_edge_threshold or topology.nodeCount() == 0)
     {
         return 1;
     }
-    return @min(max_kernel_parallelism, @min(options.max_parallelism, topology.nodeCount()));
+    return @min(max_kernel_parallelism, options.max_parallelism);
 }
 
 fn vectorParallelWidth(len: usize, options: Options) usize {
@@ -217,28 +217,23 @@ fn logicalReductionParts(len: usize) usize {
 fn graphReductionParts(topology: Topology) usize {
     // Stable across runtime worker counts, but sensitive to edge work.
     return if (topology.edgeCount() >= parallel_edge_threshold)
-        @min(reduction_partitions, topology.nodeCount())
+        reduction_partitions
     else
         logicalReductionParts(topology.nodeCount());
 }
 
-/// Partition by vertices plus incident edges, not merely vertex count. This
-/// keeps power-law graphs balanced while retaining exclusive ownership of each
-/// output ordinal.
-fn weightedBoundary(offsets: []const u32, part: usize, width: usize) usize {
-    if (part == 0) return 0;
-    if (part >= width) return offsets.len - 1;
+/// Locate a work coordinate in CSR's interleaved vertex/edge stream. Unlike
+/// vertex-only boundaries, a coordinate may fall inside a high-degree row.
+fn workOrdinal(offsets: []const u32, coordinate: usize) usize {
     const node_count = offsets.len - 1;
-    const total_work = @as(u64, @intCast(node_count)) + offsets[node_count];
-    const target = (total_work * part + width - 1) / width;
     var lower: usize = 0;
     var upper: usize = node_count;
     while (lower < upper) {
         const middle = lower + (upper - lower) / 2;
-        const work = @as(u64, @intCast(middle)) + offsets[middle];
-        if (work < target) lower = middle + 1 else upper = middle;
+        const work = middle + @as(usize, offsets[middle]);
+        if (work <= coordinate) lower = middle + 1 else upper = middle;
     }
-    return lower;
+    return lower -| 1;
 }
 
 pub const Result = struct {
@@ -351,67 +346,7 @@ fn fillPageRankNext(
     base: f64,
     options: Options,
 ) !f64 {
-    const Worker = struct {
-        fn run(
-            graph: Topology,
-            current: []const f64,
-            scale: []const f64,
-            output: []f64,
-            base_score: f64,
-            parts: usize,
-            worker: usize,
-            width: usize,
-            partials: *[reduction_partitions]f64,
-            cancellation: CancellationToken,
-            failure: *?anyerror,
-        ) void {
-            var part = worker;
-            while (part < parts) : (part += width) {
-                var delta: f64 = 0;
-                const start = weightedBoundary(graph.incoming_offsets, part, parts);
-                const end = weightedBoundary(graph.incoming_offsets, part + 1, parts);
-                for (start..end) |target| {
-                    if ((target - start) % 4096 == 0) cancellation.check() catch |err| {
-                        failure.* = err;
-                        return;
-                    };
-                    var value = base_score;
-                    const edge_start: usize = graph.incoming_offsets[target];
-                    const edge_end: usize = graph.incoming_offsets[target + 1];
-                    for (graph.incoming_sources[edge_start..edge_end], 0..) |source, edge_index| {
-                        if (edge_index % 4096 == 0) cancellation.check() catch |err| {
-                            failure.* = err;
-                            return;
-                        };
-                        value += current[source] * scale[source];
-                    }
-                    output[target] = value;
-                    delta += @abs(value - current[target]);
-                }
-                partials[part] = delta;
-            }
-        }
-    };
-    const parts = graphReductionParts(topology);
-    var partials: [reduction_partitions]f64 = @splat(0);
-    const width = @min(parallelWidth(topology, options), parts);
-    if (width == 1) {
-        var failure: ?anyerror = null;
-        Worker.run(topology, scores, source_scale, next, base, parts, 0, 1, &partials, options.cancellation, &failure);
-        if (failure) |err| return err;
-    } else {
-        const io = options.io.?;
-        var failures: [max_kernel_parallelism]?anyerror = @splat(null);
-        var group: std.Io.Group = .init;
-        for (0..width) |worker| group.async(io, Worker.run, .{
-            topology, scores, source_scale, next, base, parts, worker, width, &partials, options.cancellation, &failures[worker],
-        });
-        try group.await(io);
-        for (failures[0..width]) |failure| if (failure) |err| return err;
-    }
-    var delta: f64 = 0;
-    for (partials[0..parts]) |partial| delta += partial;
-    return delta;
+    return fillTiledAdjacency(topology, scores, next, true, source_scale, 1, base, options);
 }
 
 fn fillAdjacencySums(
@@ -422,69 +357,126 @@ fn fillAdjacencySums(
     input_divisor: f64,
     options: Options,
 ) !void {
+    _ = try fillTiledAdjacency(topology, input, output, incoming, null, if (input_divisor > 0) 1.0 / input_divisor else 1.0, 0, options);
+}
+
+/// Fixed logical edge tiles, independent of executor width. Interior vertices
+/// retain exclusive output ownership. Only the two boundary rows of each tile
+/// need partial sums: at most 32 records, on the stack, for any graph size.
+/// This bounds worker work by ceil((N + E) / 16), even for a single giant hub.
+fn fillTiledAdjacency(
+    topology: Topology,
+    input: []const f64,
+    output: []f64,
+    incoming: bool,
+    source_scale: ?[]const f64,
+    input_scale: f64,
+    base: f64,
+    options: Options,
+) !f64 {
+    const Boundary = struct { ordinal: usize, sum: f64 };
+    const Partial = struct {
+        boundaries: [2]Boundary = undefined,
+        count: usize = 0,
+        delta: f64 = 0,
+    };
     const Worker = struct {
         fn run(
-            graph: Topology,
-            values: []const f64,
+            offsets: []const u32,
+            neighbors: []const u32,
+            current: []const f64,
+            scale: ?[]const f64,
+            scalar: f64,
             result: []f64,
-            use_incoming: bool,
-            input_scale: f64,
-            start: usize,
-            end: usize,
+            base_score: f64,
+            parts: usize,
+            worker: usize,
+            width: usize,
+            partials: *[reduction_partitions]Partial,
             cancellation: CancellationToken,
             failure: *?anyerror,
         ) void {
-            for (start..end) |ordinal| {
-                if ((ordinal - start) % 4096 == 0) cancellation.check() catch |err| {
-                    failure.* = err;
-                    return;
-                };
-                var sum: f64 = 0;
-                if (use_incoming) {
-                    const edge_start: usize = graph.incoming_offsets[ordinal];
-                    const edge_end: usize = graph.incoming_offsets[ordinal + 1];
-                    for (graph.incoming_sources[edge_start..edge_end], 0..) |source, edge_index| {
+            var part = worker;
+            while (part < parts) : (part += width) {
+                const total = offsets.len - 1 + neighbors.len;
+                const start = vectorBoundary(total, part, parts);
+                const end = vectorBoundary(total, part + 1, parts);
+                if (start == end) continue;
+                var ordinal = workOrdinal(offsets, start);
+                var visited: usize = 0;
+                while (ordinal < offsets.len - 1) : (ordinal += 1) {
+                    const row_start = ordinal + @as(usize, offsets[ordinal]);
+                    if (row_start >= end) break;
+                    if (visited % 4096 == 0) cancellation.check() catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                    visited += 1;
+                    const row_end = ordinal + 1 + @as(usize, offsets[ordinal + 1]);
+                    const complete = row_start >= start and row_end <= end;
+                    const edge_start = offsets[ordinal] + (@max(start, row_start + 1) - (row_start + 1));
+                    const edge_end = offsets[ordinal] + (@min(end, row_end) - (row_start + 1));
+                    var value: f64 = if (complete) base_score else 0;
+                    for (neighbors[edge_start..edge_end], 0..) |source, edge_index| {
                         if (edge_index % 4096 == 0) cancellation.check() catch |err| {
                             failure.* = err;
                             return;
                         };
-                        sum += values[source] * input_scale;
+                        value += current[source] * (if (scale) |scales| scales[source] else scalar);
                     }
-                } else {
-                    const edge_start: usize = graph.outgoing_offsets[ordinal];
-                    const edge_end: usize = graph.outgoing_offsets[ordinal + 1];
-                    for (graph.outgoing_targets[edge_start..edge_end], 0..) |target, edge_index| {
-                        if (edge_index % 4096 == 0) cancellation.check() catch |err| {
-                            failure.* = err;
-                            return;
-                        };
-                        sum += values[target] * input_scale;
+                    if (complete) {
+                        result[ordinal] = value;
+                        if (scale != null) partials[part].delta += @abs(value - current[ordinal]);
+                    } else {
+                        const partial = &partials[part];
+                        partial.boundaries[partial.count] = .{ .ordinal = ordinal, .sum = value };
+                        partial.count += 1;
                     }
                 }
-                result[ordinal] = sum;
             }
         }
     };
+    const parts = graphReductionParts(topology);
+    var partials: [reduction_partitions]Partial = @splat(.{});
+    const width = @min(parallelWidth(topology, options), parts);
     const offsets = if (incoming) topology.incoming_offsets else topology.outgoing_offsets;
-    const input_scale = if (input_divisor > 0) 1.0 / input_divisor else 1.0;
-    const width = parallelWidth(topology, options);
+    const neighbors = if (incoming) topology.incoming_sources else topology.outgoing_targets;
     if (width == 1) {
         var failure: ?anyerror = null;
-        Worker.run(topology, input, output, incoming, input_scale, 0, topology.nodeCount(), options.cancellation, &failure);
+        Worker.run(offsets, neighbors, input, source_scale, input_scale, output, base, parts, 0, 1, &partials, options.cancellation, &failure);
         if (failure) |err| return err;
-        return;
+    } else {
+        const io = options.io.?;
+        var failures: [max_kernel_parallelism]?anyerror = @splat(null);
+        var group: std.Io.Group = .init;
+        for (0..width) |worker| group.async(io, Worker.run, .{
+            offsets, neighbors, input, source_scale, input_scale, output, base, parts, worker, width, &partials, options.cancellation, &failures[worker],
+        });
+        try group.await(io);
+        for (failures[0..width]) |failure| if (failure) |err| return err;
     }
-    const io = options.io.?;
-    var failures: [max_kernel_parallelism]?anyerror = @splat(null);
-    var group: std.Io.Group = .init;
-    for (0..width) |part| {
-        const start = weightedBoundary(offsets, part, width);
-        const end = weightedBoundary(offsets, part + 1, width);
-        if (start == end) continue;
-        group.async(io, Worker.run, .{ topology, input, output, incoming, input_scale, start, end, options.cancellation, &failures[part] });
+    var delta: f64 = 0;
+    var boundary_ordinal: ?usize = null;
+    var boundary_sum: f64 = base;
+    for (partials[0..parts]) |partial| {
+        delta += partial.delta;
+        for (partial.boundaries[0..partial.count]) |boundary| {
+            if (boundary_ordinal) |ordinal| {
+                if (ordinal != boundary.ordinal) {
+                    output[ordinal] = boundary_sum;
+                    if (source_scale != null) delta += @abs(boundary_sum - input[ordinal]);
+                    boundary_sum = base;
+                }
+            }
+            boundary_ordinal = boundary.ordinal;
+            boundary_sum += boundary.sum;
+        }
     }
-    try group.await(io);
-    for (failures[0..width]) |failure| if (failure) |err| return err;
+    if (boundary_ordinal) |ordinal| {
+        output[ordinal] = boundary_sum;
+        if (source_scale != null) delta += @abs(boundary_sum - input[ordinal]);
+    }
+    return delta;
 }
 
 pub fn pageRankAlloc(alloc: Allocator, node_count: usize, edges: []const Edge, options: Options) !Result {
@@ -1105,5 +1097,50 @@ test "serverless graph metric runtime fanout preserves deterministic target-owne
         try normalize(serial_normalized, options);
         try normalize(parallel_normalized, parallel_options);
         try std.testing.expectEqualSlices(f64, serial_normalized, parallel_normalized);
+    }
+}
+
+test "serverless graph metric edge tiles split hubs with deterministic bounded reductions" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    for ([_]usize{ 2, parallel_edge_threshold + 1 }) |n| {
+        const edges = try alloc.alloc(Edge, parallel_edge_threshold);
+        defer alloc.free(edges);
+        for (edges, 0..) |*edge, i| edge.* = .{ .source = @intCast(i % (n - 1)), .target = @intCast(n - 1) };
+        var topology = try Topology.initAlloc(alloc, n, edges, .none);
+        defer topology.deinit(alloc);
+        const total = n + edges.len;
+        const hub_start = n - 1;
+        var hub_tiles: usize = 0;
+        for (0..reduction_partitions) |part| {
+            const start = vectorBoundary(total, part, reduction_partitions);
+            const end = vectorBoundary(total, part + 1, reduction_partitions);
+            try std.testing.expect(end - start <= (total + reduction_partitions - 1) / reduction_partitions);
+            if (end > hub_start) hub_tiles += 1;
+        }
+        try std.testing.expect(hub_tiles >= 8);
+        const options = Options{ .max_iterations = 3 };
+        var serial = try pageRankTopologyAlloc(alloc, topology, options);
+        defer serial.deinit(alloc);
+        const input = try alloc.alloc(f64, n);
+        defer alloc.free(input);
+        @memset(input, 1);
+        const output = try alloc.alloc(f64, n);
+        defer alloc.free(output);
+        for ([_]usize{ 1, 2, 4, 16 }) |width| {
+            var parallel = options;
+            parallel.io = io_impl.io();
+            parallel.max_parallelism = width;
+            var rank = try pageRankTopologyAlloc(alloc, topology, parallel);
+            defer rank.deinit(alloc);
+            try std.testing.expectEqualSlices(f64, serial.scores, rank.scores);
+            try std.testing.expectEqual(serial.delta, rank.delta);
+            for ([_]bool{ true, false }) |incoming| {
+                try fillAdjacencySums(topology, input, output, incoming, 1, parallel);
+                const offsets = if (incoming) topology.incoming_offsets else topology.outgoing_offsets;
+                for (output, 0..) |value, i| try std.testing.expectEqual(@as(f64, @floatFromInt(offsets[i + 1] - offsets[i])), value);
+            }
+        }
     }
 }

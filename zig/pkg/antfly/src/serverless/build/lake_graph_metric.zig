@@ -443,11 +443,30 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
     provenance: Provenance,
     runtime: ComputeRuntime,
 ) ![]artifact_ref.ArtifactRef {
+    try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
+    return publishPreparedComputationsAlloc(alloc, artifacts, graph_index_name, source_graph, configs, prior_artifacts, cancellation, limits, batch_budget, prepared, provenance, runtime);
+}
+
+/// Internal computation groups can span independently validated index aliases.
+/// Their names and refresh policies are not a catalog configuration.
+fn publishPreparedComputationsAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    configs: []const graph_mod.GraphMetricConfig,
+    prior_artifacts: []const ?artifact_ref.ArtifactRef,
+    cancellation: CancellationToken,
+    limits: Limits,
+    batch_budget: *graph_metric_policy.Budget,
+    prepared: *PreparedGraphArtifact,
+    provenance: Provenance,
+    runtime: ComputeRuntime,
+) ![]artifact_ref.ArtifactRef {
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
     if (prior_artifacts.len != 0 and prior_artifacts.len != configs.len) return error.InvalidGraphMetricBuildOptions;
     try provenance.validate();
     try runtime.validate();
-    try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
     if (!prepared.identifies(source_graph)) return error.ArtifactIntegrityMismatch;
 
     const refs = try alloc.alloc(artifact_ref.ArtifactRef, configs.len);
@@ -507,6 +526,15 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
         for (configs, 0..) |candidate, candidate_index| {
             if (processed[candidate_index] or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
             try cancellation.check();
+            const reused = for (configs, initialized, 0..) |prior, ready, prior_index| {
+                if (ready and sameComputation(prior, candidate)) break prior_index;
+            } else null;
+            if (reused) |prior_index| {
+                refs[candidate_index] = try aliasRefAlloc(alloc, refs[prior_index], graph_index_name, candidate.name, provenance);
+                initialized[candidate_index] = true;
+                processed[candidate_index] = true;
+                continue;
+            }
             var options = group_options;
             options.config = candidate;
             const projection_resident_bytes = try projectionResidentMemoryBytes(projection.*);
@@ -574,6 +602,138 @@ pub fn publishManyFromPreparedGraphWithWarmStartsAlloc(
             refs[candidate_index] = try putBuildResultAlloc(alloc, artifacts, &built, cancellation);
             initialized[candidate_index] = true;
             processed[candidate_index] = true;
+        }
+    }
+    return refs;
+}
+
+pub const PublicationRequest = struct {
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    config: graph_mod.GraphMetricConfig,
+    prior_artifact: ?artifact_ref.ArtifactRef = null,
+    provenance: Provenance,
+};
+
+fn sameSource(a: artifact_ref.ArtifactRef, b: artifact_ref.ArtifactRef) bool {
+    return a.kind == b.kind and a.byte_len == b.byte_len and
+        std.mem.eql(u8, a.artifact_id, b.artifact_id) and std.mem.eql(u8, a.checksum, b.checksum);
+}
+
+fn sameComputation(a: graph_mod.GraphMetricConfig, b: graph_mod.GraphMetricConfig) bool {
+    // Exact equality, not a truncated storage fingerprint. Names and refresh
+    // scheduling do not affect immutable metric computation.
+    return a.kind == b.kind and @as(u64, @bitCast(a.damping)) == @as(u64, @bitCast(b.damping)) and
+        @as(u64, @bitCast(a.tolerance)) == @as(u64, @bitCast(b.tolerance)) and
+        a.max_iterations == b.max_iterations and a.edge_filter.equivalent(b.edge_filter);
+}
+
+fn aliasRefAlloc(alloc: Allocator, original: artifact_ref.ArtifactRef, index_name: []const u8, metric_name: []const u8, provenance: Provenance) !artifact_ref.ArtifactRef {
+    var ref = original;
+    ref.name = try metric_segment.artifactNameAlloc(alloc, index_name, metric_name);
+    errdefer alloc.free(ref.name);
+    ref.artifact_id = try alloc.dupe(u8, original.artifact_id);
+    errdefer alloc.free(ref.artifact_id);
+    ref.checksum = try alloc.dupe(u8, original.checksum);
+    ref.published_generation = provenance.published_generation;
+    ref.edge_generation = provenance.edge_generation;
+    ref.computed_at_ms = provenance.computed_at_ms;
+    return ref;
+}
+
+/// Plan a whole publication, not one named index at a time. Stable source and
+/// filter groups keep exactly one decoded source and one projection resident.
+/// Each distinct kernel is encoded/uploaded once; only lightweight, independently
+/// named/provenanced references fan out. Results retain the caller's order.
+pub fn publishRequestsAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    requests: []const PublicationRequest,
+    cancellation: CancellationToken,
+    limits: Limits,
+    budget: *graph_metric_policy.Budget,
+    runtime: ComputeRuntime,
+) ![]artifact_ref.ArtifactRef {
+    try graph_metric_policy.validateCatalogFanout(0, requests.len, limits);
+    if (!std.meta.eql(budget.limits, limits)) return error.InvalidGraphMetricBuildOptions;
+    try runtime.validate();
+    for (requests) |request| {
+        try request.provenance.validate();
+        try graph_metric_policy.validateConfigs(&.{request.config}, limits);
+        try graph_mod.validateGraphMetricEdgeFilters(&.{}, &.{request.config});
+        if (request.graph_index_name.len == 0 or request.graph_index_name.len > limits.max_graph_index_name_bytes or
+            request.source_graph.kind != .graph_segment or request.source_graph.byte_len == 0)
+            return error.InvalidGraphMetricBuildOptions;
+    }
+    const refs = try alloc.alloc(artifact_ref.ArtifactRef, requests.len);
+    errdefer alloc.free(refs);
+    const ready = try alloc.alloc(bool, requests.len);
+    defer alloc.free(ready);
+    @memset(ready, false);
+    errdefer for (refs, ready) |ref, initialized| if (initialized) freeArtifactRef(alloc, ref);
+    var configs = std.ArrayListUnmanaged(graph_mod.GraphMetricConfig).empty;
+    defer configs.deinit(alloc);
+    var priors = std.ArrayListUnmanaged(?artifact_ref.ArtifactRef).empty;
+    defer priors.deinit(alloc);
+    var mapping = std.ArrayListUnmanaged(usize).empty;
+    defer mapping.deinit(alloc);
+    for (requests, 0..) |first, first_index| {
+        if (ready[first_index]) continue;
+        try cancellation.check();
+        configs.clearRetainingCapacity();
+        priors.clearRetainingCapacity();
+        mapping.clearRetainingCapacity();
+        for (requests, ready) |request, initialized| {
+            if (initialized or !sameSource(first.source_graph, request.source_graph)) continue;
+            const existing = for (configs.items, 0..) |config, i| {
+                if (sameComputation(config, request.config)) break i;
+            } else null;
+            const index = existing orelse configs.items.len;
+            if (existing == null) {
+                var config = request.config;
+                config.refresh = .background;
+                try configs.append(alloc, config);
+                try priors.append(alloc, request.prior_artifact);
+            } else if (priors.items[index] == null) {
+                // The first available seed in stable publication order wins.
+                // Seed authentication/compatibility is still mandatory.
+                priors.items[index] = request.prior_artifact;
+            }
+            try mapping.append(alloc, index);
+        }
+        const built = build: {
+            var prepared = prepare: {
+                if (first.source_graph.byte_len > limits.max_graph_payload_bytes) break :prepare null;
+                budget.chargeGraphPayload(first.source_graph.artifact_id, first.source_graph.checksum, first.source_graph.byte_len) catch break :prepare null;
+                break :prepare prepareGraphArtifactAlloc(alloc, artifacts, first.source_graph, cancellation, limits) catch |err| switch (err) {
+                    error.GraphMetricBuildBudgetExceeded => null,
+                    else => return err,
+                };
+            };
+            if (prepared) |*graph| {
+                defer graph.deinit(alloc);
+                break :build try publishPreparedComputationsAlloc(alloc, artifacts, first.graph_index_name, first.source_graph, configs.items, priors.items, cancellation, limits, budget, graph, first.provenance, runtime);
+            }
+            const rejected = try alloc.alloc(artifact_ref.ArtifactRef, configs.items.len);
+            errdefer alloc.free(rejected);
+            var count: usize = 0;
+            errdefer for (rejected[0..count]) |ref| freeArtifactRef(alloc, ref);
+            for (configs.items, rejected) |config, *ref| {
+                ref.* = try publishRejectedAlloc(alloc, artifacts, first.graph_index_name, first.source_graph, config, cancellation, .build_budget_exceeded, limits, first.provenance);
+                count += 1;
+            }
+            break :build rejected;
+        };
+        defer {
+            for (built) |ref| freeArtifactRef(alloc, ref);
+            alloc.free(built);
+        }
+        var mapped: usize = 0;
+        for (requests, ready, refs) |request, *initialized, *ref| {
+            if (initialized.* or !sameSource(first.source_graph, request.source_graph)) continue;
+            ref.* = try aliasRefAlloc(alloc, built[mapping.items[mapped]], request.graph_index_name, request.config.name, request.provenance);
+            initialized.* = true;
+            mapped += 1;
         }
     }
     return refs;
@@ -2256,7 +2416,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = source_metadata.artifact_id, .byte_len = source_metadata.byte_len, .checksum = source_metadata.checksum };
     const configs = [_]graph_mod.GraphMetricConfig{
         .{ .name = "rank_a", .kind = .pagerank },
-        .{ .name = "rank_b", .kind = .pagerank },
+        .{ .name = "rank_b", .kind = .pagerank, .damping = 0.75 },
     };
     // One PageRank consumes 254 kernel work items plus fifteen projection
     // items; the table-wide budget admits the first and rejects the second.
@@ -2393,6 +2553,92 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     try std.testing.expect(!std.mem.eql(u8, alias_a[0].name, alias_b[0].name));
     try std.testing.expectEqualStrings(alias_a[0].artifact_id, alias_b[0].artifact_id);
     try std.testing.expectEqualStrings(alias_a[0].checksum, alias_b[0].checksum);
+
+    // Whole-publication planning must survive A -> B -> A and all -> typed
+    // -> all ordering without another source read, projection, kernel or PUT.
+    graph.adjacencies[0].out_edges[0].weight = 2;
+    const other_payload = try graph_segment.encodeAlloc(alloc, graph);
+    defer alloc.free(other_payload);
+    var other_metadata = try artifacts.put(other_payload);
+    defer other_metadata.deinit(alloc);
+    const other_source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .name = "other", .artifact_id = other_metadata.artifact_id, .byte_len = other_metadata.byte_len, .checksum = other_metadata.checksum };
+    const CountingStore = struct {
+        inner: *artifact_store.ArtifactStore,
+        reads: usize = 0,
+        writes: usize = 0,
+        fn get(ptr: *anyopaque, allocator: Allocator, id: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return self.inner.getAllocWithCancellationUsingAllocator(allocator, id, .none);
+        }
+        fn put(ptr: *anyopaque, allocator: Allocator, bytes: []const u8) !artifact_store.ArtifactMetadata {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.writes += 1;
+            return self.inner.vtable.put(self.inner.ptr, allocator, bytes);
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn range(ptr: *anyopaque, allocator: Allocator, id: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return self.inner.getRangeAllocWithCancellationUsingAllocator(allocator, id, offset, len, .none);
+        }
+        fn stat(ptr: *anyopaque, allocator: Allocator, id: []const u8) !artifact_store.ArtifactMetadata {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.statWithCancellationUsingAllocator(allocator, id, .none);
+        }
+        fn delete(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedDelete;
+        }
+    };
+    var counting = CountingStore{ .inner = &artifacts };
+    var counted = artifact_store.ArtifactStore{ .allocator = alloc, .ptr = &counting, .vtable = &.{ .deinit = CountingStore.deinit, .put = CountingStore.put, .get_alloc = CountingStore.get, .get_range_alloc = CountingStore.range, .stat = CountingStore.stat, .delete = CountingStore.delete } };
+    const request_a = PublicationRequest{ .graph_index_name = "a", .source_graph = source, .config = one_config[0], .provenance = .{ .published_generation = 2, .edge_generation = 1, .computed_at_ms = 2 } };
+    // Even numerically equal signed zeroes have distinct persisted config
+    // fingerprints. Deduplication must preserve the exact storage identity.
+    try std.testing.expect(!sameComputation(.{ .name = "zero", .tolerance = 0.0 }, .{ .name = "negative_zero", .tolerance = -0.0 }));
+    var request_b = request_a;
+    request_b.graph_index_name = "b";
+    request_b.source_graph = other_source;
+    var request_typed = request_a;
+    request_typed.config.name = "typed_rank";
+    request_typed.config.edge_filter = .{ .mode = .types, .types = &.{"cites"} };
+    var request_alias = request_a;
+    request_alias.graph_index_name = "alias";
+    request_alias.provenance = .{ .published_generation = 4, .edge_generation = 3, .computed_at_ms = 4 };
+    var request_authority = request_a;
+    request_authority.config = .{ .name = "authority", .kind = .hits_authority };
+    var request_hub = request_alias;
+    request_hub.config = .{ .name = "hub", .kind = .hits_hub };
+    var baseline_budget = graph_metric_policy.Budget{ .limits = .{} };
+    const baseline = try publishRequestsAlloc(alloc, &counted, &.{ request_a, request_typed, request_b, request_authority, request_hub }, .none, baseline_budget.limits, &baseline_budget, .{});
+    defer {
+        for (baseline) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(baseline);
+    }
+    try std.testing.expectEqual(@as(usize, 2), counting.reads);
+    try std.testing.expectEqual(@as(usize, 5), counting.writes);
+    counting.reads = 0;
+    counting.writes = 0;
+    var planned_budget = graph_metric_policy.Budget{ .limits = .{
+        .max_total_work_items = baseline_budget.work_items,
+        .max_total_graph_payload_bytes = baseline_budget.graph_payload_bytes,
+        .max_total_metric_payload_bytes = baseline_budget.metric_payload_bytes,
+    } };
+    const planned = try publishRequestsAlloc(alloc, &counted, &.{ request_a, request_b, request_typed, request_alias, request_hub, request_typed, request_authority, request_authority }, .none, planned_budget.limits, &planned_budget, .{});
+    defer {
+        for (planned) |ref| freeArtifactRef(alloc, ref);
+        alloc.free(planned);
+    }
+    try std.testing.expectEqual(@as(usize, 2), counting.reads);
+    try std.testing.expectEqual(@as(usize, 5), counting.writes);
+    try std.testing.expectEqual(baseline_budget.work_items, planned_budget.work_items);
+    try std.testing.expectEqualStrings(planned[0].artifact_id, planned[3].artifact_id);
+    try std.testing.expectEqualStrings(planned[2].artifact_id, planned[5].artifact_id);
+    try std.testing.expectEqualStrings(planned[6].artifact_id, planned[7].artifact_id);
+    try std.testing.expectEqualStrings("1:a11:shared_rank", planned[0].name);
+    try std.testing.expectEqualStrings("5:alias11:shared_rank", planned[3].name);
+    try std.testing.expectEqual(@as(u64, 3), planned[3].edge_generation);
+    for (planned) |ref| try std.testing.expectEqual(artifact_ref.GraphMetricMaterializationState.ready, ref.graph_metric_materialization_state);
 
     // Cache reuse must not inherit admission from the request that populated
     // the cache. A later caller's stricter source-topology limit still wins.

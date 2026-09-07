@@ -570,13 +570,18 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const cache = self.cache orelse return null;
-        return cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.cancellation);
+        return cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.cancellation) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => return err,
+            // A damaged/unavailable local cache is a miss, never authority.
+            // The origin read still authenticates against the manifest digest.
+            else => null,
+        };
     }
 
     pub fn cacheAuthenticatedBlocks(self: *QuerySession, index: usize, blocks: []const AuthenticatedBlockPublication) !void {
         const cache = self.cache orelse return;
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
-        try cache.publishAuthenticatedBlocks(artifact.artifact_id, artifact.byte_len, artifact.checksum, blocks, self.cancellation);
+        cache.retainAuthenticatedBlocks(artifact.artifact_id, artifact.byte_len, artifact.checksum, blocks);
     }
 
     /// Fetches a bounded range and authenticates every byte against digests

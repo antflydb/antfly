@@ -736,3 +736,43 @@ Query tests:
 - External node ids can be returned without document hydration.
 - Hydration-required query over external nodes fails closed.
 - Entity/global projection query shapes are rejected in V1.
+
+## Immutable graph-metric execution
+
+Document and external-source serverless publications use the same request-wide
+plan in `serverless/build/lake_graph_metric.zig`. Reusable metrics are resolved
+first. Dirty requests are grouped by authenticated source identity, equivalent
+edge filter, and exact metric computation parameters. Names and refresh policies
+are not computation identity. Each source is fetched/decoded once, each filter
+builds one union topology, and each unique metric is computed, encoded, and
+uploaded once. Compatible HITS authority/hub metrics share their kernel.
+
+The plan retains only one source and one filtered projection at a time; alias
+fanout retains lightweight references, not score vectors or encoded payloads.
+References preserve request order and independently carry index names and
+publication, topology, and computation provenance. Equivalent PageRank aliases
+use the first available prior artifact in request order as their optional seed;
+authentication or compatibility failure still cold-starts the shared computation.
+Aggregate budgets count actual unique work, source reads, and output uploads.
+
+The storage-independent PageRank, eigenvector, and HITS kernels partition the
+CSR vertex/edge work stream into fixed logical tiles, including boundaries inside
+high-degree vertices. Complete rows remain target-owned. Only tile-boundary rows
+need partial sums (at most 32 stack records), reduced in a fixed order independent
+of the `std.Io` worker count. Large graphs have at most
+`ceil((nodes + edges) / 16)` work units per logical tile; no extra edge-sized
+scratch allocation or atomic floating-point updates are required.
+
+Graph-metric queries authenticate control, routing, primary-score, and ranked
+blocks before publishing them to the bounded shared memory cache. Disk retention
+is optional and asynchronous: one cache-owned `std.Io` worker drains at most
+32 outstanding jobs / 16 MiB, independent of request allocator, executor, and
+cancellation lifetimes. Queue pressure or disk failure does not fail a verified
+read or make shared waiters download it again. Shutdown cancels pending retention
+and joins the worker before destroying the cache. Pending bytes/jobs, failures,
+and bypasses are exposed in `QueryCacheStats`; maintenance can explicitly drain
+retention, but queries never wait for it. Local-cache read errors fall back to
+authenticated origin reads; origin integrity failures remain fatal.
+
+Materializer epoch 11 invalidates earlier admission and reduction policies.
+Serverless is unreleased and supports only the current artifact contract.

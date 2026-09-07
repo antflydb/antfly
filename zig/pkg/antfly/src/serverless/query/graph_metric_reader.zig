@@ -834,18 +834,16 @@ fn fetchControlAlloc(
     artifact: manifest_mod.ArtifactRef,
     expected_len: usize,
 ) ![]u8 {
-    try session.chargeGraphMetricRange(expected_len);
     if (artifact.metadata_version != metric_segment.wire_version or
         artifact.graph_metric_control_len != expected_len) return error.InvalidGraphMetricSegment;
-    const subranges = [_]runtime_mod.AuthenticatedSubrange{.{
-        .relative_offset = 0,
+    const entries = [_]metric_segment.codec.RoutingEntry{.{
+        .first_node_id = "",
+        .block_index = 2,
+        .offset = 0,
         .len = expected_len,
         .checksum = artifact.graph_metric_control_checksum,
     }};
-    return session.fetchArtifactAuthenticatedRangeAlloc(metric_index, 0, expected_len, &subranges) catch |err| switch (err) {
-        error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
-        else => |other| other,
-    };
+    return fetchMetadataRangeAlloc(session, metric_index, &entries);
 }
 
 fn routingFooterLen(
@@ -871,23 +869,43 @@ fn fetchRoutingFooterAlloc(
     footer_len: usize,
     root_len: usize,
 ) ![]u8 {
-    try session.chargeGraphMetricRange(footer_len);
     if (segment_version != metric_segment.wire_version) return error.InvalidGraphMetricSegment;
     if (root_len > footer_len) return error.InvalidGraphMetricSegment;
-    const subranges = [_]runtime_mod.AuthenticatedSubrange{.{
-        .relative_offset = footer_len - root_len,
+    const root = metric_segment.codec.RoutingEntry{
+        .first_node_id = "",
+        .block_index = 1,
+        .offset = footer_offset + footer_len - root_len,
         .len = root_len,
         .checksum = artifact.graph_metric_routing_checksum,
-    }};
-    const both = [_]runtime_mod.AuthenticatedSubrange{ .{
-        .relative_offset = 0,
+    };
+    const both = [_]metric_segment.codec.RoutingEntry{ .{
+        .first_node_id = "",
+        .offset = footer_offset,
         .len = footer_len - root_len,
         .checksum = artifact.graph_metric_point_index_checksum,
-    }, subranges[0] };
-    return session.fetchArtifactAuthenticatedRangeAlloc(metric_index, footer_offset, footer_len, if (footer_len == root_len) &subranges else &both) catch |err| switch (err) {
-        error.ArtifactIntegrityMismatch => error.InvalidGraphMetricSegment,
-        else => |other| other,
-    };
+    }, root };
+    return fetchMetadataRangeAlloc(session, metric_index, if (footer_len == root_len) &.{root} else &both);
+}
+
+fn fetchMetadataRangeAlloc(session: *runtime_mod.QuerySession, metric_index: usize, entries: []const metric_segment.codec.RoutingEntry) ![]u8 {
+    if (entries.len == 0) return error.InvalidGraphMetricSegment;
+    const last = entries[entries.len - 1];
+    const end = std.math.add(u64, last.offset, last.len) catch return error.InvalidGraphMetricSegment;
+    const extent = std.math.sub(u64, end, entries[0].offset) catch return error.InvalidGraphMetricSegment;
+    const len = std.math.cast(usize, extent) orelse return error.InvalidGraphMetricSegment;
+    // Large valid metadata can exceed the canonical memory pool's per-fill
+    // limit. Authenticate it directly; optional disk retention must not become
+    // a synchronous fallback on the serving path.
+    if (len > coalesced_score_window_bytes) {
+        try session.chargeGraphMetricRange(len);
+        return fetchCanonicalRunAlloc(session.alloc, session, metric_index, entries);
+    }
+    return fetchMetricRangeAlloc(session.alloc, session, metric_index, metric_segment.wire_version, entries, .{
+        .offset = entries[0].offset,
+        .len = len,
+        .first_block = 0,
+        .last_block = entries.len - 1,
+    }, .metadata);
 }
 
 const DirectoryRead = struct {
@@ -1137,11 +1155,7 @@ fn acquireRouting(
     try session.chargeGraphMetricRetained(std.math.add(usize, reservation, overhead) catch return error.GraphMetricQueryBudgetExceeded);
     try session.chargeGraphMetricDecode(1, decode_work);
     const footer = if (directory) |info| blk: {
-        try session.chargeGraphMetricRange(len);
-        break :blk session.fetchArtifactAuthenticatedBlockAlloc(metric_index, "graph-metric-directory", offset, len, &info.checksum) catch |err| switch (err) {
-            error.ArtifactIntegrityMismatch => return error.InvalidGraphMetricSegment,
-            else => return err,
-        };
+        break :blk try fetchMetadataRangeAlloc(session, metric_index, &.{.{ .first_node_id = "", .block_index = 3, .offset = offset, .len = len, .checksum = info.checksum }});
     } else try fetchRoutingFooterAlloc(session, metric_index, artifact, version, offset, len, root_len);
     var owns_footer = true;
     defer if (owns_footer) session.alloc.free(footer);
@@ -1179,11 +1193,12 @@ fn acquireRouting(
     return .{ .entry = entry };
 }
 
-const MetricRangeKind = enum { score, reserved_score, routing, ranked };
+const MetricRangeKind = enum { score, reserved_score, routing, ranked, metadata };
 
 fn metricBlockId(buf: []u8, kind: MetricRangeKind, block_index: usize) ![]const u8 {
     return std.fmt.bufPrint(buf, "graph-metric-{s}-{d}-exact", .{ switch (kind) {
         .routing => "routing",
+        .metadata => "metadata",
         .ranked => "ranked",
         .score, .reserved_score => "score",
     }, block_index });
@@ -1269,6 +1284,8 @@ fn fetchMetricRangeAlloc(
     const output = try session.alloc.alloc(u8, range.len);
     errdefer session.alloc.free(output);
     // All newly produced units are authenticated before waiters see them.
+    try session.checkCancellation();
+    batch.publish(session.io);
     const limit = runtime_mod.max_authenticated_publication_blocks;
     var publications: [limit]runtime_mod.AuthenticatedBlockPublication = undefined;
     var ids: [limit][64]u8 = undefined;
@@ -1291,7 +1308,6 @@ fn fetchMetricRangeAlloc(
     }
     if (count != 0) try session.cacheAuthenticatedBlocks(metric_index, publications[0..count]);
     try session.checkCancellation();
-    batch.publish(session.io);
     return output;
 }
 
@@ -2540,6 +2556,7 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         var warm_top_one = try topAlloc(alloc, &session, "graph_idx", "rank", 1);
         defer warm_top_one.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), state.range_bytes.load(.monotonic));
+        cache.drainGraphMetricPersistence();
         cache.graph_metric_blocks.deinit();
         cache.graph_metric_blocks = .{};
         session.graph_metric_read_budget = .{};
@@ -2595,6 +2612,42 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         try std.testing.expectEqual(@as(usize, 0), state.range_calls.load(.monotonic));
     }
     try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &session, last_id });
+    if (score_count == metric_segment.score_block_entries + 1) {
+        const broken_root = try std.fmt.allocPrint(alloc, "{s}-unavailable", .{cache_root});
+        defer alloc.free(broken_root);
+        var broken_cache = try @import("cache.zig").QueryCache.init(alloc, broken_root);
+        defer broken_cache.deinit();
+        const blocks_path = try std.fs.path.join(alloc, &.{ broken_root, ".blocks" });
+        defer alloc.free(blocks_path);
+        // A file where the cache needs a directory makes both reads and
+        // publication fail deterministically, independent of host permissions.
+        const blocker = try std.Io.Dir.cwd().createFile(io_impl.io(), blocks_path, .{});
+        blocker.close(io_impl.io());
+        session.cache = &broken_cache;
+        defer session.cache = &cache;
+        session.graph_metric_read_budget = .{};
+        var cold_scores = try scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids);
+        defer cold_scores.deinit(alloc);
+        try std.testing.expectEqual(@as(?f64, last_value), cold_scores.scores[0]);
+        var cold_top = try topAlloc(alloc, &session, "graph_idx", "rank", 257);
+        defer cold_top.deinit(alloc);
+        broken_cache.drainGraphMetricPersistence();
+        try std.testing.expect(broken_cache.statsSnapshot().graph_metric_persistence_failures > 0);
+        state.range_calls.store(0, .monotonic);
+        session.graph_metric_read_budget = .{};
+        var warm_scores = try scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids);
+        defer warm_scores.deinit(alloc);
+        var warm_top = try topAlloc(alloc, &session, "graph_idx", "rank", 257);
+        defer warm_top.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), state.range_calls.load(.monotonic));
+        // Optional retention cannot weaken origin authentication on a miss.
+        broken_cache.graph_metric_blocks.deinit();
+        broken_cache.graph_metric_blocks = .{};
+        state.corrupt_score_reads = true;
+        defer state.corrupt_score_reads = false;
+        session.graph_metric_read_budget = .{};
+        try std.testing.expectError(error.InvalidGraphMetricSegment, scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids));
+    }
 }
 
 test "serverless graph metric ranked blocks reject cross-boundary inversions and duplicates" {
