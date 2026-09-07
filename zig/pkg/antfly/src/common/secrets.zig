@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const fs_paths = @import("fs_paths.zig");
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
     extern "c" var environ: [*:null]?[*:0]u8;
@@ -241,8 +242,24 @@ const FileMetadata = struct {
 };
 
 pub const FileStore = struct {
+    // A store is borrowed by separately compiled API/runtime archives. Execute
+    // I/O in its creating archive: std.Io error integers are compilation-local,
+    // even when the interface layout and Zig toolchain are identical.
+    const Operations = struct {
+        refresh: *const fn (*FileStore) anyerror!bool = refreshLocal,
+        refresh_throttled: *const fn (*FileStore, u64) anyerror!bool = refreshThrottledLocal,
+        list: *const fn (*FileStore, std.mem.Allocator) anyerror![]ListedSecret = listLocal,
+        put: *const fn (*FileStore, std.mem.Allocator, []const u8, []const u8) anyerror!ListedSecret = putLocal,
+        delete: *const fn (*FileStore, []const u8) anyerror!bool = deleteLocal,
+        get_owned: *const fn (*FileStore, std.mem.Allocator, []const u8) anyerror!?[]u8 = getOwnedLocal,
+        get_owned_with_generation: *const fn (*FileStore, std.mem.Allocator, []const u8) anyerror!ResolvedSecret = getOwnedWithGenerationLocal,
+    };
+    const Boundary = runtime_callback_abi.Boundary(Operations);
+
     alloc: std.mem.Allocator,
     io: std.Io,
+    operations: Operations = .{},
+    dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     path: []u8,
     fallbacks: []FileStore = &.{},
     mutex: std.atomic.Mutex = .unlocked,
@@ -361,6 +378,10 @@ pub const FileStore = struct {
     }
 
     pub fn refreshIfChanged(self: *FileStore) !bool {
+        return Boundary.call("refresh", self.dispatch, self.operations.refresh, .{self});
+    }
+
+    fn refreshLocal(self: *FileStore) !bool {
         self.lock();
         defer self.unlock();
         var changed = try self.refreshIfChangedLocked();
@@ -373,6 +394,10 @@ pub const FileStore = struct {
     /// Refresh at most once per interval. The atomic fast path avoids taking
     /// the store lock or issuing a stat syscall on every cache lookup.
     pub fn refreshIfChangedThrottled(self: *FileStore, interval_ns: u64) !bool {
+        return Boundary.call("refresh_throttled", self.dispatch, self.operations.refresh_throttled, .{ self, interval_ns });
+    }
+
+    fn refreshThrottledLocal(self: *FileStore, interval_ns: u64) !bool {
         if (interval_ns == 0) return try self.refreshIfChanged();
         const now_ns = nowNsWithIo(self.io);
         if (now_ns < self.next_throttled_refresh_ns.load(.acquire)) return false;
@@ -392,6 +417,10 @@ pub const FileStore = struct {
     }
 
     pub fn list(self: *FileStore, alloc: std.mem.Allocator) ![]ListedSecret {
+        return Boundary.call("list", self.dispatch, self.operations.list, .{ self, alloc });
+    }
+
+    fn listLocal(self: *FileStore, alloc: std.mem.Allocator) ![]ListedSecret {
         self.lock();
         defer self.unlock();
         _ = try self.refreshIfChangedLocked();
@@ -426,6 +455,10 @@ pub const FileStore = struct {
     }
 
     pub fn put(self: *FileStore, alloc: std.mem.Allocator, key: []const u8, value: []const u8) !ListedSecret {
+        return Boundary.call("put", self.dispatch, self.operations.put, .{ self, alloc, key, value });
+    }
+
+    fn putLocal(self: *FileStore, alloc: std.mem.Allocator, key: []const u8, value: []const u8) !ListedSecret {
         try validateKey(key);
         self.lock();
         defer self.unlock();
@@ -461,6 +494,10 @@ pub const FileStore = struct {
     }
 
     pub fn delete(self: *FileStore, key: []const u8) !bool {
+        return Boundary.call("delete", self.dispatch, self.operations.delete, .{ self, key });
+    }
+
+    fn deleteLocal(self: *FileStore, key: []const u8) !bool {
         self.lock();
         defer self.unlock();
         _ = try self.refreshIfChangedLocked();
@@ -484,6 +521,10 @@ pub const FileStore = struct {
     }
 
     pub fn getOwned(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+        return Boundary.call("get_owned", self.dispatch, self.operations.get_owned, .{ self, alloc, key });
+    }
+
+    fn getOwnedLocal(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
         self.lock();
         defer self.unlock();
         _ = try self.refreshIfChangedLocked();
@@ -498,6 +539,10 @@ pub const FileStore = struct {
     }
 
     pub fn getOwnedWithGeneration(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !ResolvedSecret {
+        return Boundary.call("get_owned_with_generation", self.dispatch, self.operations.get_owned_with_generation, .{ self, alloc, key });
+    }
+
+    fn getOwnedWithGenerationLocal(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !ResolvedSecret {
         self.lock();
         defer self.unlock();
         _ = try self.refreshIfChangedLocked();

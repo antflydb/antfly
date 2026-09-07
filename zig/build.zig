@@ -3599,6 +3599,35 @@ pub fn build(b: *std.Build) void {
     const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common secret and remote-content reload tests");
     lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
 
+    const secret_store_abi_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/secret_store_abi_test_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    secret_store_abi_provider_mod.addImport("antfly_platform", platform_mod);
+    const secret_store_abi_provider = b.addLibrary(.{
+        .name = "secret-store-abi-test-provider",
+        .root_module = secret_store_abi_provider_mod,
+        .linkage = .static,
+    });
+    const secret_store_abi_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/secret_store_abi_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    secret_store_abi_test_mod.addImport("antfly_platform", platform_mod);
+    secret_store_abi_test_mod.linkLibrary(secret_store_abi_provider);
+    const secret_store_abi_tests = b.addTest(.{
+        .root_module = secret_store_abi_test_mod,
+        .filters = &.{"secret store operations retain their IO owner across runtime archives"},
+    });
+    const run_secret_store_abi_tests = b.addRunArtifact(secret_store_abi_tests);
+    const secret_store_abi_test_step = b.step("lib-common-secrets-abi-test", "Run secret store tests across independently compiled runtime archives");
+    secret_store_abi_test_step.dependOn(&run_secret_store_abi_tests.step);
+    lib_common_secrets_test_step.dependOn(&run_secret_store_abi_tests.step);
+
     const api_cluster_secret_status_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_cluster_test_root.zig"),
         .target = target,
@@ -9295,6 +9324,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
     unit_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
+    unit_test_step.dependOn(&run_secret_store_abi_tests.step);
     unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);

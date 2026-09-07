@@ -2349,6 +2349,18 @@ VOPR work has found concrete production and harness defects:
   `VoprIo` treats a directory-file sync as the namespace durability boundary,
   and the cold-start campaign proves secret crash/reopen persistence through
   the production atomic writer.
+- The assembled runtime exposed an error-domain mismatch that single-archive
+  VOPR tests could not detect: `FileStore` retained its creator's `std.Io`, but
+  API-archive methods called that foreign vtable directly. An absent optional
+  secret file's `FileNotFound` became `EndOfStream`, breaking status refresh and
+  managed semantic queries with HTTP 400. Store refresh, lookup, listing, and
+  mutations now execute in the creating archive through the existing stable
+  callback error transport. `lib-common-secrets-abi-test` compiles a separate
+  provider archive and verifies missing-file handling, typed errors, publication,
+  rotation, retained values, and deletion. It runs in `lib-common-secrets-test`
+  and `unit-test`; production semantic E2E tests cover the assembled executable.
+  Matching `std.Io` layouts/toolchains alone does not make error-returning
+  vtable calls safe across independent Zig compilation units.
 - Native Lite unconditionally constructed its own `std.Io.Threaded`, and its
   docstore locks, index timestamps, and index-root canonicalization continued
   to use native helpers even when the surrounding Embedded or C API owner had
