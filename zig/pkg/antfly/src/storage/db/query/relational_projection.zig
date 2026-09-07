@@ -24,6 +24,17 @@ pub const Plan = struct {
     arena: std.heap.ArenaAllocator,
     paths: []const []const []const u8 = &.{},
 
+    /// Positive selections share one contract across row and column readers.
+    /// A hyphen inside a name is literal; only a leading hyphen is exclusion.
+    pub fn supports(fields: []const []const u8, include_all_fields: bool) bool {
+        if (fields.len == 0) return !include_all_fields;
+        for (fields) |field| {
+            if (field.len == 0 or field[0] == '-' or field[0] == '_' or
+                std.mem.indexOfScalar(u8, field, '*') != null) return false;
+        }
+        return true;
+    }
+
     pub fn init(alloc: std.mem.Allocator, table: schema.TableSchema, layout: *const codec.PhysicalLayout, fields: []const []const u8) !Plan {
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -66,6 +77,12 @@ pub const Plan = struct {
             const cell = (try row.findCell(ordinal)) orelse continue;
             try source.put(scratch, row.table_schema.relational_columns[ordinal].name, try row.materializeCellAlloc(scratch, cell));
         }
+        return self.projectObject(alloc, scratch, source);
+    }
+
+    /// The column reader supplies only the already-bound root ordinals.
+    pub fn projectObject(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: std.json.ObjectMap) ![]u8 {
+        if (self.paths.len == 0) return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = source }, .{});
         var result = std.json.Value{ .object = std.json.ObjectMap.empty };
         for (self.paths) |parts| try document_query.applyIncludePath(scratch, source, &result.object, parts);
         return try std.json.Stringify.valueAlloc(alloc, result, .{});

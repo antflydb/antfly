@@ -422,6 +422,28 @@ reuse and pressure; payload-read counters count actual misses, not cache hits.
 A process-wide cache is intentionally not enabled: cross-query reuse must
 justify a separate global admission/memory policy with concurrency benchmarks.
 
+The bound-scan benchmark (`--test-filter 'relational columnar bound scan benchmark'`)
+compares forced primary scans with the hybrid column path on 768 rows with an
+8 KiB unselected string, a scalar predicate, and a small nested JSON column.
+Seven measured rounds follow a warmup, alternating execution order. Local
+ReleaseFast arm64 macOS medians (milliseconds, primary → hybrid):
+
+| Output / selected rows | LMDB | LSM |
+| --- | ---: | ---: |
+| Full document / 8 | 11.960 → 0.932 | 12.900 → 2.924 |
+| Nested projection / 8 | 15.256 → 0.784 | 12.596 → 2.165 |
+| Hyphenated field / 8 | 15.112 → 0.686 | 12.610 → 2.200 |
+| Full document / 768 | 96.194 → 33.826 | 85.459 → 35.860 |
+| Nested projection / 768 | 46.182 → 23.497 | 46.614 → 25.132 |
+
+Selective full output reads eight primary rows; positive projections read none.
+Each hybrid scan builds one schema plan across seven blocks. Dense full output
+uses sequential primary ranges without reading column payloads. The hybrid path
+trades bounded block workspace for less row decoding: selective nested scans
+allocate 138/310 kB (LMDB/LSM), versus 27 kB for the streaming primary baseline;
+dense full output allocates about 6.9/7.0 MB versus 35.8 MB. These are fixture
+measurements, not universal latency guarantees or timing-based test gates.
+
 Reproducible focused benchmarks (Zig 0.16, ReleaseFast, arm64 macOS):
 
 ```sh
@@ -690,12 +712,31 @@ Table-owned `typed_doc_values` remain a complementary accelerator for broad
 range scans and aggregations. They are not required for direct AROW projection
 or filtering and never become a second row authority.
 
-Covered scans evaluate flat-field predicates column-at-a-time, prune disjoint
+Covered scans evaluate bound predicates column-at-a-time, prune disjoint
 numeric ranges using block summaries, and fetch projection columns only for
 blocks with surviving rows. A sparse row-key directory lets resumed and bounded
-scans seek directly to their starting block. Positive top-level projections and hash-only scans
-avoid primary-row reads for unchanged rows. Nested/special/full-document selections retain AROW
-fallback. Checked directory boundary links detect missing range entries; block
+scans seek directly to their starting block. Positive flat/nested projections and
+hash-only scans avoid primary-row reads for unchanged rows. Hyphens inside field
+names are literal; only a leading hyphen denotes exclusion. Nested predicates
+traverse only their bound root column; dense-vector element predicates read a
+single binary float without expanding the vector. Full-document, wildcard,
+exclusion, and special-field output uses late AROW materialization after selection,
+with special-field loaders sharing the same read transaction. A block with at
+least a block's worth of remaining output budget costs actual surviving row bytes
+and random-read overhead against sequential primary access; dense output takes
+the latter. Small limits retain page-window evaluation.
+
+`column_scan_plan.zig` binds filter roots, nested traversal, and projection
+ordinals once per resident schema epoch. Clean blocks, dirty overlays, and
+primary ranges share the request-local plan cache. Up to 32 resident plans use
+frequency-based admission; active blocks pin their immutable views and cannot
+be evicted by a different dirty-row epoch. Capacity pressure uses transient
+owned plans, with no global locks or cross-request cache. Compiled predicates
+are borrowed from the request instead of copied into every epoch plan.
+`scan_plans_built`, `scan_plan_hits`, and `late_materialized_{rows,bytes}` expose
+binding reuse and deferred primary I/O.
+
+Checked directory boundary links detect missing range entries; block
 and manifest checksums protect derived bytes. Corruption resumes
 the same snapshot's primary scan after the last delivered key and requests a
 rebuild. Request-local `ColumnarScanStats` exposes blocks read/pruned, columns and
@@ -799,11 +840,11 @@ physical representation and backfill plan are compatible.
   document reconstruction on the relational hot paths.
 - **Phase 4 — table-owned typed-column persistence (implemented).** Bounded,
   staged generations, null bitmaps, checksums, coverage fences, and reclamation.
-- **Phase 5 — columnar scan and predicate pushdown (implemented for flat fields).**
-  Column-at-a-time evaluation, numeric zone maps, and late projection loading.
-- **Phase 6 — unified reads (implemented for positive top-level projections).**
-  Covered scans use columns; unsupported selections and uncovered generations
-  use authoritative AROW. Incremental maintenance and specialized aggregate/sort
+- **Phase 5 — columnar scan and predicate pushdown (implemented).**
+  Epoch-bound scalar/nested evaluation, numeric zone maps, and late projection.
+- **Phase 6 — unified reads (implemented).**
+  Column selection supports nested output and costed late AROW materialization;
+  uncovered generations use authoritative AROW. Specialized aggregate/sort
   execution can extend this without introducing another row authority.
 
 ## Related docs

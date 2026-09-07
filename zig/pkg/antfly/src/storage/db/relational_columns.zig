@@ -26,6 +26,7 @@ const registry = @import("schema_registry.zig");
 const dv = @import("../../section/typed_doc_values.zig");
 const payloads = @import("column_payloads.zig");
 const read_cache = @import("column_read_cache.zig");
+const scan_plan = @import("column_scan_plan.zig");
 const graph = @import("query/graph_exec.zig");
 const types = @import("types.zig");
 const platform_time = @import("antfly_platform").time;
@@ -1577,7 +1578,7 @@ const DirtyRanges = struct {
     /// Merge authoritative mutations up to a base-row key (inclusive), or to a
     /// range end (exclusive). The cursor streams arbitrarily large deltas with
     /// one row arena/read scope; no dirty-range materialization is needed.
-    fn emitThrough(self: *@This(), db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, end: []const u8, inclusive: bool, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, filter: ?*const graph.PreparedPatternFilter) !bool {
+    fn emitThrough(self: *@This(), db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, end: []const u8, inclusive: bool, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, plans: *scan_plan.Cache, materializer: Materializer) !bool {
         var replaced = false;
         while (self.pending) |key| {
             if (!std.mem.startsWith(u8, key, dirty_prefix)) break;
@@ -1620,20 +1621,14 @@ const DirtyRanges = struct {
             if (opts.columnar_stats) |stats| stats.primary_rows_read += 1;
             self.read_cost +|= bytes.len;
             const version = try codec.rowSchemaVersion(bytes);
-            var view = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
-            defer view.release();
+            const plan = try plans.get(db, version);
+            defer plan.release();
+            const view = plan.view;
             const typed = if (db.core.store.valuesAreAuthenticated()) try codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout()) else try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
             const row = Row{ .key = id, .hash = typed.semanticHash(), .timestamp = typed.writeTimestampNs() };
             if (!eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns)) continue;
-            if (filter) |compiled| {
-                const matches = (try compiled.compiled.matchesOrdinal(scratch, id, typed)) orelse blk: {
-                    var logical = try typed.materializeRootAlloc(scratch);
-                    defer logical.deinit(scratch);
-                    break :blk try compiled.compiled.matches(scratch, id, logical.root);
-                };
-                if (!matches) continue;
-            }
-            const projected = if (opts.include_documents) try codec.projectOrdinalFieldsTrustedWithLayoutAlloc(scratch, bytes, view.tableSchema().*, view.physicalLayout(), opts.fields) else null;
+            if (!try plan.matches(scratch, id, typed)) continue;
+            const projected = if (opts.include_documents) try projectPrimary(plan, materializer, scratch, id, typed) else null;
             try deliver(alloc, row, projected, opts, visitor, progress);
         }
         return replaced;
@@ -1664,7 +1659,7 @@ const RangeScanPlan = struct {
     visibility_complete: bool = false,
 };
 
-fn planRange(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, block: *Block, candidates: []bool, filter: ?*const graph.PreparedPatternFilter) !RangeScanPlan {
+fn planRange(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, block: *Block, candidates: []bool, filter: ?scan_plan.Filter) !RangeScanPlan {
     if (opts.limit > 0 and opts.limit <= 16) return .{};
     var lower = range.start;
     if (std.mem.order(u8, lower, from) == .lt) lower = from;
@@ -1730,16 +1725,19 @@ fn planRange(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from
         entry = try cursor.next();
     }
     var projected_bytes: u64 = 0;
+    const late_materialization = opts.include_documents and block.plan.?.projected == null;
     if (complete and std.mem.indexOfScalar(bool, surviving[0..block.rows.len], true) != null) {
         var seen = std.AutoHashMapUnmanaged(u32, void).empty;
         defer seen.deinit(alloc);
-        if (opts.include_documents) for (opts.fields) |field| {
-            const ordinal: u32 = @intCast(block.layout.ordinalForName(block.table.relational_columns, field) orelse continue);
+        if (block.plan.?.projected) |projected| for (projected.base.ordinals) |ordinal| {
             try seen.put(alloc, ordinal, {});
         };
-        if (filter) |value| try block.predicateColumns(value.compiled, &seen);
+        if (filter) |value| try block.predicateColumns(value, &seen);
         var ordinals = seen.keyIterator();
         while (ordinals.next()) |ordinal| projected_bytes +|= try block.payloadCost(ordinal.*, surviving[0..block.rows.len]);
+        if (late_materialization) for (block.rows, surviving[0..block.rows.len]) |row, selected| {
+            if (selected) projected_bytes +|= row.physical_bytes +| 4096;
+        };
     }
     // Predicate/projection pages are charged once, before any payload is read.
     // CPU ranking weights belong to leaf ordering, not this byte estimate.
@@ -1751,7 +1749,7 @@ fn planRange(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from
         stats.estimated_primary_bytes +|= primary;
     }
     // Require a margin before discarding the column plan for a row scan.
-    return .{ .primary = count >= 16 and primary +| primary / 4 < overlay, .visibility_complete = complete };
+    return .{ .primary = (count >= 16 or late_materialization) and primary +| primary / 4 < overlay, .visibility_complete = complete };
 }
 
 /// Compact one dirty key range per maintenance pass. Large insertion bursts
@@ -2146,17 +2144,13 @@ const Decoder = struct {
     }
 };
 
-fn flatPath(path: graph.CompiledPatternFilter.FieldPath) ?[]const u8 {
-    return switch (path) {
-        .single => |name| name,
-        .dotted, .json_pointer => |parts| if (parts.len == 1) parts[0] else null,
-    };
-}
-
 fn supports(filter: graph.CompiledPatternFilter) bool {
     return switch (filter) {
         .match_all, .match_none, .doc_id => true,
-        .field_matcher => |matcher| flatPath(matcher.path) != null,
+        .field_matcher => |matcher| switch (matcher.path) {
+            .single => true,
+            .dotted, .json_pointer => |parts| parts.len != 0,
+        },
         .conjuncts, .disjuncts => |items| blk: {
             for (items) |item| if (!supports(item)) break :blk false;
             break :blk true;
@@ -2212,6 +2206,7 @@ const Block = struct {
     orders: std.AutoHashMapUnmanaged(usize, []const usize) = .empty,
     decoded_payloads: std.AutoHashMapUnmanaged([32]u8, *read_cache.Payload) = .empty,
     payload_cache: ?*read_cache.Cache = null,
+    plan: ?*scan_plan.Plan = null,
     stats: ?*types.ColumnarScanStats = null,
     scan_options: ?types.ScanOptions = null,
     stop: ?*const std.atomic.Value(bool) = null,
@@ -2398,7 +2393,7 @@ const Block = struct {
         return logical;
     }
 
-    fn evaluate(self: *@This(), filter: graph.CompiledPatternFilter, candidates: []const bool, out: []bool) !void {
+    fn evaluate(self: *@This(), filter: scan_plan.Filter, candidates: []const bool, out: []bool) !void {
         try self.checkWork();
         @memset(out, false);
         if (std.mem.indexOfScalar(bool, candidates, true) == null) return;
@@ -2414,20 +2409,41 @@ const Block = struct {
                 };
             },
             .field_matcher => |matcher| {
-                const name = flatPath(matcher.path).?;
-                const ordinal: u32 = @intCast(self.layout.ordinalForName(self.table.relational_columns, name) orelse {
+                const ordinal = matcher.ordinal orelse {
                     const missing = try matcher.predicate.matches(self.alloc, &.{});
                     for (out, candidates) |*matched, candidate| matched.* = candidate and missing;
                     return;
-                });
+                };
+                if (matcher.remaining) |path| {
+                    const typed = if (self.table.relational_columns[ordinal].column_type == .dense_vector) try self.cells(ordinal, candidates) else null;
+                    for (out, candidates, 0..) |*matched, candidate, i| {
+                        if (!candidate) continue;
+                        if (typed) |cells_view| if (cells_view[i]) |cell| if (!cell.is_null) {
+                            const parts = switch (path) {
+                                .dotted, .json_pointer => |parts| parts,
+                                .single => unreachable,
+                            };
+                            const index = if (parts.len == 1 and (path != .json_pointer or graph.isCanonicalJsonPointerArrayIndex(parts[0]))) std.fmt.parseInt(usize, parts[0], 10) catch null else null;
+                            const bytes = cell.value.bytes_val;
+                            matched.* = if (index != null and index.? < bytes.len / 4) try matcher.predicate.matches(self.alloc, &.{.{ .float = @as(f32, @bitCast(std.mem.readInt(u32, bytes[index.? * 4 ..][0..4], .little))) }}) else try matcher.predicate.matches(self.alloc, &.{});
+                            continue;
+                        };
+                        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                        defer scratch.deinit();
+                        var values = std.ArrayListUnmanaged(std.json.Value).empty;
+                        if (try self.logicalValue(ordinal, i)) |logical| try path.collectValues(scratch.allocator(), logical, &values);
+                        matched.* = try matcher.predicate.matches(scratch.allocator(), values.items);
+                    }
+                    return;
+                }
                 const column_view = try self.column(ordinal);
                 const bounds = column_view.bounds;
                 if (bounds.present and !try matcher.predicate.mayMatchNumericBounds(bounds.minimum, bounds.maximum)) return;
-                const values = if (matcher.predicate == .exists) null else try self.cells(ordinal, candidates);
+                const values = if (matcher.predicate.* == .exists) null else try self.cells(ordinal, candidates);
                 for (out, 0..) |*matched, i| {
                     if (!candidates[i]) continue;
                     matched.* = if (values) |typed| blk: {
-                        if (typed[i]) |cell| if (!cell.is_null and (cell.is_json or cell.value_type == .geo_point or (cell.is_dense_vector and matcher.predicate != .term and matcher.predicate != .terms))) {
+                        if (typed[i]) |cell| if (!cell.is_null and (cell.is_json or cell.value_type == .geo_point or (cell.is_dense_vector and matcher.predicate.* != .term and matcher.predicate.* != .terms))) {
                             const logical = (try self.logicalValue(ordinal, i)).?;
                             break :blk try matcher.predicate.matches(self.alloc, &.{logical});
                         };
@@ -2477,7 +2493,7 @@ const Block = struct {
 
     /// Metadata-only estimates. Cache one ordering per immutable expression and
     /// block, not per row window; payload decoding never happens in planning.
-    fn orderedFilters(self: *@This(), items: []const graph.CompiledPatternFilter, candidates: []const bool) ![]const usize {
+    fn orderedFilters(self: *@This(), items: []const scan_plan.Filter, candidates: []const bool) ![]const usize {
         if (items.len == 0) return &.{};
         const key = @intFromPtr(items.ptr);
         if (self.orders.get(key)) |order| return order;
@@ -2521,14 +2537,14 @@ const Block = struct {
         return cost;
     }
 
-    fn predicateColumns(self: *@This(), filter: graph.CompiledPatternFilter, out: *std.AutoHashMapUnmanaged(u32, void)) anyerror!void {
+    fn predicateColumns(self: *@This(), filter: scan_plan.Filter, out: *std.AutoHashMapUnmanaged(u32, void)) anyerror!void {
         try self.checkWork();
         switch (filter) {
             .field_matcher => |matcher| {
-                if (matcher.predicate == .exists) return;
-                const ordinal: u32 = @intCast(self.layout.ordinalForName(self.table.relational_columns, flatPath(matcher.path).?) orelse return);
+                if (matcher.predicate.* == .exists and matcher.remaining == null) return;
+                const ordinal = matcher.ordinal orelse return;
                 const column_view = try self.column(ordinal);
-                if (column_view.bounds.present and !try matcher.predicate.mayMatchNumericBounds(column_view.bounds.minimum, column_view.bounds.maximum)) return;
+                if (matcher.remaining == null and column_view.bounds.present and !try matcher.predicate.mayMatchNumericBounds(column_view.bounds.minimum, column_view.bounds.maximum)) return;
                 try out.put(self.alloc, ordinal, {});
             },
             .conjuncts, .disjuncts => |items| for (items) |item| {
@@ -2545,14 +2561,14 @@ const Block = struct {
         }
     }
 
-    fn predicateCost(self: *@This(), filter: graph.CompiledPatternFilter, candidates: []const bool) anyerror!u64 {
+    fn predicateCost(self: *@This(), filter: scan_plan.Filter, candidates: []const bool) anyerror!u64 {
         try self.checkWork();
         return switch (filter) {
             .match_all, .match_none, .doc_id => 0,
             .field_matcher => |matcher| blk: {
-                const ordinal: u32 = @intCast(self.layout.ordinalForName(self.table.relational_columns, flatPath(matcher.path).?) orelse break :blk 0);
+                const ordinal = matcher.ordinal orelse break :blk 0;
                 const column_view = try self.column(ordinal);
-                if (matcher.predicate == .exists or (column_view.bounds.present and !try matcher.predicate.mayMatchNumericBounds(column_view.bounds.minimum, column_view.bounds.maximum))) break :blk 0;
+                if (matcher.remaining == null and (matcher.predicate.* == .exists or (column_view.bounds.present and !try matcher.predicate.mayMatchNumericBounds(column_view.bounds.minimum, column_view.bounds.maximum)))) break :blk 0;
                 const cost = try self.payloadCost(ordinal, candidates);
                 const weight: u64 = switch (self.table.relational_columns[ordinal].column_type) {
                     .json, .dense_vector, .geoshape => 64,
@@ -2580,13 +2596,13 @@ const Block = struct {
 
     /// A limited scan evaluates at most one physical page of each predicate
     /// column before delivering rows. Scalar-only scans keep vectorized blocks.
-    fn windowEnd(self: *@This(), filter: graph.CompiledPatternFilter, first: usize) anyerror!usize {
+    fn windowEnd(self: *@This(), filter: scan_plan.Filter, first: usize) anyerror!usize {
         try self.checkWork();
         var end = self.rows.len;
         switch (filter) {
             .field_matcher => |matcher| {
-                if (matcher.predicate == .exists) return end;
-                const ordinal: u32 = @intCast(self.layout.ordinalForName(self.table.relational_columns, flatPath(matcher.path).?) orelse return end);
+                if (matcher.predicate.* == .exists and matcher.remaining == null) return end;
+                const ordinal = matcher.ordinal orelse return end;
                 if ((try self.column(ordinal)).pages) |pages| {
                     end = pages.end(pages.containing(first));
                 }
@@ -2613,9 +2629,20 @@ pub const Progress = struct {
     callback_failed: bool = false,
 };
 
-pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, filter: ?*const graph.PreparedPatternFilter) !bool {
-    if (opts.include_documents and (opts.include_all_fields or opts.fields.len == 0)) return false;
-    for (opts.fields) |field| if (field.len == 0 or field[0] == '_' or std.mem.indexOfAny(u8, field, ".*-") != null) return false;
+/// Complex/special projections use the DB's existing transaction-aware loader.
+/// This callback runs only after selection and borrows the same scan snapshot.
+pub const Materializer = struct {
+    context: *anyopaque,
+    project: *const fn (*anyopaque, alloc_type, []const u8, codec.OrdinalRowView) anyerror![]u8,
+};
+
+fn projectPrimary(plan: *const scan_plan.Plan, materializer: Materializer, alloc: alloc_type, key: []const u8, row: codec.OrdinalRowView) ![]u8 {
+    if (plan.projected) |projected| return projected.project(alloc, row);
+    return materializer.project(materializer.context, alloc, key, row);
+}
+
+pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, filter: ?*const graph.PreparedPatternFilter, materializer: Materializer) !bool {
+    if (opts.disable_columnar_scan) return false;
     if (filter) |value| if (!supports(value.compiled)) return false;
     const raw = txn.get(manifest_key) catch |err| switch (err) {
         error.NotFound => return false,
@@ -2623,6 +2650,8 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
     };
     const manifest = try Manifest.decode(raw);
     if (!manifest.ready) return false;
+    var plans = scan_plan.Cache{ .alloc = alloc, .source = filter, .opts = opts };
+    defer plans.deinit();
     const bootstrap = try bootstrapBoundary(txn, manifest);
     if (opts.columnar_stats) |stats| stats.used = true;
     const lower_key = if (std.mem.order(u8, from, byte_range.start) == .gt) from else byte_range.start;
@@ -2655,7 +2684,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         if (byte_range.end.len != 0 and std.mem.order(u8, range.start, byte_range.end) != .lt) return true;
         if (bootstrap) |boundary| if (std.mem.order(u8, range.start, boundary) != .lt) {
             if (opts.columnar_stats) |stats| stats.uncovered_ranges_read += 1;
-            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
             if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
             continue;
         };
@@ -2692,19 +2721,32 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
             row.physical_bytes = try decoder.int(u64);
         }
         if (decoder.bytes.len != 0) return error.InvalidColumnSegment;
-        var view = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
-        defer view.release();
+        const schema_plan = try plans.get(db, version);
+        defer schema_plan.release();
+        const view = schema_plan.view;
         try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
-        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats, .scan_options = opts, .payload_cache = &payload_cache };
+        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats, .scan_options = opts, .payload_cache = &payload_cache, .plan = schema_plan };
         defer block.deinit();
         var matched: [max_rows]bool = @splat(true);
         var candidates: [max_rows]bool = @splat(false);
         for (rows, 0..) |row, i| candidates[i] = std.mem.order(u8, row.key, range.start) != .lt and (range.end.len == 0 or std.mem.order(u8, row.key, range.end) == .lt) and eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns);
-        const plan = if (dirty_range) try planRange(txn, scratch, range, from, to, byte_range, opts, &block, candidates[0..rows.len], filter) else RangeScanPlan{ .visibility_complete = true };
+        // Full/special output pays primary I/O only for survivors. For an
+        // scan with at least a block of remaining output budget, measure the
+        // actual selection before choosing random materialization versus a
+        // sequential owner scan. Small limits retain page-window evaluation.
+        const selected_for_cost = (opts.limit == 0 or opts.limit -| progress.delivered >= rows.len) and opts.include_documents and schema_plan.projected == null;
+        if (selected_for_cost) {
+            if (dirty_range) try excludeReplaced(txn, scratch, rows, candidates[0..rows.len]);
+            if (schema_plan.filter) |value| {
+                try block.evaluate(value, candidates[0..rows.len], matched[0..rows.len]);
+                @memcpy(candidates[0..rows.len], matched[0..rows.len]);
+            }
+        }
+        const plan = if (dirty_range or selected_for_cost) try planRange(txn, scratch, range, from, to, byte_range, opts, &block, candidates[0..rows.len], schema_plan.filter) else RangeScanPlan{ .visibility_complete = true };
         if (plan.primary) {
             if (opts.columnar_stats) |stats| stats.dense_delta_scans += 1;
             db.relational_column_maintenance.noteRead(manifest.generation, index, source_bytes);
-            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
             if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
             continue;
         }
@@ -2715,9 +2757,9 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
             if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
             // Advance the ordered mutation frontier before touching base
             // predicate pages. Earlier deltas may satisfy LIMIT by themselves.
-            _ = try dirty_ranges.emitThrough(db, alloc, txn, rows[window_first].key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+            _ = try dirty_ranges.emitThrough(db, alloc, txn, rows[window_first].key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
             if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
-            const window_end = if (opts.limit > 0 and filter != null) try block.windowEnd(filter.?.compiled, window_first) else rows.len;
+            const window_end = if (opts.limit > 0 and schema_plan.filter != null) try block.windowEnd(schema_plan.filter.?, window_first) else rows.len;
             var window_candidates: [max_rows]bool = @splat(false);
             @memcpy(window_candidates[window_first..window_end], candidates[window_first..window_end]);
             // Cost probes can stop early and small LIMITs skip them altogether.
@@ -2725,7 +2767,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
             // seeks rather than walking arbitrarily large insertion gaps.
             if (!plan.visibility_complete) try excludeReplaced(txn, scratch, rows[window_first..window_end], window_candidates[window_first..window_end]);
             @memcpy(matched[0..rows.len], window_candidates[0..rows.len]);
-            if (filter) |value| try block.evaluate(value.compiled, window_candidates[0..rows.len], matched[0..rows.len]);
+            if (!selected_for_cost) if (schema_plan.filter) |value| try block.evaluate(value, window_candidates[0..rows.len], matched[0..rows.len]);
             any_matched = any_matched or std.mem.indexOfScalar(bool, matched[window_first..window_end], true) != null;
             for (rows[window_first..window_end], window_first..) |row, i| {
                 if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
@@ -2733,7 +2775,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                 // A retained suffix block may contain retired prefix rows. Never
                 // merge across the current directory range's boundary.
                 if (std.mem.order(u8, row.key, range.start) == .lt or (range.end.len != 0 and std.mem.order(u8, row.key, range.end) != .lt)) continue;
-                const replaced = try dirty_ranges.emitThrough(db, alloc, txn, row.key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+                const replaced = try dirty_ranges.emitThrough(db, alloc, txn, row.key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
                 if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
                 if (replaced) continue;
                 if (!matched[i] or !byte_range.contains(row.key) or std.mem.order(u8, row.key, from) == .lt or
@@ -2741,13 +2783,32 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                 if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, row.key, to) != .lt else std.mem.order(u8, row.key, to) == .gt)) continue;
                 if (ttl_ns != 0 and row.timestamp != 0 and @import("../ttl.zig").isExpired(row.timestamp, ttl_ns, now_ns)) continue;
                 var projected: ?[]u8 = null;
+                var row_arena = std.heap.ArenaAllocator.init(alloc);
+                defer row_arena.deinit();
+                const row_alloc = row_arena.allocator();
                 if (opts.include_documents) {
-                    var object = std.json.ObjectMap.empty;
-                    for (opts.fields) |field| {
-                        const ordinal: u32 = @intCast(block.layout.ordinalForName(block.table.relational_columns, field) orelse continue);
-                        if (try block.logicalValue(ordinal, i)) |value| try object.put(scratch, field, value);
+                    if (schema_plan.projected) |projection| {
+                        var object = std.json.ObjectMap.empty;
+                        for (projection.base.ordinals) |ordinal| {
+                            if (try block.logicalValue(ordinal, i)) |value| try object.put(row_alloc, block.table.relational_columns[ordinal].name, value);
+                        }
+                        projected = try projection.projectObject(row_alloc, row_alloc, object);
+                    } else {
+                        var primary_scope = try txn.openReadScope(row_alloc);
+                        defer primary_scope.close();
+                        const bytes = try primary_scope.get(try keys.relationalRowKeyAlloc(row_alloc, row.key));
+                        if (try codec.rowSchemaVersion(bytes) != view.version()) return error.InvalidColumnSegment;
+                        if (opts.columnar_stats) |stats| {
+                            stats.primary_rows_read += 1;
+                            stats.late_materialized_rows += 1;
+                            stats.late_materialized_bytes += bytes.len;
+                        }
+                        const typed = if (db.core.store.valuesAreAuthenticated()) try codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout()) else try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+                        // A clean covered row must still name the exact primary
+                        // image. Never emit stale selection after derived damage.
+                        if (!std.mem.eql(u8, &row.hash, &typed.semanticHash()) or row.timestamp != typed.writeTimestampNs()) return error.InvalidColumnSegment;
+                        projected = try projectPrimary(schema_plan, materializer, row_alloc, row.key, typed);
                     }
-                    projected = try std.json.Stringify.valueAlloc(scratch, std.json.Value{ .object = object }, .{});
                 }
                 try deliver(alloc, row, projected, opts, visitor, progress);
                 if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
@@ -2757,12 +2818,12 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         if (!any_matched) if (opts.columnar_stats) |stats| {
             stats.blocks_pruned += 1;
         };
-        _ = try dirty_ranges.emitThrough(db, alloc, txn, range.end, false, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+        _ = try dirty_ranges.emitThrough(db, alloc, txn, range.end, false, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
         if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
     }
     if (!had_range) {
         if (manifest.ranges != 0) return error.InvalidColumnSegment;
-        try scanPrimaryRange(db, alloc, txn, "", "", from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, filter);
+        try scanPrimaryRange(db, alloc, txn, "", "", from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
     }
     return true;
 }
@@ -2808,7 +2869,7 @@ fn deliver(alloc: alloc_type, row: Row, projected: ?[]const u8, opts: types.Scan
     if (opts.columnar_stats) |stats| stats.rows_selected += 1;
 }
 
-fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, range_start: []const u8, range_end: []const u8, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, filter: ?*const graph.PreparedPatternFilter) !void {
+fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, range_start: []const u8, range_end: []const u8, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, plans: *scan_plan.Cache, materializer: Materializer) !void {
     const Context = struct {
         db: @TypeOf(db),
         alloc: alloc_type,
@@ -2821,8 +2882,8 @@ fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn
         ttl_ns: u64,
         now_ns: u64,
         progress: *Progress,
-        filter: ?*const graph.PreparedPatternFilter,
-        view: ?registry.SchemaView = null,
+        plans: *scan_plan.Cache,
+        materializer: Materializer,
         fn checkpoint(ptr: ?*anyopaque, _: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (self.opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
@@ -2845,34 +2906,23 @@ fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn
             if (self.to.len != 0 and (if (self.opts.exclusive_to) std.mem.order(u8, id, self.to) != .lt else std.mem.order(u8, id, self.to) == .gt)) return .stop;
             if (self.opts.columnar_stats) |stats| stats.primary_rows_read += 1;
             const version = try codec.rowSchemaVersion(value);
-            if (self.view == null or self.view.?.version() != version) {
-                if (self.view) |*view| view.release();
-                self.view = null;
-                self.view = (try self.db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
-            }
-            const view = self.view.?;
+            const plan = try self.plans.get(self.db, version);
+            defer plan.release();
+            const view = plan.view;
             const typed = if (self.db.core.store.valuesAreAuthenticated())
                 try codec.ordinalRowViewTrusted(value, view.tableSchema().*, view.physicalLayout())
             else
                 try codec.ordinalRowView(value, view.tableSchema().*, view.physicalLayout());
             const row = Row{ .key = id, .hash = typed.semanticHash(), .timestamp = typed.writeTimestampNs() };
             if (!eligibleRow(row, self.from, self.to, self.byte_range, self.opts, self.ttl_ns, self.now_ns)) return .@"continue";
-            if (self.filter) |compiled| {
-                const matches = (try compiled.compiled.matchesOrdinal(scratch, row.key, typed)) orelse blk: {
-                    var logical = try typed.materializeRootAlloc(scratch);
-                    defer logical.deinit(scratch);
-                    break :blk try compiled.compiled.matches(scratch, row.key, logical.root);
-                };
-                if (!matches) return .@"continue";
-            }
-            const projected = if (self.opts.include_documents) try codec.projectOrdinalFieldsTrustedWithLayoutAlloc(scratch, value, view.tableSchema().*, view.physicalLayout(), self.opts.fields) else null;
+            if (!try plan.matches(scratch, row.key, typed)) return .@"continue";
+            const projected = if (self.opts.include_documents) try projectPrimary(plan, self.materializer, scratch, row.key, typed) else null;
             try deliver(self.alloc, row, projected, self.opts, self.visitor, self.progress);
             return if (self.opts.limit > 0 and self.progress.delivered >= self.opts.limit) .stop else .@"continue";
         }
     };
-    var context = Context{ .db = db, .alloc = alloc, .arena = std.heap.ArenaAllocator.init(alloc), .from = from, .to = to, .byte_range = byte_range, .opts = opts, .visitor = visitor, .ttl_ns = ttl_ns, .now_ns = now_ns, .progress = progress, .filter = filter };
+    var context = Context{ .db = db, .alloc = alloc, .arena = std.heap.ArenaAllocator.init(alloc), .from = from, .to = to, .byte_range = byte_range, .opts = opts, .visitor = visitor, .ttl_ns = ttl_ns, .now_ns = now_ns, .progress = progress, .plans = plans, .materializer = materializer };
     defer context.arena.deinit();
-    defer if (context.view) |*view| view.release();
     var lower_raw = if (std.mem.order(u8, range_start, from) == .lt) from else range_start;
     if (std.mem.order(u8, lower_raw, byte_range.start) == .lt) lower_raw = byte_range.start;
     var upper_raw: ?[]const u8 = if (range_end.len != 0) range_end else null;

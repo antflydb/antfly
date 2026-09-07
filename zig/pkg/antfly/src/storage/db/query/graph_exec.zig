@@ -2943,7 +2943,7 @@ pub const CompiledPatternFilter = union(enum) {
         dotted: []const []const u8,
         json_pointer: []const []const u8,
 
-        fn collectValues(self: FieldPath, alloc: Allocator, doc: std.json.Value, out: *std.ArrayListUnmanaged(std.json.Value)) !void {
+        pub fn collectValues(self: FieldPath, alloc: Allocator, doc: std.json.Value, out: *std.ArrayListUnmanaged(std.json.Value)) !void {
             switch (self) {
                 .single => |segment| try collectJsonValuesAtSingleSegment(alloc, doc, segment, out),
                 .dotted => |segments| try collectJsonValuesAtPath(alloc, doc, segments, 0, out),
@@ -4006,7 +4006,7 @@ fn collectJsonValueAtPointer(
     try out.append(alloc, current);
 }
 
-fn isCanonicalJsonPointerArrayIndex(segment: []const u8) bool {
+pub fn isCanonicalJsonPointerArrayIndex(segment: []const u8) bool {
     if (segment.len == 0) return false;
     if (segment.len > 1 and segment[0] == '0') return false;
     for (segment) |char| {

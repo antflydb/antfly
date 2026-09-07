@@ -417,6 +417,15 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
 /// Deserialize a TableSchema from bytes. Dupes all string data so the result
 /// is independent of the source buffer. Call `freeSchema` to release.
 pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
+    const result = try deserializeSchemaOwned(alloc, data);
+    errdefer freeSchema(alloc, result);
+    // Ownership has transferred out of the decoder's partial-allocation
+    // cleanup scopes before validation can allocate or fail.
+    try validateRelationalSchema(alloc, result);
+    return result;
+}
+
+fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
     // Persisted schemas are also accepted from portable backups and HA logs.
     // Validate the complete byte stream before any unchecked legacy decoding
     // or input-sized allocation so corruption is always a typed error.
@@ -807,6 +816,8 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk docs;
     } else &.{};
 
+    errdefer freeFullTextDocuments(alloc, full_text_documents);
+
     const index_sort: []IndexSortField = if (fmt_version >= 10) blk: {
         const field_count = readU32(data, &pos);
         const fields = try alloc.alloc(IndexSortField, field_count);
@@ -825,6 +836,11 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         }
         break :blk fields;
     } else &.{};
+
+    errdefer {
+        for (index_sort) |field| alloc.free(field.field);
+        if (index_sort.len != 0) alloc.free(index_sort);
+    }
 
     if (fmt_version >= 13 and pos >= data.len) return error.InvalidFormat;
     const storage_mode: StorageMode = if (fmt_version >= 13) switch (data[pos]) {
@@ -912,8 +928,6 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .relational_columns = relational_columns,
         .index_sort = index_sort,
     };
-    errdefer freeSchema(alloc, result);
-    try validateRelationalSchema(alloc, result);
     return result;
 }
 
@@ -1170,7 +1184,18 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         alloc.free(field.mapping.analyzer);
     }
     if (s.declared_fields.len > 0) alloc.free(s.declared_fields);
-    for (s.full_text_documents) |doc| {
+    freeFullTextDocuments(alloc, s.full_text_documents);
+    for (s.relational_columns) |column| {
+        alloc.free(column.name);
+        alloc.free(column.path);
+    }
+    if (s.relational_columns.len > 0) alloc.free(s.relational_columns);
+    for (s.index_sort) |field| alloc.free(field.field);
+    if (s.index_sort.len > 0) alloc.free(s.index_sort);
+}
+
+fn freeFullTextDocuments(alloc: Allocator, documents: []const FullTextDocument) void {
+    for (documents) |doc| {
         alloc.free(doc.name);
         for (doc.fields) |field| {
             alloc.free(field.path);
@@ -1194,14 +1219,7 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
         for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
     }
-    if (s.full_text_documents.len > 0) alloc.free(s.full_text_documents);
-    for (s.relational_columns) |column| {
-        alloc.free(column.name);
-        alloc.free(column.path);
-    }
-    if (s.relational_columns.len > 0) alloc.free(s.relational_columns);
-    for (s.index_sort) |field| alloc.free(field.field);
-    if (s.index_sort.len > 0) alloc.free(s.index_sort);
+    if (documents.len > 0) alloc.free(documents);
 }
 
 /// Save a schema to DocStore. Returns whether durable state changed.
@@ -2767,6 +2785,10 @@ test "schema deserialization cleans initialized mappings on allocation failure" 
             .field = "title.keyword",
             .mapping = .{ .field_type = .keyword, .analyzer = "keyword" },
         }},
+        .storage_mode = .relational,
+        .relational_columns = &.{.{ .name = "title", .path = "title", .column_type = .string }},
+        .full_text_documents = &.{.{ .name = "row", .fields = &.{} }},
+        .index_sort = &.{.{ .field = "title.keyword", .desc = false }},
     });
     defer alloc.free(encoded);
 

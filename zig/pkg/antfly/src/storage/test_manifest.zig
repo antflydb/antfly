@@ -61,6 +61,7 @@ comptime {
     _ = @import("db/catalog/index_manager.zig");
     _ = @import("db/catalog/resolver_catalog.zig");
     _ = @import("db/column_read_cache.zig");
+    _ = @import("db/column_scan_plan.zig");
     _ = @import("db/config.zig");
     _ = @import("db/db.zig");
     _ = @import("db/dense_exact.zig");

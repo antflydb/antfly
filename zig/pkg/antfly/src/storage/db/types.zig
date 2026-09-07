@@ -1120,6 +1120,10 @@ pub const LookupResult = struct {
 };
 
 pub const ColumnarScanStats = struct {
+    scan_plans_built: u64 = 0,
+    scan_plan_hits: u64 = 0,
+    late_materialized_rows: u64 = 0,
+    late_materialized_bytes: u64 = 0,
     column_view_bytes: u64 = 0,
     logical_slots_initialized: u64 = 0,
     decoded_cache_hits: u64 = 0,
@@ -1154,6 +1158,8 @@ pub const ColumnarScanStats = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Internal differential-testing and benchmark baseline; never serialized.
+    disable_columnar_scan: bool = false,
     /// Internal request-local decoded payload reuse budget. Includes retained
     /// payload allocations and cache metadata; excludes active block workspace.
     /// Zero disables cross-block reuse. Never serialized on the wire.

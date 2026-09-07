@@ -1026,7 +1026,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 test "schema epoch conflicts retain a retryable public status" {
     // main published this value before the relational-only tail. Preserve it
     // when both branches append details independently.
-    try std.testing.expectEqual(@as(c_int, 296), @intFromEnum(Detail.unsupported_tensor_type));
+    try std.testing.expectEqual(@as(c_int, 297), @intFromEnum(Detail.unsupported_tensor_type));
     const value = statusFromError(error.SchemaInUse);
     try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
     try std.testing.expectEqual(error.SchemaInUse, errorFromStatus(value));

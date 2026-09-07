@@ -32386,7 +32386,8 @@ pub const DB = struct {
 
         var columnar_progress: relational_columns.Progress = .{};
         defer columnar_progress.last_key.deinit(alloc);
-        const accelerated = if (schema_view != null and schema_view.?.storageMode() == .relational) relational_columns.scan(self, alloc, &read_txn, from_key, to_key, byte_range, opts, visitor, ttl_duration_ns, scan_now_ns, &columnar_progress, if (prepared_filter) |*filter| filter else null) catch |err| switch (err) {
+        var column_materializer = ColumnScanMaterializer{ .context = &projection_context, .opts = opts };
+        const accelerated = if (schema_view != null and schema_view.?.storageMode() == .relational) relational_columns.scan(self, alloc, &read_txn, from_key, to_key, byte_range, opts, visitor, ttl_duration_ns, scan_now_ns, &columnar_progress, if (prepared_filter) |*filter| filter else null, .{ .context = &column_materializer, .project = ColumnScanMaterializer.project }) catch |err| switch (err) {
             error.InvalidColumnSegment, error.InvalidData, error.NotFound => blk: {
                 if (columnar_progress.callback_failed) return err;
                 // Disposable derived corruption never makes valid primary rows
@@ -36989,11 +36990,7 @@ fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.Sear
 }
 
 fn ordinalProjectionFields(fields: []const []const u8, include_all_fields: bool) ?[]const []const u8 {
-    if (include_all_fields or fields.len == 0) return null;
-    for (fields) |field| {
-        if (field.len == 0 or field[0] == '-' or field[0] == '_' or
-            std.mem.indexOfScalar(u8, field, '*') != null) return null;
-    }
+    if (!RelationalProjectionPlan.supports(fields, include_all_fields)) return null;
     return fields;
 }
 
@@ -37326,6 +37323,22 @@ fn loadArtifactFieldValueTxnCallback(
         projection.artifact_catalog,
     );
 }
+
+const ColumnScanMaterializer = struct {
+    context: *TransactionProjectionContext,
+    opts: types.ScanOptions,
+
+    fn project(raw: *anyopaque, alloc: Allocator, key: []const u8, row: @import("algebraic/relational_row_codec.zig").OrdinalRowView) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const logical = try row.reconstructValueAlloc(alloc);
+        if (self.opts.fields.len == 0 and self.opts.include_all_fields) return logical;
+        defer alloc.free(logical);
+        return projectLookupStoredBytesTxn(self.context, alloc, key, logical, .{
+            .fields = self.opts.fields,
+            .include_all_fields = self.opts.include_all_fields,
+        });
+    }
+};
 
 fn projectLookupStoredBytesTxn(
     context: *TransactionProjectionContext,
@@ -63855,6 +63868,185 @@ test "relational columnar decoded cache preserves snapshots and releases visitor
     }
 }
 
+fn seedColumnScanPlanTest(db: *DB, alloc: Allocator) !void {
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"user-name":{"type":"string"},"payload":{"type":"json"},"embedding":{"type":"embedding"},"wide":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const wide = try scratch.alloc(u8, 8192);
+    @memset(wide, 'x');
+    const writes = try scratch.alloc(types.BatchWrite, 768);
+    for (writes, 0..) |*write, i| write.* = .{
+        .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}),
+        .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d},\"user-name\":\"Ada\",\"payload\":{{\"items\":[{{\"id\":{d}}},{{\"id\":2}}],\"nil\":null}},\"embedding\":[1,2,3],\"wide\":\"{s}\"}}", .{ i, i, wide }),
+    };
+    try db.batch(.{ .writes = writes });
+    try drainTestRelationalMaintenance(db);
+}
+
+test "relational columnar bound selection and late projection match primary semantics" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        try seedColumnScanPlanTest(&db, alloc);
+        const selections = [_][]const []const u8{
+            &.{},                     &.{"user-name"}, &.{ "payload.items.id", "payload.nil", "missing.name" },
+            &.{"payload.items.1.id"}, &.{"-wide"},     &.{"user-*"},
+            &.{ "n", "_embeddings" },
+        };
+        const filters = [_][]const u8{
+            "{\"numeric_range\":{\"field\":\"n\",\"min\":760}}",
+            "{\"term\":{\"payload.items.id\":761}}",
+            "{\"term\":{\"/payload/items/0/id\":761}}",
+            "{\"conjuncts\":[{\"term\":{\"embedding.1\":2}},{\"term\":{\"n\":761}}]}",
+            "{\"conjuncts\":[{\"exists\":{\"field\":\"payload.nil\"}},{\"term\":{\"n\":761}}]}",
+        };
+        for (0..2) |dirty| {
+            if (dirty != 0) try db.batch(.{ .writes = &.{
+                .{ .key = "k0761", .value = "{\"n\":761,\"user-name\":\"Grace\",\"payload\":{\"items\":[{\"id\":761}],\"nil\":null},\"embedding\":[1,2,3]}" },
+                .{ .key = "k0761a", .value = "{\"n\":761,\"payload\":{\"items\":[{\"id\":761}]}}" },
+            }, .deletes = &.{"k0762"} });
+            for (selections) |fields| for (filters) |filter| for ([_]u32{ 0, 2 }) |limit| {
+                var stats: types.ColumnarScanStats = .{};
+                var opts = types.ScanOptions{ .include_documents = true, .fields = fields, .filter_query_json = filter, .limit = limit, .columnar_stats = &stats, .include_content_hashes = true };
+                var actual = try db.scan(alloc, "k0000", "k0767", opts);
+                defer actual.deinit(alloc);
+                try std.testing.expect(stats.used);
+                try std.testing.expectEqual(@as(u64, 1), stats.scan_plans_built);
+                try std.testing.expect(stats.scan_plan_hits > 0);
+                if (dirty == 0 and RelationalProjectionPlan.supports(fields, true)) try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
+                if (dirty == 0 and fields.len == 0) try std.testing.expectEqual(@as(u64, actual.documents.len), stats.late_materialized_rows);
+                opts.disable_columnar_scan = true;
+                opts.columnar_stats = null;
+                var expected = try db.scan(alloc, "k0000", "k0767", opts);
+                defer expected.deinit(alloc);
+                try std.testing.expectEqualDeep(expected.documents, actual.documents);
+                try std.testing.expectEqualDeep(expected.hashes, actual.hashes);
+            };
+        }
+        // Dense full output must choose sequential primary access, not turn
+        // every selected owner into an independent random read.
+        var stats: types.ColumnarScanStats = .{};
+        var dense = try db.scan(alloc, "", "", .{ .include_documents = true, .columnar_stats = &stats });
+        defer dense.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 768), dense.documents.len);
+        try std.testing.expect(stats.dense_delta_scans > 0);
+        try std.testing.expectEqual(@as(u64, 0), stats.late_materialized_rows);
+    }
+}
+
+test "relational columnar late materialization pins snapshots and releases visitor failures" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        try seedColumnScanPlanTest(&db, alloc);
+        const Visitor = struct {
+            db: *DB,
+            seen: usize = 0,
+            mutate: bool = false,
+            fail: bool = false,
+            cancelled: ?*std.atomic.Value(bool) = null,
+            fn visit(ptr: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr.?));
+                if (self.mutate and self.seen == 0) {
+                    try self.db.batch(.{ .writes = &.{.{ .key = "k0767", .value = "{\"n\":999,\"user-name\":\"changed\"}" }} });
+                    try drainTestRelationalMaintenance(self.db);
+                }
+                try std.testing.expect(std.mem.indexOf(u8, entry.document_json.?, "changed") == null);
+                self.seen += 1;
+                if (self.seen == 2) {
+                    if (self.fail) return error.NotFound;
+                    if (self.cancelled) |flag| flag.store(true, .release);
+                }
+            }
+        };
+        var measured = std.testing.FailingAllocator.init(alloc, .{});
+        var stats: types.ColumnarScanStats = .{};
+        var opts = types.ScanOptions{ .include_documents = true, .limit = 8, .filter_query_json = "{\"numeric_range\":{\"field\":\"n\",\"min\":760,\"max\":768}}", .columnar_stats = &stats };
+        var visitor = Visitor{ .db = &db, .mutate = true };
+        try db.scanVisit(measured.allocator(), "", "", opts, .{ .context = &visitor, .visit = Visitor.visit });
+        try std.testing.expectEqual(@as(usize, 8), visitor.seen);
+        try std.testing.expectEqual(@as(u64, 8), stats.late_materialized_rows);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+        visitor = .{ .db = &db, .fail = true };
+        try std.testing.expectError(error.NotFound, db.scanVisit(measured.allocator(), "", "", opts, .{ .context = &visitor, .visit = Visitor.visit }));
+        try std.testing.expectEqual(@as(usize, 2), visitor.seen);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+        var cancelled = std.atomic.Value(bool).init(false);
+        visitor = .{ .db = &db, .cancelled = &cancelled };
+        opts.cancellation = types.CancellationToken.fromAtomic(&cancelled);
+        try std.testing.expectError(error.Canceled, db.scanVisit(measured.allocator(), "", "", opts, .{ .context = &visitor, .visit = Visitor.visit }));
+        try std.testing.expectEqual(@as(usize, 2), visitor.seen);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+    }
+}
+
+test "relational columnar bound scan benchmark" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        try seedColumnScanPlanTest(&db, alloc);
+        const Scenario = struct { fields: []const []const u8, filter: []const u8 = "{\"numeric_range\":{\"field\":\"n\",\"min\":760}}", rows: usize = 8 };
+        for ([_]Scenario{
+            .{ .fields = &.{} },                            .{ .fields = &.{"payload.items.0.id"} },                            .{ .fields = &.{"user-name"} },
+            .{ .fields = &.{}, .filter = "", .rows = 768 }, .{ .fields = &.{"payload.items.0.id"}, .filter = "", .rows = 768 },
+        }) |scenario| {
+            const fields = scenario.fields;
+            var elapsed: [2][7]u64 = undefined;
+            var allocated: [2]usize = @splat(0);
+            var counters: types.ColumnarScanStats = .{};
+            for (0..8) |round| for (0..2) |step| {
+                const mode = (round + step) % 2;
+                var measured = std.testing.FailingAllocator.init(alloc, .{});
+                var stats: types.ColumnarScanStats = .{};
+                const start = platform_time.monotonicNs();
+                var result = try db.scan(measured.allocator(), "", "", .{
+                    .include_documents = true,
+                    .fields = fields,
+                    .filter_query_json = scenario.filter,
+                    .disable_columnar_scan = mode == 0,
+                    .columnar_stats = &stats,
+                });
+                try std.testing.expectEqual(scenario.rows, result.documents.len);
+                result.deinit(measured.allocator());
+                const ns = platform_time.monotonicNs() - start;
+                try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+                if (round > 0) elapsed[mode][round - 1] = ns;
+                allocated[mode] = measured.allocated_bytes;
+                if (mode == 1) {
+                    counters = stats;
+                    try std.testing.expectEqual(@as(u64, 1), stats.scan_plans_built);
+                    try std.testing.expectEqual(@as(u64, if (fields.len == 0) scenario.rows else 0), stats.primary_rows_read);
+                }
+            };
+            for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+            std.debug.print("\nbound scan: backend={s}, projection={s}, rows={d}, primary/column median ns={d}/{d}, allocated bytes={d}/{d}, plans={d}, hits={d}, primary rows={d}, payload bytes={d}\n", .{
+                @tagName(backend), if (fields.len == 0) "full" else fields[0], scenario.rows, elapsed[0][3], elapsed[1][3], allocated[0], allocated[1], counters.scan_plans_built, counters.scan_plan_hits, counters.primary_rows_read, counters.payload_bytes_read,
+            });
+        }
+    }
+}
+
 test "relational columnar decoded reuse benchmark" {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
@@ -64628,6 +64820,9 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
         "{\"bool\":{\"must\":[{\"term\":{\"payload\":2}},{\"numeric_range\":{\"field\":\"n\",\"min\":100}}]}}",
         "{\"disjuncts\":[{\"exists\":{\"field\":\"n\"}},{\"term\":{\"payload\":2}}]}",
         "{\"bool\":{\"should\":[{\"term\":{\"embedding\":5}},{\"term\":{\"n\":2}}],\"minimum_should_match\":2}}",
+        "{\"term\":{\"embedding.1\":5}}",
+        "{\"term\":{\"/embedding/1\":5}}",
+        "{\"term\":{\"/embedding/01\":5}}",
     };
     var baseline: [filters.len]types.ScanResult = undefined;
     var initialized: usize = 0;
