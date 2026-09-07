@@ -38799,7 +38799,12 @@ fn computeDenseMaterializedChunkRequestImpl(
     var pending_chunk_keys = std.StringHashMapUnmanaged(void).empty;
     defer pending_chunk_keys.deinit(alloc);
 
-    for (artifact_writes.items) |write| {
+    // A flush appends embedding writes and may relocate the list. Keep the
+    // original scan boundary, but reacquire each write from the current storage.
+    const original_write_count = artifact_writes.items.len;
+    var write_index: usize = 0;
+    while (write_index < original_write_count) : (write_index += 1) {
+        const write = artifact_writes.items[write_index];
         if (!std.mem.startsWith(u8, write.key, prefix) or
             !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
         if (pending_chunk_keys.contains(write.key)) continue;
@@ -38995,7 +39000,12 @@ fn computeSparseMaterializedChunkRequest(
     var pending_chunk_keys = std.StringHashMapUnmanaged(void).empty;
     defer pending_chunk_keys.deinit(alloc);
 
-    for (artifact_writes.items) |write| {
+    // A flush appends embedding writes and may relocate the list. Keep the
+    // original scan boundary, but reacquire each write from the current storage.
+    const original_write_count = artifact_writes.items.len;
+    var write_index: usize = 0;
+    while (write_index < original_write_count) : (write_index += 1) {
+        const write = artifact_writes.items[write_index];
         if (!std.mem.startsWith(u8, write.key, prefix) or
             !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
         if (pending_chunk_keys.contains(write.key)) continue;
@@ -70247,6 +70257,177 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     try std.testing.expectEqualStrings("doc:a", chunk_unit_result.hits[0].artifact_ref.?.document_id);
     try std.testing.expectEqualStrings("document_units_v1", chunk_unit_result.hits[0].artifact_ref.?.name);
     try std.testing.expectEqualStrings("document:000001", chunk_unit_result.hits[0].artifact_ref.?.unit_id.?);
+}
+
+test "db materialized dense enrichment survives artifact write list growth" {
+    try testMaterializedEmbeddingWriteGrowth(.dense);
+}
+
+test "db materialized derived dense enrichment survives artifact write list growth" {
+    try testMaterializedEmbeddingWriteGrowth(.derived_dense);
+}
+
+test "db materialized sparse enrichment survives artifact write list growth" {
+    try testMaterializedEmbeddingWriteGrowth(.sparse);
+}
+
+fn testMaterializedEmbeddingWriteGrowth(comptime mode: enum { dense, derived_dense, sparse }) !void {
+    const alloc = std.testing.allocator;
+    const is_sparse = mode == .sparse;
+    const embedding_name = if (is_sparse) "document_sparse" else "document_dense";
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+            .sparse_embedder = deterministic_sparse.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = embedding_name,
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = if (is_sparse) 0 else 3,
+    });
+    try db.addIndex(.{
+        .name = embedding_name,
+        .kind = if (is_sparse) .sparse_vector else .dense_vector,
+        .config_json = if (is_sparse)
+            "{\"field\":\"sparse_embedding\"}"
+        else
+            "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_dense\"}",
+    });
+
+    // Leave a chunk after the first flush and no spare capacity for its output.
+    // Follow the configured item limit so batch tuning cannot bypass the regression.
+    const chunk_count = generatedEmbedBatchItems() + 1;
+    var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (artifact_writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        artifact_writes.deinit(alloc);
+    }
+    try artifact_writes.ensureTotalCapacityPrecise(alloc, chunk_count);
+    for (0..chunk_count) |chunk_id| {
+        const key = try internal_keys.documentUnitChunkArtifactKeyAlloc(
+            alloc,
+            "doc:a",
+            "document_chunks_v1",
+            "document:000001",
+            @intCast(chunk_id),
+        );
+        errdefer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"text\":\"chunk {d}\"}}", .{chunk_id});
+        errdefer alloc.free(value);
+        artifact_writes.appendAssumeCapacity(.{ .key = key, .value = value });
+    }
+    const original_write_pointer = artifact_writes.items.ptr;
+
+    const Embedding = switch (mode) {
+        .dense => types.EnrichmentDenseEmbeddingWrite,
+        .derived_dense => derived_types.DerivedDenseEmbeddingWrite,
+        .sparse => derived_types.DerivedSparseEmbeddingWrite,
+    };
+    var embeddings = std.ArrayListUnmanaged(Embedding).empty;
+    defer {
+        for (embeddings.items) |*embedding| {
+            switch (mode) {
+                .dense => embedding.deinit(alloc),
+                .derived_dense => derived_types.deinitDerivedDenseEmbedding(alloc, embedding.*),
+                .sparse => derived_types.deinitDerivedSparseEmbedding(alloc, embedding.*),
+            }
+        }
+        embeddings.deinit(alloc);
+    }
+    var chunk_cache = std.ArrayListUnmanaged(ChunkCacheEntry).empty;
+    defer {
+        for (chunk_cache.items) |entry| {
+            alloc.free(entry.key);
+            chunker_mod.freeChunks(alloc, entry.chunks);
+        }
+        chunk_cache.deinit(alloc);
+    }
+
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = if (is_sparse) .sparse_embedding else .dense_embedding,
+        .index_name = embedding_name,
+        .artifact_name = "document_chunks_v1",
+        .embedding_name = embedding_name,
+        .input_kind = .materialized_chunks,
+        .doc_key = "doc:a",
+        .source_field = "text",
+        .expected_dims = if (is_sparse) 0 else 3,
+        .producer_json = "{}",
+    };
+    const compute = switch (mode) {
+        .dense => computeDenseRequest,
+        .derived_dense => computeDenseRequestDerived,
+        .sparse => computeSparseRequestDerived,
+    };
+    try compute(alloc, &db, "{}", request, &artifact_writes, &embeddings, &chunk_cache);
+
+    // Guard the test's relocation precondition, not just the successful no-growth path.
+    try std.testing.expect(original_write_pointer != artifact_writes.items.ptr);
+    try std.testing.expectEqual(chunk_count * 2, artifact_writes.items.len);
+    try std.testing.expectEqual(chunk_count, embeddings.items.len);
+    var outputs = try PendingArtifactWriteIndex.init(alloc, artifact_writes.items);
+    defer outputs.deinit(alloc);
+    for (0..chunk_count) |chunk_id| {
+        const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(
+            alloc,
+            "doc:a",
+            "document_chunks_v1",
+            "document:000001",
+            @intCast(chunk_id),
+        );
+        defer alloc.free(chunk_key);
+        const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, embedding_name);
+        defer alloc.free(embedding_key);
+        const payload = outputs.get(embedding_key) orelse return error.TestUnexpectedResult;
+        const text = try std.fmt.allocPrint(alloc, "chunk {d}", .{chunk_id});
+        defer alloc.free(text);
+        if (is_sparse) {
+            var expected = try deterministic_sparse.interface().embedSparse(alloc, embedding_name, text);
+            defer expected.deinit(alloc);
+            var actual = try enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, payload);
+            defer actual.deinit(alloc);
+            try std.testing.expectEqualSlices(u32, expected.indices, actual.indices);
+            try std.testing.expectEqualSlices(f32, expected.values, actual.values);
+        } else {
+            const expected = try deterministic_dense.interface().embedDense(alloc, embedding_name, text, 3);
+            defer alloc.free(expected);
+            const actual = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, payload);
+            defer alloc.free(actual);
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
+    }
 }
 
 test "db document extraction chunks units through source artifact enrichment" {

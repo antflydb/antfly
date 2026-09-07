@@ -412,7 +412,7 @@ const run_usage_options =
     \\  --kernel-jit-mode <mode>             off, shadow, on, or required
     \\  --preload-model <spec>               Warm a model at startup; repeatable
     \\  --allow-insecure-public-bind         Permit a non-loopback listener without built-in auth/TLS
-    \\  --allow-unknown-models               Allow models absent from the registry
+    \\  --allow-unknown-models               Accepted for compatibility; unknown architectures are attempted by default
     \\  -h, --help                           Show this help and exit
     \\
 ;
@@ -490,7 +490,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
-    var allow_unknown_models = false;
+    var allow_unknown_models = true;
     var models_overridden = false;
     var ml_overridden = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -848,7 +848,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --scratch-budget-mb <n> Process-wide inference scratch-memory admission override (MiB)
         \\  --kernel-jit-mode <off|shadow|on|required> JIT startup-preloaded Metal/CUDA models
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
-        \\  --allow-unknown-models Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
+        \\  --allow-unknown-models Accepted for compatibility; unknown architectures are attempted by default
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)

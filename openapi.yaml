@@ -13534,8 +13534,10 @@ components:
           type: integer
           minimum: 0
           maximum: 20
-          description: Additive bounded-agent field for the query builder. Phase 1 remains a single-pass
-            generation flow, but this field is echoed in result accounting.
+          description: Maximum planning tool calls (0-20). Zero uses the compatibility planner. A positive
+            value enables model-directed table inspection and complete QueryRequest submission using the
+            canonical DSL parser and runtime preflight, with validation feedback for repair. It requires
+            an Antfly or OpenAI tool-capable generator and never executes database searches.
         max_user_clarifications:
           type: integer
           minimum: 0
@@ -14102,7 +14104,13 @@ components:
 
         **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
 
-        call, using the queries to determine available tables and indexes.
+        call, using the queries to determine available tables and indexes. A query
+
+        may contain only a table scope and caller constraints: build_query delegates
+
+        to the query-builder agent, then search executes its validated QueryRequest.
+
+        Refinements use the same canonical full-DSL validator, not keyword substitution.
 
 
         Authenticated row filters are enforced on every initial and generated
@@ -14194,7 +14202,11 @@ components:
           maximum: 20
           default: 0
           description: >
-            Maximum number of internal tool-calling rounds.
+            Maximum number of model-generation rounds across retrieval and any
+
+            delegated query-builder calls. All calls share the request deadline
+
+            and cancellation. Tool calls are additionally capped at 20 overall.
 
 
             - 0: Pipeline mode — execute provided queries directly, no LLM loop

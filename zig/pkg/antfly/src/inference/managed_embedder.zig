@@ -16,7 +16,7 @@ const std = @import("std");
 const ant_json = @import("antfly-json");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const request_context = @import("request_context.zig");
-const RequestContext = request_context.RequestContext;
+pub const RequestContext = request_context.RequestContext;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
@@ -193,6 +193,15 @@ pub const AntflyProvider = struct {
         options: inference_types.GenerationOptions,
         context: RequestContext,
     ) anyerror![]u8 = null,
+    /// Canonical generation request/response, including tool definitions,
+    /// sampling options and returned calls. Implementations use the same
+    /// admitted runtime route as the inference API, without a loopback socket.
+    generate_json: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request_json: []const u8,
+        context: ?RequestContext,
+    ) anyerror![]u8 = null,
     chunk_input: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -244,6 +253,11 @@ pub const AntflyProvider = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
     ) anyerror![]u8 = null,
+
+    pub fn generateJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+        const callback = self.generate_json orelse return error.UnsupportedGeneratorProvider;
+        return AntflyProviderBoundary.call("generate_json", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, context });
+    }
 };
 
 const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);

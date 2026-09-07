@@ -94,18 +94,41 @@ const PhaseCapture = struct {
     tokenizing_ns: u64 = 0,
     preparing_ns: u64 = 0,
     executing_ns: u64 = 0,
+    serializing_ns: u64 = 0,
+    active_phase: ?inference.execution_control.Phase = null,
+    last_transition_ns: u64 = 0,
+
+    fn begin(self: *@This(), started_ns: u64) void {
+        self.active_phase = .loading_model;
+        self.last_transition_ns = started_ns;
+    }
+
+    fn account(self: *@This(), phase: inference.execution_control.Phase, elapsed_ns: u64) void {
+        const slot = switch (phase) {
+            .queued, .loading_model, .loading_weights => &self.loading_ns,
+            .preparing_weights => &self.preparing_ns,
+            .tokenizing => &self.tokenizing_ns,
+            .executing => &self.executing_ns,
+            .serializing, .publishing => &self.serializing_ns,
+        };
+        slot.* +|= elapsed_ns;
+    }
+
+    fn transition(self: *@This(), next_phase: inference.execution_control.Phase, now_ns: u64) void {
+        if (self.active_phase) |phase| self.account(phase, now_ns -| self.last_transition_ns);
+        self.active_phase = next_phase;
+        self.last_transition_ns = now_ns;
+    }
 
     fn update(raw: ?*anyopaque, progress: inference.execution_control.Progress) void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
-        const now = nowNs();
-        const slot = switch (progress.phase) {
-            .loading_model => &self.loading_ns,
-            .tokenizing => &self.tokenizing_ns,
-            .preparing_weights => &self.preparing_ns,
-            .executing => &self.executing_ns,
-            else => return,
-        };
-        if (slot.* == 0) slot.* = now;
+        self.transition(progress.phase, nowNs());
+    }
+
+    fn finish(self: *@This(), finished_ns: u64) void {
+        if (self.active_phase) |phase| self.account(phase, finished_ns -| self.last_transition_ns);
+        self.active_phase = null;
+        self.last_transition_ns = finished_ns;
     }
 };
 
@@ -168,6 +191,7 @@ pub fn main(init: std.process.Init) !void {
         .progress = .{ .ptr = &cold_capture, .update_fn = PhaseCapture.update },
     };
     const load_started_ns = nowNs();
+    cold_capture.begin(load_started_ns);
     const managed_text = try managedBenchmarkText(allocator, fixture.source_text);
     defer allocator.free(managed_text);
     const managed_texts = try allocator.alloc([]const u8, opts.batch);
@@ -183,6 +207,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     const cold_forward_done_ns = nowNs();
+    cold_capture.finish(cold_forward_done_ns);
     const cold_json = try std.json.Stringify.valueAlloc(allocator, cold_embeddings, .{});
     const cold_done_ns = nowNs();
     allocator.free(cold_json);
@@ -193,6 +218,7 @@ pub fn main(init: std.process.Init) !void {
     var warm_capture = PhaseCapture{};
     const warm_control = inference.InferenceExecutionControl{ .progress = .{ .ptr = &warm_capture, .update_fn = PhaseCapture.update } };
     const warm_started_ns = nowNs();
+    warm_capture.begin(warm_started_ns);
     const warm_embeddings = try node.embedDenseTextsFromPathWithExecutionControl(
         allocator,
         warm_control,
@@ -200,6 +226,7 @@ pub fn main(init: std.process.Init) !void {
         managed_texts,
     );
     const warm_forward_done_ns = nowNs();
+    warm_capture.finish(warm_forward_done_ns);
     const warm_json = try std.json.Stringify.valueAlloc(allocator, warm_embeddings, .{});
     const warm_done_ns = nowNs();
     allocator.free(warm_json);
@@ -441,31 +468,33 @@ fn managedBenchmarkText(allocator: std.mem.Allocator, source: []const u8) ![]u8 
 }
 
 fn managedTiming(capture: PhaseCapture, started: u64, forward_done: u64, done: u64) ManagedTiming {
-    const tokenizing = if (capture.tokenizing_ns != 0) capture.tokenizing_ns else forward_done;
-    const preparing = if (capture.preparing_ns != 0) capture.preparing_ns else tokenizing;
-    const executing = if (capture.executing_ns != 0) capture.executing_ns else preparing;
     return .{
         .total_ns = done -| started,
-        .model_load_ns = tokenizing -| started,
-        .tokenization_ns = preparing -| tokenizing,
-        .weight_prep_ns = executing -| preparing,
-        .forward_ns = forward_done -| executing,
-        .serialization_ns = done -| forward_done,
+        .model_load_ns = capture.loading_ns,
+        .tokenization_ns = capture.tokenizing_ns,
+        .weight_prep_ns = capture.preparing_ns,
+        .forward_ns = capture.executing_ns,
+        .serialization_ns = capture.serializing_ns +| (done -| forward_done),
     };
 }
 
 fn validateManagedTiming(timing: ManagedTiming) !void {
     const attributed = timing.model_load_ns +| timing.tokenization_ns +| timing.weight_prep_ns +| timing.forward_ns +| timing.serialization_ns;
-    if (attributed > timing.total_ns) return error.InvalidPhaseTiming;
+    if (attributed != timing.total_ns) return error.InvalidPhaseTiming;
 }
 
-test "managed BGE timing partitions ordered request phases" {
-    const timing = managedTiming(.{
-        .loading_ns = 10,
-        .tokenizing_ns = 30,
-        .preparing_ns = 50,
-        .executing_ns = 80,
-    }, 10, 130, 150);
+test "managed BGE timing accumulates repeated and reordered request phases" {
+    var capture = PhaseCapture{};
+    capture.begin(10);
+    capture.transition(.preparing_weights, 30);
+    capture.transition(.tokenizing, 50);
+    capture.transition(.preparing_weights, 60);
+    capture.transition(.tokenizing, 70);
+    capture.transition(.executing, 80);
+    capture.transition(.serializing, 130);
+    capture.finish(140);
+
+    const timing = managedTiming(capture, 10, 140, 150);
     try std.testing.expectEqual(@as(u64, 20), timing.model_load_ns);
     try std.testing.expectEqual(@as(u64, 20), timing.tokenization_ns);
     try std.testing.expectEqual(@as(u64, 30), timing.weight_prep_ns);
@@ -475,11 +504,19 @@ test "managed BGE timing partitions ordered request phases" {
     try validateManagedTiming(timing);
 }
 
-test "managed BGE timing rejects overlapping phase attribution" {
+test "managed BGE timing rejects incomplete or overlapping phase attribution" {
     try std.testing.expectError(error.InvalidPhaseTiming, validateManagedTiming(.{
         .total_ns = 10,
         .model_load_ns = 10,
         .tokenization_ns = 10,
+        .weight_prep_ns = 0,
+        .forward_ns = 0,
+        .serialization_ns = 0,
+    }));
+    try std.testing.expectError(error.InvalidPhaseTiming, validateManagedTiming(.{
+        .total_ns = 10,
+        .model_load_ns = 5,
+        .tokenization_ns = 0,
         .weight_prep_ns = 0,
         .forward_ns = 0,
         .serialization_ns = 0,

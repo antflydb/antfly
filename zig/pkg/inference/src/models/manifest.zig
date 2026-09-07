@@ -35,29 +35,38 @@ pub const qwen3_vl_reranker_gguf_bundle_family = "qwen3_vl_reranker_gguf_bundle/
 pub const qwen3_vl_reranker_safetensors_bundle_family = "qwen3_vl_reranker_safetensors_bundle/v1";
 
 /// Built-in chat template for Gemma 4 models (uses <|turn>/<turn|> tokens).
-/// Applied when tokenizer_config.json has sot_token=<|turn> but no
-/// chat_template, and when GGUF metadata carries the upstream tool template
-/// that requires Jinja features outside our rendering subset.
+/// Applied only when tokenizer_config.json has sot_token=<|turn> but no
+/// chat_template. Artifact-provided templates retain their tool protocol.
 const gemma4_chat_template =
     "{{ bos_token }}" ++
+    "{%- if enable_thinking is defined and enable_thinking -%}" ++
+    "{{ '<|turn>system\\n<|think|>\\n' }}" ++
+    "{%- elif messages[0]['role'] == 'system' -%}" ++
+    "{{ '<|turn>system\\n' }}" ++
+    "{%- endif -%}" ++
     "{%- if messages[0]['role'] == 'system' -%}" ++
     "{%- if messages[0]['content'] is string -%}" ++
-    "{%- set first_user_prefix = messages[0]['content'] + '\\n\\n' -%}" ++
+    "{{ messages[0]['content'] }}" ++
     "{%- else -%}" ++
-    "{%- set first_user_prefix = messages[0]['content'][0]['text'] + '\\n\\n' -%}" ++
+    "{{ messages[0]['content'][0]['text'] }}" ++
     "{%- endif -%}" ++
     "{%- set loop_messages = messages[1:] -%}" ++
     "{%- else -%}" ++
-    "{%- set first_user_prefix = \"\" -%}" ++
     "{%- set loop_messages = messages -%}" ++
     "{%- endif -%}" ++
+    "{%- if (enable_thinking is defined and enable_thinking) or messages[0]['role'] == 'system' -%}" ++
+    "{{ '<turn|>\\n' }}" ++
+    "{%- endif -%}" ++
     "{%- for message in loop_messages -%}" ++
+    "{%- if message['tool_calls'] or message['role'] == 'tool' -%}" ++
+    "{{ raise_exception('Tool history requires an artifact-provided Gemma 4 chat template') }}" ++
+    "{%- endif -%}" ++
     "{%- if (message['role'] == 'assistant') -%}" ++
     "{%- set role = \"model\" -%}" ++
     "{%- else -%}" ++
     "{%- set role = message['role'] -%}" ++
     "{%- endif -%}" ++
-    "{{ '<|turn>' + role + '\\n' + (first_user_prefix if loop.first else \"\") }}" ++
+    "{{ '<|turn>' + role + '\\n' }}" ++
     "{%- if message['content'] is string -%}" ++
     "{{ message['content'] | trim }}" ++
     "{%- elif message['content'] is iterable -%}" ++
@@ -74,11 +83,7 @@ const gemma4_chat_template =
     "{{ '<turn|>\\n' }}" ++
     "{%- endfor -%}" ++
     "{%- if add_generation_prompt -%}" ++
-    "{%- if enable_thinking is defined and not enable_thinking -%}" ++
-    "{{ '<|turn>model\\n<|channel>final\\n<channel|>' }}" ++
-    "{%- else -%}" ++
-    "{{ '<|turn>model\\n<|channel>thought\\n<channel|>' }}" ++
-    "{%- endif -%}" ++
+    "{{ '<|turn>model\\n' }}" ++
     "{%- endif -%}";
 
 pub const ModelType = enum {
@@ -1601,12 +1606,8 @@ fn applyGgufTokenizerMetadata(
     }
     if (view.getString("tokenizer.chat_template")) |value| {
         if (std.mem.trim(u8, value, &.{ ' ', '\t', '\n', '\r' }).len > 0) {
-            const selected = if (gguf_model_name) |model_name|
-                if (shouldUseBuiltInGemma4GgufChatTemplate(model_name, value)) gemma4_chat_template else value
-            else
-                value;
             if (manifest.chat_template) |old| allocator.free(old);
-            manifest.chat_template = try allocator.dupe(u8, selected);
+            manifest.chat_template = try allocator.dupe(u8, value);
         }
     }
 
@@ -1624,17 +1625,6 @@ fn artifactExists(
 ) !bool {
     if (catalog) |value| return value.exists(relative_path);
     return c_file.fileExistsInDirChecked(allocator, model_dir_path, relative_path);
-}
-
-fn gemma4ChatTemplateRequiresBuiltInFallback(chat_template: []const u8) bool {
-    return std.mem.indexOf(u8, chat_template, "macro format_parameters") != null or
-        std.mem.indexOf(u8, chat_template, "namespace(") != null or
-        std.mem.indexOf(u8, chat_template, "{% set captured_content") != null or
-        std.mem.indexOf(u8, chat_template, "{%- set captured_content") != null;
-}
-
-fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
-    return std.mem.eql(u8, model_name, "gemma4") and gemma4ChatTemplateRequiresBuiltInFallback(chat_template);
 }
 
 fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
@@ -3517,16 +3507,11 @@ fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, 
         }
     }
 
-    // Gemma 4 models use <|turn> and may ship a tool-capable upstream
-    // template that requires Jinja features outside our rendering subset.
+    // Never silently replace a supplied template: doing so can discard tool
+    // history or change the model's thinking protocol.
     if (obj.get("sot_token")) |v| {
         if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
-            if (manifest.chat_template) |existing| {
-                if (gemma4ChatTemplateRequiresBuiltInFallback(existing)) {
-                    allocator.free(existing);
-                    manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
-                }
-            } else {
+            if (manifest.chat_template == null) {
                 manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
             }
         }
@@ -5264,17 +5249,6 @@ test "manifest late interaction generation preference detects qwen2" {
     try std.testing.expect(manifest_inst.prefersGenerationEncodingForLateInteraction());
 }
 
-test "gemma4 gguf tool chat template uses built-in fallback" {
-    const gguf_tool_template =
-        "{%- macro format_parameters(properties, required, filter_keys=false) -%}" ++
-        "{%- set ns = namespace(found_first=false) -%}" ++
-        "{%- set captured_content -%}{{ message.get('content') }}{%- endset -%}";
-
-    try std.testing.expect(shouldUseBuiltInGemma4GgufChatTemplate("gemma4", gguf_tool_template));
-    try std.testing.expect(!shouldUseBuiltInGemma4GgufChatTemplate("llama", gguf_tool_template));
-    try std.testing.expect(!shouldUseBuiltInGemma4GgufChatTemplate("gemma4", "{{ bos_token }}{{ messages[0]['content'] }}"));
-}
-
 test "manifest detects layoutlmv3 as classifier-native bundle" {
     const allocator = std.testing.allocator;
     var manifest_inst = ModelManifest{ .allocator = allocator };
@@ -5877,7 +5851,7 @@ test "manifest treats gemma4 unified config as generator" {
     try std.testing.expect(manifest.gguf_projector_path != null);
 }
 
-test "gemma4 tokenizer config replaces unsupported upstream chat template" {
+test "gemma4 tokenizer config preserves upstream chat template" {
     const allocator = std.testing.allocator;
     var manifest = ModelManifest{ .allocator = allocator };
     manifest.chat_template = try allocator.dupe(u8, "{%- macro format_parameters(properties, required) -%}{%- endmacro -%}");
@@ -5888,8 +5862,7 @@ test "gemma4 tokenizer config replaces unsupported upstream chat template" {
     );
 
     try std.testing.expect(manifest.chat_template != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "<|turn>model") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "format_parameters") == null);
+    try std.testing.expectEqualStrings("{%- macro format_parameters(properties, required) -%}{%- endmacro -%}", manifest.chat_template.?);
 }
 
 test "built-in gemma4 chat template renders explicit thinking modes" {
@@ -5903,21 +5876,21 @@ test "built-in gemma4 chat template renders explicit thinking modes" {
 
     var default_context = try jinja.chatTemplateContext(arena, &messages, .{ .bos_token = "<bos>" });
     const default_prompt = try template.render(arena, &default_context);
-    try std.testing.expect(std.mem.endsWith(u8, default_prompt, "<|channel>thought\n<channel|>"));
+    try std.testing.expectEqualStrings("<bos><|turn>user\nhello<turn|>\n<|turn>model\n", default_prompt);
 
     var enabled_context = try jinja.chatTemplateContext(arena, &messages, .{
         .bos_token = "<bos>",
         .enable_thinking = true,
     });
     const enabled_prompt = try template.render(arena, &enabled_context);
-    try std.testing.expect(std.mem.endsWith(u8, enabled_prompt, "<|channel>thought\n<channel|>"));
+    try std.testing.expectEqualStrings("<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nhello<turn|>\n<|turn>model\n", enabled_prompt);
 
     var disabled_context = try jinja.chatTemplateContext(arena, &messages, .{
         .bos_token = "<bos>",
         .enable_thinking = false,
     });
     const disabled_prompt = try template.render(arena, &disabled_context);
-    try std.testing.expect(std.mem.endsWith(u8, disabled_prompt, "<|channel>final\n<channel|>"));
+    try std.testing.expectEqualStrings(default_prompt, disabled_prompt);
 }
 
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
