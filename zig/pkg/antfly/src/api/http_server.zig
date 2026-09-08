@@ -6408,6 +6408,7 @@ pub const ApiHttpServer = struct {
             error.AgentContextLimitExceeded => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query planning context limit exceeded"),
             error.UnsupportedAgentToolProvider, error.UnsupportedQueryBuilderGeneration => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "query planning requires a tool-capable generator"),
             error.GenerateRequestFailed => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query generation failed"),
+            error.GenerationCapacityUnavailable => try contextualRetryableTextResponse(self.alloc, 503, "inference capacity temporarily unavailable"),
             error.EmptyResponse => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "generator returned no answer or tool calls"),
             error.DocIdentityNamespaceMismatch => try contextual_operations.jsonErrorAlloc(self.alloc, 503, "doc identity unavailable"),
             error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query embedding input too large"),
