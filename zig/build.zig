@@ -9587,7 +9587,7 @@ pub fn build(b: *std.Build) void {
     const storage_lmdb_replay_step = b.step("lmdb-replay-fixtures", "Run only the LMDB replay fixture test");
     storage_lmdb_replay_step.dependOn(&run_storage_lmdb_replay_tests.step);
 
-    const lmdb_vopr_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb_vopr.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const lmdb_vopr_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb_vopr.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     lmdb_vopr_test_mod.addImport("vopr", vopr_mod);
     const lmdb_vopr_tests = b.addTest(.{
         .root_module = lmdb_vopr_test_mod,
