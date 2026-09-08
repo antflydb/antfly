@@ -4,6 +4,22 @@ from summarize_dense_publication import summarize_lines
 
 
 class PublicationTest(unittest.TestCase):
+    def test_blocker_overlap_is_not_additive(self):
+        result = summarize_lines(
+            [
+                "dense checkpoint rebase worker generation=2 sequence=3 rebase_stage_ns=200 success=true",
+                "dense checkpoint completion blockers generation=2 source_capture_overlap_ns=150 maintenance_capture_overlap_ns=10 rebase_stage_ns=200 lock_deferrals=4",
+            ]
+        )
+        self.assertEqual(result["groups"]["rebase_worker"]["count"], 1)
+        self.assertEqual(
+            result["groups"]["completion_blockers"]["timings"][
+                "source_capture_overlap_ns"
+            ]["sum_ms"],
+            0.00015,
+        )
+        self.assertTrue(any("overlap each other" in note for note in result["notes"]))
+
     def test_nested_timers_and_unknown_cpu_are_not_combined(self):
         result = summarize_lines(
             [

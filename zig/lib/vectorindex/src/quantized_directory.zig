@@ -546,6 +546,30 @@ pub const StreamingWriter = struct {
         try self.appendLeaf(sink, posting_id, &leaf.set, leaf.members, leaf.projections, leaf.plan_bytes);
     }
 
+    /// Carry a verified standalone leaf into a new directory without decoding
+    /// protobuf columns, undoing its permutation, or rebuilding projections.
+    /// This reuses encoding, not physical disk extents. Wide projection planes
+    /// and their generation-specific residual locators are deliberately barred.
+    pub fn appendOwnedNoCopyEntry(self: *StreamingWriter, sink: anytype, posting_id: u64, source: *const VerifiedReader.OwnedView) !usize {
+        if (self.finished) return error.QuantizedDirectoryWriterFinished;
+        const reader = try Reader.init(source.encoded);
+        if (reader.dims != self.dims or reader.metric != self.metric or reader.posting_count != 1 or
+            reader.indexId(0) != posting_id or source.view.projections != null or source.view.member_ids.len == 0)
+            return error.InvalidQuantizedDirectoryEntry;
+        if (self.posting_ids.getLastOrNull()) |previous| if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
+        const bytes = source.encoded[reader.indexOffset(0)..reader.index_offset];
+        if (reader.projectionRange(0).len != 0 or Crc32.hash(bytes) != reader.indexChecksum(0))
+            return error.QuantizedDirectoryChecksumMismatch;
+        const cost = reader.indexScanBytes(0);
+        try self.scan_bytes.append(self.alloc, cost);
+        errdefer _ = self.scan_bytes.pop();
+        try self.beginEntry(sink, posting_id);
+        try self.projection_ranges.append(self.alloc, .{});
+        try self.appendEntryBytes(sink, bytes);
+        self.admission_stats.observeLeaf(source.view.count, cost);
+        return bytes.len;
+    }
+
     fn appendLeaf(self: *StreamingWriter, sink: anytype, posting_id: u64, set: *const proto.RaBitQuantizedVectorSet, member_id_bytes: []const u8, projections: []const hbc_runtime.NativeProjectionBuildValue, subgroup_bytes: []const u8) !void {
         if (self.finished) return error.QuantizedDirectoryWriterFinished;
         if (posting_id == 0 or set.centroid.len != self.dims) return error.InvalidQuantizedDirectoryEntry;
@@ -1328,7 +1352,7 @@ fn exerciseSubgroupColumns(alloc: Allocator) !void {
         .centroid_norm = 3.5,
     };
     const ids = [_]u64{ 101, 202, 303, 404 };
-    const plan: subgroups.View = .{ .dims = 3, .rows = &.{ 2, 0, 3, 1 }, .ends = &.{ 2, 4 }, .centers = &.{ 1, 0, 0, 0, 1, 0 } };
+    const plan: subgroups.View = .{ .dims = 3, .rows = &.{ 2, 0, 3, 1 }, .ends = &.{ 2, 4 }, .centers = &.{ 1, 0, 0, 0, 1, 0 }, .radii = &.{ 0.1, 0.2 } };
     const expected = try set.encode(alloc);
     defer alloc.free(expected);
     var writer = try Writer.init(alloc, 3, 2);
@@ -1347,6 +1371,24 @@ fn exerciseSubgroupColumns(alloc: Allocator) !void {
     const restored = try canonical.value.encode(alloc);
     defer alloc.free(restored);
     try std.testing.expectEqualSlices(u8, expected, restored);
+    const location = reader.entryLocation(7).?;
+    var owned = try reader.decodeOwnedEntry(alloc, 7, encoded[@intCast(location.offset)..][0..location.len]);
+    defer owned.deinit();
+    var reused_sink: TestingSink = .{ .alloc = alloc };
+    defer reused_sink.deinit();
+    var reused = try StreamingWriter.init(alloc, &reused_sink, 3, 2);
+    defer reused.deinit();
+    try std.testing.expectEqual(location.len, try reused.appendOwnedNoCopyEntry(&reused_sink, 7, &owned));
+    try std.testing.expectError(error.UnsortedQuantizedDirectory, reused.appendOwnedNoCopyEntry(&reused_sink, 7, &owned));
+    _ = try reused.finish(&reused_sink);
+    try std.testing.expectEqualSlices(u8, encoded, reused_sink.out.items);
+    // Verify private bytes independently even after a successful prior reuse.
+    owned.encoded[header_size + entry_header_size] ^= 1;
+    var corrupt_sink: TestingSink = .{ .alloc = alloc };
+    defer corrupt_sink.deinit();
+    var corrupt_writer = try StreamingWriter.init(alloc, &corrupt_sink, 3, 2);
+    defer corrupt_writer.deinit();
+    try std.testing.expectError(error.QuantizedDirectoryChecksumMismatch, corrupt_writer.appendOwnedNoCopyEntry(&corrupt_sink, 7, &owned));
     var sink: TestingSink = .{ .alloc = alloc };
     defer sink.deinit();
     var streaming = try StreamingWriter.init(alloc, &sink, 3, 2);

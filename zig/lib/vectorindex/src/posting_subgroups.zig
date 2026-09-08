@@ -27,6 +27,9 @@ pub const View = struct {
     rows: []const u32,
     ends: []const u32,
     centers: []const f32,
+    /// Optional conservative source-space balls, bound to the same immutable
+    /// member permutation. Missing certificates must never authorize pruning.
+    radii: []const f32 = &.{},
     /// Optional generation-owned acceleration; not encoded in AFSG or a bound.
     compact: ?@import("compact_subgroups.zig").View = null,
 
@@ -69,17 +72,50 @@ pub const View = struct {
         }
         if (start != self.rows.len) return error.InvalidSubgroupPlan;
         for (self.centers) |value| if (!std.math.isFinite(value)) return error.InvalidSubgroupPlan;
+        if (self.radii.len != 0 and self.radii.len != self.ends.len) return error.InvalidSubgroupPlan;
+        for (self.radii) |value| if (!std.math.isFinite(value) or value < 0) return error.InvalidSubgroupPlan;
+    }
+
+    /// Cosine distance lower bound for every authoritative member of a group.
+    /// Accumulate in f64 and round outwards, including f32 scoring slack.
+    pub fn lowerBound(self: View, group: usize, query: []const f32) ?f32 {
+        if (self.radii.len != self.ends.len or group >= self.ends.len or query.len != self.dims) return null;
+        return self.lowerBoundScaled(group, query, queryScale(query) orelse return null);
+    }
+
+    pub fn queryScale(query: []const f32) ?f64 {
+        var norm: f64 = 0;
+        for (query) |q| {
+            if (!std.math.isFinite(q)) return null;
+            norm += @as(f64, q) * q;
+        }
+        if (norm <= 0 or !std.math.isFinite(norm)) return null;
+        return 1 / @sqrt(norm);
+    }
+
+    /// `scale` must be queryScale(query); callers can normalize once per query.
+    pub fn lowerBoundScaled(self: View, group: usize, query: []const f32, scale: f64) ?f32 {
+        if (self.radii.len != self.ends.len or group >= self.ends.len or query.len != self.dims) return null;
+        if (!std.math.isFinite(scale) or scale <= 0 or !std.math.isFinite(self.radii[group]) or self.radii[group] < 0) return null;
+        var distance: f64 = 0;
+        for (query, self.centers[group * self.dims ..][0..self.dims]) |q, center| {
+            const diff = @as(f64, q) * scale - center;
+            distance += diff * diff;
+        }
+        const chord = @max(0, @sqrt(distance) - self.radii[group]);
+        const slack = 8 * @as(f64, @floatFromInt(self.dims)) * std.math.floatEps(f32);
+        return @floatCast(chord * chord * 0.5 - slack);
     }
 
     /// Little-endian, length-framed extension. No native ABI padding is stored.
     /// Callers authenticate this together with the candidate rows it permutes.
     pub fn encode(self: View, alloc: Allocator) ![]u8 {
         try self.validate();
-        const length = header_size + (self.rows.len + self.ends.len + self.centers.len) * 4;
+        const length = header_size + (self.rows.len + self.ends.len + self.centers.len + self.radii.len) * 4;
         const bytes = try alloc.alloc(u8, length);
         @memset(bytes, 0);
         @memcpy(bytes[0..4], "AFSG");
-        put(bytes, 4, 1);
+        put(bytes, 4, if (self.radii.len == 0) 1 else 2);
         put(bytes, 8, @intCast(length));
         put(bytes, 12, @intCast(self.dims));
         put(bytes, 16, @intCast(self.rows.len));
@@ -97,6 +133,10 @@ pub const View = struct {
             put(bytes, cursor, @bitCast(center));
             cursor += 4;
         }
+        for (self.radii) |radius| {
+            put(bytes, cursor, @bitCast(radius));
+            cursor += 4;
+        }
         return bytes;
     }
 };
@@ -109,6 +149,7 @@ pub const Plan = struct {
         self.alloc.free(self.view.rows);
         self.alloc.free(self.view.ends);
         self.alloc.free(self.view.centers);
+        self.alloc.free(self.view.radii);
         self.* = undefined;
     }
 
@@ -169,6 +210,8 @@ pub const Plan = struct {
         errdefer alloc.free(ends);
         const centers = try alloc.alloc(f32, shape.groups * shape.dims);
         errdefer alloc.free(centers);
+        const radii = try alloc.alloc(f32, if (shape.certified) shape.groups else 0);
+        errdefer alloc.free(radii);
         var cursor: usize = header_size;
         for (rows) |*row| {
             row.* = get(bytes, cursor);
@@ -182,9 +225,58 @@ pub const Plan = struct {
             center.* = @bitCast(get(bytes, cursor));
             cursor += 4;
         }
-        const view: View = .{ .dims = shape.dims, .rows = rows, .ends = ends, .centers = centers };
+        for (radii) |*radius| {
+            radius.* = @bitCast(get(bytes, cursor));
+            cursor += 4;
+        }
+        const view: View = .{ .dims = shape.dims, .rows = rows, .ends = ends, .centers = centers, .radii = radii };
         try view.validate();
         return .{ .alloc = alloc, .view = view };
+    }
+
+    pub const SourceError = struct { norm_error: f32, decoded_norm_lower_bound: f32 };
+
+    /// Certify balls against decoded projection vectors plus their stored
+    /// authoritative f32 error bounds. No query/truth data enters training.
+    pub fn certify(self: *Plan, vectors: []const f32, errors: []const SourceError) !void {
+        if (vectors.len != self.view.rows.len * self.view.dims or errors.len != self.view.rows.len)
+            return error.InvalidSubgroupPlan;
+        for (errors) |error_| {
+            // Reject absent/unsafe proof inputs before allocating replacement
+            // metadata, retaining any previously validated certificate.
+            if (!std.math.isFinite(error_.norm_error) or error_.norm_error < 0 or
+                !std.math.isFinite(error_.decoded_norm_lower_bound) or
+                error_.decoded_norm_lower_bound <= error_.norm_error)
+                return error.UncertifiableSubgroup;
+        }
+        const radii = try self.alloc.alloc(f32, self.view.ends.len);
+        errdefer self.alloc.free(radii);
+        for (radii, 0..) |*radius, group| {
+            var maximum: f64 = 0;
+            const range_ = self.view.range(group);
+            for (self.view.rows[range_.start..range_.end]) |row| {
+                const error_ = errors[row];
+                const vector = vectors[row * self.view.dims ..][0..self.view.dims];
+                var norm: f64 = 0;
+                for (vector) |value| {
+                    if (!std.math.isFinite(value)) return error.UncertifiableSubgroup;
+                    norm += @as(f64, value) * value;
+                }
+                if (norm <= 0) return error.UncertifiableSubgroup;
+                const scale = 1 / @sqrt(norm);
+                var distance: f64 = 0;
+                for (vector, self.view.centers[group * self.view.dims ..][0..self.view.dims]) |value, center| {
+                    const diff = value * scale - center;
+                    distance += diff * diff;
+                }
+                // ||normalize(x)-normalize(y)|| <= 2||x-y||/||y||.
+                maximum = @max(maximum, @sqrt(distance) + 2 * @as(f64, error_.norm_error) / error_.decoded_norm_lower_bound);
+            }
+            // Also cover the f32 multiply used to decode scaled half values.
+            radius.* = @floatCast(maximum + (1 + maximum) * 32 * std.math.floatEps(f32));
+        }
+        self.alloc.free(self.view.radii);
+        self.view.radii = radii;
     }
 };
 
@@ -258,15 +350,16 @@ fn put(bytes: []u8, offset: usize, value: u32) void {
 fn get(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
-fn frame(bytes: []const u8) !struct { dims: usize, count: usize, groups: usize } {
-    if (bytes.len < header_size or !std.mem.eql(u8, bytes[0..4], "AFSG") or get(bytes, 4) != 1 or get(bytes, 8) != bytes.len)
+fn frame(bytes: []const u8) !struct { dims: usize, count: usize, groups: usize, certified: bool } {
+    if (bytes.len < header_size or !std.mem.eql(u8, bytes[0..4], "AFSG") or (get(bytes, 4) != 1 and get(bytes, 4) != 2) or get(bytes, 8) != bytes.len)
         return error.InvalidSubgroupPlan;
     const dims: usize = get(bytes, 12);
     const count: usize = get(bytes, 16);
     const groups: usize = get(bytes, 20);
+    const certified = get(bytes, 4) == 2;
     if (dims == 0 or dims > max_dims or count == 0 or count > max_rows or groups == 0 or groups > max_groups or
-        header_size + (count + groups + groups * dims) * 4 != bytes.len) return error.InvalidSubgroupPlan;
-    return .{ .dims = dims, .count = count, .groups = groups };
+        header_size + (count + groups + groups * dims + (if (certified) groups else @as(usize, 0))) * 4 != bytes.len) return error.InvalidSubgroupPlan;
+    return .{ .dims = dims, .count = count, .groups = groups, .certified = certified };
 }
 
 pub fn decodeBorrowed(bytes: []const u8) !View {
@@ -285,11 +378,13 @@ pub fn decodeBorrowedLayout(bytes: []const u8) !View {
     const aligned: []align(4) const u8 = @alignCast(bytes);
     const rows_end = header_size + shape.count * 4;
     const ends_end = rows_end + shape.groups * 4;
+    const centers_end = ends_end + shape.groups * shape.dims * 4;
     const view: View = .{
         .dims = shape.dims,
         .rows = std.mem.bytesAsSlice(u32, aligned[header_size..rows_end]),
         .ends = std.mem.bytesAsSlice(u32, @as([]align(4) const u8, @alignCast(aligned[rows_end..ends_end]))),
-        .centers = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(aligned[ends_end..]))),
+        .centers = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(aligned[ends_end..centers_end]))),
+        .radii = std.mem.bytesAsSlice(f32, @as([]align(4) const u8, @alignCast(aligned[centers_end..]))),
     };
     return view;
 }
@@ -311,6 +406,52 @@ fn allocationExercise(alloc: Allocator) !void {
     var scores: [max_groups]f64 = undefined;
     try borrowed.rank(&.{ 1, 0 }, &order, &scores);
     try std.testing.expectEqual(@as(u32, 2), borrowed.ends[0]);
+}
+
+fn certifiedAllocationExercise(alloc: Allocator) !void {
+    const vectors = [_]f32{ 1, 0, 0.99, 0.01, -1, 0, -0.99, -0.01 };
+    var plan = try Plan.build(alloc, &vectors, 2, 2, null);
+    defer plan.deinit();
+    try std.testing.expect(plan.view.lowerBound(0, &.{ 1, 0 }) == null);
+    const errors = [_]Plan.SourceError{.{ .norm_error = 0.001, .decoded_norm_lower_bound = 0.98 }} ** 4;
+    try plan.certify(&vectors, &errors);
+    const encoded = try plan.view.encode(alloc);
+    defer alloc.free(encoded);
+    var restored = try Plan.decode(alloc, encoded);
+    defer restored.deinit();
+    const borrowed = try decodeBorrowed(encoded);
+    try std.testing.expectEqualSlices(f32, plan.view.radii, borrowed.radii);
+    try std.testing.expectEqualSlices(f32, plan.view.radii, restored.view.radii);
+    var useful = false;
+    for (0..2) |group| useful = useful or borrowed.lowerBound(group, &.{ 1, 0 }).? > 1.9;
+    try std.testing.expect(useful);
+    try std.testing.expect(borrowed.lowerBound(0, &.{ 0, 0 }) == null);
+    try std.testing.expect(borrowed.lowerBound(0, &.{ std.math.nan(f32), 0 }) == null);
+    // Every group certificate covers perturbed authoritative vectors, not
+    // merely the lossy training projection. Sweep query directions and scale.
+    for (0..101) |i| {
+        const angle = @as(f64, @floatFromInt(i)) * 0.062;
+        const query = [_]f32{ @floatCast(@cos(angle) * 17), @floatCast(@sin(angle) * 17) };
+        for (0..2) |group| {
+            const bound = borrowed.lowerBound(group, &query).?;
+            const r = borrowed.range(group);
+            for (borrowed.rows[r.start..r.end]) |row| {
+                const x: f64 = vectors[row * 2] + @as(f32, 0.0001);
+                const y: f64 = vectors[row * 2 + 1] - @as(f32, 0.0001);
+                const score = 1 - (query[0] * x + query[1] * y) * View.queryScale(&query).? / @sqrt(x * x + y * y);
+                try std.testing.expect(bound <= score);
+            }
+        }
+    }
+    const invalid = [_]Plan.SourceError{.{ .norm_error = 1, .decoded_norm_lower_bound = 0 }} ** 4;
+    try std.testing.expectError(error.UncertifiableSubgroup, plan.certify(&vectors, &invalid));
+    // Failed replacement does not discard a previously valid certificate.
+    try std.testing.expectEqualSlices(f32, borrowed.radii, plan.view.radii);
+}
+
+test "certified subgroup bounds cover authoritative perturbations and allocation failures" {
+    try certifiedAllocationExercise(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, certifiedAllocationExercise, .{});
 }
 
 test "subgroup plans are balanced deterministic and allocation safe" {

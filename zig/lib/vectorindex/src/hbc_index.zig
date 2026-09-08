@@ -3775,10 +3775,11 @@ fn drainGlobalSubgroups(self: anytype, txn: anytype, scratch: anytype, req: sear
     } else return error.StalePublishedSnapshot;
     const route_start = now();
     var total: u64 = 0;
-    var can_prune = prune;
+    const certified = prune and if (comptime @hasDecl(childType(@TypeOf(self)), "nativeCertifiedSubgroupsEnabled")) self.nativeCertifiedSubgroupsEnabled() else false;
+    var can_prune = prune and !certified;
     var compact_query: [@import("posting_subgroups.zig").max_dims]i8 = undefined;
     var compact_query_scale: ?f32 = null;
-    if (prune and req.query.len <= compact_query.len) {
+    if (can_prune and req.query.len <= compact_query.len) {
         for (plan.leaves[0..plan.leaf_count]) |leaf| if (leaf.plan.compact != null) {
             compact_query_scale = @import("compact_subgroups.zig").quantize(req.query, compact_query[0..req.query.len]) catch null;
             break;
@@ -3791,7 +3792,7 @@ fn drainGlobalSubgroups(self: anytype, txn: anytype, scratch: anytype, req: sear
             const count = range.end - range.start;
             total += count;
             const id = leaf.first_group + group;
-            const score = if (!prune) 0 else if (compact_query_scale != null and leaf.plan.compact != null) compact: {
+            const score = if (!prune or certified) 0 else if (compact_query_scale != null and leaf.plan.compact != null) compact: {
                 profile.subgroup_compact_groups_scored += 1;
                 break :compact leaf.plan.compact.?.score(group, compact_query[0..req.query.len], compact_query_scale.?);
             } else planner.dot(req.query, leaf.plan.centers[group * self.config.dims ..][0..self.config.dims]);
@@ -3805,12 +3806,37 @@ fn drainGlobalSubgroups(self: anytype, txn: anytype, scratch: anytype, req: sear
     }
     profile.subgroup_routing_ns += elapsed(route_start);
     const scan_start = now();
-    for (plan.leaves[0..plan.leaf_count]) |*leaf| {
+    var certified_upper: ?f32 = null;
+    const certificate_scale = if (certified) @import("posting_subgroups.zig").View.queryScale(req.query) else null;
+    for (plan.leaves[0..plan.leaf_count], 0..) |*leaf, leaf_index| {
         try search_types.checkCancelled(req);
+        // A stale upper bound from k already-observed members remains safe.
+        // Refresh in bounded waves, not by sorting the candidate heap for
+        // every tiny group. This changes proof tightness, not search effort.
+        if (certified and (certified_upper == null or leaf_index % 64 == 0))
+            certified_upper = approxTopKUpperBound(results.items.items, req.k, scratch.distances);
         var ranges: [16]quantizer_mod.ScoreRange = undefined;
         var count: usize = 0;
         var selected_rows: usize = 0;
         for (0..leaf.plan.ends.len) |g| if (!can_prune or plan.selected[leaf.first_group + g]) {
+            if (certified) {
+                profile.traversal_bound_resolutions += 1;
+                if (if (certificate_scale) |scale| leaf.plan.lowerBoundScaled(g, req.query, scale) else null) |lower| {
+                    if (certified_upper) |upper| {
+                        if (lower > upper) {
+                            profile.traversal_bound_stops += 1;
+                            continue;
+                        }
+                        profile.traversal_bound_overlap += 1;
+                    } else {
+                        profile.traversal_bound_incomplete_topk += 1;
+                        profile.traversal_bound_fallbacks += 1;
+                    }
+                } else {
+                    profile.traversal_bound_unresolved_frontier += 1;
+                    profile.traversal_bound_fallbacks += 1;
+                }
+            }
             const range = leaf.plan.range(g);
             selected_rows += range.end - range.start;
             if (count != 0 and ranges[count - 1].end == range.start) {
@@ -3823,7 +3849,7 @@ fn drainGlobalSubgroups(self: anytype, txn: anytype, scratch: anytype, req: sear
         var sink = RangeCandidateScoreSink{ .base = .{ .results = results, .ids = leaf.ids } };
         try self.quantizer.estimateDistancesInRangesTo(&leaf.set, approx_query, &scratch.estimate, cancellation, ranges[0..count], &sink);
         sink.base.flush();
-        profile.subgroup_leaves_scored += @intFromBool(can_prune);
+        profile.subgroup_leaves_scored += @intFromBool(can_prune or certified);
         profile.subgroup_vectors_skipped += leaf.ids.len - selected_rows;
         profile.approx_leaves_scored += 1;
         profile.approx_vectors_scored += selected_rows;

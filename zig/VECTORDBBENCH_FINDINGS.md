@@ -9226,3 +9226,55 @@ runner's complete environment receipt: the older harness's short environment
 allowlist does not record the suffix flag. Missing/inconsistent binary or arm
 receipts now fail qualification, and eight Python checks pass. An absent
 flag in a partial harness receipt must not be interpreted as proof it was off.
+
+##### Native preparation, certified subgroup, and encoded-row experiments (in progress)
+
+The preserved no-copy and posting-local baselines are unchanged. These are
+independent default-off treatments, not a promoted combined configuration:
+
+- `ANTFLY_EXPERIMENT_STAGE_POSTING_READERS`: prepare immutable readers in the
+  checkpoint worker (the previously implemented experiment).
+- `ANTFLY_EXPERIMENT_STAGE_POSTING_REBASE`: includes reader preparation, then
+  pins a committed live generation and prepares the bulk of its rebase in a
+  second `std.Io` task. Shared overlay consolidation preserves that ancestor.
+  Final publication validates file/WAL/root identities and handles only the
+  newer tail when ancestry remains intact. A stable identical source takes
+  the zero-allocation rebase path. Forced readiness/close retains the existing
+  synchronous fallback; this is not yet an allocation-free O(1) writer handoff.
+- `ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS`: extends balanced subgroup layouts
+  with conservative source-space balls. Training uses decoded projections and
+  their authoritative float32 error/norm bounds, never ground-truth queries.
+  Query pruning uses a strict lower-bound/top-k-upper-bound comparison, with
+  outward numerical slack. Missing/unsafe certificates scan, and complete
+  snapshot/filter paths retain their established fallback. Unlike the older
+  75%-work representative policy, this mode does not skip groups based merely
+  on their representative score. It requires a subgroup layout to be built.
+- `ANTFLY_EXPERIMENT_REUSE_POSTING_ROWS`: forward an authenticated unchanged
+  no-copy base leaf's encoded row instead of decoding/reordering/rebuilding it
+  and fetching projection inputs again. It verifies immutable shadow identity,
+  layout compatibility and each private buffer's SIMD CRC. Projection/residual
+  locator planes are excluded. This reuses encoding, **not physical extents**;
+  `reused_bytes` measures bytes forwarded and is not saved disk space. Reusable
+  physical checkpoint chunks and their reference-manifest GC remain unfinished.
+
+Completion traces now record source/maintenance capture overlap, off-lane
+rebase time and failed lock-admission observations. Capture overlap and rebase
+time can overlap inside completed-worker wait; neither their sum nor the
+unattributed remainder is a measured scheduling delay. Lock deferrals are
+counts, not durations, and can precede worker completion.
+
+Debug validation so far includes seven standalone subgroup/cache tests,
+three focused vector-index codec tests (including raw-row round-trip and
+allocation failures), native certified flat/tree lifecycle tests requiring
+float32 score/order parity, and pinned-reader/suffix/rebase/restart tests.
+A deterministic handoff gate was added so the native suffix test cannot race
+publication and silently skip its worker-rebase assertions. Eight Python
+checks cover the stage summarizer and treatment evidence. An enabled flag or
+an unpublished worker is not enough to qualify an experimental arm.
+
+No 50K/1M performance improvement is claimed for these new treatments yet.
+The completion-lane matrix's launcher was paused between arms while its
+second 1M candidate finished and these changes compiled; its binaries and
+measurement inputs remain pinned. The new comparisons must use the same
+binary on/off, retain C1/10/20/30 and mixed workload measurements, and require
+the existing native visibility/restart and one-percentage-point recall gates.

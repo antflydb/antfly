@@ -3791,25 +3791,48 @@ const ExperimentalPostingReadGeneration = struct {
         dims: usize,
         use_quantization: bool,
     ) !*ExperimentalPostingReadGeneration {
+        return self.rebaseOntoAlloc(self.alloc, captured, base, sequence, wal_generation, wal_bytes, dims, use_quantization);
+    }
+
+    fn rebaseOntoAlloc(
+        self: *ExperimentalPostingReadGeneration,
+        alloc: Allocator,
+        captured: *ExperimentalPostingReadGeneration,
+        base: *ExperimentalPostingReadGeneration,
+        sequence: u64,
+        wal_generation: u64,
+        wal_bytes: u64,
+        dims: usize,
+        use_quantization: bool,
+    ) !*ExperimentalPostingReadGeneration {
         const old_root = experimentalPostingRootState(self) orelse return error.Corrupted;
         if (old_root != experimentalPostingRootState(captured)) return error.PostingCheckpointSourceBoundaryMismatch;
-        const rebased = try createOverlay(self.alloc, base, sequence, wal_generation, wal_bytes);
+        if (sequence < base.covered_source_sequence.load(.acquire)) return error.PostingWalSequenceRegression;
+        if (self == captured) {
+            base.advanceDurableBoundary(sequence, wal_generation, wal_bytes);
+            base.retain();
+            return base;
+        }
+        const rebased = try createOverlay(alloc, base, sequence, wal_generation, wal_bytes);
         errdefer rebased.release();
         var seen = std.AutoHashMapUnmanaged(u128, void).empty;
-        defer seen.deinit(self.alloc);
+        defer seen.deinit(alloc);
         var changed_leaves = std.AutoHashMapUnmanaged(u64, void).empty;
-        defer changed_leaves.deinit(self.alloc);
+        defer changed_leaves.deinit(alloc);
         var current: ?*ExperimentalPostingReadGeneration = self;
         while (current) |generation| : (current = generation.parent) {
+            // A pinned preparation boundary is immutable. Everything below
+            // it was already incorporated by the worker; do not scan it again.
+            if (generation == captured) break;
             var entries = generation.values.iterator();
             while (entries.next()) |entry| {
-                if ((try seen.getOrPut(self.alloc, entry.key_ptr.*)).found_existing) continue;
+                if ((try seen.getOrPut(alloc, entry.key_ptr.*)).found_existing) continue;
                 if (captured.overlayValue(entry.key_ptr.*)) |before|
                     if (before.* == entry.value_ptr.*) continue;
-                try rebased.values.put(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+                try rebased.values.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
                 if (entry.value_ptr.*) |blob| blob.retain();
                 if (experimentalPostingKindAffectsLeafScan(try experimentalPostingValueKeyKind(entry.key_ptr.*)))
-                    try changed_leaves.put(self.alloc, experimentalPostingValueKeyId(entry.key_ptr.*), {});
+                    try changed_leaves.put(alloc, experimentalPostingValueKeyId(entry.key_ptr.*), {});
             }
         }
         var leaves = changed_leaves.keyIterator();
@@ -4392,6 +4415,17 @@ const ExperimentalPostingCheckpointBuild = struct {
     staged: ?posting_segment_store_mod.StagedCheckpointSegment = null,
     staged_readers: ?*ExperimentalPostingReadGeneration = null,
     readers_stage_ns: u64 = 0,
+    // Captured by the writer at a committed boundary, then read only by the
+    // worker. Keeping this ancestor in the live chain bounds final rebase work
+    // to mutations arriving during preparation, not the complete WAL overlay.
+    rebase_source: ?*ExperimentalPostingReadGeneration = null,
+    staged_rebase: ?*ExperimentalPostingReadGeneration = null,
+    rebase_sequence: u64 = 0,
+    rebase_wal_bytes: u64 = 0,
+    rebase_stage_ns: u64 = 0,
+    source_capture_overlap_ns: u64 = 0,
+    maintenance_capture_overlap_ns: u64 = 0,
+    lock_deferrals_at_start: u64 = 0,
 
     fn allocator() Allocator {
         return platform.allocator.processAllocator(std.heap.smp_allocator);
@@ -4433,7 +4467,9 @@ const ExperimentalPostingCheckpointBuild = struct {
         if (built) |value| {
             self.staged = value.staged;
             self.result = value.result;
-            if (@import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_STAGE_POSTING_READERS")) {
+            if (@import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_STAGE_POSTING_READERS") or
+                @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_STAGE_POSTING_REBASE"))
+            {
                 const readers_started_ns = nowNs();
                 defer self.readers_stage_ns = nowNs() -| readers_started_ns;
                 self.stageReaders() catch |err| {
@@ -4480,6 +4516,47 @@ const ExperimentalPostingCheckpointBuild = struct {
             read_alloc.destroy(state);
         }
         self.staged_readers = try ExperimentalPostingReadGeneration.createRoot(read_alloc, state);
+    }
+
+    fn runRebase(self: *ExperimentalPostingCheckpointBuild) void {
+        const started = nowNs();
+        defer {
+            self.rebase_stage_ns = nowNs() -| started;
+            std.log.info("dense checkpoint rebase worker generation={} sequence={} rebase_stage_ns={} success={}", .{
+                self.segment_generation, self.rebase_sequence, self.rebase_stage_ns, self.build_error == null,
+            });
+            // Keep completed_ns as the original file-completion timestamp:
+            // handoff waiting includes this additional preparation phase.
+            self.completed.store(true, .release);
+            if (self.resource_manager) |manager| manager.dense_checkpoint_ready.notify();
+        }
+        const read_alloc = if (builtin.is_test) self.owner_alloc else allocator();
+        // rebaseOnto may advance an empty base's coverage. Keep the staged
+        // file root at its checkpoint coverage for independent receipt checks.
+        const base = ExperimentalPostingReadGeneration.createOverlay(
+            read_alloc,
+            self.staged_readers.?,
+            self.covered_source_sequence,
+            self.wal_generation,
+            0,
+        ) catch |err| {
+            self.build_error = err;
+            return;
+        };
+        defer base.release();
+        self.staged_rebase = self.rebase_source.?.rebaseOntoAlloc(
+            read_alloc,
+            self.source_generation,
+            base,
+            self.rebase_sequence,
+            self.wal_generation,
+            self.rebase_wal_bytes,
+            self.metadata.dims,
+            self.metadata.use_quantization,
+        ) catch |err| {
+            self.build_error = err;
+            return;
+        };
     }
 
     fn buildAndStage(self: *ExperimentalPostingCheckpointBuild, build_alloc: Allocator) !?StagedExperimentalPostingCheckpoint {
@@ -4535,6 +4612,8 @@ const ExperimentalPostingCheckpointBuild = struct {
     fn deinit(self: *ExperimentalPostingCheckpointBuild) void {
         self.awaitCompletion();
         if (self.owned_io) |*io_impl| io_impl.deinit();
+        if (self.staged_rebase) |generation| generation.release();
+        if (self.rebase_source) |generation| generation.release();
         if (self.staged_readers) |readers| readers.release();
         if (self.result) |result| if (result.segment_bytes.len != 0) allocator().free(result.segment_bytes);
         self.staging_store.deinit();
@@ -4735,6 +4814,8 @@ pub const HBCIndex = struct {
     experimental_posting_checkpoint_build: ?*ExperimentalPostingCheckpointBuild = null,
     native_acceleration_retry: NativeAccelerationRetry = .{},
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
+    experimental_posting_capture_started_ns: u64 = 0,
+    posting_publication_lock_deferrals: std.atomic.Value(u64) = .init(0),
     /// Native authority can become durable while an opportunistic checkpoint
     /// still borrows storage owned by the compatibility LSM. Record the
     /// retirement request explicitly and drain it only at a boundary where no
@@ -8469,8 +8550,13 @@ pub const HBCIndex = struct {
         var total_values: usize = 0;
         var total_leaf_scan_costs: usize = 0;
         var immutable_root: ?*ExperimentalPostingReadGeneration = null;
+        const preparation_boundary = if (self.experimental_posting_checkpoint_build) |build| build.rebase_source else null;
         var current: ?*ExperimentalPostingReadGeneration = newest;
         while (current) |generation| : (current = generation.parent) {
+            if (generation == preparation_boundary) {
+                immutable_root = generation;
+                break;
+            }
             total_values = std.math.add(usize, total_values, generation.values.count()) catch
                 return error.OutOfMemory;
             total_leaf_scan_costs = std.math.add(usize, total_leaf_scan_costs, generation.leaf_scan_bytes.count()) catch
@@ -8481,6 +8567,7 @@ pub const HBCIndex = struct {
             }
         }
         const root = immutable_root orelse return error.Corrupted;
+        if (newest == root) return 0;
         if (newest.parent == root) return @intCast(newest.values.count());
 
         var merged: ExperimentalPostingGenerationValues = .empty;
@@ -8527,7 +8614,7 @@ pub const HBCIndex = struct {
         replacement.leaf_scan_bytes = merged_leaf_scan_bytes;
         merged_leaf_scan_bytes_owned = false;
         replacement.scan_admission = newest.scan_admission;
-        replacement.overlay_depth = 1;
+        replacement.overlay_depth = root.overlay_depth +| 1;
         const view = newest.search_view;
         if (newest.acquireRoutingDirectory(
             view.root_node,
@@ -8997,6 +9084,7 @@ pub const HBCIndex = struct {
             };
         };
         self.experimental_posting_checkpoint_build = build;
+        build.lock_deferrals_at_start = self.posting_publication_lock_deferrals.load(.monotonic);
         std.log.info("dense posting checkpoint build started generation={} sequence={} wal_prefix_bytes={} kind={s} chain_deltas={} obsolete_scan_bytes={}", .{
             build.segment_generation,
             build.covered_source_sequence,
@@ -9015,6 +9103,37 @@ pub const HBCIndex = struct {
         const build = self.experimental_posting_checkpoint_build orelse return false;
         if (!build.completed.load(.acquire)) return false;
         build.awaitCompletion();
+        if (build.build_error == null and build.staged_readers != null and build.rebase_source == null and
+            !build.force_progress.load(.acquire) and
+            @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_STAGE_POSTING_REBASE"))
+        stage_rebase: {
+            // Source/maintenance ownership is checked by the caller. Capture
+            // the complete live identity before releasing the writer lane.
+            const live = self.retainCurrentExperimentalPostingReadGeneration() orelse return error.PostingCheckpointSourceBoundaryMismatch;
+            if (live == build.source_generation) {
+                live.release();
+                break :stage_rebase;
+            }
+            if (experimentalPostingRootState(live) != experimentalPostingRootState(build.source_generation) or
+                live.covered_source_sequence.load(.acquire) != posting_store.covered_source_sequence or
+                live.wal_generation.load(.acquire) != posting_store.wal_generation or
+                live.wal_committed_bytes.load(.acquire) != posting_store.wal_committed_bytes)
+            {
+                live.release();
+                return error.PostingCheckpointSourceBoundaryMismatch;
+            }
+            build.rebase_source = live;
+            build.rebase_sequence = posting_store.covered_source_sequence;
+            build.rebase_wal_bytes = posting_store.wal_committed_bytes;
+            build.completed.store(false, .release);
+            build.future = build.io.concurrent(ExperimentalPostingCheckpointBuild.runRebase, .{build}) catch |err| {
+                build.build_error = err;
+                build.completed.store(true, .release);
+                if (build.resource_manager) |manager| manager.dense_checkpoint_ready.notify();
+                return err;
+            };
+            return false;
+        }
         self.experimental_posting_checkpoint_build = null;
         defer build.deinit();
         if (build.build_error) |err| {
@@ -9063,11 +9182,15 @@ pub const HBCIndex = struct {
         );
         defer prepared.deinit();
         const install_started_ns = nowNs();
-        try self.installPreparedExperimentalPostingCheckpointRebased(posting_store, &prepared, build.source_generation, build.staged_readers);
+        try self.installPreparedExperimentalPostingCheckpointRebasedTail(posting_store, &prepared, build.rebase_source orelse build.source_generation, build.staged_readers, build.staged_rebase);
         std.log.info("dense checkpoint handoff generation={} sequence={} kind={s} completed_wait_ns={} prepare_ns={} install_ns={} written_bytes={} retained_bytes={}", .{
             build.segment_generation,                 build.covered_source_sequence,                     @tagName(build.kind),
             prepare_started_ns -| build.completed_ns, install_started_ns -| prepare_started_ns,          nowNs() -| install_started_ns,
             result.segment_len,                       posting_store.segment_bytes -| result.segment_len,
+        });
+        std.log.info("dense checkpoint completion blockers generation={} source_capture_overlap_ns={} maintenance_capture_overlap_ns={} rebase_stage_ns={} lock_deferrals={}", .{
+            build.segment_generation, build.source_capture_overlap_ns,                                                           build.maintenance_capture_overlap_ns,
+            build.rebase_stage_ns,    self.posting_publication_lock_deferrals.load(.monotonic) -| build.lock_deferrals_at_start,
         });
         self.native_acceleration_retry = .{};
         std.log.info("dense posting checkpoint published generation={} sequence={} bytes={} kind={s} wal_tail_bytes={} chain_deltas={} patches={} patched_value_bytes={} encoded_patch_bytes={}", .{
@@ -9108,6 +9231,17 @@ pub const HBCIndex = struct {
         prepared: *posting_segment_store_mod.Store.PreparedPublication,
         captured: ?*ExperimentalPostingReadGeneration,
         staged_readers: ?*ExperimentalPostingReadGeneration,
+    ) !void {
+        return self.installPreparedExperimentalPostingCheckpointRebasedTail(posting_store, prepared, captured, staged_readers, null);
+    }
+
+    fn installPreparedExperimentalPostingCheckpointRebasedTail(
+        self: *HBCIndex,
+        posting_store: *posting_segment_store_mod.Store,
+        prepared: *posting_segment_store_mod.Store.PreparedPublication,
+        captured: ?*ExperimentalPostingReadGeneration,
+        staged_readers: ?*ExperimentalPostingReadGeneration,
+        staged_rebase: ?*ExperimentalPostingReadGeneration,
     ) !void {
         const started_ns = nowNs();
         const previous = self.retainCurrentExperimentalPostingReadGeneration();
@@ -9153,7 +9287,7 @@ pub const HBCIndex = struct {
         const readers_finished_ns = nowNs();
         defer base.release();
         const generation = if (captured) |source|
-            try previous.?.rebaseOnto(source, base, prepared.next.covered_source_sequence, prepared.next.wal_generation, prepared.next.wal_committed_bytes, self.metadata.dims, self.metadata.use_quantization)
+            try previous.?.rebaseOnto(source, staged_rebase orelse base, prepared.next.covered_source_sequence, prepared.next.wal_generation, prepared.next.wal_committed_bytes, self.metadata.dims, self.metadata.use_quantization)
         else keep: {
             base.retain();
             break :keep base;
@@ -9689,6 +9823,7 @@ pub const HBCIndex = struct {
         self.experimental_posting_cache_capture_active.store(true, .release);
         self.experimental_posting_capture_enabled = true;
         self.experimental_posting_capture_owner = owner;
+        self.experimental_posting_capture_started_ns = nowNs();
     }
 
     pub fn beginExperimentalPostingMutationCapture(self: *HBCIndex) !void {
@@ -9802,8 +9937,21 @@ pub const HBCIndex = struct {
         return self.experimental_posting_wal_authoritative.load(.acquire);
     }
 
+    fn observeCompletedCheckpointCaptureOverlap(self: *HBCIndex) void {
+        if (!self.experimental_posting_capture_enabled) return;
+        const build = self.experimental_posting_checkpoint_build orelse return;
+        if (!build.completed.load(.acquire) and build.rebase_source == null) return;
+        const overlap = nowNs() -| @max(self.experimental_posting_capture_started_ns, build.completed_ns);
+        if (self.experimental_posting_capture_owner == .maintenance) {
+            build.maintenance_capture_overlap_ns +|= overlap;
+        } else {
+            build.source_capture_overlap_ns +|= overlap;
+        }
+    }
+
     pub fn cancelExperimentalPostingMutationCapture(self: *HBCIndex) void {
         defer self.experimental_posting_cache_capture_active.store(false, .release);
+        self.observeCompletedCheckpointCaptureOverlap();
         self.experimental_posting_capture_enabled = false;
         self.experimental_posting_capture_owner = .none;
         self.experimental_posting_capture_base_source_sequence = 0;
@@ -9936,6 +10084,7 @@ pub const HBCIndex = struct {
             return error.PostingWalCaptureSequenceOutsideLease;
         }
         defer self.experimental_posting_cache_capture_active.store(false, .release);
+        self.observeCompletedCheckpointCaptureOverlap();
         self.experimental_posting_capture_enabled = false;
         self.experimental_posting_capture_owner = .none;
         self.experimental_posting_capture_base_source_sequence = 0;
@@ -10223,6 +10372,18 @@ pub const HBCIndex = struct {
                 else => return err,
             };
             defer plan.deinit();
+            if (if (manager) |value| value.dense_certified_subgroups else false) {
+                const errors = try alloc.alloc(grouping.Plan.SourceError, count);
+                defer alloc.free(errors);
+                for (errors, projections) |*bound, projection| bound.* = .{
+                    .norm_error = projection.error_norm,
+                    .decoded_norm_lower_bound = projection.decoded_norm_lower_bound,
+                };
+                plan.certify(vectors, errors) catch |err| switch (err) {
+                    error.UncertifiableSubgroup => {}, // Missing proof scans all members.
+                    else => return err,
+                };
+            }
             if (streaming) try directory.appendWithSubgroups(sink, posting_id, set, members, retained, plan.view) else try directory.appendWithSubgroups(posting_id, set, members, retained, plan.view);
             return;
         }
@@ -10663,6 +10824,9 @@ pub const HBCIndex = struct {
         // mmap readers. Its header is patched in place before the enclosing
         // index is finalized, all still inside the unpublished temp file.
         const topology_finished_ns = nowNs();
+        const reuse_rows = @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_REUSE_POSTING_ROWS");
+        var reused_rows: u64 = 0;
+        var reused_bytes: u64 = 0;
         try writer.alignForValue(sink, .quantized_directory);
         var quantized_directory = try vectorindex_quantized_directory.StreamingWriter.init(
             alloc,
@@ -10717,6 +10881,35 @@ pub const HBCIndex = struct {
             defer packed_node_value.deinit(alloc);
             const packed_node = packed_node_value.bytes;
             const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+            if (reuse_rows and cold_base_reader != null and quantized_file_offset != null and
+                decoded_node.header.is_leaf and effective_projection_source != null and
+                !effective_projection_source.?.retain_projection_plane)
+            reuse: {
+                // Resolve through immutable shadow metadata too: checking only
+                // live overlay keys could accidentally reuse a superseded base
+                // row when a durable delta owns the current membership.
+                const handle = (try generation.resolveLeafScanHandle(node_id)) orelse break :reuse;
+                const directory = if (root.quantized_directory) |*value| value else break :reuse;
+                if (handle.directory != @as(*anyopaque, @ptrCast(directory))) break :reuse;
+                const location = directory.entryLocation(node_id) orelse break :reuse;
+                const offset = try std.math.add(u64, quantized_file_offset.?, location.offset);
+                const bytes = try cold_base_reader.?.readRangeAlloc(alloc, offset, location.len);
+                defer alloc.free(bytes);
+                var owned = try directory.decodeOwnedEntry(alloc, node_id, bytes);
+                defer owned.deinit();
+                if (owned.view.projections != null or owned.view.member_ids.len == 0) break :reuse;
+                const requested_groups = effective_projection_source.?.subgroup_count;
+                const existing_groups = if (owned.view.subgroup_plan) |plan| plan.ends.len else 0;
+                if (existing_groups != requested_groups) break :reuse;
+                if (if (foreground_manager) |manager| manager.dense_certified_subgroups else false) {
+                    const plan = owned.view.subgroup_plan orelse break :reuse;
+                    if (plan.radii.len != plan.ends.len) break :reuse;
+                }
+                reused_bytes += try quantized_directory.appendOwnedNoCopyEntry(sink, node_id, &owned);
+                reused_rows += 1;
+                base_reclaimer.observe(packed_node);
+                continue;
+            }
             const leaf_projections = if (decoded_node.header.is_leaf)
                 try loadExperimentalLeafProjectionPlane(
                     alloc,
@@ -10814,6 +11007,9 @@ pub const HBCIndex = struct {
         }
         base_reclaimer.reclaimObserved();
         const quantized_finish = try quantized_directory.finish(sink);
+        std.log.info("dense checkpoint encoded row reuse sequence={} enabled={} reused_rows={} reused_bytes={} scan_bytes={}", .{
+            covered_source_sequence, reuse_rows, reused_rows, reused_bytes, quantized_finish.len,
+        });
         try writer.appendWrittenValueAt(
             sink,
             0,
@@ -17243,7 +17439,12 @@ pub const HBCIndex = struct {
     }
 
     pub fn nativeGlobalSubgroupRoutingEnabled(self: *const HBCIndex) bool {
+        if (self.nativeCertifiedSubgroupsEnabled()) return true;
         return if (self.resource_manager) |manager| manager.dense_global_subgroup_routing else false;
+    }
+
+    pub fn nativeCertifiedSubgroupsEnabled(self: *const HBCIndex) bool {
+        return if (self.resource_manager) |manager| manager.dense_certified_subgroups else false;
     }
 
     pub fn nativeGlobalSubgroupLeaseIdentity(self: *const HBCIndex, txn: anytype) ?*const anyopaque {
@@ -23686,6 +23887,18 @@ test "compact subgroup concurrent staging preserves resource accounting" {
 }
 
 fn testNativeSubgroupLifecycle(directory_mode: HBCConfig.CentroidDirectoryMode, global: bool, compact: bool) !void {
+    return testNativeSubgroupLifecycleMode(directory_mode, global, compact, false);
+}
+
+test "certified subgroup native lifecycle preserves exact scores with flat routing" {
+    try testNativeSubgroupLifecycleMode(.flat_rabitq, true, false, true);
+}
+
+test "certified subgroup native lifecycle preserves exact scores with tree routing" {
+    try testNativeSubgroupLifecycleMode(.hbc, true, false, true);
+}
+
+fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMode, global: bool, compact: bool, certified: bool) !void {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -23698,6 +23911,7 @@ fn testNativeSubgroupLifecycle(directory_mode: HBCConfig.CentroidDirectoryMode, 
     manager.dense_subgroup_routing = true;
     manager.dense_global_subgroup_routing = global;
     manager.dense_compact_subgroup_routing = compact;
+    manager.dense_certified_subgroups = certified;
     const Fixture = struct {
         fn vector(id: u64) [3]f32 {
             const angle = @as(f32, @floatFromInt(id % 128)) * 0.049;
@@ -23744,6 +23958,16 @@ fn testNativeSubgroupLifecycle(directory_mode: HBCConfig.CentroidDirectoryMode, 
         defer ann.results.deinit();
         try std.testing.expect(ann.profile.subgroup_leaves_scored > 0);
         try std.testing.expect(ann.profile.subgroup_vectors_skipped > 0);
+        if (idx.nativeCertifiedSubgroupsEnabled()) {
+            try std.testing.expect(ann.profile.traversal_bound_resolutions > 0);
+            try std.testing.expect(ann.profile.traversal_bound_stops > 0);
+            // Certificates, unlike hints, must preserve ordering and public
+            // float32 scores, not merely an aggregate recall threshold.
+            for (complete.results.items.items, ann.results.items.items) |a, b| {
+                try std.testing.expectEqual(a.vector_id, b.vector_id);
+                try std.testing.expectEqual(a.distance, b.distance);
+            }
+        }
         try std.testing.expectEqual(compact, ann.profile.subgroup_compact_groups_scored > 0);
         try std.testing.expectEqual(vectorindex_search_results.CandidateCoverage.more, ann.results.candidate_coverage);
         var filtered = try idx.searchProfiledRequest(.{ .query = &.{ 1, 0, 0 }, .k = 10, .search_width = 8, .filter_prefix = "doc" });
@@ -24147,6 +24371,10 @@ test "native suffix checkpoint preserves pinned readers tombstones and a concurr
         defer before.release();
         const retained_base = experimentalPostingRootState(before).?.retained_segments[0].bytes().ptr;
         try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, .compact_deltas));
+        // Deterministic handoff gate: the source commit below must not race
+        // publication and accidentally skip the staged-reader/rebase checks.
+        idx.experimental_posting_checkpoint_build.?.awaitCompletion();
+        idx.experimental_posting_checkpoint_build.?.completed.store(false, .release);
         // Commit after the builder's retained boundary. Publication must not
         // flatten away this tail or resurrect the base's deleted vector.
         try idx.beginExperimentalPostingMutationCapture();
@@ -24158,6 +24386,22 @@ test "native suffix checkpoint preserves pinned readers tombstones and a concurr
             const staged = build.staged_readers.?;
             try std.testing.expectEqual(@as(u64, 4), staged.covered_source_sequence.load(.acquire));
             try std.testing.expect(staged.root.?.retained_segments[0].bytes().ptr == retained_base);
+            if (build.rebase_source == null) {
+                build.rebase_source = idx.retainCurrentExperimentalPostingReadGeneration().?;
+                build.rebase_sequence = idx.experimental_posting_write_store.?.covered_source_sequence;
+                build.rebase_wal_bytes = idx.experimental_posting_write_store.?.wal_committed_bytes;
+                build.completed.store(false, .release);
+                build.future = try build.io.concurrent(ExperimentalPostingCheckpointBuild.runRebase, .{build});
+                build.awaitCompletion();
+            }
+            try std.testing.expect(build.build_error == null);
+            try std.testing.expect(build.staged_rebase != null);
+            try std.testing.expectEqual(@as(u64, 4), staged.covered_source_sequence.load(.acquire));
+            // The staged root must not acquire the newer logical coverage.
+            // Consolidation preserves the pinned preparation boundary rather
+            // than flattening it back into a corpus-wide mutable map.
+            _ = try idx.collapseExperimentalPostingReadOverlaysShared();
+            try std.testing.expect(idx.experimental_posting_read_generation.? == build.rebase_source.?);
             try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
         }
         try std.testing.expectEqual(@as(usize, 1), idx.experimental_posting_write_store.?.deltaSegmentCount());
@@ -24274,6 +24518,18 @@ fn testPostingRebaseOwnership(alloc: Allocator) !void {
     try std.testing.expect(!rebased.values.contains(experimentalPostingValueKey(3, .vector_metadata)));
     try std.testing.expectEqualStrings("before", (try captured.value(1, .vector_metadata)).?);
     try std.testing.expectError(error.PostingCheckpointSourceBoundaryMismatch, live.rebaseOnto(new_base, new_base, 5, 2, 100, 2, false));
+    // A second stage handles only the new tail, preserving all worker-owned
+    // blobs and same-sequence maintenance/tombstone semantics.
+    const tail = try ExperimentalPostingReadGeneration.createOverlay(alloc, live, 5, 1, 300);
+    defer tail.release();
+    try tail.set(2, .vector_metadata, null);
+    const final = try tail.rebaseOnto(live, rebased, 5, 2, 200, 2, false);
+    defer final.release();
+    try std.testing.expectEqual(@as(u32, 1), final.values.count());
+    try std.testing.expectEqual(rebased, final.parent.?);
+    try std.testing.expectEqualStrings("after", (try final.value(1, .vector_metadata)).?);
+    try std.testing.expect(final.values.get(experimentalPostingValueKey(2, .vector_metadata)).? == null);
+    try std.testing.expectEqualStrings("resurrected", (try live.value(2, .vector_metadata)).?);
     const coverage_only = try captured.rebaseOnto(captured, new_base, 6, 2, 20, 2, false);
     defer coverage_only.release();
     try std.testing.expectEqual(new_base, coverage_only);
@@ -24402,6 +24658,10 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
         if (idx.experimental_posting_checkpoint_build) |build| build.awaitCompletion();
         if (idx.experimental_posting_checkpoint_build != null) {
             _ = try idx.publishCompletedExperimentalPostingCheckpointBuild(posting_store);
+            if (idx.experimental_posting_checkpoint_build) |build| {
+                build.awaitCompletion();
+                try std.testing.expect(try idx.publishCompletedExperimentalPostingCheckpointBuild(posting_store));
+            }
         }
         try std.testing.expectEqual(@as(u64, 2), posting_store.checkpoint.?.latestSegmentGeneration());
         try std.testing.expectEqual(@as(u8, 1), posting_store.checkpoint.?.delta_segment_count);

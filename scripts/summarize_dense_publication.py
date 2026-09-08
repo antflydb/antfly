@@ -10,6 +10,8 @@ EVENTS = {
     "dense checkpoint worker ": "worker",
     "dense checkpoint handoff ": "handoff",
     "dense checkpoint install ": "install",
+    "dense checkpoint rebase worker ": "rebase_worker",
+    "dense checkpoint completion blockers ": "completion_blockers",
     "dense posting checkpoint staging ": "staging",
 }
 
@@ -36,9 +38,10 @@ def summarize_lines(lines):
             row = {"line": number, **values}
             try:
                 for field, value in values.items():
-                    if (
-                        field.endswith(("_ns", "_bytes"))
-                        or field in ("sequence", "generation", "bytes")
+                    if field.endswith(("_ns", "_bytes")) or field in (
+                        "sequence",
+                        "generation",
+                        "bytes",
                     ):
                         row[field] = None if value == "null" else int(value)
                         if row[field] is not None and row[field] < 0:
@@ -78,6 +81,8 @@ def summarize_lines(lines):
             "Thread CPU excludes other threads; wall minus CPU is not proof of I/O or CPU contention.",
             "Readiness counts are observations, not elapsed durations or independent rebuilds.",
             "Historical logs without worker/handoff events cannot attribute queue or completion waiting.",
+            "Capture overlap and rebase worker time can overlap each other inside completed_wait; do not add them or label the remainder scheduling time.",
+            "Lock deferrals count failed admission observations, not lock-held duration; they can include time before the worker completed.",
         ],
     }
 

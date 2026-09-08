@@ -7987,6 +7987,7 @@ pub const IndexManager = struct {
         var result: OnlineVectorBlockPublicationResult = .{};
         for (self.dense_indexes.items) |*entry| {
             if (!entry.apply_mutex.tryLock()) {
+                _ = entry.index.posting_publication_lock_deferrals.fetchAdd(1, .monotonic);
                 result.deferred = true;
                 continue;
             }
