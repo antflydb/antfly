@@ -55,7 +55,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
     for (sections) |section| {
         const section_tokens = try countTokens(alloc, tokenizer, section.text);
         // Count the actual source span, including separators between sections.
-        const candidate_tokens = if (current.items.len > 0)
+        var candidate_tokens = if (current.items.len > 0)
             try countTokens(alloc, tokenizer, text[current.items[0].start .. section.start + section.text.len])
         else
             section_tokens;
@@ -67,22 +67,22 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
 
             previous_text = chunks.items[chunks.items.len - 1].text.?;
             current.clearRetainingCapacity();
-            current_tokens = 0;
+            candidate_tokens = section_tokens;
 
             if (overlap_tokens > 0 and previous_text.len > 0) {
                 // A full-size next section leaves no room for overlap.
                 const overlap_budget = @min(overlap_tokens, target_tokens -| section_tokens);
                 const overlap_start = try computeOverlapStart(alloc, tokenizer, previous_text, overlap_budget);
                 const overlap_text = previous_text[overlap_start..];
-                if (overlap_text.len > 0 and
-                    try countTokens(alloc, tokenizer, text[previous_start + overlap_start .. section.start + section.text.len]) <= target_tokens)
-                {
-                    try current.append(alloc, .{
-                        .text = overlap_text,
-                        .start = previous_start + overlap_start,
-                        .tokens = try countTokens(alloc, tokenizer, overlap_text),
-                    });
-                    current_tokens = current.items[0].tokens;
+                if (overlap_text.len > 0) {
+                    const overlap_candidate_tokens = try countTokens(alloc, tokenizer, text[previous_start + overlap_start .. section.start + section.text.len]);
+                    if (overlap_candidate_tokens <= target_tokens) {
+                        try current.append(alloc, .{
+                            .text = overlap_text,
+                            .start = previous_start + overlap_start,
+                        });
+                        candidate_tokens = overlap_candidate_tokens;
+                    }
                 }
             }
         }
@@ -92,7 +92,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
             .start = section.start,
             .tokens = section_tokens,
         });
-        current_tokens = try countTokens(alloc, tokenizer, text[current.items[0].start .. section.start + section.text.len]);
+        current_tokens = candidate_tokens;
     }
 
     if (current.items.len > 0 and chunks.items.len < max_chunks) {
