@@ -504,11 +504,12 @@ const Child = struct {
         switch (envelope.operation) {
             .provider => {
                 const provider = try std.json.parseFromSliceLeaky(wire.Provider, arena, envelope.options, .{});
-                var media = try wire.attachments.parseAlloc(arena, envelope.data, .{
-                    .max_metadata_bytes = rpc.max_body_bytes,
-                    .max_total_attachment_bytes = rpc.max_body_bytes,
-                });
+                var limits = wire.provider_attachment_limits;
+                // Text-only calls keep the existing logical JSON body ceiling.
+                limits.max_metadata_bytes = rpc.max_body_bytes;
+                var media = try wire.attachments.parseAlloc(arena, envelope.data, limits);
                 defer media.deinit();
+                if (media.attachments.len > 0 and media.metadata.len > wire.provider_attachment_limits.max_metadata_bytes) return error.BodyTooLarge;
                 const payloads = try arena.alloc(bridge.ProviderBinaryPayload, media.attachments.len);
                 for (payloads, media.attachments) |*payload, attachment| payload.* = .{
                     .bytes = .init(attachment.data),

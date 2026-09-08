@@ -854,7 +854,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         if (!state.node.tryAcquireRequestSlot()) return error.ResourceTemporarilyUnavailable;
         defer state.node.releaseRequestSlot();
         const result = try worker_runtime.invokeProvider(worker, context);
-        const json = switch (result) {
+        var json = switch (result) {
             .json => |json| json,
             .numeric => |numeric| {
                 errdefer {
@@ -866,6 +866,14 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             },
         };
         errdefer state.alloc.free(json);
+        if (context.operation == @intFromEnum(inference_bridge.ProviderOperation.model_capabilities)) {
+            var capabilities = try std.json.parseFromSlice(antfly.inference.work.InferenceCapabilities, state.alloc, json, .{});
+            defer capabilities.deinit();
+            const constrained = worker_runtime.wire.constrainCapabilities(capabilities.value);
+            const updated = try std.json.Stringify.valueAlloc(state.alloc, constrained, .{});
+            state.alloc.free(json);
+            json = updated;
+        }
         const response = try state.alloc.create(ProviderResponseState);
         response.* = .{ .alloc = state.alloc, .json = json };
         context.out_response_handle.* = response;

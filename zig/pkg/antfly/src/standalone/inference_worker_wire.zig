@@ -137,6 +137,30 @@ pub const Create = struct {
 };
 
 pub const attachments = @import("httpx").attachment_envelope;
+pub const provider_attachment_limits = attachments.Limits{
+    .max_metadata_bytes = 1024 * 1024,
+    .max_attachments = 1024,
+    .max_mime_bytes = 1024,
+    // Reserve the complete worst-case envelope, not just the raster payload.
+    .max_total_attachment_bytes = @import("inference_worker_rpc.zig").max_body_bytes - 24 - 1024 * 1024 - 1024 * (16 + 1024),
+};
+
+pub fn constrainCapabilities(capabilities: anytype) @TypeOf(capabilities) {
+    var result = capabilities;
+    const limit = @min(result.attachment_payload_max_bytes orelse provider_attachment_limits.max_total_attachment_bytes, provider_attachment_limits.max_total_attachment_bytes);
+    result.attachment_payload_max_bytes = limit;
+    result.attachment_metadata_max_bytes = @min(result.attachment_metadata_max_bytes orelse provider_attachment_limits.max_metadata_bytes, provider_attachment_limits.max_metadata_bytes);
+    result.batch.max_encoded_media_bytes = @min(result.batch.max_encoded_media_bytes orelse limit, limit);
+    // PDF raster producers use tightly packed RGBA8. Publish a route pixel
+    // ceiling so every existing render/window planner bounds IPC before paint.
+    if (result.borrowed_rasters) {
+        if (result.image_transform) |transform| {
+            if (@as(u64, transform.target_width) * transform.target_height > limit / 4) result.borrowed_rasters = false;
+        }
+        if (result.borrowed_rasters) result.batch.max_decoded_pixels = @min(result.batch.max_decoded_pixels orelse limit / 4, limit / 4);
+    }
+    return result;
+}
 pub const AttachmentRef = struct {
     attachment_index: usize,
     item_index: usize,
@@ -159,9 +183,15 @@ pub const ProviderInput = struct {
     pub fn init(arena: std.mem.Allocator, context: *const bridge.ProviderInvokeContext) !ProviderInput {
         if ((context.binary_payloads == null and context.binary_payloads_len != 0) or
             (context.attachment_refs == null and context.attachment_refs_len != 0)) return error.InvalidInput;
+        if (context.binary_payloads_len > provider_attachment_limits.max_attachments) return error.BodyTooLarge;
+        if (context.binary_payloads_len > 0 and context.request_json.len > provider_attachment_limits.max_metadata_bytes) return error.BodyTooLarge;
         const payloads = try arena.alloc(attachments.Attachment, context.binary_payloads_len);
+        var payload_bytes: usize = 0;
         for (payloads, 0..) |*payload, i| {
             const source = context.binary_payloads.?[i];
+            if (source.content_type.len > provider_attachment_limits.max_mime_bytes) return error.BodyTooLarge;
+            payload_bytes = std.math.add(usize, payload_bytes, source.bytes.len) catch return error.BodyTooLarge;
+            if (payload_bytes > provider_attachment_limits.max_total_attachment_bytes) return error.BodyTooLarge;
             payload.* = .{ .mime_type = source.content_type.slice(), .data = source.bytes.slice() };
         }
         const refs = try arena.alloc(AttachmentRef, context.attachment_refs_len);
@@ -244,6 +274,21 @@ pub const Observation = struct { key: usize, previous: u64, next: u64 };
 
 test "inference worker logical body limit matches the public HTTP contract" {
     try std.testing.expectEqual(@import("../api/public_limits.zig").max_request_body_bytes, @import("inference_worker_rpc.zig").max_body_bytes);
+}
+
+test "inference worker raster capability reserves envelope overhead before rendering" {
+    const work = @import("../inference/work.zig");
+    const original = work.InferenceCapabilities{ .task = .read, .input_modalities = .{ .image = true }, .input_granularity = .page, .batch = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_decoded_pixels = 50_000_000 }, .output = .read_result, .borrowed_rasters = true, .borrowed_attachments = true };
+    const constrained = constrainCapabilities(original);
+    try constrained.validate();
+    const pixels = constrained.batch.max_decoded_pixels.?;
+    const limits = provider_attachment_limits;
+    try std.testing.expect(pixels < original.batch.max_decoded_pixels.?);
+    try std.testing.expect(pixels * 4 + limits.max_metadata_bytes + 24 + limits.max_attachments * (16 + limits.max_mime_bytes) <= @import("inference_worker_rpc.zig").max_body_bytes);
+    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, constrained.validateInvocation(.read, .{ .item_count = 8, .modalities = .{ .image = true }, .decoded_pixels = pixels + 1 }));
+    var large = original;
+    large.image_transform = .{ .target_width = 4096, .target_height = 4096, .resize_mode = .stretch, .resample = .bilinear };
+    try std.testing.expect(!constrainCapabilities(large).borrowed_rasters);
 }
 
 test "inference worker provider attachments preserve bytes and per-item provenance" {

@@ -30,20 +30,85 @@ const Ticket = struct {
     rows: usize,
 };
 
+test "tensor microbatch retained cross output does not pin obsolete columns" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const alloc = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    const session = session_mod.Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{},
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+    } };
+    const outputs = try alloc.alloc(Tensor, 2);
+    outputs[0] = try Tensor.initFloat32(alloc, "logits", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+    outputs[1] = try Tensor.initFloat32(alloc, "cross", &.{ 2, 2 }, &.{ 5, 6, 7, 8 });
+    const retained = try session_mod.retainedOutputAmounts(outputs, false);
+    const owner = try alloc.create(SharedOutputs);
+    const columns = try alloc.alloc(SharedOutputs.Column, 2);
+    owner.* = .{ .allocator = alloc, .outputs = outputs, .columns = columns, .remaining = .init(2), .permit = try session.admitHostPreprocess(retained.host_scratch_bytes) };
+    for (columns, 0..) |*column, index| column.* = .{ .owner = owner, .index = index };
+    const first = try owner.rows(0, 1, 2);
+    const second = try owner.rows(1, 1, 2);
+    defer alloc.free(first);
+    defer alloc.free(second);
+    SharedOutputs.release(owner);
+    first[0].deinit();
+    second[0].deinit();
+    try std.testing.expectEqual(retained.host_scratch_bytes / 2, controller.snapshot().host_scratch_bytes);
+    first[1].deinit();
+    try std.testing.expectEqual(retained.host_scratch_bytes / 2, controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqualSlices(f32, &.{ 7, 8 }, second[1].asFloat32());
+    second[1].deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
 /// Names and data remain valid through the last consumer, not merely the last
 /// submitter. Slices share a batch allocation but never share mutable rows.
 const SharedOutputs = struct {
     allocator: std.mem.Allocator,
     outputs: []Tensor,
     permit: ?session_mod.RunPermit,
-    refs: std.atomic.Value(usize) = .init(1),
+    columns: []Column,
+    remaining: std.atomic.Value(usize),
+    mutex: std.atomic.Mutex = .unlocked,
+
+    const Column = struct {
+        owner: *SharedOutputs,
+        index: usize,
+        refs: std.atomic.Value(usize) = .init(1),
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const owner = self.owner;
+            // A persistent cross-cache must not pin obsolete logits/self-cache.
+            platform.sync.lockYielding(&owner.mutex);
+            const output = &owner.outputs[self.index];
+            if (owner.permit) |*permit| if (permit.lease) |*lease| {
+                const released = session_mod.retainedOutputAmounts(@as([*]const Tensor, @ptrCast(output))[0..1], lease.amounts.host_kv_bytes > 0) catch unreachable;
+                var retained = lease.amounts;
+                retained.host_scratch_bytes -= released.host_scratch_bytes;
+                retained.host_kv_bytes -= released.host_kv_bytes;
+                output.deinit();
+                // A failed reduction keeps a conservative reservation until the
+                // last column releases the lease; it cannot under-admit memory.
+                lease.retain(retained) catch {};
+            } else output.deinit() else output.deinit();
+            owner.mutex.unlock();
+            if (owner.remaining.fetchSub(1, .acq_rel) != 1) return;
+            if (owner.permit) |*permit| permit.deinit();
+            owner.allocator.free(owner.outputs);
+            owner.allocator.free(owner.columns);
+            owner.allocator.destroy(owner);
+        }
+    };
 
     fn release(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        destroy(self.allocator, self.outputs);
-        if (self.permit) |*permit| permit.deinit();
-        self.allocator.destroy(self);
+        const columns = self.columns;
+        for (columns) |*column| Column.release(column);
     }
 
     fn rows(self: *@This(), start: usize, count: usize, total: usize) ![]Tensor {
@@ -53,7 +118,7 @@ const SharedOutputs = struct {
             for (output[0..initialized]) |*tensor| tensor.deinit();
             self.allocator.free(output);
         }
-        for (self.outputs, output) |tensor, *view| {
+        for (self.outputs, output, self.columns) |tensor, *view, *column| {
             const shape = try self.allocator.dupe(i64, tensor.shape);
             if (shape[0] != 0) shape[0] = @intCast(count);
             const stride = tensor.data.len / total;
@@ -65,11 +130,11 @@ const SharedOutputs = struct {
                 .allocator = self.allocator,
                 .owns_data = false,
                 .owns_shape = true,
-                .lifetime = .{ .context = self, .release = release },
+                .lifetime = .{ .context = column, .release = Column.release },
                 .shared_storage = tensor.data,
                 .admitted_storage_domain = if (self.permit) |permit| if (permit.lease) |lease| lease.controller else null else null,
             };
-            _ = self.refs.fetchAdd(1, .monotonic);
+            _ = column.refs.fetchAdd(1, .monotonic);
             initialized += 1;
         }
         return output;
@@ -401,7 +466,10 @@ fn executeGroup(items: []const micro.ExecuteItem) !void {
     first.gate.unlock();
     locked = false;
     const owner = try alloc.create(SharedOutputs);
-    owner.* = .{ .allocator = alloc, .outputs = outputs, .permit = permit };
+    errdefer alloc.destroy(owner);
+    const columns = try alloc.alloc(SharedOutputs.Column, outputs.len);
+    owner.* = .{ .allocator = alloc, .outputs = outputs, .permit = permit, .columns = columns, .remaining = .init(outputs.len) };
+    for (columns, 0..) |*column, index| column.* = .{ .owner = owner, .index = index };
     owns_outputs = false;
     owns_permit = false;
     defer SharedOutputs.release(owner);
@@ -811,7 +879,10 @@ test "tensor microbatch row-view ownership unwinds every allocation failure" {
             outputs[0] = try Tensor.initFloat32(allocator, "a", &.{ 2, 1 }, &.{ 1, 2 });
             errdefer outputs[0].deinit();
             outputs[1] = try Tensor.initFloat32(allocator, "b", &.{ 2, 1 }, &.{ 3, 4 });
-            owner.* = .{ .allocator = allocator, .outputs = outputs, .permit = null };
+            errdefer outputs[1].deinit();
+            const columns = try allocator.alloc(SharedOutputs.Column, outputs.len);
+            owner.* = .{ .allocator = allocator, .outputs = outputs, .permit = null, .columns = columns, .remaining = .init(outputs.len) };
+            for (columns, 0..) |*column, index| column.* = .{ .owner = owner, .index = index };
             return owner;
         }
         fn check(allocator: std.mem.Allocator) !void {

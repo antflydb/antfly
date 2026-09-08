@@ -901,6 +901,9 @@ pub const InferenceCapabilities = struct {
     /// Linked-process executor has a concrete borrowed raw-raster entrypoint.
     /// This is never inferred from image modality or encoded attachment support.
     borrowed_rasters: bool = false,
+    /// Physical local transport ceilings, distinct from model codec limits.
+    attachment_payload_max_bytes: ?usize = null,
+    attachment_metadata_max_bytes: ?usize = null,
 
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
@@ -959,6 +962,14 @@ pub const InferenceCapabilities = struct {
     pub fn validateInvocation(self: InferenceCapabilities, task: Task, shape: InvocationShape) !void {
         try self.validate();
         if (self.task != task) return error.InferenceTaskMismatch;
+        if (self.attachment_metadata_max_bytes) |limit| {
+            // Reserve half for structural JSON, identities and model options;
+            // text/schema content can expand sixfold when JSON-escaped.
+            if (shape.modalities.image or shape.modalities.audio or shape.modalities.document) {
+                const content_bytes = std.math.add(usize, shape.text_bytes, shape.schema_bytes) catch return error.InferenceTextBytesExceeded;
+                if (content_bytes > limit / 12) return error.InferenceTextBytesExceeded;
+            }
+        }
         if (!self.batch.acceptsItems(shape.item_count))
             return error.InferenceBatchTooLarge;
         if (@as(u8, @bitCast(shape.modalities)) != 0 and !self.supports(shape.modalities))

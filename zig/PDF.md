@@ -4928,12 +4928,32 @@ handshakes remain authoritative.
 
 Prepared text uses an admission-backed allocator for every tokenizer allocation,
 including normalization, Unigram Viterbi scratch, retained IDs and realloc overlap.
-Capacity is acquired before backing allocation and released after free; allocator
-failures preserve the admission error and unwind all leases. Only actual retained
-token storage and bounded staging remain charged after preparation. Length-class
+Admission credit is acquired before backing allocation in 64 KiB quanta, with an
+exact-size retry when slack would exceed the limit. Individual allocations still
+use the backing heap; their frees return credit locally without resource RPCs.
+Preparation trims unused credit, retaining IDs, allocation bookkeeping and bounded
+staging. The owner tracks every live allocation and reclaims even blocks abandoned
+by a failing tokenizer before releasing its leases. Metaspace also cleans up its
+own partial words/lists; direct and owner-wrapped real-tokenizer allocation-failure
+tests cover both contracts. A thousand sequential scratch allocations reuse one
+admission reservation. Length-class
 queue indices/result descriptors have their own admitted allowance. A 16 KiB
 tokenizer-scratch regression rejects over-budget growth before the backing
 allocation; allocation-failure tests cover complete cleanup.
+
+Worker route capabilities constrain rendering before materialization: the 64 MiB
+logical request ceiling reserves 1 MiB of attachment metadata plus worst-case
+attachment descriptors/MIME strings, then publishes the remaining encoded-byte
+and tightly packed RGBA pixel ceilings. Oversized fixed transforms disable the
+raw-raster path and retain encoded-image execution. Multimodal metadata preflight
+is conservative; the sender and receiver also enforce exact envelope limits.
+Text-only requests retain the original logical JSON ceiling.
+
+Direct output admission and fused output storage release each output tensor
+independently. Retaining a cross-attention cache therefore does not pin obsolete
+logits or self-attention tensors, or their byte reservations. Rows of the same
+output column still share its backing allocation until its final row is released;
+live-row compaction and device-resident gather/scatter remain separate work.
 
 For sixteen alternating short/long rewrites, the hermetic dispatcher regression
 now uses six physical forwards instead of twelve from adjacent eight-item sorting,

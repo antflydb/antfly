@@ -170,8 +170,12 @@ uses generated IDs rather than re-encoding decoded text. Token IDs are retained
 for whole-request validation; padded tensors and model execution stay bounded
 to eight-row windows. Tokenizer allocations acquire host capacity before the
 backing allocation, including normalization/Viterbi scratch and realloc overlap;
-scratch is released as soon as the tokenizer frees it. This is enforced allocation
-accounting, not an estimate based on UTF-8 length. The retained token owner is
+freed scratch returns credit to a request-local pool. Admission grows in 64 KiB
+quanta (with exact-size fallback under tight limits), not one RPC per allocation.
+After preparation, unused credit is trimmed; teardown reclaims abandoned blocks
+before releasing leases. Real Metaspace allocation-failure tests cover both direct
+cleanup and this owner rollback. This is enforced allocation accounting, not an
+estimate based on UTF-8 length. The retained token owner is
 bound to the same session, controller and limits as its consumer.
 It partitions the whole bounded queue by token-length class before materializing tensors,
 then restores original result order. Subdivision never inherits an unrelated
@@ -226,6 +230,12 @@ repacking them; result slots preserve each request's identity. Split groups or
 noncontiguous rows still pack normally. Generic seq2seq decoding also reuses its
 token-ID buffer, borrows attention masks and selects argmax directly from logits,
 eliminating the per-token vocabulary copy.
+
+Each output column has its own shared lifetime and byte-credit reduction, for
+both fused and direct forwards. Retained cross-attention output no longer pins
+obsolete logits/self-attention columns. Rows within a column still share one
+allocation; live-row compaction and device-resident cache execution are not
+implied by this host-memory optimization.
 
 `pipelines/seq2seq_decode.zig` provides request-owned incremental execution for
 qualified merged exports with `use_cache_branch`, matching `past_key_values` /

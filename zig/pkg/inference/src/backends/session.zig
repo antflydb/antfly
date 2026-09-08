@@ -462,18 +462,29 @@ const OutputAdmission = struct {
     allocator: std.mem.Allocator,
     lease: memory.AdmissionLease,
     remaining: std.atomic.Value(usize),
+    entries: []Entry,
+    mutex: std.atomic.Mutex = .unlocked,
+    const Entry = struct { owner: *OutputAdmission, amounts: memory.AdmissionAmounts };
 
     fn release(raw: *anyopaque) void {
-        const self: *OutputAdmission = @ptrCast(@alignCast(raw));
+        const entry: *Entry = @ptrCast(@alignCast(raw));
+        const self = entry.owner;
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        var retained = self.lease.amounts;
+        retained.host_scratch_bytes -= entry.amounts.host_scratch_bytes;
+        retained.host_kv_bytes -= entry.amounts.host_kv_bytes;
+        self.lease.retain(retained) catch {};
+        self.mutex.unlock();
         const previous = self.remaining.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
         if (previous != 1) return;
         self.lease.release();
+        self.allocator.free(self.entries);
         self.allocator.destroy(self);
     }
 };
 
-fn retainedOutputAmounts(outputs: []const Tensor, cache_qualified: bool) !memory.AdmissionAmounts {
+pub fn retainedOutputAmounts(outputs: []const Tensor, cache_qualified: bool) !memory.AdmissionAmounts {
     var amounts = memory.AdmissionAmounts{};
     for (outputs) |output| {
         const bytes = try addBytes(output.data.len, try mulBytes(output.shape.len, @sizeOf(i64)));
@@ -593,16 +604,27 @@ pub const Session = struct {
         } else resource_lease.*.?.retain(retained) catch {};
 
         const output_admission = try allocator.create(OutputAdmission);
+        errdefer allocator.destroy(output_admission);
+        const entries = try allocator.alloc(OutputAdmission.Entry, outputs.len);
+        errdefer allocator.free(entries);
+        for (outputs, entries) |output, *entry| entry.* = .{
+            .owner = output_admission,
+            .amounts = if (retained.host_scratch_bytes <= resource_lease.*.?.amounts.host_scratch_bytes and retained.host_kv_bytes <= resource_lease.*.?.amounts.host_kv_bytes)
+                try retainedOutputAmounts(&.{output}, resource_lease.*.?.amounts.host_kv_bytes > 0)
+            else
+                .{},
+        };
         output_admission.* = .{
             .allocator = allocator,
             .lease = resource_lease.*.?,
             .remaining = std.atomic.Value(usize).init(outputs.len),
+            .entries = entries,
         };
         resource_lease.* = null;
-        for (outputs) |*output| {
+        for (outputs, entries) |*output, *entry| {
             std.debug.assert(output.lifetime == null);
             output.lifetime = .{
-                .context = output_admission,
+                .context = entry,
                 .release = OutputAdmission.release,
             };
             if (output_admission.lease.amounts.hostTotalBytes() >= retained_output_bytes) {
@@ -1333,6 +1355,31 @@ test "forced run admission denials are counted and recover" {
     for (outputs) |*output| output.deinit();
     std.testing.allocator.free(outputs);
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "session output admission releases obsolete outputs independently" {
+    const alloc = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    const session = Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{},
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+    } };
+    var outputs = [_]Tensor{
+        try Tensor.initFloat32(alloc, "logits", &.{ 1, 2 }, &.{ 1, 2 }),
+        try Tensor.initFloat32(alloc, "cross", &.{ 1, 2 }, &.{ 3, 4 }),
+    };
+    const retained = try retainedOutputAmounts(&outputs, false);
+    var permit = try session.admitHostPreprocess(retained.host_scratch_bytes);
+    defer permit.deinit();
+    _ = try Session.attachOutputAdmission(&outputs, alloc, &permit.lease);
+    outputs[0].deinit();
+    try std.testing.expectEqual(retained.host_scratch_bytes / 2, controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, outputs[1].asFloat32());
+    outputs[1].deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }
 
 test "session output admission has one owner on every allocation failure" {

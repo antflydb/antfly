@@ -35,6 +35,7 @@ pub const PreparedTextBatch = struct {
         const owner = try allocator.create(AdmittedAllocator);
         errdefer allocator.destroy(owner);
         owner.* = .{ .backing = allocator, .session = session };
+        errdefer owner.deinit();
         const token_alloc = owner.allocator();
         const ids = token_alloc.alloc([]i32, texts.len) catch |err| return owner.admission_error orelse err;
         var initialized: usize = 0;
@@ -52,7 +53,8 @@ pub const PreparedTextBatch = struct {
             maximum = @max(maximum, item.len);
         }
         if (control) |active| try active.check();
-        return .{ .allocator = allocator, .ids = ids, .permit = permit, .token_owner = owner, .reserved_bytes = try add(usize, bytes, owner.live_bytes), .tokenizer = tokenizer, .max_sequence = max_sequence, .total_tokens = total, .max_tokens = maximum };
+        try owner.trim();
+        return .{ .allocator = allocator, .ids = ids, .permit = permit, .token_owner = owner, .reserved_bytes = try add(usize, bytes, owner.reserved_bytes), .tokenizer = tokenizer, .max_sequence = max_sequence, .total_tokens = total, .max_tokens = maximum };
     }
 
     pub fn validateFor(self: *const @This(), session: session_mod.Session, tokenizer: Tokenizer, max_sequence: usize) !void {
@@ -73,6 +75,7 @@ pub const PreparedTextBatch = struct {
         for (self.ids) |ids| token_alloc.free(ids);
         token_alloc.free(self.ids);
         std.debug.assert(self.token_owner.live_bytes == 0);
+        self.token_owner.deinit();
         self.allocator.destroy(self.token_owner);
         self.permit.deinit();
     }
@@ -108,6 +111,61 @@ fn checkPreparedOwnership(allocator: std.mem.Allocator) !void {
 
 test "prepared text admits before tokenization and unwinds every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPreparedOwnership, .{});
+}
+
+fn checkRealPrepared(alloc: std.mem.Allocator, tokenizer: Tokenizer) !void {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    const session = session_mod.Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{},
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+    } };
+    var prepared = try PreparedTextBatch.init(alloc, session, tokenizer, &.{"abc abc abc"}, 32, null);
+    defer prepared.deinit();
+}
+
+test "prepared text real Metaspace tokenizer unwinds every allocation failure" {
+    var tok = try @import("inference_tokenizer").hf.HfTokenizer.loadFromBytes(std.testing.allocator,
+        \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0],["a",-1],["b",-1],["c",-1]]},"pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always"}}
+    );
+    defer tok.deinitSelf();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRealPrepared, .{tok.tokenizer()});
+    // Check the tokenizer itself too: the rollback owner must not mask leaks.
+    const Direct = struct {
+        fn run(allocator: std.mem.Allocator, tokenizer: Tokenizer) !void {
+            const ids = try tokenizer.encode(allocator, "abc abc abc");
+            defer allocator.free(ids);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Direct.run, .{tok.tokenizer()});
+}
+
+test "prepared text pooled owner reuses admission and rolls back abandoned allocations" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    const session = session_mod.Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{},
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+    } };
+    var owner = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer owner.deinit();
+    const alloc = owner.allocator();
+    for (0..1000) |_| {
+        const scratch = try alloc.alloc(u8, 1024);
+        alloc.free(scratch);
+    }
+    try std.testing.expect(owner.reservations != null);
+    try std.testing.expect(owner.reservations.?.next == null);
+    _ = try alloc.alignedAlloc(u8, .@"64", 2048); // Simulate a misbehaving callee.
+    owner.deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }
 
 test "prepared text charges tokenizer scratch and denies growth before allocation" {

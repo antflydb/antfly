@@ -325,7 +325,7 @@ test "rewrite arrays fuse padded encoder and independent decoder stages" {
     bounded.run_admission = .{
         .controller = &controller,
         .backend_class = .cpu,
-        .limits = .{ .host_limit_bytes = 1500 + @sizeOf(@import("../backends/admitted_allocator.zig").AdmittedAllocator) + 3 * @import("../backends/admitted_allocator.zig").AdmittedAllocator.allocationOverhead(.of([]i32)) },
+        .limits = .{ .host_limit_bytes = 1500 + @sizeOf(@import("../backends/admitted_allocator.zig").AdmittedAllocator) + 3 * (@import("../backends/admitted_allocator.zig").AdmittedAllocator.allocationOverhead(.of([]i32)) + @import("../backends/admitted_allocator.zig").AdmittedAllocator.reservation_overhead) },
         .static_workspace_bytes = 1,
         .check_live_memory = false,
     };
