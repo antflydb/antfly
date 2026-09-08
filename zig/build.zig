@@ -2339,6 +2339,10 @@ pub fn build(b: *std.Build) void {
     });
     @call(.auto, configureEmbeddedModule, .{ b, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
     embedded_support_mod.addImport("antfly_scraping", scraping_mod);
+    embedded_support_mod.addImport("antfly_resolver", resolver_mod);
+    embedded_support_mod.addImport("antfly_matcher", matcher_mod);
+    embedded_support_mod.addImport("antfly_reader_config", reader_config_mod);
+    embedded_support_mod.addImport("antfly_transcribing", transcribing_mod);
 
     const embedded_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
@@ -3681,6 +3685,18 @@ pub fn build(b: *std.Build) void {
     const run_embedded_tests = addFilteredTestRunArtifact(b, embedded_tests);
     const embedded_test_step = b.step("embedded-test", "Run embedded API tests");
     embedded_test_step.dependOn(&run_embedded_tests.step);
+    // Imported module roots do not collect their own tests through the package
+    // surface test, so run the API fixtures in their owning module as well.
+    const embedded_api_tests = b.addTest(.{
+        .root_module = embedded_api_mod,
+        .filters = &.{
+            "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
+            "embedded api hosted profile drains derived indexing without native runtimes",
+            "embedded api hosted profile persists text index across reopen over storage",
+        },
+    });
+    const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
+    embedded_test_step.dependOn(&run_embedded_api_tests.step);
 
     const antfly_embedded_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_pkg_mod,
