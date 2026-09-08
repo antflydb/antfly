@@ -906,6 +906,9 @@ pub const InferenceCapabilities = struct {
     /// Physical local transport ceilings, distinct from model codec limits.
     attachment_payload_max_bytes: ?usize = null,
     attachment_metadata_max_bytes: ?usize = null,
+    /// Complete linked-worker envelope, including metadata, framing and payload.
+    /// Applies even to text-only invocations with no physical attachments.
+    attachment_envelope_max_bytes: ?usize = null,
 
     /// PDF painting produces tightly packed RGBA8. Only raw transport planning
     /// may derive pixels from its wire budget; encoded inputs keep model limits.

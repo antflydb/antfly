@@ -5650,7 +5650,8 @@ fn densePartBatchEnd(
     if (start >= items.len) return start;
     // This descriptor describes the linked-worker ABI, not remote HTTP JSON.
     const metadata_limit = if (attachment_transport == .borrowed_binary) capabilities.attachment_metadata_max_bytes else null;
-    var metadata_sizer: ?embedding_wire.Sizer = if (metadata_limit != null)
+    const envelope_limit = if (attachment_transport == .borrowed_binary) capabilities.attachment_envelope_max_bytes else null;
+    var metadata_sizer: ?embedding_wire.Sizer = if (metadata_limit != null or envelope_limit != null)
         try embedding_wire.Sizer.init(template_mod.ContentPart, metadata_options)
     else
         null;
@@ -5695,7 +5696,9 @@ fn densePartBatchEnd(
             const metadata_bytes = try sizer.append(items[end]);
             // The smaller metadata ceiling applies only to physical attachments.
             // A text-only prefix can still fit when adding an image cannot.
-            if (sizer.attachment_count > 0 and metadata_bytes > metadata_limit.?) {
+            const metadata_exceeded = if (metadata_limit) |limit| sizer.attachment_count > 0 and metadata_bytes > limit else false;
+            const envelope_exceeded = if (envelope_limit) |limit| try sizer.envelopeSize(metadata_bytes) > limit else false;
+            if (metadata_exceeded or envelope_exceeded) {
                 if (end == start) return error.BodyTooLarge;
                 break;
             }
@@ -5711,12 +5714,16 @@ test "managed embedder metadata sizing matches wire JSON at every prefix" {
     const options = embedding_wire.Options{ .model = "model\"\\\nλ", .task_type = "RETRIEVAL_DOCUMENT", .instruction = "\x00instruction" };
     var parts: [105]template_mod.ContentPart = undefined;
     var wire_parts: [105]template_mod.ContentPart = undefined;
+    var payloads: [105]httpx.attachment_envelope.Attachment = undefined;
     var sizer = try embedding_wire.Sizer.init(template_mod.ContentPart, options);
     var attachments: usize = 0;
     for (&parts, &wire_parts, 0..) |*part, *wire_part, i| {
         part.* = if (i == 0) .{ .text = "\x00\n\"\\λ" } else if (i == 1) .{ .media_url = "https://example.test/\"λ" } else .{ .binary = .{ .mime_type = "image/png", .data = "\x00\xffpayload stays borrowed" } };
         wire_part.* = embedding_wire.metadataPart(part.*);
-        if (part.* == .binary) attachments += 1;
+        if (part.* == .binary) {
+            payloads[attachments] = .{ .mime_type = part.binary.mime_type, .data = part.binary.data };
+            attachments += 1;
+        }
         const measured = try sizer.append(part.*);
         // Independent literal catches drift in both fields and JSON encoding,
         // including attachment-count transitions through 9/10 and 99/100.
@@ -5729,7 +5736,72 @@ test "managed embedder metadata sizing matches wire JSON at every prefix" {
         }, .{});
         defer alloc.free(json);
         try std.testing.expectEqual(json.len, measured);
+        const body = try httpx.attachment_envelope.encodeAlloc(alloc, json, payloads[0..attachments]);
+        defer alloc.free(body);
+        try std.testing.expectEqual(body.len, try sizer.envelopeSize(measured));
     }
+}
+
+test "managed embedder metadata text-only windows respect the complete envelope limit" {
+    const alloc = std.testing.allocator;
+    const text = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(text);
+    @memset(text, 0);
+    const items = [_]template_mod.ContentPart{ .{ .text = text }, .{ .text = text } };
+    var caps = inference_work.InferenceCapabilities{
+        .task = .embed,
+        .input_modalities = .{ .text = true, .image = true },
+        .input_granularity = .page,
+        .batch = .{ .mode = .native, .max_items = 8, .preferred_items = 8, .max_media_parts_per_item = 1 },
+        .output = .embedding,
+        .attachment_metadata_max_bytes = 1024 * 1024,
+        .attachment_envelope_max_bytes = 64 * 1024 * 1024,
+    };
+    const options = embedding_wire.Options{ .model = "model", .task_type = "RETRIEVAL_DOCUMENT" };
+    // Each escaped item is ~36 MiB, but their combined JSON is ~72 MiB.
+    // The complete envelope limit applies even with zero attachments.
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    try std.testing.expectEqual(@as(usize, 2), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 1, options));
+    caps.attachment_metadata_max_bytes = null;
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    // An unrelated HTTP transport must not inherit the linked-worker ceiling.
+    try std.testing.expectEqual(@as(usize, 2), try densePartBatchEnd(alloc, caps, .segmented_framed_binary, &items, 0, options));
+    @memset(text, 'a');
+    caps.attachment_metadata_max_bytes = 1024 * 1024;
+    try std.testing.expectEqual(@as(usize, 2), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    var sizer = try embedding_wire.Sizer.init(template_mod.ContentPart, options);
+    const single_metadata = try sizer.append(items[0]);
+    caps.attachment_envelope_max_bytes = try sizer.envelopeSize(single_metadata);
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    caps.attachment_envelope_max_bytes.? -= 1;
+    try std.testing.expectError(error.BodyTooLarge, densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    caps.attachment_envelope_max_bytes = null;
+    try std.testing.expectEqual(@as(usize, 2), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+}
+
+test "managed embedder metadata envelope sizing includes binary framing and payload" {
+    const alloc = std.testing.allocator;
+    var png = [_]u8{0} ** 24;
+    @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, png[16..20], 2, .big);
+    std.mem.writeInt(u32, png[20..24], 3, .big);
+    const part = template_mod.ContentPart{ .binary = .{ .mime_type = "image/png", .data = &png } };
+    const items = [_]template_mod.ContentPart{ part, part };
+    const options = embedding_wire.Options{ .model = "model" };
+    var sizer = try embedding_wire.Sizer.init(template_mod.ContentPart, options);
+    const metadata_bytes = try sizer.append(part);
+    var caps = inference_work.InferenceCapabilities{
+        .task = .embed,
+        .input_modalities = .{ .image = true },
+        .input_granularity = .page,
+        .batch = .{ .mode = .native, .max_items = 8, .preferred_items = 8, .max_media_parts_per_item = 1 },
+        .output = .embedding,
+        .attachment_metadata_max_bytes = 1024 * 1024,
+        .attachment_envelope_max_bytes = try sizer.envelopeSize(metadata_bytes),
+    };
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    caps.attachment_envelope_max_bytes.? -= 1;
+    try std.testing.expectError(error.BodyTooLarge, densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
 }
 
 test "managed embedder metadata ceiling splits mixed batches before dispatch" {

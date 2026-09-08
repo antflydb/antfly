@@ -4955,13 +4955,24 @@ a 100 KB ASCII prompt, and escaping that actually exceeds the metadata allowance
 
 Linked-worker embedding windows also enforce that metadata ceiling before
 dispatch. Planning and ABI serialization share the embedding request structure
-and binary-part projection. An allocation-free prefix counter scans each part
-once, including JSON escaping, model/task/instruction fields, array separators,
+and binary-part projection. An allocation-free prefix counter avoids rescanning
+earlier items, including JSON escaping, model/task/instruction fields, array separators,
 and attachment-count digits. Mixed text/image windows split without shrinking
 valid text-only batches to the attachment limit. Tests cover two 600 KiB text
 items mixed with an image in either order, escaped text, exact-boundary requests,
 and attachment-count digit transitions. Oversized indivisible metadata fails
 before invoking the provider; no post-inference retry is needed.
+
+The worker also advertises `attachment_envelope_max_bytes`, its complete 64 MiB
+request-body ceiling. This is independent of the 1 MiB attachment-metadata limit
+and applies even with zero attachments. Embedding windows check both constraints;
+their exact total includes the envelope header, attachment descriptors, MIME
+strings, serialized metadata, and binary payloads. Incremental framing arithmetic
+is shared with the envelope encoder rather than duplicated in the planner.
+Regressions cover two 6 MiB NUL-containing text items (about 36 MiB of JSON each,
+72 MiB together), exact-limit and one-byte-over-limit requests, and binary payload
+overhead. Valid text-only requests above 1 MiB remain supported; a single item that
+cannot fit the complete envelope is rejected before provider dispatch.
 
 Direct and fused output storage still release tensors independently. Related
 self-cache and cross-cache columns coalesce byte-credit reductions: physical

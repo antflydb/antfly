@@ -150,6 +150,8 @@ pub fn constrainCapabilities(capabilities: anytype) @TypeOf(capabilities) {
     const limit = @min(result.attachment_payload_max_bytes orelse provider_attachment_limits.max_total_attachment_bytes, provider_attachment_limits.max_total_attachment_bytes);
     result.attachment_payload_max_bytes = limit;
     result.attachment_metadata_max_bytes = @min(result.attachment_metadata_max_bytes orelse provider_attachment_limits.max_metadata_bytes, provider_attachment_limits.max_metadata_bytes);
+    const envelope_limit = @import("inference_worker_rpc.zig").max_body_bytes;
+    result.attachment_envelope_max_bytes = @min(result.attachment_envelope_max_bytes orelse envelope_limit, envelope_limit);
     result.batch.max_encoded_media_bytes = @min(result.batch.max_encoded_media_bytes orelse limit, limit);
     // Keep model pixel limits independent of transport representation.
     // PDF raw producers use renderPixelLimit to bound IPC before painting.
@@ -280,6 +282,10 @@ test "inference worker raster capability reserves envelope overhead before rende
     const original = work.InferenceCapabilities{ .task = .read, .input_modalities = .{ .image = true }, .input_granularity = .page, .batch = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_decoded_pixels = 50_000_000 }, .output = .read_result, .borrowed_rasters = true, .borrowed_attachments = true };
     const constrained = constrainCapabilities(original);
     try constrained.validate();
+    try std.testing.expectEqual(@as(?usize, @import("inference_worker_rpc.zig").max_body_bytes), constrained.attachment_envelope_max_bytes);
+    var lower = original;
+    lower.attachment_envelope_max_bytes = 1024 * 1024;
+    try std.testing.expectEqual(lower.attachment_envelope_max_bytes, constrainCapabilities(lower).attachment_envelope_max_bytes);
     const pixels = constrained.renderPixelLimit(true);
     const limits = provider_attachment_limits;
     try std.testing.expect(pixels < original.batch.max_decoded_pixels.?);

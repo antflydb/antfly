@@ -75,20 +75,51 @@ fn addSize(total: *usize, amount: usize) !void {
         return error.AttachmentEnvelopeTooLarge;
 }
 
-pub fn encodedSize(metadata: []const u8, attachments: []const Attachment) !usize {
-    if (std.math.cast(u64, metadata.len) == null or
-        std.math.cast(u32, attachments.len) == null) return error.AttachmentEnvelopeTooLarge;
-    var total = header_len;
-    try addSize(&total, std.math.mul(usize, attachments.len, descriptor_len) catch
-        return error.AttachmentEnvelopeTooLarge);
-    try addSize(&total, metadata.len);
-    for (attachments) |attachment| {
-        if (std.math.cast(u32, attachment.mime_type.len) == null or
-            std.math.cast(u64, attachment.data.len) == null) return error.AttachmentEnvelopeTooLarge;
-        try addSize(&total, attachment.mime_type.len);
-        try addSize(&total, attachment.data.len);
+/// Incremental, allocation-free sizing for planners that have not materialized
+/// metadata or attachments. The encoder uses the same framing arithmetic.
+pub const SizeAccumulator = struct {
+    attachment_count: usize = 0,
+    attachment_bytes: usize = 0,
+
+    pub fn addAttachment(self: *SizeAccumulator, mime_bytes: usize, data_bytes: usize) !void {
+        if (std.math.cast(u32, mime_bytes) == null or
+            std.math.cast(u64, data_bytes) == null or
+            self.attachment_count == std.math.maxInt(u32)) return error.AttachmentEnvelopeTooLarge;
+        var bytes = self.attachment_bytes;
+        try addSize(&bytes, descriptor_len);
+        try addSize(&bytes, mime_bytes);
+        try addSize(&bytes, data_bytes);
+        self.attachment_bytes = bytes;
+        self.attachment_count += 1;
     }
-    return total;
+
+    pub fn total(self: SizeAccumulator, metadata_bytes: usize) !usize {
+        if (std.math.cast(u64, metadata_bytes) == null) return error.AttachmentEnvelopeTooLarge;
+        var bytes = header_len;
+        try addSize(&bytes, self.attachment_bytes);
+        try addSize(&bytes, metadata_bytes);
+        return bytes;
+    }
+};
+
+pub fn encodedSize(metadata: []const u8, attachments: []const Attachment) !usize {
+    if (std.math.cast(u32, attachments.len) == null) return error.AttachmentEnvelopeTooLarge;
+    var size = SizeAccumulator{};
+    for (attachments) |attachment| try size.addAttachment(attachment.mime_type.len, attachment.data.len);
+    return size.total(metadata.len);
+}
+
+test "attachment envelope incremental sizing includes empty framing and rejects overflow" {
+    var size = SizeAccumulator{};
+    try std.testing.expectEqual(header_len, try size.total(0));
+    try size.addAttachment(9, 123);
+    try std.testing.expectEqual(header_len + descriptor_len + 9 + 123 + 7, try size.total(7));
+    const before = size;
+    try std.testing.expectError(error.AttachmentEnvelopeTooLarge, size.addAttachment(0, std.math.maxInt(usize)));
+    try std.testing.expectEqualDeep(before, size);
+    try std.testing.expectError(error.AttachmentEnvelopeTooLarge, size.total(std.math.maxInt(usize)));
+    size.attachment_count = std.math.maxInt(u32);
+    try std.testing.expectError(error.AttachmentEnvelopeTooLarge, size.addAttachment(0, 0));
 }
 
 pub fn encodeAlloc(

@@ -4,6 +4,7 @@
 //! Shared linked-provider metadata contract. Binary bytes travel separately;
 //! planning counts the same JSON representation emitted by the provider ABI.
 const std = @import("std");
+const envelope = @import("httpx").attachment_envelope;
 
 pub const Options = struct {
     model: []const u8 = "",
@@ -41,6 +42,7 @@ pub const Sizer = struct {
     parts_bytes: usize = 0,
     count: usize = 0,
     attachment_count: usize = 0,
+    envelope_size: envelope.SizeAccumulator = .{},
 
     pub fn init(comptime Part: type, options: Options) !Sizer {
         return .{ .base_bytes = try jsonSize(Request(Part){
@@ -57,11 +59,18 @@ pub const Sizer = struct {
         self.parts_bytes = std.math.add(usize, self.parts_bytes, bytes) catch return error.BodyTooLarge;
         if (self.count > 0) self.parts_bytes = std.math.add(usize, self.parts_bytes, 1) catch return error.BodyTooLarge;
         self.count += 1;
-        if (part == .binary) self.attachment_count += 1;
+        if (part == .binary) {
+            try self.envelope_size.addAttachment(part.binary.mime_type.len, part.binary.data.len);
+            self.attachment_count += 1;
+        }
         var digits: usize = 1;
         var remaining = self.attachment_count;
         while (remaining >= 10) : (remaining /= 10) digits += 1;
         const total = std.math.add(usize, self.base_bytes, self.parts_bytes) catch return error.BodyTooLarge;
         return std.math.add(usize, total, digits - 1) catch error.BodyTooLarge;
+    }
+
+    pub fn envelopeSize(self: Sizer, metadata_bytes: usize) !usize {
+        return self.envelope_size.total(metadata_bytes);
     }
 };
