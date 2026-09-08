@@ -5721,11 +5721,7 @@ fn inferenceProviderGenerateJson(
     });
     if (request) |context| try context.check();
     if (!response.valid()) return error.RuntimeBoundaryFailure;
-    if (response.status >= 300) return switch (response.status) {
-        429 => error.RateLimit,
-        504 => error.Timeout,
-        else => error.GenerateRequestFailed,
-    };
+    if (response.status >= 300) return antfly.inference.types.localGenerationStatusError(alloc, response.status, response.body.slice());
     return alloc.dupe(u8, response.body.slice());
 }
 

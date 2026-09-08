@@ -738,12 +738,7 @@ pub const Provider = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, self.controlledJsonRequest(json_body, 300_000));
         defer resp.deinit();
-        if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
-            error.InferenceCapabilitiesStale
-        else if (resp.status.code == 429)
-            error.RateLimit
-        else
-            error.GenerateRequestFailed;
+        if (!resp.ok()) return generationResponseError(alloc, resp);
         const body = resp.body orelse return error.EmptyResponse;
         return parseGenerationResponse(alloc, body, self.tools_json, self.tool_choice_json);
     }
@@ -871,6 +866,11 @@ fn isCapabilityStaleResponse(response: httpx.Response) bool {
     if (response.status.code != 409) return false;
     const value = response.headers.get("X-Antfly-Capability-Stale") orelse return false;
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
+}
+
+fn generationResponseError(alloc: std.mem.Allocator, response: httpx.Response) anyerror {
+    if (isCapabilityStaleResponse(response)) return error.InferenceCapabilitiesStale;
+    return inference.localGenerationStatusError(alloc, response.status.code, response.body);
 }
 
 fn isInferenceAdmissionDenied(response: httpx.Response) bool {
@@ -1130,6 +1130,54 @@ fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime requi
         return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(usize, 3), result_dim);
+}
+
+test "generating backend local HTTP preserves retryable capacity" {
+    try testGenerationStatus(503, "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true,\"reason\":\"inference_capacity\",\"retry_after_ms\":1000}", error.GenerationCapacityUnavailable);
+}
+
+test "generating backend local HTTP preserves capability refresh alongside capacity errors" {
+    var response = httpx.Response.init(std.testing.allocator, 409);
+    defer response.deinit();
+    try std.testing.expectEqual(error.GenerateRequestFailed, generationResponseError(std.testing.allocator, response));
+    try response.headers.set("X-Antfly-Capability-Stale", "true");
+    try std.testing.expectEqual(error.InferenceCapabilitiesStale, generationResponseError(std.testing.allocator, response));
+    try testGenerationStatus(409, "{}", error.GenerateRequestFailed);
+    try testGenerationStatus(504, "{}", error.Timeout);
+    try testGenerationStatus(429, "{}", error.RateLimit);
+}
+
+fn testGenerationStatus(status: u16, body: []const u8, expected: anyerror) !void {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/generate", .respond = .{
+        .status = status,
+        .body = body,
+    } }});
+    defer server.deinit();
+    var result_error: anyerror = error.TestUnexpectedResult;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    const Call = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, url: []const u8, result: *anyerror) std.Io.Cancelable!void {
+            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+            defer client.deinit();
+            var provider = Provider.init(a, &client, url);
+            defer provider.deinit();
+            var generator = provider.generator();
+            var response = generator.generate(a, "gemma", &.{.{ .role = .user, .content = .{ .text = "Hello" } }}) catch |err| {
+                result.* = err;
+                return;
+            };
+            response.deinit();
+        }
+    };
+    try group.concurrent(io, Call.run, .{ alloc, io, server.baseUrl(), &result_error });
+    try server.handleOne();
+    try group.await(io);
+    try std.testing.expectEqual(expected, result_error);
 }
 
 test "antfly generate round trip" {

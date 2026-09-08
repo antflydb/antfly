@@ -1505,8 +1505,17 @@ pub const ComputeBackend = struct {
         debugCudaGraphCaptureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
         debugCudaDeviceWarmup: ?*const fn (ctx: *anyopaque, bytes: usize, iterations: usize) anyerror!bool = null,
 
-        /// Look up a named weight tensor. Returned tensor is borrowed (do NOT free).
+        /// Look up an immutable, backend-owned weight tensor. Repeated lookups
+        /// share a handle; unreleased handles are reclaimed at backend teardown.
+        /// A caller may release its lookup early with free (once per lookup),
+        /// but must not consume/mutate the weight or use that reference afterward.
+        /// CUDA may retain resident handles until backend teardown regardless.
         getWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
+        /// Acquire a distinct, caller-owned handle to an immutable weight.
+        /// Unlike getWeight, handle identity is never shared with another live
+        /// acquisition. Free exactly once; the backend must outlive the handle.
+        /// Storage may still be borrowed from the model or backend cache.
+        acquireWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
         prefetchWeightHint: *const fn (ctx: *anyopaque, name: []const u8, hint: u32) void,
         drainPrefetchBudget: *const fn (ctx: *anyopaque, max_items: usize) void,
         debugProfileCheckpoint: ?*const fn (ctx: *anyopaque, label: []const u8, layer: usize) void = null,
@@ -2710,6 +2719,11 @@ pub const ComputeBackend = struct {
     pub fn getWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
         return self.vtable.getWeight(self.ptr, name);
+    }
+
+    pub fn acquireWeight(self: *const ComputeBackend, name: []const u8) !CT {
+        try self.checkExecutionControl();
+        return self.vtable.acquireWeight(self.ptr, name);
     }
 
     pub fn prefetchWeight(self: *const ComputeBackend, name: []const u8) void {
