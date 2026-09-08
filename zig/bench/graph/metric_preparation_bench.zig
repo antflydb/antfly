@@ -98,6 +98,8 @@ pub fn main(init: std.process.Init) !void {
     try benchmarkVectorWrites(&output);
     try benchmarkQuerySnapshots(init.io, &output);
     try benchmarkMembership(init.io, &output);
+    try benchmarkOrdinalFold(&output);
+    try benchmarkCandidatePlanning(&output);
     try benchmarkAuthenticatedCache(init.io, &output);
     try benchmarkTopOwnership(&output);
     for ([_]usize{ 2_000, 20_000, 50_000 }) |nodes| {
@@ -595,6 +597,122 @@ fn benchmarkMembership(io: std.Io, out: anytype) !void {
         try out.interface.writeAll(json);
         try out.interface.writeByte('\n');
         try out.flush();
+    }
+}
+
+fn benchmarkOrdinalFold(out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const tiles = 4096;
+    var expected: ?f64 = null;
+    for ([_]bool{ true, false }) |reference| {
+        var times: [5]u64 = undefined;
+        var last = PhaseAllocStats{};
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            const start = antfly.platform_time.monotonicNs();
+            const sum = try antfly.graph.GraphIndex.benchmarkOrdinalFold(tracking.allocator(), reference, tiles);
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (expected) |value| {
+                if (sum != value) return error.InvalidBenchmarkResult;
+            } else expected = sum;
+            if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+            last = stats;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(alloc, .{
+            .mode = if (reference) "ordinal_fold_owned_reference" else "ordinal_fold_borrowed_scratch",
+            .tiles = tiles,
+            .edge_visits = tiles * 256,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .allocation_count = last.alloc_count,
+            .allocated_bytes = last.total_alloc_bytes,
+            .peak_bytes = last.peak_bytes,
+            .sum = expected.?,
+            .note = "warm vector cache; validates and folds the same tile repeatedly; includes constant fixture setup in time but excludes fixture allocations; no storage I/O or checkpoint commit",
+        }, .{});
+        defer alloc.free(json);
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkCandidatePlanning(out: anytype) !void {
+    for ([_]bool{ true, false }) |common_prefix| try benchmarkCandidatePlanningIds(out, common_prefix);
+}
+
+fn benchmarkCandidatePlanningIds(out: anytype, common_prefix: bool) !void {
+    const alloc = std.heap.smp_allocator;
+    const reader = antfly.serverless.query.graph_metric_reader;
+    const codec = antfly.serverless.graph_metric_segment.codec;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const count = 100_000;
+    const canonical = try fixture.alloc([]const u8, count);
+    for (canonical, 0..) |*id, i| id.* = if (common_prefix)
+        try std.fmt.allocPrint(fixture, "graph/customer-record-{d:0>8}", .{i})
+    else
+        try std.fmt.allocPrint(fixture, "{x:0>16}", .{std.hash.Wyhash.hash(0, std.mem.asBytes(&i))});
+    std.mem.sort([]const u8, canonical, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    const ids = try fixture.alloc([]const u8, count);
+    for (ids, 0..) |*id, i| id.* = canonical[(i * 7919) % count];
+    const entries = try fixture.alloc(codec.RoutingEntry, (count + 255) / 256);
+    for (entries, 0..) |*entry, i| entry.* = .{
+        .block_index = i,
+        .first_node_id = canonical[i * 256],
+        .offset = i * 4096,
+        .len = 4096,
+    };
+    const routing = codec.RoutingIndex{ .entries = entries, .top_score_count = 0, .ranked_entries = &.{}, .footer_offset = entries.len * 4096 };
+    for ([_]usize{ 1, 16 }) |columns| {
+        var expected: ?u64 = null;
+        for ([_]bool{ true, false }) |reference| {
+            var times: [5]u64 = undefined;
+            var last = PhaseAllocStats{};
+            for (0..6) |sample| {
+                var stats = PhaseAllocStats{};
+                var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+                var session = antfly.serverless.query.QuerySession{ .alloc = tracking.allocator(), .artifacts = undefined, .manifest = undefined };
+                const start = antfly.platform_time.monotonicNs();
+                const sum = try reader.benchmarkCandidatePlanningAlloc(tracking.allocator(), &session, ids, routing, columns, reference);
+                const elapsed = antfly.platform_time.monotonicNs() - start;
+                if (expected) |value| {
+                    if (sum != value) return error.InvalidBenchmarkResult;
+                } else expected = sum;
+                if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+                if (sample != 0) times[sample - 1] = elapsed;
+                last = stats;
+            }
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(fixture, .{
+                .mode = if (reference) "point_row_maps_reference" else "point_shared_candidate_order",
+                .rows = count,
+                .columns = columns,
+                .blocks = entries.len,
+                .id_shape = if (common_prefix) "common_prefix" else "hashed_hex",
+                .node_id_bytes = ids[0].len,
+                .median_ns = times[2],
+                .min_ns = times[0],
+                .max_ns = times[4],
+                .allocation_count = last.alloc_count,
+                .allocated_bytes = last.total_alloc_bytes,
+                .peak_bytes = last.peak_bytes,
+                .checksum = expected.?,
+                .note = "row mapping only; permuted IDs; all legacy column maps retained; excludes output, routing/control ownership, span materialization, fetch and score decoding",
+            }, .{});
+            try out.interface.writeAll(json);
+            try out.interface.writeByte('\n');
+            try out.flush();
+        }
     }
 }
 

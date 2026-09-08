@@ -111,20 +111,43 @@ pub fn encodeTopology(alloc: std.mem.Allocator, topology: Topology) ![]u8 {
     return out;
 }
 
-pub fn decodeTopology(alloc: std.mem.Allocator, raw: []const u8) !Topology {
+/// Validated, unaligned wire view. The caller keeps the source bytes alive.
+pub const TopologyView = struct {
+    data: []const u8,
+    cursor: []const u8,
+    scanned: u64,
+    complete: bool,
+
+    pub fn len(self: TopologyView) usize {
+        return self.data.len / 16;
+    }
+    pub fn edge(self: TopologyView, i: usize) Edge {
+        std.debug.assert(i < self.len());
+        return .{ .source = std.mem.readInt(u64, self.data[i * 16 ..][0..8], .little), .target = std.mem.readInt(u64, self.data[i * 16 + 8 ..][0..8], .little) };
+    }
+};
+
+pub fn decodeTopologyView(raw: []const u8) !TopologyView {
     if (raw.len < 17 or !std.mem.eql(u8, raw[0..4], "GTO1") or raw[12] > 1) return error.InvalidGraphMetricBuildManifest;
     const cursor_len = std.mem.readInt(u32, raw[13..17], .little);
     if (cursor_len > raw.len - 17) return error.InvalidGraphMetricBuildManifest;
     const data = raw[17 + cursor_len ..];
     const scanned = std.mem.readInt(u64, raw[4..12], .little);
     if (data.len % 16 != 0 or data.len / 16 > max_edges or scanned > max_edges or data.len / 16 > scanned) return error.InvalidGraphMetricBuildManifest;
-    const edges = try alloc.alloc(Edge, data.len / 16);
-    errdefer alloc.free(edges);
-    for (edges, 0..) |*edge, i| {
-        edge.* = .{ .source = std.mem.readInt(u64, data[i * 16 ..][0..8], .little), .target = std.mem.readInt(u64, data[i * 16 + 8 ..][0..8], .little) };
-        if (edge.source == 0 or edge.target == 0) return error.InvalidGraphMetricBuildManifest;
+    const view = TopologyView{ .data = data, .cursor = raw[17..][0..cursor_len], .scanned = scanned, .complete = raw[12] == 1 };
+    for (0..view.len()) |i| {
+        const value = view.edge(i);
+        if (value.source == 0 or value.target == 0) return error.InvalidGraphMetricBuildManifest;
     }
-    return .{ .edges = edges, .cursor = try alloc.dupe(u8, raw[17..][0..cursor_len]), .scanned = scanned, .complete = raw[12] == 1 };
+    return view;
+}
+
+pub fn decodeTopology(alloc: std.mem.Allocator, raw: []const u8) !Topology {
+    const view = try decodeTopologyView(raw);
+    const edges = try alloc.alloc(Edge, view.len());
+    errdefer alloc.free(edges);
+    for (edges, 0..) |*edge, i| edge.* = view.edge(i);
+    return .{ .edges = edges, .cursor = try alloc.dupe(u8, view.cursor), .scanned = view.scanned, .complete = view.complete };
 }
 
 pub fn encodeValues(alloc: std.mem.Allocator, values: []const Value) ![]u8 {
@@ -168,6 +191,14 @@ test "ordinal blocks round trip and reject malformed input" {
     try std.testing.expectEqualSlices(u8, &cursor, decoded.cursor);
     try std.testing.expectEqual(@as(u64, 9), decoded.edges[0].source);
     try std.testing.expect(!decoded.complete);
+    const view = try decodeTopologyView(bytes);
+    try std.testing.expectEqual(@as(usize, 1), view.len());
+    try std.testing.expectEqual(decoded.edges[0], view.edge(0));
+    try std.testing.expectEqual(bytes[17..].ptr, view.cursor.ptr);
+    try std.testing.expectError(error.InvalidGraphMetricBuildManifest, decodeTopologyView(bytes[0 .. bytes.len - 1]));
+    std.mem.writeInt(u64, bytes[19..][0..8], 0, .little);
+    try std.testing.expectError(error.InvalidGraphMetricBuildManifest, decodeTopologyView(bytes));
+    std.mem.writeInt(u64, bytes[19..][0..8], 9, .little);
     var fold = Fold{ .attempt = 2, .prior = 256, .count = 2, .position = 1, .cursor = "checkpoint" };
     fold.sums[0] = 1.0e16;
     fold.corrections[0] = 1;

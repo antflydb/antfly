@@ -6,6 +6,49 @@ measured samples per case; tables report medians. This was a shared development
 host, not an isolated benchmark machine.
 The compact-query comparison below uses 21 measured samples instead of five.
 
+## Shared point planning and checkpoint-local folds
+
+Same host/toolchain, one warmup and five samples, using the production helpers:
+
+| Phase / scenario | Allocating reference median | Current median | Tracked heap peak, before → after |
+| --- | ---: | ---: | ---: |
+| Warm ordinal fold, 4,096 tiles / 1,048,576 edge visits | 7.496 ms | 6.230 ms | 12,288 → 0 bytes |
+| Point row planning, 100,000 common-prefix IDs / 1 column | 17.537 ms | 3.622 ms | 1,600,000 → 1,200,000 bytes |
+| Point row planning, 100,000 common-prefix IDs / 16 columns | 290.126 ms | 8.552 ms | 25,600,000 → 1,200,000 bytes |
+| Point row planning, 100,000 hashed IDs / 1 column | 4.178 ms | 2.517 ms | 1,600,000 → 1,200,000 bytes |
+| Point row planning, 100,000 hashed IDs / 16 columns | 70.889 ms | 4.672 ms | 25,600,000 → 1,200,000 bytes |
+
+The fold fixture repeats a 256-edge tile with a warm source-vector chunk and
+one target accumulator. Both paths perform the same compensated addition order
+and return exactly equal sums. The reference owns decoded edges, source slots,
+gathered ranks and contribution rows, using the same topology validation as the
+borrowed path. Current execution also replaces per-edge target hash lookups with
+a bounded chunk-local slot table. Across these edge visits, 16,384 allocations
+and 50,331,648 cumulative allocated bytes become zero. Fixed stack scratch and
+fixture/cache residency are **not** zero memory: fixture allocations are excluded
+from tracking, while constant fixture setup is included in wall time. Storage
+reads, cold cache fills, checkpoint commits and whole-build execution are excluded.
+Measured ranges were 7.360–8.155 ms versus 6.011–6.528 ms.
+
+Point fixtures use 391 routing blocks, deterministic permuted row order, and
+either 30-byte collection-prefixed IDs or 16-byte hashed hexadecimal IDs. Each
+path verifies the same row/block checksum. The reference retains every column's
+16-byte row map. The new path admits 8-byte transient comparison keys plus one
+4-byte shared permutation; the keys are freed before column preparation, leaving
+only 400,000 bytes of row-mapping ownership regardless of column count. It uses
+two allocations versus one per reference column. Integer prefix keys improve
+both tested single-column cases; sorting full strings alone regressed hashed
+single-column IDs and was not retained.
+
+These are **sequential row-planning phase** measurements, not parallel column
+execution or end-to-end query latency. They exclude output cells, control/routing
+ownership, materialized block spans, score decoding, cache and network work.
+Common-prefix single-column ranges were 17.273–18.224 ms versus 3.580–4.352 ms;
+16-column ranges were 282.258–295.582 ms versus 8.319–8.814 ms. Hashed-ID ranges
+were 4.078–4.624 ms versus 2.495–2.569 ms and 70.246–73.654 ms versus
+4.133–4.898 ms. Sparse candidates, duplicate IDs, key lengths and shared-prefix
+collisions change the balance; no universal speedup is claimed.
+
 ## Initialization and query ownership follow-up
 
 Same host/toolchain, one warmup and five measured samples:

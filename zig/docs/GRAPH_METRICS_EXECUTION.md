@@ -41,6 +41,13 @@ full-graph calculation hidden inside a query or maintenance tick.
   membership and carries its validated slots into all rank/factor/HITS lane
   writes. It does not rediscover producers or resolve the same node dictionary
   separately for each output lane. Numerical seeds still use the global summary.
+- Numerical folds validate and borrow each immutable 256-edge tile from the read
+  transaction. One checkpoint-local scratch buffer gathers vector values and
+  maps chunk-local target slots directly to compensated accumulators. Warm vector
+  gathers allocate no per-tile arrays; cold gathers reuse arena capacity. Chunk
+  changes clear target mappings, and framing, receipt counts, ordinal validity,
+  generation/attempt fences and accumulation order remain enforced. Scratch and
+  caches are bounded by checkpoint limits, not total graph size.
 - Execution schema 11 fences older intermediate jobs. Published score epochs
   retain their existing read contract; an execution-format change does not hide
   previously published results.
@@ -91,6 +98,20 @@ fill or pinned-capacity pressure. Point-score consumers borrow ref-counted lease
 on warm blocks instead of copying payloads; leases keep entries alive during
 decoding. Authentication is unchanged, and a cache failure remains a miss rather
 than authority over the immutable source.
+
+Point queries admit output descriptors/cells before allocating them, then admit
+one `u32` candidate permutation shared by every physical metric column. IDs are
+validated once and a common prefix is skipped. Admitted transient `u64` prefix
+keys accelerate sorting, with full-string comparison on ties; they are freed
+before any metric plan is prepared. Only the shared `u32` permutation survives.
+Original row indexes preserve duplicate IDs and public result order. Routing
+uses binary boundaries in that order, so dense block/page spans do not rescan
+every row per column. Per-column ownership contains only unresolved block spans,
+not another row map; authenticated cache hits are consumed during preparation.
+Span, range, selected-page and decoded-routing capacities are charged before
+allocation, including possible owned-slice replacement peaks. These reservations
+use the same shared, conservative, request-cumulative budget as score storage.
+The complete transport plan is still admitted before score network I/O.
 
 Top-K reserves descriptor storage before allocation or ranked-block reads, then
 charges each decoded node ID before allocating it. Both per-result and shared

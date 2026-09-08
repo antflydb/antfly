@@ -9174,7 +9174,14 @@ pub const GraphIndex = struct {
     fn readGraphMetricVectorSlotsTypedAlloc(self: *GraphIndex, comptime T: type, txn: anytype, metric_name: []const u8, job_id: u64, lane: []const u8, iteration: u32, slots: []const u64, required: bool, cache: *VectorReadCache) ![]T {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const temp = arena.allocator();
+        const values = try self.alloc.alloc(T, slots.len);
+        errdefer self.alloc.free(values);
+        try self.readGraphMetricVectorSlotsTypedInto(T, txn, metric_name, job_id, lane, iteration, slots, required, cache, values, arena.allocator());
+        return values;
+    }
+
+    fn readGraphMetricVectorSlotsTypedInto(self: *GraphIndex, comptime T: type, txn: anytype, metric_name: []const u8, job_id: u64, lane: []const u8, iteration: u32, slots: []const u64, required: bool, cache: *VectorReadCache, values: []T, temp: Allocator) !void {
+        if (values.len != slots.len) return error.InvalidGraphMetricScore;
         var missing = std.AutoHashMapUnmanaged(u64, void).empty;
         var chunk_ids = std.ArrayListUnmanaged(u64).empty;
         var keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -9189,13 +9196,92 @@ pub const GraphIndex = struct {
             defer self.alloc.free(chunks);
             for (chunk_ids.items, chunks) |chunk, raw| try cache.put(self.alloc, chunk, raw);
         }
-        const values = try self.alloc.alloc(T, slots.len);
-        errdefer self.alloc.free(values);
         for (slots, 0..) |slot, i| {
             const raw = cache.get(slot / vector_chunk.entries).?;
             values[i] = if (raw) |chunk| if (T == u64) try vector_chunk.getU64(chunk, @intCast(slot % vector_chunk.entries), required) else try vector_chunk.get(chunk, @intCast(slot % vector_chunk.entries), required) else if (required) return error.InvalidGraphMetricScore else 0;
         }
-        return values;
+    }
+
+    const OrdinalFoldScratch = struct {
+        arena: std.heap.ArenaAllocator,
+        slots: [vector_chunk.entries]u64 = undefined,
+        ranks: [vector_chunk.entries]f64 = undefined,
+        targets: [vector_chunk.entries]u16 = undefined,
+        target_chunk: ?u64 = null,
+
+        fn prepareTargets(self: *@This(), slots: []const u64, chunk: u64) void {
+            if (self.target_chunk == chunk) return;
+            @memset(&self.targets, std.math.maxInt(u16));
+            for (slots, 0..) |slot, i| if (slot / vector_chunk.entries == chunk) {
+                self.targets[slot % vector_chunk.entries] = @intCast(i);
+            };
+            self.target_chunk = chunk;
+        }
+    };
+
+    fn foldOrdinalAdjacency(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, lane: []const u8, iteration: u32, damping: f64, raw: []const u8, cache: *VectorReadCache, scratch: *OrdinalFoldScratch, fold: *ordinal_blocks.Fold, chunk: u64, expected_count: u64) !void {
+        std.debug.assert(scratch.target_chunk == chunk);
+        // Point reads do not advance the source cursor; its tile stays valid
+        // through the gather and fold on both native storage and LMDB.
+        const view = try ordinal_blocks.decodeTopologyView(raw);
+        if (!view.complete or view.cursor.len != 0 or view.len() > vector_chunk.entries or view.scanned != view.len() or view.len() != expected_count) return error.InvalidGraphMetricBuildManifest;
+        for (scratch.slots[0..view.len()], 0..) |*slot, i| slot.* = view.edge(i).source;
+        _ = scratch.arena.reset(.retain_capacity);
+        try self.readGraphMetricVectorSlotsTypedInto(f64, txn, metric, job_id, lane, iteration, scratch.slots[0..view.len()], true, cache, scratch.ranks[0..view.len()], scratch.arena.allocator());
+        for (scratch.ranks[0..view.len()], 0..) |rank, i| {
+            const target = view.edge(i).target;
+            const value = rank * damping;
+            if (!std.math.isFinite(value) or value < 0) return error.InvalidGraphMetricScore;
+            if (target / vector_chunk.entries != chunk) return error.InvalidGraphMetricBuildManifest;
+            const index = scratch.targets[target % vector_chunk.entries];
+            if (index == std.math.maxInt(u16)) continue;
+            const sum = fold.sums[index] + value;
+            fold.corrections[index] += if (@abs(fold.sums[index]) >= @abs(value)) (fold.sums[index] - sum) + value else (value - sum) + fold.sums[index];
+            fold.sums[index] = sum;
+        }
+    }
+
+    /// Isolated warm-gather benchmark. Fixture ownership is independent of
+    /// the allocator measuring the old/new numerical tile paths.
+    pub fn benchmarkOrdinalFold(alloc: Allocator, reference: bool, tiles: usize) !f64 {
+        const fixture = std.heap.smp_allocator;
+        var edges: [vector_chunk.entries]ordinal_blocks.Edge = undefined;
+        var vector: vector_chunk.Chunk = @splat(0);
+        for (0..vector_chunk.entries) |i| try vector_chunk.put(&vector, @intCast(i), @as(f64, @floatFromInt(i + 1)) / 257);
+        for (&edges, 0..) |*edge, i| edge.* = .{ .source = 1 + i % 255, .target = 1 };
+        const raw = try ordinal_blocks.encodeTopology(fixture, .{ .edges = &edges, .cursor = @constCast(""), .scanned = edges.len, .complete = true });
+        defer fixture.free(raw);
+        var cache = VectorReadCache.empty;
+        defer cache.deinit(fixture);
+        try cache.put(fixture, 0, &vector);
+        var indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
+        defer indexes.deinit(fixture);
+        try indexes.put(fixture, 1, 0);
+        var graph: GraphIndex = undefined;
+        graph.alloc = alloc;
+        graph.metric_configs = &.{.{ .name = "rank", .kind = .pagerank, .damping = 0.85 }};
+        var txn = struct {
+            pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+                return error.UnexpectedStorageRead;
+            }
+        }{};
+        var scratch = OrdinalFoldScratch{ .arena = std.heap.ArenaAllocator.init(alloc) };
+        defer scratch.arena.deinit();
+        scratch.prepareTargets(&.{1}, 0);
+        var fold = ordinal_blocks.Fold{};
+        for (0..tiles) |_| {
+            if (reference) {
+                const values = try graph.ordinalAdjacencyValuesCachedAlloc(&txn, "rank", 1, .iterate_contributions, 0, raw, &cache);
+                defer alloc.free(values);
+                for (values) |value| {
+                    const i = indexes.get(value.ordinal).?;
+                    const sum = fold.sums[i] + value.value;
+                    fold.corrections[i] += if (@abs(fold.sums[i]) >= @abs(value.value)) (fold.sums[i] - sum) + value.value else (value.value - sum) + fold.sums[i];
+                    fold.sums[i] = sum;
+                }
+            } else try graph.foldOrdinalAdjacency(&txn, "rank", 1, "factor", 0, 0.85, raw, &cache, &scratch, &fold, 0, edges.len);
+        }
+        return fold.sums[0] + fold.corrections[0];
     }
 
     fn ordinalContributionPrefixAlloc(self: *GraphIndex, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase, iteration: u32, chunk: u64) ![]u8 {
@@ -9777,11 +9863,9 @@ pub const GraphIndex = struct {
             reached_end = try self.collectGraphMetricOrdinalNodesInRange(&txn, metric_name, job.job_id, current.range_lower, current.range_upper, current.cursor, if (fold.count != 0) fold.count else @min(max_nodes, ordinal_blocks.fold_entries), &nodes, &slots_list);
             const slots = slots_list.items;
             var slot_hash = std.hash.Wyhash.init(0);
-            var indexes = std.AutoHashMapUnmanaged(u64, usize).empty;
             for (slots, 0..) |slot, i| {
                 if (i > 0 and slot <= slots[i - 1]) return error.InvalidGraphMetricBuildManifest;
                 graphMetricConfigFingerprintHashU64(&slot_hash, slot);
-                try indexes.put(temp, slot, i);
             }
             const fingerprint = slot_hash.final();
             if (fold.count != 0 and (fold.count != slots.len or fold.fingerprint != fingerprint)) return error.InvalidGraphMetricBuildManifest;
@@ -9811,8 +9895,17 @@ pub const GraphIndex = struct {
             }
             var vector_cache = VectorReadCache.empty;
             defer vector_cache.deinit(self.alloc);
+            var scratch = OrdinalFoldScratch{ .arena = std.heap.ArenaAllocator.init(self.alloc) };
+            defer scratch.arena.deinit();
+            const lane: []const u8 = if (hub) "authority" else switch (cfg.kind) {
+                .pagerank => "factor",
+                .eigenvector => "rank",
+                .hits_authority, .hits_hub => "hub",
+                else => return error.UnsupportedGraphMetric,
+            };
             while (compaction_chunk == null and fold.position < slots.len and records < record_limit) {
                 const chunk = slots[fold.position] / vector_chunk.entries;
+                scratch.prepareTargets(slots, chunk);
                 const base = try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk);
                 defer self.alloc.free(base);
                 const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
@@ -9839,16 +9932,7 @@ pub const GraphIndex = struct {
                     if (entry.key.len != prefix.len + 20 or expected >= receipt.blocks()) return error.InvalidGraphMetricBuildManifest;
                     const index = std.fmt.parseInt(u64, entry.key[prefix.len..], 10) catch return error.InvalidGraphMetricBuildManifest;
                     if (index != expected) return error.InvalidGraphMetricBuildManifest;
-                    const values = try self.ordinalAdjacencyValuesCachedAlloc(&txn, metric_name, job.job_id, producer_phase, claimed.iteration, entry.value, &vector_cache);
-                    defer self.alloc.free(values);
-                    if (values.len != @min(adjacency_blocks.tile_entries, receipt.edges - expected * adjacency_blocks.tile_entries)) return error.InvalidGraphMetricBuildManifest;
-                    for (values) |value| {
-                        if (value.ordinal / vector_chunk.entries != chunk) return error.InvalidGraphMetricBuildManifest;
-                        const i = indexes.get(value.ordinal) orelse continue;
-                        const sum = fold.sums[i] + value.value;
-                        fold.corrections[i] += if (@abs(fold.sums[i]) >= @abs(value.value)) (fold.sums[i] - sum) + value.value else (value.value - sum) + fold.sums[i];
-                        fold.sums[i] = sum;
-                    }
+                    try self.foldOrdinalAdjacency(&txn, metric_name, job.job_id, lane, claimed.iteration + @as(u32, @intFromBool(hub)), if (cfg.kind == .pagerank) cfg.damping else 1, entry.value, &vector_cache, &scratch, &fold, chunk, @min(adjacency_blocks.tile_entries, receipt.edges - expected * adjacency_blocks.tile_entries));
                     expected += 1;
                     records += 1;
                     fold.cursor = try temp.dupe(u8, entry.key);
@@ -17570,6 +17654,31 @@ test "graph metric membership resumes across sealed blocks and rejects corrupt r
             try std.testing.expectEqualStrings(ids[257], nodes.items[1]);
         }
     }
+}
+
+test "graph metric ordinal borrowed folds match the allocating path without warm tile allocations" {
+    const alloc = std.testing.allocator;
+    const expected = try GraphIndex.benchmarkOrdinalFold(alloc, true, 32);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const actual = try GraphIndex.benchmarkOrdinalFold(failing.allocator(), false, 32);
+    try std.testing.expectEqual(expected, actual);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+test "graph metric ordinal fold target scratch fences chunk-local aliases" {
+    var scratch = GraphIndex.OrdinalFoldScratch{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer scratch.arena.deinit();
+    const slots = [_]u64{ 1, 255, 257, 511, 800 };
+    scratch.prepareTargets(&slots, 0);
+    try std.testing.expectEqual(@as(u16, 0), scratch.targets[1]);
+    try std.testing.expectEqual(@as(u16, 1), scratch.targets[255]);
+    try std.testing.expectEqual(std.math.maxInt(u16), scratch.targets[32]);
+    scratch.prepareTargets(&slots, 1);
+    try std.testing.expectEqual(@as(u16, 2), scratch.targets[1]);
+    try std.testing.expectEqual(@as(u16, 3), scratch.targets[255]);
+    scratch.prepareTargets(&slots, 3);
+    try std.testing.expectEqual(std.math.maxInt(u16), scratch.targets[1]);
+    try std.testing.expectEqual(@as(u16, 4), scratch.targets[32]);
 }
 
 test "graph metric vector chunks cache gathers across a bounded fold" {
