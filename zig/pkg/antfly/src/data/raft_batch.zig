@@ -117,7 +117,8 @@ test "raft protocol barrier is fail closed for legacy batch parsers" {
     try std.testing.expect(merge_transition_protocol_version > activation_barrier_protocol_version);
     try std.testing.expect(split_delta_predecessor_protocol_version > merge_transition_protocol_version);
     try std.testing.expect(merge_artifacts_protocol_version > split_delta_predecessor_protocol_version);
-    try std.testing.expectEqual(protocol_version, merge_artifacts_protocol_version);
+    try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
+    try std.testing.expectEqual(protocol_version, merge_copy_attempt_protocol_version);
     const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
     defer std.testing.allocator.free(encoded);
 

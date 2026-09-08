@@ -1782,6 +1782,7 @@ pub fn build(b: *std.Build) void {
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
     usermgr_mod.addImport("bloom", bloom_mod);
     usermgr_mod.addImport("antfly_platform", platform_mod);
+    usermgr_mod.addImport("antfly_hash", hash_mod);
     const usermgr_test_storage_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
@@ -3005,6 +3006,7 @@ pub fn build(b: *std.Build) void {
     common_http_test_mod.addImport("antfly_platform", platform_mod);
     common_http_test_mod.addImport("antfly_hash", hash_mod);
     common_http_test_mod.addImport("httpx", httpx_mod);
+    common_http_test_mod.addImport("vopr", vopr_mod);
     const common_http_tests = b.addTest(.{
         .root_module = common_http_test_mod,
         .test_runner = .{

@@ -33,13 +33,16 @@ def _check_query_budgets(api, table, query):
 def test_query_timeout_budget_survives_routing(stateful_api, num_shards):
     table = f"query_deadline_{num_shards}"
     stateful_api.create_table(table, num_shards=num_shards)
+    # A write acknowledgement does not guarantee full-text visibility. Wait
+    # for the searched index before asserting deadline behavior.
     stateful_api.batch_write(
-        table, inserts={"doc:a": {"title": "alpha"}}, sync_level="write"
+        table, inserts={"doc:a": {"title": "alpha"}}, sync_level="full_text"
     )
     # Warm publication and the query path first; these assertions concern
     # deadline clock identity, not startup latency.
     query = {"full_text_search": {"match_all": {}}, "limit": 10}
-    stateful_api.query_table(table, query)
+    baseline = stateful_api.query_table(table, query)["responses"][0]["hits"]["hits"]
+    assert [hit["_id"] for hit in baseline] == ["doc:a"]
     for timeout_ms in (1000, 5000, 30000):
         result = stateful_api.query_table(table, {**query, "timeout_ms": timeout_ms})
         hits = result["responses"][0]["hits"]["hits"]
