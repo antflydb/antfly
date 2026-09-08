@@ -54,7 +54,12 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
 
     for (sections) |section| {
         const section_tokens = try countTokens(alloc, tokenizer, section.text);
-        if (current_tokens > 0 and current_tokens + section_tokens > target_tokens) {
+        // Count the actual source span, including separators between sections.
+        var candidate_tokens = if (current.items.len > 0)
+            try countTokens(alloc, tokenizer, text[current.items[0].start .. section.start + section.text.len])
+        else
+            section_tokens;
+        if (current_tokens > 0 and candidate_tokens > target_tokens) {
             try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
             previous_start = current.items[0].start;
             chunk_id += 1;
@@ -62,18 +67,22 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
 
             previous_text = chunks.items[chunks.items.len - 1].text.?;
             current.clearRetainingCapacity();
-            current_tokens = 0;
+            candidate_tokens = section_tokens;
 
             if (overlap_tokens > 0 and previous_text.len > 0) {
-                const overlap_start = computeOverlapStart(alloc, tokenizer, previous_text, overlap_tokens);
+                // A full-size next section leaves no room for overlap.
+                const overlap_budget = @min(overlap_tokens, target_tokens -| section_tokens);
+                const overlap_start = try computeOverlapStart(alloc, tokenizer, previous_text, overlap_budget);
                 const overlap_text = previous_text[overlap_start..];
                 if (overlap_text.len > 0) {
-                    try current.append(alloc, .{
-                        .text = overlap_text,
-                        .start = previous_start + overlap_start,
-                        .tokens = try countTokens(alloc, tokenizer, overlap_text),
-                    });
-                    current_tokens = current.items[0].tokens;
+                    const overlap_candidate_tokens = try countTokens(alloc, tokenizer, text[previous_start + overlap_start .. section.start + section.text.len]);
+                    if (overlap_candidate_tokens <= target_tokens) {
+                        try current.append(alloc, .{
+                            .text = overlap_text,
+                            .start = previous_start + overlap_start,
+                        });
+                        candidate_tokens = overlap_candidate_tokens;
+                    }
                 }
             }
         }
@@ -83,7 +92,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
             .start = section.start,
             .tokens = section_tokens,
         });
-        current_tokens += section_tokens;
+        current_tokens = candidate_tokens;
     }
 
     if (current.items.len > 0 and chunks.items.len < max_chunks) {
@@ -303,13 +312,23 @@ fn countTokens(alloc: Allocator, tokenizer: *HfTokenizer, text: []const u8) !usi
     return ids.len;
 }
 
-fn computeOverlapStart(alloc: Allocator, tokenizer: *HfTokenizer, text: []const u8, overlap_tokens: usize) usize {
-    const ids = tokenizer.tokenizer().encode(alloc, text) catch return 0;
-    defer alloc.free(ids);
-    if (ids.len <= overlap_tokens) return 0;
-    const overlap_text = tokenizer.tokenizer().decode(alloc, ids[ids.len - overlap_tokens ..]) catch return 0;
-    defer alloc.free(overlap_text);
-    return std.mem.lastIndexOf(u8, text, overlap_text) orelse 0;
+fn computeOverlapStart(alloc: Allocator, tokenizer: *HfTokenizer, text: []const u8, overlap_tokens: usize) !usize {
+    if (overlap_tokens == 0) return text.len;
+    // Decoded tokens are normalized text, not a searchable source substring.
+    // If offsets are unavailable, omit overlap rather than retaining a prefix.
+    var encoded = (try tokenizer.encodeWithOffsets(alloc, text)) orelse return text.len;
+    defer encoded.deinit(alloc);
+    if (encoded.ids.items.len != encoded.offsets.items.len) return text.len;
+    const first = encoded.ids.items.len -| overlap_tokens;
+    for (encoded.offsets.items[first..]) |offset| {
+        const start: usize = offset[0];
+        if (start >= text.len or start > offset[1] or offset[1] > text.len) return text.len;
+        if (previousUtf8Boundary(text, start) != start) continue;
+        // Starting inside a word can change its tokenization. Only keep a
+        // suffix that fits the overlap budget when encoded independently.
+        if (try countTokens(alloc, tokenizer, text[start..]) <= overlap_tokens) return start;
+    }
+    return text.len;
 }
 
 test "fixed text chunker splits by token target" {
@@ -350,4 +369,50 @@ test "decoded token window fallback clamps to source bounds" {
     const end = fallbackWindowEnd("abc", 1, 1, 2);
     try std.testing.expect(end <= 3);
     try std.testing.expect(end > 1);
+}
+
+test "fixed text overlap preserves source offsets despite normalization" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    const text = "alpha beta gamma HELLO, WORLD!";
+    const start = try computeOverlapStart(alloc, tokenizer, text, 4);
+    try std.testing.expectEqualStrings("HELLO, WORLD!", text[start..]);
+    try std.testing.expectEqual(text.len, try computeOverlapStart(alloc, tokenizer, text, 0));
+    try std.testing.expectEqual(@as(usize, 0), try computeOverlapStart(alloc, tokenizer, text, 100));
+}
+
+test "fixed text overlap advances bounded chunks through mixed source text" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    const paragraph = "Korean HISTORY: Major Events (1950–1953), Seoul! Café, 日本語. Repeated WORDS; punctuation changes.\n\n";
+    const text = paragraph ** 80;
+    const chunks = try chunkText(alloc, text, .{ .target_tokens = 200, .overlap_tokens = 25, .max_chunks = 200 });
+    defer alloc.free(chunks);
+    try std.testing.expect(chunks.len > 1 and chunks.len < 200);
+    for (chunks, 0..) |chunk, i| {
+        const start = chunk.start_char.?;
+        const end = chunk.end_char.?;
+        try std.testing.expectEqualStrings(text[start..end], chunk.text.?);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.text.?));
+        try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 200);
+        if (i > 0) {
+            try std.testing.expect(start > chunks[i - 1].start_char.?);
+            try std.testing.expect(end > chunks[i - 1].end_char.?);
+        }
+    }
+    try std.testing.expect(chunks[chunks.len - 1].end_char.? >= std.mem.trimEnd(u8, text, "\n").len);
+}
+
+test "fixed text overlap leaves room for full sections and counts separators" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    for ([_][]const u8{ "alpha beta gamma delta\n\nepsilon zeta eta theta", "alpha,beta,gamma,delta,epsilon,zeta,eta,theta" }) |text| {
+        const chunks = try chunkText(alloc, text, .{ .target_tokens = 4, .overlap_tokens = 2, .separator = "," });
+        defer alloc.free(chunks);
+        for (chunks) |chunk| try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 4);
+        try std.testing.expectEqual(text.len, chunks[chunks.len - 1].end_char.?);
+    }
 }
