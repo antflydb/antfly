@@ -5080,6 +5080,20 @@ Recovering a chunk/vector therefore does not by itself qualify transcription
 accuracy. Real-model qualification must check content against the source page,
 not only nonempty artifacts and searchable-vector counts.
 
+The rebuilt `65084a2c4` Metal binary passes both the isolated scan and the
+four-document, ten-page forced-OCR suite, with no OCR execution failures and
+complete chunk/vector coverage. All three multi-table regression tests also
+pass. Unit verification includes 51 document-extraction/OCR tests in Debug and
+13 focused OCR tests in both Debug and ReleaseFast, with no reported leaks.
+The scan's recovered 45-character output persists `ocr_selected_low_quality`.
+It is an unrelated image description, not a transcription of the source form.
+An independent Poppler rendering also produces unrelated text through the
+Florence/Metal path, so that quality failure does not require native PDF
+rendering. The CPU comparison was interrupted and supplies no parity evidence.
+Model artifacts, shared preprocessing and backend inference still need separate
+qualification; the structural checks above must not be advertised as OCR
+accuracy or RC-versus-branch performance results.
+
 `BackendRuntime` lazily owns one maintenance scheduler. TTL, transaction recovery,
 text merging, sparse compaction, enrichment, resolution/promotion, derived-index
 replay, artifact repair and quarantine retry register work instead of parking a
