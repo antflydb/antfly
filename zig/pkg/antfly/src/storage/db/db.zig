@@ -59412,6 +59412,11 @@ test "db index catalog barrier disables published dense fast path" {
     // writer's closed bit.
     try std.testing.expect(!db.beginIndexCatalogBarrierUntil(monotonicTimeNs() + std.time.ns_per_s));
     try std.testing.expect(!db.beginPublishedDenseSearch());
+    // Native snapshot pinning holds this barrier too. Completion-only
+    // publication must defer instead of retiring files under the capture.
+    const publication = try db.publishCompletedDensePostingCheckpoints();
+    try std.testing.expect(publication.busy);
+    try std.testing.expectEqual(@as(usize, 0), publication.published);
 }
 
 test "db index catalog barrier and apply acquisition honor activation deadline" {

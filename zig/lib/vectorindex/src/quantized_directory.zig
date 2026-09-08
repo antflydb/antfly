@@ -1224,12 +1224,13 @@ pub const VerifiedReader = struct {
 
         const state = self.verification[index].load(.acquire);
         if (state == corrupt) return error.QuantizedDirectoryChecksumMismatch;
-        if (state == unknown) {
-            if (try self.reader.projectionRange(index).checksum(entry) != self.reader.indexChecksum(index)) {
-                self.verification[index].store(corrupt, .release);
-                return error.QuantizedDirectoryChecksumMismatch;
-            }
-            self.verification[index].store(valid, .release);
+        // `valid` certifies the generation's retained mapping, not these new
+        // bytes read through a maintenance-private descriptor. Authenticate
+        // every private read before it can be copied into a new generation;
+        // a warm query must not allow later disk corruption to be republished.
+        if (try self.reader.projectionRange(index).checksum(entry) != self.reader.indexChecksum(index)) {
+            self.verification[index].store(corrupt, .release);
+            return error.QuantizedDirectoryChecksumMismatch;
         }
 
         const entry_offset = std.mem.alignForward(usize, header_size, entry_alignment);
@@ -1441,6 +1442,20 @@ test "streaming quantized directory is byte-compatible with buffered writer" {
     try std.testing.expectEqualSlices(u64, &member_ids, owned.view.member_ids);
     try std.testing.expectEqualSlices(f16, &first, owned.view.projections.?.values[0..first.len]);
     try std.testing.expectEqual(first_location, owned.view.projections.?.residual_locations.?.at(0).?);
+
+    // The warm mapping was verified above, but a subsequent private read is
+    // independently authenticated. Never persist bytes on the strength of a
+    // different buffer's cached validation result.
+    const changed_entry = try alloc.dupe(u8, sink.out.items[@intCast(location.offset)..][0..location.len]);
+    defer alloc.free(changed_entry);
+    changed_entry[16] ^= 1; // centroid norm: valid layout, incorrect checksum
+    try std.testing.expectError(error.QuantizedDirectoryChecksumMismatch, verified.decodeOwnedEntry(alloc, 7, changed_entry));
+
+    var cold = try VerifiedReader.init(alloc, sink.out.items);
+    defer cold.deinit();
+    var cold_owned = try cold.decodeOwnedEntry(alloc, 7, sink.out.items[@intCast(location.offset)..][0..location.len]);
+    defer cold_owned.deinit();
+    try std.testing.expectEqual(VerifiedReader.unknown, cold.verification[cold.resolveIndex(7).?].load(.acquire));
 }
 
 test "quantized directory persists conservative fallback admission" {
