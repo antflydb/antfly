@@ -319,6 +319,9 @@ def _delete_created_table(api: Any, table_name: str) -> None:
             remaining = deadline - time.monotonic()
             if attempt == 2 or remaining <= 0.1:
                 raise_request_error_with_logs(err, api._server)
+            print(
+                f"retrying table cleanup for {table_name}: {type(err).__name__}: {err}"
+            )
             time.sleep(0.1)
             continue
         except requests.RequestException as err:

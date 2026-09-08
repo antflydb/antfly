@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import conftest as e2e_conftest
 import helpers
+import test_backup_restore as backups
 import test_standalone as standalone
 
 
@@ -293,6 +294,95 @@ def test_table_cleanup_does_not_retry_after_deadline(monkeypatch):
     assert "delete timed out" in errors[0]
     assert len(calls) == 1
     assert calls[0][1]["timeout"] == 30
+
+
+def _seed_cluster(monkeypatch, outcomes):
+    calls = []
+    pending = iter(outcomes)
+    clock = [0.0]
+    monkeypatch.setattr(backups.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        backups.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay)
+    )
+
+    def post(url, **kwargs):
+        calls.append(kwargs)
+        outcome = next(pending)
+        if isinstance(outcome, Exception):
+            raise outcome
+        status, body = outcome
+        response = requests.Response()
+        response.status_code = status
+        response._content = body
+        response.url = url
+        response.request = requests.Request("POST", url).prepare()
+        return response
+
+    return (
+        SimpleNamespace(
+            data_api_urls=["http://localhost/db/v1"],
+            assert_processes_alive=lambda: None,
+            debug_logs=lambda: "cluster write diagnostics",
+        ),
+        SimpleNamespace(post=post),
+        calls,
+    )
+
+
+def test_cluster_seed_waits_for_precommit_write_admission(monkeypatch):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch, [(503, b"write unavailable"), (200, b'{"inserted":1}')]
+    )
+    docs = {"doc:a": {"title": "a"}}
+    assert backups._seed_cluster_docs_when_writable(cluster, session, "docs", docs) == {
+        "inserted": 1
+    }
+    assert len(calls) == 2
+    assert all(
+        call["json"] == {"inserts": docs, "sync_level": "write"} for call in calls
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        (503, b"write committed locally; standby durability acknowledgment pending"),
+        (409, b"transaction outcome unknown"),
+        (500, b"internal failure"),
+        (400, b"invalid batch request"),
+        requests.ConnectionError("response lost"),
+    ],
+)
+def test_cluster_seed_preserves_non_admission_failures(monkeypatch, outcome):
+    cluster, session, calls = _seed_cluster(monkeypatch, [outcome])
+    with pytest.raises((AssertionError, requests.ConnectionError)):
+        backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+    assert len(calls) == 1
+
+
+def test_cluster_seed_deadline_retains_cluster_diagnostics(monkeypatch):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch, [(503, b"write unavailable")] * 3
+    )
+    with pytest.raises(AssertionError, match="cluster write diagnostics"):
+        backups._seed_cluster_docs_when_writable(
+            cluster, session, "docs", {}, timeout_s=0.25
+        )
+    assert len(calls) == 3
+    assert calls[-1]["timeout"] < calls[0]["timeout"]
+
+
+def test_cluster_seed_stops_when_server_exits(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [(503, b"write unavailable")])
+
+    def assert_alive():
+        if calls:
+            raise RuntimeError("data server exited")
+
+    cluster.assert_processes_alive = assert_alive
+    with pytest.raises(RuntimeError, match="data server exited"):
+        backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+    assert len(calls) == 1
 
 
 def test_wait_until_retries_structured_retryable_service_unavailable():
