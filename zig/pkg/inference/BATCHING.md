@@ -231,11 +231,19 @@ noncontiguous rows still pack normally. Generic seq2seq decoding also reuses its
 token-ID buffer, borrows attention masks and selects argmax directly from logits,
 eliminating the per-token vocabulary copy.
 
-Each output column has its own shared lifetime and byte-credit reduction, for
-both fused and direct forwards. Retained cross-attention output no longer pins
-obsolete logits/self-attention columns. Rows within a column still share one
-allocation; live-row compaction and device-resident cache execution are not
-implied by this host-memory optimization.
+Each output column has its own shared storage lifetime. Direct and fused forwards
+coalesce admission reductions for related self-cache/cross-cache columns, retaining
+conservative credit until each cohort's last column is freed. Other outputs keep
+independent credit lifetimes. This avoids per-layer resource RPCs without retaining
+obsolete logits/self-cache buffers. A 129-output callback regression needs only two
+intermediate reductions and a final release.
+
+A lone surviving host-cache row can detach from an oversized shared allocation
+before its next decode. Exclusive lifetime proof, at least 64 KiB savings and
+twofold column shrink are required. Old/new overlap is admitted before copying;
+all copies commit together, and capacity/allocation failures retain the original
+cache. This does not implement device-resident cache execution or multi-survivor
+device gather/scatter.
 
 `pipelines/seq2seq_decode.zig` provides request-owned incremental execution for
 qualified merged exports with `use_cache_branch`, matching `past_key_values` /

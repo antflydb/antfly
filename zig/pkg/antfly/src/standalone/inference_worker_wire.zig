@@ -151,13 +151,12 @@ pub fn constrainCapabilities(capabilities: anytype) @TypeOf(capabilities) {
     result.attachment_payload_max_bytes = limit;
     result.attachment_metadata_max_bytes = @min(result.attachment_metadata_max_bytes orelse provider_attachment_limits.max_metadata_bytes, provider_attachment_limits.max_metadata_bytes);
     result.batch.max_encoded_media_bytes = @min(result.batch.max_encoded_media_bytes orelse limit, limit);
-    // PDF raster producers use tightly packed RGBA8. Publish a route pixel
-    // ceiling so every existing render/window planner bounds IPC before paint.
+    // Keep model pixel limits independent of transport representation.
+    // PDF raw producers use renderPixelLimit to bound IPC before painting.
     if (result.borrowed_rasters) {
         if (result.image_transform) |transform| {
             if (@as(u64, transform.target_width) * transform.target_height > limit / 4) result.borrowed_rasters = false;
         }
-        if (result.borrowed_rasters) result.batch.max_decoded_pixels = @min(result.batch.max_decoded_pixels orelse limit / 4, limit / 4);
     }
     return result;
 }
@@ -281,11 +280,13 @@ test "inference worker raster capability reserves envelope overhead before rende
     const original = work.InferenceCapabilities{ .task = .read, .input_modalities = .{ .image = true }, .input_granularity = .page, .batch = .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_decoded_pixels = 50_000_000 }, .output = .read_result, .borrowed_rasters = true, .borrowed_attachments = true };
     const constrained = constrainCapabilities(original);
     try constrained.validate();
-    const pixels = constrained.batch.max_decoded_pixels.?;
+    const pixels = constrained.renderPixelLimit(true);
     const limits = provider_attachment_limits;
     try std.testing.expect(pixels < original.batch.max_decoded_pixels.?);
     try std.testing.expect(pixels * 4 + limits.max_metadata_bytes + 24 + limits.max_attachments * (16 + limits.max_mime_bytes) <= @import("inference_worker_rpc.zig").max_body_bytes);
-    try std.testing.expectError(error.InferenceDecodedPixelsExceeded, constrained.validateInvocation(.read, .{ .item_count = 8, .modalities = .{ .image = true }, .decoded_pixels = pixels + 1 }));
+    try std.testing.expectEqual(original.batch.max_decoded_pixels, constrained.batch.max_decoded_pixels);
+    try constrained.validateInvocation(.read, .{ .item_count = 1, .modalities = .{ .image = true }, .decoded_pixels = 25_000_000, .encoded_media_bytes = 100_000, .text_bytes = 100_000 });
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, constrained.validateInvocation(.read, .{ .item_count = 8, .modalities = .{ .image = true }, .decoded_pixels = pixels + 1, .raw_media_bytes = @intCast((pixels + 1) * 4) }));
     var large = original;
     large.image_transform = .{ .target_width = 4096, .target_height = 4096, .resize_mode = .stretch, .resample = .bilinear };
     try std.testing.expect(!constrainCapabilities(large).borrowed_rasters);
@@ -339,10 +340,20 @@ test "inference worker provider attachments preserve bytes and per-item provenan
     }
     // The sender owns descriptors only; media segments point at caller bytes.
     try std.testing.expectEqual(payloads[0].bytes.ptr, input.body.segments[3].ptr);
+    // Admission follows actual serialization, not sixfold worst-case UTF-8.
+    const prompt = try alloc.alloc(u8, 100_000);
+    @memset(prompt, 'a');
+    context.request_json = .init(try std.json.Stringify.valueAlloc(alloc, .{ .prompt = prompt }, .{}));
+    _ = try ProviderInput.init(alloc, &context);
+    const escaped = try alloc.alloc(u8, 200_000);
+    @memset(escaped, 0);
+    context.request_json = .init(try std.json.Stringify.valueAlloc(alloc, .{ .prompt = escaped }, .{}));
+    try std.testing.expectError(error.BodyTooLarge, ProviderInput.init(alloc, &context));
     context.binary_payloads = null;
     try std.testing.expectError(error.InvalidInput, ProviderInput.init(alloc, &context));
     context.binary_payloads = &payloads;
     context.binary_payloads_len = 1;
+    context.request_json = .init("{}");
     try std.testing.expectError(error.InvalidInput, ProviderInput.init(alloc, &context));
 }
 

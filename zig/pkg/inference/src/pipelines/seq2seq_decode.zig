@@ -106,6 +106,11 @@ pub const State = struct {
     pub fn step(self: *State, prefix: []const i64, dispatch: ?Dispatch, control: ?Control) !backends.Tensor {
         if (prefix.len <= self.processed) return error.InvalidDecoderPosition;
         if (control) |active| try active.check();
+        _ = self.session.compactExclusiveRows(self.allocator, self.cache.tensors, 64 * 1024, control) catch |err| switch (err) {
+            // Optional compaction must never reject an otherwise valid decode.
+            error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => false,
+            else => return err,
+        };
         const tokens = prefix[self.processed..];
         const shape = [_]i64{ 1, @intCast(tokens.len) };
         const mask_shape = [_]i64{ 1, @intCast(self.mask.len) };

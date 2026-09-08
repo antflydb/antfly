@@ -6537,7 +6537,7 @@ const SharedPdfWindowScheduler = struct {
             request.expected_dims,
         );
         const page_bytes = if (raster) 1 else @min(maximum_pdf_page_inline_png_bytes, try consumer.plans.items[1].attachment_transport.maxRawBytesForLimits("image/png".len, 1, consumer.max_bytes, std.math.maxInt(usize)));
-        consumer.transform = SharedPdfTransform.init(consumer.config, caps.batch.max_decoded_pixels orelse std.math.maxInt(u64), if (caps.image_transform) |t| t.target_width else null, if (caps.image_transform) |t| t.target_height else null, page_bytes, raster);
+        consumer.transform = SharedPdfTransform.init(consumer.config, caps.renderPixelLimit(raster), if (caps.image_transform) |t| t.target_width else null, if (caps.image_transform) |t| t.target_height else null, page_bytes, raster);
         consumer.enabled = true;
     }
 
@@ -7192,7 +7192,7 @@ const SharedPdfWindowScheduler = struct {
         const page_bytes = if (raster) 1 else @min(maximum_pdf_page_inline_png_bytes, try memory.attachment_transport.maxRawBytesForLimits("image/png".len, 1, consumer.max_bytes, std.math.maxInt(usize)));
         consumer.config.pdf_decode_limits.max_working_set_bytes = @min(consumer.config.pdf_decode_limits.max_working_set_bytes, consumer.config.pdf_render_max_inflight_bytes);
         consumer.config.pdf_decode_limits.max_decoded_stream_bytes = @min(consumer.config.pdf_decode_limits.max_decoded_stream_bytes, consumer.config.pdf_decode_limits.max_working_set_bytes);
-        consumer.transform = SharedPdfTransform.init(consumer.config, caps.batch.max_decoded_pixels orelse std.math.maxInt(u64), if (caps.image_transform) |t| t.target_width else null, if (caps.image_transform) |t| t.target_height else null, page_bytes, raster);
+        consumer.transform = SharedPdfTransform.init(consumer.config, caps.renderPixelLimit(raster), if (caps.image_transform) |t| t.target_width else null, if (caps.image_transform) |t| t.target_height else null, page_bytes, raster);
         consumer.text = true;
         consumer.enabled = true;
     }
@@ -7436,7 +7436,7 @@ const SharedPdfWindowScheduler = struct {
                     },
                 }
                 const request_bytes = runtimeGeneratedTextRequestBytes(request) +| (if (consumer.transform.raster) size.bytes else @as(usize, 0));
-                const pixel_cap = consumer.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+                const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
                 if (request_bytes > consumer.max_bytes or size.pixels > pixel_cap) return error.DocumentExtractionWorkingSetTooLarge;
                 const candidate_bytes = if (consumer.transform.raster) bytes +| request_bytes else (bytes +| request_bytes -| (media_bytes +| size.bytes)) +| try consumer.transport.batchWireSizeUpperBound(media_bytes +| size.bytes, "image/png".len, count + 1);
                 if (candidate_bytes > consumer.max_bytes or pixels +| size.pixels > pixel_cap) {
@@ -7558,7 +7558,7 @@ const SharedPdfWindowScheduler = struct {
     fn commitEmbeddingOutput(self: *@This(), alloc: Allocator, consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, stage_id: []const u8, output: PdfPageEmbeddingBatch) !void {
         const runtime = self.runtime;
         const embedding_name = requestEmbeddingName(request);
-        const pixel_cap = consumer.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+        const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         var first_error: ?anyerror = null;
         var writes = std.ArrayListUnmanaged(KVPair).empty;
@@ -7604,7 +7604,7 @@ const SharedPdfWindowScheduler = struct {
     fn pendingEmbeddingPages(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow) ![]bool {
         const runtime = self.runtime;
         const embedding_name = requestEmbeddingName(request);
-        const pixel_cap = consumer.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+        const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
         const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
@@ -7646,7 +7646,7 @@ const SharedPdfWindowScheduler = struct {
         const runtime = self.runtime;
         const embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
         const embedding_name = requestEmbeddingName(request);
-        const pixel_cap = consumer.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+        const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
         const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
@@ -8948,6 +8948,14 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             try std.testing.expectEqual(@as(usize, 1), downscaled.count);
             const small = downscaled.rendered.encoded.results[0].rendered.?;
             try std.testing.expect(@as(u64, small.width) * small.height <= physical_limit.render_config.pdf_render_max_inflight_pixels);
+            var transport_limit = preparer;
+            transport_limit.use_borrowed_rasters = true;
+            transport_limit.capabilities.attachment_payload_max_bytes = @intCast(pixel_caps.batch.max_decoded_pixels.? * 2);
+            var raw_window = try transport_limit.prepare(0);
+            defer raw_window.deinit();
+            const raw_page = raw_window.rendered.raster.results[0].rendered.?;
+            try std.testing.expect(raw_page.bytes.len <= transport_limit.capabilities.attachment_payload_max_bytes.?);
+            try std.testing.expectEqual(pixel_caps.batch.max_decoded_pixels.?, transport_limit.capabilities.renderPixelLimit(false));
             var mixed = preparer;
             mixed.pending_pages = &.{ 1, 3 };
             var isolated = try mixed.prepare(0);
@@ -14265,8 +14273,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                 if (capabilities.batch.max_encoded_media_bytes) |limit|
                     admitted_batch_policy.max_bytes = @min(admitted_batch_policy.max_bytes, limit);
             }
-            if (capabilities.batch.max_decoded_pixels) |limit|
-                admitted_batch_policy.max_pixels = @min(admitted_batch_policy.max_pixels, limit);
+            admitted_batch_policy.max_pixels = @min(admitted_batch_policy.max_pixels, capabilities.renderPixelLimit(use_pdf_borrowed_rasters));
             if (capabilities.image_transform) |transform| {
                 admitted_batch_policy.preferred_image_width = transform.target_width;
                 admitted_batch_policy.preferred_image_height = transform.target_height;
@@ -20316,7 +20323,7 @@ const PdfEmbeddingWindowPreparer = struct {
             try self.coordinator.availableRenderBytes(),
             self.render_config.pdf_render_max_inflight_bytes,
         );
-        const model_pixel_cap = self.capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+        const model_pixel_cap = self.capabilities.renderPixelLimit(self.use_borrowed_rasters);
         const requests = try concurrent_alloc.alloc(document_extraction_mod.PdfPageRenderRequest, count);
         defer concurrent_alloc.free(requests);
         const minimum_dimension = @min(
@@ -20835,7 +20842,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
     );
     if (page_count > max_document_pages) return error.PdfDocumentPageLimitExceeded;
     try heartbeatEnrichmentLease(runtime);
-    const model_pixel_cap = capabilities.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+    const model_pixel_cap = capabilities.renderPixelLimit(use_borrowed_rasters);
     const render_items = if (runtime.shared_pdf_windows) |shared| shared.planWindow(raw, batch_items) catch |err| blk: {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         break :blk batch_items;

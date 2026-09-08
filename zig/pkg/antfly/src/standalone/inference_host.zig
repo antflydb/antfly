@@ -1209,7 +1209,9 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 );
                 if (!capabilities.borrowed_rasters) return error.BorrowedRasterUnsupported;
                 var pixels: u64 = 0;
+                var raw_bytes: usize = 0;
                 for (decoded.images) |raster| {
+                    raw_bytes = std.math.add(usize, raw_bytes, raster.bytes.len) catch return error.InferenceEncodedBytesExceeded;
                     pixels = std.math.add(u64, pixels, try raster.pixels()) catch
                         return error.InferenceDecodedPixelsExceeded;
                 }
@@ -1223,6 +1225,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     else
                         0,
                     .decoded_pixels = pixels,
+                    .raw_media_bytes = raw_bytes,
                     .max_media_parts_per_item = 1,
                 });
             }

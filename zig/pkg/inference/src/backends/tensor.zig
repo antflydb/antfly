@@ -48,6 +48,8 @@ pub const TensorInfo = struct {
 pub const Lifetime = struct {
     context: *anyopaque,
     release: *const fn (*anyopaque) void,
+    /// True only when no other view or future view producer can retain storage.
+    is_exclusive: ?*const fn (*anyopaque) bool = null,
 };
 
 /// A multi-dimensional tensor backed by a flat buffer.

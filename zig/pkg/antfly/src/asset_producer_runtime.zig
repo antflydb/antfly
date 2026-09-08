@@ -2699,8 +2699,10 @@ pub const Runtime = struct {
             return error.BorrowedRasterUnsupported;
 
         var decoded_pixels: u64 = 0;
+        var raw_bytes: usize = 0;
         for (request.images) |raster| {
             try raster.validate();
+            raw_bytes = std.math.add(usize, raw_bytes, raster.bytes.len) catch return error.InferenceEncodedBytesExceeded;
             decoded_pixels = std.math.add(u64, decoded_pixels, try raster.pixels()) catch
                 return error.InferenceDecodedPixelsExceeded;
         }
@@ -2713,10 +2715,9 @@ pub const Runtime = struct {
                 if (tokens > 0) std.math.cast(usize, tokens) orelse std.math.maxInt(usize) else 0
             else
                 0,
-            // The model receives decoded pixels. Raw resident bytes are
-            // covered by the caller's composite window and local admission;
-            // they are not encoded codec input and must not consume that cap.
+            // Raw bytes include stride padding and use a transport-only limit.
             .encoded_media_bytes = 0,
+            .raw_media_bytes = raw_bytes,
             .decoded_pixels = decoded_pixels,
             .max_media_parts_per_item = 1,
         });

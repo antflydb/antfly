@@ -415,6 +415,8 @@ pub const InvocationShape = struct {
     max_candidates_per_request: usize = 0,
     schema_bytes: usize = 0,
     encoded_media_bytes: usize = 0,
+    /// Physical raw attachments, including row padding; not encoded codec input.
+    raw_media_bytes: usize = 0,
     decoded_pixels: u64 = 0,
     max_media_parts_per_item: usize = 0,
 };
@@ -905,6 +907,13 @@ pub const InferenceCapabilities = struct {
     attachment_payload_max_bytes: ?usize = null,
     attachment_metadata_max_bytes: ?usize = null,
 
+    /// PDF painting produces tightly packed RGBA8. Only raw transport planning
+    /// may derive pixels from its wire budget; encoded inputs keep model limits.
+    pub fn renderPixelLimit(self: InferenceCapabilities, raw: bool) u64 {
+        const pixels = self.batch.max_decoded_pixels orelse std.math.maxInt(u64);
+        return if (raw) @min(pixels, if (self.attachment_payload_max_bytes) |bytes| bytes / 4 else std.math.maxInt(u64)) else pixels;
+    }
+
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
         if (self.image_transform) |transform| {
@@ -962,13 +971,9 @@ pub const InferenceCapabilities = struct {
     pub fn validateInvocation(self: InferenceCapabilities, task: Task, shape: InvocationShape) !void {
         try self.validate();
         if (self.task != task) return error.InferenceTaskMismatch;
-        if (self.attachment_metadata_max_bytes) |limit| {
-            // Reserve half for structural JSON, identities and model options;
-            // text/schema content can expand sixfold when JSON-escaped.
-            if (shape.modalities.image or shape.modalities.audio or shape.modalities.document) {
-                const content_bytes = std.math.add(usize, shape.text_bytes, shape.schema_bytes) catch return error.InferenceTextBytesExceeded;
-                if (content_bytes > limit / 12) return error.InferenceTextBytesExceeded;
-            }
+        if (self.attachment_payload_max_bytes) |limit| {
+            const payload = std.math.add(usize, shape.raw_media_bytes, shape.encoded_media_bytes) catch return error.InferenceEncodedBytesExceeded;
+            if (payload > limit) return error.InferenceEncodedBytesExceeded;
         }
         if (!self.batch.acceptsItems(shape.item_count))
             return error.InferenceBatchTooLarge;

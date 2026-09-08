@@ -463,22 +463,21 @@ const OutputAdmission = struct {
     lease: memory.AdmissionLease,
     remaining: std.atomic.Value(usize),
     entries: []Entry,
+    credits: OutputCredits,
     mutex: std.atomic.Mutex = .unlocked,
-    const Entry = struct { owner: *OutputAdmission, amounts: memory.AdmissionAmounts };
+    const Entry = struct { owner: *OutputAdmission, index: usize };
 
     fn release(raw: *anyopaque) void {
         const entry: *Entry = @ptrCast(@alignCast(raw));
         const self = entry.owner;
         @import("antfly_platform").sync.lockYielding(&self.mutex);
-        var retained = self.lease.amounts;
-        retained.host_scratch_bytes -= entry.amounts.host_scratch_bytes;
-        retained.host_kv_bytes -= entry.amounts.host_kv_bytes;
-        self.lease.retain(retained) catch {};
+        self.credits.release(entry.index, &self.lease);
         self.mutex.unlock();
         const previous = self.remaining.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
         if (previous != 1) return;
         self.lease.release();
+        self.credits.deinit(self.allocator);
         self.allocator.free(self.entries);
         self.allocator.destroy(self);
     }
@@ -494,6 +493,63 @@ pub fn retainedOutputAmounts(outputs: []const Tensor, cache_qualified: bool) !me
     }
     return amounts;
 }
+
+/// Coalesce accounting for a decode step's related cache columns. Tensor
+/// storage is freed immediately; credit stays conservative until the cohort's
+/// final column dies. Non-cache outputs retain independent credit lifetimes.
+/// The owner serializes release calls and releases the final lease itself.
+pub const OutputCredits = struct {
+    entries: []Entry,
+    remaining_groups: usize,
+    covered: bool,
+    const Entry = struct { group: usize = 0, remaining: usize = 0, amounts: memory.AdmissionAmounts = .{} };
+
+    fn cacheGroup(name: []const u8) ?bool {
+        if (!std.mem.startsWith(u8, name, "present.")) return null;
+        return std.mem.indexOf(u8, name, ".encoder.") != null;
+    }
+
+    pub fn init(allocator: std.mem.Allocator, outputs: []const Tensor, cache_qualified: bool, covered: bool) !OutputCredits {
+        const entries = try allocator.alloc(Entry, outputs.len);
+        errdefer allocator.free(entries);
+        @memset(entries, .{});
+        var groups: usize = 0;
+        var cache_groups: [2]?usize = .{ null, null };
+        for (outputs, 0..) |output, index| {
+            var group = index;
+            if (cacheGroup(output.name)) |kind| {
+                const slot = &cache_groups[@intFromBool(kind)];
+                group = slot.* orelse index;
+                slot.* = group;
+            }
+            entries[index].group = group;
+            if (group == index) groups += 1;
+            entries[group].remaining += 1;
+            const amounts = try retainedOutputAmounts(&.{output}, cache_qualified);
+            entries[group].amounts.host_scratch_bytes = try addBytes(entries[group].amounts.host_scratch_bytes, amounts.host_scratch_bytes);
+            entries[group].amounts.host_kv_bytes = try addBytes(entries[group].amounts.host_kv_bytes, amounts.host_kv_bytes);
+        }
+        return .{ .entries = entries, .remaining_groups = groups, .covered = covered };
+    }
+
+    pub fn release(self: *OutputCredits, index: usize, lease: *memory.AdmissionLease) void {
+        const group = &self.entries[self.entries[index].group];
+        std.debug.assert(group.remaining > 0);
+        group.remaining -= 1;
+        if (group.remaining != 0) return;
+        self.remaining_groups -= 1;
+        // The final group uses release(), never a redundant retain-then-release.
+        if (self.remaining_groups == 0 or !self.covered) return;
+        var retained = lease.amounts;
+        retained.host_scratch_bytes -= group.amounts.host_scratch_bytes;
+        retained.host_kv_bytes -= group.amounts.host_kv_bytes;
+        if (!std.meta.eql(retained, lease.amounts)) lease.retain(retained) catch {};
+    }
+
+    pub fn deinit(self: *OutputCredits, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+    }
+};
 
 /// Session represents a loaded model that can run forward passes.
 /// This is the core abstraction all backends implement.
@@ -607,18 +663,18 @@ pub const Session = struct {
         errdefer allocator.destroy(output_admission);
         const entries = try allocator.alloc(OutputAdmission.Entry, outputs.len);
         errdefer allocator.free(entries);
-        for (outputs, entries) |output, *entry| entry.* = .{
+        var credits = try OutputCredits.init(allocator, outputs, resource_lease.*.?.amounts.host_kv_bytes > 0, retained.host_scratch_bytes <= resource_lease.*.?.amounts.host_scratch_bytes and retained.host_kv_bytes <= resource_lease.*.?.amounts.host_kv_bytes);
+        errdefer credits.deinit(allocator);
+        for (entries, 0..) |*entry, index| entry.* = .{
             .owner = output_admission,
-            .amounts = if (retained.host_scratch_bytes <= resource_lease.*.?.amounts.host_scratch_bytes and retained.host_kv_bytes <= resource_lease.*.?.amounts.host_kv_bytes)
-                try retainedOutputAmounts(&.{output}, resource_lease.*.?.amounts.host_kv_bytes > 0)
-            else
-                .{},
+            .index = index,
         };
         output_admission.* = .{
             .allocator = allocator,
             .lease = resource_lease.*.?,
             .remaining = std.atomic.Value(usize).init(outputs.len),
             .entries = entries,
+            .credits = credits,
         };
         resource_lease.* = null;
         for (outputs, entries) |*output, *entry| {
@@ -709,6 +765,53 @@ pub const Session = struct {
             bytes = try addBytes(bytes, input.data.len);
         }
         return bytes;
+    }
+
+    /// Detach a lone surviving row from larger immutable host-cache columns.
+    /// All candidates must be exclusive; reserve old/new overlap before copying
+    /// and commit only after every copy and ownership descriptor succeeds.
+    pub fn compactExclusiveRows(self: Session, allocator: std.mem.Allocator, tensors: []Tensor, minimum_saving: usize, control: ?InferenceExecutionControl) !bool {
+        var count: usize = 0;
+        var bytes: usize = 0;
+        var saving: usize = 0;
+        for (tensors) |tensor| {
+            const storage = tensor.shared_storage orelse continue;
+            if (tensor.data.len == 0 or tensor.data.len > storage.len / 2) continue;
+            const lifetime = tensor.lifetime orelse return false;
+            const exclusive = lifetime.is_exclusive orelse return false;
+            if (!exclusive(lifetime.context) or tensor.dtype != .f32 or !std.mem.startsWith(u8, tensor.name, "present.")) return false;
+            count += 1;
+            bytes = try addBytes(bytes, try addBytes(tensor.data.len, try mulBytes(tensor.shape.len, @sizeOf(i64))));
+            saving = try addBytes(saving, storage.len - tensor.data.len);
+        }
+        if (count == 0 or saving < minimum_saving) return false;
+        if (control) |active| try active.check();
+        var lease: ?memory.AdmissionLease = if (self.run_admission) |admission| try admission.acquireAmounts(.{
+            .host_kv_bytes = bytes,
+            .host_scratch_bytes = try addBytes(@sizeOf(OutputAdmission), try mulBytes(count, @sizeOf(Tensor) + @sizeOf(usize) + @sizeOf(OutputAdmission.Entry) + @sizeOf(OutputCredits.Entry))),
+        }) else null;
+        defer if (lease) |*active| active.release();
+        const copies = try allocator.alloc(Tensor, count);
+        defer allocator.free(copies);
+        const indices = try allocator.alloc(usize, count);
+        defer allocator.free(indices);
+        var initialized: usize = 0;
+        errdefer for (copies[0..initialized]) |*copy| copy.deinit();
+        for (tensors, 0..) |tensor, index| {
+            const storage = tensor.shared_storage orelse continue;
+            if (tensor.data.len == 0 or tensor.data.len > storage.len / 2) continue;
+            if (control) |active| try active.check();
+            copies[initialized] = try Tensor.initFloat32(allocator, tensor.name, tensor.shape, tensor.asFloat32());
+            indices[initialized] = index;
+            initialized += 1;
+        }
+        if (control) |active| try active.check();
+        _ = try attachOutputAdmission(copies, allocator, &lease);
+        for (copies, indices) |copy, index| {
+            tensors[index].deinit();
+            tensors[index] = copy;
+        }
+        return true;
     }
 
     /// Allocation-free planning against permanent session limits. This is not
@@ -1355,6 +1458,130 @@ test "forced run admission denials are counted and recover" {
     for (outputs) |*output| output.deinit();
     std.testing.allocator.free(outputs);
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "session output admission row compaction rolls back allocation and capacity failures" {
+    const Source = struct {
+        tensor: Tensor,
+        permit: RunPermit,
+        released: bool = false,
+        fn exclusive(_: *anyopaque) bool {
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.released);
+            self.tensor.deinit();
+            self.permit.deinit();
+            self.released = true;
+        }
+        fn check(allocator: std.mem.Allocator, deny: bool, cancel: bool) !void {
+            const Source = @This();
+            const CancelAfterCopy = struct {
+                checks: usize = 0,
+                fn check(raw: ?*anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    self.checks += 1;
+                    if (self.checks == 3) return error.InferenceCancelled;
+                }
+            };
+            var cancellation = CancelAfterCopy{};
+            var controller = memory.AdmissionController{};
+            defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+            const session = Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
+                .controller = &controller,
+                .backend_class = .cpu,
+                .limits = .{ .host_limit_bytes = if (deny) 64 else 0 },
+                .static_workspace_bytes = 1,
+                .check_live_memory = false,
+            } };
+            var source = Source{
+                .tensor = try Tensor.initFloat32(std.testing.allocator, "present.0.decoder.key", &.{ 4, 2 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }),
+                .permit = try session.admitHostPreprocess(48),
+            };
+            var row = source.tensor.borrowedView(source.tensor.name);
+            row.data = source.tensor.data[0..8];
+            row.shape = &.{ 1, 2 };
+            row.shared_storage = source.tensor.data;
+            row.lifetime = .{ .context = &source, .release = Source.release, .is_exclusive = Source.exclusive };
+            defer row.deinit();
+            const slice = @as([*]Tensor, @ptrCast(&row))[0..1];
+            const compacted = session.compactExclusiveRows(allocator, slice, 0, if (cancel) .{ .ptr = &cancellation, .check_fn = CancelAfterCopy.check } else null) catch |err| {
+                try std.testing.expect(!source.released);
+                try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row.asFloat32());
+                if (deny) {
+                    try std.testing.expect(err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable);
+                    return;
+                }
+                if (cancel) {
+                    try std.testing.expectEqual(error.InferenceCancelled, err);
+                    return;
+                }
+                return err;
+            };
+            try std.testing.expect(!deny and !cancel and compacted and source.released);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row.asFloat32());
+            try std.testing.expectEqual(@as(usize, 24), controller.snapshot().hostTotalBytes());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Source.check, .{ false, false });
+    try Source.check(std.testing.allocator, true, false);
+    try Source.check(std.testing.allocator, false, true);
+}
+
+test "session output admission coalesces cache column callbacks" {
+    const Probe = struct {
+        retains: usize = 0,
+        releases: usize = 0,
+        fn reserve(_: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retains += 1;
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+    var probe = Probe{};
+    var controller = memory.AdmissionController{};
+    try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    defer controller.configureResourceBudget(null) catch unreachable;
+    const session = Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{},
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+    } };
+    var value = [_]f32{1};
+    var outputs: [129]Tensor = undefined;
+    for (&outputs, 0..) |*output, i| output.* = .{
+        .name = if (i < 64) "present.0.decoder.key" else if (i < 128) "present.0.encoder.key" else "logits",
+        .data = std.mem.sliceAsBytes(&value),
+        .shape = &.{1},
+        .dtype = .f32,
+        .allocator = std.testing.allocator,
+        .owns_data = false,
+        .owns_shape = false,
+    };
+    const amounts = try retainedOutputAmounts(&outputs, false);
+    var permit = try session.admitHostPreprocess(amounts.host_scratch_bytes);
+    defer permit.deinit();
+    var credits = try OutputCredits.init(std.testing.allocator, &outputs, false, true);
+    defer credits.deinit(std.testing.allocator);
+    for (0..63) |i| credits.release(i, &permit.lease.?);
+    try std.testing.expectEqual(@as(usize, 0), probe.retains);
+    credits.release(63, &permit.lease.?);
+    try std.testing.expectEqual(@as(usize, 1), probe.retains);
+    try std.testing.expectEqual(@as(usize, 65 * 12), controller.snapshot().host_scratch_bytes);
+    for (64..129) |i| credits.release(i, &permit.lease.?);
+    try std.testing.expectEqual(@as(usize, 2), probe.retains);
+    permit.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }
 
 test "session output admission releases obsolete outputs independently" {

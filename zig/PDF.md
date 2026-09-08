@@ -4943,17 +4943,31 @@ allocation; allocation-failure tests cover complete cleanup.
 
 Worker route capabilities constrain rendering before materialization: the 64 MiB
 logical request ceiling reserves 1 MiB of attachment metadata plus worst-case
-attachment descriptors/MIME strings, then publishes the remaining encoded-byte
-and tightly packed RGBA pixel ceilings. Oversized fixed transforms disable the
-raw-raster path and retain encoded-image execution. Multimodal metadata preflight
-is conservative; the sender and receiver also enforce exact envelope limits.
-Text-only requests retain the original logical JSON ceiling.
+attachment descriptors/MIME strings. The payload ceiling is distinct from model
+decoded-pixel limits: only raw PDF planning derives a tightly packed RGBA pixel
+ceiling through `renderPixelLimit(true)`. Encoded images keep the model's pixel
+allowance, and raw invocation accounting includes stride padding. Oversized fixed
+transforms disable raw transport and retain encoded execution. Metadata is checked
+using actual serialized JSON, including escaping; UTF-8 length divided by a
+worst-case expansion factor is not an input limit. Text-only requests retain the
+original logical JSON ceiling. Regressions cover compressed 25-megapixel inputs,
+a 100 KB ASCII prompt, and escaping that actually exceeds the metadata allowance.
 
-Direct output admission and fused output storage release each output tensor
-independently. Retaining a cross-attention cache therefore does not pin obsolete
-logits or self-attention tensors, or their byte reservations. Rows of the same
-output column still share its backing allocation until its final row is released;
-live-row compaction and device-resident gather/scatter remain separate work.
+Direct and fused output storage still release tensors independently. Related
+self-cache and cross-cache columns coalesce byte-credit reductions: physical
+buffers are freed immediately, while their credit remains conservative until the
+last column of that cohort dies. Other outputs keep independent credit lifetimes.
+The final cohort releases its lease without a redundant reduction RPC. A hermetic
+129-output regression observes two intermediate resource callbacks rather than
+one per tensor. Retained cross-cache cannot pin obsolete logits/self-cache storage.
+
+Host seq2seq decoding can detach a lone surviving row from oversized immutable
+batch columns. A lifetime hook proves no other view or view producer remains;
+the optimization requires at least 64 KiB of savings and a twofold column shrink.
+Admission covers old/new overlap, copies commit atomically, and allocation or
+capacity failure retains the original valid cache. Failure-injection and shared
+row tests cover rollback, live-peer refusal, values and byte-credit cleanup.
+This is last-survivor host compaction, not device-side multi-survivor gather/scatter.
 
 For sixteen alternating short/long rewrites, the hermetic dispatcher regression
 now uses six physical forwards instead of twelve from adjacent eight-item sorting,
@@ -4980,6 +4994,16 @@ names/dtypes/layouts, and share the same admission and completion ownership.
 Enabling these paths requires per-backend parity, mixed-EOS, cancellation,
 allocation-failure, cache-pressure and measured transfer/throughput tests. They
 are not implemented by the host fusion changes above.
+
+Branch-specific admission additionally needs a backend-qualified output contract
+for each prefill/append branch. The current conservative planner must retain full
+cross-output allowances until the backend proves that its cached branch returns
+empty cross outputs. Observing an empty output once, or recognizing cache names,
+is insufficient proof for future calls. Qualification should bind to the pinned
+artifact generation, expose branch geometry to both cold planning and execution,
+and validate outputs against that contract. Device-resident execution and this
+branch qualification remain unimplemented; existing resident hooks alone do not
+provide independent cache ownership and device-domain KV admission.
 
 ## Open decisions
 
