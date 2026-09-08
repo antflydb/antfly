@@ -309,6 +309,10 @@ fn parseBatchRequestWithOptions(
             .transition_id = transition_id,
             .donor_group_id = donor_group_id,
             .receiver_group_id = receiver_group_id,
+            .copy_attempt = .{
+                .donor_term = try parseInternalU64(object.get("copy_donor_term") orelse return error.InvalidBatchRequest),
+                .sequence = try parseInternalU64(object.get("copy_sequence") orelse return error.InvalidBatchRequest),
+            },
             .identity_namespace = .{
                 .table_id = table_id,
                 .shard_id = shard_id,
@@ -434,6 +438,10 @@ fn parseBatchRequestWithOptions(
             .transition_id = transition_id,
             .donor_group_id = donor_group_id,
             .receiver_group_id = receiver_group_id,
+            .copy_attempt = .{
+                .donor_term = try parseInternalU64(object.get("copy_donor_term") orelse return error.InvalidBatchRequest),
+                .sequence = try parseInternalU64(object.get("copy_sequence") orelse return error.InvalidBatchRequest),
+            },
             .receiver_base_start = merge_receiver_base_start.?,
             .receiver_base_end = merge_receiver_base_end.?,
             .merged_start = merge_range_start.?,
@@ -545,12 +553,12 @@ fn parseBatchRequestWithOptions(
     {
         return error.InvalidBatchRequest;
     }
-    if (merge_checkpoint) |checkpoint| {
+    if (merge_checkpoint != null) {
         if (merge_artifacts != null) return error.InvalidBatchRequest;
         if (split_checkpoint != null or split_replication != null or split_transition != null or
             merge_source_transition != null or
             transforms.len != 0 or predicates.len != 0 or writes.len != 0 or
-            (deletes.len != 0 and checkpoint.kind != .rollback))
+            deletes.len != 0)
             return error.InvalidBatchRequest;
     }
     if (merge_replication != null and
@@ -563,7 +571,8 @@ fn parseBatchRequestWithOptions(
     if (merge_replication) |replication| if (merge_checkpoint) |checkpoint| {
         if (replication.transition_id != checkpoint.transition_id or
             replication.donor_group_id != checkpoint.donor_group_id or
-            replication.receiver_group_id != checkpoint.receiver_group_id)
+            replication.receiver_group_id != checkpoint.receiver_group_id or
+            replication.copy_attempt.order(checkpoint.copy_attempt) != .eq)
             return error.InvalidBatchRequest;
     };
 
@@ -629,12 +638,12 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
     {
         return error.InvalidBatchRequest;
     }
-    if (req.merge_checkpoint) |checkpoint| {
+    if (req.merge_checkpoint != null) {
         if (req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
             req.merge_source_transition != null or
             req.transforms.len != 0 or req.predicates.len != 0 or req.writes.len != 0 or
             req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.transaction != null or
-            (req.deletes.len != 0 and checkpoint.kind != .rollback))
+            req.deletes.len != 0)
             return error.InvalidBatchRequest;
     }
     if (req.merge_replication != null and
@@ -648,7 +657,8 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
     if (req.merge_replication) |replication| if (req.merge_checkpoint) |checkpoint| {
         if (replication.transition_id != checkpoint.transition_id or
             replication.donor_group_id != checkpoint.donor_group_id or
-            replication.receiver_group_id != checkpoint.receiver_group_id)
+            replication.receiver_group_id != checkpoint.receiver_group_id or
+            replication.copy_attempt.order(checkpoint.copy_attempt) != .eq)
             return error.InvalidBatchRequest;
     };
 
@@ -738,13 +748,15 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.writeByte('}');
     }
     if (req.merge_replication) |replication| {
-        try writer.print(",\"_merge_replication\":{{\"transition_id\":\"{d}\",\"donor_group_id\":\"{d}\",\"receiver_group_id\":\"{d}\",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\"}}", .{
+        try writer.print(",\"_merge_replication\":{{\"transition_id\":\"{d}\",\"donor_group_id\":\"{d}\",\"receiver_group_id\":\"{d}\",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\",\"copy_donor_term\":\"{d}\",\"copy_sequence\":\"{d}\"}}", .{
             replication.transition_id,
             replication.donor_group_id,
             replication.receiver_group_id,
             replication.identity_namespace.table_id,
             replication.identity_namespace.shard_id,
             replication.identity_namespace.range_id,
+            replication.copy_attempt.donor_term,
+            replication.copy_attempt.sequence,
         });
     }
     if (req.split_transition) |transition| {
@@ -764,7 +776,7 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         });
     }
     if (req.merge_checkpoint) |checkpoint| {
-        try writer.print(",\"_merge_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"donor_group_id\":\"{d}\",\"receiver_group_id\":\"{d}\",\"receiver_base_start\":{f},\"receiver_base_end\":{f},\"merged_start\":{f},\"merged_end\":{f},\"bootstrap_applied_index\":\"{d}\",\"allow_doc_identity_reassignment\":{}", .{
+        try writer.print(",\"_merge_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"donor_group_id\":\"{d}\",\"receiver_group_id\":\"{d}\",\"receiver_base_start\":{f},\"receiver_base_end\":{f},\"merged_start\":{f},\"merged_end\":{f},\"bootstrap_applied_index\":\"{d}\",\"allow_doc_identity_reassignment\":{},\"copy_donor_term\":\"{d}\",\"copy_sequence\":\"{d}\"", .{
             std.json.fmt(@tagName(checkpoint.kind), .{}),
             checkpoint.transition_id,
             checkpoint.donor_group_id,
@@ -775,6 +787,8 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             std.json.fmt(checkpoint.merged_end, .{}),
             checkpoint.bootstrap_applied_index,
             checkpoint.allow_doc_identity_reassignment,
+            checkpoint.copy_attempt.donor_term,
+            checkpoint.copy_attempt.sequence,
         });
         if (checkpoint.receiver_identity_reassignment_namespace) |namespace| {
             try writer.print(",\"namespace_table_id\":\"{d}\",\"namespace_shard_id\":\"{d}\",\"namespace_range_id\":\"{d}\"", .{

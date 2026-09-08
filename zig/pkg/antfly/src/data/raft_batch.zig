@@ -23,6 +23,7 @@ pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_b
 pub const merge_transition_protocol_version = internal_batch_forwarding.raft_batch_merge_transition_protocol_version;
 pub const split_delta_predecessor_protocol_version = internal_batch_forwarding.raft_batch_split_delta_predecessor_protocol_version;
 pub const merge_artifacts_protocol_version = internal_batch_forwarding.raft_batch_merge_artifacts_protocol_version;
+pub const merge_copy_attempt_protocol_version = internal_batch_forwarding.raft_batch_merge_copy_attempt_protocol_version;
 
 pub const OwnedReplicatedBatch = struct {
     table_name: []u8,
@@ -245,6 +246,7 @@ test "raft batch round trips internal merge checkpoint" {
             .merged_start = "doc:a",
             .merged_end = "doc:z",
             .bootstrap_applied_index = 19,
+            .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
             .allow_doc_identity_reassignment = true,
             .receiver_identity_reassignment_namespace = namespace,
         },
@@ -260,6 +262,8 @@ test "raft batch round trips internal merge checkpoint" {
     try std.testing.expectEqualStrings("doc:m", checkpoint.receiver_base_end);
     try std.testing.expectEqualStrings("doc:z", checkpoint.merged_end);
     try std.testing.expectEqual(@as(u64, 19), checkpoint.bootstrap_applied_index);
+    try std.testing.expectEqual(@as(u64, 8), checkpoint.copy_attempt.donor_term);
+    try std.testing.expectEqual(@as(u64, 9), checkpoint.copy_attempt.sequence);
     try std.testing.expect(checkpoint.receiver_identity_reassignment_namespace.?.eql(namespace));
 }
 
@@ -267,7 +271,8 @@ test "raft batch round trips merge replay identity with checkpoint" {
     const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 42, .range_id = 420 };
     const encoded = try encode(std.testing.allocator, "docs", .{
         .merge_checkpoint = .{
-            .kind = .accept,
+            .kind = .begin_copy,
+            .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
             .transition_id = 40,
             .donor_group_id = 41,
             .receiver_group_id = 42,
@@ -279,6 +284,7 @@ test "raft batch round trips merge replay identity with checkpoint" {
             .receiver_identity_reassignment_namespace = namespace,
         },
         .merge_replication = .{
+            .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
             .transition_id = 40,
             .donor_group_id = 41,
             .receiver_group_id = 42,
@@ -294,6 +300,15 @@ test "raft batch round trips merge replay identity with checkpoint" {
     try std.testing.expectEqual(@as(u64, 41), replication.donor_group_id);
     try std.testing.expectEqual(@as(u64, 42), replication.receiver_group_id);
     try std.testing.expect(replication.identity_namespace.eql(namespace));
+    try std.testing.expectEqual(@as(u64, 8), replication.copy_attempt.donor_term);
+    try std.testing.expectEqual(@as(u64, 9), replication.copy_attempt.sequence);
+    var mismatched = decoded.batch.req;
+    mismatched.merge_replication.?.copy_attempt.sequence += 1;
+    try std.testing.expectError(error.InvalidBatchRequest, encode(std.testing.allocator, "docs", mismatched));
+    var bundled = decoded.batch.req;
+    bundled.merge_checkpoint.?.kind = .rollback;
+    bundled.deletes = &.{"doc:b"};
+    try std.testing.expectError(error.InvalidBatchRequest, encode(std.testing.allocator, "docs", bundled));
 }
 
 test "raft batch round trips merge artifacts and rejects public or unscoped payloads" {

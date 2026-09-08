@@ -827,6 +827,7 @@ pub const MergeCoordinator = struct {
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace,
     bootstrap_complete: bool,
     bootstrap_applied_index: u64,
+    copy_attempt: db_types.MergeCopyAttempt,
     retired_transition_ids: []u64,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MergeConfig) !MergeCoordinator {
@@ -927,6 +928,7 @@ pub const MergeCoordinator = struct {
                 null,
             .bootstrap_complete = if (persisted) |state| state.bootstrap_complete else false,
             .bootstrap_applied_index = if (persisted) |state| state.bootstrap_applied_index else 0,
+            .copy_attempt = if (persisted) |state| state.copy_attempt else .{},
             .retired_transition_ids = retired_ids,
         };
     }
@@ -992,15 +994,19 @@ pub const MergeCoordinator = struct {
         defer range_state.freeRange(self.alloc, donor_range);
         if (self.bootstrap_complete) return false;
 
-        const donor_applied_index = try self.copyCurrentDonorSnapshot(donor_range);
-        self.bootstrap_complete = true;
-        self.bootstrap_applied_index = donor_applied_index;
-        try self.persistMergeState();
+        _ = try self.copyCurrentDonorSnapshot(donor_range);
         return true;
     }
 
     fn copyCurrentDonorSnapshot(self: *MergeCoordinator, donor_range: db_types.ByteRange) !u64 {
         const donor_applied_index = try self.donorAppliedIndex();
+        // The direct coordinator owns exclusive DB leases, but still opens a
+        // fresh durable attempt before refreshing a previously completed copy.
+        self.copy_attempt.donor_term = @max(1, self.copy_attempt.donor_term);
+        self.copy_attempt.sequence = try std.math.add(u64, self.copy_attempt.sequence, 1);
+        self.bootstrap_complete = false;
+        self.bootstrap_applied_index = 0;
+        try self.persistMergeState();
         if (self.donor_lease) |lease| {
             // A live DB is authoritative for transforms, predicates and 2PC
             // outcomes. The raw Raft request/projection is not an effects log.
@@ -1053,6 +1059,9 @@ pub const MergeCoordinator = struct {
         // Publish the watermark only after both documents and artifacts are
         // durable. Never replay retained requests over this current snapshot.
         try self.receiver.db.setSplitDeltaFinalSeq(donor_applied_index);
+        self.bootstrap_complete = true;
+        self.bootstrap_applied_index = donor_applied_index;
+        try self.persistMergeState();
         return donor_applied_index;
     }
 
@@ -1076,6 +1085,7 @@ pub const MergeCoordinator = struct {
                     .donor_group_id = self.donor_group_id,
                     .receiver_group_id = self.receiver_group_id,
                     .identity_namespace = self.receiver.db.core.identity_namespace,
+                    .copy_attempt = self.copy_attempt,
                 },
                 .sync_level = .full_index,
             });
@@ -1196,6 +1206,7 @@ pub const MergeCoordinator = struct {
             .bootstrap_complete = self.bootstrap_complete,
             .bootstrap_applied_index = self.bootstrap_applied_index,
             .retired_transition_ids = self.retired_transition_ids,
+            .copy_attempt = self.copy_attempt,
         });
     }
 

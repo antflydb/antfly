@@ -7282,6 +7282,12 @@ pub const DB = struct {
             }
         }
 
+        // Checkpoints certify a copy; payloads must use a separately fenced
+        // command so a stale checkpoint cannot smuggle destructive mutations.
+        if (req.merge_checkpoint != null and (req.writes.len != 0 or req.deletes.len != 0 or
+            req.merge_artifacts.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0))
+            return error.InvalidBatchRequest;
         if (req.merge_replication) |replication| if (req.merge_checkpoint == null) {
             const raw = try self.core.getStoreValue(self.alloc, merge_state_mod.key);
             defer if (raw) |value| self.alloc.free(value);
@@ -104863,6 +104869,104 @@ test "db merge receiver fences stale copies and retains retired transitions acro
     const value = (try db.get(alloc, "b")).?;
     defer alloc.free(value);
     try std.testing.expectEqualStrings("{\"public\":true}", value);
+}
+
+test "db merge copy attempts fence delayed leaders before finalize across reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var checkpoint: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 100,
+        .donor_group_id = 101,
+        .receiver_group_id = 102,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    const Apply = struct {
+        fn command(db: *DB, index: *u64, req: types.BatchRequest) !void {
+            index.* += 1;
+            try db.batchRaftReplicatedApply(req, .{ .term = 7, .index = index.* });
+        }
+    };
+    var index: u64 = 0;
+    var old_copy: types.MergeReplicationContext = undefined;
+    var old_begin = checkpoint;
+    old_begin.kind = .begin_copy;
+    old_begin.copy_attempt = .{ .donor_term = 1, .sequence = 100 };
+    var new_begin = old_begin;
+    // Term must dominate sequence, even if the successor just restarted.
+    new_begin.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        old_copy = .{
+            .transition_id = 100,
+            .donor_group_id = 101,
+            .receiver_group_id = 102,
+            .identity_namespace = db.core.identity_namespace,
+            .copy_attempt = old_begin.copy_attempt,
+        };
+        try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+        try Apply.command(&db, &index, .{ .merge_checkpoint = old_begin });
+        try Apply.command(&db, &index, .{ .merge_replication = old_copy, .writes = &.{.{ .key = "b", .value = "{}" }} });
+        try Apply.command(&db, &index, .{ .merge_checkpoint = new_begin });
+        var new_copy = old_copy;
+        new_copy.copy_attempt = new_begin.copy_attempt;
+        try Apply.command(&db, &index, .{ .merge_replication = new_copy, .writes = &.{.{ .key = "b", .value = "{\"new\":true}" }} });
+        // A delayed begin cannot take ownership back. Nor can its completion
+        // or finalize certify B's still-incomplete copy.
+        try Apply.command(&db, &index, .{ .merge_checkpoint = old_begin });
+        var stale = old_begin;
+        stale.kind = .bootstrap_complete;
+        stale.bootstrap_applied_index = 900;
+        try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
+        stale.kind = .finalize;
+        try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
+        try Apply.command(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b"} });
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.accepting, state.phase);
+        try std.testing.expect(!state.bootstrap_complete);
+        try std.testing.expectEqual(std.math.Order.eq, state.copy_attempt.order(new_begin.copy_attempt));
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    checkpoint = new_begin;
+    checkpoint.kind = .bootstrap_complete;
+    checkpoint.bootstrap_applied_index = 20;
+    try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+    const before = db.core.nextDerivedSequence();
+    // This is the reported window: B completed bootstrap, but has not yet
+    // finalized, when A's delayed clear and artifact page are delivered.
+    try Apply.command(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b"} });
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "b", "graph", "links", "c");
+    defer alloc.free(artifact_key);
+    try Apply.command(&db, &index, .{ .merge_replication = old_copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} });
+    // Completion also closes the winning attempt against duplicate packets.
+    var completed_copy = old_copy;
+    completed_copy.copy_attempt = checkpoint.copy_attempt;
+    try Apply.command(&db, &index, .{ .merge_replication = completed_copy, .deletes = &.{"b"} });
+    try std.testing.expectEqual(before, db.core.nextDerivedSequence());
+    try std.testing.expectEqual(index, (try db.raftAppliedEntry()).?.index);
+    try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
+    checkpoint.kind = .finalize;
+    try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+    const value = (try db.get(alloc, "b")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"new\":true}", value);
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+    try std.testing.expectEqual(@as(u64, 20), state.bootstrap_applied_index);
 }
 
 test "db replicated merge checkpoints persist phase range and watermark across reopen" {

@@ -4892,6 +4892,7 @@ pub fn build(b: *std.Build) void {
         "db replicated merge artifacts",
         "db replicated merge checkpoints persist phase range and watermark across reopen",
         "db merge receiver fences stale copies and retains retired transitions across reopen",
+        "db merge copy attempts fence delayed leaders before finalize across reopen",
         "data runtime health metrics include replay debt and provisioned warmup counters",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime local group status does not open roots owned by transitions",

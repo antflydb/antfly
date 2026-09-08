@@ -3739,7 +3739,7 @@ test "data raft merge receiver checkpoint expands monotonically and snapshots" {
             const payload = try data_raft_batch.encodeProtocolBarrier(
                 allocator,
                 "docs",
-                data_raft_batch.merge_transition_protocol_version,
+                data_raft_batch.merge_copy_attempt_protocol_version,
             );
             defer allocator.free(payload);
             const entries = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{
@@ -3855,33 +3855,58 @@ test "data raft merge receiver checkpoint expands monotonically and snapshots" {
     var new_copy = old_copy;
     new_copy.transition_id = 600;
     new_copy.donor_group_id = 601;
-    try Apply.command(alloc, &source, group_id, 11, .{
+    var first_attempt = second;
+    first_attempt.kind = .begin_copy;
+    first_attempt.copy_attempt = .{ .donor_term = 1, .sequence = 100 };
+    try Apply.command(alloc, &source, group_id, 11, .{ .merge_checkpoint = first_attempt });
+    var next_attempt = first_attempt;
+    next_attempt.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+    try Apply.command(alloc, &source, group_id, 12, .{ .merge_checkpoint = next_attempt });
+    new_copy.copy_attempt = next_attempt.copy_attempt;
+    try Apply.command(alloc, &source, group_id, 13, .{
         .merge_replication = new_copy,
         .writes = &.{.{ .key = "doc:0", .value = "{\"side\":\"new donor\"}" }},
     });
-    var second_complete = second;
+    try Apply.command(alloc, &source, group_id, 14, .{ .merge_checkpoint = first_attempt });
+    var stale_complete = first_attempt;
+    stale_complete.kind = .bootstrap_complete;
+    stale_complete.bootstrap_applied_index = 100;
+    try Apply.command(alloc, &source, group_id, 15, .{ .merge_checkpoint = stale_complete });
+    stale_complete.kind = .finalize;
+    try Apply.command(alloc, &source, group_id, 16, .{ .merge_checkpoint = stale_complete });
+    var second_complete = next_attempt;
     second_complete.kind = .bootstrap_complete;
-    second_complete.bootstrap_applied_index = 11;
-    try Apply.command(alloc, &source, group_id, 12, .{ .merge_checkpoint = second_complete });
-    second_complete.kind = .finalize;
-    try Apply.command(alloc, &source, group_id, 13, .{ .merge_checkpoint = second_complete });
+    second_complete.bootstrap_applied_index = 13;
+    try Apply.command(alloc, &source, group_id, 17, .{ .merge_checkpoint = second_complete });
 
     const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group_id);
     defer alloc.free(snapshot);
     var target = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
     defer target.deinit();
-    try target.installSnapshot(alloc, group_id, 13, snapshot);
+    try target.installSnapshot(alloc, group_id, 17, snapshot);
     current_range = try target.currentRange(alloc, group_id);
     defer range_state.freeRange(alloc, current_range);
     try std.testing.expectEqualStrings("", current_range.start);
     var restored = (try target.currentMergeReceiverState(alloc, group_id)) orelse
         return error.MissingMergeReceiverState;
     defer restored.deinit(alloc);
-    try std.testing.expectEqual(merge_state.Phase.finalized, restored.phase);
+    try std.testing.expectEqual(merge_state.Phase.accepting, restored.phase);
+    try std.testing.expect(restored.bootstrap_complete);
+    try std.testing.expectEqual(std.math.Order.eq, restored.copy_attempt.order(next_attempt.copy_attempt));
     try std.testing.expectEqual(@as(u64, 600), restored.transition_id);
     try std.testing.expectEqualSlices(u64, &.{500}, restored.retired_transition_ids);
-    try Apply.command(alloc, &target, group_id, 14, .{ .merge_checkpoint = checkpoint });
-    try Apply.command(alloc, &target, group_id, 15, .{ .merge_replication = old_copy, .deletes = &.{"doc:b"} });
+    try Apply.command(alloc, &target, group_id, 18, .{ .merge_checkpoint = checkpoint });
+    try Apply.command(alloc, &target, group_id, 19, .{ .merge_replication = old_copy, .deletes = &.{"doc:b"} });
+    var stale_copy = new_copy;
+    stale_copy.copy_attempt = first_attempt.copy_attempt;
+    try Apply.command(alloc, &target, group_id, 20, .{ .merge_replication = stale_copy, .deletes = &.{"doc:0"} });
+    try Apply.command(alloc, &target, group_id, 21, .{ .merge_replication = new_copy, .deletes = &.{"doc:0"} });
+    second_complete.kind = .finalize;
+    try Apply.command(alloc, &target, group_id, 22, .{ .merge_checkpoint = second_complete });
+    var final_state = (try target.currentMergeReceiverState(alloc, group_id)).?;
+    defer final_state.deinit(alloc);
+    try std.testing.expectEqual(merge_state.Phase.finalized, final_state.phase);
+    try std.testing.expectEqual(@as(u64, 13), final_state.bootstrap_applied_index);
     const entries = try target.groupState(alloc, group_id);
     defer shard_state_store.freeGroupStateEntries(alloc, entries);
     try std.testing.expectEqual(@as(usize, 3), entries.len);

@@ -192,6 +192,18 @@ pub const MergeSourceTransitionMutation = struct {
     receiver_group_id: u64,
 };
 
+/// Receiver-persisted fencing identity for one copy, ordered by the donor's
+/// elected Raft term and then its per-process attempt sequence.
+pub const MergeCopyAttempt = struct {
+    donor_term: u64 = 0,
+    sequence: u64 = 0,
+
+    pub fn order(a: MergeCopyAttempt, b: MergeCopyAttempt) std.math.Order {
+        const term_order = std.math.order(a.donor_term, b.donor_term);
+        return if (term_order == .eq) std.math.order(a.sequence, b.sequence) else term_order;
+    }
+};
+
 /// Replay identity for receiver-side merge copy batches. Unlike an ordinary
 /// write, these entries must reopen the already-provisioned receiver from its
 /// local manifest even while metadata publication is synchronously waiting on
@@ -202,6 +214,7 @@ pub const MergeReplicationContext = struct {
     donor_group_id: u64,
     receiver_group_id: u64,
     identity_namespace: doc_identity_mod.Namespace,
+    copy_attempt: MergeCopyAttempt = .{},
 };
 
 /// Private receiver-side data-Raft checkpoint for a range merge. Document
@@ -211,6 +224,7 @@ pub const MergeReplicationContext = struct {
 pub const MergeReplicationCheckpoint = struct {
     pub const Kind = enum {
         accept,
+        begin_copy,
         bootstrap_complete,
         finalize,
         rollback,
@@ -225,6 +239,7 @@ pub const MergeReplicationCheckpoint = struct {
     merged_start: []const u8,
     merged_end: []const u8,
     bootstrap_applied_index: u64 = 0,
+    copy_attempt: MergeCopyAttempt = .{},
     allow_doc_identity_reassignment: bool = false,
     receiver_identity_reassignment_namespace: ?doc_identity_mod.Namespace = null,
 };

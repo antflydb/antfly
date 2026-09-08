@@ -36,6 +36,7 @@ pub const State = struct {
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
     bootstrap_complete: bool = false,
     bootstrap_applied_index: u64 = 0,
+    copy_attempt: db_types.MergeCopyAttempt = .{},
     /// Terminal identities remain fenced even after another merge takes over.
     retired_transition_ids: []const u64 = &.{},
 
@@ -92,6 +93,8 @@ pub fn encode(
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u32, retired_len)));
     for (state.retired_transition_ids) |id|
         try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, id)));
+    try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.copy_attempt.donor_term)));
+    try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.copy_attempt.sequence)));
 }
 
 pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
@@ -188,6 +191,13 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
             pos += 8;
         }
     }
+    var copy_attempt: db_types.MergeCopyAttempt = .{};
+    if (pos < data.len) {
+        if (data.len - pos != 16) return error.InvalidMergeState;
+        copy_attempt.donor_term = std.mem.readInt(u64, data[pos..][0..8], .little);
+        copy_attempt.sequence = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little);
+        pos += 16;
+    }
     if (pos != data.len or donor_group_id == 0 or receiver_group_id == 0 or
         donor_group_id == receiver_group_id)
         return error.InvalidMergeState;
@@ -203,6 +213,7 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
         .bootstrap_complete = bootstrap_complete,
         .bootstrap_applied_index = bootstrap_applied_index,
         .retired_transition_ids = retired,
+        .copy_attempt = copy_attempt,
     };
 }
 
@@ -231,7 +242,8 @@ pub fn retireCurrentAlloc(alloc: std.mem.Allocator, state: State) ![]u64 {
 /// A stale committed payload is a no-op, not a fatal Raft apply error.
 pub fn copyAllowed(state: ?State, replication: db_types.MergeReplicationContext) bool {
     const current = state orelse return false;
-    return current.phase == .accepting and
+    return current.phase == .accepting and !current.bootstrap_complete and
+        current.copy_attempt.order(replication.copy_attempt) == .eq and
         current.transition_id == replication.transition_id and
         current.donor_group_id == replication.donor_group_id and
         current.receiver_group_id == replication.receiver_group_id;
@@ -260,7 +272,7 @@ pub fn planCheckpointApply(
         !validRange(base) or !validRange(merged) or !rangeContains(merged, base) or
         rangesEqual(base, merged))
         return error.InvalidMergeCheckpoint;
-    if ((checkpoint.kind == .accept or checkpoint.kind == .rollback) and
+    if ((checkpoint.kind == .accept or checkpoint.kind == .begin_copy or checkpoint.kind == .rollback) and
         checkpoint.bootstrap_applied_index != 0)
         return error.InvalidMergeCheckpoint;
     if ((checkpoint.kind == .bootstrap_complete or checkpoint.kind == .finalize) and
@@ -321,7 +333,24 @@ pub fn planCheckpointApply(
     };
     if (!rangesEqual(current_range, expected_current)) return error.MergeRangeStateMismatch;
 
+    // Attempts are ordered first by the donor's elected term, then by its
+    // node-local sequence. Delayed begins cannot reclaim a newer attempt;
+    // delayed completion/finalization cannot certify a different copy.
+    if (checkpoint.kind == .begin_copy) {
+        if (checkpoint.copy_attempt.donor_term == 0 or checkpoint.copy_attempt.sequence == 0)
+            return error.InvalidMergeCheckpoint;
+        if (prior.phase != .accepting or checkpoint.copy_attempt.order(prior.copy_attempt) != .gt)
+            return .{ .state = prior.*, .range = current_range };
+        return .{
+            .state = advanceState(prior, checkpoint, .accepting, false, 0),
+            .range = merged,
+        };
+    }
+    if (checkpoint.kind != .accept and checkpoint.copy_attempt.order(prior.copy_attempt) != .eq)
+        return .{ .state = prior.*, .range = current_range };
+
     switch (checkpoint.kind) {
+        .begin_copy => unreachable,
         .accept => switch (prior.phase) {
             .accepting, .finalized => return preserveAdvanced(prior, checkpoint, expected_current),
             .rolling_back, .rolled_back => return error.ConflictingMergeTransition,
@@ -444,6 +473,7 @@ fn stateFromCheckpoint(
 ) State {
     return .{
         .transition_id = checkpoint.transition_id,
+        .copy_attempt = checkpoint.copy_attempt,
         .donor_group_id = checkpoint.donor_group_id,
         .receiver_group_id = checkpoint.receiver_group_id,
         .phase = phase,

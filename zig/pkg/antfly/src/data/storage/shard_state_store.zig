@@ -2455,7 +2455,7 @@ pub fn appendOperationEffects(
     defer if (merge_receiver_state) |*state| state.deinit(alloc);
     var needs_raft_batch_protocol = false;
     for (operations) |op| switch (op) {
-        .set_raft_batch_protocol, .merge_source_transition, .merge_receiver_checkpoint => needs_raft_batch_protocol = true,
+        .set_raft_batch_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence => needs_raft_batch_protocol = true,
         else => {},
     };
     var raft_batch_protocol_version: u16 = if (needs_raft_batch_protocol)
@@ -2479,6 +2479,11 @@ pub fn appendOperationEffects(
     var merge_copy_allowed = true;
     for (operations) |op| switch (op) {
         .merge_copy_fence => |replication| {
+            if (replication) |context| {
+                if (context.copy_attempt.donor_term != 0 and
+                    raft_batch_protocol_version < data_raft_protocol.batch_merge_copy_attempt_protocol_version)
+                    return error.RaftBatchMergeProtocolNotActivated;
+            }
             merge_copy_allowed = if (replication) |context| merge_state.copyAllowed(merge_receiver_state, context) else true;
         },
         .set_raft_batch_protocol => |version| {
@@ -2871,6 +2876,9 @@ pub fn appendOperationEffects(
             );
         },
         .merge_receiver_checkpoint => |owned_checkpoint| {
+            if (owned_checkpoint.checkpoint.copy_attempt.donor_term != 0 and
+                raft_batch_protocol_version < data_raft_protocol.batch_merge_copy_attempt_protocol_version)
+                return error.RaftBatchMergeProtocolNotActivated;
             if (raft_batch_protocol_version < data_raft_protocol.batch_merge_transition_protocol_version)
                 return error.RaftBatchMergeProtocolNotActivated;
             // Every replica owns an independent durable apply projection. A

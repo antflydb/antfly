@@ -3496,6 +3496,51 @@ regressions are included in the existing data-runtime and data-storage default
 filters. GitHub reported no checks for the prior PR head; these are local
 validation results, not a remote CI certification.
 
+### Merge Copy Attempt Fencing (2026-09-07)
+
+The terminal-state fence above left a same-transition failover window: an old
+donor leader's delayed clear could arrive after its replacement completed
+bootstrap but before receiver finalization. The receiver was still accepting
+and the transition/group IDs still matched, so the clear could delete data
+that finalization would publish without another verification.
+
+Each production copy now opens a durable `begin_copy` checkpoint carrying a
+`(donor_term, sequence)` attempt token. The elected donor allocates sequences
+under its Raft mutex; retries in one process cannot reuse a sequence, and a
+restarted donor must win election in a newer term. Receiver apply orders tokens
+by term first, then sequence. A newer attempt resets bootstrap evidence; a
+delayed begin cannot reclaim ownership. Every document, delete, and artifact
+page carries that token. Both serving DB and Raft projection apply reject
+superseded copies, and bootstrap completion closes even the winning attempt
+against late duplicate packets. Completion and finalization must match the
+persisted attempt; stale checkpoints cannot certify a replacement copy.
+
+Finalization carries the token returned by its own copy, rather than borrowing
+a newer receipt from the receiver. Donor finalize/rollback proposals also
+require the captured local leadership term under the proposal mutex and cannot
+be forwarded into a successor term. Rollback cleanup opens its own attempt;
+checkpoint commands cannot bundle unfenced document mutations. The exclusive
+direct coordinator persists a fresh attempt before refreshing completed data.
+
+Raft batch protocol v6 activates these semantics before receiver commands are
+proposed. Attempt identity survives forwarding, durable DB reopen, and
+projection snapshot transfer. Regressions cover term-over-sequence ordering,
+stale begin/completion/finalization, delayed clears and artifact pages before
+finalization, winning-attempt closure, unchanged derived visibility, advancing
+Raft receipts, and repeated production copies with stale packets through the
+real proposal path. These are bounded regression histories, not a claim of
+exhaustive overlapping-coordinator or placement coverage.
+
+Validation: the final default data-storage gate passes 69/69. The focused
+runtime/protocol gate passes 7/7, including the expanded production stale-copy
+history and the three-node merge/split record-and-replay history; the additional
+codec assertions pass 3/3. The four DB merge regressions pass in Debug and
+ReleaseSafe, together with the 34 query tests included by each DB invocation.
+All report zero skips, failures, or leaks. The production build,
+`make fmt-check`, and `git diff --check` pass. Before push, GitHub checks on the
+previous head had no reported failures but several jobs were still pending;
+these results are local validation, not a remote CI certification.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and
