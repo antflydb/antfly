@@ -287,13 +287,78 @@ def test_table_cleanup_does_not_hide_server_crash(monkeypatch, outcome):
 
 def test_table_cleanup_does_not_retry_after_deadline(monkeypatch):
     api, calls = _cleanup_api(monkeypatch, [requests.Timeout("delete timed out"), 204])
-    clock = iter([0.0, 0.0, 30.0])
-    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: next(clock))
+    clock = [0.0]
+    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: clock[0])
+    delete = api.s.delete
+
+    def timed_out_delete(*args, **kwargs):
+        clock[0] = 30.0
+        return delete(*args, **kwargs)
+
+    api.s.delete = timed_out_delete
     errors = e2e_conftest._cleanup_created_tables(api, {"table"})
     assert len(errors) == 1
     assert "delete timed out" in errors[0]
     assert len(calls) == 1
     assert calls[0][1]["timeout"] == 30
+    assert not api._request_lock.locked()
+
+
+def test_table_cleanup_does_not_retry_when_sleep_passes_deadline(monkeypatch):
+    api, calls = _cleanup_api(monkeypatch, [requests.ConnectionError("reset"), 204])
+    clock = [0.0]
+    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        e2e_conftest.time, "sleep", lambda _: clock.__setitem__(0, 31.0)
+    )
+    errors = e2e_conftest._cleanup_created_tables(api, {"table"})
+    assert len(errors) == 1
+    assert "deadline expired" in errors[0]
+    assert len(calls) == 1
+    assert not api._request_lock.locked()
+
+
+@pytest.mark.parametrize(
+    "delay, acquired, request_timeout",
+    [(30.0, False, None), (31.0, True, None), (29.0, True, 1.0)],
+)
+def test_table_cleanup_bounds_lock_wait_and_rechecks_deadline(
+    monkeypatch, delay, acquired, request_timeout
+):
+    api, calls = _cleanup_api(monkeypatch, [204])
+    clock = [0.0]
+    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: clock[0])
+
+    class ContendedLock:
+        releases = 0
+
+        def acquire(self, *, timeout=-1):
+            assert timeout == 30.0, "cleanup must bound the lock wait"
+            clock[0] += delay
+            return acquired
+
+        def release(self):
+            self.releases += 1
+
+        def __enter__(self):
+            self.acquire()
+
+        def __exit__(self, *args):
+            self.release()
+
+    lock = ContendedLock()
+    api._request_lock = lock
+    errors = e2e_conftest._cleanup_created_tables(api, {"table"})
+    assert lock.releases == int(acquired)
+    if request_timeout is None:
+        assert calls == []
+        assert len(errors) == 1
+        assert "cleanup server diagnostics" in errors[0]
+        assert "request lock" in errors[0] or "deadline" in errors[0]
+    else:
+        assert errors == []
+        assert len(calls) == 1
+        assert calls[0][1]["timeout"] == request_timeout
 
 
 def _seed_cluster(monkeypatch, outcomes):

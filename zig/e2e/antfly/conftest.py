@@ -309,11 +309,29 @@ def _delete_created_table(api: Any, table_name: str) -> None:
     for attempt in range(3):
         raise_if_server_process_exited(api._server)
         try:
-            with api._request_lock:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.Timeout(
+                    "table cleanup deadline expired before request lock"
+                )
+            if not api._request_lock.acquire(timeout=remaining):
+                raise requests.Timeout(
+                    "table cleanup timed out waiting for request lock"
+                )
+            try:
+                # Lock acquisition may consume the deadline, including when
+                # the waiter is descheduled just as the lock becomes available.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise requests.Timeout(
+                        "table cleanup deadline expired before DELETE"
+                    )
                 response = api.s.delete(
                     f"{api.url}/tables/{quote(table_name, safe='')}",
-                    timeout=max(0.001, deadline - time.monotonic()),
+                    timeout=remaining,
                 )
+            finally:
+                api._request_lock.release()
         except (requests.ConnectionError, requests.Timeout) as err:
             raise_if_server_process_exited(api._server)
             remaining = deadline - time.monotonic()
