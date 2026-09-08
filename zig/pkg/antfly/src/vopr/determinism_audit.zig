@@ -14,7 +14,7 @@ const Source = struct {
     bytes: []const u8,
 };
 
-const metadata_sim_source = @embedFile("../metadata/sim_harness.zig");
+const metadata_vopr_source = @embedFile("../metadata/vopr_harness.zig");
 
 fn region(comptime source: []const u8, comptime begin: []const u8, comptime end: []const u8) []const u8 {
     @setEvalBranchQuota(100_000);
@@ -65,17 +65,17 @@ const replayable_sources = [_]Source{
     .{ .path = "storage/index_manager_vopr.zig", .bytes = @embedFile("../storage/index_manager_vopr.zig") },
     .{ .path = "storage/db_split_vopr.zig", .bytes = @embedFile("../storage/db_split_vopr.zig") },
     .{
-        .path = "metadata/sim_harness.zig#DistributedDataVoprScenario",
+        .path = "metadata/vopr_harness.zig#DistributedDataVoprScenario",
         .bytes = region(
-            metadata_sim_source,
+            metadata_vopr_source,
             "pub const DistributedDataVoprCampaignConfig",
             "fn runAutomaticMergePublicTrafficScenario",
         ),
     },
     .{
-        .path = "metadata/sim_harness.zig#MetadataVoprScenario",
+        .path = "metadata/vopr_harness.zig#MetadataVoprScenario",
         .bytes = region(
-            metadata_sim_source,
+            metadata_vopr_source,
             "const metadata_vopr_scenario_version",
             "test \"metadata VOPR",
         ),

@@ -12,7 +12,7 @@ const data_runtime = @import("../data/runtime.zig");
 const distributed_graph = @import("../api/distributed_graph.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const metadata_replication = @import("../metadata/replication_backfill.zig");
-const metadata_sim = @import("../metadata/sim_harness.zig");
+const metadata_vopr = @import("../metadata/vopr_harness.zig");
 const production_cluster = @import("production_cluster.zig");
 const replication_backfill_vopr = @import("replication_backfill.zig");
 const serverless_workflow = @import("serverless_workflow.zig");
@@ -137,7 +137,7 @@ pub const Scenario = struct {
         .{ .id = complete_id, .name = name ++ ".history-completes", .kind = .reachable },
     };
 
-    const PublicFault = metadata_sim.VoprPublicClusterFixture.FaultMode;
+    const PublicFault = metadata_vopr.VoprPublicClusterFixture.FaultMode;
     const Mode = enum {
         clean,
         metadata_partition,
@@ -871,7 +871,7 @@ pub const Scenario = struct {
         replication: *replication_backfill_vopr.Scenario.Fixture,
         service_rates_enabled: bool = false,
         service_rates_healed: bool = false,
-        public_cluster: ?*metadata_sim.VoprPublicClusterFixture = null,
+        public_cluster: ?*metadata_vopr.VoprPublicClusterFixture = null,
         production_cluster: ?*production_cluster.Fixture = null,
         deployment: ?vopr.deployment.Composer = null,
         serverless: *serverless_workflow.Scenario.Fixture,
@@ -1760,7 +1760,7 @@ pub const Scenario = struct {
                 self.complete = true;
                 return;
             };
-            var public_fixture: ?*metadata_sim.VoprPublicClusterFixture = null;
+            var public_fixture: ?*metadata_vopr.VoprPublicClusterFixture = null;
             if (mode.isProduction()) {
                 self.production_cluster = production_cluster.Fixture.create(
                     self.fixture_allocator.allocator(),
@@ -1785,7 +1785,7 @@ pub const Scenario = struct {
                     };
                 if (mode.isReplicationBackfill()) {
                     self.replication.setTargetTableId(
-                        metadata_sim.VoprPublicClusterFixture.table_id,
+                        metadata_vopr.VoprPublicClusterFixture.table_id,
                     ) catch |err| {
                         self.initialization_failed = true;
                         self.initialization_error_code = @intFromError(err);
@@ -1960,7 +1960,7 @@ pub const Scenario = struct {
                     );
                 }
             } else {
-                public_fixture = metadata_sim.VoprPublicClusterFixture.init(
+                public_fixture = metadata_vopr.VoprPublicClusterFixture.init(
                     self.fixture_allocator.allocator(),
                     &self.sim,
                 ) catch |err| {
@@ -2084,7 +2084,7 @@ pub const Scenario = struct {
         fn registerDeployment(
             self: *State,
             mode: Mode,
-            fixture: ?*metadata_sim.VoprPublicClusterFixture,
+            fixture: ?*metadata_vopr.VoprPublicClusterFixture,
         ) !void {
             const deployment = &self.deployment.?;
             for (deployment_node_ids) |node_id| try deployment.startNode(node_id);

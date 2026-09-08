@@ -73,17 +73,17 @@ const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
-const LeanSimAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
-// Public API simulations can open DBs and hosted indexes from the listener
+const LeanVoprAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+// Public API VOPR fixtures can open DBs and hosted indexes from the listener
 // request thread. Debug x86_64 index construction exceeds the partitioned
 // runtime's 4 MiB floor, so match the production HTTP request stack instead
 // of intermittently entering the guard page while opening query-only DBs.
-const lean_sim_thread_stack_size = 8 * 1024 * 1024;
-fn leanSimHttpAllocator() std.mem.Allocator {
+const lean_vopr_thread_stack_size = 8 * 1024 * 1024;
+fn leanVoprHttpAllocator() std.mem.Allocator {
     return std.heap.smp_allocator;
 }
 
-pub const SimSplitRuntime = struct {
+pub const VoprSplitRuntime = struct {
     const Entry = struct {
         transition_id: u64,
         attempt_epoch: u64,
@@ -458,7 +458,7 @@ pub const SimSplitRuntime = struct {
 };
 
 fn backendRuntimeForReplicaRoot(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     replica_root_dir: []const u8,
 ) ?*db_mod.background_runtime.BackendRuntime {
     for (cluster.cluster.configs, 0..) |config, index| {
@@ -470,12 +470,12 @@ fn backendRuntimeForReplicaRoot(
     return null;
 }
 
-test "metadata sim split runtime preserves source identity namespace" {
+test "metadata VOPR split runtime preserves source identity namespace" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-sim-split-identity", .{tmp.sub_path});
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-split-identity", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
     const source_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 701);
     defer alloc.free(source_root_dir);
@@ -500,7 +500,7 @@ test "metadata sim split runtime preserves source identity namespace" {
         });
     }
 
-    var runtime = SimSplitRuntime{ .replica_root_dir = replica_root_dir };
+    var runtime = VoprSplitRuntime{ .replica_root_dir = replica_root_dir };
     defer runtime.deinit();
     var split = runtime.iface();
 
@@ -540,7 +540,7 @@ const EnsureGroupGraphIndexProgressContext = struct {
 };
 
 fn projectedIdentityNamespaceForGroup(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     group_id: u64,
 ) !?db_mod.DocIdentityNamespace {
     const preferred_index = currentMetadataLeaderIndex(cluster);
@@ -566,7 +566,7 @@ fn projectedIdentityNamespaceForGroup(
     return null;
 }
 
-fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *EnsureGroupTextIndexProgressContext = @ptrCast(@alignCast(ptr));
     const path = try metadata_mod.groupDbPathFromReplicaRoot(cluster.alloc, ctx.replica_root_dir, ctx.group_id);
     defer cluster.alloc.free(path);
@@ -605,7 +605,7 @@ fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation
 }
 
 fn ensureGroupTextIndex(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     replica_root_dir: []const u8,
     group_id: u64,
     index_name: []const u8,
@@ -621,7 +621,7 @@ fn ensureGroupTextIndex(
 }
 
 fn ensureGroupTextIndexOnActiveReplicas(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     replica_root_dirs: []const []const u8,
     group_id: u64,
     index_name: []const u8,
@@ -636,7 +636,7 @@ fn ensureGroupTextIndexOnActiveReplicas(
     if (ensured == 0) return error.TestExpectedEqual;
 }
 
-fn ensureGroupGraphIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn ensureGroupGraphIndexProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *EnsureGroupGraphIndexProgressContext = @ptrCast(@alignCast(ptr));
     const path = try metadata_mod.groupDbPathFromReplicaRoot(cluster.alloc, ctx.replica_root_dir, ctx.group_id);
     defer cluster.alloc.free(path);
@@ -677,7 +677,7 @@ fn ensureGroupGraphIndexProgressPredicate(cluster: *MetadataHttpClusterSimulatio
 }
 
 fn ensureGroupGraphIndex(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     replica_root_dir: []const u8,
     group_id: u64,
     index_name: []const u8,
@@ -693,7 +693,7 @@ fn ensureGroupGraphIndex(
 }
 
 fn ensureGroupGraphIndexOnActiveReplicas(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     replica_root_dirs: []const []const u8,
     group_id: u64,
     index_name: []const u8,
@@ -741,7 +741,7 @@ pub const RuntimeGroupMetricsOverride = struct {
 };
 
 pub fn reportRuntimeDocIdentityForActiveReplicas(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     node: anytype,
     replica_root_dirs: []const []const u8,
     table_name: []const u8,
@@ -812,7 +812,7 @@ pub fn reportRuntimeDocIdentityForActiveReplicas(
                 .store_id = @intCast(i + 1),
                 .node_id = @intCast(i + 1),
                 .updated_at_ns = now_ms * std.time.ns_per_ms,
-                .source = "metadata-sim",
+                .source = "metadata-vopr",
                 .freshness = "fresh",
                 .doc_count = reported_doc_count,
                 .disk_bytes = reported_disk_bytes,
@@ -851,7 +851,7 @@ pub fn reportRuntimeDocIdentityForActiveReplicas(
 }
 
 fn seedGroupDocsAcrossReplicaRoots(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     replica_root_dirs: []const []const u8,
     group_id: u64,
     writes: []const db_mod.types.BatchWrite,
@@ -879,8 +879,8 @@ fn seedGroupDocsAcrossReplicaRoots(
 }
 
 fn seedDefaultSplitCandidateDocs(
-    cluster: *MetadataHttpClusterSimulation,
-    node: MetadataHttpNodeSimulation,
+    cluster: *MetadataHttpClusterVopr,
+    node: MetadataHttpNodeVopr,
     replica_root_dirs: []const []const u8,
     group_id: u64,
     max_rounds: usize,
@@ -944,7 +944,7 @@ const CountProfileProgressContext = struct {
     expected_merged: bool,
 };
 
-fn countProfileProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn countProfileProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *CountProfileProgressContext = @ptrCast(@alignCast(ptr));
     expectCountProfile(ctx.client, ctx.client_base, ctx.table_name, ctx.query_text, ctx.expected_total_hits, ctx.expected_shards, ctx.expected_merged) catch |err| switch (err) {
@@ -955,7 +955,7 @@ fn countProfileProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *
 }
 
 fn waitForCountProfile(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     client: *api_http_client.ApiHttpClient,
     client_base: []const u8,
     table_name: []const u8,
@@ -978,7 +978,7 @@ fn waitForCountProfile(
 }
 
 fn waitForHelloCountProfile(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     client: *api_http_client.ApiHttpClient,
     client_base: []const u8,
     table_name: []const u8,
@@ -998,7 +998,7 @@ const LookupContainsProgressContext = struct {
     needle: []const u8,
 };
 
-fn lookupContainsProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn lookupContainsProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *LookupContainsProgressContext = @ptrCast(@alignCast(ptr));
     if (ctx.client.fetchLookup(ctx.client_base, ctx.table_name, ctx.key, null)) |lookup| {
@@ -1012,7 +1012,7 @@ fn lookupContainsProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr:
 }
 
 fn waitForLookupContains(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     client: *api_http_client.ApiHttpClient,
     client_base: []const u8,
     table_name: []const u8,
@@ -1038,7 +1038,7 @@ const QueryContainsAllProgressContext = struct {
     needles: []const []const u8,
 };
 
-fn queryContainsAllProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn queryContainsAllProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *QueryContainsAllProgressContext = @ptrCast(@alignCast(ptr));
     if (ctx.client.fetchQuery(ctx.client_base, ctx.table_name, ctx.body)) |query| {
@@ -1055,7 +1055,7 @@ fn queryContainsAllProgressPredicate(cluster: *MetadataHttpClusterSimulation, pt
 }
 
 fn waitForQueryContainsAll(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     client: *api_http_client.ApiHttpClient,
     client_base: []const u8,
     table_name: []const u8,
@@ -1074,12 +1074,12 @@ fn waitForQueryContainsAll(
 }
 
 const MedianKeyEqualsProgressContext = struct {
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     group_id: u64,
     expected_key: []const u8,
 };
 
-fn medianKeyEqualsProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn medianKeyEqualsProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *MedianKeyEqualsProgressContext = @ptrCast(@alignCast(ptr));
     const lookup = ctx.node.medianKeyLookup() orelse return false;
@@ -1095,8 +1095,8 @@ fn medianKeyEqualsProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr
 }
 
 fn waitForMedianKeyEquals(
-    cluster: *MetadataHttpClusterSimulation,
-    node: MetadataHttpNodeSimulation,
+    cluster: *MetadataHttpClusterVopr,
+    node: MetadataHttpNodeVopr,
     group_id: u64,
     expected_key: []const u8,
     max_rounds: usize,
@@ -1110,7 +1110,7 @@ fn waitForMedianKeyEquals(
 }
 
 pub fn mirrorGroupBatchToActiveReplicas(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
     group_id: u64,
@@ -1190,7 +1190,7 @@ const AcknowledgedPublicDataModel = struct {
 
     fn verify(
         self: *const @This(),
-        cluster: *MetadataHttpClusterSimulation,
+        cluster: *MetadataHttpClusterVopr,
         client: *api_http_client.ApiHttpClient,
         client_base: []const u8,
         table_name: []const u8,
@@ -1523,7 +1523,7 @@ fn expectBodyContainsAll(body: []const u8, needles: []const []const u8) !void {
 }
 
 fn waitForSplitResolvedGroups(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     catalog: api_table_catalog.CatalogSource,
     table_name: []const u8,
     route_rounds: usize,
@@ -1542,7 +1542,7 @@ const SplitResolvedGroupsProgressContext = struct {
     result: SplitResolvedGroups = .{ .left_group = 0, .right_group = 0 },
 };
 
-fn splitResolvedGroupsProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn splitResolvedGroupsProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *SplitResolvedGroupsProgressContext = @ptrCast(@alignCast(ptr));
     ctx.result.left_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:a")) orelse 0;
@@ -1558,7 +1558,7 @@ const ResolvedGroupForKeyProgressContext = struct {
     resolved_group_id: ?u64 = null,
 };
 
-fn resolvedGroupForKeyProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn resolvedGroupForKeyProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *ResolvedGroupForKeyProgressContext = @ptrCast(@alignCast(ptr));
     ctx.resolved_group_id = try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, ctx.key);
@@ -1566,7 +1566,7 @@ fn resolvedGroupForKeyProgressPredicate(cluster: *MetadataHttpClusterSimulation,
 }
 
 fn waitForResolvedGroupForKey(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     catalog: api_table_catalog.CatalogSource,
     table_name: []const u8,
     key: []const u8,
@@ -1594,7 +1594,7 @@ const FirstProjectedRangeProgressContext = struct {
     non_host_index: ?usize = null,
 };
 
-fn firstProjectedRangeProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn firstProjectedRangeProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *FirstProjectedRangeProgressContext = @ptrCast(@alignCast(ptr));
     const query_index = currentMetadataLeaderIndex(cluster) orelse ctx.fallback_index;
     const projected_ranges = try cluster.node(query_index).listProjectedRanges(std.testing.allocator);
@@ -1623,7 +1623,7 @@ fn firstProjectedRangeProgressPredicate(cluster: *MetadataHttpClusterSimulation,
 }
 
 fn waitForFirstProjectedRange(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     fallback_index: usize,
     expected_range_count: ?usize,
     expected_active_count: ?usize,
@@ -1649,7 +1649,7 @@ const PublicSplitRouteProgressContext = struct {
     client_index: ?usize = null,
 };
 
-fn publicSplitRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn publicSplitRouteProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *PublicSplitRouteProgressContext = @ptrCast(@alignCast(ptr));
     const query_index = currentMetadataLeaderIndex(cluster) orelse ctx.fallback_index;
     if (query_index >= ctx.catalog_sources.len) return false;
@@ -1669,7 +1669,7 @@ fn publicSplitRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, pt
 }
 
 fn waitForPublicSplitRoute(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     catalog_sources: []PublicApiCatalogSource,
     table_name: []const u8,
     fallback_index: usize,
@@ -1692,7 +1692,7 @@ const PublicMergedRouteProgressContext = struct {
     client_index: ?usize = null,
 };
 
-fn publicMergedRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn publicMergedRouteProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *PublicMergedRouteProgressContext = @ptrCast(@alignCast(ptr));
     const merged_group = try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog_source, ctx.table_name, ctx.key);
     if (merged_group != ctx.expected_group_id) return false;
@@ -1707,7 +1707,7 @@ fn publicMergedRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, p
 }
 
 fn waitForPublicMergedRoute(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     catalog_source: api_table_catalog.CatalogSource,
     table_name: []const u8,
     key: []const u8,
@@ -1730,7 +1730,7 @@ const SingleActiveGroupHostProgressContext = struct {
     active_count: usize = 0,
 };
 
-fn singleActiveGroupHostProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn singleActiveGroupHostProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *SingleActiveGroupHostProgressContext = @ptrCast(@alignCast(ptr));
     ctx.host_index = null;
     ctx.active_count = 0;
@@ -1744,7 +1744,7 @@ fn singleActiveGroupHostProgressPredicate(cluster: *MetadataHttpClusterSimulatio
 }
 
 fn waitForSingleActiveGroupHost(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     group_id: u64,
     max_rounds: usize,
 ) !usize {
@@ -1754,7 +1754,7 @@ fn waitForSingleActiveGroupHost(
 }
 
 fn verifySplitPublicTraffic(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
     catalog: api_table_catalog.CatalogSource,
@@ -1812,7 +1812,7 @@ fn verifySplitPublicTraffic(
 }
 
 fn verifyMergePublicTraffic(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
     catalog: api_table_catalog.CatalogSource,
@@ -1863,7 +1863,7 @@ fn verifyMergePublicTraffic(
 }
 
 fn verifyComposedMergePublicTraffic(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
     catalog: api_table_catalog.CatalogSource,
@@ -1952,24 +1952,24 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, cfg.table_id, root_a, cat_a),
-        makeHostSimConfig(2, cfg.table_id, root_b, cat_b),
-        makeHostSimConfig(3, cfg.table_id, root_c, cat_c),
+        makeHostVoprConfig(1, cfg.table_id, root_a, cat_a),
+        makeHostVoprConfig(2, cfg.table_id, root_b, cat_b),
+        makeHostVoprConfig(3, cfg.table_id, root_c, cat_c),
     };
     const deps = if (cfg.delayed_transport)
         [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostSimDepsWithTransportExecutor(&factory_a, delayed_a.?.executor()),
-            makeHostSimDepsWithTransportExecutor(&factory_b, delayed_b.?.executor()),
-            makeHostSimDepsWithTransportExecutor(&factory_c, delayed_c.?.executor()),
+            makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.?.executor()),
+            makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.?.executor()),
+            makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.?.executor()),
         }
     else
         [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostSimDeps(&factory_a),
-            makeHostSimDeps(&factory_b),
-            makeHostSimDeps(&factory_c),
+            makeHostVoprDeps(&factory_a),
+            makeHostVoprDeps(&factory_b),
+            makeHostVoprDeps(&factory_c),
         };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, cfg.table_id, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, cfg.table_id, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
     const factories = [_]*TestDescriptorFactory{ &factory_a, &factory_b, &factory_c };
@@ -2165,7 +2165,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
             merge_cfg.finalize_rounds,
         ));
         // This HTTP topology rig models transition progress in
-        // `SimMergeRuntime`; it does not own the data server's borrowed DB
+        // `VoprMergeRuntime`; it does not own the data server's borrowed DB
         // leases. Materialize the modeled bootstrap on every active receiver
         // replica before retiring the donor. The production-path regression
         // for the same split->merge handoff lives beside DataServer's local
@@ -2316,24 +2316,24 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, cfg.table_id, root_a, cat_a),
-        makeHostSimConfig(2, cfg.table_id, root_b, cat_b),
-        makeHostSimConfig(3, cfg.table_id, root_c, cat_c),
+        makeHostVoprConfig(1, cfg.table_id, root_a, cat_a),
+        makeHostVoprConfig(2, cfg.table_id, root_b, cat_b),
+        makeHostVoprConfig(3, cfg.table_id, root_c, cat_c),
     };
     const deps = if (cfg.delayed_transport)
         [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostSimDepsWithTransportExecutor(&factory_a, delayed_a.?.executor()),
-            makeHostSimDepsWithTransportExecutor(&factory_b, delayed_b.?.executor()),
-            makeHostSimDepsWithTransportExecutor(&factory_c, delayed_c.?.executor()),
+            makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.?.executor()),
+            makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.?.executor()),
+            makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.?.executor()),
         }
     else
         [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostSimDeps(&factory_a),
-            makeHostSimDeps(&factory_b),
-            makeHostSimDeps(&factory_c),
+            makeHostVoprDeps(&factory_a),
+            makeHostVoprDeps(&factory_b),
+            makeHostVoprDeps(&factory_c),
         };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, cfg.table_id, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, cfg.table_id, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
     const leader_index = try startBootstrappedMetadataCluster(&cluster, cfg.bootstrap_rounds, true);
@@ -2494,7 +2494,7 @@ fn containsProjectedBootstrapStore(
     return false;
 }
 
-fn freeOwnedSimStoreStatusReports(
+fn freeOwnedVoprStoreStatusReports(
     alloc: std.mem.Allocator,
     reports: []const metadata_table_manager.StoreStatusReport,
 ) void {
@@ -2532,7 +2532,7 @@ fn buildHealthyStoreStatusReports(
     }
 
     const reports = try alloc.alloc(metadata_table_manager.StoreStatusReport, report_store_ids.items.len);
-    errdefer freeOwnedSimStoreStatusReports(alloc, reports);
+    errdefer freeOwnedVoprStoreStatusReports(alloc, reports);
 
     for (report_store_ids.items, 0..) |store_id, i| {
         reports[i] = .{
@@ -2613,12 +2613,12 @@ fn reportHealthyStoreStatuses(
 ) !void {
     const alloc = node.cluster.alloc;
     const reports = try buildHealthyStoreStatusReports(node, group_statuses);
-    defer freeOwnedSimStoreStatusReports(alloc, reports);
+    defer freeOwnedVoprStoreStatusReports(alloc, reports);
     try std.testing.expectEqual(reports.len, try node.reportStoreStatuses(reports));
 }
 
-fn publishSimulatedRaftGroupStatus(
-    cluster: *MetadataHttpClusterSimulation,
+fn publishVoprRaftGroupStatus(
+    cluster: *MetadataHttpClusterVopr,
     proposer_index: usize,
     group_id: u64,
     retry_election: bool,
@@ -2761,7 +2761,7 @@ fn reportMergeCandidateStatuses(
 
 fn createActiveTableRanges(
     workflow: *metadata_table_workflow.TableWorkflow,
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     leader_index: usize,
     table: metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -2772,7 +2772,7 @@ fn createActiveTableRanges(
 
 fn createActiveTableRangesWithSummary(
     workflow: *metadata_table_workflow.TableWorkflow,
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     leader_index: usize,
     table: metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -2801,7 +2801,7 @@ const ProjectedTableField = enum {
 };
 
 fn waitForProjectedTablePresenceOnAllNodes(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     table_name: []const u8,
     max_rounds: usize,
 ) !bool {
@@ -2813,7 +2813,7 @@ const ProjectedTablePresenceProgressContext = struct {
     table_name: []const u8,
 };
 
-fn projectedTablePresenceProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn projectedTablePresenceProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *ProjectedTablePresenceProgressContext = @ptrCast(@alignCast(ptr));
     for (0..cluster.cluster.nodes.len) |i| {
         const node = cluster.node(i);
@@ -2834,7 +2834,7 @@ fn projectedTablePresenceProgressPredicate(cluster: *MetadataHttpClusterSimulati
 }
 
 fn projectedTableFieldContainsOnAllNodes(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     table_name: []const u8,
     field: ProjectedTableField,
     needle: []const u8,
@@ -2864,7 +2864,7 @@ fn projectedTableFieldContainsOnAllNodes(
 }
 
 fn waitForProjectedTableFieldContains(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     table_name: []const u8,
     field: ProjectedTableField,
     needle: []const u8,
@@ -2882,7 +2882,7 @@ fn waitForProjectedTableFieldContains(
 }
 
 fn waitForNodeProjectedTableFieldContains(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     node_index: usize,
     table_name: []const u8,
     field: ProjectedTableField,
@@ -2910,7 +2910,7 @@ const ProjectedTableFieldContainsProgressContext = struct {
     run_node_rounds: bool = false,
 };
 
-fn projectedTableFieldContainsProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn projectedTableFieldContainsProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *ProjectedTableFieldContainsProgressContext = @ptrCast(@alignCast(ptr));
     const matches = if (ctx.node_index) |node_index|
         try projectedTableFieldContainsOnNode(cluster, node_index, ctx.table_name, ctx.field, ctx.needle, ctx.expected_present)
@@ -2924,7 +2924,7 @@ fn projectedTableFieldContainsProgressPredicate(cluster: *MetadataHttpClusterSim
 }
 
 fn projectedTableFieldContainsOnNode(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     node_index: usize,
     table_name: []const u8,
     field: ProjectedTableField,
@@ -2950,7 +2950,7 @@ fn projectedTableFieldContainsOnNode(
     return (std.mem.indexOf(u8, haystack, needle) != null) == expected_present;
 }
 
-pub const SimMergeRuntime = struct {
+pub const VoprMergeRuntime = struct {
     const HostedLeaseContext = struct {
         alloc: std.mem.Allocator,
         lease: api_table_writes.HostedProvisionedTableWriteSource.GroupWriterLease,
@@ -3190,7 +3190,7 @@ pub const SimMergeRuntime = struct {
                 null;
             errdefer if (receiver_lease) |lease| lease.release();
 
-            var seed_runtime = SimSplitRuntime{
+            var seed_runtime = VoprSplitRuntime{
                 .replica_root_dir = donor_replica_root_dir,
                 .backend_runtime = self.donor_backend_runtime orelse self.backend_runtime,
             };
@@ -3264,8 +3264,8 @@ pub const SimMergeRuntime = struct {
     }
 };
 
-test "metadata sim merge runtime records doc identity reassignment opt-in" {
-    var sim = SimMergeRuntime{};
+test "metadata VOPR merge runtime records doc identity reassignment opt-in" {
+    var sim = VoprMergeRuntime{};
     var runtime = transition_runtime.TransitionRuntime{ .merge = sim.iface() };
 
     try runtime.execute(.{ .accept_merge_receiver = .{
@@ -3287,8 +3287,8 @@ const TestDescriptorFactory = struct {
     alloc: std.mem.Allocator,
     store: *raft_engine.core.MemoryStorage,
     peers: []const raft_engine.core.types.NodeId,
-    split_runtime: SimSplitRuntime = .{},
-    merge_runtime: SimMergeRuntime = .{},
+    split_runtime: VoprSplitRuntime = .{},
+    merge_runtime: VoprMergeRuntime = .{},
     group_stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
     primary_group_id: ?u64 = null,
     trace_group_id: ?u64 = null,
@@ -3367,7 +3367,7 @@ const TestDescriptorFactory = struct {
     }
 };
 
-fn makeHostSimConfig(
+fn makeHostVoprConfig(
     local_node_id: u64,
     metadata_group_id: u64,
     replica_root_dir: []const u8,
@@ -3391,20 +3391,20 @@ fn makeHostSimConfig(
     };
 }
 
-fn makeHostSimDeps(factory: *TestDescriptorFactory) raft_sim.ManagedHttpHostSimulationDeps {
-    return makeHostSimDepsWithTransportExecutor(factory, null);
+fn makeHostVoprDeps(factory: *TestDescriptorFactory) raft_sim.ManagedHttpHostSimulationDeps {
+    return makeHostVoprDepsWithTransportExecutor(factory, null);
 }
 
-fn makeHostSimDepsWithBorrowedIo(
+fn makeHostVoprDepsWithBorrowedIo(
     factory: *TestDescriptorFactory,
     io: std.Io,
 ) raft_sim.ManagedHttpHostSimulationDeps {
-    var deps = makeHostSimDeps(factory);
+    var deps = makeHostVoprDeps(factory);
     deps.borrowed_io = io;
     return deps;
 }
 
-fn makeHostSimDepsWithTransportExecutor(
+fn makeHostVoprDepsWithTransportExecutor(
     factory: *TestDescriptorFactory,
     request_executor: ?raft_transport.RequestExecutor,
 ) raft_sim.ManagedHttpHostSimulationDeps {
@@ -3488,39 +3488,39 @@ test "modeled DB configurator supplies stable physical-root incarnations" {
     try std.testing.expect(first.external_root_incarnation != rebound.external_root_incarnation);
 }
 
-pub const MetadataHttpNodeSimulation = struct {
-    cluster: *MetadataHttpClusterSimulation,
+pub const MetadataHttpNodeVopr = struct {
+    cluster: *MetadataHttpClusterVopr,
     index: usize,
 
-    fn sim(self: MetadataHttpNodeSimulation) *raft_sim.ManagedHttpHostSimulation {
+    fn sim(self: MetadataHttpNodeVopr) *raft_sim.ManagedHttpHostSimulation {
         return self.cluster.cluster.node(self.index);
     }
 
-    pub fn backendRuntime(self: MetadataHttpNodeSimulation) *db_mod.background_runtime.BackendRuntime {
+    pub fn backendRuntime(self: MetadataHttpNodeVopr) *db_mod.background_runtime.BackendRuntime {
         return self.cluster.backendRuntime(self.index);
     }
 
-    pub fn runRound(self: MetadataHttpNodeSimulation) !void {
+    pub fn runRound(self: MetadataHttpNodeVopr) !void {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
         _ = try self.sim().stepOnce();
         try self.cluster.refreshOwnedMetadataRuntimes(self.index);
     }
 
-    pub fn serviceMetrics(self: MetadataHttpNodeSimulation) @TypeOf(self.sim().serviceMetrics()) {
+    pub fn serviceMetrics(self: MetadataHttpNodeVopr) @TypeOf(self.sim().serviceMetrics()) {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
         return self.sim().serviceMetrics();
     }
 
     pub fn replaceTransitionOps(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         ops: raft_shard_ops.ShardOperationAdapter,
     ) !raft_shard_ops.OwnedShardOperationAdapter.Registration {
         return try self.sim().runtime.svc.replaceTransitionOps(ops);
     }
 
-    pub fn metadataStatus(self: MetadataHttpNodeSimulation) !metadata_service.MetadataStatus {
+    pub fn metadataStatus(self: MetadataHttpNodeVopr) !metadata_service.MetadataStatus {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
         return try metadata_service.snapshotStatus(
@@ -3531,20 +3531,20 @@ pub const MetadataHttpNodeSimulation = struct {
         );
     }
 
-    pub fn metadataIncarnation(self: MetadataHttpNodeSimulation) !?metadata_api.MetadataClusterIncarnation {
+    pub fn metadataIncarnation(self: MetadataHttpNodeVopr) !?metadata_api.MetadataClusterIncarnation {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse
             return error.MissingMetadataStore;
         return try store.getMetadataIncarnation(self.cluster.metadata_group_id);
     }
 
-    pub fn adminSnapshot(self: MetadataHttpNodeSimulation) !metadata_api.AdminSnapshot {
+    pub fn adminSnapshot(self: MetadataHttpNodeVopr) !metadata_api.AdminSnapshot {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
         return try metadata_api.captureSnapshot(self.cluster.alloc, self);
     }
 
     pub fn catalogRoutingSnapshot(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         deadline_ns: ?u64,
     ) !metadata_api.CatalogRoutingSnapshot {
         self.cluster.scheduler_gate.lock();
@@ -3571,7 +3571,7 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn freeCatalogRoutingSnapshot(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         snapshot: *metadata_api.CatalogRoutingSnapshot,
     ) void {
         for (snapshot.tables) |table| metadata_table_manager.freeTable(self.cluster.alloc, table);
@@ -3581,7 +3581,7 @@ pub const MetadataHttpNodeSimulation = struct {
         snapshot.* = undefined;
     }
 
-    pub fn medianKeyLookup(self: MetadataHttpNodeSimulation) ?metadata_reconciler.MedianKeyLookup {
+    pub fn medianKeyLookup(self: MetadataHttpNodeVopr) ?metadata_reconciler.MedianKeyLookup {
         return .{
             .ptr = self.cluster,
             .vtable = &.{
@@ -3591,7 +3591,7 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     fn fetchMedianKey(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
-        const cluster: *MetadataHttpClusterSimulation = @ptrCast(@alignCast(ptr));
+        const cluster: *MetadataHttpClusterVopr = @ptrCast(@alignCast(ptr));
         const preferred_index = currentGroupLeaderIndex(cluster, group_id);
         if (preferred_index) |index| {
             if (try fetchMedianKeyFromReplica(cluster, alloc, index, group_id)) |median| return median;
@@ -3605,7 +3605,7 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     fn fetchMedianKeyFromReplica(
-        cluster: *MetadataHttpClusterSimulation,
+        cluster: *MetadataHttpClusterVopr,
         alloc: std.mem.Allocator,
         node_index: usize,
         group_id: u64,
@@ -3629,26 +3629,26 @@ pub const MetadataHttpNodeSimulation = struct {
         };
     }
 
-    pub fn reconcileLeaseStats(self: MetadataHttpNodeSimulation) metadata_reconcile_lease.Stats {
+    pub fn reconcileLeaseStats(self: MetadataHttpNodeVopr) metadata_reconcile_lease.Stats {
         return self.cluster.reconcile_leases[self.index].stats();
     }
 
-    pub fn getProjectedReconcileLease(self: MetadataHttpNodeSimulation) !?metadata_reconcile_lease.ReconcileLeaseRecord {
+    pub fn getProjectedReconcileLease(self: MetadataHttpNodeVopr) !?metadata_reconcile_lease.ReconcileLeaseRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.getReconcileLease(self.cluster.metadata_group_id);
     }
 
-    pub fn freeAdminSnapshot(self: MetadataHttpNodeSimulation, snapshot: *metadata_api.AdminSnapshot) void {
+    pub fn freeAdminSnapshot(self: MetadataHttpNodeVopr, snapshot: *metadata_api.AdminSnapshot) void {
         metadata_api.freeSnapshot(self.cluster.alloc, self, snapshot);
     }
 
-    pub fn status(self: MetadataHttpNodeSimulation, group_id: u64) raft_host.HostedReplicaStatus {
+    pub fn status(self: MetadataHttpNodeVopr, group_id: u64) raft_host.HostedReplicaStatus {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
         return self.sim().status(group_id);
     }
 
-    pub fn campaignMetadataGroup(self: MetadataHttpNodeSimulation) !void {
+    pub fn campaignMetadataGroup(self: MetadataHttpNodeVopr) !void {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
         if (self.sim().raftStatus(self.cluster.metadata_group_id)) |raft_status| {
@@ -3657,91 +3657,91 @@ pub const MetadataHttpNodeSimulation = struct {
         try self.sim().campaignGroup(self.cluster.metadata_group_id);
     }
 
-    pub fn campaignGroup(self: MetadataHttpNodeSimulation, group_id: u64) !void {
+    pub fn campaignGroup(self: MetadataHttpNodeVopr, group_id: u64) !void {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
         try self.sim().campaignGroup(group_id);
     }
 
-    pub fn listProjectedTables(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
+    pub fn listProjectedTables(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listTables(alloc, self.cluster.metadata_group_id);
     }
 
-    pub fn freeProjectedTables(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
+    pub fn freeProjectedTables(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
         store.freeTables(alloc, records);
     }
 
-    pub fn listProjectedRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+    pub fn listProjectedRanges(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listRanges(alloc, self.cluster.metadata_group_id);
     }
 
-    pub fn freeProjectedRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
+    pub fn freeProjectedRanges(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
         store.freeRanges(alloc, records);
     }
 
-    pub fn listProjectedPlacementIntents(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+    pub fn listProjectedPlacementIntents(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listPlacementIntents(alloc, self.cluster.metadata_group_id);
     }
 
     pub fn listProjectedPlacementVersionFences(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         alloc: std.mem.Allocator,
     ) ![]metadata_reconciler.PlacementVersionFence {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listPlacementVersionFences(alloc, self.cluster.metadata_group_id);
     }
 
-    pub fn listProjectedNodes(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
+    pub fn listProjectedNodes(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator) ![]metadata_table_manager.NodeRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listNodes(alloc, self.cluster.metadata_group_id);
     }
 
-    pub fn freeProjectedNodes(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []metadata_table_manager.NodeRecord) void {
+    pub fn freeProjectedNodes(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator, records: []metadata_table_manager.NodeRecord) void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
         store.freeNodes(alloc, records);
     }
 
-    pub fn listProjectedStores(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.StoreRecord {
+    pub fn listProjectedStores(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator) ![]metadata_table_manager.StoreRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listStores(alloc, self.cluster.metadata_group_id);
     }
 
-    pub fn freeProjectedStores(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []metadata_table_manager.StoreRecord) void {
+    pub fn freeProjectedStores(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator, records: []metadata_table_manager.StoreRecord) void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
         store.freeStores(alloc, records);
     }
 
-    pub fn freeProjectedPlacementIntents(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+    pub fn freeProjectedPlacementIntents(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
         store.freePlacementIntents(alloc, intents);
     }
 
-    pub fn listProjectedSplitTransitions(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]transition_state.SplitTransitionRecord {
+    pub fn listProjectedSplitTransitions(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator) ![]transition_state.SplitTransitionRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listSplitTransitions(alloc, self.cluster.metadata_group_id);
     }
 
-    pub fn freeProjectedSplitTransitions(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []transition_state.SplitTransitionRecord) void {
+    pub fn freeProjectedSplitTransitions(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator, records: []transition_state.SplitTransitionRecord) void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
         store.freeSplitTransitions(alloc, records);
     }
 
-    pub fn listProjectedMergeTransitions(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]transition_state.MergeTransitionRecord {
+    pub fn listProjectedMergeTransitions(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator) ![]transition_state.MergeTransitionRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listMergeTransitions(alloc, self.cluster.metadata_group_id);
     }
 
-    pub fn freeProjectedMergeTransitions(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []transition_state.MergeTransitionRecord) void {
+    pub fn freeProjectedMergeTransitions(self: MetadataHttpNodeVopr, alloc: std.mem.Allocator, records: []transition_state.MergeTransitionRecord) void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
         store.freeMergeTransitions(alloc, records);
     }
 
-    pub fn observeSplitTransition(self: MetadataHttpNodeSimulation, transition_id: u64) !?transition_state.SplitObservation {
+    pub fn observeSplitTransition(self: MetadataHttpNodeVopr, transition_id: u64) !?transition_state.SplitObservation {
         if (try self.sim().observeSplitTransition(transition_id)) |observation| return observation;
         if (self.cluster.currentMetadataLeaseHolderIndex()) |lease_holder_index| {
             if (lease_holder_index != self.index) {
@@ -3756,7 +3756,7 @@ pub const MetadataHttpNodeSimulation = struct {
         return null;
     }
 
-    pub fn observeMergeTransition(self: MetadataHttpNodeSimulation, transition_id: u64) !?transition_state.MergeObservation {
+    pub fn observeMergeTransition(self: MetadataHttpNodeVopr, transition_id: u64) !?transition_state.MergeObservation {
         if (try self.sim().observeMergeTransition(transition_id)) |observation| return observation;
         if (self.cluster.currentMetadataLeaseHolderIndex()) |lease_holder_index| {
             if (lease_holder_index != self.index) {
@@ -3771,12 +3771,12 @@ pub const MetadataHttpNodeSimulation = struct {
         return null;
     }
 
-    pub fn proposeTransitionCommand(self: MetadataHttpNodeSimulation, command: metadata_storage.TransitionCommand) anyerror!void {
+    pub fn proposeTransitionCommand(self: MetadataHttpNodeVopr, command: metadata_storage.TransitionCommand) anyerror!void {
         return try self.proposeTransitionCommands(&.{command});
     }
 
     pub fn upsertReplicaIntent(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         intent: raft_reconciler.PlacementIntent,
         expected_metadata_version: ?u64,
         expected_version_fence: u64,
@@ -3790,47 +3790,47 @@ pub const MetadataHttpNodeSimulation = struct {
         } });
     }
 
-    pub fn upsertNode(self: MetadataHttpNodeSimulation, record: metadata_table_manager.NodeRecord) !void {
+    pub fn upsertNode(self: MetadataHttpNodeVopr, record: metadata_table_manager.NodeRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_node = record });
     }
 
-    pub fn registerNode(self: MetadataHttpNodeSimulation, record: metadata_table_manager.NodeRecord) !void {
+    pub fn registerNode(self: MetadataHttpNodeVopr, record: metadata_table_manager.NodeRecord) !void {
         try self.proposeTransitionCommand(.{ .register_node = record });
     }
 
-    pub fn requestNodeShutdown(self: MetadataHttpNodeSimulation, node_id: u64) !void {
+    pub fn requestNodeShutdown(self: MetadataHttpNodeVopr, node_id: u64) !void {
         try self.proposeTransitionCommand(.{ .request_node_shutdown = .{ .node_id = node_id } });
     }
 
-    pub fn cancelNodeShutdown(self: MetadataHttpNodeSimulation, node_id: u64) !void {
+    pub fn cancelNodeShutdown(self: MetadataHttpNodeVopr, node_id: u64) !void {
         try self.proposeTransitionCommand(.{ .cancel_node_shutdown = .{ .node_id = node_id } });
     }
 
-    pub fn finalizeNodeShutdown(self: MetadataHttpNodeSimulation, node_id: u64) !void {
+    pub fn finalizeNodeShutdown(self: MetadataHttpNodeVopr, node_id: u64) !void {
         try self.proposeTransitionCommand(.{ .finalize_node_shutdown = .{ .node_id = node_id } });
     }
 
-    pub fn removeNode(self: MetadataHttpNodeSimulation, node_id: u64) !void {
+    pub fn removeNode(self: MetadataHttpNodeVopr, node_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_node = .{ .node_id = node_id } });
     }
 
-    pub fn upsertStore(self: MetadataHttpNodeSimulation, record: metadata_table_manager.StoreRecord) !void {
+    pub fn upsertStore(self: MetadataHttpNodeVopr, record: metadata_table_manager.StoreRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
-    pub fn registerStore(self: MetadataHttpNodeSimulation, record: metadata_table_manager.StoreRecord) !void {
+    pub fn registerStore(self: MetadataHttpNodeVopr, record: metadata_table_manager.StoreRecord) !void {
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
-    pub fn reportStoreStatus(self: MetadataHttpNodeSimulation, report: metadata_table_manager.StoreStatusReport) !void {
+    pub fn reportStoreStatus(self: MetadataHttpNodeVopr, report: metadata_table_manager.StoreStatusReport) !void {
         _ = try self.reportStoreStatuses(&.{report});
     }
 
-    pub fn upsertSchemaProgress(self: MetadataHttpNodeSimulation, record: metadata_table_manager.SchemaProgressRecord) !void {
+    pub fn upsertSchemaProgress(self: MetadataHttpNodeVopr, record: metadata_table_manager.SchemaProgressRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_schema_progress = record });
     }
 
-    pub fn reportStoreStatuses(self: MetadataHttpNodeSimulation, reports: []const metadata_table_manager.StoreStatusReport) !usize {
+    pub fn reportStoreStatuses(self: MetadataHttpNodeVopr, reports: []const metadata_table_manager.StoreStatusReport) !usize {
         const projected = try self.listProjectedStores(self.cluster.alloc);
         defer self.freeProjectedStores(self.cluster.alloc, projected);
 
@@ -3847,11 +3847,11 @@ pub const MetadataHttpNodeSimulation = struct {
         return applied;
     }
 
-    pub fn removeStore(self: MetadataHttpNodeSimulation, store_id: u64) !void {
+    pub fn removeStore(self: MetadataHttpNodeVopr, store_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_store = .{ .store_id = store_id } });
     }
 
-    pub fn removeReplicaIntent(self: MetadataHttpNodeSimulation, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
+    pub fn removeReplicaIntent(self: MetadataHttpNodeVopr, group_id: u64, local_node_id: u64, expected_metadata_version: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_replica_intent = .{
             .group_id = group_id,
             .local_node_id = local_node_id,
@@ -3859,7 +3859,7 @@ pub const MetadataHttpNodeSimulation = struct {
         } });
     }
 
-    pub fn upsertTable(self: MetadataHttpNodeSimulation, record: metadata_table_manager.TableRecord) !void {
+    pub fn upsertTable(self: MetadataHttpNodeVopr, record: metadata_table_manager.TableRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
@@ -3867,14 +3867,14 @@ pub const MetadataHttpNodeSimulation = struct {
     /// command used by the production service. Deployment-shaped VOPR tests
     /// use these methods instead of maintaining a shadow status ledger.
     pub fn upsertReplicationSourceStatus(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         record: metadata_table_manager.ReplicationSourceStatusRecord,
     ) !void {
         try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
     }
 
     pub fn claimReplicationSourceCutoverDurable(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         expected_replication_sources_json: []const u8,
         expected_authority_id: u64,
         record: metadata_table_manager.ReplicationSourceStatusRecord,
@@ -3909,7 +3909,7 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn replicationSourceAuthorityCurrent(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         expected_replication_sources_json: []const u8,
         expected: metadata_table_manager.ReplicationSourceStatusRecord,
     ) !void {
@@ -3938,7 +3938,7 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn completeReplicationSourceCutoverRetirementDurable(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         expected: metadata_table_manager.ReplicationSourceStatusRecord,
     ) !void {
         try self.proposeTransitionCommand(.{
@@ -3961,7 +3961,7 @@ pub const MetadataHttpNodeSimulation = struct {
     }
 
     pub fn replaceTableDefinition(
-        self: MetadataHttpNodeSimulation,
+        self: MetadataHttpNodeVopr,
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !void {
@@ -4007,7 +4007,7 @@ pub const MetadataHttpNodeSimulation = struct {
         return error.MetadataMutationApplyTimeout;
     }
 
-    pub fn removeTable(self: MetadataHttpNodeSimulation, table_id: u64) !void {
+    pub fn removeTable(self: MetadataHttpNodeVopr, table_id: u64) !void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse
             return error.MissingMetadataStore;
         const fence = try store.getTableTransitionFence(
@@ -4021,39 +4021,39 @@ pub const MetadataHttpNodeSimulation = struct {
         } });
     }
 
-    pub fn upsertRange(self: MetadataHttpNodeSimulation, record: metadata_table_manager.RangeRecord) !void {
+    pub fn upsertRange(self: MetadataHttpNodeVopr, record: metadata_table_manager.RangeRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_range = record });
     }
 
-    pub fn removeRange(self: MetadataHttpNodeSimulation, group_id: u64) !void {
+    pub fn removeRange(self: MetadataHttpNodeVopr, group_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_range = .{ .group_id = group_id } });
     }
 
-    pub fn upsertSplitTransition(self: MetadataHttpNodeSimulation, record: transition_state.SplitTransitionRecord) !void {
+    pub fn upsertSplitTransition(self: MetadataHttpNodeVopr, record: transition_state.SplitTransitionRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_split_transition = record });
     }
 
-    pub fn removeSplitTransition(self: MetadataHttpNodeSimulation, transition_id: u64) !void {
+    pub fn removeSplitTransition(self: MetadataHttpNodeVopr, transition_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_split_transition = .{ .transition_id = transition_id } });
     }
 
-    pub fn upsertMergeTransition(self: MetadataHttpNodeSimulation, record: transition_state.MergeTransitionRecord) !void {
+    pub fn upsertMergeTransition(self: MetadataHttpNodeVopr, record: transition_state.MergeTransitionRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_merge_transition = record });
     }
 
-    pub fn removeMergeTransition(self: MetadataHttpNodeSimulation, transition_id: u64) !void {
+    pub fn removeMergeTransition(self: MetadataHttpNodeVopr, transition_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_merge_transition = .{ .transition_id = transition_id } });
     }
 
-    pub fn upsertReconcileLease(self: MetadataHttpNodeSimulation, record: metadata_reconcile_lease.ReconcileLeaseRecord) anyerror!void {
+    pub fn upsertReconcileLease(self: MetadataHttpNodeVopr, record: metadata_reconcile_lease.ReconcileLeaseRecord) anyerror!void {
         try self.proposeTransitionCommand(.{ .upsert_reconcile_lease = record });
     }
 
-    pub fn removeReconcileLease(self: MetadataHttpNodeSimulation) !void {
+    pub fn removeReconcileLease(self: MetadataHttpNodeVopr) !void {
         try self.proposeTransitionCommand(.{ .remove_reconcile_lease = .{} });
     }
 
-    pub fn requestReallocation(self: MetadataHttpNodeSimulation, requested_at_ms: u64) !void {
+    pub fn requestReallocation(self: MetadataHttpNodeVopr, requested_at_ms: u64) !void {
         const request_id = self.cluster.next_reallocation_request_id;
         self.cluster.next_reallocation_request_id +|= 1;
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
@@ -4062,13 +4062,13 @@ pub const MetadataHttpNodeSimulation = struct {
         } });
     }
 
-    pub fn clearReallocationRequest(self: MetadataHttpNodeSimulation, expected_request_id: u128) !void {
+    pub fn clearReallocationRequest(self: MetadataHttpNodeVopr, expected_request_id: u128) !void {
         try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{
             .expected_request_id = expected_request_id,
         } });
     }
 
-    pub fn applyReconciliationPlan(self: MetadataHttpNodeSimulation, plan: *const metadata_reconciler.ReconciliationPlan) !void {
+    pub fn applyReconciliationPlan(self: MetadataHttpNodeVopr, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         const projected_intents = try self.listProjectedPlacementIntents(self.cluster.alloc);
         defer self.freeProjectedPlacementIntents(self.cluster.alloc, projected_intents);
 
@@ -4124,16 +4124,16 @@ pub const MetadataHttpNodeSimulation = struct {
         try self.proposeTransitionCommands(commands.items);
     }
 
-    pub fn getProjectedReallocationRequest(self: MetadataHttpNodeSimulation) !?metadata_mod.ReallocationRequestRecord {
+    pub fn getProjectedReallocationRequest(self: MetadataHttpNodeVopr) !?metadata_mod.ReallocationRequestRecord {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.getReallocationRequest(self.cluster.metadata_group_id);
     }
 
-    pub fn reconcileOnce(self: MetadataHttpNodeSimulation, loop: *metadata_control_loop.MetadataControlLoop) !metadata_control_loop.ReconcileSummary {
+    pub fn reconcileOnce(self: MetadataHttpNodeVopr, loop: *metadata_control_loop.MetadataControlLoop) !metadata_control_loop.ReconcileSummary {
         return try loop.reconcileOnce(self);
     }
 
-    fn proposeTransitionCommands(self: MetadataHttpNodeSimulation, commands: []const metadata_storage.TransitionCommand) anyerror!void {
+    fn proposeTransitionCommands(self: MetadataHttpNodeVopr, commands: []const metadata_storage.TransitionCommand) anyerror!void {
         if (commands.len == 0) return;
 
         self.cluster.scheduler_gate.lock();
@@ -4160,7 +4160,7 @@ pub const MetadataHttpNodeSimulation = struct {
 
         for (commands) |command| {
             const encoded = metadata_storage.encodeTransitionCommand(self.cluster.alloc, command) catch |err|
-                return simulationMutationError(err, operation_may_have_been_admitted);
+                return voprMutationError(err, operation_may_have_been_admitted);
             defer self.cluster.alloc.free(encoded);
 
             var attempts: usize = 0;
@@ -4176,11 +4176,11 @@ pub const MetadataHttpNodeSimulation = struct {
                     // different replicas.
                     self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
                         error.UnknownGroup => {},
-                        else => return simulationMutationError(err, operation_may_have_been_admitted),
+                        else => return voprMutationError(err, operation_may_have_been_admitted),
                     };
                     for (0..16) |_| {
                         self.cluster.stepAll() catch |err|
-                            return simulationMutationError(err, operation_may_have_been_admitted);
+                            return voprMutationError(err, operation_may_have_been_admitted);
                         if (self.cluster.currentMetadataLeaderIndex() != null) continue :command_retry;
                     }
                     continue;
@@ -4188,17 +4188,17 @@ pub const MetadataHttpNodeSimulation = struct {
 
                 const leader_status = self.cluster.cluster.node(target_index).raftStatus(self.cluster.metadata_group_id) orelse {
                     self.cluster.stepAll() catch |err|
-                        return simulationMutationError(err, operation_may_have_been_admitted);
+                        return voprMutationError(err, operation_may_have_been_admitted);
                     continue;
                 };
                 const proposal_index = leader_status.last_index + 1;
                 self.cluster.node(target_index).sim().propose(self.cluster.metadata_group_id, encoded) catch |err| switch (err) {
                     error.NotLeader => {
                         self.cluster.stepAll() catch |step_err|
-                            return simulationMutationError(step_err, operation_may_have_been_admitted);
+                            return voprMutationError(step_err, operation_may_have_been_admitted);
                         continue;
                     },
-                    else => return simulationMutationError(err, operation_may_have_been_admitted),
+                    else => return voprMutationError(err, operation_may_have_been_admitted),
                 };
                 operation_may_have_been_admitted = true;
 
@@ -4208,13 +4208,13 @@ pub const MetadataHttpNodeSimulation = struct {
                 // that is subsequently overwritten.
                 for (0..16) |_| {
                     self.cluster.stepAll() catch |err|
-                        return simulationMutationError(err, operation_may_have_been_admitted);
+                        return voprMutationError(err, operation_may_have_been_admitted);
                     const raft_status = self.cluster.cluster.node(target_index).raftStatus(self.cluster.metadata_group_id) orelse break;
                     if (raft_status.soft.role != .leader or raft_status.hard.current_term != leader_status.hard.current_term) break;
                     if (raft_status.hard.commit_index >= proposal_index and raft_status.applied_index >= proposal_index) {
                         if (self.cluster.metadata_proposal_post_apply_failure) |post_apply_failure| {
                             self.cluster.metadata_proposal_post_apply_failure = null;
-                            return simulationMutationError(post_apply_failure, operation_may_have_been_admitted);
+                            return voprMutationError(post_apply_failure, operation_may_have_been_admitted);
                         }
                         break :command_retry;
                     }
@@ -4230,7 +4230,7 @@ pub const MetadataHttpNodeSimulation = struct {
                         std.debug.print("metadata proposal exhausted node={d} status=absent\n", .{index});
                     }
                 }
-                return simulationMutationError(error.NotLeader, operation_may_have_been_admitted);
+                return voprMutationError(error.NotLeader, operation_may_have_been_admitted);
             }
         }
 
@@ -4241,11 +4241,11 @@ pub const MetadataHttpNodeSimulation = struct {
         var rounds: usize = 0;
         while (rounds < settle_rounds) : (rounds += 1) {
             self.cluster.stepAll() catch |err|
-                return simulationMutationError(err, operation_may_have_been_admitted);
+                return voprMutationError(err, operation_may_have_been_admitted);
         }
     }
 
-    fn simulationMutationError(err: anyerror, operation_may_have_been_admitted: bool) anyerror {
+    fn voprMutationError(err: anyerror, operation_may_have_been_admitted: bool) anyerror {
         if (!operation_may_have_been_admitted) return err;
         std.log.warn(
             "simulated metadata mutation outcome became ambiguous after admission err={s}",
@@ -4262,7 +4262,7 @@ pub const MetadataHttpNodeSimulation = struct {
         return true;
     }
 
-    pub fn reconcileOnceIfLeaseHeld(self: MetadataHttpNodeSimulation, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
+    pub fn reconcileOnceIfLeaseHeld(self: MetadataHttpNodeVopr, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
         if (!self.cluster.reconcile_leases[self.index].stats().held_by_local) return null;
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
@@ -4273,7 +4273,7 @@ pub const MetadataHttpNodeSimulation = struct {
         return null;
     }
 
-    pub fn reconcileOnceEnsuringLease(self: MetadataHttpNodeSimulation, loop: *metadata_control_loop.MetadataControlLoop) !metadata_control_loop.ReconcileSummary {
+    pub fn reconcileOnceEnsuringLease(self: MetadataHttpNodeVopr, loop: *metadata_control_loop.MetadataControlLoop) !metadata_control_loop.ReconcileSummary {
         const target = currentMetadataMutationNode(self);
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
@@ -4351,7 +4351,7 @@ const MetadataMergeTransitionFinalizedProgressContext = struct {
 /// allowing the scheduler's reconcile path to advance itself recursively on
 /// the same OS thread. A plain mutex cannot be used here: `stepAll` may renew a
 /// reconcile lease, whose proposal waits for another scheduler round.
-const SimulationSchedulerGate = struct {
+const VoprSchedulerGate = struct {
     mutex: std.Io.Mutex = .init,
     owner_thread_id: std.atomic.Value(u64) = .init(0),
     owner_valid: std.atomic.Value(bool) = .init(false),
@@ -4392,7 +4392,7 @@ const SimulationSchedulerGate = struct {
     }
 };
 
-pub const MetadataHttpClusterSimulation = struct {
+pub const MetadataHttpClusterVopr = struct {
     pub const DataPlaneOwnership = enum {
         /// Metadata and data replicas are co-located in the managed-host
         /// simulation. This remains the default for focused metadata tests.
@@ -4420,7 +4420,7 @@ pub const MetadataHttpClusterSimulation = struct {
     backend_runtimes: []db_mod.background_runtime.BackendRuntimeHandle,
     linearizable_read_drivers: []PublicApiLinearizableReadDriver,
     manual_clock: *platform_clock.ManualClock,
-    scheduler_gate: SimulationSchedulerGate = .{},
+    scheduler_gate: VoprSchedulerGate = .{},
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
     metadata_leader_recovery_in_flight: std.atomic.Value(bool) = .init(false),
@@ -4428,7 +4428,7 @@ pub const MetadataHttpClusterSimulation = struct {
     next_reallocation_request_id: u128 = 1,
     data_plane_ownership: DataPlaneOwnership = .co_located,
 
-    pub const ProgressPredicate = *const fn (*MetadataHttpClusterSimulation, *anyopaque) anyerror!bool;
+    pub const ProgressPredicate = *const fn (*MetadataHttpClusterVopr, *anyopaque) anyerror!bool;
     const min_pending_reconcile_lease_retry_ms: u64 = 250;
     const pending_cluster_publish_retry_ms: u64 = 250;
 
@@ -4437,7 +4437,7 @@ pub const MetadataHttpClusterSimulation = struct {
         metadata_group_id: u64,
         configs: []const raft_sim.ManagedHttpHostSimulationConfig,
         deps: []const raft_sim.ManagedHttpHostSimulationDeps,
-    ) !MetadataHttpClusterSimulation {
+    ) !MetadataHttpClusterVopr {
         const manual_clock = try alloc.create(platform_clock.ManualClock);
         errdefer alloc.destroy(manual_clock);
         manual_clock.* = .{};
@@ -4553,18 +4553,18 @@ pub const MetadataHttpClusterSimulation = struct {
         }
         const linearizable_read_drivers = try alloc.alloc(PublicApiLinearizableReadDriver, configs.len);
         errdefer alloc.free(linearizable_read_drivers);
-        const simulation_deps = try alloc.dupe(raft_sim.ManagedHttpHostSimulationDeps, deps);
-        defer alloc.free(simulation_deps);
-        for (simulation_deps, linearizable_read_drivers, 0..) |*dep, *driver, index| {
+        const vopr_deps = try alloc.dupe(raft_sim.ManagedHttpHostSimulationDeps, deps);
+        defer alloc.free(vopr_deps);
+        for (vopr_deps, linearizable_read_drivers, 0..) |*dep, *driver, index| {
             driver.* = .{
                 .node_index = index,
                 .downstream = dep.host.read_state_observer,
             };
             dep.host.read_state_observer = driver.observer();
         }
-        var raft_cluster = try raft_sim.ManagedHttpClusterSimulation.init(alloc, configs, simulation_deps);
+        var raft_cluster = try raft_sim.ManagedHttpClusterSimulation.init(alloc, configs, vopr_deps);
         errdefer raft_cluster.deinit();
-        var cluster = MetadataHttpClusterSimulation{
+        var cluster = MetadataHttpClusterVopr{
             .alloc = alloc,
             .metadata_group_id = metadata_group_id,
             .virtual_network = raft_cluster.network,
@@ -4589,7 +4589,7 @@ pub const MetadataHttpClusterSimulation = struct {
         return cluster;
     }
 
-    pub fn deinit(self: *MetadataHttpClusterSimulation) void {
+    pub fn deinit(self: *MetadataHttpClusterVopr) void {
         self.cluster.deinit();
         self.alloc.free(self.reconcile_leases);
         self.alloc.free(self.pending_reconcile_leases);
@@ -4607,7 +4607,7 @@ pub const MetadataHttpClusterSimulation = struct {
         self.* = undefined;
     }
 
-    pub fn startAll(self: *MetadataHttpClusterSimulation) !void {
+    pub fn startAll(self: *MetadataHttpClusterVopr) !void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
         for (self.linearizable_read_drivers) |*driver| driver.cluster = self;
@@ -4618,7 +4618,7 @@ pub const MetadataHttpClusterSimulation = struct {
     /// any data placement when composing production DataServers with the real
     /// metadata quorum.
     pub fn setDataPlaneOwnership(
-        self: *MetadataHttpClusterSimulation,
+        self: *MetadataHttpClusterVopr,
         ownership: DataPlaneOwnership,
     ) void {
         if (ownership == .external and self.data_plane_ownership != .external) {
@@ -4629,13 +4629,13 @@ pub const MetadataHttpClusterSimulation = struct {
         @memset(self.placement_intent_hash_valid, false);
     }
 
-    pub fn stopAll(self: *MetadataHttpClusterSimulation) void {
+    pub fn stopAll(self: *MetadataHttpClusterVopr) void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
         self.cluster.stopAll();
     }
 
-    pub fn node(self: *MetadataHttpClusterSimulation, index: usize) MetadataHttpNodeSimulation {
+    pub fn node(self: *MetadataHttpClusterVopr, index: usize) MetadataHttpNodeVopr {
         return .{ .cluster = self, .index = index };
     }
 
@@ -4644,7 +4644,7 @@ pub const MetadataHttpClusterSimulation = struct {
     /// than every observed candidate; otherwise a lagging replica that ticks
     /// first can repeatedly consume the shared next term without ever being
     /// eligible for an up-to-date quorum's votes.
-    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterSimulation) !void {
+    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterVopr) !void {
         const candidate_index = bestMetadataElectionCandidateIndex(self) orelse
             return error.UnknownGroup;
         var max_observed_term: u64 = 0;
@@ -4661,11 +4661,11 @@ pub const MetadataHttpClusterSimulation = struct {
         return error.MetadataElectionTermDidNotAdvance;
     }
 
-    pub fn backendRuntime(self: *MetadataHttpClusterSimulation, index: usize) *db_mod.background_runtime.BackendRuntime {
+    pub fn backendRuntime(self: *MetadataHttpClusterVopr, index: usize) *db_mod.background_runtime.BackendRuntime {
         return self.backend_runtimes[index].ptr();
     }
 
-    pub fn stepAll(self: *MetadataHttpClusterSimulation) anyerror!void {
+    pub fn stepAll(self: *MetadataHttpClusterVopr) anyerror!void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
         self.manual_clock.advanceMs(100);
@@ -4686,19 +4686,19 @@ pub const MetadataHttpClusterSimulation = struct {
 
     /// One atomic node round for the VOPR scheduler. Network delivery and time
     /// advancement are intentionally separate transitions.
-    pub fn stepNode(self: *MetadataHttpClusterSimulation, index: usize) anyerror!void {
+    pub fn stepNode(self: *MetadataHttpClusterVopr, index: usize) anyerror!void {
         if (index >= self.cluster.nodes.len) return error.InvalidNodeIndex;
         try self.refreshOwnedMetadataRuntimes(index);
         _ = try self.cluster.node(index).stepOnce();
         try self.refreshOwnedMetadataRuntimes(index);
     }
 
-    pub fn advanceSimTime(self: *MetadataHttpClusterSimulation, ticks: u64) void {
+    pub fn advanceVoprTime(self: *MetadataHttpClusterVopr, ticks: u64) void {
         self.manual_clock.advanceMs(ticks *| 100);
         self.virtual_network.advanceClockTicks(ticks);
     }
 
-    pub fn stepAllExcept(self: *MetadataHttpClusterSimulation, stalled_index: usize) anyerror!void {
+    pub fn stepAllExcept(self: *MetadataHttpClusterVopr, stalled_index: usize) anyerror!void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
         std.debug.assert(stalled_index < self.cluster.nodes.len);
@@ -4722,7 +4722,7 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn runUntil(
-        self: *MetadataHttpClusterSimulation,
+        self: *MetadataHttpClusterVopr,
         max_rounds: usize,
         context: *anyopaque,
         predicate: ProgressPredicate,
@@ -4736,18 +4736,18 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn assertProgress(
-        self: *MetadataHttpClusterSimulation,
+        self: *MetadataHttpClusterVopr,
         label: []const u8,
         max_rounds: usize,
         context: *anyopaque,
         predicate: ProgressPredicate,
     ) !void {
         if (try self.runUntil(max_rounds, context, predicate)) return;
-        std.debug.print("metadata cluster sim progress timeout label={s} rounds={d}\n", .{ label, max_rounds });
-        return error.SimulationProgressTimeout;
+        std.debug.print("metadata cluster VOPR progress timeout label={s} rounds={d}\n", .{ label, max_rounds });
+        return error.VoprProgressTimeout;
     }
 
-    pub fn restartNode(self: *MetadataHttpClusterSimulation, index: usize) !void {
+    pub fn restartNode(self: *MetadataHttpClusterVopr, index: usize) !void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
         const was_started = self.cluster.started;
@@ -4769,31 +4769,31 @@ pub const MetadataHttpClusterSimulation = struct {
         if (was_started) try self.cluster.node(index).start();
     }
 
-    pub fn waitForMetadataLeader(self: *MetadataHttpClusterSimulation, max_rounds: usize) !?usize {
+    pub fn waitForMetadataLeader(self: *MetadataHttpClusterVopr, max_rounds: usize) !?usize {
         var ctx = MetadataLeaderProgressContext{};
         if (try self.runUntil(max_rounds, &ctx, metadataLeaderProgressPredicate)) return ctx.index;
         return null;
     }
 
-    pub fn currentMetadataLeaderIndex(self: *MetadataHttpClusterSimulation) ?usize {
+    pub fn currentMetadataLeaderIndex(self: *MetadataHttpClusterVopr) ?usize {
         return bestMetadataLeaderIndex(self);
     }
 
-    fn currentMetadataLeaseHolderIndex(self: *MetadataHttpClusterSimulation) ?usize {
+    fn currentMetadataLeaseHolderIndex(self: *MetadataHttpClusterVopr) ?usize {
         for (self.reconcile_leases, 0..) |lease, index| {
             if (lease.stats().held_by_local) return index;
         }
         return null;
     }
 
-    fn firstMetadataReplicaIndex(self: *MetadataHttpClusterSimulation) ?usize {
+    fn firstMetadataReplicaIndex(self: *MetadataHttpClusterVopr) ?usize {
         for (self.cluster.nodes, 0..) |*sim, index| {
             if (sim.raftStatus(self.metadata_group_id) != null) return index;
         }
         return null;
     }
 
-    pub fn waitForGroupStatus(self: *MetadataHttpClusterSimulation, group_id: u64, desired: raft_host.HostedReplicaStatus, max_rounds: usize) !bool {
+    pub fn waitForGroupStatus(self: *MetadataHttpClusterVopr, group_id: u64, desired: raft_host.HostedReplicaStatus, max_rounds: usize) !bool {
         var ctx = MetadataGroupStatusProgressContext{
             .group_id = group_id,
             .desired = desired,
@@ -4802,7 +4802,7 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn waitForNodeGroupStatus(
-        self: *MetadataHttpClusterSimulation,
+        self: *MetadataHttpClusterVopr,
         index: usize,
         group_id: u64,
         desired: raft_host.HostedReplicaStatus,
@@ -4816,7 +4816,7 @@ pub const MetadataHttpClusterSimulation = struct {
         return try self.runUntil(max_rounds, &ctx, metadataNodeGroupStatusProgressPredicate);
     }
 
-    pub fn countGroupStatus(self: *MetadataHttpClusterSimulation, group_id: u64, desired: raft_host.HostedReplicaStatus) usize {
+    pub fn countGroupStatus(self: *MetadataHttpClusterVopr, group_id: u64, desired: raft_host.HostedReplicaStatus) usize {
         var count: usize = 0;
         for (self.cluster.nodes) |*sim| {
             if (sim.status(group_id) == desired) count += 1;
@@ -4825,7 +4825,7 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn waitForGroupStatusCount(
-        self: *MetadataHttpClusterSimulation,
+        self: *MetadataHttpClusterVopr,
         group_id: u64,
         desired: raft_host.HostedReplicaStatus,
         expected_count: usize,
@@ -4840,7 +4840,7 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     pub fn waitForGroupStatusCountAtLeast(
-        self: *MetadataHttpClusterSimulation,
+        self: *MetadataHttpClusterVopr,
         group_id: u64,
         desired: raft_host.HostedReplicaStatus,
         minimum_count: usize,
@@ -4854,7 +4854,7 @@ pub const MetadataHttpClusterSimulation = struct {
         return try self.runUntil(max_rounds, &ctx, metadataGroupStatusMinimumProgressPredicate);
     }
 
-    pub fn bootstrapMetadataReplicas(self: *MetadataHttpClusterSimulation) !void {
+    pub fn bootstrapMetadataReplicas(self: *MetadataHttpClusterVopr) !void {
         const node_count = self.cluster.nodes.len;
         const base_uris = try self.alloc.alloc([]u8, node_count);
         defer {
@@ -4911,7 +4911,7 @@ pub const MetadataHttpClusterSimulation = struct {
         while (rounds < 8 and self.firstMetadataReplicaIndex() == null) : (rounds += 1) try self.stepAll();
     }
 
-    pub fn publishClusterNodes(self: *MetadataHttpClusterSimulation, proposer_index: usize) !void {
+    pub fn publishClusterNodes(self: *MetadataHttpClusterVopr, proposer_index: usize) !void {
         const proposer = self.node(proposer_index);
         const projected_nodes = try proposer.listProjectedNodes(self.alloc);
         defer proposer.freeProjectedNodes(self.alloc, projected_nodes);
@@ -4941,7 +4941,7 @@ pub const MetadataHttpClusterSimulation = struct {
         if (changed) try self.stepAll();
     }
 
-    pub fn publishClusterStores(self: *MetadataHttpClusterSimulation, proposer_index: usize) !void {
+    pub fn publishClusterStores(self: *MetadataHttpClusterVopr, proposer_index: usize) !void {
         const proposer = self.node(proposer_index);
         const projected_stores = try proposer.listProjectedStores(self.alloc);
         defer proposer.freeProjectedStores(self.alloc, projected_stores);
@@ -4976,7 +4976,7 @@ pub const MetadataHttpClusterSimulation = struct {
         if (changed) try self.stepAll();
     }
 
-    fn refreshOwnedMetadataRuntimes(self: *MetadataHttpClusterSimulation, index: usize) anyerror!void {
+    fn refreshOwnedMetadataRuntimes(self: *MetadataHttpClusterVopr, index: usize) anyerror!void {
         try self.refreshLocalPlacementIntents(index);
         if (self.metadata_proposal_in_flight == 0) {
             _ = try self.ensureReconcileLease(index);
@@ -4984,7 +4984,7 @@ pub const MetadataHttpClusterSimulation = struct {
         try self.refreshLocalTransitions(index);
     }
 
-    fn ensureReconcileLease(self: *MetadataHttpClusterSimulation, index: usize) anyerror!bool {
+    fn ensureReconcileLease(self: *MetadataHttpClusterVopr, index: usize) anyerror!bool {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
         const sim = self.cluster.node(index);
@@ -5031,7 +5031,7 @@ pub const MetadataHttpClusterSimulation = struct {
         return has_lease;
     }
 
-    fn refreshLocalPlacementIntents(self: *MetadataHttpClusterSimulation, index: usize) !void {
+    fn refreshLocalPlacementIntents(self: *MetadataHttpClusterVopr, index: usize) !void {
         if (self.data_plane_ownership == .external)
             return try self.refreshMetadataPlacementIntent(index);
 
@@ -5108,7 +5108,7 @@ pub const MetadataHttpClusterSimulation = struct {
     /// placements stay in the replicated metadata store for external
     /// DataServers to consume, but cannot accidentally instantiate a second,
     /// test-owned data plane with the same node and group identities.
-    fn refreshMetadataPlacementIntent(self: *MetadataHttpClusterSimulation, index: usize) !void {
+    fn refreshMetadataPlacementIntent(self: *MetadataHttpClusterVopr, index: usize) !void {
         const sim = self.cluster.node(index);
         const store = sim.runtime.svc.host.owned_metadata_store orelse return;
         const local_node_id = self.cluster.configs[index].host.http.host.local_node_id;
@@ -5191,7 +5191,7 @@ pub const MetadataHttpClusterSimulation = struct {
         self.placement_intent_hash_valid[index] = true;
     }
 
-    fn refreshLocalTransitions(self: *MetadataHttpClusterSimulation, index: usize) !void {
+    fn refreshLocalTransitions(self: *MetadataHttpClusterVopr, index: usize) !void {
         const sim = self.cluster.node(index);
         const transition_svc = if (sim.runtime.svc.transition_svc) |*svc| svc else return;
         const store = sim.runtime.svc.host.owned_metadata_store orelse return;
@@ -5235,39 +5235,39 @@ pub const MetadataHttpClusterSimulation = struct {
         sim.runtime.svc.metrics.queued_merge_transitions = transition_svc.metrics.queued_merge_transitions;
     }
 
-    fn indexForNodeId(self: *const MetadataHttpClusterSimulation, node_id: u64) ?usize {
+    fn indexForNodeId(self: *const MetadataHttpClusterVopr, node_id: u64) ?usize {
         for (self.cluster.configs, 0..) |cfg, i| {
             if (cfg.host.http.host.local_node_id == node_id) return i;
         }
         return null;
     }
 
-    fn nodeBaseUri(self: *MetadataHttpClusterSimulation, alloc: std.mem.Allocator, index: usize) ![]u8 {
+    fn nodeBaseUri(self: *MetadataHttpClusterVopr, alloc: std.mem.Allocator, index: usize) ![]u8 {
         return try raft_sim.VirtualHttpNetwork.baseUri(alloc, self.cluster.configs[index].host.http.host.local_node_id);
     }
 
-    fn registerVirtualNodes(self: *MetadataHttpClusterSimulation) !void {
+    fn registerVirtualNodes(self: *MetadataHttpClusterVopr) !void {
         for (0..self.cluster.nodes.len) |i| try self.registerVirtualNode(i);
     }
 
-    fn registerVirtualNode(self: *MetadataHttpClusterSimulation, index: usize) !void {
+    fn registerVirtualNode(self: *MetadataHttpClusterVopr, index: usize) !void {
         const node_id = self.cluster.configs[index].host.http.host.local_node_id;
         try self.virtual_network.registerNode(node_id, self.cluster.node(index).runtime.svc.host.http_host.server.executor());
     }
 };
 
-fn metadataLeaderProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataLeaderProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataLeaderProgressContext = @ptrCast(@alignCast(ptr));
     ctx.index = cluster.currentMetadataLeaderIndex();
     return ctx.index != null;
 }
 
-fn metadataSpecificLeaderProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataSpecificLeaderProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataSpecificLeaderProgressContext = @ptrCast(@alignCast(ptr));
     return cluster.currentMetadataLeaderIndex() == ctx.index;
 }
 
-fn metadataGroupStatusProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataGroupStatusProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataGroupStatusProgressContext = @ptrCast(@alignCast(ptr));
     for (cluster.cluster.nodes) |*sim| {
         if (sim.status(ctx.group_id) != ctx.desired) return false;
@@ -5275,22 +5275,22 @@ fn metadataGroupStatusProgressPredicate(cluster: *MetadataHttpClusterSimulation,
     return true;
 }
 
-fn metadataNodeGroupStatusProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataNodeGroupStatusProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataNodeGroupStatusProgressContext = @ptrCast(@alignCast(ptr));
     return cluster.cluster.node(ctx.index).status(ctx.group_id) == ctx.desired;
 }
 
-fn metadataGroupStatusCountProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataGroupStatusCountProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataGroupStatusCountProgressContext = @ptrCast(@alignCast(ptr));
     return cluster.countGroupStatus(ctx.group_id, ctx.desired) == ctx.expected_count;
 }
 
-fn metadataGroupStatusMinimumProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataGroupStatusMinimumProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataGroupStatusMinimumProgressContext = @ptrCast(@alignCast(ptr));
     return cluster.countGroupStatus(ctx.group_id, ctx.desired) >= ctx.minimum_count;
 }
 
-fn metadataSplitTransitionProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataSplitTransitionProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataSplitTransitionProgressContext = @ptrCast(@alignCast(ptr));
     if (anyNodeSteppedSplitTransitions(cluster)) return true;
     const leader_index = currentMetadataLeaderIndex(cluster) orelse return false;
@@ -5298,7 +5298,7 @@ fn metadataSplitTransitionProgressPredicate(cluster: *MetadataHttpClusterSimulat
     return observation.status.phase != .prepare or observation.status.source_split_phase != .prepare;
 }
 
-fn metadataMergeTransitionProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataMergeTransitionProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataMergeTransitionProgressContext = @ptrCast(@alignCast(ptr));
     if (anyNodeSteppedMergeTransitions(cluster)) return true;
     const leader_index = currentMetadataLeaderIndex(cluster) orelse return false;
@@ -5306,14 +5306,14 @@ fn metadataMergeTransitionProgressPredicate(cluster: *MetadataHttpClusterSimulat
     return observation.donor.phase != .prepare or observation.receiver.phase != .prepare;
 }
 
-fn metadataSplitTransitionFinalizedProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataSplitTransitionFinalizedProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataSplitTransitionFinalizedProgressContext = @ptrCast(@alignCast(ptr));
     const observer_index = ctx.observer_index orelse (currentMetadataLeaderIndex(cluster) orelse ctx.fallback_index);
     const observation = (try cluster.node(observer_index).observeSplitTransition(ctx.transition_id)) orelse return false;
     return observation.status.phase == .finalized;
 }
 
-fn metadataSplitFinalizedOrGroupReadyProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataSplitFinalizedOrGroupReadyProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataSplitFinalizedOrGroupReadyProgressContext = @ptrCast(@alignCast(ptr));
     if (currentGroupLeaderIndex(cluster, ctx.group_id)) |index| {
         ctx.group_index = index;
@@ -5333,7 +5333,7 @@ fn metadataSplitFinalizedOrGroupReadyProgressPredicate(cluster: *MetadataHttpClu
     return false;
 }
 
-fn metadataMergeTransitionFinalizedProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataMergeTransitionFinalizedProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataMergeTransitionFinalizedProgressContext = @ptrCast(@alignCast(ptr));
     const observer_index = ctx.observer_index orelse (currentMetadataLeaderIndex(cluster) orelse ctx.fallback_index);
     const observation = (try cluster.node(observer_index).observeMergeTransition(ctx.transition_id)) orelse return false;
@@ -5341,7 +5341,7 @@ fn metadataMergeTransitionFinalizedProgressPredicate(cluster: *MetadataHttpClust
 }
 
 pub fn waitForSplitTransitionFinalized(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     transition_id: u64,
     observer_index: ?usize,
     fallback_index: usize,
@@ -5373,7 +5373,7 @@ pub fn waitForSplitTransitionFinalized(
 }
 
 fn waitForMergeTransitionFinalized(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     transition_id: u64,
     observer_index: ?usize,
     fallback_index: usize,
@@ -5568,25 +5568,25 @@ fn containsProjectedPlacementIntentGroup(
     return false;
 }
 
-fn anyNodeSteppedSplitTransitions(cluster: *MetadataHttpClusterSimulation) bool {
+fn anyNodeSteppedSplitTransitions(cluster: *MetadataHttpClusterVopr) bool {
     for (cluster.cluster.nodes, 0..) |_, index| {
         if (cluster.node(index).serviceMetrics().stepped_split_transitions > 0) return true;
     }
     return false;
 }
 
-fn anyNodeSteppedMergeTransitions(cluster: *MetadataHttpClusterSimulation) bool {
+fn anyNodeSteppedMergeTransitions(cluster: *MetadataHttpClusterVopr) bool {
     for (cluster.cluster.nodes, 0..) |_, index| {
         if (cluster.node(index).serviceMetrics().stepped_merge_transitions > 0) return true;
     }
     return false;
 }
 
-fn currentMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+fn currentMetadataLeaderIndex(cluster: *MetadataHttpClusterVopr) ?usize {
     return bestMetadataLeaderIndex(cluster);
 }
 
-fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterVopr) ?usize {
     cluster.scheduler_gate.lock();
     defer cluster.scheduler_gate.unlock();
     var best_index: ?usize = null;
@@ -5624,7 +5624,7 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
     return best_index;
 }
 
-fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
+fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterVopr) ?usize {
     cluster.scheduler_gate.lock();
     defer cluster.scheduler_gate.unlock();
     var best_index: ?usize = null;
@@ -5650,7 +5650,7 @@ fn bestMetadataElectionCandidateIndex(cluster: *MetadataHttpClusterSimulation) ?
     return best_index;
 }
 
-fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterSimulation, group_id: u64) ?usize {
+fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterVopr, group_id: u64) ?usize {
     cluster.scheduler_gate.lock();
     defer cluster.scheduler_gate.unlock();
     for (cluster.cluster.nodes, 0..) |*sim, index| {
@@ -5665,7 +5665,7 @@ fn currentGroupLeaderIndex(cluster: *MetadataHttpClusterSimulation, group_id: u6
 }
 
 fn waitForGroupLeaderIndex(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     group_id: u64,
     max_rounds: usize,
 ) !?usize {
@@ -5678,7 +5678,7 @@ fn waitForGroupLeaderIndex(
 }
 
 fn waitForGroupElectedLeaderIndex(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     group_id: u64,
     max_rounds: usize,
 ) !?usize {
@@ -5692,14 +5692,14 @@ const GroupLeaderProgressContext = struct {
     index: ?usize = null,
 };
 
-fn groupLeaderProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn groupLeaderProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *GroupLeaderProgressContext = @ptrCast(@alignCast(ptr));
     ctx.index = currentGroupLeaderIndex(cluster, ctx.group_id);
     return ctx.index != null;
 }
 
 fn requireLeasedReconcile(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !metadata_control_loop.ReconcileSummary {
     var rounds: usize = 0;
@@ -5715,7 +5715,7 @@ fn requireLeasedReconcile(
 }
 
 fn reconcileUntilNodeGroupStatus(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     loop: *metadata_control_loop.MetadataControlLoop,
     node_index: usize,
     group_id: u64,
@@ -5728,7 +5728,7 @@ fn reconcileUntilNodeGroupStatus(
             try cluster.stepAll();
             continue;
         };
-        try publishSimulatedRaftGroupStatus(cluster, leader_index, group_id, round > 0 and round % 8 == 0);
+        try publishVoprRaftGroupStatus(cluster, leader_index, group_id, round > 0 and round % 8 == 0);
         try cluster.stepAll();
         _ = requireLeasedReconcile(cluster.node(leader_index), loop) catch |err| switch (err) {
             error.NotLeader, error.ReconcileLeaseNotHeld => {
@@ -5806,7 +5806,7 @@ pub const SplitRetirementSummary = struct {
 };
 
 pub fn retireFinalizedSplitTransition(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !SplitRetirementSummary {
     const terminal = try requireLeasedReconcile(node, loop);
@@ -5830,7 +5830,7 @@ pub const MergeRetirementSummary = struct {
 };
 
 pub fn retireFinalizedMergeTransition(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !MergeRetirementSummary {
     const terminal = try requireLeasedReconcile(node, loop);
@@ -5847,7 +5847,7 @@ pub fn retireFinalizedMergeTransition(
 }
 
 fn bootstrapDesiredLoop(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !void {
     loop.setClock(node.cluster.manual_clock.clock());
@@ -5861,7 +5861,7 @@ fn metadataBlackholeEndpoints() []const peer_resolver.PeerEndpoint {
     })[0..];
 }
 
-fn isolateMetadataNode(cluster: *MetadataHttpClusterSimulation, isolated_index: usize) !void {
+fn isolateMetadataNode(cluster: *MetadataHttpClusterVopr, isolated_index: usize) !void {
     const isolated_node_id = cluster.cluster.configs[isolated_index].host.http.host.local_node_id;
     for (cluster.cluster.configs, 0..) |cfg, index| {
         if (index == isolated_index) continue;
@@ -5872,7 +5872,7 @@ fn isolateMetadataNode(cluster: *MetadataHttpClusterSimulation, isolated_index: 
 }
 
 fn waitForMetadataLeaderExcluding(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     excluded_index: usize,
     max_rounds: usize,
 ) !?usize {
@@ -5882,7 +5882,7 @@ fn waitForMetadataLeaderExcluding(
 }
 
 fn waitForMetadataLeaderIndex(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     index: usize,
     max_rounds: usize,
 ) !bool {
@@ -5896,7 +5896,7 @@ const MetadataLeaderExcludingProgressContext = struct {
     index: ?usize = null,
 };
 
-fn metadataLeaderExcludingProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn metadataLeaderExcludingProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *MetadataLeaderExcludingProgressContext = @ptrCast(@alignCast(ptr));
     if (currentMetadataLeaderIndex(cluster)) |index| {
         if (index != ctx.excluded_index) {
@@ -5954,13 +5954,13 @@ fn deriveGroupId(table_name: []const u8, key: []const u8, seed: u64, reserved: u
     return id;
 }
 
-fn currentMetadataMutationNode(node: MetadataHttpNodeSimulation) MetadataHttpNodeSimulation {
+fn currentMetadataMutationNode(node: MetadataHttpNodeVopr) MetadataHttpNodeVopr {
     if (node.cluster.currentMetadataLeaderIndex()) |index| return node.cluster.node(index);
     return node;
 }
 
 fn applyCreateTableMutation(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     table_name: []const u8,
     req: api_tables.CreateTableRequest,
 ) !void {
@@ -5973,7 +5973,7 @@ fn applyCreateTableMutation(
 }
 
 fn applyDropTableMutation(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     alloc: std.mem.Allocator,
     table_name: []const u8,
 ) !metadata_table_topology_mutations.DropResult {
@@ -6032,7 +6032,7 @@ fn applyDropTableMutation(
 }
 
 fn applyUpdateSchemaMutation(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     alloc: std.mem.Allocator,
     table_name: []const u8,
     schema_json: []const u8,
@@ -6049,7 +6049,7 @@ fn applyUpdateSchemaMutation(
 }
 
 fn applyCreateIndexMutation(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     alloc: std.mem.Allocator,
     table_name: []const u8,
     index_name: []const u8,
@@ -6068,7 +6068,7 @@ fn applyCreateIndexMutation(
 }
 
 fn applyDropIndexMutation(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     alloc: std.mem.Allocator,
     table_name: []const u8,
     index_name: []const u8,
@@ -6087,7 +6087,7 @@ fn applyDropIndexMutation(
 }
 
 fn applyReplaceTableDefinitionMutation(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !void {
@@ -6096,7 +6096,7 @@ fn applyReplaceTableDefinitionMutation(
 }
 
 const PublicApiLinearizableReadProof = struct {
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     node_index: usize,
     group_id: u64,
     term: u64,
@@ -6105,8 +6105,8 @@ const PublicApiLinearizableReadProof = struct {
 
     fn authoritativeNode(
         self: @This(),
-        expected_cluster: *MetadataHttpClusterSimulation,
-    ) !MetadataHttpNodeSimulation {
+        expected_cluster: *MetadataHttpClusterVopr,
+    ) !MetadataHttpNodeVopr {
         if (self.cluster != expected_cluster)
             return error.MetadataLinearizableReadTimeout;
         self.cluster.scheduler_gate.lock();
@@ -6130,7 +6130,7 @@ const PublicApiLinearizableReadProof = struct {
 };
 
 const PublicApiLinearizableReadDriver = struct {
-    cluster: ?*MetadataHttpClusterSimulation = null,
+    cluster: ?*MetadataHttpClusterVopr = null,
     node_index: usize,
     downstream: ?raft_state_machine.ReadStateObserver = null,
     ensure_mutex: std.Io.Mutex = .init,
@@ -6300,10 +6300,10 @@ test "public api linearizable read driver ignores a delayed earlier generation" 
 }
 
 fn authoritativePublicApiRoutingNode(
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     deadline_ns: ?u64,
     external_driver: ?*PublicApiLinearizableReadDriver,
-) !MetadataHttpNodeSimulation {
+) !MetadataHttpNodeVopr {
     if (deadline_ns) |deadline| {
         if (platform_time.monotonicNs() >= deadline)
             return error.CatalogRoutingSnapshotTimeout;
@@ -6334,11 +6334,11 @@ const PublicApiStatusSource = struct {
         leader_backed,
     };
 
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     metadata_snapshot_mode: MetadataSnapshotMode = .local,
     linearizable_read_driver: ?*PublicApiLinearizableReadDriver = null,
 
-    fn metadataNode(self: @This()) MetadataHttpNodeSimulation {
+    fn metadataNode(self: @This()) MetadataHttpNodeVopr {
         return switch (self.metadata_snapshot_mode) {
             .local => self.node,
             .leader_backed => currentMetadataMutationNode(self.node),
@@ -6466,8 +6466,8 @@ const PublicApiStatusSource = struct {
     }
 };
 
-pub const MetadataAdminSimSource = struct {
-    node: MetadataHttpNodeSimulation,
+pub const MetadataAdminVoprSource = struct {
+    node: MetadataHttpNodeVopr,
 
     pub fn iface(self: *@This()) metadata_http_server.AdminSource {
         return .{
@@ -6739,10 +6739,10 @@ pub const MetadataAdminSimSource = struct {
 };
 
 const PublicApiCatalogSource = struct {
-    node: MetadataHttpNodeSimulation,
+    node: MetadataHttpNodeVopr,
     metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode = .local,
 
-    fn metadataNode(self: @This()) MetadataHttpNodeSimulation {
+    fn metadataNode(self: @This()) MetadataHttpNodeVopr {
         return switch (self.metadata_snapshot_mode) {
             .local => self.node,
             .leader_backed => currentMetadataMutationNode(self.node),
@@ -6791,8 +6791,8 @@ const PublicApiCatalogSource = struct {
 
 fn PublicApiRouter(comptime N: usize) type {
     return struct {
-        node: MetadataHttpNodeSimulation,
-        cluster: *MetadataHttpClusterSimulation,
+        node: MetadataHttpNodeVopr,
+        cluster: *MetadataHttpClusterVopr,
         api_base_uris: *const [N][]const u8,
 
         fn iface(self: *@This()) api_table_router.HostedGroupRouter {
@@ -6838,13 +6838,13 @@ fn PublicApiRouter(comptime N: usize) type {
     };
 }
 
-const SimAuthManager = struct {
+const VoprAuthManager = struct {
     store: usermgr.MemoryStore,
     policy_store: casbin.MemoryAdapter,
     manager: usermgr.UserManager,
 
-    fn init(alloc: std.mem.Allocator) !SimAuthManager {
-        var self = SimAuthManager{
+    fn init(alloc: std.mem.Allocator) !VoprAuthManager {
+        var self = VoprAuthManager{
             .store = usermgr.MemoryStore.init(alloc),
             .policy_store = casbin.MemoryAdapter.init(alloc),
             .manager = undefined,
@@ -6863,7 +6863,7 @@ const SimAuthManager = struct {
         return self;
     }
 
-    fn deinit(self: *SimAuthManager) void {
+    fn deinit(self: *VoprAuthManager) void {
         self.manager.deinit();
         self.policy_store.deinit();
         self.store.deinit();
@@ -6871,7 +6871,7 @@ const SimAuthManager = struct {
     }
 };
 
-const sim_internal_service_secret = "metadata-simulation-internal-service-secret";
+const vopr_internal_service_secret = "metadata-vopr-internal-service-secret";
 
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
@@ -6885,7 +6885,7 @@ fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, pass
 
 fn PublicApiServerOptions(comptime N: usize) type {
     return struct {
-        auth_managers: ?*[N]SimAuthManager = null,
+        auth_managers: ?*[N]VoprAuthManager = null,
         resource_managers: ?*[N]resource_manager_mod.ResourceManager = null,
     };
 }
@@ -6893,7 +6893,7 @@ fn PublicApiServerOptions(comptime N: usize) type {
 fn startPublicApiServers(
     comptime N: usize,
     alloc: std.mem.Allocator,
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     shared_io: std.Io,
     async_limit: std.Io.Limit,
     roots: *const [N][]const u8,
@@ -6909,7 +6909,7 @@ fn startPublicApiServers(
     options: PublicApiServerOptions(N),
     api_base_uris: *[N][]const u8,
 ) !void {
-    const http_alloc = leanSimHttpAllocator();
+    const http_alloc = leanVoprHttpAllocator();
     var started: usize = 0;
     errdefer {
         for (0..started) |i| listeners[i].deinit();
@@ -6928,18 +6928,18 @@ fn startPublicApiServers(
             forward_executor,
         );
         _ = read_sources[i].withIoInterface(shared_io, async_limit);
-        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+        _ = read_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor,
         );
-        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
-        attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
+        _ = write_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
+        attachHostedSourcesBackendRuntimeForVopr(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         var server_config: api_http_server.ApiHttpServerConfig = .{
-            .internal_service_secret = sim_internal_service_secret,
-            .internal_service_issuer = "metadata-sim",
+            .internal_service_secret = vopr_internal_service_secret,
+            .internal_service_issuer = "metadata-vopr",
         };
         if (options.auth_managers) |auth_managers| {
             server_config.auth_enabled = true;
@@ -6967,7 +6967,7 @@ fn startPublicApiServers(
     }
 }
 
-fn attachHostedSourcesBackendRuntimeForSimulation(
+fn attachHostedSourcesBackendRuntimeForVopr(
     read_source: *api_table_reads.HostedProvisionedTableReadSource,
     write_source: *api_table_writes.HostedProvisionedTableWriteSource,
     backend_runtime: *db_mod.background_runtime.BackendRuntime,
@@ -7018,7 +7018,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         fn initInPlace(
             self: *@This(),
             alloc: std.mem.Allocator,
-            cluster: *MetadataHttpClusterSimulation,
+            cluster: *MetadataHttpClusterVopr,
             roots: [N][]const u8,
         ) !void {
             try self.initWithMetadataMode(alloc, cluster, roots, .local);
@@ -7027,7 +7027,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         fn initLeaderBackedInPlace(
             self: *@This(),
             alloc: std.mem.Allocator,
-            cluster: *MetadataHttpClusterSimulation,
+            cluster: *MetadataHttpClusterVopr,
             roots: [N][]const u8,
         ) !void {
             try self.initWithMetadataMode(alloc, cluster, roots, .leader_backed);
@@ -7036,9 +7036,9 @@ fn PublicApiTestRig(comptime N: usize) type {
         fn initLeaderBackedWithAuthInPlace(
             self: *@This(),
             alloc: std.mem.Allocator,
-            cluster: *MetadataHttpClusterSimulation,
+            cluster: *MetadataHttpClusterVopr,
             roots: [N][]const u8,
-            auth_managers: *[N]SimAuthManager,
+            auth_managers: *[N]VoprAuthManager,
         ) !void {
             try self.initWithMetadataModeAndOptions(alloc, cluster, roots, .leader_backed, .{ .auth_managers = auth_managers });
         }
@@ -7046,7 +7046,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         fn initWithMetadataMode(
             self: *@This(),
             alloc: std.mem.Allocator,
-            cluster: *MetadataHttpClusterSimulation,
+            cluster: *MetadataHttpClusterVopr,
             roots: [N][]const u8,
             metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode,
         ) !void {
@@ -7056,14 +7056,14 @@ fn PublicApiTestRig(comptime N: usize) type {
         fn initWithMetadataModeAndOptions(
             self: *@This(),
             alloc: std.mem.Allocator,
-            cluster: *MetadataHttpClusterSimulation,
+            cluster: *MetadataHttpClusterVopr,
             roots: [N][]const u8,
             metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode,
             options: PublicApiServerOptions(N),
         ) !void {
             self.* = .{
                 .alloc = alloc,
-                .http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size }),
+                .http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size }),
             };
             self.forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &self.http_io);
             errdefer self.forward_executor.deinit();
@@ -7096,7 +7096,7 @@ fn PublicApiTestRig(comptime N: usize) type {
             errdefer self.client_executor.deinit();
 
             self.client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, self.client_executor.executor());
-            _ = self.client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+            _ = self.client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
             self.metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, self.client_executor.executor());
 
             for (0..N) |i| try cluster.node(i).runRound();
@@ -7104,7 +7104,7 @@ fn PublicApiTestRig(comptime N: usize) type {
 
         fn init(
             alloc: std.mem.Allocator,
-            cluster: *MetadataHttpClusterSimulation,
+            cluster: *MetadataHttpClusterVopr,
             roots: [N][]const u8,
         ) !@This() {
             var self: @This() = undefined;
@@ -7168,7 +7168,7 @@ pub const VoprPublicClusterFixture = struct {
     resource_managers: [node_count]resource_manager_mod.ResourceManager = undefined,
     resource_manager_count: usize = 0,
     resource_reservations: [node_count]?resource_manager_mod.BatchReservation = .{null} ** node_count,
-    cluster: MetadataHttpClusterSimulation = undefined,
+    cluster: MetadataHttpClusterVopr = undefined,
     cluster_live: bool = false,
     cluster_started: bool = false,
     raft_wire_executor: io_http_executor.IoHttpExecutor = undefined,
@@ -7256,7 +7256,7 @@ pub const VoprPublicClusterFixture = struct {
     fn initWithDataPlaneOwnership(
         alloc: std.mem.Allocator,
         sim: *vopr.vopr_io.VoprIo,
-        data_plane_ownership: MetadataHttpClusterSimulation.DataPlaneOwnership,
+        data_plane_ownership: MetadataHttpClusterVopr.DataPlaneOwnership,
     ) !*VoprPublicClusterFixture {
         const self = try create(alloc, sim);
         errdefer self.deinit();
@@ -7287,7 +7287,7 @@ pub const VoprPublicClusterFixture = struct {
 
     fn bootstrapWithDataPlaneOwnership(
         self: *VoprPublicClusterFixture,
-        data_plane_ownership: MetadataHttpClusterSimulation.DataPlaneOwnership,
+        data_plane_ownership: MetadataHttpClusterVopr.DataPlaneOwnership,
     ) !void {
         if (self.bootstrap_phase != .created) return error.PublicClusterFixtureAlreadyBootstrapped;
         const alloc = self.alloc;
@@ -7342,20 +7342,20 @@ pub const VoprPublicClusterFixture = struct {
         self.bootstrap_phase = .local_resources_ready;
 
         var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-            makeHostSimConfig(1, metadata_group_id, self.roots[0], self.catalogs[0]),
-            makeHostSimConfig(2, metadata_group_id, self.roots[1], self.catalogs[1]),
-            makeHostSimConfig(3, metadata_group_id, self.roots[2], self.catalogs[2]),
+            makeHostVoprConfig(1, metadata_group_id, self.roots[0], self.catalogs[0]),
+            makeHostVoprConfig(2, metadata_group_id, self.roots[1], self.catalogs[1]),
+            makeHostVoprConfig(3, metadata_group_id, self.roots[2], self.catalogs[2]),
         };
         // Raft rounds are deliberately bounded and synchronous in this
         // fixture. The send still crosses the virtual fault router and a real
         // httpx/VoprIo socket; it simply completes before the next round.
         for (&configs) |*config| config.host.http.transport.driver.async_send_worker_count = 0;
         const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostSimDepsWithBorrowedIo(&self.factories[0], sim.io()),
-            makeHostSimDepsWithBorrowedIo(&self.factories[1], sim.io()),
-            makeHostSimDepsWithBorrowedIo(&self.factories[2], sim.io()),
+            makeHostVoprDepsWithBorrowedIo(&self.factories[0], sim.io()),
+            makeHostVoprDepsWithBorrowedIo(&self.factories[1], sim.io()),
+            makeHostVoprDepsWithBorrowedIo(&self.factories[2], sim.io()),
         };
-        self.cluster = try MetadataHttpClusterSimulation.init(alloc, metadata_group_id, &configs, &deps);
+        self.cluster = try MetadataHttpClusterVopr.init(alloc, metadata_group_id, &configs, &deps);
         self.cluster_live = true;
         self.cluster.setDataPlaneOwnership(data_plane_ownership);
         for (0..node_count) |index| self.catalog_sources[index] = .{
@@ -8601,7 +8601,7 @@ pub const VoprPublicClusterFixture = struct {
 };
 
 fn startBootstrappedMetadataCluster(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     leader_wait_rounds: usize,
     publish_stores: bool,
 ) !usize {
@@ -8610,7 +8610,7 @@ fn startBootstrappedMetadataCluster(
 }
 
 fn finishBootstrappedMetadataCluster(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     leader_wait_rounds: usize,
     publish_stores: bool,
 ) !usize {
@@ -8933,7 +8933,7 @@ fn orderedRemove(comptime T: type, values: []T, index: usize) T {
     return removed;
 }
 
-fn metadataVoprNodeId(cluster: *MetadataHttpClusterSimulation, index: usize) u64 {
+fn metadataVoprNodeId(cluster: *MetadataHttpClusterVopr, index: usize) u64 {
     return cluster.cluster.configs[index].host.http.host.local_node_id;
 }
 
@@ -8968,7 +8968,7 @@ const MetadataVoprCandidate = struct {
 
 const MetadataVoprDriver = struct {
     alloc: std.mem.Allocator,
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     cfg: MetadataVoprCampaignConfig,
     source: vopr.choice.Source,
     artifact: ?vopr.trace.Trace,
@@ -8992,7 +8992,7 @@ const MetadataVoprDriver = struct {
 
     fn init(
         alloc: std.mem.Allocator,
-        cluster: *MetadataHttpClusterSimulation,
+        cluster: *MetadataHttpClusterVopr,
         cfg: MetadataVoprCampaignConfig,
         source: vopr.choice.Source,
         flight_recorder: ?*vopr.flight_recorder.Recorder,
@@ -9635,7 +9635,7 @@ const MetadataVoprDriver = struct {
             .network_duplicate => _ = try self.cluster.virtual_network.duplicateMessage(selected.message_id.?),
             .network_delay => try self.cluster.virtual_network.delayMessage(selected.message_id.?, selected.ticks),
             .network_release => try self.cluster.virtual_network.releaseMessage(selected.message_id.?),
-            .time_advance => self.cluster.advanceSimTime(selected.ticks),
+            .time_advance => self.cluster.advanceVoprTime(selected.ticks),
             .drop_next => {
                 try self.cluster.cluster.inject(.drop_next);
             },
@@ -9930,7 +9930,7 @@ const MetadataVoprDriver = struct {
 };
 
 fn metadataVoprStartFollowerPartition(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     state: *MetadataVoprCampaignState,
 ) !void {
     if (state.faultCount() != 0) return;
@@ -9943,7 +9943,7 @@ fn metadataVoprStartFollowerPartition(
 }
 
 fn metadataVoprStartFollowerLinkPartition(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     state: *MetadataVoprCampaignState,
 ) !void {
     if (state.faultCount() != 0) return;
@@ -9959,7 +9959,7 @@ fn metadataVoprStartFollowerLinkPartition(
 }
 
 fn metadataVoprHealAll(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     state: *MetadataVoprCampaignState,
 ) !void {
     cluster.cluster.healAll();
@@ -9974,7 +9974,7 @@ fn metadataVoprHealAll(
     _ = try cluster.waitForMetadataLeader(96) orelse return error.NotLeader;
 }
 
-fn metadataVoprLeaderIndex(cluster: *MetadataHttpClusterSimulation) !usize {
+fn metadataVoprLeaderIndex(cluster: *MetadataHttpClusterVopr) !usize {
     return (try cluster.waitForMetadataLeader(96)) orelse error.TestExpectedEqual;
 }
 
@@ -9983,7 +9983,7 @@ const VoprStoreLiveProgressContext = struct {
     expected_live: bool,
 };
 
-fn voprStoreLiveProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn voprStoreLiveProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *VoprStoreLiveProgressContext = @ptrCast(@alignCast(ptr));
     const leader_index = currentMetadataLeaderIndex(cluster) orelse return false;
     const stores = try cluster.node(leader_index).listProjectedStores(cluster.alloc);
@@ -9997,7 +9997,7 @@ const VoprStoreDrainProgressContext = struct {
     expected_drain_requested: bool,
 };
 
-fn voprStoreDrainProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+fn voprStoreDrainProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr: *anyopaque) anyerror!bool {
     const ctx: *VoprStoreDrainProgressContext = @ptrCast(@alignCast(ptr));
     const leader_index = currentMetadataLeaderIndex(cluster) orelse return false;
     const stores = try cluster.node(leader_index).listProjectedStores(cluster.alloc);
@@ -10006,7 +10006,7 @@ fn voprStoreDrainProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr:
     return store.drain_requested == ctx.expected_drain_requested;
 }
 
-fn reportMetadataVoprDrainState(cluster: *MetadataHttpClusterSimulation, store_id: u64) void {
+fn reportMetadataVoprDrainState(cluster: *MetadataHttpClusterVopr, store_id: u64) void {
     for (cluster.cluster.nodes, 0..) |*node, index| {
         if (node.raftStatus(cluster.metadata_group_id)) |status| {
             std.debug.print(
@@ -10031,7 +10031,7 @@ fn reportMetadataVoprDrainState(cluster: *MetadataHttpClusterSimulation, store_i
 }
 
 fn metadataVoprCreateActiveTable(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     workflow: *metadata_table_workflow.TableWorkflow,
     table_id: u64,
     table_name: []const u8,
@@ -10060,7 +10060,7 @@ fn metadataVoprCreateActiveTable(
 }
 
 fn metadataVoprCreateTableWithRanges(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     workflow: *metadata_table_workflow.TableWorkflow,
     table: metadata_table_manager.TableRecord,
     ranges: []const metadata_table_manager.RangeRecord,
@@ -10081,7 +10081,7 @@ fn metadataVoprCreateTableWithRanges(
 }
 
 fn metadataVoprAddRange(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     workflow: *metadata_table_workflow.TableWorkflow,
     range: metadata_table_manager.RangeRecord,
     max_rounds: usize,
@@ -10101,7 +10101,7 @@ fn metadataVoprAddRange(
 }
 
 fn metadataVoprRunLivenessWorkload(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     cfg: MetadataVoprCampaignConfig,
     driver: *MetadataVoprDriver,
 ) !void {
@@ -10112,7 +10112,7 @@ fn metadataVoprRunLivenessWorkload(
 }
 
 fn metadataVoprRunSmokeLivenessWorkload(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     cfg: MetadataVoprCampaignConfig,
 ) !void {
     var workflow = metadata_table_workflow.TableWorkflow.init(cluster.alloc);
@@ -10134,7 +10134,7 @@ fn metadataVoprRunSmokeLivenessWorkload(
 }
 
 fn metadataVoprRunExpandedLivenessWorkload(
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     cfg: MetadataVoprCampaignConfig,
     driver: *MetadataVoprDriver,
 ) !void {
@@ -10371,17 +10371,17 @@ fn runMetadataVoprCampaignWithChoicesAndRaftTrace(
     defer alloc.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, cfg.metadata_group_id, root_a, cat_a),
-        makeHostSimConfig(2, cfg.metadata_group_id, root_b, cat_b),
-        makeHostSimConfig(3, cfg.metadata_group_id, root_c, cat_c),
+        makeHostVoprConfig(1, cfg.metadata_group_id, root_a, cat_a),
+        makeHostVoprConfig(2, cfg.metadata_group_id, root_b, cat_b),
+        makeHostVoprConfig(3, cfg.metadata_group_id, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(alloc, cfg.metadata_group_id, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(alloc, cfg.metadata_group_id, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
 
@@ -10675,14 +10675,14 @@ test "metadata VOPR expanded generated workload campaign" {
 fn startMetadataAdminServers(
     comptime N: usize,
     alloc: std.mem.Allocator,
-    cluster: *MetadataHttpClusterSimulation,
+    cluster: *MetadataHttpClusterVopr,
     shared_io: *std.Io.Threaded,
     listeners: *[N]metadata_http_test_runtime.Runtime,
     servers: *[N]metadata_http_server.MetadataHttpServer,
-    sources: *[N]MetadataAdminSimSource,
+    sources: *[N]MetadataAdminVoprSource,
     base_uris: *[N][]const u8,
 ) !void {
-    const http_alloc = leanSimHttpAllocator();
+    const http_alloc = leanVoprHttpAllocator();
     var started: usize = 0;
     errdefer {
         for (0..started) |i| listeners[i].deinit();
@@ -10708,12 +10708,12 @@ fn deinitMetadataAdminServers(comptime N: usize, servers: *[N]metadata_http_serv
     for (servers) |*server| server.deinit();
 }
 
-fn requestNodeShutdownViaSimAdmin(
-    cluster: *MetadataHttpClusterSimulation,
+fn requestNodeShutdownViaVoprAdmin(
+    cluster: *MetadataHttpClusterVopr,
     source_index: usize,
     node_id: u64,
 ) !void {
-    var source = MetadataAdminSimSource{ .node = cluster.node(source_index) };
+    var source = MetadataAdminVoprSource{ .node = cluster.node(source_index) };
     var server = metadata_http_server.MetadataHttpServer.init(cluster.alloc, .{}, source.iface());
     defer server.deinit();
     var runtime = try metadata_http_test_runtime.Runtime.startOwned(cluster.alloc, &server);
@@ -10726,7 +10726,7 @@ fn requestNodeShutdownViaSimAdmin(
     try client.requestNodeShutdown(base_uri, node_id, "{\"type\":\"remove\",\"reason\":\"sim\"}");
 }
 
-test "metadata http cluster simulation drives table placement convergence" {
+test "metadata VOPR http cluster drives table placement convergence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -10741,31 +10741,31 @@ test "metadata http cluster simulation drives table placement convergence" {
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4000, root_a, cat_a),
-        makeHostSimConfig(2, 4000, root_b, cat_b),
-        makeHostSimConfig(3, 4000, root_c, cat_c),
+        makeHostVoprConfig(1, 4000, root_a, cat_a),
+        makeHostVoprConfig(2, 4000, root_b, cat_b),
+        makeHostVoprConfig(3, 4000, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4000, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4000, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -10830,17 +10830,17 @@ test "metadata-only cluster preserves external data placements without shadow re
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4050, root_a, cat_a),
-        makeHostSimConfig(2, 4050, root_b, cat_b),
-        makeHostSimConfig(3, 4050, root_c, cat_c),
+        makeHostVoprConfig(1, 4050, root_a, cat_a),
+        makeHostVoprConfig(2, 4050, root_b, cat_b),
+        makeHostVoprConfig(3, 4050, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4050, &configs, &deps);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4050, &configs, &deps);
     defer cluster.deinit();
     cluster.setDataPlaneOwnership(.external);
     try cluster.startAll();
@@ -10877,59 +10877,59 @@ test "metadata-only cluster preserves external data placements without shadow re
     }
 }
 
-test "metadata http cluster simulation serves public lifecycle from a non-host node after public create" {
-    var sim_alloc_state: LeanSimAllocator = .init;
-    defer _ = sim_alloc_state.deinit();
-    const sim_alloc = sim_alloc_state.allocator();
+test "metadata VOPR http cluster serves public lifecycle from a non-host node after public create" {
+    var vopr_alloc_state: LeanVoprAllocator = .init;
+    defer _ = vopr_alloc_state.deinit();
+    const vopr_alloc = vopr_alloc_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store_a = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_a = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_a.deinit();
-    var store_b = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_b = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_b.deinit();
-    var store_c = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_c = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_c.deinit();
-    var store_d = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_d = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_d.deinit();
 
-    var factory_a = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_a, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_b = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_b, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_c = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_d = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_a = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_a, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_b = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_b, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_c = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_d = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
 
-    const root_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-a", .{tmp.sub_path});
-    defer sim_alloc.free(root_a);
-    const root_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-b", .{tmp.sub_path});
-    defer sim_alloc.free(root_b);
-    const root_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-c", .{tmp.sub_path});
-    defer sim_alloc.free(root_c);
-    const root_d = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-d", .{tmp.sub_path});
-    defer sim_alloc.free(root_d);
-    const cat_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-a.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-b.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-c.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_c);
-    const cat_d = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-d.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_d);
+    const root_a = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-a", .{tmp.sub_path});
+    defer vopr_alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-b", .{tmp.sub_path});
+    defer vopr_alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-c", .{tmp.sub_path});
+    defer vopr_alloc.free(root_c);
+    const root_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-d", .{tmp.sub_path});
+    defer vopr_alloc.free(root_d);
+    const cat_a = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-a.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-b.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-c.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_c);
+    const cat_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-d.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_d);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4860, root_a, cat_a),
-        makeHostSimConfig(2, 4860, root_b, cat_b),
-        makeHostSimConfig(3, 4860, root_c, cat_c),
-        makeHostSimConfig(4, 4860, root_d, cat_d),
+        makeHostVoprConfig(1, 4860, root_a, cat_a),
+        makeHostVoprConfig(2, 4860, root_b, cat_b),
+        makeHostVoprConfig(3, 4860, root_c, cat_c),
+        makeHostVoprConfig(4, 4860, root_d, cat_d),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
-        makeHostSimDeps(&factory_d),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+        makeHostVoprDeps(&factory_d),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(sim_alloc, 4860, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(vopr_alloc, 4860, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -10944,7 +10944,7 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     const roots = [_][]const u8{ root_a, root_b, root_c, root_d };
 
     var public_api: PublicApiTestRig(4) = undefined;
-    try public_api.initLeaderBackedInPlace(sim_alloc, &cluster, roots);
+    try public_api.initLeaderBackedInPlace(vopr_alloc, &cluster, roots);
     defer public_api.deinit();
     api_base_uris = public_api.api_base_uris;
     var client = public_api.client;
@@ -11068,62 +11068,62 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     try std.testing.expectEqual(@as(usize, 0), parsed_tables_after_drop.value.len);
 }
 
-test "metadata http cluster simulation seeds default admin for auth-enabled public api" {
-    var sim_alloc_state: LeanSimAllocator = .init;
-    defer _ = sim_alloc_state.deinit();
-    const sim_alloc = sim_alloc_state.allocator();
+test "metadata VOPR http cluster seeds default admin for auth-enabled public api" {
+    var vopr_alloc_state: LeanVoprAllocator = .init;
+    defer _ = vopr_alloc_state.deinit();
+    const vopr_alloc = vopr_alloc_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store_a = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_a = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_a.deinit();
-    var store_b = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_b = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_b.deinit();
-    var store_c = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_c = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_c.deinit();
 
-    var factory_a = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
-    var factory_b = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
-    var factory_c = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+    var factory_a = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-a", .{tmp.sub_path});
-    defer sim_alloc.free(root_a);
-    const root_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-b", .{tmp.sub_path});
-    defer sim_alloc.free(root_b);
-    const root_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-c", .{tmp.sub_path});
-    defer sim_alloc.free(root_c);
-    const cat_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-a.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-b.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-c.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_c);
+    const root_a = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-a", .{tmp.sub_path});
+    defer vopr_alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-b", .{tmp.sub_path});
+    defer vopr_alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-c", .{tmp.sub_path});
+    defer vopr_alloc.free(root_c);
+    const cat_a = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-a.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-b.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-c.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4868, root_a, cat_a),
-        makeHostSimConfig(2, 4868, root_b, cat_b),
-        makeHostSimConfig(3, 4868, root_c, cat_c),
+        makeHostVoprConfig(1, 4868, root_a, cat_a),
+        makeHostVoprConfig(2, 4868, root_b, cat_b),
+        makeHostVoprConfig(3, 4868, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(sim_alloc, 4868, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(vopr_alloc, 4868, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
     _ = try startBootstrappedMetadataCluster(&cluster, 24, true);
 
-    var auth_managers: [3]SimAuthManager = undefined;
+    var auth_managers: [3]VoprAuthManager = undefined;
     var auth_count: usize = 0;
     var auth_init_complete = false;
     errdefer if (!auth_init_complete) {
         for (auth_managers[0..auth_count]) |*auth| auth.deinit();
     };
     for (&auth_managers) |*auth| {
-        auth.* = try SimAuthManager.init(sim_alloc);
+        auth.* = try VoprAuthManager.init(vopr_alloc);
         auth_count += 1;
     }
     auth_init_complete = true;
@@ -11131,7 +11131,7 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
 
     const roots = [_][]const u8{ root_a, root_b, root_c };
     var public_api: PublicApiTestRig(3) = undefined;
-    try public_api.initLeaderBackedWithAuthInPlace(sim_alloc, &cluster, roots, &auth_managers);
+    try public_api.initLeaderBackedWithAuthInPlace(vopr_alloc, &cluster, roots, &auth_managers);
     defer public_api.deinit();
 
     const admin_auth = try encodeBasicAuthorization(std.heap.page_allocator, "admin", "admin");
@@ -11162,59 +11162,59 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
     }
 }
 
-test "metadata http cluster simulation forwards public split flow from a non-host node after public create" {
-    var sim_alloc_state: LeanSimAllocator = .init;
-    defer _ = sim_alloc_state.deinit();
-    const sim_alloc = sim_alloc_state.allocator();
+test "metadata VOPR http cluster forwards public split flow from a non-host node after public create" {
+    var vopr_alloc_state: LeanVoprAllocator = .init;
+    defer _ = vopr_alloc_state.deinit();
+    const vopr_alloc = vopr_alloc_state.allocator();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var store_a = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_a = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_a.deinit();
-    var store_b = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_b = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_b.deinit();
-    var store_c = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_c = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_c.deinit();
-    var store_d = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_d = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_d.deinit();
 
-    var factory_a = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_a, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_b = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_b, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_c = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_d = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_a = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_a, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_b = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_b, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_c = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_d = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
 
-    const root_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-a", .{tmp.sub_path});
-    defer sim_alloc.free(root_a);
-    const root_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-b", .{tmp.sub_path});
-    defer sim_alloc.free(root_b);
-    const root_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-c", .{tmp.sub_path});
-    defer sim_alloc.free(root_c);
-    const root_d = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-d", .{tmp.sub_path});
-    defer sim_alloc.free(root_d);
-    const cat_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-a.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-b.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-c.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_c);
-    const cat_d = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-d.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_d);
+    const root_a = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-a", .{tmp.sub_path});
+    defer vopr_alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-b", .{tmp.sub_path});
+    defer vopr_alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-c", .{tmp.sub_path});
+    defer vopr_alloc.free(root_c);
+    const root_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-d", .{tmp.sub_path});
+    defer vopr_alloc.free(root_d);
+    const cat_a = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-a.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-b.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-c.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_c);
+    const cat_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-d.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_d);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4861, root_a, cat_a),
-        makeHostSimConfig(2, 4861, root_b, cat_b),
-        makeHostSimConfig(3, 4861, root_c, cat_c),
-        makeHostSimConfig(4, 4861, root_d, cat_d),
+        makeHostVoprConfig(1, 4861, root_a, cat_a),
+        makeHostVoprConfig(2, 4861, root_b, cat_b),
+        makeHostVoprConfig(3, 4861, root_c, cat_c),
+        makeHostVoprConfig(4, 4861, root_d, cat_d),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
-        makeHostSimDeps(&factory_d),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+        makeHostVoprDeps(&factory_d),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(sim_alloc, 4861, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(vopr_alloc, 4861, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -11225,16 +11225,16 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(
         4,
-        sim_alloc,
+        vopr_alloc,
         &cluster,
         &http_io,
         &metadata_admin_listeners,
@@ -11244,7 +11244,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     );
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer deinitMetadataAdminServers(4, &metadata_admin_servers);
-    defer for (metadata_apis) |uri| sim_alloc.free(uri);
+    defer for (metadata_apis) |uri| vopr_alloc.free(uri);
 
     var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
@@ -11261,7 +11261,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     defer forward_executor.deinit();
     try startPublicApiServers(
         4,
-        sim_alloc,
+        vopr_alloc,
         &cluster,
         http_io.io(),
         http_io.async_limit,
@@ -11278,14 +11278,14 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
         .{},
         &api_base_uris,
     );
-    defer for (api_base_uris) |uri| sim_alloc.free(uri);
+    defer for (api_base_uris) |uri| vopr_alloc.free(uri);
     defer deinitPublicApiStack(4, &listeners, &servers, &write_sources);
 
     var client_executor: std_http_executor.StdHttpExecutor = undefined;
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
-    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+    _ = client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
     var metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, client_executor.executor());
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "split public docs");
@@ -11364,59 +11364,59 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
-test "metadata http cluster simulation forwards public merge flow from a non-host node after public create" {
+test "metadata VOPR http cluster forwards public merge flow from a non-host node after public create" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var sim_alloc_state: LeanSimAllocator = .init;
-    defer _ = sim_alloc_state.deinit();
-    const sim_alloc = sim_alloc_state.allocator();
+    var vopr_alloc_state: LeanVoprAllocator = .init;
+    defer _ = vopr_alloc_state.deinit();
+    const vopr_alloc = vopr_alloc_state.allocator();
 
-    var store_a = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_a = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_a.deinit();
-    var store_b = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_b = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_b.deinit();
-    var store_c = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_c = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_c.deinit();
-    var store_d = raft_engine.core.MemoryStorage.init(sim_alloc);
+    var store_d = raft_engine.core.MemoryStorage.init(vopr_alloc);
     defer store_d.deinit();
 
-    var factory_a = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_a, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_b = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_b, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_c = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
-    var factory_d = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_a = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_a, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_b = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_b, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_c = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
+    var factory_d = TestDescriptorFactory{ .alloc = vopr_alloc, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
 
-    const root_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-a", .{tmp.sub_path});
-    defer sim_alloc.free(root_a);
-    const root_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-b", .{tmp.sub_path});
-    defer sim_alloc.free(root_b);
-    const root_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-c", .{tmp.sub_path});
-    defer sim_alloc.free(root_c);
-    const root_d = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-d", .{tmp.sub_path});
-    defer sim_alloc.free(root_d);
-    const cat_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-a.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-b.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-c.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_c);
-    const cat_d = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-d.txt", .{tmp.sub_path});
-    defer sim_alloc.free(cat_d);
+    const root_a = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-a", .{tmp.sub_path});
+    defer vopr_alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-b", .{tmp.sub_path});
+    defer vopr_alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-c", .{tmp.sub_path});
+    defer vopr_alloc.free(root_c);
+    const root_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-d", .{tmp.sub_path});
+    defer vopr_alloc.free(root_d);
+    const cat_a = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-a.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-b.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-c.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_c);
+    const cat_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-d.txt", .{tmp.sub_path});
+    defer vopr_alloc.free(cat_d);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4862, root_a, cat_a),
-        makeHostSimConfig(2, 4862, root_b, cat_b),
-        makeHostSimConfig(3, 4862, root_c, cat_c),
-        makeHostSimConfig(4, 4862, root_d, cat_d),
+        makeHostVoprConfig(1, 4862, root_a, cat_a),
+        makeHostVoprConfig(2, 4862, root_b, cat_b),
+        makeHostVoprConfig(3, 4862, root_c, cat_c),
+        makeHostVoprConfig(4, 4862, root_d, cat_d),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
-        makeHostSimDeps(&factory_d),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+        makeHostVoprDeps(&factory_d),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(sim_alloc, 4862, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(vopr_alloc, 4862, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -11427,16 +11427,16 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(
         4,
-        sim_alloc,
+        vopr_alloc,
         &cluster,
         &http_io,
         &metadata_admin_listeners,
@@ -11446,7 +11446,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     );
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
     defer deinitMetadataAdminServers(4, &metadata_admin_servers);
-    defer for (metadata_apis) |uri| sim_alloc.free(uri);
+    defer for (metadata_apis) |uri| vopr_alloc.free(uri);
 
     var listeners: [4]api_http_test_runtime.Runtime = undefined;
     var servers: [4]api_http_server.ApiHttpServer = undefined;
@@ -11463,7 +11463,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     defer forward_executor.deinit();
     try startPublicApiServers(
         4,
-        sim_alloc,
+        vopr_alloc,
         &cluster,
         http_io.io(),
         http_io.async_limit,
@@ -11480,14 +11480,14 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
         .{},
         &api_base_uris,
     );
-    defer for (api_base_uris) |uri| sim_alloc.free(uri);
+    defer for (api_base_uris) |uri| vopr_alloc.free(uri);
     defer deinitPublicApiStack(4, &listeners, &servers, &write_sources);
 
     var client_executor: std_http_executor.StdHttpExecutor = undefined;
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
-    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+    _ = client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
     var metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, client_executor.executor());
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "merge public docs");
@@ -11600,7 +11600,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
-test "metadata http cluster simulation survives metadata leader restart during placement reconcile" {
+test "metadata VOPR http cluster survives metadata leader restart during placement reconcile" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -11615,31 +11615,31 @@ test "metadata http cluster simulation survives metadata leader restart during p
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-r-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-r-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-r-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-r-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-r-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-r-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-r-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-r-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-r-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-r-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-r-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-r-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4100, root_a, cat_a),
-        makeHostSimConfig(2, 4100, root_b, cat_b),
-        makeHostSimConfig(3, 4100, root_c, cat_c),
+        makeHostVoprConfig(1, 4100, root_a, cat_a),
+        makeHostVoprConfig(2, 4100, root_b, cat_b),
+        makeHostVoprConfig(3, 4100, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4100, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4100, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -11673,7 +11673,7 @@ test "metadata http cluster simulation survives metadata leader restart during p
     try std.testing.expectEqual(@as(usize, 1), tables.len);
 }
 
-test "metadata http cluster simulation drops table topology across leader restart" {
+test "metadata VOPR http cluster drops table topology across leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -11688,31 +11688,31 @@ test "metadata http cluster simulation drops table topology across leader restar
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-drop-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-drop-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-drop-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-drop-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-drop-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-drop-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-drop-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-drop-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-drop-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-drop-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-drop-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-drop-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4200, root_a, cat_a),
-        makeHostSimConfig(2, 4200, root_b, cat_b),
-        makeHostSimConfig(3, 4200, root_c, cat_c),
+        makeHostVoprConfig(1, 4200, root_a, cat_a),
+        makeHostVoprConfig(2, 4200, root_b, cat_b),
+        makeHostVoprConfig(3, 4200, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4200, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4200, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -11760,7 +11760,7 @@ test "metadata http cluster simulation drops table topology across leader restar
     try std.testing.expectEqual(@as(usize, 0), intents.len);
 }
 
-test "metadata http cluster simulation converges placement after candidate churn" {
+test "metadata VOPR http cluster converges placement after candidate churn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -11775,31 +11775,31 @@ test "metadata http cluster simulation converges placement after candidate churn
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-churn-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-churn-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-churn-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-churn-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-churn-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-churn-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-churn-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-churn-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-churn-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-churn-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-churn-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-churn-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4300, root_a, cat_a),
-        makeHostSimConfig(2, 4300, root_b, cat_b),
-        makeHostSimConfig(3, 4300, root_c, cat_c),
+        makeHostVoprConfig(1, 4300, root_a, cat_a),
+        makeHostVoprConfig(2, 4300, root_b, cat_b),
+        makeHostVoprConfig(3, 4300, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4300, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4300, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -11860,7 +11860,7 @@ test "metadata http cluster simulation converges placement after candidate churn
     try std.testing.expect(saw_three);
 }
 
-test "metadata http cluster simulation drives split intent through the control loop" {
+test "metadata VOPR http cluster drives split intent through the control loop" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -11875,31 +11875,31 @@ test "metadata http cluster simulation drives split intent through the control l
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-split-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-split-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-split-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-split-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-split-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-split-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-split-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-split-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-split-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-split-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-split-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-split-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4400, root_a, cat_a),
-        makeHostSimConfig(2, 4400, root_b, cat_b),
-        makeHostSimConfig(3, 4400, root_c, cat_c),
+        makeHostVoprConfig(1, 4400, root_a, cat_a),
+        makeHostVoprConfig(2, 4400, root_b, cat_b),
+        makeHostVoprConfig(3, 4400, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4400, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4400, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -11948,7 +11948,7 @@ test "metadata http cluster simulation drives split intent through the control l
     try std.testing.expect(observation.status.phase != .prepare or observation.status.source_split_phase != .prepare);
 }
 
-test "metadata http cluster simulation drives merge intent through the control loop" {
+test "metadata VOPR http cluster drives merge intent through the control loop" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -11963,31 +11963,31 @@ test "metadata http cluster simulation drives merge intent through the control l
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-merge-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-merge-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-merge-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-merge-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-merge-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-merge-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-merge-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-merge-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-merge-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-merge-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-merge-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-merge-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4500, root_a, cat_a),
-        makeHostSimConfig(2, 4500, root_b, cat_b),
-        makeHostSimConfig(3, 4500, root_c, cat_c),
+        makeHostVoprConfig(1, 4500, root_a, cat_a),
+        makeHostVoprConfig(2, 4500, root_b, cat_b),
+        makeHostVoprConfig(3, 4500, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4500, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4500, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -12043,7 +12043,7 @@ test "metadata http cluster simulation drives merge intent through the control l
     try std.testing.expect(observation.donor.phase != .prepare or observation.receiver.phase != .prepare);
 }
 
-test "metadata http cluster simulation drives automatic split through the control loop" {
+test "metadata VOPR http cluster drives automatic split through the control loop" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12058,34 +12058,34 @@ test "metadata http cluster simulation drives automatic split through the contro
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4510, root_a, cat_a),
-        makeHostSimConfig(2, 4510, root_b, cat_b),
-        makeHostSimConfig(3, 4510, root_c, cat_c),
+        makeHostVoprConfig(1, 4510, root_a, cat_a),
+        makeHostVoprConfig(2, 4510, root_b, cat_b),
+        makeHostVoprConfig(3, 4510, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4510, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4510, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -12144,7 +12144,7 @@ test "metadata http cluster simulation drives automatic split through the contro
     try std.testing.expectEqual(@as(usize, 0), remaining_splits.len);
 }
 
-test "metadata http cluster simulation uses live median key for automatic split planning" {
+test "metadata VOPR http cluster uses live median key for automatic split planning" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12159,34 +12159,34 @@ test "metadata http cluster simulation uses live median key for automatic split 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-live-median-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-live-median-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-live-median-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-live-median-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-live-median-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-live-median-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-live-median-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-live-median-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-live-median-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-live-median-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-live-median-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-live-median-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4510, root_a, cat_a),
-        makeHostSimConfig(2, 4510, root_b, cat_b),
-        makeHostSimConfig(3, 4510, root_c, cat_c),
+        makeHostVoprConfig(1, 4510, root_a, cat_a),
+        makeHostVoprConfig(2, 4510, root_b, cat_b),
+        makeHostVoprConfig(3, 4510, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4510, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4510, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
     const leader_index = try startBootstrappedMetadataCluster(&cluster, 48, true);
@@ -12245,7 +12245,7 @@ test "metadata http cluster simulation uses live median key for automatic split 
     try std.testing.expectEqualStrings("doc:m", transitions[0].split_key.?);
 }
 
-test "metadata http cluster simulation uses remote live median key when metadata leader is not a shard replica" {
+test "metadata VOPR http cluster uses remote live median key when metadata leader is not a shard replica" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12263,41 +12263,41 @@ test "metadata http cluster simulation uses remote live median key when metadata
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
     var factory_d = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-remote-median-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-remote-median-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-remote-median-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const root_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-remote-median-d", .{tmp.sub_path});
+    const root_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-d", .{tmp.sub_path});
     defer std.testing.allocator.free(root_d);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
     factory_d.split_runtime.replica_root_dir = root_d;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-remote-median-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-remote-median-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-remote-median-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
-    const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-remote-median-d.txt", .{tmp.sub_path});
+    const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4510, root_a, cat_a),
-        makeHostSimConfig(2, 4510, root_b, cat_b),
-        makeHostSimConfig(3, 4510, root_c, cat_c),
-        makeHostSimConfig(4, 4510, root_d, cat_d),
+        makeHostVoprConfig(1, 4510, root_a, cat_a),
+        makeHostVoprConfig(2, 4510, root_b, cat_b),
+        makeHostVoprConfig(3, 4510, root_c, cat_c),
+        makeHostVoprConfig(4, 4510, root_d, cat_d),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
-        makeHostSimDeps(&factory_d),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+        makeHostVoprDeps(&factory_d),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4510, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4510, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
     const initial_leader = try startBootstrappedMetadataCluster(&cluster, 48, true);
@@ -12369,7 +12369,7 @@ test "metadata http cluster simulation uses remote live median key when metadata
     try std.testing.expectEqualStrings("doc:m", transitions[0].split_key.?);
 }
 
-test "metadata http cluster simulation completes automatic split after metadata leader restart" {
+test "metadata VOPR http cluster completes automatic split after metadata leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12384,34 +12384,34 @@ test "metadata http cluster simulation completes automatic split after metadata 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4515, root_a, cat_a),
-        makeHostSimConfig(2, 4515, root_b, cat_b),
-        makeHostSimConfig(3, 4515, root_c, cat_c),
+        makeHostVoprConfig(1, 4515, root_a, cat_a),
+        makeHostVoprConfig(2, 4515, root_b, cat_b),
+        makeHostVoprConfig(3, 4515, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4515, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4515, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -12470,7 +12470,7 @@ test "metadata http cluster simulation completes automatic split after metadata 
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic split after metadata leader partition" {
+test "metadata VOPR http cluster completes automatic split after metadata leader partition" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12485,34 +12485,34 @@ test "metadata http cluster simulation completes automatic split after metadata 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-partition-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-partition-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-partition-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-partition-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-partition-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-partition-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-partition-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-partition-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-partition-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-partition-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-partition-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-partition-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4516, root_a, cat_a),
-        makeHostSimConfig(2, 4516, root_b, cat_b),
-        makeHostSimConfig(3, 4516, root_c, cat_c),
+        makeHostVoprConfig(1, 4516, root_a, cat_a),
+        makeHostVoprConfig(2, 4516, root_b, cat_b),
+        makeHostVoprConfig(3, 4516, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4516, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4516, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -12570,7 +12570,7 @@ test "metadata http cluster simulation completes automatic split after metadata 
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic split under delayed raft transport" {
+test "metadata VOPR http cluster completes automatic split under delayed raft transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12592,34 +12592,34 @@ test "metadata http cluster simulation completes automatic split under delayed r
     var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4517, root_a, cat_a),
-        makeHostSimConfig(2, 4517, root_b, cat_b),
-        makeHostSimConfig(3, 4517, root_c, cat_c),
+        makeHostVoprConfig(1, 4517, root_a, cat_a),
+        makeHostVoprConfig(2, 4517, root_b, cat_b),
+        makeHostVoprConfig(3, 4517, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4517, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4517, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -12675,7 +12675,7 @@ test "metadata http cluster simulation completes automatic split under delayed r
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic split after leader restart under delayed raft transport" {
+test "metadata VOPR http cluster completes automatic split after leader restart under delayed raft transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12697,34 +12697,34 @@ test "metadata http cluster simulation completes automatic split after leader re
     var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4519, root_a, cat_a),
-        makeHostSimConfig(2, 4519, root_b, cat_b),
-        makeHostSimConfig(3, 4519, root_c, cat_c),
+        makeHostVoprConfig(1, 4519, root_a, cat_a),
+        makeHostVoprConfig(2, 4519, root_b, cat_b),
+        makeHostVoprConfig(3, 4519, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4519, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4519, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -12783,7 +12783,7 @@ test "metadata http cluster simulation completes automatic split after leader re
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic split after source group leader restart" {
+test "metadata VOPR http cluster completes automatic split after source group leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12798,34 +12798,34 @@ test "metadata http cluster simulation completes automatic split after source gr
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-source-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-source-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-source-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-source-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-source-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-source-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-source-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-source-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-source-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-source-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-source-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-source-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4544, root_a, cat_a),
-        makeHostSimConfig(2, 4544, root_b, cat_b),
-        makeHostSimConfig(3, 4544, root_c, cat_c),
+        makeHostVoprConfig(1, 4544, root_a, cat_a),
+        makeHostVoprConfig(2, 4544, root_b, cat_b),
+        makeHostVoprConfig(3, 4544, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4544, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4544, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -12885,7 +12885,7 @@ test "metadata http cluster simulation completes automatic split after source gr
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic split after destination group leader restart" {
+test "metadata VOPR http cluster completes automatic split after destination group leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12900,34 +12900,34 @@ test "metadata http cluster simulation completes automatic split after destinati
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-destination-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-destination-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-destination-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-destination-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-destination-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-destination-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-destination-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-destination-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-destination-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-destination-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-destination-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-destination-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4545, root_a, cat_a),
-        makeHostSimConfig(2, 4545, root_b, cat_b),
-        makeHostSimConfig(3, 4545, root_c, cat_c),
+        makeHostVoprConfig(1, 4545, root_a, cat_a),
+        makeHostVoprConfig(2, 4545, root_b, cat_b),
+        makeHostVoprConfig(3, 4545, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4545, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4545, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -13012,7 +13012,7 @@ test "metadata http cluster simulation completes automatic split after destinati
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic split after leader partition under delayed raft transport" {
+test "metadata VOPR http cluster completes automatic split after leader partition under delayed raft transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -13034,34 +13034,34 @@ test "metadata http cluster simulation completes automatic split after leader pa
     var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-partition-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-partition-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-partition-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-partition-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-partition-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-partition-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     factory_a.split_runtime.replica_root_dir = root_a;
     factory_b.split_runtime.replica_root_dir = root_b;
     factory_c.split_runtime.replica_root_dir = root_c;
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-partition-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-partition-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-partition-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-partition-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-split-delay-partition-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-partition-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4521, root_a, cat_a),
-        makeHostSimConfig(2, 4521, root_b, cat_b),
-        makeHostSimConfig(3, 4521, root_c, cat_c),
+        makeHostVoprConfig(1, 4521, root_a, cat_a),
+        makeHostVoprConfig(2, 4521, root_b, cat_b),
+        makeHostVoprConfig(3, 4521, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4521, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4521, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
     const leader_index = try startBootstrappedMetadataCluster(&cluster, 48, true);
@@ -13113,10 +13113,10 @@ test "metadata http cluster simulation completes automatic split after leader pa
     try std.testing.expectEqual(@as(usize, 2), ranges.len);
 }
 
-test "metadata http cluster simulation serves public traffic across automatic split under delayed raft transport" {
+test "metadata VOPR http cluster serves public traffic across automatic split under delayed raft transport" {
     try runAutomaticSplitPublicTrafficScenario(.{
         .table_id = 4518,
-        .path_prefix = "metadata-sim-auto-split-public-delay",
+        .path_prefix = "metadata-vopr-auto-split-public-delay",
         .description = "automatic split public delay docs",
         .delayed_transport = true,
         .bootstrap_rounds = 48,
@@ -13133,10 +13133,10 @@ test "metadata http cluster simulation serves public traffic across automatic sp
     });
 }
 
-test "metadata http cluster simulation serves public traffic across automatic split after leader restart under delayed raft transport" {
+test "metadata VOPR http cluster serves public traffic across automatic split after leader restart under delayed raft transport" {
     try runAutomaticSplitPublicTrafficScenario(.{
         .table_id = 4523,
-        .path_prefix = "metadata-sim-auto-split-public-delay-restart",
+        .path_prefix = "metadata-vopr-auto-split-public-delay-restart",
         .description = "automatic split public delay restart docs",
         .delayed_transport = true,
         .bootstrap_rounds = 48,
@@ -13156,10 +13156,10 @@ test "metadata http cluster simulation serves public traffic across automatic sp
     });
 }
 
-test "metadata http cluster simulation serves public traffic across automatic split after source leader restart under delayed raft transport" {
+test "metadata VOPR http cluster serves public traffic across automatic split after source leader restart under delayed raft transport" {
     try runAutomaticSplitPublicTrafficScenario(.{
         .table_id = 4548,
-        .path_prefix = "metadata-sim-auto-split-public-source-restart",
+        .path_prefix = "metadata-vopr-auto-split-public-source-restart",
         .description = "automatic split public source restart docs",
         .delayed_transport = true,
         .bootstrap_rounds = 48,
@@ -13178,10 +13178,10 @@ test "metadata http cluster simulation serves public traffic across automatic sp
     });
 }
 
-test "metadata http cluster simulation serves public traffic across automatic split after leader partition under delayed raft transport" {
+test "metadata VOPR http cluster serves public traffic across automatic split after leader partition under delayed raft transport" {
     try runAutomaticSplitPublicTrafficScenario(.{
         .table_id = 4522,
-        .path_prefix = "metadata-sim-auto-split-public-delay-partition",
+        .path_prefix = "metadata-vopr-auto-split-public-delay-partition",
         .description = "automatic split public delay partition docs",
         .delayed_transport = true,
         .bootstrap_rounds = 48,
@@ -13201,10 +13201,10 @@ test "metadata http cluster simulation serves public traffic across automatic sp
     });
 }
 
-test "metadata http cluster simulation serves public traffic across automatic split after metadata leader partition" {
+test "metadata VOPR http cluster serves public traffic across automatic split after metadata leader partition" {
     try runAutomaticSplitPublicTrafficScenario(.{
         .table_id = 4527,
-        .path_prefix = "metadata-sim-auto-split-public-partition",
+        .path_prefix = "metadata-vopr-auto-split-public-partition",
         .description = "automatic split public partition docs",
         .delayed_transport = false,
         .bootstrap_rounds = 24,
@@ -13236,7 +13236,7 @@ test "metadata VOPR distributed data survives split partition node restart and m
     replayed.deinit();
 }
 
-test "metadata http cluster simulation drives automatic merge through the control loop" {
+test "metadata VOPR http cluster drives automatic merge through the control loop" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -13251,31 +13251,31 @@ test "metadata http cluster simulation drives automatic merge through the contro
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4520, root_a, cat_a),
-        makeHostSimConfig(2, 4520, root_b, cat_b),
-        makeHostSimConfig(3, 4520, root_c, cat_c),
+        makeHostVoprConfig(1, 4520, root_a, cat_a),
+        makeHostVoprConfig(2, 4520, root_b, cat_b),
+        makeHostVoprConfig(3, 4520, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4520, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4520, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -13343,7 +13343,7 @@ test "metadata http cluster simulation drives automatic merge through the contro
     try std.testing.expectEqual(@as(usize, 0), remaining_merges.len);
 }
 
-test "metadata http cluster simulation completes automatic merge after metadata leader restart" {
+test "metadata VOPR http cluster completes automatic merge after metadata leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -13358,31 +13358,31 @@ test "metadata http cluster simulation completes automatic merge after metadata 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4525, root_a, cat_a),
-        makeHostSimConfig(2, 4525, root_b, cat_b),
-        makeHostSimConfig(3, 4525, root_c, cat_c),
+        makeHostVoprConfig(1, 4525, root_a, cat_a),
+        makeHostVoprConfig(2, 4525, root_b, cat_b),
+        makeHostVoprConfig(3, 4525, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4525, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4525, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -13449,7 +13449,7 @@ test "metadata http cluster simulation completes automatic merge after metadata 
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic merge after donor group leader restart" {
+test "metadata VOPR http cluster completes automatic merge after donor group leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -13464,31 +13464,31 @@ test "metadata http cluster simulation completes automatic merge after donor gro
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-donor-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-donor-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-donor-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-donor-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-donor-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-donor-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-donor-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-donor-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-donor-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-donor-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-donor-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-donor-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4546, root_a, cat_a),
-        makeHostSimConfig(2, 4546, root_b, cat_b),
-        makeHostSimConfig(3, 4546, root_c, cat_c),
+        makeHostVoprConfig(1, 4546, root_a, cat_a),
+        makeHostVoprConfig(2, 4546, root_b, cat_b),
+        makeHostVoprConfig(3, 4546, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4546, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4546, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -13556,7 +13556,7 @@ test "metadata http cluster simulation completes automatic merge after donor gro
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic merge after receiver group leader restart" {
+test "metadata VOPR http cluster completes automatic merge after receiver group leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -13571,31 +13571,31 @@ test "metadata http cluster simulation completes automatic merge after receiver 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-receiver-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-receiver-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-receiver-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-receiver-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-receiver-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-receiver-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-receiver-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-receiver-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-receiver-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-receiver-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-receiver-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-receiver-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4547, root_a, cat_a),
-        makeHostSimConfig(2, 4547, root_b, cat_b),
-        makeHostSimConfig(3, 4547, root_c, cat_c),
+        makeHostVoprConfig(1, 4547, root_a, cat_a),
+        makeHostVoprConfig(2, 4547, root_b, cat_b),
+        makeHostVoprConfig(3, 4547, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4547, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4547, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -13663,7 +13663,7 @@ test "metadata http cluster simulation completes automatic merge after receiver 
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic merge after metadata leader partition" {
+test "metadata VOPR http cluster completes automatic merge after metadata leader partition" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -13678,31 +13678,31 @@ test "metadata http cluster simulation completes automatic merge after metadata 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-partition-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-partition-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-partition-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-partition-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-partition-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-partition-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-partition-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-partition-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-partition-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-partition-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-partition-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-partition-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4526, root_a, cat_a),
-        makeHostSimConfig(2, 4526, root_b, cat_b),
-        makeHostSimConfig(3, 4526, root_c, cat_c),
+        makeHostVoprConfig(1, 4526, root_a, cat_a),
+        makeHostVoprConfig(2, 4526, root_b, cat_b),
+        makeHostVoprConfig(3, 4526, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4526, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4526, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -13768,7 +13768,7 @@ test "metadata http cluster simulation completes automatic merge after metadata 
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic merge under delayed raft transport" {
+test "metadata VOPR http cluster completes automatic merge under delayed raft transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -13790,31 +13790,31 @@ test "metadata http cluster simulation completes automatic merge under delayed r
     var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4529, root_a, cat_a),
-        makeHostSimConfig(2, 4529, root_b, cat_b),
-        makeHostSimConfig(3, 4529, root_c, cat_c),
+        makeHostVoprConfig(1, 4529, root_a, cat_a),
+        makeHostVoprConfig(2, 4529, root_b, cat_b),
+        makeHostVoprConfig(3, 4529, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4529, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4529, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -13878,7 +13878,7 @@ test "metadata http cluster simulation completes automatic merge under delayed r
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic merge after leader restart under delayed raft transport" {
+test "metadata VOPR http cluster completes automatic merge after leader restart under delayed raft transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -13900,31 +13900,31 @@ test "metadata http cluster simulation completes automatic merge after leader re
     var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4531, root_a, cat_a),
-        makeHostSimConfig(2, 4531, root_b, cat_b),
-        makeHostSimConfig(3, 4531, root_c, cat_c),
+        makeHostVoprConfig(1, 4531, root_a, cat_a),
+        makeHostVoprConfig(2, 4531, root_b, cat_b),
+        makeHostVoprConfig(3, 4531, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4531, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4531, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -13991,7 +13991,7 @@ test "metadata http cluster simulation completes automatic merge after leader re
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 }
 
-test "metadata http cluster simulation completes automatic merge after leader partition under delayed raft transport" {
+test "metadata VOPR http cluster completes automatic merge after leader partition under delayed raft transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -14013,31 +14013,31 @@ test "metadata http cluster simulation completes automatic merge after leader pa
     var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-partition-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-partition-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-partition-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-partition-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-partition-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-partition-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-partition-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-partition-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-partition-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-partition-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-merge-delay-partition-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-partition-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4532, root_a, cat_a),
-        makeHostSimConfig(2, 4532, root_b, cat_b),
-        makeHostSimConfig(3, 4532, root_c, cat_c),
+        makeHostVoprConfig(1, 4532, root_a, cat_a),
+        makeHostVoprConfig(2, 4532, root_b, cat_b),
+        makeHostVoprConfig(3, 4532, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
-        makeHostSimDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
+        makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4532, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4532, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -14103,10 +14103,10 @@ test "metadata http cluster simulation completes automatic merge after leader pa
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
 }
 
-test "metadata http cluster simulation serves public traffic across automatic merge under delayed raft transport" {
+test "metadata VOPR http cluster serves public traffic across automatic merge under delayed raft transport" {
     try runAutomaticMergePublicTrafficScenario(.{
         .table_id = 4530,
-        .path_prefix = "metadata-sim-auto-merge-public-delay",
+        .path_prefix = "metadata-vopr-auto-merge-public-delay",
         .description = "automatic merge public delay docs",
         .delayed_transport = true,
         .bootstrap_rounds = 48,
@@ -14124,10 +14124,10 @@ test "metadata http cluster simulation serves public traffic across automatic me
     });
 }
 
-test "metadata http cluster simulation serves public traffic across automatic merge after leader restart under delayed raft transport" {
+test "metadata VOPR http cluster serves public traffic across automatic merge after leader restart under delayed raft transport" {
     try runAutomaticMergePublicTrafficScenario(.{
         .table_id = 4534,
-        .path_prefix = "metadata-sim-auto-merge-public-delay-restart",
+        .path_prefix = "metadata-vopr-auto-merge-public-delay-restart",
         .description = "automatic merge public delay restart docs",
         .delayed_transport = true,
         .bootstrap_rounds = 48,
@@ -14147,10 +14147,10 @@ test "metadata http cluster simulation serves public traffic across automatic me
     });
 }
 
-test "metadata http cluster simulation serves public traffic across automatic merge after donor leader restart under delayed raft transport" {
+test "metadata VOPR http cluster serves public traffic across automatic merge after donor leader restart under delayed raft transport" {
     try runAutomaticMergePublicTrafficScenario(.{
         .table_id = 4549,
-        .path_prefix = "metadata-sim-auto-merge-public-donor-restart",
+        .path_prefix = "metadata-vopr-auto-merge-public-donor-restart",
         .description = "automatic merge public donor restart docs",
         .delayed_transport = true,
         .bootstrap_rounds = 48,
@@ -14169,10 +14169,10 @@ test "metadata http cluster simulation serves public traffic across automatic me
     });
 }
 
-test "metadata http cluster simulation serves public traffic across automatic merge after leader partition under delayed raft transport" {
+test "metadata VOPR http cluster serves public traffic across automatic merge after leader partition under delayed raft transport" {
     try runAutomaticMergePublicTrafficScenario(.{
         .table_id = 4533,
-        .path_prefix = "metadata-sim-auto-merge-public-delay-partition",
+        .path_prefix = "metadata-vopr-auto-merge-public-delay-partition",
         .description = "automatic merge public delay partition docs",
         .delayed_transport = true,
         .bootstrap_rounds = 48,
@@ -14193,10 +14193,10 @@ test "metadata http cluster simulation serves public traffic across automatic me
     });
 }
 
-test "metadata http cluster simulation serves public traffic across automatic merge after metadata leader partition" {
+test "metadata VOPR http cluster serves public traffic across automatic merge after metadata leader partition" {
     try runAutomaticMergePublicTrafficScenario(.{
         .table_id = 4528,
-        .path_prefix = "metadata-sim-auto-merge-public-partition",
+        .path_prefix = "metadata-vopr-auto-merge-public-partition",
         .description = "automatic merge public partition docs",
         .delayed_transport = false,
         .bootstrap_rounds = 24,
@@ -14217,7 +14217,7 @@ test "metadata http cluster simulation serves public traffic across automatic me
     });
 }
 
-test "metadata http cluster simulation survives leader restart before forced automatic split reconcile" {
+test "metadata VOPR http cluster survives leader restart before forced automatic split reconcile" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -14232,32 +14232,32 @@ test "metadata http cluster simulation survives leader restart before forced aut
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-reallocate-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-reallocate-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-reallocate-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-reallocate-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-reallocate-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-reallocate-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
     const roots = [_][]const u8{ root_a, root_b, root_c };
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-reallocate-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-reallocate-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-reallocate-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-reallocate-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-auto-reallocate-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-reallocate-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4530, root_a, cat_a),
-        makeHostSimConfig(2, 4530, root_b, cat_b),
-        makeHostSimConfig(3, 4530, root_c, cat_c),
+        makeHostVoprConfig(1, 4530, root_a, cat_a),
+        makeHostVoprConfig(2, 4530, root_b, cat_b),
+        makeHostVoprConfig(3, 4530, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4530, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4530, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
     const leader_index = try startBootstrappedMetadataCluster(&cluster, 24, true);
@@ -14299,7 +14299,7 @@ test "metadata http cluster simulation survives leader restart before forced aut
     try std.testing.expect((try cluster.node(new_leader).getProjectedReallocationRequest()) == null);
 }
 
-test "metadata http cluster simulation publishes split topology after finalize" {
+test "metadata VOPR http cluster publishes split topology after finalize" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -14328,17 +14328,17 @@ test "metadata http cluster simulation publishes split topology after finalize" 
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4700, root_a, cat_a),
-        makeHostSimConfig(2, 4700, root_b, cat_b),
-        makeHostSimConfig(3, 4700, root_c, cat_c),
+        makeHostVoprConfig(1, 4700, root_a, cat_a),
+        makeHostVoprConfig(2, 4700, root_b, cat_b),
+        makeHostVoprConfig(3, 4700, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4700, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4700, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -14388,7 +14388,7 @@ test "metadata http cluster simulation publishes split topology after finalize" 
     try std.testing.expectEqual(@as(usize, 0), splits.len);
 }
 
-test "metadata http cluster simulation publishes merge topology after finalize" {
+test "metadata VOPR http cluster publishes merge topology after finalize" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -14417,17 +14417,17 @@ test "metadata http cluster simulation publishes merge topology after finalize" 
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4800, root_a, cat_a),
-        makeHostSimConfig(2, 4800, root_b, cat_b),
-        makeHostSimConfig(3, 4800, root_c, cat_c),
+        makeHostVoprConfig(1, 4800, root_a, cat_a),
+        makeHostVoprConfig(2, 4800, root_b, cat_b),
+        makeHostVoprConfig(3, 4800, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4800, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4800, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -14486,7 +14486,7 @@ test "metadata http cluster simulation publishes merge topology after finalize" 
     try std.testing.expectEqual(@as(usize, 0), merges.len);
 }
 
-test "metadata http cluster simulation provisions split destination replicas across nodes" {
+test "metadata VOPR http cluster provisions split destination replicas across nodes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -14515,17 +14515,17 @@ test "metadata http cluster simulation provisions split destination replicas acr
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4810, root_a, cat_a),
-        makeHostSimConfig(2, 4810, root_b, cat_b),
-        makeHostSimConfig(3, 4810, root_c, cat_c),
+        makeHostVoprConfig(1, 4810, root_a, cat_a),
+        makeHostVoprConfig(2, 4810, root_b, cat_b),
+        makeHostVoprConfig(3, 4810, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4810, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4810, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -14571,7 +14571,7 @@ test "metadata http cluster simulation provisions split destination replicas acr
     try std.testing.expect(try cluster.waitForGroupStatus(4812, .active, 40));
 }
 
-test "metadata http cluster simulation retires merge donor replicas across nodes" {
+test "metadata VOPR http cluster retires merge donor replicas across nodes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -14600,17 +14600,17 @@ test "metadata http cluster simulation retires merge donor replicas across nodes
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4820, root_a, cat_a),
-        makeHostSimConfig(2, 4820, root_b, cat_b),
-        makeHostSimConfig(3, 4820, root_c, cat_c),
+        makeHostVoprConfig(1, 4820, root_a, cat_a),
+        makeHostVoprConfig(2, 4820, root_b, cat_b),
+        makeHostVoprConfig(3, 4820, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4820, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4820, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -14666,9 +14666,9 @@ test "metadata http cluster simulation retires merge donor replicas across nodes
     try std.testing.expect(try cluster.waitForGroupStatus(4822, .absent, 40));
 }
 
-test "metadata http cluster simulation forwards public table io from a non-host node" {
+test "metadata VOPR http cluster forwards public table io from a non-host node" {
     const TestStatusSource = struct {
-        node: MetadataHttpNodeSimulation,
+        node: MetadataHttpNodeVopr,
 
         fn iface(self: *@This()) api_http_server.StatusSource {
             return .{
@@ -14700,8 +14700,8 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     const TestCatalogSource = PublicApiCatalogSource;
 
     const TestRouter = struct {
-        node: MetadataHttpNodeSimulation,
-        cluster: *MetadataHttpClusterSimulation,
+        node: MetadataHttpNodeVopr,
+        cluster: *MetadataHttpClusterVopr,
         api_base_uris: *const [3][]const u8,
 
         fn iface(self: *@This()) api_table_router.HostedGroupRouter {
@@ -14776,17 +14776,17 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4830, root_a, cat_a),
-        makeHostSimConfig(2, 4830, root_b, cat_b),
-        makeHostSimConfig(3, 4830, root_c, cat_c),
+        makeHostVoprConfig(1, 4830, root_a, cat_a),
+        makeHostVoprConfig(2, 4830, root_b, cat_b),
+        makeHostVoprConfig(3, 4830, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4830, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4830, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -14819,7 +14819,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     const client_index: usize = if (actual_host_index == 0) 1 else 0;
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4831));
 
-    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]api_http_test_runtime.Runtime = undefined;
@@ -14836,7 +14836,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
 
-    const http_alloc = leanSimHttpAllocator();
+    const http_alloc = leanVoprHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -14849,19 +14849,19 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
-        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+        _ = read_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
-        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
-        attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
+        _ = write_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
+        attachHostedSourcesBackendRuntimeForVopr(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             std.testing.allocator,
             http_alloc,
-            .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" },
+            .{ .internal_service_secret = vopr_internal_service_secret, .internal_service_issuer = "metadata-vopr" },
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
@@ -14876,7 +14876,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
-    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+    _ = client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -14945,9 +14945,9 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
-test "metadata http cluster simulation forwards public table io across split ranges from a non-host node" {
+test "metadata VOPR http cluster forwards public table io across split ranges from a non-host node" {
     const TestStatusSource = struct {
-        node: MetadataHttpNodeSimulation,
+        node: MetadataHttpNodeVopr,
         fn iface(self: *@This()) api_http_server.StatusSource {
             return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
         }
@@ -14966,8 +14966,8 @@ test "metadata http cluster simulation forwards public table io across split ran
     };
     const TestCatalogSource = PublicApiCatalogSource;
     const TestRouter = struct {
-        node: MetadataHttpNodeSimulation,
-        cluster: *MetadataHttpClusterSimulation,
+        node: MetadataHttpNodeVopr,
+        cluster: *MetadataHttpClusterVopr,
         api_base_uris: *const [3][]const u8,
         fn iface(self: *@This()) api_table_router.HostedGroupRouter {
             return .{ .ptr = self, .vtable = &.{ .local_node_id = localNodeId, .local_status = localStatus, .group_leader_node_id = groupLeaderNodeId, .node_status = nodeStatus, .node_base_uri = nodeBaseUri } };
@@ -15027,17 +15027,17 @@ test "metadata http cluster simulation forwards public table io across split ran
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4840, root_a, cat_a),
-        makeHostSimConfig(2, 4840, root_b, cat_b),
-        makeHostSimConfig(3, 4840, root_c, cat_c),
+        makeHostVoprConfig(1, 4840, root_a, cat_a),
+        makeHostVoprConfig(2, 4840, root_b, cat_b),
+        makeHostVoprConfig(3, 4840, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4840, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4840, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -15093,7 +15093,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         if (i != left and i != right) break i;
     } else return error.TestExpectedEqual;
 
-    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]api_http_test_runtime.Runtime = undefined;
@@ -15109,7 +15109,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     var forward_executor: std_http_executor.StdHttpExecutor = undefined;
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
-    const http_alloc = leanSimHttpAllocator();
+    const http_alloc = leanVoprHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -15122,16 +15122,16 @@ test "metadata http cluster simulation forwards public table io across split ran
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
-        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+        _ = read_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
-        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
-        attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        _ = write_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
+        attachHostedSourcesBackendRuntimeForVopr(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = vopr_internal_service_secret, .internal_service_issuer = "metadata-vopr" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
         listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, http_io.io(), &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -15146,7 +15146,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
-    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+    _ = client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -15213,9 +15213,9 @@ test "metadata http cluster simulation forwards public table io across split ran
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
-test "metadata http cluster simulation forwards public table io after merge finalization from a non-host node" {
+test "metadata VOPR http cluster forwards public table io after merge finalization from a non-host node" {
     const TestStatusSource = struct {
-        node: MetadataHttpNodeSimulation,
+        node: MetadataHttpNodeVopr,
         fn iface(self: *@This()) api_http_server.StatusSource {
             return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
         }
@@ -15234,8 +15234,8 @@ test "metadata http cluster simulation forwards public table io after merge fina
     };
     const TestCatalogSource = PublicApiCatalogSource;
     const TestRouter = struct {
-        node: MetadataHttpNodeSimulation,
-        cluster: *MetadataHttpClusterSimulation,
+        node: MetadataHttpNodeVopr,
+        cluster: *MetadataHttpClusterVopr,
         api_base_uris: *const [3][]const u8,
         fn iface(self: *@This()) api_table_router.HostedGroupRouter {
             return .{ .ptr = self, .vtable = &.{ .local_node_id = localNodeId, .local_status = localStatus, .group_leader_node_id = groupLeaderNodeId, .node_status = nodeStatus, .node_base_uri = nodeBaseUri } };
@@ -15295,17 +15295,17 @@ test "metadata http cluster simulation forwards public table io after merge fina
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4850, root_a, cat_a),
-        makeHostSimConfig(2, 4850, root_b, cat_b),
-        makeHostSimConfig(3, 4850, root_c, cat_c),
+        makeHostVoprConfig(1, 4850, root_a, cat_a),
+        makeHostVoprConfig(2, 4850, root_b, cat_b),
+        makeHostVoprConfig(3, 4850, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4850, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4850, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -15366,7 +15366,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4851));
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4852));
 
-    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]api_http_test_runtime.Runtime = undefined;
@@ -15382,7 +15382,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     var forward_executor: std_http_executor.StdHttpExecutor = undefined;
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
-    const http_alloc = leanSimHttpAllocator();
+    const http_alloc = leanVoprHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -15395,16 +15395,16 @@ test "metadata http cluster simulation forwards public table io after merge fina
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
-        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+        _ = read_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
-        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
-        attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        _ = write_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
+        attachHostedSourcesBackendRuntimeForVopr(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = vopr_internal_service_secret, .internal_service_issuer = "metadata-vopr" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
         listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, http_io.io(), &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -15417,7 +15417,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
-    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+    _ = client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -15446,7 +15446,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
-test "metadata http cluster simulation reconverges placement from committed node membership" {
+test "metadata VOPR http cluster reconverges placement from committed node membership" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -15461,31 +15461,31 @@ test "metadata http cluster simulation reconverges placement from committed node
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-nodes-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-nodes-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-nodes-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-nodes-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-nodes-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-nodes-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-nodes-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-nodes-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-nodes-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-nodes-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-nodes-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-nodes-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4600, root_a, cat_a),
-        makeHostSimConfig(2, 4600, root_b, cat_b),
-        makeHostSimConfig(3, 4600, root_c, cat_c),
+        makeHostVoprConfig(1, 4600, root_a, cat_a),
+        makeHostVoprConfig(2, 4600, root_b, cat_b),
+        makeHostVoprConfig(3, 4600, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4600, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4600, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -15541,7 +15541,7 @@ test "metadata http cluster simulation reconverges placement from committed node
     try std.testing.expect(saw_three);
 }
 
-test "metadata http cluster simulation reconverges placement from committed live stores" {
+test "metadata VOPR http cluster reconverges placement from committed live stores" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -15556,31 +15556,31 @@ test "metadata http cluster simulation reconverges placement from committed live
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-stores-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-stores-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-stores-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-stores-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-stores-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-stores-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-stores-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-stores-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-stores-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-stores-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-stores-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-stores-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4700, root_a, cat_a),
-        makeHostSimConfig(2, 4700, root_b, cat_b),
-        makeHostSimConfig(3, 4700, root_c, cat_c),
+        makeHostVoprConfig(1, 4700, root_a, cat_a),
+        makeHostVoprConfig(2, 4700, root_b, cat_b),
+        makeHostVoprConfig(3, 4700, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4700, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4700, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -15636,7 +15636,7 @@ test "metadata http cluster simulation reconverges placement from committed live
     try std.testing.expect(saw_live_three);
 }
 
-test "metadata http cluster simulation drains node through shutdown API" {
+test "metadata VOPR http cluster drains node through shutdown API" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -15651,31 +15651,31 @@ test "metadata http cluster simulation drains node through shutdown API" {
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-shutdown-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-shutdown-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-shutdown-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-shutdown-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-shutdown-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-shutdown-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-shutdown-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-shutdown-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-shutdown-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-shutdown-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-shutdown-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-shutdown-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4720, root_a, cat_a),
-        makeHostSimConfig(2, 4720, root_b, cat_b),
-        makeHostSimConfig(3, 4720, root_c, cat_c),
+        makeHostVoprConfig(1, 4720, root_a, cat_a),
+        makeHostVoprConfig(2, 4720, root_b, cat_b),
+        makeHostVoprConfig(3, 4720, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4720, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4720, configs[0..], deps[0..]);
     defer cluster.deinit();
     defer cluster.stopAll();
     const leader_index = try startBootstrappedMetadataCluster(&cluster, 24, false);
@@ -15703,9 +15703,9 @@ test "metadata http cluster simulation drains node through shutdown API" {
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(2).status(4821));
 
     try cluster.node(leader_index).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = true });
-    try requestNodeShutdownViaSimAdmin(&cluster, leader_index, 1);
+    try requestNodeShutdownViaVoprAdmin(&cluster, leader_index, 1);
     var drain_ctx = VoprStoreDrainProgressContext{ .store_id = 1, .expected_drain_requested = true };
-    try cluster.assertProgress("metadata-sim-node-shutdown-drain-requested", 32, &drain_ctx, voprStoreDrainProgressPredicate);
+    try cluster.assertProgress("metadata-vopr-node-shutdown-drain-requested", 32, &drain_ctx, voprStoreDrainProgressPredicate);
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
@@ -15728,7 +15728,7 @@ test "metadata http cluster simulation drains node through shutdown API" {
     try std.testing.expect(saw_three);
 }
 
-test "metadata http cluster simulation ignores live stores without available capacity" {
+test "metadata VOPR http cluster ignores live stores without available capacity" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -15743,31 +15743,31 @@ test "metadata http cluster simulation ignores live stores without available cap
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-cap-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-cap-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-cap-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-cap-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-cap-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-cap-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-cap-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-cap-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-cap-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-cap-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-cap-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-cap-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4800, root_a, cat_a),
-        makeHostSimConfig(2, 4800, root_b, cat_b),
-        makeHostSimConfig(3, 4800, root_c, cat_c),
+        makeHostVoprConfig(1, 4800, root_a, cat_a),
+        makeHostVoprConfig(2, 4800, root_b, cat_b),
+        makeHostVoprConfig(3, 4800, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4800, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4800, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -15834,7 +15834,7 @@ test "metadata http cluster simulation ignores live stores without available cap
     try std.testing.expect(saw_three);
 }
 
-test "metadata http cluster simulation rebalances after store capacity churn" {
+test "metadata VOPR http cluster rebalances after store capacity churn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -15849,31 +15849,31 @@ test "metadata http cluster simulation rebalances after store capacity churn" {
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-rebalance-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-rebalance-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-rebalance-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-rebalance-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-rebalance-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-rebalance-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-rebalance-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-rebalance-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-rebalance-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-rebalance-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-rebalance-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-rebalance-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4900, root_a, cat_a),
-        makeHostSimConfig(2, 4900, root_b, cat_b),
-        makeHostSimConfig(3, 4900, root_c, cat_c),
+        makeHostVoprConfig(1, 4900, root_a, cat_a),
+        makeHostVoprConfig(2, 4900, root_b, cat_b),
+        makeHostVoprConfig(3, 4900, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4900, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4900, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -15931,7 +15931,7 @@ test "metadata http cluster simulation rebalances after store capacity churn" {
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5001, .active, 40));
 }
 
-test "metadata http cluster simulation survives leader restart after reported store status churn" {
+test "metadata VOPR http cluster survives leader restart after reported store status churn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -15946,31 +15946,31 @@ test "metadata http cluster simulation survives leader restart after reported st
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-status-restart-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-status-restart-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-status-restart-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-status-restart-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-status-restart-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-status-restart-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-status-restart-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-status-restart-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-status-restart-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-status-restart-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-status-restart-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-status-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4950, root_a, cat_a),
-        makeHostSimConfig(2, 4950, root_b, cat_b),
-        makeHostSimConfig(3, 4950, root_c, cat_c),
+        makeHostVoprConfig(1, 4950, root_a, cat_a),
+        makeHostVoprConfig(2, 4950, root_b, cat_b),
+        makeHostVoprConfig(3, 4950, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4950, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4950, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -16028,7 +16028,7 @@ test "metadata http cluster simulation survives leader restart after reported st
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5201, .active, 40));
 }
 
-test "metadata http cluster simulation transfers reconcile lease on leader restart" {
+test "metadata VOPR http cluster transfers reconcile lease on leader restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -16043,31 +16043,31 @@ test "metadata http cluster simulation transfers reconcile lease on leader resta
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-lease-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-lease-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-lease-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-lease-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-lease-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-lease-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-lease-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-lease-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-lease-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-lease-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-lease-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-lease-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4970, root_a, cat_a),
-        makeHostSimConfig(2, 4970, root_b, cat_b),
-        makeHostSimConfig(3, 4970, root_c, cat_c),
+        makeHostVoprConfig(1, 4970, root_a, cat_a),
+        makeHostVoprConfig(2, 4970, root_b, cat_b),
+        makeHostVoprConfig(3, 4970, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4970, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4970, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -16101,9 +16101,9 @@ test "metadata http cluster simulation transfers reconcile lease on leader resta
     try std.testing.expectEqual(new_leader_status.reconcile_lease_owner_node_id, restarted_status.reconcile_lease_owner_node_id);
 }
 
-test "metadata http cluster simulation recovers from a ready persistence stall without term churn" {
+test "metadata VOPR http cluster recovers from a ready persistence stall without term churn" {
     const PersistenceStall = struct {
-        cluster: ?*MetadataHttpClusterSimulation = null,
+        cluster: ?*MetadataHttpClusterVopr = null,
         node_index: usize,
         armed: bool = false,
         fired: bool = false,
@@ -16141,7 +16141,7 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
 
         fn observePeerLeadership(
             self: *@This(),
-            cluster: *MetadataHttpClusterSimulation,
+            cluster: *MetadataHttpClusterVopr,
         ) !void {
             var observed_leader_node_id: u64 = 0;
             for (0..cluster.cluster.nodes.len) |index| {
@@ -16212,23 +16212,23 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-ready-stall-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-ready-stall-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-ready-stall-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-ready-stall-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-ready-stall-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-ready-stall-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-ready-stall-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4972, root_a, cat_a),
-        makeHostSimConfig(2, 4972, root_b, cat_b),
-        makeHostSimConfig(3, 4972, root_c, cat_c),
+        makeHostVoprConfig(1, 4972, root_a, cat_a),
+        makeHostVoprConfig(2, 4972, root_b, cat_b),
+        makeHostVoprConfig(3, 4972, root_c, cat_c),
     };
     var persistence_stalls = [_]PersistenceStall{
         .{ .node_index = 0 },
@@ -16243,13 +16243,13 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
 
     var read_barriers = [_]ReadBarrierRecorder{ .{}, .{}, .{} };
     var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
     for (&deps, 0..) |*dep, index| dep.host.read_state_observer = read_barriers[index].observer();
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4972, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4972, configs[0..], deps[0..]);
     defer cluster.deinit();
     for (&persistence_stalls) |*stall| stall.cluster = &cluster;
     try cluster.startAll();
@@ -16332,7 +16332,7 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
     }
 }
 
-test "metadata http cluster simulation load balanced backup retries a real election" {
+test "metadata VOPR http cluster load balanced backup retries a real election" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -16361,9 +16361,9 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4973, root_a, cat_a),
-        makeHostSimConfig(2, 4973, root_b, cat_b),
-        makeHostSimConfig(3, 4973, root_c, cat_c),
+        makeHostVoprConfig(1, 4973, root_a, cat_a),
+        makeHostVoprConfig(2, 4973, root_b, cat_b),
+        makeHostVoprConfig(3, 4973, root_c, cat_c),
     };
     var read_drivers = [_]PublicApiLinearizableReadDriver{
         .{ .node_index = 0 },
@@ -16371,13 +16371,13 @@ test "metadata http cluster simulation load balanced backup retries a real elect
         .{ .node_index = 2 },
     };
     var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
     for (&deps, 0..) |*dep, index| dep.host.read_state_observer = read_drivers[index].observer();
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4973, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4973, configs[0..], deps[0..]);
     defer cluster.deinit();
     for (&read_drivers) |*driver| driver.cluster = &cluster;
     try cluster.startAll();
@@ -16445,12 +16445,12 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     defer if (scheduler_locked) cluster.scheduler_gate.unlock();
     const baseline_contentions = cluster.scheduler_gate.contentions.load(.acquire);
     var external_thread = try std.Thread.spawn(
-        .{ .stack_size = lean_sim_thread_stack_size },
+        .{ .stack_size = lean_vopr_thread_stack_size },
         ConcurrentBarrierWorker.run,
         .{&external_barrier},
     );
     var internal_thread = std.Thread.spawn(
-        .{ .stack_size = lean_sim_thread_stack_size },
+        .{ .stack_size = lean_vopr_thread_stack_size },
         ConcurrentBarrierWorker.run,
         .{&internal_barrier},
     ) catch |err| {
@@ -16526,7 +16526,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
         writes[index] = api_table_writes.BoundTableWriteSource.init("docs", &dbs[index]);
     }
 
-    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
     var status_sources: [3]PublicApiStatusSource = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
@@ -16543,14 +16543,14 @@ test "metadata http cluster simulation load balanced backup retries a real elect
         };
         servers[index] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             std.testing.allocator,
-            leanSimHttpAllocator(),
+            leanVoprHttpAllocator(),
             .{ .node_config = &node_config },
             status_sources[index].iface(),
             null,
             writes[index].source(),
         );
         listeners[index] = try api_http_test_runtime.Runtime.startShared(
-            leanSimHttpAllocator(),
+            leanVoprHttpAllocator(),
             http_io.io(),
             &servers[index],
         );
@@ -16567,7 +16567,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
-    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
+    _ = client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
 
     const initial_leader_node_id = cluster.cluster.configs[initial_leader].host.http.host.local_node_id;
     try cluster.virtual_network.partitionNode(initial_leader_node_id);
@@ -16631,7 +16631,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     try std.testing.expectEqual(@as(usize, 0), projected_ranges.len);
 }
 
-test "metadata http cluster simulation skips reconcile work without lease ownership" {
+test "metadata VOPR http cluster skips reconcile work without lease ownership" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -16643,25 +16643,25 @@ test "metadata http cluster simulation skips reconcile work without lease owners
     var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2 } };
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-no-lease-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-no-lease-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-no-lease-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-no-lease-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-no-lease-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-no-lease-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-no-lease-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-no-lease-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4971, root_a, cat_a),
-        makeHostSimConfig(2, 4971, root_b, cat_b),
+        makeHostVoprConfig(1, 4971, root_a, cat_a),
+        makeHostVoprConfig(2, 4971, root_b, cat_b),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4971, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4971, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -16696,7 +16696,7 @@ test "metadata http cluster simulation skips reconcile work without lease owners
     try std.testing.expectEqual(@as(usize, 0), projected_tables.len);
 }
 
-test "metadata http cluster simulation rebalances away from high lease pressure" {
+test "metadata VOPR http cluster rebalances away from high lease pressure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -16711,31 +16711,31 @@ test "metadata http cluster simulation rebalances away from high lease pressure"
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pressure-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pressure-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pressure-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pressure-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pressure-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pressure-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pressure-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pressure-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pressure-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pressure-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pressure-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pressure-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 4960, root_a, cat_a),
-        makeHostSimConfig(2, 4960, root_b, cat_b),
-        makeHostSimConfig(3, 4960, root_c, cat_c),
+        makeHostVoprConfig(1, 4960, root_a, cat_a),
+        makeHostVoprConfig(2, 4960, root_b, cat_b),
+        makeHostVoprConfig(3, 4960, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4960, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 4960, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -16825,7 +16825,7 @@ test "metadata http cluster simulation rebalances away from high lease pressure"
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5301, .active, 40));
 }
 
-test "metadata http cluster simulation repairs replica count after store recovery" {
+test "metadata VOPR http cluster repairs replica count after store recovery" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -16840,31 +16840,31 @@ test "metadata http cluster simulation repairs replica count after store recover
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-repair-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-repair-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-repair-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-repair-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-repair-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-repair-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-repair-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-repair-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-repair-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-repair-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-repair-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-repair-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5000, root_a, cat_a),
-        makeHostSimConfig(2, 5000, root_b, cat_b),
-        makeHostSimConfig(3, 5000, root_c, cat_c),
+        makeHostVoprConfig(1, 5000, root_a, cat_a),
+        makeHostVoprConfig(2, 5000, root_b, cat_b),
+        makeHostVoprConfig(3, 5000, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5000, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5000, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -16917,7 +16917,7 @@ test "metadata http cluster simulation repairs replica count after store recover
     try std.testing.expectEqual(@as(usize, 3), active_count);
 }
 
-test "metadata http cluster simulation spreads multi-range placement across stores" {
+test "metadata VOPR http cluster spreads multi-range placement across stores" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -16932,31 +16932,31 @@ test "metadata http cluster simulation spreads multi-range placement across stor
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-spread-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-spread-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-spread-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-spread-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-spread-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-spread-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-spread-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-spread-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-spread-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-spread-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-spread-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-spread-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5100, root_a, cat_a),
-        makeHostSimConfig(2, 5100, root_b, cat_b),
-        makeHostSimConfig(3, 5100, root_c, cat_c),
+        makeHostVoprConfig(1, 5100, root_a, cat_a),
+        makeHostVoprConfig(2, 5100, root_b, cat_b),
+        makeHostVoprConfig(3, 5100, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5100, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5100, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17016,7 +17016,7 @@ test "metadata http cluster simulation spreads multi-range placement across stor
     try std.testing.expect(counts[2] > 0);
 }
 
-test "metadata http cluster simulation preserves valid placement when a better store appears" {
+test "metadata VOPR http cluster preserves valid placement when a better store appears" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17031,31 +17031,31 @@ test "metadata http cluster simulation preserves valid placement when a better s
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-sticky-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-sticky-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-sticky-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-sticky-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-sticky-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-sticky-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-sticky-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-sticky-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-sticky-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-sticky-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-sticky-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-sticky-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5200, root_a, cat_a),
-        makeHostSimConfig(2, 5200, root_b, cat_b),
-        makeHostSimConfig(3, 5200, root_c, cat_c),
+        makeHostVoprConfig(1, 5200, root_a, cat_a),
+        makeHostVoprConfig(2, 5200, root_b, cat_b),
+        makeHostVoprConfig(3, 5200, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5200, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5200, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17095,7 +17095,7 @@ test "metadata http cluster simulation preserves valid placement when a better s
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(2).status(5301));
 }
 
-test "metadata http cluster simulation rotates replica pairs across tables and ranges" {
+test "metadata VOPR http cluster rotates replica pairs across tables and ranges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17110,31 +17110,31 @@ test "metadata http cluster simulation rotates replica pairs across tables and r
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pairs-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pairs-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pairs-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pairs-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pairs-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pairs-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pairs-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pairs-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pairs-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pairs-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-pairs-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pairs-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5300, root_a, cat_a),
-        makeHostSimConfig(2, 5300, root_b, cat_b),
-        makeHostSimConfig(3, 5300, root_c, cat_c),
+        makeHostVoprConfig(1, 5300, root_a, cat_a),
+        makeHostVoprConfig(2, 5300, root_b, cat_b),
+        makeHostVoprConfig(3, 5300, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5300, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5300, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17217,7 +17217,7 @@ test "metadata http cluster simulation rotates replica pairs across tables and r
     }
 }
 
-test "metadata http cluster simulation rebalances one table while preserving another valid placement" {
+test "metadata VOPR http cluster rebalances one table while preserving another valid placement" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17232,31 +17232,31 @@ test "metadata http cluster simulation rebalances one table while preserving ano
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-rebalance-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-rebalance-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-rebalance-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-rebalance-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-rebalance-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-rebalance-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-rebalance-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-rebalance-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-rebalance-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-rebalance-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-rebalance-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-rebalance-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5400, root_a, cat_a),
-        makeHostSimConfig(2, 5400, root_b, cat_b),
-        makeHostSimConfig(3, 5400, root_c, cat_c),
+        makeHostVoprConfig(1, 5400, root_a, cat_a),
+        makeHostVoprConfig(2, 5400, root_b, cat_b),
+        makeHostVoprConfig(3, 5400, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5400, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5400, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17356,7 +17356,7 @@ test "metadata http cluster simulation rebalances one table while preserving ano
     try std.testing.expect(saw_5702_3);
 }
 
-test "metadata http cluster simulation prefers healthy stores before degraded ones" {
+test "metadata VOPR http cluster prefers healthy stores before degraded ones" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17371,31 +17371,31 @@ test "metadata http cluster simulation prefers healthy stores before degraded on
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-health-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-health-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-health-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-health-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-health-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-health-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-health-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-health-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-health-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-health-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-health-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-health-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5500, root_a, cat_a),
-        makeHostSimConfig(2, 5500, root_b, cat_b),
-        makeHostSimConfig(3, 5500, root_c, cat_c),
+        makeHostVoprConfig(1, 5500, root_a, cat_a),
+        makeHostVoprConfig(2, 5500, root_b, cat_b),
+        makeHostVoprConfig(3, 5500, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5500, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5500, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17437,7 +17437,7 @@ test "metadata http cluster simulation prefers healthy stores before degraded on
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5801, .active, 1));
 }
 
-test "metadata http cluster simulation prefers cross-domain placement for a range" {
+test "metadata VOPR http cluster prefers cross-domain placement for a range" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17452,31 +17452,31 @@ test "metadata http cluster simulation prefers cross-domain placement for a rang
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-domain-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-domain-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-domain-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-domain-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-domain-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-domain-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-domain-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-domain-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-domain-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-domain-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-domain-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-domain-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5600, root_a, cat_a),
-        makeHostSimConfig(2, 5600, root_b, cat_b),
-        makeHostSimConfig(3, 5600, root_c, cat_c),
+        makeHostVoprConfig(1, 5600, root_a, cat_a),
+        makeHostVoprConfig(2, 5600, root_b, cat_b),
+        makeHostVoprConfig(3, 5600, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5600, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5600, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17521,7 +17521,7 @@ test "metadata http cluster simulation prefers cross-domain placement for a rang
     try std.testing.expect(saw_one_or_two);
 }
 
-test "metadata http cluster simulation mixes health domain and minimal-movement policy" {
+test "metadata VOPR http cluster mixes health domain and minimal-movement policy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17536,31 +17536,31 @@ test "metadata http cluster simulation mixes health domain and minimal-movement 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-policy-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-policy-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-policy-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-policy-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-policy-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-policy-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-policy-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-policy-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-policy-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-policy-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-mixed-policy-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-policy-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5700, root_a, cat_a),
-        makeHostSimConfig(2, 5700, root_b, cat_b),
-        makeHostSimConfig(3, 5700, root_c, cat_c),
+        makeHostVoprConfig(1, 5700, root_a, cat_a),
+        makeHostVoprConfig(2, 5700, root_b, cat_b),
+        makeHostVoprConfig(3, 5700, root_c, cat_c),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5700, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5700, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17637,7 +17637,7 @@ test "metadata http cluster simulation mixes health domain and minimal-movement 
     try std.testing.expectEqualSlices(u64, before_6101.items, after_6101.items);
 }
 
-test "metadata http cluster simulation respects table placement roles under churn" {
+test "metadata VOPR http cluster respects table placement roles under churn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17658,43 +17658,43 @@ test "metadata http cluster simulation respects table placement roles under chur
     var factory_d = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_d, .peers = &.{ 1, 2, 3, 4, 5 } };
     var factory_e = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_e, .peers = &.{ 1, 2, 3, 4, 5 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const root_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-d", .{tmp.sub_path});
+    const root_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-d", .{tmp.sub_path});
     defer std.testing.allocator.free(root_d);
-    const root_e = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-e", .{tmp.sub_path});
+    const root_e = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-e", .{tmp.sub_path});
     defer std.testing.allocator.free(root_e);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
-    const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-d.txt", .{tmp.sub_path});
+    const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
-    const cat_e = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-e.txt", .{tmp.sub_path});
+    const cat_e = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-e.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_e);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5800, root_a, cat_a),
-        makeHostSimConfig(2, 5800, root_b, cat_b),
-        makeHostSimConfig(3, 5800, root_c, cat_c),
-        makeHostSimConfig(4, 5800, root_d, cat_d),
-        makeHostSimConfig(5, 5800, root_e, cat_e),
+        makeHostVoprConfig(1, 5800, root_a, cat_a),
+        makeHostVoprConfig(2, 5800, root_b, cat_b),
+        makeHostVoprConfig(3, 5800, root_c, cat_c),
+        makeHostVoprConfig(4, 5800, root_d, cat_d),
+        makeHostVoprConfig(5, 5800, root_e, cat_e),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
-        makeHostSimDeps(&factory_d),
-        makeHostSimDeps(&factory_e),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+        makeHostVoprDeps(&factory_d),
+        makeHostVoprDeps(&factory_e),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5800, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5800, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17806,7 +17806,7 @@ test "metadata http cluster simulation respects table placement roles under chur
     }
 }
 
-test "metadata http cluster simulation repairs only when a matching placement role appears" {
+test "metadata VOPR http cluster repairs only when a matching placement role appears" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17824,37 +17824,37 @@ test "metadata http cluster simulation repairs only when a matching placement ro
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
     var factory_d = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-repair-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-repair-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-repair-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const root_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-repair-d", .{tmp.sub_path});
+    const root_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-d", .{tmp.sub_path});
     defer std.testing.allocator.free(root_d);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-repair-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-repair-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-repair-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
-    const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-role-repair-d.txt", .{tmp.sub_path});
+    const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 5900, root_a, cat_a),
-        makeHostSimConfig(2, 5900, root_b, cat_b),
-        makeHostSimConfig(3, 5900, root_c, cat_c),
-        makeHostSimConfig(4, 5900, root_d, cat_d),
+        makeHostVoprConfig(1, 5900, root_a, cat_a),
+        makeHostVoprConfig(2, 5900, root_b, cat_b),
+        makeHostVoprConfig(3, 5900, root_c, cat_c),
+        makeHostVoprConfig(4, 5900, root_d, cat_d),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
-        makeHostSimDeps(&factory_d),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+        makeHostVoprDeps(&factory_d),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 5900, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 5900, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -17897,7 +17897,7 @@ test "metadata http cluster simulation repairs only when a matching placement ro
     try std.testing.expect(try cluster.waitForNodeGroupStatus(3, 6401, .active, 40));
 }
 
-test "metadata http cluster simulation rebalances after store class promotion and demotion" {
+test "metadata VOPR http cluster rebalances after store class promotion and demotion" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -17915,37 +17915,37 @@ test "metadata http cluster simulation rebalances after store class promotion an
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3, 4 } };
     var factory_d = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_d, .peers = &.{ 1, 2, 3, 4 } };
 
-    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-class-a", .{tmp.sub_path});
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-a", .{tmp.sub_path});
     defer std.testing.allocator.free(root_a);
-    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-class-b", .{tmp.sub_path});
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-b", .{tmp.sub_path});
     defer std.testing.allocator.free(root_b);
-    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-class-c", .{tmp.sub_path});
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-c", .{tmp.sub_path});
     defer std.testing.allocator.free(root_c);
-    const root_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-class-d", .{tmp.sub_path});
+    const root_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-d", .{tmp.sub_path});
     defer std.testing.allocator.free(root_d);
-    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-class-a.txt", .{tmp.sub_path});
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-a.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_a);
-    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-class-b.txt", .{tmp.sub_path});
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
-    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-class-c.txt", .{tmp.sub_path});
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
-    const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sim-class-d.txt", .{tmp.sub_path});
+    const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
     const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
-        makeHostSimConfig(1, 6000, root_a, cat_a),
-        makeHostSimConfig(2, 6000, root_b, cat_b),
-        makeHostSimConfig(3, 6000, root_c, cat_c),
-        makeHostSimConfig(4, 6000, root_d, cat_d),
+        makeHostVoprConfig(1, 6000, root_a, cat_a),
+        makeHostVoprConfig(2, 6000, root_b, cat_b),
+        makeHostVoprConfig(3, 6000, root_c, cat_c),
+        makeHostVoprConfig(4, 6000, root_d, cat_d),
     };
     const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-        makeHostSimDeps(&factory_a),
-        makeHostSimDeps(&factory_b),
-        makeHostSimDeps(&factory_c),
-        makeHostSimDeps(&factory_d),
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+        makeHostVoprDeps(&factory_d),
     };
 
-    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 6000, configs[0..], deps[0..]);
+    var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, 6000, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();

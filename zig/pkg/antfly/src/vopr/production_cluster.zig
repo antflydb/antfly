@@ -12,7 +12,7 @@ const data_runtime = @import("../data/runtime.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_http_server = @import("../metadata/http_server.zig");
 const metadata_http_test_runtime = @import("../metadata/http_test_runtime.zig");
-const metadata_sim = @import("../metadata/sim_harness.zig");
+const metadata_vopr = @import("../metadata/vopr_harness.zig");
 const raft_runtime_loop = @import("../raft/runtime_loop.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
@@ -48,8 +48,8 @@ const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 // cluster: production middleware fails every internal route closed with an
 // unmarked 503, which correctly prevents the forwarding client from assuming
 // that a mutation was not proposed.
-const internal_service_secret = "metadata-simulation-internal-service-secret";
-const internal_service_issuer = "metadata-sim";
+const internal_service_secret = "metadata-vopr-internal-service-secret";
+const internal_service_issuer = "metadata-vopr";
 const modeled_healthy_capacity_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
 test "production distributed join oracle accepts broadcast without a shuffle ledger" {
@@ -239,11 +239,11 @@ pub const Fixture = struct {
         ) anyerror!void,
     };
 
-    const node_count = metadata_sim.VoprPublicClusterFixture.node_count;
+    const node_count = metadata_vopr.VoprPublicClusterFixture.node_count;
     const initial_groups = [_]u64{
-        metadata_sim.VoprPublicClusterFixture.data_group_id,
-        metadata_sim.VoprPublicClusterFixture.graph_data_group_id,
-        metadata_sim.VoprPublicClusterFixture.tenant_data_group_id,
+        metadata_vopr.VoprPublicClusterFixture.data_group_id,
+        metadata_vopr.VoprPublicClusterFixture.graph_data_group_id,
+        metadata_vopr.VoprPublicClusterFixture.tenant_data_group_id,
     };
     const split_transition_id: u64 = 6_842_001;
     const split_destination_group_id: u64 = 6_846;
@@ -316,8 +316,8 @@ pub const Fixture = struct {
 
     alloc: std.mem.Allocator,
     sim: *vopr.vopr_io.VoprIo,
-    metadata: ?*metadata_sim.VoprPublicClusterFixture = null,
-    metadata_sources: [node_count]metadata_sim.MetadataAdminSimSource = undefined,
+    metadata: ?*metadata_vopr.VoprPublicClusterFixture = null,
+    metadata_sources: [node_count]metadata_vopr.MetadataAdminVoprSource = undefined,
     metadata_servers: [node_count]metadata_http_server.MetadataHttpServer = undefined,
     metadata_server_count: usize = 0,
     metadata_listeners: [node_count]metadata_http_test_runtime.Runtime = undefined,
@@ -1084,7 +1084,7 @@ pub const Fixture = struct {
         } else return error.ProductionReplicationOwnerRestartBoundaryTimeout;
 
         const target_index = self.currentDataLeaderIndex(
-            metadata_sim.VoprPublicClusterFixture.data_group_id,
+            metadata_vopr.VoprPublicClusterFixture.data_group_id,
         ) orelse return error.ProductionReplicationOwnerUnavailable;
         const stopped_uri = try allocator.dupe(u8, self.data_api_uris[target_index]);
         defer allocator.free(stopped_uri);
@@ -1167,7 +1167,7 @@ pub const Fixture = struct {
             if (!self.replication_owner_restart_durable_row_recovered) {
                 const recovered = self.data_servers[target_index].read_source.source().lookupGroupLocal(
                     self.alloc,
-                    metadata_sim.VoprPublicClusterFixture.data_group_id,
+                    metadata_vopr.VoprPublicClusterFixture.data_group_id,
                     "docs",
                     "doc:d",
                     .{},
@@ -1269,11 +1269,11 @@ pub const Fixture = struct {
     }
 
     pub fn currentGraphOwnerIndex(self: *Fixture) ?usize {
-        return self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.graph_data_group_id);
+        return self.currentDataLeaderIndex(metadata_vopr.VoprPublicClusterFixture.graph_data_group_id);
     }
 
     pub fn currentTenantOwnerIndex(self: *Fixture) ?usize {
-        return self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.tenant_data_group_id);
+        return self.currentDataLeaderIndex(metadata_vopr.VoprPublicClusterFixture.tenant_data_group_id);
     }
 
     /// Freeze one real directional coordinator-to-tenant-owner link for the
@@ -1324,7 +1324,7 @@ pub const Fixture = struct {
     fn prepareJoinOwnerRestartCampaign(self: *Fixture) !void {
         if (self.phase != .reads_complete or !self.join_owner_restart_enabled)
             return error.InvalidProductionJoinOwnerRestartTarget;
-        const group_id = metadata_sim.VoprPublicClusterFixture.data_group_id;
+        const group_id = metadata_vopr.VoprPublicClusterFixture.data_group_id;
         const coordinator_index = if (self.join_cancellation_owner_restart_enabled)
             1
         else for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
@@ -1344,8 +1344,8 @@ pub const Fixture = struct {
     fn prepareJoinRetryExhaustionCampaign(self: *Fixture) !void {
         if (self.phase != .reads_complete or !self.join_retry_exhaustion_enabled)
             return error.InvalidProductionJoinRetryExhaustionTarget;
-        const first_group_id = metadata_sim.VoprPublicClusterFixture.data_group_id;
-        const retry_group_id = metadata_sim.VoprPublicClusterFixture.graph_data_group_id;
+        const first_group_id = metadata_vopr.VoprPublicClusterFixture.data_group_id;
+        const retry_group_id = metadata_vopr.VoprPublicClusterFixture.graph_data_group_id;
         const coordinator_index = self.currentDataLeaderIndex(first_group_id) orelse
             return error.ProductionDataJoinFirstLeaderMissing;
         const retry_target_index = self.currentDataLeaderIndex(retry_group_id) orelse
@@ -1368,8 +1368,8 @@ pub const Fixture = struct {
         if (self.phase != .reads_complete or !self.join_cancellation_enabled or
             !self.join_cancellation_overlap_enabled)
             return error.InvalidProductionJoinCancellationOverlapTarget;
-        const first_group_id = metadata_sim.VoprPublicClusterFixture.data_group_id;
-        const worker_group_id = metadata_sim.VoprPublicClusterFixture.graph_data_group_id;
+        const first_group_id = metadata_vopr.VoprPublicClusterFixture.data_group_id;
+        const worker_group_id = metadata_vopr.VoprPublicClusterFixture.graph_data_group_id;
         const network_target_index = self.currentDataLeaderIndex(first_group_id) orelse
             return error.ProductionDataJoinFirstLeaderMissing;
         const coordinator_index = self.currentDataLeaderIndex(worker_group_id) orelse
@@ -1389,7 +1389,7 @@ pub const Fixture = struct {
     pub fn configureGraphPartialWriteTarget(self: *Fixture, target_index: usize) !usize {
         if (self.phase != .leaders_ready or target_index >= self.data_server_count or !self.data_server_live[target_index])
             return error.InvalidProductionGraphPartialWriteTarget;
-        const start_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
+        const start_index = self.currentDataLeaderIndex(metadata_vopr.VoprPublicClusterFixture.data_group_id) orelse
             return error.ProductionDataGraphLeaderMissing;
         const coordinator_index = for (0..self.data_api_uri_count) |index| {
             if (index != start_index and index != target_index) break index;
@@ -1406,7 +1406,7 @@ pub const Fixture = struct {
     pub fn configureGraphTransportTarget(self: *Fixture, target_index: usize) !usize {
         if (self.phase != .leaders_ready or target_index >= self.data_server_count or !self.data_server_live[target_index])
             return error.InvalidProductionGraphTransportTarget;
-        const start_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
+        const start_index = self.currentDataLeaderIndex(metadata_vopr.VoprPublicClusterFixture.data_group_id) orelse
             return error.ProductionDataGraphLeaderMissing;
         const coordinator_index = for (0..self.data_api_uri_count) |index| {
             if (index != start_index and index != target_index) break index;
@@ -1490,7 +1490,7 @@ pub const Fixture = struct {
         }
         const alloc = self.alloc;
         const sim = self.sim;
-        self.metadata = try metadata_sim.VoprPublicClusterFixture.create(alloc, sim);
+        self.metadata = try metadata_vopr.VoprPublicClusterFixture.create(alloc, sim);
         try self.metadata.?.bootstrapExternalDataPlane();
         try self.ensureMetadataIncarnation();
         self.phase = .metadata_quorum_ready;
@@ -2532,7 +2532,7 @@ pub const Fixture = struct {
         try self.runDataControlRound();
         try self.metadata.?.cluster.stepAll();
         if (self.metadata.?.cluster.currentMetadataLeaderIndex() == null and self.driver_rounds % 8 == 7) {
-            // The metadata simulation intentionally uses deterministic timers,
+            // The metadata VOPR harness intentionally uses deterministic timers,
             // so a long data-plane outage can align every healthy candidate.
             // A production deployment gets the equivalent symmetry break from
             // randomized election timeouts. Campaign one rotating healthy
@@ -3035,17 +3035,17 @@ pub const Fixture = struct {
                         key: []const u8,
                         expected: []const u8,
                     } = switch (group_id) {
-                        metadata_sim.VoprPublicClusterFixture.data_group_id => .{
+                        metadata_vopr.VoprPublicClusterFixture.data_group_id => .{
                             .table = "docs",
                             .key = "doc:c",
                             .expected = "production-left",
                         },
-                        metadata_sim.VoprPublicClusterFixture.graph_data_group_id => .{
+                        metadata_vopr.VoprPublicClusterFixture.graph_data_group_id => .{
                             .table = "docs",
                             .key = "doc:x",
                             .expected = "production-right",
                         },
-                        metadata_sim.VoprPublicClusterFixture.tenant_data_group_id => .{
+                        metadata_vopr.VoprPublicClusterFixture.tenant_data_group_id => .{
                             .table = "tenant_b_docs",
                             .key = "tenant:q",
                             .expected = "production-tenant",
@@ -3408,7 +3408,7 @@ pub const Fixture = struct {
         // routing topology, and prove a migrated key remains publicly visible.
         try self.metadata.?.requestExternalDataSplit(
             split_transition_id,
-            metadata_sim.VoprPublicClusterFixture.data_group_id,
+            metadata_vopr.VoprPublicClusterFixture.data_group_id,
             split_destination_group_id,
             split_key,
         );
@@ -3443,9 +3443,9 @@ pub const Fixture = struct {
                 if (self.fault_mode != .clean and self.fault_mode != .resource_pressure and
                     self.fault_mode != .socket_pressure)
                 {
-                    const start_leader_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
+                    const start_leader_index = self.currentDataLeaderIndex(metadata_vopr.VoprPublicClusterFixture.data_group_id) orelse
                         return error.ProductionDataGraphLeaderMissing;
-                    const target_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.graph_data_group_id) orelse
+                    const target_index = self.currentDataLeaderIndex(metadata_vopr.VoprPublicClusterFixture.graph_data_group_id) orelse
                         return error.ProductionDataGraphLeaderMissing;
                     self.graph_probe_route_index = for (0..self.data_api_uri_count) |index| {
                         if (index != start_leader_index and index != target_index) break index;
@@ -5601,7 +5601,7 @@ pub const Fixture = struct {
     fn publishSplitAtStaleGraphBoundary(self: *Fixture) !void {
         try self.metadata.?.requestExternalDataSplit(
             split_transition_id,
-            metadata_sim.VoprPublicClusterFixture.data_group_id,
+            metadata_vopr.VoprPublicClusterFixture.data_group_id,
             split_destination_group_id,
             split_key,
         );

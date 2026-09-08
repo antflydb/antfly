@@ -139,7 +139,7 @@ pub const metadata_http_server = @import("metadata/http_server.zig");
 pub const metadata_http_client = @import("metadata/http_client.zig");
 pub const metadata_service = @import("metadata/service.zig");
 pub const metadata_server = @import("metadata/server.zig");
-pub const metadata_sim_harness = @import("metadata/sim_harness.zig");
+pub const metadata_vopr_harness = @import("metadata/vopr_harness.zig");
 pub const metadata_table_workflow = @import("metadata/table_workflow.zig");
 pub const metadata_replication_backfill = @import("metadata/replication_backfill.zig");
 pub const metadata_placement_planner = @import("metadata/placement_planner.zig");
@@ -326,7 +326,7 @@ test {
     _ = metadata_http_client;
     _ = metadata_service;
     _ = metadata_server;
-    _ = metadata_sim_harness;
+    _ = metadata_vopr_harness;
     _ = metadata_table_workflow;
     _ = metadata_replication_backfill;
     _ = metadata_placement_planner;

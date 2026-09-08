@@ -3770,7 +3770,6 @@ pub fn build(b: *std.Build) void {
     antfly_client_pkg_test_step.dependOn(&run_antfly_client_pkg_tests.step);
 
     const root_test_skip_filters = [_][]const u8{
-        "metadata http cluster simulation",
         "managed host simulation",
         "managed http host simulation",
         "managed http cluster simulation",
@@ -3782,7 +3781,6 @@ pub fn build(b: *std.Build) void {
         "wal sim ",
         "index manager sim ",
         "db split sim ",
-        "metadata sim ",
         "metadata VOPR",
         "chaos",
         "soak",
@@ -4794,7 +4792,7 @@ pub fn build(b: *std.Build) void {
         run_image_jpeg_seed_corpora_e2e_after_fetch_quiet_step,
     });
 
-    const unit_test_step = b.step("unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    const unit_test_step = b.step("unit-test", "Run hermetic unit and focused integration test buckets without metadata VOPR chaos campaigns");
     const unit_test_progress_step = b.step("unit-test-progress", "Run labeled major unit test suites to expose slow or stuck phases");
     unit_test_step.dependOn(&yacc_steps.run_yacc_tests.step);
     unit_test_step.dependOn(&yacc_steps.run_parser_tests.step);
@@ -5550,68 +5548,62 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_table_workflow_test_step = b.step("lib-metadata-table-workflow-test", "Run focused metadata table workflow tests");
     lib_metadata_table_workflow_test_step.dependOn(&run_lib_metadata_table_workflow_tests.step);
 
-    const lib_metadata_http_integration_default_filters = [_][]const u8{"metadata http cluster simulation"};
-    const lib_metadata_http_integration_tests = b.addTest(.{
+    const lib_metadata_vopr_http_integration_default_filters = [_][]const u8{"metadata VOPR http cluster"};
+    const lib_metadata_vopr_http_integration_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_http_integration_default_filters),
+        .filters = selectTestFilters(b, &lib_metadata_vopr_http_integration_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_metadata_http_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_http_integration_tests);
-    const lib_metadata_http_integration_test_step = b.step("lib-metadata-http-integration-test", "Run metadata real-HTTP integration tests only");
-    lib_metadata_http_integration_test_step.dependOn(&run_lib_metadata_http_integration_tests.step);
-    const lib_metadata_sim_test_compat_step = b.step("lib-metadata-sim-test", "Compatibility alias for lib-metadata-http-integration-test");
-    lib_metadata_sim_test_compat_step.dependOn(lib_metadata_http_integration_test_step);
+    const run_lib_metadata_vopr_http_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_http_integration_tests);
+    const lib_metadata_vopr_http_integration_test_step = b.step("lib-metadata-vopr-http-integration-test", "Run metadata VOPR HTTP cluster fixtures, including native HTTP integration");
+    lib_metadata_vopr_http_integration_test_step.dependOn(&run_lib_metadata_vopr_http_integration_tests.step);
 
-    const lib_metadata_virtual_transport_default_filters = [_][]const u8{
-        "metadata http cluster simulation drives table placement convergence",
-        "metadata http cluster simulation converges placement after candidate churn",
-        "metadata http cluster simulation drives split intent through the control loop",
-        "metadata http cluster simulation drives merge intent through the control loop",
-        "metadata http cluster simulation drives automatic split through the control loop",
-        "metadata http cluster simulation drives automatic merge through the control loop",
-        "metadata http cluster simulation uses live median key for automatic split planning",
-        "metadata http cluster simulation uses remote live median key when metadata leader is not a shard replica",
-        "metadata http cluster simulation publishes split topology after finalize",
-        "metadata http cluster simulation publishes merge topology after finalize",
-        "metadata http cluster simulation provisions split destination replicas across nodes",
-        "metadata http cluster simulation retires merge donor replicas across nodes",
+    const lib_metadata_vopr_virtual_transport_default_filters = [_][]const u8{
+        "metadata VOPR http cluster drives table placement convergence",
+        "metadata VOPR http cluster converges placement after candidate churn",
+        "metadata VOPR http cluster drives split intent through the control loop",
+        "metadata VOPR http cluster drives merge intent through the control loop",
+        "metadata VOPR http cluster drives automatic split through the control loop",
+        "metadata VOPR http cluster drives automatic merge through the control loop",
+        "metadata VOPR http cluster uses live median key for automatic split planning",
+        "metadata VOPR http cluster uses remote live median key when metadata leader is not a shard replica",
+        "metadata VOPR http cluster publishes split topology after finalize",
+        "metadata VOPR http cluster publishes merge topology after finalize",
+        "metadata VOPR http cluster provisions split destination replicas across nodes",
+        "metadata VOPR http cluster retires merge donor replicas across nodes",
     };
-    const lib_metadata_virtual_transport_tests = b.addTest(.{
+    const lib_metadata_vopr_virtual_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_virtual_transport_default_filters),
+        .filters = selectTestFilters(b, &lib_metadata_vopr_virtual_transport_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_metadata_virtual_transport_tests = addFilteredTestRunArtifact(b, lib_metadata_virtual_transport_tests);
-    const lib_metadata_virtual_transport_test_step = b.step("lib-metadata-virtual-transport-test", "Run deterministic metadata virtual-transport tests without public API or chaos");
-    lib_metadata_virtual_transport_test_step.dependOn(&run_lib_metadata_virtual_transport_tests.step);
-    const lib_metadata_sim_core_test_compat_step = b.step("lib-metadata-sim-core-test", "Compatibility alias for lib-metadata-virtual-transport-test");
-    lib_metadata_sim_core_test_compat_step.dependOn(lib_metadata_virtual_transport_test_step);
+    const run_lib_metadata_vopr_virtual_transport_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_virtual_transport_tests);
+    const lib_metadata_vopr_virtual_transport_test_step = b.step("lib-metadata-vopr-virtual-transport-test", "Run metadata virtual-Raft-transport convergence tests; median-key fixtures also use native HTTP");
+    lib_metadata_vopr_virtual_transport_test_step.dependOn(&run_lib_metadata_vopr_virtual_transport_tests.step);
 
-    const lib_metadata_virtual_smoke_default_filters = [_][]const u8{
-        "metadata sim split runtime preserves source identity namespace",
-        "metadata sim merge runtime records doc identity reassignment opt-in",
-        "metadata http cluster simulation drives table placement convergence",
-        "metadata http cluster simulation drives split intent through the control loop",
+    const lib_metadata_vopr_virtual_smoke_default_filters = [_][]const u8{
+        "metadata VOPR split runtime preserves source identity namespace",
+        "metadata VOPR merge runtime records doc identity reassignment opt-in",
+        "metadata VOPR http cluster drives table placement convergence",
+        "metadata VOPR http cluster drives split intent through the control loop",
     };
-    const lib_metadata_virtual_smoke_tests = b.addTest(.{
+    const lib_metadata_vopr_virtual_smoke_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_virtual_smoke_default_filters),
+        .filters = selectTestFilters(b, &lib_metadata_vopr_virtual_smoke_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_metadata_virtual_smoke_tests = addFilteredTestRunArtifact(b, lib_metadata_virtual_smoke_tests);
-    const lib_metadata_virtual_smoke_test_step = b.step("lib-metadata-virtual-smoke-test", "Run fast metadata virtual-transport smoke tests");
-    lib_metadata_virtual_smoke_test_step.dependOn(&run_lib_metadata_virtual_smoke_tests.step);
-    const lib_metadata_sim_smoke_test_compat_step = b.step("lib-metadata-sim-smoke-test", "Compatibility alias for lib-metadata-virtual-smoke-test");
-    lib_metadata_sim_smoke_test_compat_step.dependOn(lib_metadata_virtual_smoke_test_step);
+    const run_lib_metadata_vopr_virtual_smoke_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_virtual_smoke_tests);
+    const lib_metadata_vopr_virtual_smoke_test_step = b.step("lib-metadata-vopr-virtual-smoke-test", "Run fast metadata virtual-transport smoke tests");
+    lib_metadata_vopr_virtual_smoke_test_step.dependOn(&run_lib_metadata_vopr_virtual_smoke_tests.step);
 
     const lib_metadata_vopr_default_filters = [_][]const u8{
         "metadata VOPR seeded smoke campaign",
@@ -5671,72 +5663,72 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_vopr_chaos_test_step = b.step("lib-metadata-vopr-chaos-test", "Run expanded metadata VOPR generated workload campaigns");
     lib_metadata_vopr_chaos_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
 
-    const lib_metadata_transition_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation completes automatic split after metadata leader restart",
-        "metadata http cluster simulation completes automatic split after metadata leader partition",
-        "metadata http cluster simulation completes automatic split under delayed raft transport",
-        "metadata http cluster simulation completes automatic split after leader restart under delayed raft transport",
-        "metadata http cluster simulation completes automatic split after source group leader restart",
-        "metadata http cluster simulation completes automatic split after destination group leader restart",
-        "metadata http cluster simulation completes automatic split after leader partition under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after metadata leader restart",
-        "metadata http cluster simulation completes automatic merge after donor group leader restart",
-        "metadata http cluster simulation completes automatic merge after receiver group leader restart",
-        "metadata http cluster simulation completes automatic merge after metadata leader partition",
-        "metadata http cluster simulation completes automatic merge under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after leader restart under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after leader partition under delayed raft transport",
-        "metadata http cluster simulation survives leader restart before forced automatic split reconcile",
+    const lib_metadata_vopr_transition_chaos_default_filters = [_][]const u8{
+        "metadata VOPR http cluster completes automatic split after metadata leader restart",
+        "metadata VOPR http cluster completes automatic split after metadata leader partition",
+        "metadata VOPR http cluster completes automatic split under delayed raft transport",
+        "metadata VOPR http cluster completes automatic split after leader restart under delayed raft transport",
+        "metadata VOPR http cluster completes automatic split after source group leader restart",
+        "metadata VOPR http cluster completes automatic split after destination group leader restart",
+        "metadata VOPR http cluster completes automatic split after leader partition under delayed raft transport",
+        "metadata VOPR http cluster completes automatic merge after metadata leader restart",
+        "metadata VOPR http cluster completes automatic merge after donor group leader restart",
+        "metadata VOPR http cluster completes automatic merge after receiver group leader restart",
+        "metadata VOPR http cluster completes automatic merge after metadata leader partition",
+        "metadata VOPR http cluster completes automatic merge under delayed raft transport",
+        "metadata VOPR http cluster completes automatic merge after leader restart under delayed raft transport",
+        "metadata VOPR http cluster completes automatic merge after leader partition under delayed raft transport",
+        "metadata VOPR http cluster survives leader restart before forced automatic split reconcile",
     };
-    const lib_metadata_public_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation serves public traffic across automatic split under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after source leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after leader partition under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after metadata leader partition",
-        "metadata http cluster simulation serves public traffic across automatic merge under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after donor leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after leader partition under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after metadata leader partition",
+    const lib_metadata_vopr_public_chaos_default_filters = [_][]const u8{
+        "metadata VOPR http cluster serves public traffic across automatic split under delayed raft transport",
+        "metadata VOPR http cluster serves public traffic across automatic split after leader restart under delayed raft transport",
+        "metadata VOPR http cluster serves public traffic across automatic split after source leader restart under delayed raft transport",
+        "metadata VOPR http cluster serves public traffic across automatic split after leader partition under delayed raft transport",
+        "metadata VOPR http cluster serves public traffic across automatic split after metadata leader partition",
+        "metadata VOPR http cluster serves public traffic across automatic merge under delayed raft transport",
+        "metadata VOPR http cluster serves public traffic across automatic merge after leader restart under delayed raft transport",
+        "metadata VOPR http cluster serves public traffic across automatic merge after donor leader restart under delayed raft transport",
+        "metadata VOPR http cluster serves public traffic across automatic merge after leader partition under delayed raft transport",
+        "metadata VOPR http cluster serves public traffic across automatic merge after metadata leader partition",
     };
-    const lib_metadata_placement_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation survives metadata leader restart during placement reconcile",
-        "metadata http cluster simulation drops table topology across leader restart",
+    const lib_metadata_vopr_placement_chaos_default_filters = [_][]const u8{
+        "metadata VOPR http cluster survives metadata leader restart during placement reconcile",
+        "metadata VOPR http cluster drops table topology across leader restart",
     };
-    const lib_metadata_transition_chaos_filters = selectTestFilters(b, &lib_metadata_transition_chaos_default_filters);
-    const lib_metadata_public_chaos_filters = selectTestFilters(b, &lib_metadata_public_chaos_default_filters);
-    const lib_metadata_placement_chaos_filters = selectTestFilters(b, &lib_metadata_placement_chaos_default_filters);
+    const lib_metadata_vopr_transition_chaos_filters = selectTestFilters(b, &lib_metadata_vopr_transition_chaos_default_filters);
+    const lib_metadata_vopr_public_chaos_filters = selectTestFilters(b, &lib_metadata_vopr_public_chaos_default_filters);
+    const lib_metadata_vopr_placement_chaos_filters = selectTestFilters(b, &lib_metadata_vopr_placement_chaos_default_filters);
 
-    const lib_metadata_transition_chaos_test_step = b.step("lib-metadata-transition-chaos-test", "Run metadata split/merge transition restart and partition chaos simulations");
+    const lib_metadata_vopr_transition_chaos_test_step = b.step("lib-metadata-vopr-transition-chaos-test", "Run metadata VOPR split/merge transition restart and partition chaos tests");
     var metadata_transition_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_transition_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, metadata_transition_chaos_progress_tail);
-    lib_metadata_transition_chaos_test_step.dependOn(metadata_transition_chaos_progress_tail.?);
+    metadata_transition_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-transition-chaos-test", lib_metadata_vopr_transition_chaos_filters, metadata_transition_chaos_progress_tail);
+    lib_metadata_vopr_transition_chaos_test_step.dependOn(metadata_transition_chaos_progress_tail.?);
 
-    const lib_metadata_public_chaos_test_step = b.step("lib-metadata-public-chaos-test", "Run metadata public traffic split/merge chaos simulations");
+    const lib_metadata_vopr_public_chaos_test_step = b.step("lib-metadata-vopr-public-chaos-test", "Run metadata VOPR public traffic split/merge chaos tests");
     var metadata_public_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_public_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, metadata_public_chaos_progress_tail);
-    lib_metadata_public_chaos_test_step.dependOn(metadata_public_chaos_progress_tail.?);
+    metadata_public_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-public-chaos-test", lib_metadata_vopr_public_chaos_filters, metadata_public_chaos_progress_tail);
+    lib_metadata_vopr_public_chaos_test_step.dependOn(metadata_public_chaos_progress_tail.?);
 
-    const lib_metadata_placement_chaos_test_step = b.step("lib-metadata-placement-chaos-test", "Run metadata placement restart chaos simulations");
+    const lib_metadata_vopr_placement_chaos_test_step = b.step("lib-metadata-vopr-placement-chaos-test", "Run metadata VOPR placement restart chaos tests");
     var metadata_placement_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_placement_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, metadata_placement_chaos_progress_tail);
-    lib_metadata_placement_chaos_test_step.dependOn(metadata_placement_chaos_progress_tail.?);
+    metadata_placement_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-placement-chaos-test", lib_metadata_vopr_placement_chaos_filters, metadata_placement_chaos_progress_tail);
+    lib_metadata_vopr_placement_chaos_test_step.dependOn(metadata_placement_chaos_progress_tail.?);
 
-    const lib_metadata_chaos_test_step = b.step("lib-metadata-chaos-test", "Run metadata delayed/restart/partition chaos simulations");
+    const lib_metadata_vopr_chaos_soak_test_step = b.step("lib-metadata-vopr-chaos-soak-test", "Run metadata VOPR delayed/restart/partition chaos tests");
     var metadata_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, metadata_chaos_progress_tail);
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, metadata_chaos_progress_tail);
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, metadata_chaos_progress_tail);
-    lib_metadata_chaos_test_step.dependOn(metadata_chaos_progress_tail.?);
+    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-transition-chaos-test", lib_metadata_vopr_transition_chaos_filters, metadata_chaos_progress_tail);
+    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-public-chaos-test", lib_metadata_vopr_public_chaos_filters, metadata_chaos_progress_tail);
+    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-placement-chaos-test", lib_metadata_vopr_placement_chaos_filters, metadata_chaos_progress_tail);
+    lib_metadata_vopr_chaos_soak_test_step.dependOn(metadata_chaos_progress_tail.?);
 
-    const lib_metadata_public_integration_tests = b.addTest(.{
+    const lib_metadata_vopr_public_integration_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "metadata http cluster simulation serves public lifecycle from a non-host node after public create",
-            "metadata http cluster simulation seeds default admin for auth-enabled public api",
-            "metadata http cluster simulation forwards public split flow from a non-host node after public create",
-            "metadata http cluster simulation forwards public merge flow from a non-host node after public create",
+            "metadata VOPR http cluster serves public lifecycle from a non-host node after public create",
+            "metadata VOPR http cluster seeds default admin for auth-enabled public api",
+            "metadata VOPR http cluster forwards public split flow from a non-host node after public create",
+            "metadata VOPR http cluster forwards public merge flow from a non-host node after public create",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -5746,11 +5738,9 @@ pub fn build(b: *std.Build) void {
         // 12 GiB. Reserve its observed class without serializing the suite.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
-    const run_lib_metadata_public_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_public_integration_tests);
-    const lib_metadata_public_integration_test_step = b.step("lib-metadata-public-integration-test", "Run metadata public lifecycle/split/merge integration tests");
-    lib_metadata_public_integration_test_step.dependOn(&run_lib_metadata_public_integration_tests.step);
-    const lib_metadata_sim_public_test_compat_step = b.step("lib-metadata-sim-public-test", "Compatibility alias for lib-metadata-public-integration-test");
-    lib_metadata_sim_public_test_compat_step.dependOn(lib_metadata_public_integration_test_step);
+    const run_lib_metadata_vopr_public_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_public_integration_tests);
+    const lib_metadata_vopr_public_integration_test_step = b.step("lib-metadata-vopr-public-integration-test", "Run metadata public lifecycle/split/merge integration tests");
+    lib_metadata_vopr_public_integration_test_step.dependOn(&run_lib_metadata_vopr_public_integration_tests.step);
 
     const public_api_parity_default_filters = [_][]const u8{
         "public openapi contract module is generated and wired",
@@ -7500,7 +7490,7 @@ pub fn build(b: *std.Build) void {
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);
 
-    const lib_metadata_forwarding_integration_tests = b.addTest(.{
+    const lib_metadata_vopr_forwarding_integration_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"forwards public table io"},
         .test_runner = .{
@@ -7508,11 +7498,9 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const run_lib_metadata_forwarding_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_forwarding_integration_tests);
-    const lib_metadata_forwarding_integration_test_step = b.step("lib-metadata-forwarding-integration-test", "Run public table I/O forwarding integration tests only");
-    lib_metadata_forwarding_integration_test_step.dependOn(&run_lib_metadata_forwarding_integration_tests.step);
-    const lib_metadata_sim_forward_test_compat_step = b.step("lib-metadata-sim-forward-test", "Compatibility alias for lib-metadata-forwarding-integration-test");
-    lib_metadata_sim_forward_test_compat_step.dependOn(lib_metadata_forwarding_integration_test_step);
+    const run_lib_metadata_vopr_forwarding_integration_tests = addFilteredTestRunArtifact(b, lib_metadata_vopr_forwarding_integration_tests);
+    const lib_metadata_vopr_forwarding_integration_test_step = b.step("lib-metadata-vopr-forwarding-integration-test", "Run public table I/O forwarding integration tests only");
+    lib_metadata_vopr_forwarding_integration_test_step.dependOn(&run_lib_metadata_vopr_forwarding_integration_tests.step);
 
     const lib_metadata_service_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -9094,7 +9082,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
     vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
     vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
-    vopr_test_step.dependOn(&run_lib_metadata_virtual_smoke_tests.step);
+    vopr_test_step.dependOn(&run_lib_metadata_vopr_virtual_smoke_tests.step);
     vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     vopr_test_step.dependOn(&run_lib_metadata_vopr_data_tests.step);
     vopr_test_step.dependOn(&run_lib_raft_vopr_tests.step);
@@ -9104,8 +9092,8 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_vopr_cli_registry_tests.step);
 
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
-    integration_test_step.dependOn(&run_lib_metadata_public_integration_tests.step);
-    integration_test_step.dependOn(&run_lib_metadata_forwarding_integration_tests.step);
+    integration_test_step.dependOn(&run_lib_metadata_vopr_public_integration_tests.step);
+    integration_test_step.dependOn(&run_lib_metadata_vopr_forwarding_integration_tests.step);
     // Both aggregates share this run node, so the default test DAG executes
     // the stateful parity suite once. The focused alias remains independent.
     integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
@@ -9133,11 +9121,11 @@ pub fn build(b: *std.Build) void {
     chaos_progress_tail = chainLabeledRun(b, lib_ha_vopr_tests, "ha-vopr-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
-    const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
+    const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad metadata VOPR and raft chaos soaks");
     var chaos_soak_progress_tail: ?*std.Build.Step = null;
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, chaos_soak_progress_tail);
+    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-transition-chaos-test", lib_metadata_vopr_transition_chaos_filters, chaos_soak_progress_tail);
+    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-public-chaos-test", lib_metadata_vopr_public_chaos_filters, chaos_soak_progress_tail);
+    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-vopr-placement-chaos-test", lib_metadata_vopr_placement_chaos_filters, chaos_soak_progress_tail);
     chaos_soak_progress_tail = chainLabeledRun(b, lib_raft_chaos_tests, "lib-raft-chaos-test", chaos_soak_progress_tail);
     chaos_soak_test_step.dependOn(chaos_soak_progress_tail.?);
     soak_test_step.dependOn(chaos_soak_test_step);
@@ -10473,13 +10461,13 @@ pub fn build(b: *std.Build) void {
     );
     recall_test_step.dependOn(&run_compiled_recall_tests.step);
 
-    // The complete metadata namespace pulls in the simulation harness and a
+    // The complete metadata namespace pulls in the VOPR harness and a
     // large amount of control-plane code even though the default unit target
     // excludes simulations at runtime. Compile the production metadata tests
     // in module-owned shards so no individual Linux test image has to load the
     // entire namespace. An explicit, flat production test root gives every
     // shard a stable compile-time ownership prefix without traversing the
-    // public metadata namespace or its simulation imports. The sets are
+    // public metadata namespace or its VOPR imports. The sets are
     // disjoint, and the default runtime selection uses the same ownership
     // prefixes so an accidental empty shard is a hard failure.
     const unit_metadata_shard_filters = [_][]const []const u8{
@@ -10533,7 +10521,7 @@ pub fn build(b: *std.Build) void {
     // Preserve the former two compile lanes while compiling each lane's
     // production metadata ownership groups into one executable. This removes
     // seven repeated semantic-analysis/code-generation passes without
-    // constructing the public metadata barrel that also owns simulations.
+    // constructing the public metadata barrel that also owns VOPR fixtures.
     const unit_metadata_artifact_shard_indices = [_][]const usize{
         &.{ 0, 2, 4, 6, 8 },
         &.{ 1, 3, 5, 7 },

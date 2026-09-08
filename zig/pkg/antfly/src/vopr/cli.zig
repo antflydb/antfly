@@ -37,7 +37,7 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     var seed: u64 = 0xa17f_0001;
     var transitions: ?usize = null;
     var scenario: []const u8 = "metadata";
-    var workload: antfly.metadata_sim_harness.MetadataVoprWorkload = .smoke;
+    var workload: antfly.metadata_vopr_harness.MetadataVoprWorkload = .smoke;
     var trace_out: ?[]const u8 = null;
     var index: usize = 0;
     while (index < args.len) {
@@ -96,7 +96,7 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     if (transition_budget == 0) return error.InvalidTransitionBudget;
     var artifact = if (std.mem.eql(u8, scenario, "metadata")) blk: {
         const base_id = 10_000 + seed % 1_000_000;
-        break :blk try antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
+        break :blk try antfly.metadata_vopr_harness.recordMetadataVoprCampaign(alloc, .{
             .seed = seed,
             .operation_count = transition_budget,
             .metadata_group_id = base_id,
@@ -109,7 +109,7 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     } else if (std.mem.eql(u8, scenario, "distributed-data")) blk: {
         if (transition_budget != 4) return error.DistributedDataScenarioRequiresFourTransitions;
         const table_id = 10_000 + seed % 100_000;
-        break :blk try antfly.metadata_sim_harness.recordDistributedDataVoprCampaign(alloc, .{
+        break :blk try antfly.metadata_vopr_harness.recordDistributedDataVoprCampaign(alloc, .{
             .seed = seed,
             .table_id = table_id,
         });
@@ -626,9 +626,9 @@ fn indexCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
 fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Trace) !vopr.trace.Trace {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
-        return antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, recorded);
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name))
-        return antfly.metadata_sim_harness.replayDistributedDataVoprCampaign(alloc, recorded);
+        return antfly.metadata_vopr_harness.replayMetadataVoprCampaign(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_vopr_harness.DistributedDataVoprScenario.name))
+        return antfly.metadata_vopr_harness.replayDistributedDataVoprCampaign(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return antfly.transaction_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name))
@@ -699,12 +699,12 @@ fn runKnownScenarioWithChoicesAndRecorder(
     recorder: ?*vopr.flight_recorder.Recorder,
 ) !vopr.trace.Trace {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr")) {
-        const cfg = try antfly.metadata_sim_harness.MetadataVoprCampaignConfig.fromTrace(recorded);
-        return antfly.metadata_sim_harness.runMetadataVoprCampaignWithChoicesAndRecorder(alloc, cfg, source, recorder);
+        const cfg = try antfly.metadata_vopr_harness.MetadataVoprCampaignConfig.fromTrace(recorded);
+        return antfly.metadata_vopr_harness.runMetadataVoprCampaignWithChoicesAndRecorder(alloc, cfg, source, recorder);
     }
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name)) {
-        const cfg = try antfly.metadata_sim_harness.DistributedDataVoprCampaignConfig.fromTrace(recorded);
-        return antfly.metadata_sim_harness.runDistributedDataVoprCampaignWithChoices(alloc, cfg, source, recorder);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_vopr_harness.DistributedDataVoprScenario.name)) {
+        const cfg = try antfly.metadata_vopr_harness.DistributedDataVoprCampaignConfig.fromTrace(recorded);
+        return antfly.metadata_vopr_harness.runDistributedDataVoprCampaignWithChoices(alloc, cfg, source, recorder);
     }
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return runContextFreeWithChoicesAndRecorder(antfly.transaction_vopr.Scenario, alloc, recorded, source, recorder);
@@ -820,8 +820,8 @@ fn runDebugRecipeKnown(
 }
 
 fn declarationsKnown(recorded: *const vopr.trace.Trace) []const vopr.property.Declaration {
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name))
-        return antfly.metadata_sim_harness.DistributedDataVoprScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_vopr_harness.DistributedDataVoprScenario.name))
+        return antfly.metadata_vopr_harness.DistributedDataVoprScenario.properties;
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return antfly.transaction_vopr.Scenario.properties;
     if (std.mem.eql(u8, recorded.header.scenario, antfly.wal_vopr.CliScenario.name))
@@ -883,7 +883,7 @@ fn recordCampaignScenario(
 ) !vopr.trace.Trace {
     if (std.mem.eql(u8, scenario, "metadata")) {
         const base_id = 10_000 + campaign_seed % 1_000_000;
-        return antfly.metadata_sim_harness.recordMetadataVoprCampaign(alloc, .{
+        return antfly.metadata_vopr_harness.recordMetadataVoprCampaign(alloc, .{
             .seed = seed,
             .operation_count = transitions,
             .metadata_group_id = base_id,
@@ -894,7 +894,7 @@ fn recordCampaignScenario(
         });
     }
     if (std.mem.eql(u8, scenario, "distributed-data"))
-        return antfly.metadata_sim_harness.recordDistributedDataVoprCampaign(alloc, .{ .seed = seed, .table_id = 10_000 + campaign_seed % 100_000 });
+        return antfly.metadata_vopr_harness.recordDistributedDataVoprCampaign(alloc, .{ .seed = seed, .table_id = 10_000 + campaign_seed % 100_000 });
     if (std.mem.eql(u8, scenario, "transaction")) return antfly.transaction_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "wal")) return antfly.wal_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "persistent")) return antfly.persistent_vopr.record(alloc, seed);
@@ -910,7 +910,7 @@ fn recordCampaignScenario(
 
 fn artifactMatchesScenario(artifact: *const vopr.trace.Trace, scenario: []const u8) bool {
     if (std.mem.eql(u8, scenario, "metadata")) return std.mem.eql(u8, artifact.header.scenario, "metadata-vopr");
-    if (std.mem.eql(u8, scenario, "distributed-data")) return std.mem.eql(u8, artifact.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name);
+    if (std.mem.eql(u8, scenario, "distributed-data")) return std.mem.eql(u8, artifact.header.scenario, antfly.metadata_vopr_harness.DistributedDataVoprScenario.name);
     if (std.mem.eql(u8, scenario, "transaction")) return std.mem.eql(u8, artifact.header.scenario, antfly.transaction_vopr.Scenario.name);
     if (std.mem.eql(u8, scenario, "wal")) return std.mem.eql(u8, artifact.header.scenario, antfly.wal_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "persistent")) return std.mem.eql(u8, artifact.header.scenario, antfly.persistent_vopr.CliScenario.name);
@@ -950,7 +950,7 @@ fn tlaCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     var ndjson: std.Io.Writer.Allocating = .init(alloc);
     defer ndjson.deinit();
     var replayed = if (std.mem.eql(u8, domain, "raft"))
-        try antfly.metadata_sim_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &recorded, &ndjson.writer)
+        try antfly.metadata_vopr_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &recorded, &ndjson.writer)
     else if (std.mem.eql(u8, recorded.header.scenario, antfly.domain_vopr.DistributedTransactionScenario.name))
         try antfly.domain_vopr.replayDistributedTransactionToTrace(alloc, &recorded, &ndjson.writer)
     else
@@ -1337,7 +1337,7 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var recorded = try vopr.trace.parseAlloc(alloc, encoded);
     defer recorded.deinit();
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr")) {
-        var reduced = try antfly.metadata_sim_harness.reduceMetadataVoprCampaign(alloc, &recorded, attempts);
+        var reduced = try antfly.metadata_vopr_harness.reduceMetadataVoprCampaign(alloc, &recorded, attempts);
         defer reduced.deinit();
         return writeReducedArtifact(
             alloc,
@@ -1500,8 +1500,8 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
             reduced.report.target_fingerprint,
         );
     }
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name)) {
-        var reduced = try antfly.metadata_sim_harness.reduceDistributedDataVoprCampaign(alloc, &recorded, attempts);
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_vopr_harness.DistributedDataVoprScenario.name)) {
+        var reduced = try antfly.metadata_vopr_harness.reduceDistributedDataVoprCampaign(alloc, &recorded, attempts);
         defer reduced.deinit();
         return writeReducedArtifact(
             alloc,
@@ -1620,7 +1620,7 @@ fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
 fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
         return "pkg/antfly/src/vopr/fixtures/metadata";
-    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_sim_harness.DistributedDataVoprScenario.name))
+    if (std.mem.eql(u8, recorded.header.scenario, antfly.metadata_vopr_harness.DistributedDataVoprScenario.name))
         return "pkg/antfly/src/vopr/fixtures/distributed-data";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.transaction_vopr.Scenario.name))
         return "pkg/antfly/src/vopr/fixtures/transaction";
@@ -2462,13 +2462,13 @@ extern fn antflyVoprProcessInit() *const anyopaque;
 test "Antfly injected bug is discovered replayed reduced and promoted" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    var discovered = try antfly.metadata_sim_harness.discoverMetadataVoprInjectedOverlap(alloc, 0xA17F_FA11);
+    var discovered = try antfly.metadata_vopr_harness.discoverMetadataVoprInjectedOverlap(alloc, 0xA17F_FA11);
     defer discovered.deinit();
     try std.testing.expectEqual(@as(usize, 1), discovered.failures.items.len);
 
-    var replayed = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &discovered);
+    var replayed = try antfly.metadata_vopr_harness.replayMetadataVoprCampaign(alloc, &discovered);
     replayed.deinit();
-    var reduced = try antfly.metadata_sim_harness.reduceMetadataVoprCampaign(alloc, &discovered, 8);
+    var reduced = try antfly.metadata_vopr_harness.reduceMetadataVoprCampaign(alloc, &discovered, 8);
     defer reduced.deinit();
     try std.testing.expectEqual(discovered.failures.items[0].fingerprint, reduced.target_fingerprint);
 
@@ -2483,11 +2483,11 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     var promoted = try vopr.trace.parseAlloc(alloc, encoded);
     defer promoted.deinit();
     try std.testing.expectEqual(reduced.target_fingerprint, promoted.failures.items[0].fingerprint);
-    var promoted_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &promoted);
+    var promoted_replay = try antfly.metadata_vopr_harness.replayMetadataVoprCampaign(alloc, &promoted);
     promoted_replay.deinit();
     var raft_ndjson: std.Io.Writer.Allocating = .init(alloc);
     defer raft_ndjson.deinit();
-    var formal_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &promoted, &raft_ndjson.writer);
+    var formal_replay = try antfly.metadata_vopr_harness.replayMetadataVoprCampaignToRaftTrace(alloc, &promoted, &raft_ndjson.writer);
     formal_replay.deinit();
     try validateRaftTraceNdjson(alloc, raft_ndjson.written());
     try std.testing.expect(std.mem.indexOf(u8, raft_ndjson.written(), "\"name\":\"InitState\"") != null);
@@ -2618,7 +2618,7 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     if (try context.mutateCorpusEntry(alloc, 0xA17F_FA12)) |mutated_value| {
         var mutated = mutated_value;
         defer mutated.artifact.deinit();
-        var mutation_replay = try antfly.metadata_sim_harness.replayMetadataVoprCampaign(alloc, &mutated.artifact);
+        var mutation_replay = try antfly.metadata_vopr_harness.replayMetadataVoprCampaign(alloc, &mutated.artifact);
         mutation_replay.deinit();
     } else return error.PersistentCorpusMutationRequired;
 

@@ -23,7 +23,7 @@ const metadata_http_server = @import("../metadata/http_server.zig");
 const metadata_http_test_runtime = @import("../metadata/http_test_runtime.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_service = @import("../metadata/service.zig");
-const metadata_sim = @import("../metadata/sim_harness.zig");
+const metadata_vopr = @import("../metadata/vopr_harness.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_workflow = @import("../metadata/table_workflow.zig");
 const raft_catalog = @import("../raft/catalog.zig");
@@ -310,8 +310,8 @@ const Factory = struct {
     alloc: std.mem.Allocator,
     store: *raft_engine.core.MemoryStorage,
     peers: []const raft_engine.core.types.NodeId,
-    split_runtime: metadata_sim.SimSplitRuntime = .{},
-    merge_runtime: metadata_sim.SimMergeRuntime = .{},
+    split_runtime: metadata_vopr.VoprSplitRuntime = .{},
+    merge_runtime: metadata_vopr.VoprMergeRuntime = .{},
     group_stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
     primary_group_id: ?u64 = null,
     active_descriptors: usize = 0,
@@ -423,7 +423,7 @@ fn makeHostSimDeps(factory: *Factory) raft_sim.ManagedHttpHostSimulationDeps {
 }
 
 const PublicApiStatusSource = struct {
-    node: metadata_sim.MetadataHttpNodeSimulation,
+    node: metadata_vopr.MetadataHttpNodeVopr,
 
     fn iface(self: *@This()) api_http_server.StatusSource {
         return .{
@@ -523,7 +523,7 @@ const PublicApiStatusSource = struct {
 };
 
 const PublicApiCatalogSource = struct {
-    node: metadata_sim.MetadataHttpNodeSimulation,
+    node: metadata_vopr.MetadataHttpNodeVopr,
 
     fn iface(self: *@This()) api_table_catalog.CatalogSource {
         return .{
@@ -551,8 +551,8 @@ const PublicApiCatalogSource = struct {
 
 fn PublicApiRouter(comptime N: usize) type {
     return struct {
-        node: metadata_sim.MetadataHttpNodeSimulation,
-        cluster: *metadata_sim.MetadataHttpClusterSimulation,
+        node: metadata_vopr.MetadataHttpNodeVopr,
+        cluster: *metadata_vopr.MetadataHttpClusterVopr,
         api_base_uris: *const [N][]const u8,
 
         fn iface(self: *@This()) api_table_router.HostedGroupRouter {
@@ -602,7 +602,7 @@ fn PublicApiRouter(comptime N: usize) type {
 
 fn startPublicApiServers(
     comptime N: usize,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     roots: *const [N][]const u8,
     forward_executor: *std_http_executor.StdHttpExecutor,
     listeners: *[N]api_http_test_runtime.Runtime,
@@ -634,7 +634,7 @@ fn startPublicApiServers(
 
 fn startPublicApiServersWithExecutor(
     comptime N: usize,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     roots: *const [N][]const u8,
     forward_executor: http_common.RequestExecutor,
     listeners: *[N]api_http_test_runtime.Runtime,
@@ -666,7 +666,7 @@ fn startPublicApiServersWithExecutor(
 
 fn startPublicApiServersWithDurableSessions(
     comptime N: usize,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     roots: *const [N][]const u8,
     forward_executor: http_common.RequestExecutor,
     session_stores: *const [N]?*transactions_api.DurableSessionStore,
@@ -699,7 +699,7 @@ fn startPublicApiServersWithDurableSessions(
 
 fn startPublicApiServersWithSharedSessionStorePath(
     comptime N: usize,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     roots: *const [N][]const u8,
     forward_executor: *std_http_executor.StdHttpExecutor,
     session_store_path: []const u8,
@@ -773,7 +773,7 @@ fn startPublicApiServersWithSharedSessionStorePath(
 
 fn startPublicApiServersWithOptionalSessions(
     comptime N: usize,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     roots: *const [N][]const u8,
     forward_executor: http_common.RequestExecutor,
     forward_io_impl: ?*std.Io.Threaded,
@@ -848,7 +848,7 @@ const GraphChurnMode = enum {
 
 const GraphTopologyChurnExecutor = struct {
     forward: http_common.RequestExecutor,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     metadata_apis: *const [4][]const u8,
     api_base_uris: *const [4][]const u8,
     left_batch_body: []const u8,
@@ -897,8 +897,8 @@ const GraphTopologyChurnExecutor = struct {
         const right_group = findRangeForKey(snapshot.ranges, table.table_id, "doc:z") orelse return error.RangeNotFound;
 
         var client = api_http_client.ApiHttpClient.init(alloc, self.forward);
-        try metadata_sim.mirrorGroupBatchToActiveReplicas(self.cluster, &client, self.api_base_uris[0..], left_group, "docs", self.left_batch_body);
-        try metadata_sim.mirrorGroupBatchToActiveReplicas(self.cluster, &client, self.api_base_uris[0..], right_group, "docs", self.right_batch_body);
+        try metadata_vopr.mirrorGroupBatchToActiveReplicas(self.cluster, &client, self.api_base_uris[0..], left_group, "docs", self.left_batch_body);
+        try metadata_vopr.mirrorGroupBatchToActiveReplicas(self.cluster, &client, self.api_base_uris[0..], right_group, "docs", self.right_batch_body);
     }
 };
 
@@ -909,7 +909,7 @@ const TxnChurnMode = enum {
 
 const TxnTopologyChurnExecutor = struct {
     forward: http_common.RequestExecutor,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     metadata_apis: *const [4][]const u8,
     mode: TxnChurnMode,
     trigger_count: u32 = 0,
@@ -947,7 +947,7 @@ const TxnTopologyChurnExecutor = struct {
 fn injectDocsMerge(
     alloc: std.mem.Allocator,
     forward: http_common.RequestExecutor,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     metadata_apis: *const [4][]const u8,
     transition_id: u64,
 ) !void {
@@ -985,13 +985,13 @@ fn injectDocsMerge(
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
     try workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
-    _ = try metadata_sim.retireFinalizedMergeTransition(cluster.node(reconcile_index), workflow.controlLoop());
+    _ = try metadata_vopr.retireFinalizedMergeTransition(cluster.node(reconcile_index), workflow.controlLoop());
 }
 
 fn injectDocsSplit(
     alloc: std.mem.Allocator,
     forward: http_common.RequestExecutor,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     metadata_apis: *const [4][]const u8,
     transition_id: u64,
     split_key: []const u8,
@@ -1029,10 +1029,10 @@ fn injectDocsSplit(
     var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
     defer workflow.deinit();
     try workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
-    _ = try metadata_sim.retireFinalizedSplitTransition(cluster.node(reconcile_index), workflow.controlLoop());
+    _ = try metadata_vopr.retireFinalizedSplitTransition(cluster.node(reconcile_index), workflow.controlLoop());
 }
 
-fn currentMetadataLeaderIndex(cluster: *metadata_sim.MetadataHttpClusterSimulation) ?usize {
+fn currentMetadataLeaderIndex(cluster: *metadata_vopr.MetadataHttpClusterVopr) ?usize {
     for (cluster.cluster.nodes, 0..) |*sim, index| {
         if (sim.raftStatus(cluster.metadata_group_id)) |status| {
             if (status.soft.role == .leader) return index;
@@ -1041,7 +1041,7 @@ fn currentMetadataLeaderIndex(cluster: *metadata_sim.MetadataHttpClusterSimulati
     return null;
 }
 
-fn currentGroupLeaderIndex(cluster: *metadata_sim.MetadataHttpClusterSimulation, group_id: u64) ?usize {
+fn currentGroupLeaderIndex(cluster: *metadata_vopr.MetadataHttpClusterVopr, group_id: u64) ?usize {
     for (cluster.cluster.nodes, 0..) |*sim, index| {
         if (sim.leaderId(group_id)) |leader_id| {
             if (leader_id == cluster.cluster.configs[index].host.http.host.local_node_id) return index;
@@ -1050,7 +1050,7 @@ fn currentGroupLeaderIndex(cluster: *metadata_sim.MetadataHttpClusterSimulation,
     return null;
 }
 
-fn currentGroupNonHostIndex(cluster: *metadata_sim.MetadataHttpClusterSimulation, group_id: u64) ?usize {
+fn currentGroupNonHostIndex(cluster: *metadata_vopr.MetadataHttpClusterVopr, group_id: u64) ?usize {
     for (0..cluster.cluster.nodes.len) |index| {
         if (cluster.node(index).status(group_id) != .active) return index;
     }
@@ -1134,7 +1134,7 @@ fn deriveGroupId(table_name: []const u8, key: []const u8, seed: u64, reserved: u
 }
 
 fn ensureGroupTextIndex(
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     replica_root_dir: []const u8,
     group_id: u64,
     index_name: []const u8,
@@ -1167,7 +1167,7 @@ fn ensureGroupTextIndex(
 }
 
 fn ensureGroupEmbeddingIndexes(
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     replica_root_dir: []const u8,
     group_id: u64,
     dense_index_name: []const u8,
@@ -1198,7 +1198,7 @@ fn ensureGroupEmbeddingIndexes(
 }
 
 fn ensureGroupDenseIndex(
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     replica_root_dir: []const u8,
     group_id: u64,
     dense_index_name: []const u8,
@@ -1228,7 +1228,7 @@ fn ensureGroupDenseIndex(
 }
 
 fn ensureGroupGraphIndex(
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     replica_root_dir: []const u8,
     group_id: u64,
     index_name: []const u8,
@@ -1346,8 +1346,8 @@ fn expectGraphNodePath(
     }
 }
 
-const MetadataAdminSimSource = struct {
-    node: metadata_sim.MetadataHttpNodeSimulation,
+const MetadataAdminVoprSource = struct {
+    node: metadata_vopr.MetadataHttpNodeVopr,
 
     fn iface(self: *@This()) metadata_http_server.AdminSource {
         return .{
@@ -1425,10 +1425,10 @@ const MetadataAdminSimSource = struct {
 
 fn startMetadataAdminServers(
     comptime N: usize,
-    cluster: *metadata_sim.MetadataHttpClusterSimulation,
+    cluster: *metadata_vopr.MetadataHttpClusterVopr,
     listeners: *[N]metadata_http_test_runtime.Runtime,
     servers: *[N]metadata_http_server.MetadataHttpServer,
-    sources: *[N]MetadataAdminSimSource,
+    sources: *[N]MetadataAdminVoprSource,
     base_uris: *[N][]const u8,
 ) !void {
     for (0..N) |i| {
@@ -1487,7 +1487,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6110, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6110, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -1741,7 +1741,7 @@ test "public api multi-node e2e routes transaction commit from a non-host node" 
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6145, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6145, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -1754,7 +1754,7 @@ test "public api multi-node e2e routes transaction commit from a non-host node" 
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -1942,7 +1942,7 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6144, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6144, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -1955,7 +1955,7 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -2197,7 +2197,7 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6149, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6149, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -2531,7 +2531,7 @@ test "public api multi-node e2e supports cross-table transaction sessions" {
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6154, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6154, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -2767,7 +2767,7 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6155, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6155, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -3036,7 +3036,7 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6156, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6156, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -3306,7 +3306,7 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6151, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6151, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -3533,7 +3533,7 @@ test "public api multi-node e2e adopts durable transaction sessions after coordi
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6151, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6151, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -3735,7 +3735,7 @@ test "public api multi-node e2e retries transaction commit once after topology c
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6146, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6146, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -3748,7 +3748,7 @@ test "public api multi-node e2e retries transaction commit once after topology c
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -3980,7 +3980,7 @@ test "public api multi-node e2e fails transaction commit after repeated topology
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6147, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6147, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -3993,7 +3993,7 @@ test "public api multi-node e2e fails transaction commit after repeated topology
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -4216,7 +4216,7 @@ test "public api multi-node e2e retries transaction session commit once after to
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6150, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6150, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -4229,7 +4229,7 @@ test "public api multi-node e2e retries transaction session commit once after to
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -4502,7 +4502,7 @@ test "public api multi-node e2e retries cross-table transaction session commit o
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6157, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6157, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -4515,7 +4515,7 @@ test "public api multi-node e2e retries cross-table transaction session commit o
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -4837,7 +4837,7 @@ test "public api multi-node e2e fails transaction session commit after repeated 
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6151, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6151, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -4850,7 +4850,7 @@ test "public api multi-node e2e fails transaction session commit after repeated 
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -5127,7 +5127,7 @@ test "public api multi-node e2e recovers unresolved distributed transaction afte
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6148, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6148, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -5140,7 +5140,7 @@ test "public api multi-node e2e recovers unresolved distributed transaction afte
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -5386,7 +5386,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6140, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6140, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -5399,7 +5399,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -5745,7 +5745,7 @@ test "public api multi-node e2e routes graph queries from a non-host node" {
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6170, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6170, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -5758,7 +5758,7 @@ test "public api multi-node e2e routes graph queries from a non-host node" {
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(
         4,
@@ -5940,7 +5940,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6120, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6120, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -5953,7 +5953,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(
         4,
@@ -6379,7 +6379,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6130, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6130, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -6392,7 +6392,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(
         4,
@@ -6692,7 +6692,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6190, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6190, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -6705,7 +6705,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -6781,7 +6781,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     try std.testing.expect(source_group_id != 0);
 
     const source_identity_status_node = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    try metadata_sim.reportRuntimeDocIdentityForActiveReplicas(
+    try metadata_vopr.reportRuntimeDocIdentityForActiveReplicas(
         &cluster,
         cluster.node(source_identity_status_node),
         &roots,
@@ -6797,13 +6797,13 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     defer std.testing.allocator.free(split_body);
     try metadata_client.requestTableSplit(metadata_apis[currentMetadataLeaderIndex(&cluster) orelse leader_index], "docs", split_body);
 
-    try std.testing.expect(try metadata_sim.waitForSplitTransitionFinalized(&cluster, 619001, null, leader_index, 192));
+    try std.testing.expect(try metadata_vopr.waitForSplitTransitionFinalized(&cluster, 619001, null, leader_index, 192));
     {
         const reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
         var split_workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
         defer split_workflow.deinit();
         try split_workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
-        _ = try metadata_sim.retireFinalizedSplitTransition(cluster.node(reconcile_index), split_workflow.controlLoop());
+        _ = try metadata_vopr.retireFinalizedSplitTransition(cluster.node(reconcile_index), split_workflow.controlLoop());
     }
     try metadata_client.triggerReallocate(metadata_apis[currentMetadataLeaderIndex(&cluster) orelse leader_index]);
     try cluster.stepAll();
@@ -6843,8 +6843,8 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
         \\}}
     );
     defer std.heap.page_allocator.free(right_batch_body);
-    try metadata_sim.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], left_group, "docs", left_batch_body);
-    try metadata_sim.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], right_group, "docs", right_batch_body);
+    try metadata_vopr.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], left_group, "docs", left_batch_body);
+    try metadata_vopr.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], right_group, "docs", right_batch_body);
 
     const left_leader_index = currentGroupLeaderIndex(&cluster, left_group) orelse return error.TestExpectedEqual;
     const right_leader_index = currentGroupLeaderIndex(&cluster, right_group) orelse return error.TestExpectedEqual;
@@ -6855,7 +6855,7 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     // namespaces. Publish those runtime facts before routing writes across the
     // new topology so admission compares against the authoritative values.
     const identity_status_node = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    try metadata_sim.reportRuntimeDocIdentityForActiveReplicas(
+    try metadata_vopr.reportRuntimeDocIdentityForActiveReplicas(
         &cluster,
         cluster.node(identity_status_node),
         &roots,
@@ -6968,7 +6968,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6191, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6191, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -6981,7 +6981,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -7057,7 +7057,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     try std.testing.expect(source_group_id != 0);
 
     const source_identity_status_node = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    try metadata_sim.reportRuntimeDocIdentityForActiveReplicas(
+    try metadata_vopr.reportRuntimeDocIdentityForActiveReplicas(
         &cluster,
         cluster.node(source_identity_status_node),
         &roots,
@@ -7073,13 +7073,13 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     defer std.testing.allocator.free(split_body);
     try metadata_client.requestTableSplit(metadata_apis[currentMetadataLeaderIndex(&cluster) orelse leader_index], "docs", split_body);
 
-    try std.testing.expect(try metadata_sim.waitForSplitTransitionFinalized(&cluster, 619101, null, leader_index, 192));
+    try std.testing.expect(try metadata_vopr.waitForSplitTransitionFinalized(&cluster, 619101, null, leader_index, 192));
     {
         const reconcile_index = currentMetadataLeaderIndex(&cluster) orelse leader_index;
         var split_workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
         defer split_workflow.deinit();
         try split_workflow.bootstrapDesiredFromCommitted(&cluster.node(reconcile_index));
-        _ = try metadata_sim.retireFinalizedSplitTransition(cluster.node(reconcile_index), split_workflow.controlLoop());
+        _ = try metadata_vopr.retireFinalizedSplitTransition(cluster.node(reconcile_index), split_workflow.controlLoop());
     }
     try metadata_client.triggerReallocate(metadata_apis[currentMetadataLeaderIndex(&cluster) orelse leader_index]);
     try cluster.stepAll();
@@ -7119,8 +7119,8 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
         \\}}
     );
     defer std.heap.page_allocator.free(right_batch_body);
-    try metadata_sim.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], left_group, "docs", left_batch_body);
-    try metadata_sim.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], right_group, "docs", right_batch_body);
+    try metadata_vopr.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], left_group, "docs", left_batch_body);
+    try metadata_vopr.mirrorGroupBatchToActiveReplicas(&cluster, &client, bootstrap_api_base_uris[0..], right_group, "docs", right_batch_body);
 
     const left_leader_index = currentGroupLeaderIndex(&cluster, left_group) orelse return error.TestExpectedEqual;
     const right_leader_index = currentGroupLeaderIndex(&cluster, right_group) orelse return error.TestExpectedEqual;
@@ -7128,7 +7128,7 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     try ensureGroupGraphIndex(&cluster, roots[right_leader_index], right_group, "graph_idx", 40);
 
     const identity_status_node = currentMetadataLeaderIndex(&cluster) orelse leader_index;
-    try metadata_sim.reportRuntimeDocIdentityForActiveReplicas(
+    try metadata_vopr.reportRuntimeDocIdentityForActiveReplicas(
         &cluster,
         cluster.node(identity_status_node),
         &roots,
@@ -7233,7 +7233,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6150, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6150, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -7246,7 +7246,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
@@ -7572,7 +7572,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
         makeHostSimDeps(&factory_d),
     };
 
-    var cluster = try metadata_sim.MetadataHttpClusterSimulation.init(std.testing.allocator, 6160, configs[0..], deps[0..]);
+    var cluster = try metadata_vopr.MetadataHttpClusterVopr.init(std.testing.allocator, 6160, configs[0..], deps[0..]);
     defer cluster.deinit();
     try cluster.startAll();
     defer cluster.stopAll();
@@ -7585,7 +7585,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
     var metadata_admin_servers: [4]metadata_http_server.MetadataHttpServer = undefined;
-    var metadata_admin_sources: [4]MetadataAdminSimSource = undefined;
+    var metadata_admin_sources: [4]MetadataAdminVoprSource = undefined;
     var metadata_apis: [4][]const u8 = undefined;
     try startMetadataAdminServers(4, &cluster, &metadata_admin_listeners, &metadata_admin_servers, &metadata_admin_sources, &metadata_apis);
     defer for (&metadata_admin_listeners) |*listener| listener.deinit();
