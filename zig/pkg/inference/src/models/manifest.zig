@@ -26,7 +26,6 @@ const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
-const multistage_metadata = @import("../readers/multistage_metadata.zig");
 const build_options = @import("build_options");
 const jinja = @import("jinja");
 
@@ -239,7 +238,6 @@ pub const safetensors_index_candidates = [_][]const u8{
 pub const listing_compatibility_sidecars = [_][]const u8{
     "antfly_inference_bundle.json",
     "antfly_inference_variants.json",
-    "antfly_metadata.json",
     "gliner_config.json",
     "added_tokens.json",
     "clip_config.json",
@@ -257,8 +255,6 @@ pub const ModelManifest = struct {
     // Identity
     model_type: ModelType = .embedder,
     model_type_origin: ModelTypeOrigin = .default,
-    /// Reader bundles own their stage graphs rather than one root weight file.
-    has_multistage_ocr: bool = false,
 
     // Files (allocated strings — absolute paths)
     onnx_path: ?[]const u8 = null,
@@ -1043,7 +1039,6 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     try applyImplicitSparseOutputLayout(&manifest, catalog);
     try applySentenceTransformersPoolingSidecars(&manifest, allocator, catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
-    try applyMultiStageReaderHint(&manifest, allocator, catalog);
     try finalizeEmbeddingProfile(&manifest);
 
     return manifest;
@@ -1132,7 +1127,6 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     try applyImplicitSparseOutputLayout(&manifest, &catalog);
     try applySentenceTransformersPoolingSidecars(&manifest, allocator, &catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
-    try applyMultiStageReaderHint(&manifest, allocator, &catalog);
     try finalizeEmbeddingProfile(&manifest);
 
     return manifest;
@@ -1174,14 +1168,6 @@ fn isListingCandidateRejection(err: anyerror) bool {
         error.MissingEmbeddingTaskProfile,
         => true,
         else => false,
-    };
-}
-
-fn applyMultiStageReaderHint(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !void {
-    if (manifest.model_type != .reader or !(try catalog.exists("antfly_metadata.json"))) return;
-    manifest.has_multistage_ocr = multistage_metadata.isMultiStageModelDir(allocator, catalog.model_dir_path) catch |err| switch (err) {
-        error.InvalidMetadata => return error.InvalidModelManifest,
-        else => return err,
     };
 }
 

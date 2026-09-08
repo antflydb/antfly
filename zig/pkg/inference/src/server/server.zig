@@ -18010,47 +18010,6 @@ test "model listing does not parse GGUF payloads during discovery" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"acme/demo\":") != null);
 }
 
-test "model listing and readiness include nested multistage readers" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "acme/ocr/detection/v3");
-    try tmp.dir.createDirPath(std.testing.io, "acme/ocr/languages/english");
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "acme/ocr/model_manifest.json",
-        .data = "{\"type\":\"reader\",\"tasks\":[\"read\"],\"inputs\":[\"image\"]}",
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "acme/ocr/antfly_metadata.json",
-        .data =
-        \\{"pipeline_type":"multistage_ocr","stages":{
-        \\  "detection":{"model_file":"detection/v3/det.onnx","post_processor":"db"},
-        \\  "recognition":{"type":"ctc","model_file":"languages/english/rec.onnx","char_dict_file":"languages/english/dict.txt"}
-        \\}}
-        ,
-    });
-    // Discovery must inspect metadata, not load the stage graphs.
-    for ([_][]const u8{ "detection/v3/det.onnx", "languages/english/rec.onnx", "languages/english/dict.txt" }) |relative| {
-        const path = try std.fs.path.join(allocator, &.{ "acme/ocr", relative });
-        defer allocator.free(path);
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "listing-only fixture" });
-    }
-    const models_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(models_path);
-    var node = try Node.init(allocator, .{ .models_dir = models_path });
-    defer node.deinit();
-
-    const body = try node.listModelsJsonAlloc(allocator, std.testing.io);
-    defer allocator.free(body);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("readers").?.object.contains("acme/ocr"));
-    const reader_info = parsed.value.object.get("readers").?.object.get("acme/ocr").?.object;
-    try std.testing.expectEqualStrings("unknown", reader_info.get("compatibility").?.string);
-    try node.refreshReadinessInventory(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 1), node.readiness_inventory.load().counts.readers);
-}
-
 test "readiness refresh observes an externally published model" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

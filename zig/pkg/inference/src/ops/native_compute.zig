@@ -35764,7 +35764,80 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     const output = try self.allocator.alloc(f32, output_elems);
     errdefer self.allocator.free(output);
 
-    if (groups > 1 and groups == in_channels and groups == out_channels) {
+    if (groups == 1) {
+        const rows = output_area;
+        const k_dim = std.math.mul(usize, in_channels, kernel_elems) catch return error.InvalidInputShape;
+        const cols_elems = try std.math.mul(usize, rows, k_dim);
+        if (cols_elems > conv_temp_limit_elems) {
+            std.log.warn("conv2d refusing oversized im2col rows={d} k_dim={d} cols_elems={d} batch={d} in_channels={d} out_channels={d} height={d} width={d} kernel={d}x{d} stride={d}x{d} padding={d}x{d}", .{
+                rows,
+                k_dim,
+                cols_elems,
+                batch,
+                in_channels,
+                out_channels,
+                height,
+                width,
+                kernel_h,
+                kernel_w,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+            });
+            return error.UnsupportedShape;
+        }
+        const cols = try self.allocator.alloc(f32, cols_elems);
+        defer self.allocator.free(cols);
+
+        for (0..batch) |b| {
+            for (0..out_h) |oy| {
+                for (0..out_w) |ox| {
+                    const row = oy * out_w + ox;
+                    const row_base = row * k_dim;
+                    for (0..in_channels) |ic| {
+                        for (0..kernel_h) |ky| {
+                            for (0..kernel_w) |kx| {
+                                const col_idx = ((ic * kernel_h + ky) * kernel_w) + kx;
+                                const in_y_signed: i64 = @as(i64, @intCast(oy * stride_h + ky)) - @as(i64, @intCast(padding_h));
+                                const in_x_signed: i64 = @as(i64, @intCast(ox * stride_w + kx)) - @as(i64, @intCast(padding_w));
+                                cols[row_base + col_idx] = if (in_y_signed < 0 or in_x_signed < 0 or in_y_signed >= @as(i64, @intCast(height)) or in_x_signed >= @as(i64, @intCast(width))) 0.0 else blk: {
+                                    const in_y: usize = @intCast(in_y_signed);
+                                    const in_x: usize = @intCast(in_x_signed);
+                                    const in_idx = ((b * in_channels + ic) * height + in_y) * width + in_x;
+                                    break :blk input_data[in_idx];
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
+            const batch_out = output[b * out_channels * rows ..][0 .. out_channels * rows];
+            for (0..rows) |row| {
+                const dst = batch_out[row * out_channels ..][0..out_channels];
+                @memcpy(dst, bias_data[0..out_channels]);
+            }
+            try self.dispatchSgemmTransB(rows, out_channels, k_dim, 1.0, cols, weight_data, 1.0, batch_out);
+        }
+
+        const transposed = try self.allocator.alloc(f32, output.len);
+        defer self.allocator.free(transposed);
+        for (0..batch) |b| {
+            const src_batch = output[b * out_channels * rows ..][0 .. out_channels * rows];
+            const dst_batch = transposed[b * out_channels * rows ..][0 .. out_channels * rows];
+            for (0..rows) |row| {
+                for (0..out_channels) |oc| {
+                    dst_batch[(oc * rows) + row] = src_batch[row * out_channels + oc];
+                }
+            }
+        }
+        @memcpy(output, transposed);
+        const result = try self.makeBuf(output, true);
+        return self.withLogicalShape(result, &.{ @intCast(batch), @intCast(out_channels), @intCast(out_h), @intCast(out_w) });
+    }
+
+    if (groups == in_channels and groups == out_channels) {
         const kernel_size = kernel_elems;
         for (0..batch) |b| {
             for (0..out_channels) |c| {
@@ -35803,30 +35876,43 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     const out_per_group = out_channels / groups;
     const rows = output_area;
     const k_dim = std.math.mul(usize, in_per_group, kernel_elems) catch return error.InvalidInputShape;
-    if (k_dim > conv_temp_limit_elems) return error.UnsupportedShape;
-    // Bound the im2col and output scratch together, rather than refusing a
-    // valid convolution because its full-image expansion is too large.
-    const target_workspace_bytes: usize = 8 * 1024 * 1024;
-    const row_elems = std.math.add(usize, k_dim, out_per_group) catch return error.InvalidInputShape;
-    const block_rows = @max(@as(usize, 1), @min(rows, target_workspace_bytes / @sizeOf(f32) / row_elems));
-    const cols = try self.allocator.alloc(f32, block_rows * k_dim);
+    const cols_elems = try std.math.mul(usize, rows, k_dim);
+    if (cols_elems > conv_temp_limit_elems) {
+        std.log.warn("conv2d refusing oversized grouped im2col rows={d} k_dim={d} cols_elems={d} batch={d} in_channels={d} out_channels={d} height={d} width={d} kernel={d}x{d} stride={d}x{d} padding={d}x{d} groups={d}", .{
+            rows,
+            k_dim,
+            cols_elems,
+            batch,
+            in_channels,
+            out_channels,
+            height,
+            width,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            groups,
+        });
+        return error.UnsupportedShape;
+    }
+    const cols = try self.allocator.alloc(f32, cols_elems);
     defer self.allocator.free(cols);
-    const group_out = try self.allocator.alloc(f32, block_rows * out_per_group);
+    const group_out = try self.allocator.alloc(f32, rows * out_per_group);
     defer self.allocator.free(group_out);
+    const transposed = try self.allocator.alloc(f32, rows * out_per_group);
+    defer self.allocator.free(transposed);
 
     for (0..batch) |b| {
         for (0..groups) |group| {
             const ic_base = group * in_per_group;
             const oc_base = group * out_per_group;
 
-            var row_start: usize = 0;
-            while (row_start < rows) : (row_start += block_rows) {
-                const row_count = @min(block_rows, rows - row_start);
-                for (0..row_count) |local_row| {
-                    const row = row_start + local_row;
-                    const oy = row / out_w;
-                    const ox = row % out_w;
-                    const row_base = local_row * k_dim;
+            for (0..out_h) |oy| {
+                for (0..out_w) |ox| {
+                    const row = oy * out_w + ox;
+                    const row_base = row * k_dim;
                     for (0..in_per_group) |ic_group| {
                         const ic = ic_base + ic_group;
                         for (0..kernel_h) |ky| {
@@ -35844,26 +35930,25 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
                         }
                     }
                 }
-                for (0..row_count) |row| {
-                    const dst = group_out[row * out_per_group ..][0..out_per_group];
-                    @memcpy(dst, bias_data[oc_base..][0..out_per_group]);
-                }
-                const weight_group = weight_data[oc_base * k_dim ..][0 .. out_per_group * k_dim];
-                try self.dispatchSgemmTransB(
-                    row_count,
-                    out_per_group,
-                    k_dim,
-                    1.0,
-                    cols[0 .. row_count * k_dim],
-                    weight_group,
-                    1.0,
-                    group_out[0 .. row_count * out_per_group],
-                );
-                const batch_base = b * out_channels * rows;
+            }
+
+            for (0..rows) |row| {
+                const dst = group_out[row * out_per_group ..][0..out_per_group];
+                @memcpy(dst, bias_data[oc_base..][0..out_per_group]);
+            }
+            const weight_group = weight_data[oc_base * k_dim ..][0 .. out_per_group * k_dim];
+            try self.dispatchSgemmTransB(rows, out_per_group, k_dim, 1.0, cols, weight_group, 1.0, group_out);
+
+            for (0..rows) |row| {
                 for (0..out_per_group) |oc_group| {
-                    const dst = output[batch_base + (oc_base + oc_group) * rows + row_start ..][0..row_count];
-                    for (dst, 0..) |*value, row| value.* = group_out[row * out_per_group + oc_group];
+                    transposed[oc_group * rows + row] = group_out[row * out_per_group + oc_group];
                 }
+            }
+            const batch_base = b * out_channels * rows;
+            for (0..out_per_group) |oc_group| {
+                const dst = output[batch_base + (oc_base + oc_group) * rows ..][0..rows];
+                const src = transposed[oc_group * rows ..][0..rows];
+                @memcpy(dst, src);
             }
         }
     }
@@ -48564,45 +48649,6 @@ test "native rejects mismatched shaped buffers before conv2d" {
         error.InvalidInputShape,
         cb.conv2d(input, weight, bias, 1, 1, 1, 2, 2, 1, 1, 1, 1, 0, 0, 1),
     );
-}
-
-test "native conv2d tiles large workspaces while preserving padding and channel layout" {
-    const allocator = std.testing.allocator;
-    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    var compute = NativeCompute.init(allocator, &weight_store, null);
-    const cb = compute.computeBackend();
-    const side = 1024;
-    const area = side * side;
-    const pixels = try allocator.alloc(f32, area);
-    defer allocator.free(pixels);
-    for (pixels, 0..) |*pixel, i| pixel.* = @floatFromInt(i % 23);
-    var kernels = [_]f32{0} ** (2 * 9 * 9);
-    kernels[4 * 9 + 4] = 1;
-    kernels[9 * 9 + 2 * 9 + 3] = 2;
-    var biases = [_]f32{ 3, 5 };
-    const input = try compute.makeBuf(pixels, false);
-    defer cb.free(input);
-    const weight = try compute.makeBuf(&kernels, false);
-    defer cb.free(weight);
-    const bias = try compute.makeBuf(&biases, false);
-    defer cb.free(bias);
-
-    // The full im2col expansion exceeds the old 64M-element workspace cap.
-    // The output is small; a bounded tile must not reject this convolution.
-    const result = try cb.conv2d(input, weight, bias, 1, 1, 2, side, side, 9, 9, 1, 1, 4, 4, 1);
-    defer cb.free(result);
-    const shape = try cb.tensorShape(result, allocator);
-    defer allocator.free(shape);
-    try std.testing.expectEqualSlices(i64, &.{ 1, 2, side, side }, shape);
-    const actual = try cb.toFloat32(result, allocator);
-    defer allocator.free(actual);
-    for (0..area) |i| {
-        try std.testing.expectEqual(pixels[i] + 3, actual[i]);
-        const y = i / side;
-        const x = i % side;
-        const shifted: f32 = if (y >= 2 and x >= 1) pixels[(y - 2) * side + x - 1] else 0;
-        try std.testing.expectEqual(shifted * 2 + 5, actual[area + i]);
-    }
 }
 
 test "argmax reduces axis with keepdims" {

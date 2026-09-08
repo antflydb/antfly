@@ -2932,17 +2932,18 @@ const ShadingStitchingFunction = struct {
 
 const PositionedTextOutput = union(enum) {
     layout: *std.ArrayList(LayoutTextRun),
+    analysis: *std.ArrayList(TextRun),
     render: *std.ArrayList(TextRun),
 
     fn len(self: PositionedTextOutput) usize {
         return switch (self) {
             .layout => |out| out.items.len,
-            .render => |out| out.items.len,
+            .analysis, .render => |out| out.items.len,
         };
     }
 
-    fn isLayout(self: PositionedTextOutput) bool {
-        return self == .layout;
+    fn isTextOnly(self: PositionedTextOutput) bool {
+        return self != .render;
     }
 };
 
@@ -4188,6 +4189,8 @@ pub const Reader = struct {
     /// Extracts canonical page text and positioned text runs while sharing the
     /// page object, resource collection, content stream resolution, and stream
     /// decoding work between both representations.
+    /// Paint-only resources are not needed for character positions. Keep mask
+    /// and image decoding in the rendering APIs, as in plain-text extraction.
     pub fn extractPageTextAnalysisAlloc(self: *Reader, page_num: usize) !PageTextAnalysis {
         try self.beginImageCacheScope();
         defer self.endImageCacheScope();
@@ -4208,12 +4211,7 @@ pub const Reader = struct {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
-        defer {
-            for (gstates) |*gstate| gstate.deinit(self.alloc);
-            self.alloc.free(gstates);
-        }
-        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
+        const forms = try self.collectPageTextFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
@@ -4224,7 +4222,7 @@ pub const Reader = struct {
             self.alloc.free(color_spaces);
         }
 
-        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
+        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, &.{}, forms, color_spaces);
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
         return analysis;
     }
@@ -5599,7 +5597,7 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
-        var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
+        var run_parser = try PositionedTextParser.init(self.alloc, .{ .analysis = &runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer run_parser.deinit();
         run_parser.cancellation = self.cancellation;
 
@@ -14550,7 +14548,7 @@ fn applyTextRunOperator(
         paint_order.* += 1;
     }
     if (std.mem.eql(u8, op, "q")) {
-        const clip_points = if (out.isLayout()) null else try alloc.dupe([2]f64, current_clip_points.items);
+        const clip_points = if (out.isTextOnly()) null else try alloc.dupe([2]f64, current_clip_points.items);
         errdefer if (clip_points) |points| alloc.free(points);
         try stack.append(alloc, .{
             .matrix = state.matrix,
@@ -14634,7 +14632,7 @@ fn applyTextRunOperator(
         current_path_closed.* = false;
         return;
     }
-    if (std.mem.eql(u8, op, "gs") and out.isLayout()) return;
+    if (std.mem.eql(u8, op, "gs") and out.isTextOnly()) return;
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
             state.alpha = gstate.fill_alpha;
@@ -14657,7 +14655,7 @@ fn applyTextRunOperator(
         }
         return;
     }
-    if (out.isLayout() and isLayoutIgnoredTextOperator(op)) return;
+    if (out.isTextOnly() and isLayoutIgnoredTextOperator(op)) return;
     if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -15014,7 +15012,7 @@ fn applyTextRunOperator(
         var nested_state = buildFormTextState(state.*, form);
         if (form.transparency_group)
             try enterTextTransparencyGroup(state.*, &nested_state, form, next_group_id);
-        const nested_clip = if (out.isLayout()) &.{} else current_clip_points.items;
+        const nested_clip = if (out.isTextOnly()) &.{} else current_clip_points.items;
         var nested_parser = try PositionedTextParser.init(alloc, out, nested_state, nested_clip, current_clip_fill_rule.*);
         defer nested_parser.deinit();
         nested_parser.cancellation = cancellation;
@@ -15026,7 +15024,7 @@ fn applyTextRunOperator(
         next_group_id.* = nested_parser.next_group_id;
         switch (out) {
             .layout => {},
-            .render => |render_out| for (render_out.items[start_len..]) |*run| {
+            .analysis, .render => |render_out| for (render_out.items[start_len..]) |*run| {
                 if (vectorize_form_text) {
                     // Recursively nested runs already hold the innermost
                     // resource borrow. Otherwise translate this Form-local
@@ -16536,7 +16534,7 @@ fn appendTextRunDecodedString(
         estimateDecodedAdvance(decoded, state.*);
     const vertical = if (state.current_font_index) |font_idx| fonts[font_idx].isVertical() else false;
     const render_mode = switch (out) {
-        .layout => state.render_mode,
+        .layout, .analysis => state.render_mode,
         .render => try effectiveTextRenderMode(state.*),
     };
     if (render_mode != 3) switch (out) {
@@ -16558,7 +16556,7 @@ fn appendTextRunDecodedString(
                 .paint_order = paint_order,
             });
         },
-        .render => |render_out| {
+        .analysis, .render => |render_out| {
             const vectorizable = if (state.current_font_index) |font_idx|
                 fonts[font_idx].type3 != null or
                     fonts[font_idx].type1 != null or
@@ -27193,6 +27191,44 @@ test "reader extracts text and shapes through form xobject" {
     try std.testing.expectEqual(@as(u32, 0), render_runs.diagnostics.fallback_text_groups);
     try std.testing.expect(render_runs.shape_runs.len > shape_runs.len);
     try std.testing.expectEqual(@as(?*const PageFont, null), render_runs.text_runs[0].render_font);
+}
+
+test "reader text analysis ignores raster resources while preserving form positions" {
+    const alloc = std.testing.allocator;
+    const page_content = "/GS1 gs /Fm1 Do\n";
+    const form_content = "/Im1 Do /Spot cs BT /F1 12 Tf 1 0 0 1 10 10 Tm (Form text) Tj ET\n";
+    const page_stream = try std.fmt.allocPrint(alloc, "5 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content });
+    defer alloc.free(page_stream);
+    const form_stream = try std.fmt.allocPrint(
+        alloc,
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Matrix [1 0 0 1 15 20] /Resources << /Font << /F1 4 0 R >> /ColorSpace << /Spot [/Lab << /WhitePoint [1 1 1] >>] >> /XObject << /Im1 9 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ form_content.len, form_content },
+    );
+    defer alloc.free(form_stream);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ExtGState << /GS1 6 0 R >> /XObject << /Fm1 7 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+        "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>\nendobj\n",
+        page_stream,
+        "6 0 obj\n<< /Type /ExtGState /SMask << /S /Luminosity /G 8 0 R >> >>\nendobj\n",
+        form_stream,
+        "8 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Group << /S /Transparency /CS [/CalGray << /WhitePoint [1 1 1] >>] >> /Length 0 >>\nstream\n\nendstream\nendobj\n",
+        "9 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length 3 >>\nstream\nbad\nendstream\nendobj\n",
+    };
+    const bytes = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(bytes);
+    var parsed = try Reader.init(alloc, bytes);
+    defer parsed.deinit();
+    var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings("Form text\n", analysis.text);
+    try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 25), analysis.runs[0].x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 30), analysis.runs[0].y, 0.001);
+    try std.testing.expectEqual(@as(?TextOutputSpan, .{ .start = 0, .end = 9 }), analysis.runs[0].output_span);
+    // Extraction is independent of raster support; rendering remains strict.
+    try std.testing.expectError(error.UnsupportedPdfRendering, parsed.extractPageRenderRunsAlloc(1));
 }
 
 test "reader shares one decoded image mask while preserving per-use stencil color" {

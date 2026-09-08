@@ -30,7 +30,7 @@ loading weights.
 | State | Meaning | Behaviour |
 |---|---|---|
 | **`compatible`** | Static checks found a viable runtime path for this artifact and build. | May load, subject to resource admission. |
-| **`unknown`** | Listing cannot establish a viable runtime path from the parent contract alone. | Unrecognized single-model contracts require `--allow-unknown-models`; multistage OCR is assessed per stage. |
+| **`unknown`** | Antfly cannot prove compatibility or incompatibility without trying an unrecognized contract. | Rejected by default; opt in with `--allow-unknown-models`. |
 | **`incompatible`** | A required artifact/backend is missing, a tensor contract cannot be materialized, or the path is known unsafe or unusable. | Always rejected before load; the unknown-model opt-in cannot override it. |
 
 Resource fit is separate from compatibility. Model weights are admitted against stable host
@@ -180,83 +180,6 @@ latency guarantee; hosts must have enough reclaimable memory for their
 checkpoint and loader working set, and should measure replacement-worker load
 time on the actual storage topology.
 
-## Native PaddleOCR reader
-
-The native reader supports the `monkt/paddleocr-onnx` v3 detector with its English
-or Latin CTC recognizer. These artifacts execute through Antfly's own ONNX importer
-and native compute backend; ONNX Runtime and Paddle's runtime are not required.
-The English recognizer has also been exercised through standalone image reading
-and embedded/mixed/scanned PDF ingestion on native CPU with Accelerate BLAS
-(Apple M5 Pro). This does not qualify CUDA or Metal execution.
-
-The model directory needs `det.onnx`, `rec.onnx`, `dict.txt`, and
-`antfly_metadata.json`:
-
-```json
-{
-  "model_type": "paddleocr",
-  "pipeline_type": "multistage_ocr",
-  "stages": {
-    "detection": { "model_file": "det.onnx", "post_processor": "db" },
-    "recognition": {
-      "type": "ctc",
-      "model_file": "rec.onnx",
-      "char_dict_file": "dict.txt"
-    }
-  }
-}
-```
-
-The Paddle download path creates this metadata automatically. Without a custom
-preprocessor, dynamic detector inputs fit within 960 pixels with dimensions aligned
-to 32; dynamic recognition inputs preserve line aspect ratio up to width 3200.
-Narrow recognition crops retain a 320-pixel canvas with neutral padding rather
-than stretching glyphs or shrinking below the convolution's minimum dimensions.
-Fixed-width models retain their declared width. Recognition failures propagate
-instead of silently dropping text.
-
-Nested multistage bundles appear in `/ai/v1/models` and readiness inventory even
-without a top-level weight file. Their parent compatibility is `unknown` because
-listing does not inspect every stage graph. Reader loading still validates and
-admits the individual stages; the parent label does not bypass those checks.
-
-Build and exercise only the native reader, without rebuilding Antfly:
-
-```sh
-cd zig/pkg/inference
-zig build reader-bench-install -Doptimize=ReleaseFast -Dcpu=native -Donnx=false -Dcuda=false -Dmetal=false -Dsystem-blas=false -j1
-zig-out/bin/antfly-inference-reader-bench /path/to/paddle-model 512 scan.png
-```
-
-The command emits JSONL containing recognized text, regions, load time, and
-inference time. Other Paddle detector versions and languages are not qualified by
-this check.
-
-For PDF document extraction, select the installed Paddle model explicitly in the
-document-extraction configuration:
-
-```json
-{
-  "ocr": {
-    "enabled": true,
-    "mode": "auto",
-    "config": {
-      "provider": "antfly",
-      "model": "monkt/paddleocr-onnx"
-    }
-  }
-}
-```
-
-Embedded inference must be enabled for this local provider route. The existing
-PDF extraction pipeline uses the shared native PDF reader for embedded text and
-the reader provider for OCR fallback; the isolated benchmark does not replace
-either production path. The default OCR model remains Florence-2. Native PDF
-working-set limits and unsupported CCITT streams can still prevent rendering;
-the document manifest retains per-page OCR failure details. Reader bounding boxes
-are not yet retained when PDF ingestion selects OCR text, so OCR text recovery
-does not imply visual-grounding support.
-
 ## Known incompatible artifacts and families
 
 Rejected with HTTP 400 before any load. Some of these do not merely fail — they would
@@ -270,6 +193,7 @@ otherwise crash the server, so blocking them protects every other caller.
 | Seq2seq rewriters (`/rewrite`) | Importing an ONNX encoder/decoder graph panics on a rank assertion. No rewriter model currently works. |
 | `Babelscape/rebel-large` | Uses the same unsafe BART encoder-decoder graph-import path. Its relation parser has unit coverage, but the real model is not release-safe. It is also CC-BY-NC-SA. |
 | `microsoft/layoutlmv3-base` | Ships the legacy `vocab.json` + `merges.txt` pair with no `tokenizer.json`; the manifest accepts it but the loader rejects it. |
+| `monkt/paddleocr-onnx` | No backend accepts the model. |
 | `nomic-ai/nomic-embed-text-v1.5-GGUF` | `NoTokenizerFound`. |
 | Qwen2 | Loads with a correct chat template and clean termination, then answers the wrong question and emits token soup over the chat endpoint. |
 | Mistral / Mixtral | Loads with zero missing tensors, then argmaxes to token 0 on every step on both backends. The prompt tokenizes correctly, so the fault is in the forward pass. |

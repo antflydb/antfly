@@ -178,8 +178,8 @@ fn renderAllPages(alloc: std.mem.Allocator, path: []const u8, dpi: u16) !void {
 /// than `Backend.extractText` / `Reader.extractPlainTextAlloc`, whose per-page
 /// `catch`/`continue` (reader.zig) silently drops pages that fail extraction;
 /// here the first per-page error propagates so a corrupt page surfaces as a
-/// nonzero exit and no output file instead of silently missing text. Page
-/// concatenation is byte-identical to `extractPlainTextAlloc` on success.
+/// nonzero exit and no output file instead of silently missing text. Uses the
+/// production page-text/region API, with no OCR or raster rendering.
 fn dumpText(alloc: std.mem.Allocator, path: []const u8, output_path: []const u8) !void {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -195,9 +195,9 @@ fn dumpText(alloc: std.mem.Allocator, path: []const u8, output_path: []const u8)
     defer out.deinit(alloc);
 
     for (1..page_count + 1) |page_num| {
-        const text = try parsed.extractPageTextAlloc(page_num);
-        defer alloc.free(text);
-        try out.appendSlice(alloc, text);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(page_num);
+        defer analysis.deinit(alloc);
+        try out.appendSlice(alloc, analysis.text);
     }
 
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = output_path, .data = out.items });

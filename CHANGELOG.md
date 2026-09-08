@@ -29,23 +29,10 @@ All notable changes to Antfly will be documented in this file.
   from text geometry instead of operator boundaries.
 - Accept integer-syntax PDF numbers outside the i64 range when they remain finite
   f64 values, including large Form bounding boxes; non-finite values still fail.
+- Extract PDF text and positions independently of raster masks, images, and
+  unsupported paint color spaces, so rendering limitations do not drop readable pages.
 - Add an isolated `lib-pdf-bench-install` build target and strict `dump-text`
   command for reproducing extraction failures without rebuilding the application.
-
-#### Native inference
-
-- Enable native PaddleOCR v3 detection with English and Latin CTC recognition,
-  without ONNX Runtime or Paddle runtime dependencies.
-- Fix dynamic ONNX shape handling, implement native ConvTranspose and exact
-  unpadded AveragePool, and bound convolution workspace through tiled execution.
-- Correct Paddle image normalization and CTC space handling, preserve dynamic
-  recognition widths up to 3200, and propagate recognition failures.
-- Pad narrow Paddle recognition crops to the training-width canvas with neutral
-  padding, avoiding invalid convolution shapes without stretching glyphs.
-- Discover nested multistage reader bundles in model inventory and readiness;
-  keep parent-only compatibility unknown and validate stages during loading.
-- Add an isolated `reader-bench-install` build target for exercising the production
-  reader without rebuilding the full application.
 
 #### Upgrade compatibility
 

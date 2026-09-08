@@ -190,16 +190,19 @@ zig build lib-pdf-bench-install -Dpdf-optimize=Debug -j1
 zig build lib-pdf-test -Doptimize=Debug -j1
 ```
 
-`dump-text` writes native UTF-8 text, without OCR or layout postprocessing by the
-server. It propagates page extraction errors rather than silently skipping
-failed pages. Create the output directory first.
+`dump-text` writes native UTF-8 text using the same page-text/region extraction API
+as the production document pipeline, without OCR or server postprocessing. It
+propagates page extraction errors rather than silently skipping failed pages.
+Create the output directory first.
 
 The isolated executable defaults to `ReleaseFast`; use `-Dpdf-optimize=Debug`
 for short edit/build/debug cycles, and omit it for optimized benchmark runs.
 `--prefix /path/to/run` installs a separate `bin/lib-pdf-bench` so baseline and
-candidate executables can be retained independently. Antfly's Circus
-`benchmarks/ParseBench-harness/text_content_driver.py` scores this command's output
-against upstream content rules without running an Antfly server.
+candidate executables can be retained independently. Also use a separate
+`--cache-dir /path/to/cache` for each source revision, especially with cloned
+worktrees: a separate install prefix does not isolate Zig's cached build graph.
+Antfly's Circus `benchmarks/ParseBench-harness/text_content_driver.py` scores this
+command's output against upstream content rules without running an Antfly server.
 
 ## Generated Code
 
