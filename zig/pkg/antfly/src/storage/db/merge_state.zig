@@ -36,8 +36,11 @@ pub const State = struct {
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
     bootstrap_complete: bool = false,
     bootstrap_applied_index: u64 = 0,
+    /// Terminal identities remain fenced even after another merge takes over.
+    retired_transition_ids: []const u64 = &.{},
 
     pub fn deinit(self: *State, alloc: std.mem.Allocator) void {
+        alloc.free(self.retired_transition_ids);
         alloc.free(@constCast(self.receiver_base_range.start));
         alloc.free(@constCast(self.receiver_base_range.end));
         if (self.merged_range) |merged| {
@@ -85,6 +88,10 @@ pub fn encode(
     } else {
         try list.append(alloc, 0);
     }
+    const retired_len: u32 = @intCast(state.retired_transition_ids.len);
+    try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u32, retired_len)));
+    for (state.retired_transition_ids) |id|
+        try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, id)));
 }
 
 pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
@@ -103,6 +110,7 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
     const start = try alloc.dupe(u8, data[pos .. pos + start_len]);
     errdefer alloc.free(start);
     pos += start_len;
+    if (data.len - pos < 4) return error.InvalidMergeState;
     const end_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
     if (pos + end_len > data.len) return error.InvalidMergeState;
@@ -167,6 +175,19 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
         pos += merged_end_len;
         break :blk .{ .start = merged_start.?, .end = merged_end.? };
     } else null;
+    var retired: []u64 = &.{};
+    errdefer alloc.free(retired);
+    if (pos < data.len) {
+        if (data.len - pos < 4) return error.InvalidMergeState;
+        const count = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4;
+        if (count > (data.len - pos) / 8) return error.InvalidMergeState;
+        retired = try alloc.alloc(u64, count);
+        for (retired) |*id| {
+            id.* = std.mem.readInt(u64, data[pos..][0..8], .little);
+            pos += 8;
+        }
+    }
     if (pos != data.len or donor_group_id == 0 or receiver_group_id == 0 or
         donor_group_id == receiver_group_id)
         return error.InvalidMergeState;
@@ -181,18 +202,46 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
         .receiver_identity_reassignment_namespace = receiver_identity_reassignment_namespace,
         .bootstrap_complete = bootstrap_complete,
         .bootstrap_applied_index = bootstrap_applied_index,
+        .retired_transition_ids = retired,
     };
 }
 
 pub const ApplyPlan = struct {
     state: State,
     range: db_types.ByteRange,
+    owned_retired_ids: ?[]u64 = null,
+
+    pub fn deinit(self: ApplyPlan, alloc: std.mem.Allocator) void {
+        if (self.owned_retired_ids) |ids| alloc.free(ids);
+    }
 };
+
+pub fn isRetired(state: State, transition_id: u64) bool {
+    return std.mem.indexOfScalar(u64, state.retired_transition_ids, transition_id) != null;
+}
+
+pub fn retireCurrentAlloc(alloc: std.mem.Allocator, state: State) ![]u64 {
+    const ids = try alloc.alloc(u64, state.retired_transition_ids.len + 1);
+    @memcpy(ids[0..state.retired_transition_ids.len], state.retired_transition_ids);
+    ids[ids.len - 1] = state.transition_id;
+    return ids;
+}
+
+/// Copy payloads have authority only during their exact receiver transition.
+/// A stale committed payload is a no-op, not a fatal Raft apply error.
+pub fn copyAllowed(state: ?State, replication: db_types.MergeReplicationContext) bool {
+    const current = state orelse return false;
+    return current.phase == .accepting and
+        current.transition_id == replication.transition_id and
+        current.donor_group_id == replication.donor_group_id and
+        current.receiver_group_id == replication.receiver_group_id;
+}
 
 /// Validate and monotonically fold one receiver-side data-Raft checkpoint.
 /// Replayed or delayed commands may be idempotent, but can never move the
 /// durable phase, range, or donor watermark backwards.
 pub fn planCheckpointApply(
+    alloc: std.mem.Allocator,
     existing: ?*const State,
     current_range: db_types.ByteRange,
     checkpoint: db_types.MergeReplicationCheckpoint,
@@ -234,20 +283,22 @@ pub fn planCheckpointApply(
     }
 
     const prior = existing.?;
-    // A rollback is terminal for one transition, not a permanent fence on the
-    // receiver range. Metadata may admit a fresh transition after observing
-    // the rollback. Replace the old terminal receipt only with that new
-    // transition's accept checkpoint and only after the live range is back at
-    // the newly declared base. Same-transition replays continue through the
-    // monotonic checks below; every other phase remains fail closed.
-    if (prior.phase == .rolled_back and
+    if (isRetired(prior.*, checkpoint.transition_id))
+        return .{ .state = prior.*, .range = current_range };
+    // Both terminal outcomes release the receiver for a fresh transition.
+    // Retain retired identities so delayed accepts cannot resurrect them.
+    if ((prior.phase == .rolled_back or prior.phase == .finalized) and
         prior.transition_id != checkpoint.transition_id)
     {
         if (checkpoint.kind != .accept or !rangesEqual(current_range, base))
             return error.ConflictingMergeTransition;
+        const retired = try retireCurrentAlloc(alloc, prior.*);
+        var next = stateFromCheckpoint(checkpoint, .accepting, false, 0);
+        next.retired_transition_ids = retired;
         return .{
-            .state = stateFromCheckpoint(checkpoint, .accepting, false, 0),
+            .state = next,
             .range = merged,
+            .owned_retired_ids = retired,
         };
     }
     if ((prior.transition_id != 0 and prior.transition_id != checkpoint.transition_id) or
@@ -282,7 +333,8 @@ pub fn planCheckpointApply(
                     checkpoint.bootstrap_applied_index <= prior.bootstrap_applied_index)
                     return preserveAdvanced(prior, checkpoint, merged);
                 return .{
-                    .state = stateFromCheckpoint(
+                    .state = advanceState(
+                        prior,
                         checkpoint,
                         .accepting,
                         true,
@@ -303,7 +355,8 @@ pub fn planCheckpointApply(
             .accepting => {
                 if (!prior.bootstrap_complete) return error.MergeTransitionNotReady;
                 return .{
-                    .state = stateFromCheckpoint(
+                    .state = advanceState(
+                        prior,
                         checkpoint,
                         .finalized,
                         true,
@@ -322,7 +375,7 @@ pub fn planCheckpointApply(
         },
         .rollback => switch (prior.phase) {
             .accepting, .rolling_back => return .{
-                .state = stateFromCheckpoint(checkpoint, .rolled_back, false, 0),
+                .state = advanceState(prior, checkpoint, .rolled_back, false, 0),
                 .range = base,
             },
             .rolled_back => return preserveAdvanced(prior, checkpoint, base),
@@ -353,10 +406,12 @@ test "rolled back merge receiver admits only a fresh accept transition" {
     };
 
     const accepted = try planCheckpointApply(
+        std.testing.allocator,
         &prior,
         .{ .start = "doc:m", .end = "" },
         fresh,
     );
+    defer accepted.deinit(std.testing.allocator);
     try std.testing.expectEqual(Phase.accepting, accepted.state.phase);
     try std.testing.expectEqual(@as(u64, 600), accepted.state.transition_id);
     try std.testing.expectEqual(@as(u64, 601), accepted.state.donor_group_id);
@@ -367,12 +422,18 @@ test "rolled back merge receiver admits only a fresh accept transition" {
     not_accept.bootstrap_applied_index = 7;
     try std.testing.expectError(
         error.ConflictingMergeTransition,
-        planCheckpointApply(&prior, .{ .start = "doc:m", .end = "" }, not_accept),
+        planCheckpointApply(std.testing.allocator, &prior, .{ .start = "doc:m", .end = "" }, not_accept),
     );
     try std.testing.expectError(
         error.ConflictingMergeTransition,
-        planCheckpointApply(&prior, .{ .start = "doc:n", .end = "" }, fresh),
+        planCheckpointApply(std.testing.allocator, &prior, .{ .start = "doc:n", .end = "" }, fresh),
     );
+}
+
+fn advanceState(prior: *const State, checkpoint: db_types.MergeReplicationCheckpoint, phase: Phase, complete: bool, index: u64) State {
+    var state = stateFromCheckpoint(checkpoint, phase, complete, index);
+    state.retired_transition_ids = prior.retired_transition_ids;
+    return state;
 }
 
 fn stateFromCheckpoint(

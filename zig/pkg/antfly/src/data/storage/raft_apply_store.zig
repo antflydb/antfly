@@ -1839,7 +1839,7 @@ pub const RaftApplyStore = struct {
             },
             .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
             .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
-            .acknowledge_split, .merge_source_transition, .set_raft_batch_protocol, .flush_split_delta => {},
+            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .flush_split_delta => {},
         }
     }
 
@@ -1891,7 +1891,7 @@ pub const RaftApplyStore = struct {
                 },
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
                 .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
-                .acknowledge_split, .merge_source_transition, .set_raft_batch_protocol, .flush_split_delta => {},
+                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -2172,6 +2172,8 @@ pub const RaftApplyStore = struct {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
         }
+        const fenced_copy = decoded.batch.req.merge_replication != null and decoded.batch.req.merge_checkpoint == null;
+        if (fenced_copy) try operations.append(alloc, .{ .merge_copy_fence = decoded.batch.req.merge_replication });
         for (decoded.batch.req.writes) |write| {
             const key = try alloc.dupe(u8, write.key);
             errdefer alloc.free(key);
@@ -2184,6 +2186,7 @@ pub const RaftApplyStore = struct {
             errdefer alloc.free(owned_key);
             try operations.append(alloc, .{ .delete = owned_key });
         }
+        if (fenced_copy) try operations.append(alloc, .{ .merge_copy_fence = null });
         if (decoded.batch.req.split_transition) |transition| switch (transition.kind) {
             .prepare => {
                 const split_key = try alloc.dupe(u8, transition.split_key);
@@ -3820,22 +3823,70 @@ test "data raft merge receiver checkpoint expands monotonically and snapshots" {
     try std.testing.expectEqual(merge_state.Phase.finalized, receiver_state.phase);
     try std.testing.expectEqual(@as(u64, 3), receiver_state.bootstrap_applied_index);
 
+    const old_copy: db_types.MergeReplicationContext = .{
+        .transition_id = 500,
+        .donor_group_id = 501,
+        .receiver_group_id = group_id,
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+    };
+    // An old coordinator can deliver a delete or snapshot page after cutover.
+    try Apply.command(alloc, &source, group_id, 7, .{
+        .merge_replication = old_copy,
+        .deletes = &.{"doc:b"},
+        .writes = &.{.{ .key = "doc:z", .value = "{\"stale\":true}" }},
+    });
+    const second: db_types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 600,
+        .donor_group_id = 601,
+        .receiver_group_id = group_id,
+        .receiver_base_start = "doc:a",
+        .receiver_base_end = "",
+        .merged_start = "",
+        .merged_end = "",
+    };
+    try Apply.command(alloc, &source, group_id, 8, .{ .merge_checkpoint = second });
+    // Neither an old accept nor an old copy can replace the fresh transition.
+    try Apply.command(alloc, &source, group_id, 9, .{ .merge_checkpoint = checkpoint });
+    try Apply.command(alloc, &source, group_id, 10, .{
+        .merge_replication = old_copy,
+        .deletes = &.{"doc:b"},
+    });
+    var new_copy = old_copy;
+    new_copy.transition_id = 600;
+    new_copy.donor_group_id = 601;
+    try Apply.command(alloc, &source, group_id, 11, .{
+        .merge_replication = new_copy,
+        .writes = &.{.{ .key = "doc:0", .value = "{\"side\":\"new donor\"}" }},
+    });
+    var second_complete = second;
+    second_complete.kind = .bootstrap_complete;
+    second_complete.bootstrap_applied_index = 11;
+    try Apply.command(alloc, &source, group_id, 12, .{ .merge_checkpoint = second_complete });
+    second_complete.kind = .finalize;
+    try Apply.command(alloc, &source, group_id, 13, .{ .merge_checkpoint = second_complete });
+
     const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group_id);
     defer alloc.free(snapshot);
     var target = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
     defer target.deinit();
-    try target.installSnapshot(alloc, group_id, 6, snapshot);
+    try target.installSnapshot(alloc, group_id, 13, snapshot);
     current_range = try target.currentRange(alloc, group_id);
     defer range_state.freeRange(alloc, current_range);
-    try std.testing.expectEqualStrings("doc:a", current_range.start);
+    try std.testing.expectEqualStrings("", current_range.start);
     var restored = (try target.currentMergeReceiverState(alloc, group_id)) orelse
         return error.MissingMergeReceiverState;
     defer restored.deinit(alloc);
     try std.testing.expectEqual(merge_state.Phase.finalized, restored.phase);
-    try std.testing.expectEqual(@as(u64, 500), restored.transition_id);
+    try std.testing.expectEqual(@as(u64, 600), restored.transition_id);
+    try std.testing.expectEqualSlices(u64, &.{500}, restored.retired_transition_ids);
+    try Apply.command(alloc, &target, group_id, 14, .{ .merge_checkpoint = checkpoint });
+    try Apply.command(alloc, &target, group_id, 15, .{ .merge_replication = old_copy, .deletes = &.{"doc:b"} });
     const entries = try target.groupState(alloc, group_id);
     defer shard_state_store.freeGroupStateEntries(alloc, entries);
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("doc:b", entries[1].key);
+    try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", entries[2].value);
 }
 
 test "data raft merge accept initializes a pristine replica projection" {

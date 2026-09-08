@@ -7282,6 +7282,25 @@ pub const DB = struct {
             }
         }
 
+        if (req.merge_replication) |replication| if (req.merge_checkpoint == null) {
+            const raw = try self.core.getStoreValue(self.alloc, merge_state_mod.key);
+            defer if (raw) |value| self.alloc.free(value);
+            var state = if (raw) |value| try merge_state_mod.decodeAlloc(self.alloc, value) else null;
+            defer if (state) |*value| value.deinit(self.alloc);
+            if (!merge_state_mod.copyAllowed(state, replication)) {
+                if (!opts.bypass_ha_write_gate) return error.MergeCopyFenced;
+                // A delayed committed command must advance the receipt without
+                // touching documents, artifacts, indexes or visibility state.
+                if (opts.raft_applied_entry_marker) |identity| {
+                    var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+                    try self.core.store.putBatch(&.{raftAppliedEntryWrite(identity, &marker_buf)}, &.{});
+                }
+                self.core.unlockApply();
+                apply_mutex_held = false;
+                return;
+            }
+        };
+
         if (req.merge_artifacts.len > 0) {
             if (!req.merge_replication.?.identity_namespace.eql(self.core.identity_namespace))
                 return error.DocIdentityNamespaceMismatch;
@@ -8067,10 +8086,12 @@ pub const DB = struct {
                 null;
             defer if (existing_state) |*state| state.deinit(self.alloc);
             const plan = try merge_state_mod.planCheckpointApply(
+                self.alloc,
                 if (existing_state) |*state| state else null,
                 self.core.byteRange(),
                 checkpoint,
             );
+            defer plan.deinit(self.alloc);
             persisted_range = plan.range;
             persisted_range_start_owned = try self.alloc.dupe(u8, plan.range.start);
             persisted_range_end_owned = try self.alloc.dupe(u8, plan.range.end);
@@ -84905,6 +84926,17 @@ test "db replicated merge artifacts preserve graph dense sparse projections acro
             var receiver = try DB.open(alloc, std.mem.span(receiver_path), .{ .start_index_workers = start_workers });
             defer receiver.close();
             for (configs) |config| try receiver.addIndex(config);
+            try receiver.updateRange(.{ .start = "doc:m", .end = "" });
+            try receiver.batch(.{ .merge_checkpoint = .{
+                .kind = .accept,
+                .transition_id = 1,
+                .donor_group_id = 2,
+                .receiver_group_id = 3,
+                .receiver_base_start = "doc:m",
+                .receiver_base_end = "",
+                .merged_start = "",
+                .merged_end = "",
+            } });
             try receiver.batch(.{
                 .writes = &.{ .{ .key = "doc:a", .value = primary }, .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" } },
                 .sync_level = .full_index,
@@ -104752,6 +104784,85 @@ test "db replicated split bootstrap requires and preserves begin barrier" {
     var found = (try db.lookup(alloc, "doc:z", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"v\":1}", found.json);
+}
+
+test "db merge receiver fences stale copies and retains retired transitions across reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const first: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 100,
+        .donor_group_id = 101,
+        .receiver_group_id = 102,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        const copy: types.MergeReplicationContext = .{
+            .transition_id = 100,
+            .donor_group_id = 101,
+            .receiver_group_id = 102,
+            .identity_namespace = db.core.identity_namespace,
+        };
+        const payload: types.BatchRequest = .{ .merge_replication = copy, .writes = &.{.{ .key = "b", .value = "{}" }} };
+        try db.batchRaftReplicatedApply(payload, .{ .term = 1, .index = 1 });
+        try std.testing.expect((try db.get(alloc, "b")) == null);
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = first }, .{ .term = 1, .index = 2 });
+        try db.batchRaftReplicatedApply(payload, .{ .term = 1, .index = 3 });
+        var terminal = first;
+        terminal.kind = .bootstrap_complete;
+        terminal.bootstrap_applied_index = 3;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 4 });
+        terminal.kind = .finalize;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 5 });
+        try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"public\":true}" }} });
+        const before = db.core.nextDerivedSequence();
+        try db.batchRaftReplicatedApply(payload, .{ .term = 2, .index = 6 });
+        try db.batchRaftReplicatedApply(.{ .merge_replication = copy, .deletes = &.{"b"} }, .{ .term = 2, .index = 7 });
+        // A stale artifact must be ignored before its payload is decoded.
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "b", "graph", "links", "c");
+        defer alloc.free(artifact_key);
+        try db.batchRaftReplicatedApply(.{ .merge_replication = copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} }, .{ .term = 2, .index = 8 });
+        try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
+        try std.testing.expectEqual(before, db.core.nextDerivedSequence());
+        try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+        const value = (try db.get(alloc, "b")).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"public\":true}", value);
+        var second = first;
+        second.transition_id = 200;
+        second.donor_group_id = 201;
+        second.receiver_base_start = "a";
+        second.merged_start = "";
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 9 });
+        try db.batchRaftReplicatedApply(payload, .{ .term = 2, .index = 10 });
+        second.kind = .bootstrap_complete;
+        second.bootstrap_applied_index = 10;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 11 });
+        second.kind = .finalize;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 12 });
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.batchRaftReplicatedApply(.{ .merge_checkpoint = first }, .{ .term = 3, .index = 13 });
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 200), state.transition_id);
+    try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+    try std.testing.expectEqualSlices(u64, &.{100}, state.retired_transition_ids);
+    try std.testing.expectEqualStrings("", db.getRange().start);
+    const value = (try db.get(alloc, "b")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"public\":true}", value);
 }
 
 test "db replicated merge checkpoints persist phase range and watermark across reopen" {

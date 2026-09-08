@@ -827,6 +827,7 @@ pub const MergeCoordinator = struct {
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace,
     bootstrap_complete: bool,
     bootstrap_applied_index: u64,
+    retired_transition_ids: []u64,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MergeConfig) !MergeCoordinator {
         // As with split coordinators, init consumes borrowed leases on every
@@ -871,10 +872,21 @@ pub const MergeCoordinator = struct {
 
         var persisted = try receiver.loadMergeState(alloc);
         defer if (persisted) |*state| state.deinit(alloc);
+        var retired_ids: []u64 = &.{};
+        errdefer alloc.free(retired_ids);
         if (persisted) |state| {
-            if (cfg.transition_id != 0 and state.transition_id != 0 and
-                cfg.transition_id != state.transition_id)
-                return error.ConflictingMergeTransition;
+            if (merge_state.isRetired(state, cfg.transition_id)) return error.ConflictingMergeTransition;
+            if (cfg.transition_id != state.transition_id) {
+                if (cfg.transition_id == 0 or (state.phase != .finalized and state.phase != .rolled_back))
+                    return error.ConflictingMergeTransition;
+                retired_ids = try merge_state.retireCurrentAlloc(alloc, state);
+                persisted.?.deinit(alloc);
+                persisted = null;
+            } else {
+                if (state.donor_group_id != cfg.donor_group_id or state.receiver_group_id != cfg.receiver_group_id)
+                    return error.ConflictingMergeTransition;
+                retired_ids = try alloc.dupe(u64, state.retired_transition_ids);
+            }
         }
 
         const base_range: db_types.ByteRange = if (persisted) |state| .{
@@ -915,10 +927,12 @@ pub const MergeCoordinator = struct {
                 null,
             .bootstrap_complete = if (persisted) |state| state.bootstrap_complete else false,
             .bootstrap_applied_index = if (persisted) |state| state.bootstrap_applied_index else 0,
+            .retired_transition_ids = retired_ids,
         };
     }
 
     pub fn deinit(self: *MergeCoordinator) void {
+        self.alloc.free(self.retired_transition_ids);
         self.receiver.deinit();
         if (self.donor_lease) |lease| lease.release();
         if (self.donor_owned) {
@@ -1181,6 +1195,7 @@ pub const MergeCoordinator = struct {
             .receiver_identity_reassignment_namespace = self.receiver_identity_reassignment_namespace,
             .bootstrap_complete = self.bootstrap_complete,
             .bootstrap_applied_index = self.bootstrap_applied_index,
+            .retired_transition_ids = self.retired_transition_ids,
         });
     }
 
@@ -2387,6 +2402,63 @@ test "db merge coordinator finalize persists across reopen" {
         try std.testing.expect(reopened.allow_doc_identity_reassignment);
         try std.testing.expect(status.allow_doc_identity_reassignment);
     }
+}
+
+test "db merge coordinator accepts successive donors and fences retired identities" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const receiver_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/successive-receiver", .{tmp.sub_path});
+    defer alloc.free(receiver_root);
+    const donor_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/successive-donor", .{tmp.sub_path});
+    defer alloc.free(donor_root);
+    {
+        var receiver = try Destination.init(alloc, .{ .root_dir = receiver_root });
+        defer receiver.deinit();
+        try receiver.db.updateRange(.{ .start = "m", .end = "t" });
+        try receiver.db.batch(.{ .writes = &.{.{ .key = "p", .value = "{}" }} });
+    }
+    var donor = try data_store.RaftApplyStore.init(alloc, .{ .root_dir = donor_root });
+    defer donor.deinit();
+    const ranges = [_]db_types.ByteRange{ .{ .start = "t", .end = "z" }, .{ .start = "a", .end = "m" } };
+    for (ranges, 0..) |range, i| {
+        const group: u64 = 1001 + @as(u64, @intCast(i));
+        const key = if (i == 0) "u" else "b";
+        try std.testing.expect(try donor.seedGroupSnapshotIfAbsent(alloc, group, 1, range, &.{.{ .key = key, .value = "{}" }}));
+        var coord = try MergeCoordinator.init(alloc, .{
+            .transition_id = 2001 + @as(u64, @intCast(i)),
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = group,
+            .receiver_group_id = 1003,
+            .donor_store = &donor,
+        });
+        defer coord.deinit();
+        try std.testing.expectEqualStrings("m", coord.receiver_base_range.start);
+        try std.testing.expectEqualStrings(if (i == 0) "t" else "z", coord.receiver_base_range.end);
+        try coord.acceptDonorRange();
+        _ = try coord.syncOnce();
+        try std.testing.expect(try coord.finalizeMerge());
+    }
+    try std.testing.expectError(error.ConflictingMergeTransition, MergeCoordinator.init(alloc, .{
+        .transition_id = 2001,
+        .donor_root_dir = donor_root,
+        .receiver_root_dir = receiver_root,
+        .donor_group_id = 1001,
+        .receiver_group_id = 1003,
+        .donor_store = &donor,
+    }));
+    var receiver = try Destination.init(alloc, .{ .root_dir = receiver_root });
+    defer receiver.deinit();
+    for ([_][]const u8{ "b", "p", "u" }) |key| {
+        const value = (try receiver.get(alloc, key)) orelse return error.TestExpectedEqual;
+        alloc.free(value);
+    }
+    try std.testing.expectEqualStrings("a", receiver.getRange().start);
+    try std.testing.expectEqualStrings("z", receiver.getRange().end);
+    var state = (try receiver.loadMergeState(alloc)).?;
+    defer state.deinit(alloc);
+    try std.testing.expectEqualSlices(u64, &.{2001}, state.retired_transition_ids);
 }
 
 test "db merge coordinator reassigns receiver identity namespace only after opt-in" {

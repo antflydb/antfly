@@ -12850,6 +12850,23 @@ pub const DataServer = struct {
         };
     }
 
+    fn mergeReceiverAcceptRanges(
+        donor: antfly.db.types.ByteRange,
+        current: antfly.db.types.ByteRange,
+        prior: ?antfly.db.merge_state.State,
+        transition_id: u64,
+    ) !struct { base: antfly.db.types.ByteRange, merged: antfly.db.types.ByteRange } {
+        if (prior) |state| {
+            if (antfly.db.merge_state.isRetired(state, transition_id)) return error.ConflictingMergeTransition;
+            if (state.transition_id == transition_id) return .{
+                .base = state.receiver_base_range,
+                .merged = state.merged_range orelse return error.MergeReceiverProjectionNotReady,
+            };
+            if (state.phase != .finalized and state.phase != .rolled_back) return error.ConflictingMergeTransition;
+        }
+        return .{ .base = current, .merged = try mergeTransitionRange(donor, current) };
+    }
+
     fn mergeReplicationContext(
         transition_id: u64,
         donor_group_id: u64,
@@ -13129,9 +13146,22 @@ pub const DataServer = struct {
         store: *antfly.data.RaftApplyStore,
         record: antfly.metadata.MergeTransitionRecord,
     ) !antfly.metadata.transition_state.MergeObservation {
-        const source_state = try store.currentMergeSourceState(alloc, record.donor_group_id);
+        var source_state = try store.currentMergeSourceState(alloc, record.donor_group_id);
         var receiver_state = try store.currentMergeReceiverState(alloc, record.receiver_group_id);
         defer if (receiver_state) |*state| state.deinit(alloc);
+        if (source_state) |state| {
+            if (state.phase == .rolled_back and state.transition_id != record.transition_id)
+                source_state = null;
+        }
+        if (receiver_state) |state| {
+            if (state.transition_id != record.transition_id and
+                (state.phase == .finalized or state.phase == .rolled_back) and
+                !antfly.db.merge_state.isRetired(state, record.transition_id))
+            {
+                receiver_state.?.deinit(alloc);
+                receiver_state = null;
+            }
+        }
         if (source_state) |state| {
             if (state.transition_id != record.transition_id or
                 state.receiver_group_id != record.receiver_group_id)
@@ -13244,21 +13274,14 @@ pub const DataServer = struct {
             defer range_state_mod.freeRange(self.alloc, current_receiver_range);
             var existing_receiver = try store.currentMergeReceiverState(self.alloc, op.receiver_group_id);
             defer if (existing_receiver) |*state| state.deinit(self.alloc);
-            const base_range = if (existing_receiver) |state|
-                state.receiver_base_range
-            else
-                current_receiver_range;
-            const merged_range = if (existing_receiver) |state|
-                state.merged_range orelse return error.MergeReceiverProjectionNotReady
-            else
-                try mergeTransitionRange(donor_range, base_range);
+            const accepted_ranges = try mergeReceiverAcceptRanges(donor_range, current_receiver_range, existing_receiver, op.transition_id);
             try self.replicateMergeReceiverCheckpoint(
                 mergeReceiverCheckpoint(
                     op.transition_id,
                     op.donor_group_id,
                     op.receiver_group_id,
-                    base_range,
-                    merged_range,
+                    accepted_ranges.base,
+                    accepted_ranges.merged,
                     .accept,
                     0,
                     op.allow_doc_identity_reassignment,
@@ -24910,6 +24933,35 @@ test "data raft merge observation derives from replicated source and receiver ma
     try std.testing.expect(observation.receiver.bootstrapped);
     try std.testing.expectEqual(@as(u64, 2), observation.receiver.donor_delta_sequence);
     try std.testing.expectEqual(@as(u64, 2), observation.receiver.receiver_delta_sequence);
+    var next_record = record;
+    next_record.transition_id = 7002;
+    next_record.donor_group_id = 73;
+    try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record));
+    complete.kind = .finalize;
+    try Apply.command(alloc, &store, record.receiver_group_id, 4, .{ .merge_checkpoint = complete });
+    const fresh_observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, next_record);
+    try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.prepare, fresh_observation.receiver.phase);
+    try std.testing.expect(!fresh_observation.receiver.bootstrapped);
+    var prior = (try store.currentMergeReceiverState(alloc, record.receiver_group_id)).?;
+    defer prior.deinit(alloc);
+    const next_ranges = try DataServer.mergeReceiverAcceptRanges(
+        .{ .start = "", .end = "doc:a" },
+        .{ .start = "doc:a", .end = "" },
+        prior,
+        next_record.transition_id,
+    );
+    try std.testing.expectEqualStrings("doc:a", next_ranges.base.start);
+    try std.testing.expectEqualStrings("", next_ranges.merged.start);
+    var next_checkpoint = base_checkpoint;
+    next_checkpoint.transition_id = next_record.transition_id;
+    next_checkpoint.donor_group_id = next_record.donor_group_id;
+    next_checkpoint.receiver_base_start = next_ranges.base.start;
+    next_checkpoint.merged_start = next_ranges.merged.start;
+    try Apply.command(alloc, &store, record.receiver_group_id, 5, .{ .merge_checkpoint = next_checkpoint });
+    next_checkpoint.kind = .rollback;
+    try Apply.command(alloc, &store, record.receiver_group_id, 6, .{ .merge_checkpoint = next_checkpoint });
+    // A retired identity is not mistaken for a fresh request after rollback.
+    try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, record));
 }
 
 test "data raft source lifecycle commands bypass document db apply while receiver checkpoints apply" {

@@ -96,6 +96,8 @@ pub const DataOperation = union(enum) {
     rollback_split: SplitTransition,
     merge_source_transition: MergeSourceTransition,
     merge_receiver_checkpoint: MergeReceiverCheckpoint,
+    /// Scope the following document effects to one merge copy envelope.
+    merge_copy_fence: ?db_types.MergeReplicationContext,
     /// Irreversibly activates a Raft batch log format for this group.
     set_raft_batch_protocol: u16,
     /// Internal apply boundary. Split deltas use the committed Raft index as
@@ -2474,7 +2476,11 @@ pub fn appendOperationEffects(
         delta_deletes.deinit(alloc);
     }
 
+    var merge_copy_allowed = true;
     for (operations) |op| switch (op) {
+        .merge_copy_fence => |replication| {
+            merge_copy_allowed = if (replication) |context| merge_state.copyAllowed(merge_receiver_state, context) else true;
+        },
         .set_raft_batch_protocol => |version| {
             if (version < raft_batch_protocol_version)
                 return error.RaftBatchProtocolVersionRegression;
@@ -2489,6 +2495,7 @@ pub fn appendOperationEffects(
             raft_batch_protocol_version = version;
         },
         .put => |put| {
+            if (!merge_copy_allowed) continue;
             if (merge_source_state != null and merge_source_state.?.phase == .finalized)
                 return error.MergeSourceFenced;
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
@@ -2516,6 +2523,7 @@ pub fn appendOperationEffects(
             }
         },
         .delete => |key_to_delete| {
+            if (!merge_copy_allowed) continue;
             if (merge_source_state != null and merge_source_state.?.phase == .finalized)
                 return error.MergeSourceFenced;
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
@@ -2877,6 +2885,7 @@ pub fn appendOperationEffects(
                 .end = owned_checkpoint.checkpoint.receiver_base_end,
             };
             const plan = try merge_state.planCheckpointApply(
+                alloc,
                 if (merge_receiver_state) |*state| state else null,
                 if (!range_initialized and merge_receiver_state == null and
                     owned_checkpoint.checkpoint.kind == .accept)
@@ -2885,6 +2894,7 @@ pub fn appendOperationEffects(
                     byte_range,
                 owned_checkpoint.checkpoint,
             );
+            defer plan.deinit(alloc);
 
             const next_start = try alloc.dupe(u8, plan.range.start);
             const next_end = alloc.dupe(u8, plan.range.end) catch |err| {

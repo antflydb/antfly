@@ -3462,6 +3462,40 @@ formatting checks, and all 21 selected public deadline/join/graph/semantic E2Es
 pass. GitHub reported no CI checks for the prior PR head at validation time;
 these are local results, not a claim of completed remote CI.
 
+### Merge Copy Fencing and Receiver Reuse (2026-09-07)
+
+The next production review found that copy payloads carried transition identity
+without checking the receiver's durable phase. A delayed coordinator could
+therefore delete or overwrite post-cutover data. Both document DB apply and the
+Raft apply projection now accept copy effects only for the exact active
+receiver transition. Stale committed writes, deletes, and artifact pages become
+no-ops that advance their Raft receipt without changing data or derived
+visibility; unfenced direct mutations fail with `MergeCopyFenced`.
+
+A successful merge also left a terminal receipt that blocked any subsequent
+donor. Both finalized and rolled-back receivers now admit a fresh accept against
+their current range. Production range construction does not reuse another
+transition's base or merged range, and observation presents an unrelated
+terminal receipt as awaiting acceptance. Durable retired transition IDs survive
+subsequent checkpoints, reopen, and snapshot transfer; old accepts cannot
+resurrect a retired merge. The direct coordinator follows the same retirement
+rules. No claim is made here about arbitrary overlapping active coordinators or
+all disjoint-placement histories.
+
+Regressions exercise successive donors, stale writes/deletes/artifacts after
+finalization and during a later merge, unchanged derived visibility with
+advancing Raft receipts, retired checkpoint replay after reopen/snapshot
+transfer, and fresh-versus-retired metadata observations.
+
+Validation: the default data-storage gate passes 69/69 and the focused merge
+storage/coordinator gate passes 15/15. The DB fencing, checkpoint, and artifact
+replay/reopen tests pass 3/3 in both Debug and ReleaseSafe. The production
+observation and two DataServer merge/split record-and-replay histories pass
+3/3 without skips. The production build and `make fmt-check` pass. New
+regressions are included in the existing data-runtime and data-storage default
+filters. GitHub reported no checks for the prior PR head; these are local
+validation results, not a remote CI certification.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and
