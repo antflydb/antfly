@@ -41,7 +41,9 @@ fn sleepWatchdog(ns: u64) void {
 /// Last-resort process termination is deliberately independent of every
 /// `std.Io` executor being drained. A stuck task can consume or deadlock those
 /// executors, so scheduling the deadline on one of them would make the
-/// deadline advisory precisely when it is needed.
+/// deadline advisory precisely when it is needed. This is the sole intentional
+/// application-owned `std.Thread.spawn` exception: the hard deadline must also
+/// survive faults in Io scheduling, waiting, or executor destruction itself.
 const ShutdownWatchdog = struct {
     const State = enum(u8) { idle, armed, disarmed, expired };
     const Expiration = struct {

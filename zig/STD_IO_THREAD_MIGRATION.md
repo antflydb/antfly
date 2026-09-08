@@ -13,9 +13,10 @@ are the six data-server workers, internal LSM flush, quarantine retry, and
 parallel index opening. The benchmark follow-up also converts all 19 original
 benchmark spawn sites. The serverless/inference follow-up converts six more
 runtime sites and retires the two unused legacy implementations. The latest
-follow-up converts LMDB, linalg, both CUDA worker sites, and all remaining
-direct yield calls. **Four original runtime/library spawn sites remain; no `Thread.yield` calls
-remain.** The inventory and migration
+follow-ups convert LMDB, linalg, both CUDA worker sites, all remaining direct
+yield calls, and the three HTTP control loops. **One original spawn site remains
+as an intentional exception: the hard-shutdown watchdog. No `Thread.yield`
+calls remain.** The inventory and migration
 table below are historical, rather than a list of work still outstanding.
 
 The test-suite follow-up converts the remaining 227 test/helper sites across
@@ -83,8 +84,8 @@ and cleanup after every worker completes. Nested per-shard reads stay serial.
 The Linux prepared-pack test checks normal and zero-capacity inline execution.
 There are no direct Thread references left in the CUDA source directory.
 
-Four direct spawn sites remain: HTTP accept, peer-disconnect observation,
-httpx cancellation observation, and the hard-shutdown watchdog.
+At that stage four direct spawn sites remained. The HTTP control follow-up
+below converts three; the hard-shutdown watchdog remains an explicit exception.
 
 Validation for the yield/LMDB/linalg/CUDA follow-up:
 
@@ -99,6 +100,45 @@ Validation for the yield/LMDB/linalg/CUDA follow-up:
 - Linalg pool and prepared-pack tests cross-compile for `aarch64-linux-musl`. Linux execution, Linux kernel performance qualification, and GPU transfer execution were unavailable locally.
 - Final `zig build antfly -j1` and `zig build antfly -Dcuda=true -j1` both passed, along with CLI `--help` smoke checks. The CUDA-enabled build validates the full production loading path; GPU transfer execution still requires hardware.
 - Optional `zig build install-wasm -j1` does not pass: it reports broader freestanding/32-bit compilation problems, including unsupported PATH_MAX, 64-bit atomics, architecture constants, and unrelated missing members. No successful WASM validation is claimed.
+
+## HTTP control executor follow-up
+
+The std HTTP accept loop, peer/deadline observer, and httpx cancellation observer
+now each own one guaranteed-concurrent future on a private `Io.Threaded` executor
+with async capacity disabled and a one-worker concurrent limit. Executors are
+initialized at the owner's stable address during start and destroyed after the
+future drains. Configured accept/httpx stack sizes and the peer observer's 4 MiB
+stack floor are preserved. The accept loop still uses the request executor for
+socket I/O and connection handoff, including inline fallback when that executor
+has zero concurrent capacity. Neither observer consumes request pool capacity.
+
+Start/stop serialize access to futures and executor destruction. Observer
+registration checks atomic lifecycle publication instead of reading a mutable
+future. Failed startup releases executors, kernel queues, and listener resources;
+retry creates fresh control owners. Listener stop publishes stopping, wakes retry
+waits and the accept socket, drains acceptance, shuts down accepted sockets,
+drains connection work, then releases the observer and server. The control
+executor remains alive through this sequence.
+
+Idle observer waits use latched Io stop events. Active poll/kevent/WSAPoll calls
+retain their bounded 25 ms kernel timeouts: stop/await does not depend on future
+cancellation interrupting those raw syscalls. Registrations stay multiplexed,
+with existing deadline/failure publication, descriptor retirement, and distinct
+peer-observer FIN versus httpx half-close semantics preserved. This is a Threaded
+backend migration, not a claim of arbitrary evented-backend support.
+
+The hard-shutdown watchdog is the sole direct-spawn exception. Keeping it outside
+Io preserves its stronger guarantee: expiration remains independent of faults in
+Io scheduling, waiting, and destruction, as well as exhausted application pools.
+The source now identifies that exception explicitly.
+
+Validation on macOS ARM64 with Zig 0.16.0:
+
+- `zig build common-http-test lib-httpx-test -j2 --summary all` passed with local socket access: 126 common HTTP tests passed, one optional external-endpoint soak skipped; all 522 httpx tests passed. No failures or leaks. Initial sandbox runs failed at prohibited local binds; the unrestricted runs passed.
+- New tests force control-capacity refusal, check rollback and retry, verify the one-worker ceiling, and race two stop callers through repeated listener/httpx observer restarts. Existing tests cover zero-capacity request Io, deadline storms, peer cancellation, HTTP half-close behavior, blocked-read shutdown, and watchdog expiration outside Io.
+- The httpx observer tests cross-compile for `aarch64-linux-musl` and `x86_64-windows-gnu`. These are compile checks; Linux/Windows execution and Linux-only resource-stability checks still need those platforms.
+- Final `zig build antfly -j1` and the production CLI `--help` smoke check passed.
+- Source scan finds one direct spawn (the watchdog) and zero direct yields.
 
 ## Serverless, inference, and legacy retirement follow-up
 
@@ -307,10 +347,10 @@ Paths below are relative to `zig/`. Line numbers refer to the audited commit.
 | **Implemented** `pkg/antfly/src/storage/lsm_backend.zig` — internal flush worker | 6228 | Supply scheduling `Io`, replace polling/wake state with Io waits, preserve `drain_on_stop` and obsolete-file reclamation. Scope executor ownership above individual backends where practical. |
 | **Implemented** `pkg/antfly/src/storage/db/db.zig` — quarantine retry | 23824 | Use the database's background ownership machinery or a concurrent future. Preserve stable-address startup, best-effort spawn failure, stop/join, and deterministic manual test mode. |
 | **Implemented** `pkg/antfly/src/storage/db/catalog/index_manager.zig` — parallel index open | 5886 | Plumb scheduling `Io`; bounded finite fan-out can use `Group.async` if inline execution is safe. Preserve read-only-only parallelism, per-index errors/quarantine, partial startup cleanup, and result ownership. |
-| `pkg/antfly/src/common/http/std_http_listener.zig` — accept loop | 266 | Use a future on a control executor with explicit capacity and stack sizing. Preserve accept wakeup, connection cancellation, observer teardown, and borrowed/owned executor lifetimes. See the zero-capacity contract below. |
-| `pkg/antfly/src/common/http/peer_disconnect_observer.zig` | 161 | Add Io ownership but retain one multiplexed observer task. Raw poll/kqueue and nanosleep need an explicit backend/wakeup design for portable cancellation. |
-| `lib/httpx/src/server/cancellation_observer.zig` | 123 | Same observer constraints; preserve startup-error reporting and configurable stack size. |
-| `pkg/antfly/src/common/runtime_lifecycle.zig` — hard shutdown watchdog | 68 | Requires a separately owned, isolated watchdog executor or a documented exception. Never schedule this on an executor it is timing out. |
+| **Implemented** `pkg/antfly/src/common/http/std_http_listener.zig` — accept loop | 266 | Use a future on a control executor with explicit capacity and stack sizing. Preserve accept wakeup, connection cancellation, observer teardown, and borrowed/owned executor lifetimes. See the zero-capacity contract below. |
+| **Implemented** `pkg/antfly/src/common/http/peer_disconnect_observer.zig` | 161 | Add Io ownership but retain one multiplexed observer task. Raw poll/kqueue and nanosleep need an explicit backend/wakeup design for portable cancellation. |
+| **Implemented** `lib/httpx/src/server/cancellation_observer.zig` | 123 | Same observer constraints; preserve startup-error reporting and configurable stack size. |
+| **Retained exception** `pkg/antfly/src/common/runtime_lifecycle.zig` — hard shutdown watchdog | 68 | Requires a separately owned, isolated watchdog executor or a documented exception. Never schedule this on an executor it is timing out. |
 | **Implemented** `pkg/antfly/src/lmdb/env.zig` — commit worker | 182 | Add a bounded scheduling owner; review pthread mutex/conditions and synchronous submitters together. Preserve serialization, readiness handshake, optional worker-owned async runtime, C error mapping, and transaction/thread assumptions. |
 | **Implemented** `lib/linalg/src/pool.zig` — process-wide Sync kernel pool | 172 | Prefer existing `dispatchJobsIo` at callers. Decide whether Sync APIs become sequential or borrow an explicitly owned compute runtime. Removing the global futex pool requires performance validation. |
 | **Implemented** `pkg/inference/src/runtime/tier/prefetch.zig` — generic prefetch queue | 97 | Plumb `Io` through queue owners and mutex callers. Replace the no-op signal plus idle polling with a condition/event; preserve priority, processing-under-lock option, and manual test draining. |

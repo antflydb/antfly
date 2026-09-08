@@ -40,12 +40,11 @@ fn monotonicNowNs() ?u64 {
 
 /// A bounded, multiplexed H1 socket-lifetime observer.
 ///
-/// One owner thread watches every admitted request for peer disconnects and
-/// enforces header/body deadlines. This deliberately avoids `Io.concurrent`:
-/// the threaded Io backend permanently retains one worker for every concurrent
-/// blocking timeout race. The registry therefore keeps observation O(1)
-/// threads per listener while retaining O(n) descriptors and a small, fixed
-/// polling cadence.
+/// One concurrent future on a private, single-worker Io executor watches every
+/// admitted request for peer disconnects and enforces header/body deadlines.
+/// Multiplexing avoids per-request blocking timeout races, which would retain
+/// one Threaded worker per request. Observation therefore stays O(1) workers
+/// per listener with O(n) descriptors and a fixed polling cadence.
 pub const Observer = struct {
     pub const DeadlineOutcome = enum {
         completed,
@@ -136,7 +135,12 @@ pub const Observer = struct {
     active_deadline_count: std.atomic.Value(usize) = .init(0),
     deadline_expirations_total: std.atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
+    // One reserved worker for all registrations, independent of request Io.
+    control_io: ?std.Io.Threaded = null,
+    future: ?std.Io.Future(void) = null,
+    running: std.atomic.Value(bool) = .init(false),
+    stop_event: std.Io.Event = .unset,
+    lifecycle_mutex: std.Io.Mutex = .init,
     /// A single kqueue observes EOF behind unread pipelined bytes on Darwin.
     kernel_fd: ?std.posix.fd_t = null,
 
@@ -145,8 +149,16 @@ pub const Observer = struct {
     }
 
     pub fn start(self: *Observer) !void {
+        return self.startWithControlLimit(.limited(1));
+    }
+
+    // The explicit limit also exercises partial-start rollback in tests.
+    fn startWithControlLimit(self: *Observer, limit: std.Io.Limit) !void {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
-        if (self.thread != null) return error.AlreadyStarted;
+        const lifecycle_io = std.Io.Threaded.global_single_threaded.io();
+        self.lifecycle_mutex.lockUncancelable(lifecycle_io);
+        defer self.lifecycle_mutex.unlock(lifecycle_io);
+        if (self.future != null) return error.AlreadyStarted;
         try self.entries.ensureTotalCapacity(self.alloc, self.capacity);
         if (comptime builtin.os.tag == .macos) {
             const raw = std.posix.system.kqueue();
@@ -158,17 +170,33 @@ pub const Observer = struct {
             self.kernel_fd = null;
         };
         self.stopping.store(false, .release);
-        self.thread = try std.Thread.spawn(
-            .{ .stack_size = thread_config.minimum_partitioned_stack_size },
-            run,
-            .{self},
-        );
+        self.stop_event = .unset;
+        self.control_io = std.Io.Threaded.init(self.alloc, .{
+            .stack_size = thread_config.minimum_partitioned_stack_size,
+            .async_limit = .nothing,
+            .concurrent_limit = limit,
+        });
+        errdefer {
+            self.control_io.?.deinit();
+            self.control_io = null;
+        }
+        self.future = try self.control_io.?.io().concurrent(run, .{self});
+        self.running.store(true, .release);
     }
 
     pub fn deinit(self: *Observer) void {
+        const lifecycle_io = std.Io.Threaded.global_single_threaded.io();
+        self.lifecycle_mutex.lockUncancelable(lifecycle_io);
+        defer self.lifecycle_mutex.unlock(lifecycle_io);
         self.stopping.store(true, .release);
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
+        self.running.store(false, .release);
+        if (self.future) |*future| {
+            self.stop_event.set(self.control_io.?.io());
+            future.await(self.control_io.?.io());
+            self.future = null;
+        }
+        if (self.control_io) |*control| control.deinit();
+        self.control_io = null;
         if (self.kernel_fd) |fd| _ = std.posix.system.close(fd);
         self.kernel_fd = null;
         platform_sync.lockYielding(&self.mutex);
@@ -190,14 +218,14 @@ pub const Observer = struct {
         observer_failures_total: ?*std.atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return .{};
-        if (self.thread == null or self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
 
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         // Close the check/register race with deinit() and fatal observer
         // failures. Once stopping is published, no stack-backed action may be
         // admitted because no owner thread is guaranteed to retire it.
-        if (self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
         if (self.entries.items.len >= self.capacity) return error.ObserverCapacityExceeded;
 
         const id = self.nextId();
@@ -225,7 +253,7 @@ pub const Observer = struct {
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding)
             return error.ObserverUnavailable;
-        if (self.thread == null or self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
         const now_ns = monotonicNowNs() orelse return error.ObserverUnavailable;
         const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
         const expires_at_ns = std.math.add(u64, now_ns, timeout_ns) catch std.math.maxInt(u64);
@@ -233,7 +261,7 @@ pub const Observer = struct {
 
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        if (self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
         if (self.entries.items.len >= self.capacity) return error.ObserverCapacityExceeded;
 
         const id = self.nextId();
@@ -262,11 +290,11 @@ pub const Observer = struct {
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding)
             return error.ObserverUnavailable;
-        if (self.thread == null or self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
 
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        if (self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
         if (self.entries.items.len >= self.capacity) return error.ObserverCapacityExceeded;
 
         const id = self.nextId();
@@ -318,6 +346,15 @@ pub const Observer = struct {
         }
     }
 
+    // Idle waits wake immediately on stop. Active raw kernel polls retain a
+    // finite 25 ms timeout, so draining never relies on Io cancellation being
+    // able to interrupt poll, kevent, or WSAPoll.
+    fn waitForObservation(self: *Observer) void {
+        self.stop_event.waitTimeout(self.control_io.?.io(), .{
+            .duration = .{ .raw = .fromMilliseconds(observation_interval_ms), .clock = .awake },
+        }) catch {};
+    }
+
     fn run(self: *Observer) void {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
         if (comptime builtin.os.tag == .macos) return self.runKqueue();
@@ -338,7 +375,7 @@ pub const Observer = struct {
             ids.clearRetainingCapacity();
             if (self.entries.items.len == 0) {
                 self.mutex.unlock();
-                sleepMs(observation_interval_ms);
+                self.waitForObservation();
                 continue;
             }
             for (self.entries.items) |entry| {
@@ -406,7 +443,7 @@ pub const Observer = struct {
 
         while (!self.stopping.load(.acquire)) {
             if (self.active_count.load(.acquire) == 0) {
-                sleepMs(observation_interval_ms);
+                self.waitForObservation();
                 continue;
             }
             const ready_raw = std.posix.system.kevent(kq, events.items.ptr, 0, events.items.ptr, @intCast(events.items.len), &timeout);
@@ -807,4 +844,22 @@ test "std http listener socket observer rejects registration after fatal stop" {
         observer.registerDeadline(sockets[1], 60_000, &deadline, null),
     );
     try std.testing.expectEqual(@as(usize, 0), observer.activeCount());
+}
+
+test "peer observer rolls back refused control capacity before retry" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Noop = struct {
+        fn run() void {}
+    };
+    var observer = Observer.init(std.testing.allocator, 2);
+    defer observer.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, observer.startWithControlLimit(.nothing));
+    try std.testing.expect(observer.control_io == null);
+    try std.testing.expect(observer.future == null);
+    try std.testing.expect(observer.kernel_fd == null);
+    var deadline: Observer.Deadline = .{};
+    try std.testing.expectError(error.ObserverUnavailable, observer.registerDeadline(undefined, 1, &deadline, null));
+    try observer.start();
+    try std.testing.expectError(error.AlreadyStarted, observer.start());
+    try std.testing.expectError(error.ConcurrencyUnavailable, observer.control_io.?.io().concurrent(Noop.run, .{}));
 }
