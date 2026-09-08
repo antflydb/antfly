@@ -5570,6 +5570,7 @@ fn inferenceProviderEmbedDensePartsBorrowed(
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) ![][]f32 {
+    const embedding_wire = @import("../inference/embedding_wire.zig");
     const wire_parts = try alloc.alloc(antfly.template.ContentPart, parts.len);
     defer alloc.free(wire_parts);
     const payload_storage = try alloc.alloc(inference_bridge.ProviderBinaryPayload, parts.len);
@@ -5585,7 +5586,7 @@ fn inferenceProviderEmbedDensePartsBorrowed(
             };
             ref_storage[payload_count] = .{ .attachment_index = payload_count, .item_index = item_index };
             payload_count += 1;
-            wire_part.* = .{ .binary = .{ .mime_type = binary.mime_type, .data = &.{} } };
+            wire_part.* = embedding_wire.metadataPart(part);
         },
         else => wire_part.* = part,
     };
@@ -5594,7 +5595,7 @@ fn inferenceProviderEmbedDensePartsBorrowed(
         alloc,
         handle,
         operation,
-        .{
+        embedding_wire.Request(antfly.template.ContentPart){
             .model = model,
             .parts = wire_parts,
             .attachment_count = payload_count,

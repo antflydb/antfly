@@ -4953,6 +4953,16 @@ worst-case expansion factor is not an input limit. Text-only requests retain the
 original logical JSON ceiling. Regressions cover compressed 25-megapixel inputs,
 a 100 KB ASCII prompt, and escaping that actually exceeds the metadata allowance.
 
+Linked-worker embedding windows also enforce that metadata ceiling before
+dispatch. Planning and ABI serialization share the embedding request structure
+and binary-part projection. An allocation-free prefix counter scans each part
+once, including JSON escaping, model/task/instruction fields, array separators,
+and attachment-count digits. Mixed text/image windows split without shrinking
+valid text-only batches to the attachment limit. Tests cover two 600 KiB text
+items mixed with an image in either order, escaped text, exact-boundary requests,
+and attachment-count digit transitions. Oversized indivisible metadata fails
+before invoking the provider; no post-inference retry is needed.
+
 Direct and fused output storage still release tensors independently. Related
 self-cache and cross-cache columns coalesce byte-credit reductions: physical
 buffers are freed immediately, while their credit remains conservative until the

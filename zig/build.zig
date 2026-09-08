@@ -3788,6 +3788,7 @@ pub fn build(b: *std.Build) void {
         "metadata http client preserves artifact dependency conflicts",
         "managed embedder preserves coverage policy in storage config",
         "managed embedder admission follows the selected attachment transport",
+        "managed embedder metadata",
         "managed embedder partitions and validates inline image data URIs",
         "attachment transport separates wire and peak resident representations",
         "bounded invocation allocator",

@@ -55,6 +55,7 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const inference_work = @import("work.zig");
+const embedding_wire = @import("embedding_wire.zig");
 const remote_capabilities = @import("remote_capabilities.zig");
 const execution_context = @import("execution_context.zig");
 const shared_vector = @import("antfly_vector").vector;
@@ -1594,7 +1595,13 @@ pub const ManagedEmbedder = struct {
         }
         var offset: usize = 0;
         while (offset < items.len) {
-            const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset);
+            const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset, .{
+                .model = entry.model,
+                .task_type = if (entry.antfly_provider) |local|
+                    if (local.embed_dense_parts_with_context != null) EmbeddingTaskType.retrieval_document.canonical() else null
+                else
+                    null,
+            });
             const chunk = items[offset..end];
             try validateDensePartItemInvocation(alloc, capabilities, attachment_transport, chunk);
             const chunk_vectors = try embedPartItemsWithEntry(alloc, entry, chunk, dims, lease);
@@ -5638,8 +5645,15 @@ fn densePartBatchEnd(
     attachment_transport: inference_work.AttachmentTransport,
     items: []const template_mod.ContentPart,
     start: usize,
+    metadata_options: embedding_wire.Options,
 ) !usize {
     if (start >= items.len) return start;
+    // This descriptor describes the linked-worker ABI, not remote HTTP JSON.
+    const metadata_limit = if (attachment_transport == .borrowed_binary) capabilities.attachment_metadata_max_bytes else null;
+    var metadata_sizer: ?embedding_wire.Sizer = if (metadata_limit != null)
+        try embedding_wire.Sizer.init(template_mod.ContentPart, metadata_options)
+    else
+        null;
     const max_items = capabilities.batch.max_items;
     var encoded_media_bytes: usize = 0;
     var decoded_pixels: u64 = 0;
@@ -5677,10 +5691,86 @@ fn densePartBatchEnd(
                 break;
             }
         }
+        if (metadata_sizer) |*sizer| {
+            const metadata_bytes = try sizer.append(items[end]);
+            // The smaller metadata ceiling applies only to physical attachments.
+            // A text-only prefix can still fit when adding an image cannot.
+            if (sizer.attachment_count > 0 and metadata_bytes > metadata_limit.?) {
+                if (end == start) return error.BodyTooLarge;
+                break;
+            }
+        }
         encoded_media_bytes = next_bytes;
         decoded_pixels = next_pixels;
     }
     return end;
+}
+
+test "managed embedder metadata sizing matches wire JSON at every prefix" {
+    const alloc = std.testing.allocator;
+    const options = embedding_wire.Options{ .model = "model\"\\\nλ", .task_type = "RETRIEVAL_DOCUMENT", .instruction = "\x00instruction" };
+    var parts: [105]template_mod.ContentPart = undefined;
+    var wire_parts: [105]template_mod.ContentPart = undefined;
+    var sizer = try embedding_wire.Sizer.init(template_mod.ContentPart, options);
+    var attachments: usize = 0;
+    for (&parts, &wire_parts, 0..) |*part, *wire_part, i| {
+        part.* = if (i == 0) .{ .text = "\x00\n\"\\λ" } else if (i == 1) .{ .media_url = "https://example.test/\"λ" } else .{ .binary = .{ .mime_type = "image/png", .data = "\x00\xffpayload stays borrowed" } };
+        wire_part.* = embedding_wire.metadataPart(part.*);
+        if (part.* == .binary) attachments += 1;
+        const measured = try sizer.append(part.*);
+        // Independent literal catches drift in both fields and JSON encoding,
+        // including attachment-count transitions through 9/10 and 99/100.
+        const json = try std.json.Stringify.valueAlloc(alloc, .{
+            .model = options.model,
+            .parts = wire_parts[0 .. i + 1],
+            .attachment_count = attachments,
+            .task_type = options.task_type,
+            .instruction = options.instruction,
+        }, .{});
+        defer alloc.free(json);
+        try std.testing.expectEqual(json.len, measured);
+    }
+}
+
+test "managed embedder metadata ceiling splits mixed batches before dispatch" {
+    const alloc = std.testing.allocator;
+    var png = [_]u8{0} ** 24;
+    @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, png[16..20], 2, .big);
+    std.mem.writeInt(u32, png[20..24], 3, .big);
+    const binary = template_mod.ContentPart{ .binary = .{ .mime_type = "image/png", .data = &png } };
+    const text = try alloc.alloc(u8, 600 * 1024);
+    defer alloc.free(text);
+    @memset(text, 'a');
+    const items = [_]template_mod.ContentPart{ binary, .{ .text = text }, .{ .text = text } };
+    var caps = inference_work.InferenceCapabilities{
+        .task = .embed,
+        .input_modalities = .{ .text = true, .image = true },
+        .input_granularity = .page,
+        .batch = .{ .mode = .native, .max_items = 8, .preferred_items = 8, .max_media_parts_per_item = 1 },
+        .output = .embedding,
+        .attachment_metadata_max_bytes = 1024 * 1024,
+    };
+    const options = embedding_wire.Options{ .model = "local-model", .task_type = "RETRIEVAL_DOCUMENT" };
+    try std.testing.expectEqual(@as(usize, 2), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    try std.testing.expectEqual(@as(usize, 3), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 2, options));
+    // A text-only prefix remains legal even above 1 MiB. Adding its first
+    // physical attachment must start a new invocation, regardless of order.
+    const reversed = [_]template_mod.ContentPart{ items[1], items[2], binary };
+    try std.testing.expectEqual(@as(usize, 2), try densePartBatchEnd(alloc, caps, .borrowed_binary, &reversed, 0, options));
+    try std.testing.expectEqual(@as(usize, 3), try densePartBatchEnd(alloc, caps, .borrowed_binary, &reversed, 2, options));
+    @memset(text, 0);
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    // Exact boundary includes the model, task, instruction, and JSON syntax.
+    var sizer = try embedding_wire.Sizer.init(template_mod.ContentPart, options);
+    caps.attachment_metadata_max_bytes = try sizer.append(binary);
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    caps.attachment_metadata_max_bytes.? -= 1;
+    try std.testing.expectError(error.BodyTooLarge, densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
+    // A linked-worker ceiling must not be applied to a different wire format.
+    try std.testing.expectEqual(@as(usize, 3), try densePartBatchEnd(alloc, caps, .segmented_framed_binary, &items, 0, options));
+    caps.attachment_metadata_max_bytes = null;
+    try std.testing.expectEqual(@as(usize, 3), try densePartBatchEnd(alloc, caps, .borrowed_binary, &items, 0, options));
 }
 
 test "managed embedder admission follows the selected attachment transport" {
@@ -5708,11 +5798,11 @@ test "managed embedder admission follows the selected attachment transport" {
     };
     try std.testing.expectEqual(
         @as(usize, 2),
-        try densePartBatchEnd(std.testing.allocator, capabilities, .borrowed_binary, &items, 0),
+        try densePartBatchEnd(std.testing.allocator, capabilities, .borrowed_binary, &items, 0, .{}),
     );
     try std.testing.expectEqual(
         @as(usize, 1),
-        try densePartBatchEnd(std.testing.allocator, capabilities, .base64_payload, &items, 0),
+        try densePartBatchEnd(std.testing.allocator, capabilities, .base64_payload, &items, 0, .{}),
     );
     try validateDensePartItemInvocation(std.testing.allocator, capabilities, .base64_payload, items[0..1]);
     try std.testing.expectError(
@@ -5724,7 +5814,7 @@ test "managed embedder admission follows the selected attachment transport" {
     pixel_limited.batch.max_decoded_pixels = 6;
     try std.testing.expectEqual(
         @as(usize, 1),
-        try densePartBatchEnd(std.testing.allocator, pixel_limited, .borrowed_binary, &items, 0),
+        try densePartBatchEnd(std.testing.allocator, pixel_limited, .borrowed_binary, &items, 0, .{}),
     );
     try std.testing.expectError(
         error.InferenceDecodedPixelsExceeded,
@@ -5756,7 +5846,7 @@ test "managed embedder partitions and validates inline image data URIs" {
         },
         .output = .embedding,
     };
-    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(std.testing.allocator, capabilities, .base64_payload, &items, 0));
+    try std.testing.expectEqual(@as(usize, 1), try densePartBatchEnd(std.testing.allocator, capabilities, .base64_payload, &items, 0, .{}));
     try validateDensePartItemInvocation(std.testing.allocator, capabilities, .base64_payload, items[0..1]);
     try std.testing.expectError(
         error.InferenceEncodedBytesExceeded,
