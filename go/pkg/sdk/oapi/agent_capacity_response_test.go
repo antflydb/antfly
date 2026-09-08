@@ -62,3 +62,40 @@ func TestAgentCapacityResponseContract(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentDependencyUnavailableResponseContract(t *testing.T) {
+	doc, err := GetSwagger()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []string{"doc_identity_unavailable", "query_embedding_temporarily_unavailable"} {
+		t.Run(code, func(t *testing.T) {
+			payload := map[string]any{"code": code, "message": "temporarily unavailable", "retryable": true}
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{"/db/v1/agents/retrieval", "/db/v1/agents/query-builder"} {
+				schema := doc.Paths.Value(path).Post.Responses.Value("503").Value.Content["application/json"].Schema.Value
+				if err := schema.VisitJSON(payload); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response := &http.Response{StatusCode: 503, Header: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"1"}}, Body: io.NopCloser(strings.NewReader(string(body)))}
+			parsed, err := ParseQueryBuilderAgentResponse(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if parsed.JSON503 == nil || parsed.Headers503 == nil || parsed.Headers503.RetryAfter != 1 {
+				t.Fatal("missing typed 503 response or retry header")
+			}
+			failure, err := parsed.JSON503.AsQueryTemporarilyUnavailableError()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(failure.Code) != code || !failure.Retryable || failure.Message == "" {
+				t.Fatalf("dependency retry metadata lost: %#v", failure)
+			}
+		})
+	}
+}

@@ -886,7 +886,8 @@ export class AntflyClient {
    * @param config - Chat configuration (generator, table, indexes, etc.)
    * @param history - Previous conversation messages (pass result.messages from prior turns)
    * @param callbacks - Optional streaming callbacks including chat-specific events
-   * @returns For streaming: { abortController, messages } where messages is a Promise.
+   * @returns For streaming: { abortController, messages } where messages resolves on completion
+   *          and rejects on terminal stream errors, premature EOF, or abort.
    *          For non-streaming: { result, messages }
    */
   async chatAgent(
@@ -923,9 +924,22 @@ export class AntflyClient {
       // Streaming mode: accumulate answer and emit chat-specific callbacks
       let answerText = "";
       let resolveMessages: (msgs: ChatMessage[]) => void;
-      const messagesPromise = new Promise<ChatMessage[]>((resolve) => {
+      let rejectMessages: (error: Error) => void;
+      let settled = false;
+      let removeAbortListener = () => {};
+      const messagesPromise = new Promise<ChatMessage[]>((resolve, reject) => {
         resolveMessages = resolve;
+        rejectMessages = reject;
       });
+      // A terminal frame can arrive before the turn handle reaches the caller.
+      // Mark that early rejection handled while returning the original promise.
+      void messagesPromise.catch(() => {});
+      const failMessages = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        removeAbortListener();
+        rejectMessages(error);
+      };
 
       const wrappedCallbacks: RetrievalAgentStreamCallbacks = {
         ...callbacks,
@@ -940,14 +954,32 @@ export class AntflyClient {
             { role: "user", content: userMessage },
             { role: "assistant", content: answerText },
           ];
+          settled = true;
+          removeAbortListener();
+          resolveMessages(updatedMessages);
           callbacks.onAssistantMessage?.(answerText);
           callbacks.onMessagesUpdated?.(updatedMessages);
           callbacks.onDone?.(data);
-          resolveMessages(updatedMessages);
+        },
+        onErrorDetail: (error) => {
+          failMessages(error);
+          callbacks.onErrorDetail?.(error);
         },
       };
 
       const abortController = await this.streamRetrievalAgent(request, wrappedCallbacks);
+      const { signal } = abortController;
+      const onAbort = () =>
+        failMessages(
+          signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("Chat turn aborted", "AbortError")
+        );
+      if (signal.aborted) onAbort();
+      else if (!settled) {
+        signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      }
 
       return { abortController, messages: messagesPromise };
     }

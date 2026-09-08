@@ -6401,27 +6401,7 @@ pub const ApiHttpServer = struct {
             parsed.value,
             &collected_context,
             generation_runner.iface(),
-        ) catch |err| return switch (err) {
-            error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request"),
-            error.InvalidQueryBuilderGeneration, error.InvalidAgentToolCall => try contextual_operations.jsonErrorAlloc(self.alloc, 422, "generator did not submit a valid query tool call"),
-            error.AgentToolLimitExceeded => try contextual_operations.jsonErrorAlloc(self.alloc, 422, "query planning tool budget exhausted"),
-            error.AgentContextLimitExceeded => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query planning context limit exceeded"),
-            error.UnsupportedAgentToolProvider, error.UnsupportedQueryBuilderGeneration => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "query planning requires a tool-capable generator"),
-            error.GenerateRequestFailed => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query generation failed"),
-            error.GenerationCapacityUnavailable => try contextualCapacityResponse(self.alloc, connections_api.generationCapacityFailure()),
-            error.EmptyResponse => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "generator returned no answer or tool calls"),
-            error.DocIdentityNamespaceMismatch => try contextual_operations.jsonErrorAlloc(self.alloc, 503, "doc identity unavailable"),
-            error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query embedding input too large"),
-            error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => try contextualRetryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-            error.EmbedUpstreamFailure => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => try contextual_operations.jsonErrorAlloc(self.alloc, 504, "query embedding timed out"),
-            else => {
-                std.log.warn("query builder failed err={s}", .{@errorName(err)});
-                return err;
-            },
-        };
+        ) catch |err| return queryBuilderFailureResponse(self.alloc, err);
         return contextual_operations.json(
             // Imported optional query components must be omitted when absent,
             // not emitted as null: the public request schema is non-nullable.
@@ -18440,6 +18420,30 @@ fn contextualUnsupportedQueryResponse(alloc: std.mem.Allocator) !contextual_oper
     };
 }
 
+fn queryBuilderFailureResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+    return switch (err) {
+        error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(alloc, 400, "invalid query builder request"),
+        error.InvalidQueryBuilderGeneration, error.InvalidAgentToolCall => try contextual_operations.jsonErrorAlloc(alloc, 422, "generator did not submit a valid query tool call"),
+        error.AgentToolLimitExceeded => try contextual_operations.jsonErrorAlloc(alloc, 422, "query planning tool budget exhausted"),
+        error.AgentContextLimitExceeded => try contextual_operations.jsonErrorAlloc(alloc, 413, "query planning context limit exceeded"),
+        error.UnsupportedAgentToolProvider, error.UnsupportedQueryBuilderGeneration => try contextual_operations.jsonErrorAlloc(alloc, 400, "query planning requires a tool-capable generator"),
+        error.GenerateRequestFailed => try contextual_operations.jsonErrorAlloc(alloc, 502, "query generation failed"),
+        error.GenerationCapacityUnavailable => try contextualCapacityResponse(alloc, connections_api.generationCapacityFailure()),
+        error.EmptyResponse => try contextual_operations.jsonErrorAlloc(alloc, 502, "generator returned no answer or tool calls"),
+        error.DocIdentityNamespaceMismatch => try contextualQueryTemporarilyUnavailableResponse(alloc, .doc_identity_unavailable),
+        error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(alloc, 413, "query embedding input too large"),
+        error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(alloc, 429, "query embedding overloaded"),
+        error.EmbedRateLimited => try contextualRetryableTextResponse(alloc, 429, "query embedding rate limited"),
+        error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(alloc, .query_embedding_temporarily_unavailable),
+        error.EmbedUpstreamFailure => try contextual_operations.jsonErrorAlloc(alloc, 502, "query embedding provider failed"),
+        error.Timeout => try contextual_operations.jsonErrorAlloc(alloc, 504, "query embedding timed out"),
+        else => {
+            std.log.warn("query builder failed err={s}", .{@errorName(err)});
+            return err;
+        },
+    };
+}
+
 fn contextualQueryTemporarilyUnavailableResponse(
     alloc: std.mem.Allocator,
     reason: public_table_http.QueryTemporarilyUnavailableReason,
@@ -18694,7 +18698,7 @@ fn contextualCapacityResponse(alloc: std.mem.Allocator, payload: connections_api
 
 test "contextual generation capacity response preserves public retry contract" {
     const alloc = std.testing.allocator;
-    var response = try contextualCapacityResponse(alloc, connections_api.generationCapacityFailure());
+    var response = try queryBuilderFailureResponse(alloc, error.GenerationCapacityUnavailable);
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), response.status);
     try std.testing.expectEqual(@as(usize, 1), response.headers.len);
@@ -46522,4 +46526,31 @@ test "api http server executes direct foreign table aggregations through registr
     try std.testing.expect(DummyForeign.query_saw_cancellation);
     try std.testing.expect(DummyForeign.aggregate_saw_no_deadline);
     try std.testing.expect(DummyForeign.aggregate_saw_cancellation);
+}
+
+test "query builder dependency 503 responses preserve public retry contract" {
+    const alloc = std.testing.allocator;
+    const cases = .{
+        .{ error.DocIdentityNamespaceMismatch, "doc_identity_unavailable" },
+        .{ error.EmbedTransientFailure, "query_embedding_temporarily_unavailable" },
+    };
+    inline for (cases) |case| {
+        var response = try queryBuilderFailureResponse(alloc, case[0]);
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+        try std.testing.expectEqualStrings("application/json", response.content_type);
+        const parsed = try std.json.parseFromSlice(metadata_openapi.QueryTemporarilyUnavailableError, alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case[1], parsed.value.code);
+        try std.testing.expect(parsed.value.retryable);
+        try std.testing.expect(parsed.value.message.len > 0);
+        var retry_header = false;
+        for (response.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) {
+                try std.testing.expect((try std.fmt.parseInt(u32, header.value, 10)) > 0);
+                retry_header = true;
+            }
+        }
+        try std.testing.expect(retry_header);
+    }
 }

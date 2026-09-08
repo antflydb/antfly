@@ -52,9 +52,9 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
     var chunk_id: u32 = 0;
 
     for (sections) |section| {
-        // Separators may produce empty edge sections. They are boundaries,
-        // not chunk content, and must not anchor a span or emit empty chunks.
-        if (section.text.len == 0) continue;
+        // Empty and tokenizer-empty sections (such as whitespace) are only
+        // boundaries. They must not anchor a span or emit a chunk artifact.
+        if (section.tokens == 0) continue;
         const section_tokens = section.tokens;
         // Count the actual source span, including separators between sections.
         const candidate_tokens = if (current.items.len > 0)
@@ -500,6 +500,22 @@ test "fixed text fallback preserves normalized and unknown source spans" {
                 end = chunk.end_char.?;
             }
             try std.testing.expectEqual(text.len, end);
+        }
+    }
+}
+
+test "fixed text chunker omits tokenizer empty sections" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    for ([_][]const u8{ " ,alpha", "alpha, \t", " ,alpha, \t", " \t, \r" }) |text| {
+        const chunks = try chunkText(alloc, text, .{ .target_tokens = 1, .overlap_tokens = 0, .separator = "," });
+        defer alloc.free(chunks);
+        try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, text, "alpha") != null) 1 else 0), chunks.len);
+        for (chunks) |chunk| {
+            try std.testing.expect(std.mem.trim(u8, chunk.text.?, " \t\r\n").len > 0);
+            try std.testing.expectEqual(@as(usize, 1), try countTokens(alloc, tokenizer, chunk.text.?));
+            try std.testing.expectEqualStrings(text[chunk.start_char.?..chunk.end_char.?], chunk.text.?);
         }
     }
 }
