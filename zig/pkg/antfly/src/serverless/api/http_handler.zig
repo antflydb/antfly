@@ -1158,7 +1158,10 @@ pub const HttpHandler = struct {
     fn handleTableBuildStatus(self: *HttpHandler, table_name: []const u8) !HttpResponse {
         var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
-            else => return try textResponse(self.alloc, 500, "status failed"),
+            else => {
+                std.log.warn("table build status failed table={s} err={s}", .{ table_name, @errorName(err) });
+                return try textResponse(self.alloc, 500, "status failed");
+            },
         };
         defer status.deinit(self.alloc);
         var table_status = api_types.TableBuildStatus.fromNamespaceBuildStatus(self.alloc, table_name, status) catch {
