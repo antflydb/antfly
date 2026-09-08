@@ -651,13 +651,40 @@ The lane suffix still describes fidelity:
 The aggregate `vopr-test`, `integration-test`, `chaos-test`, and
 `chaos-soak-test` retain their existing selections.
 
-Rename validation (2026-09-07): the focused smoke, seeded campaign, public HTTP,
-and determinism-audit gates pass. The broader virtual-transport gate remains
-8/12: automatic split, local and remote live-median split planning, and automatic
-merge each observe zero planned transitions where one is expected. All four
-failures reproduce in a clean worktree at merged, pre-rename commit
-`6d21a583f`; resolving those planning failures remains follow-up work, not a
-passing gate implied by this rename.
+Metadata planning fixes (2026-09-07): rename validation exposed four failures
+that also reproduced at merged, pre-rename commit `6d21a583f`. The shared
+candidate-report fixture supplied disk sizes without setting
+`disk_bytes_known`, so the production planner correctly rejected them as
+inconclusive. Explicit scenario size observations now carry that flag; unknown
+size and known-zero size paired with live documents remain fenced.
+
+Once planning resumed, automatic split exposed an ownership error in the
+harness: polling reopened and reseeded the apply store while the active split
+coordinator still owned it. Polling now reads through the matching coordinator.
+First observation establishes that fixture owner even before a destination DB
+exists; missing initial progress is an unbootstrapped state, not a file error.
+After the coordinator releases a terminal transition, observation reads durable
+progress without reopening or reseeding its possibly retired source primary.
+This also works after reconstructing the runtime: the terminal record, rather
+than an in-memory completion flag, is authoritative.
+Initial source seeding also uses a read-only DB view, so it can coexist with a
+public writer without acquiring a second writer. Filesystem-backed read-only
+views load the existing validated root-identity checkpoint through the borrowed
+filesystem I/O; missing external-backend identities still fail closed.
+Neither fix relaxes LSM's single-writer guard. The split fixture regression
+covers seeding beside a live
+writer, failed initialization and retry, initial status before destination
+creation, status observation between
+transition actions, terminal observation and runtime reconstruction without the
+former source identity checkpoint, destination contents, and preservation of the source
+identity namespace; the planner regression
+covers the known/unknown and empty/non-empty size-evidence matrix.
+
+Verification: the complete virtual-transport gate now passes **12/12**, smoke
+**5/5**, seeded campaigns **2/2**, and public HTTP integration **4/4**, with no
+skips, failures, leaks, or storage-ownership warnings. The focused planner
+contract checks pass **2/2** in Debug; the split-lifecycle and candidate-report
+regressions pass **2/2** in both Debug and ReleaseSafe.
 
 | Capability | Implementation evidence | Verification |
 | --- | --- | --- |

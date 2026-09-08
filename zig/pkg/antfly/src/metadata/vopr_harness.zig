@@ -64,6 +64,7 @@ const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const common_config = @import("../common/config.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const db_root_identity = @import("../storage/db/root_identity.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const storage_sim = @import("../storage/sim_runtime.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
@@ -156,6 +157,15 @@ pub const VoprSplitRuntime = struct {
     fn observeStatus(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64) !data_mod.SplitTransitionStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.replica_root_dir != null) {
+            // The active coordinator owns the source apply store and the
+            // destination writer. Observe through those owners rather than
+            // reopening storage or reseeding its projection during a split.
+            for (self.entries[0..self.len]) |*entry| {
+                if (entry.transition_id != transition_id or entry.attempt_epoch != attempt_epoch or
+                    entry.source_group_id != source_group_id or entry.destination_group_id != destination_group_id) continue;
+                if (entry.coord) |coord| return fromStorageStatus(try coord.status());
+                break;
+            }
             const alloc = std.heap.page_allocator;
             const replica_root_dir = self.replica_root_dir.?;
             const source_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, source_group_id);
@@ -163,34 +173,58 @@ pub const VoprSplitRuntime = struct {
             const destination_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, destination_group_id);
             defer alloc.free(destination_root_dir);
 
-            try self.ensureSourceApplyStoreSeeded(alloc, source_root_dir, source_group_id);
-
-            const status = try data_mod.storage.observeSplitStatus(alloc, .{
-                .transition_id = transition_id,
-                .attempt_epoch = attempt_epoch,
-                .source_root_dir = source_root_dir,
-                .dest_root_dir = destination_root_dir,
-                .source_group_id = source_group_id,
-                .dest_group_id = destination_group_id,
-                .source = .{ .root_dir = source_root_dir },
-                .dest = .{
-                    .root_dir = destination_root_dir,
-                    .db = self.dbOptions(.{}),
-                },
-            });
-            return .{
-                .phase = status.phase,
-                .source_split_phase = status.source_split_phase,
-                .bootstrapped = status.bootstrapped,
-                .replay_required = status.replay_required,
-                .replay_caught_up = status.replay_caught_up,
-                .cutover_ready = status.cutover_ready,
-                .destination_ready_for_reads = status.destination_ready_for_reads,
-                .source_delta_sequence = status.source_delta_sequence,
-                .dest_delta_sequence = status.dest_delta_sequence,
-            };
+            // Terminal progress survives coordinator/runtime reconstruction.
+            // Read it without reseeding a possibly retired source primary.
+            {
+                var source = try data_mod.RaftApplyStore.init(alloc, .{ .root_dir = source_root_dir });
+                defer source.deinit();
+                const terminal = try source.currentSplitTerminal(alloc, source_group_id);
+                defer if (terminal) |record| data_mod.storage.shard_state_store.freeSplitTerminal(alloc, record);
+                if (terminal) |record| {
+                    if (attempt_epoch <= record.attempt_epoch) {
+                        return fromStorageStatus(try data_mod.storage.observeSplitStatus(alloc, .{
+                            .transition_id = transition_id,
+                            .attempt_epoch = attempt_epoch,
+                            .source_root_dir = source_root_dir,
+                            .dest_root_dir = destination_root_dir,
+                            .source_group_id = source_group_id,
+                            .dest_group_id = destination_group_id,
+                            .source_store = &source,
+                            .dest = .{
+                                .root_dir = destination_root_dir,
+                                .db = self.dbOptions(.{}),
+                            },
+                        }));
+                    }
+                }
+            }
+            // New or interrupted initialization needs a fixture owner even
+            // before a destination DB exists. Failed initialization retries
+            // here; merely having a cached entry is not terminal evidence.
+            const status = try (try self.withCoordinator(transition_id, attempt_epoch, source_group_id, destination_group_id, struct {
+                fn call(coord: *data_mod.SplitSyncCoordinator) !data_mod.storage.db_split_handoff.SplitSyncStatus {
+                    return try coord.status();
+                }
+            }.call, .{}));
+            if (status.phase == .finalized or status.phase == .rolled_back)
+                self.releaseCoordinator(self.entryFor(transition_id, attempt_epoch, source_group_id, destination_group_id));
+            return fromStorageStatus(status);
         }
         return self.entryFor(transition_id, attempt_epoch, source_group_id, destination_group_id).status;
+    }
+
+    fn fromStorageStatus(status: data_mod.storage.db_split_handoff.SplitSyncStatus) data_mod.SplitTransitionStatus {
+        return .{
+            .phase = status.phase,
+            .source_split_phase = status.source_split_phase,
+            .bootstrapped = status.bootstrapped,
+            .replay_required = status.replay_required,
+            .replay_caught_up = status.replay_caught_up,
+            .cutover_ready = status.cutover_ready,
+            .destination_ready_for_reads = status.destination_ready_for_reads,
+            .source_delta_sequence = status.source_delta_sequence,
+            .dest_delta_sequence = status.dest_delta_sequence,
+        };
     }
 
     fn prepareSource(ptr: *anyopaque, transition_id: u64, attempt_epoch: u64, source_group_id: u64, destination_group_id: u64, split_key: []const u8, source_range_end: ?[]const u8) !bool {
@@ -368,7 +402,12 @@ pub const VoprSplitRuntime = struct {
         source_root_dir: []const u8,
         source_group_id: u64,
     ) !void {
-        var db = db_mod.DB.open(alloc, source_root_dir, self.dbOptions(.{})) catch |err| switch (err) {
+        // Seeding reads the authoritative documents; it does not own their
+        // writer. Public traffic may keep that writer open concurrently.
+        var db = db_mod.DB.open(alloc, source_root_dir, self.dbOptions(.{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+        })) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -389,7 +428,19 @@ pub const VoprSplitRuntime = struct {
         defer source_store.deinit();
 
         if (try source_store.latestBatchForTransition(source_group_id)) |watermark| {
-            const root_incarnation = try db.durableRootIncarnation();
+            // Read-only DB views do not cache the filesystem root identity.
+            // This fixture owns a stable source path; load its existing,
+            // validated checkpoint without creating an identity or a writer.
+            const root_incarnation = db.durableRootIncarnation() catch |err| switch (err) {
+                error.DurableRootIncarnationUnavailable => identity: {
+                    if (db.physical_root_mode != .filesystem_managed) return err;
+                    break :identity (try db_root_identity.load(
+                        alloc,
+                        db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable,
+                        source_root_dir,
+                    )).incarnation;
+                },
+            };
             if (!try source_store.reconcileGroupSnapshotFromAuthoritativeStoreAtRootIncarnation(
                 alloc,
                 source_group_id,
@@ -498,16 +549,48 @@ test "metadata VOPR split runtime preserves source identity namespace" {
         try db.batch(.{
             .writes = &.{.{ .key = "doc:t", .value = "{\"v\":\"right\"}" }},
         });
+        // Public traffic may retain the source writer while the harness
+        // snapshots committed documents into its split apply-store fixture.
+        var seed_runtime = VoprSplitRuntime{};
+        try seed_runtime.ensureSourceApplyStoreSeeded(alloc, source_root_dir, 701);
     }
 
     var runtime = VoprSplitRuntime{ .replica_root_dir = replica_root_dir };
     defer runtime.deinit();
     var split = runtime.iface();
 
+    const source_identity_path = try db_root_identity.checkpointPathAlloc(alloc, source_root_dir);
+    defer alloc.free(source_identity_path);
+    const retained_identity_path = try std.fmt.allocPrint(alloc, "{s}.retained", .{source_identity_path});
+    defer alloc.free(retained_identity_path);
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), source_identity_path, std.Io.Dir.cwd(), retained_identity_path, std.testing.io);
+    try std.testing.expectError(error.FileNotFound, split.observeStatus(7001, 1, 701, 702));
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), retained_identity_path, std.Io.Dir.cwd(), source_identity_path, std.testing.io);
+    // A failed initialization leaves a retryable entry, not a terminal one.
+    const initial = try split.observeStatus(7001, 1, 701, 702);
+    try std.testing.expect(!initial.bootstrapped);
     try std.testing.expect(try split.prepareSource(7001, 1, 701, 702, "doc:m", "doc:z"));
+    const prepared = try split.observeStatus(7001, 1, 701, 702);
+    try std.testing.expect(!prepared.bootstrapped);
     try std.testing.expect(try split.startSource(7001, 1, 701, 702));
     try std.testing.expect(try split.bootstrapDestination(7001, 1, 701, 702));
     _ = try split.catchUpDestination(7001, 1, 701, 702);
+    const caught_up = try split.observeStatus(7001, 1, 701, 702);
+    try std.testing.expect(caught_up.bootstrapped);
+    try std.testing.expect(caught_up.cutover_ready);
+    try std.testing.expect(try split.finalizeSource(7001, 1, 701, 702));
+
+    // Terminal progress belongs to the apply/progress stores, not to the
+    // former source primary's identity checkpoint. Observation must not
+    // reopen or reseed that primary after the coordinator releases it.
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, source_identity_path);
+    const finalized = try split.observeStatus(7001, 1, 701, 702);
+    try std.testing.expectEqual(.finalized, finalized.phase);
+    var reconstructed = VoprSplitRuntime{ .replica_root_dir = replica_root_dir };
+    defer reconstructed.deinit();
+    const recovered = try reconstructed.iface().observeStatus(7001, 1, 701, 702);
+    try std.testing.expectEqual(.finalized, recovered.phase);
+    try std.testing.expectEqual(@as(usize, 0), reconstructed.len);
 
     var dest = try db_mod.DB.open(alloc, destination_root_dir, .{
         .open_mode = .query_readonly,
@@ -2436,9 +2519,22 @@ fn makeGroupStatus(
         .group_id = group_id,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
+        // These are explicit scenario observations, not unsampled defaults.
+        // Automatic planning must still reject reports with unknown size.
+        .disk_bytes_known = true,
         .empty = false,
         .updated_at_millis = now_ms,
     };
+}
+
+test "metadata VOPR candidate status marks explicitly supplied disk sizes known" {
+    for ([_]u64{ 0, 180 }) |disk_bytes| {
+        const status = makeGroupStatus(4511, 12, disk_bytes, 1000);
+        try std.testing.expect(status.disk_bytes_known);
+        try std.testing.expectEqual(disk_bytes, status.disk_bytes);
+        try std.testing.expectEqual(@as(u64, 12), status.doc_count);
+        try std.testing.expectEqual(@as(u64, 1000), status.updated_at_millis);
+    }
 }
 
 fn containsGroupStatus(group_statuses: []const metadata_table_manager.GroupStatusReport, group_id: u64) bool {

@@ -5588,6 +5588,7 @@ pub fn build(b: *std.Build) void {
     lib_metadata_vopr_virtual_transport_test_step.dependOn(&run_lib_metadata_vopr_virtual_transport_tests.step);
 
     const lib_metadata_vopr_virtual_smoke_default_filters = [_][]const u8{
+        "metadata VOPR candidate status marks explicitly supplied disk sizes known",
         "metadata VOPR split runtime preserves source identity namespace",
         "metadata VOPR merge runtime records doc identity reassignment opt-in",
         "metadata VOPR http cluster drives table placement convergence",
