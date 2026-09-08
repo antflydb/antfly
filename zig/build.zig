@@ -8435,6 +8435,8 @@ pub fn build(b: *std.Build) void {
         "graph metric large-build summary",
         "graph metric vector chunks",
         "graph metric ordinal",
+        "graph metric membership",
+        "graph metric edge scan",
         "graph metric consumer barrier",
         "ordinal blocks",
         "graph degree planned build honors edge filter during scan page execution",

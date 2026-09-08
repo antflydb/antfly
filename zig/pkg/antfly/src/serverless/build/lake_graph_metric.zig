@@ -1237,6 +1237,34 @@ pub fn benchmarkRejectedPreparation(alloc: Allocator, payload: []const u8, refer
     return topology.edges.len;
 }
 
+/// Includes one source/projection preparation. The reference executes and
+/// encodes PageRank before discovering an exhausted output quota.
+pub fn benchmarkRejectedOutput(alloc: Allocator, payload: []const u8, reference: bool) !usize {
+    var topology = try prepareTopologyFromPackedAlloc(alloc, payload, .none, .{});
+    defer topology.deinit(alloc);
+    var options = BuildOptions{
+        .graph_index_name = "bench",
+        .config = .{ .name = "rank", .kind = .pagerank, .max_iterations = 3 },
+        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "a" ** 64, .byte_len = payload.len },
+    };
+    var projection = try buildProjectionFromTopologyAlloc(alloc, topology, 0, options);
+    defer projection.deinit(alloc);
+    if (reference) {
+        var built = try buildAdmittedProjectionAlloc(alloc, projection, options);
+        built.deinit(alloc);
+    } else {
+        var budget = graph_metric_policy.Budget{ .limits = .{ .max_total_metric_payload_bytes = 0 } };
+        options.batch_budget = &budget;
+        var built = buildFromProjectionAlloc(alloc, projection, options) catch |err| switch (err) {
+            error.GraphMetricBuildBudgetExceeded => return topology.edges.len,
+            else => return err,
+        };
+        built.deinit(alloc);
+        return error.InvalidBenchmarkResult;
+    }
+    return topology.edges.len;
+}
+
 fn compileTopologyWithinBudgetAlloc(
     alloc: Allocator,
     graph: graph_segment.Segment,
@@ -1871,8 +1899,22 @@ fn chargeKernelWork(options: BuildOptions, projection: Projection) !void {
 }
 
 fn admitProjectionKernel(projection: Projection, options: BuildOptions) !void {
+    try admitMinimumOutput(projection, options, 1);
     try admitPeakMemory(projection, options, 1);
     try chargeKernelWork(options, projection);
+}
+
+fn admitMinimumOutput(projection: Projection, options: BuildOptions, outputs: usize) !void {
+    // Every primary row stores a value and suffix length, independent of score
+    // ordering/prefix compression. Reject impossible output before any kernel,
+    // warm-start I/O, or top-tier selection; do not charge numerical work.
+    const control = try metric_segment.controlProbeLen(std.math.maxInt(u64), options.source_graph.artifact_id, options.source_graph.checksum, options.config.edge_filter);
+    const rows = std.math.mul(usize, projection.node_ids.items.len, 10) catch return error.GraphMetricBuildBudgetExceeded;
+    const minimum = std.math.add(usize, control, rows) catch return error.GraphMetricBuildBudgetExceeded;
+    if (minimum > options.limits.max_metric_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+    const total = std.math.mul(usize, minimum, outputs) catch return error.GraphMetricBuildBudgetExceeded;
+    if (options.batch_budget) |budget| if (total > budget.limits.max_total_metric_payload_bytes -| budget.metric_payload_bytes)
+        return error.GraphMetricBuildBudgetExceeded;
 }
 
 fn buildFromProjectionAlloc(alloc: Allocator, projection: Projection, options: BuildOptions) !BuildResult {
@@ -1922,6 +1964,7 @@ fn publishHitsPairFromProjectionAlloc(
     // Both vectors are computed once, while immutable artifacts are encoded
     // and published one at a time. This makes output memory independent of the
     // number of paired HITS lanes.
+    try admitMinimumOutput(projection, first_options, 2);
     try admitPeakMemory(projection, first_options, 1);
     try chargeKernelWork(first_options, projection);
 
@@ -1932,8 +1975,19 @@ fn publishHitsPairFromProjectionAlloc(
     const second_scores = if (second_config.kind == .hits_authority) pair.authorities else pair.hubs;
     const first_result = metrics.Result{ .scores = first_scores, .iterations_completed = pair.iterations_completed, .converged = pair.converged, .delta = pair.delta };
     const second_result = metrics.Result{ .scores = second_scores, .iterations_completed = pair.iterations_completed, .converged = pair.converged, .delta = pair.delta };
+    var second_options = first_options;
+    second_options.config = second_config;
+    const first_plan = try prepareMetricOutputPlan(alloc, projection.node_ids.items, first_options, first_result);
+    const second_plan = try prepareMetricOutputPlan(alloc, projection.node_ids.items, second_options, second_result);
+    // Reserve the pair atomically. A second-lane quota failure must never leave
+    // the first lane uploaded only to be discarded as a rejected pair.
+    const pair_bytes = std.math.add(usize, first_plan.size, second_plan.size) catch return error.GraphMetricBuildBudgetExceeded;
+    if (first_options.batch_budget) |budget| try budget.chargePayload(pair_bytes);
+    errdefer if (first_options.batch_budget) |budget| {
+        budget.metric_payload_bytes -= pair_bytes;
+    };
     const first_ref = blk: {
-        var first = try encodeMetricResultAlloc(alloc, projection.node_ids.items, first_options, first_result);
+        var first = try encodeMetricResultWithPlanAlloc(alloc, projection.node_ids.items, first_options, first_result, &first_plan, true);
         defer first.deinit(alloc);
         break :blk try putBuildResultAlloc(alloc, artifacts, &first, cancellation);
     };
@@ -1946,10 +2000,8 @@ fn publishHitsPairFromProjectionAlloc(
         pair.hubs = @constCast(&[_]f64{});
     }
 
-    var second_options = first_options;
-    second_options.config = second_config;
     const second_ref = blk: {
-        var second = try encodeMetricResultAlloc(alloc, projection.node_ids.items, second_options, second_result);
+        var second = try encodeMetricResultWithPlanAlloc(alloc, projection.node_ids.items, second_options, second_result, &second_plan, true);
         defer second.deinit(alloc);
         break :blk try putBuildResultAlloc(alloc, artifacts, &second, cancellation);
     };
@@ -1962,6 +2014,22 @@ fn encodeMetricResultAlloc(
     options: BuildOptions,
     result: metrics.Result,
 ) !BuildResult {
+    return encodeMetricResultWithPlanAlloc(alloc, node_ids, options, result, null, false);
+}
+
+fn prepareMetricOutputPlan(alloc: Allocator, node_ids: []const []const u8, options: BuildOptions, result: metrics.Result) !metric_segment.codec.EncodingPlan {
+    const scores = try makeScoresAlloc(alloc, node_ids, result.scores, options.cancellation);
+    var owned = true;
+    errdefer if (owned) alloc.free(scores);
+    var segment = try makeMetricSegmentAlloc(alloc, options, result, scores);
+    owned = false;
+    defer segment.deinit(alloc);
+    const plan = try metric_segment.codec.prepareEncoding(segment, options.cancellation);
+    if (plan.size > options.limits.max_metric_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+    return plan;
+}
+
+fn encodeMetricResultWithPlanAlloc(alloc: Allocator, node_ids: []const []const u8, options: BuildOptions, result: metrics.Result, prepared: ?*const metric_segment.codec.EncodingPlan, reserved: bool) !BuildResult {
     const scores = try makeScoresAlloc(alloc, node_ids, result.scores, options.cancellation);
     var scores_owned = true;
     defer if (scores_owned) alloc.free(scores);
@@ -1969,22 +2037,30 @@ fn encodeMetricResultAlloc(
     var segment = try makeMetricSegmentAlloc(alloc, options, result, scores);
     scores_owned = false;
     defer segment.deinit(alloc);
-    const payload = metric_segment.encodeAllocWithCancellationAndLimit(
+    const local_plan = if (prepared == null) try metric_segment.codec.prepareEncoding(segment, options.cancellation) else undefined;
+    const plan = prepared orelse &local_plan;
+    if (plan.size > options.limits.max_metric_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+    if (!reserved) if (options.batch_budget) |budget| try budget.chargePayload(plan.size);
+    errdefer if (!reserved) {
+        if (options.batch_budget) |budget| budget.metric_payload_bytes -= plan.size;
+    };
+    const payload = metric_segment.codec.encodePreparedAlloc(
         alloc,
         segment,
         options.cancellation,
+        plan,
         options.limits.max_metric_payload_bytes,
     ) catch |err| switch (err) {
         error.GraphMetricSegmentTooLarge => return error.GraphMetricBuildBudgetExceeded,
         else => return err,
     };
     errdefer alloc.free(payload);
-    if (options.batch_budget) |budget| try budget.chargePayload(payload.len);
     const name = try artifactNameAlloc(alloc, options.graph_index_name, options.config.name);
     errdefer alloc.free(name);
     const artifact_id = try std.fmt.allocPrint(alloc, "lake-graph-metric:{d}:{s}:{d}", .{ name.len, name, payload.len });
     errdefer alloc.free(artifact_id);
     const checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{payload.len});
+    errdefer alloc.free(checksum);
     var artifact = artifact_ref.ArtifactRef{
         .kind = .graph_metric_segment,
         .name = name,
@@ -2727,6 +2803,75 @@ test "serverless graph metric projection admits census before allocations and bo
         // A failed preparation still consumes its reserved census allowance.
         try std.testing.expectEqual(@as(u64, 3), budget.work_items);
     }
+}
+
+test "serverless graph metric output admission rejects before kernels and reserves pairs atomically" {
+    const alloc = std.testing.allocator;
+    const topology = CompiledTopology{
+        .node_ids = &.{ "a", "b" },
+        .edge_types = &.{"cites"},
+        .string_bytes = &.{},
+        .edge_type_offsets = &.{ 0, 1 },
+        .edges = &.{.{ .source = 0, .target = 1 }},
+        .source_node_count = 2,
+        .source_edge_count = 1,
+        .retained_bytes = 128,
+    };
+    var budget = graph_metric_policy.Budget{ .limits = .{ .max_total_metric_payload_bytes = 0 } };
+    var options = BuildOptions{
+        .graph_index_name = "graph",
+        .config = .{ .name = "authority", .kind = .hits_authority },
+        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "a" ** 64, .byte_len = 1 },
+        .batch_budget = &budget,
+    };
+    var projection = try buildProjectionFromTopologyAlloc(alloc, topology, 0, options);
+    defer projection.deinit(alloc);
+    const before = budget.work_items;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, buildFromProjectionAlloc(failing.allocator(), projection, options));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(before, budget.work_items);
+    // Undefined store is intentional: admission must fail before any upload.
+    var artifacts: artifact_store.ArtifactStore = undefined;
+    const hub = graph_mod.GraphMetricConfig{ .name = "hub", .kind = .hits_hub };
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, publishHitsPairFromProjectionAlloc(failing.allocator(), &artifacts, projection, options, hub, .none));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(before, budget.work_items);
+
+    var pair = try metrics.hitsTopologyAlloc(alloc, projection.topology.?, kernelOptions(options));
+    defer pair.deinit(alloc);
+    const result = metrics.Result{ .scores = pair.authorities, .iterations_completed = pair.iterations_completed, .converged = pair.converged, .delta = pair.delta };
+    const first_plan = try prepareMetricOutputPlan(alloc, projection.node_ids.items, options, result);
+    var second = options;
+    second.config = hub;
+    const second_plan = try prepareMetricOutputPlan(alloc, projection.node_ids.items, second, .{ .scores = pair.hubs, .iterations_completed = pair.iterations_completed, .converged = pair.converged, .delta = pair.delta });
+    budget.limits.max_total_metric_payload_bytes = first_plan.size + second_plan.size - 1;
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, publishHitsPairFromProjectionAlloc(alloc, &artifacts, projection, options, hub, .none));
+    try std.testing.expectEqual(@as(usize, 0), budget.metric_payload_bytes);
+    // Exact single-output admission precedes payload allocation, and every
+    // allocation failure after reservation refunds the entire reservation.
+    budget.limits.max_total_metric_payload_bytes = first_plan.size;
+    var succeeded = false;
+    for (0..32) |fail_index| {
+        var injected = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        var built = encodeMetricResultAlloc(injected.allocator(), projection.node_ids.items, options, result) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), budget.metric_payload_bytes);
+            continue;
+        };
+        defer built.deinit(injected.allocator());
+        try std.testing.expectEqual(first_plan.size, built.payload.len);
+        try std.testing.expectEqual(first_plan.size, budget.metric_payload_bytes);
+        succeeded = true;
+        break;
+    }
+    try std.testing.expect(succeeded);
+    budget.metric_payload_bytes = 0;
+    options.source_graph.checksum = "invalid";
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, encodeMetricResultAlloc(alloc, projection.node_ids.items, options, result));
+    try std.testing.expectEqual(@as(usize, 0), budget.metric_payload_bytes);
+    options.limits.max_metric_payload_bytes = 0;
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, buildFromProjectionAlloc(failing.allocator(), projection, options));
 }
 
 test "serverless lake graph metrics share one bounded HITS execution for a compatible pair" {

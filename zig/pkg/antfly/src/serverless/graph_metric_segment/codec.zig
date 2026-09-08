@@ -656,8 +656,25 @@ pub fn encodeAllocWithCancellationAndLimit(
     cancellation: CancellationToken,
     max_encoded_bytes: usize,
 ) ![]u8 {
+    const plan = try prepareEncoding(segment, cancellation);
+    return encodePreparedAlloc(alloc, segment, cancellation, &plan, max_encoded_bytes);
+}
+
+/// Prepared against an immutable segment; reuse only with that same segment.
+/// Numeric top-tier selection and exact size calculation happen once, before
+/// publication reserves output capacity or allocates an encoded payload.
+pub const EncodingPlan = struct { top: PreparedTopTier, size: usize };
+
+pub fn prepareEncoding(segment: types.Segment, cancellation: CancellationToken) !EncodingPlan {
     const prepared = try prepareTopTier(segment.scores, cancellation);
     const size = try encodedSizeWithPreparedTopTier(segment, &prepared, cancellation);
+    return .{ .top = prepared, .size = size };
+}
+
+pub fn encodePreparedAlloc(alloc: Allocator, segment: types.Segment, cancellation: CancellationToken, plan: *const EncodingPlan, max_encoded_bytes: usize) ![]u8 {
+    try cancellation.check();
+    const prepared = plan.top;
+    const size = plan.size;
     if (size > max_encoded_bytes) return error.GraphMetricSegmentTooLarge;
     const data = try alloc.alloc(u8, size);
     errdefer alloc.free(data);
@@ -1349,6 +1366,15 @@ test "serverless graph metric segment round trips with binary-search lookup" {
     defer segment.deinit(alloc);
     const encoded = try encodeAlloc(alloc, segment);
     defer alloc.free(encoded);
+    const plan = try prepareEncoding(segment, .none);
+    const prepared = try encodePreparedAlloc(alloc, segment, .none, &plan, plan.size);
+    defer alloc.free(prepared);
+    try std.testing.expectEqualSlices(u8, encoded, prepared);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.GraphMetricSegmentTooLarge, encodePreparedAlloc(failing.allocator(), segment, .none, &plan, plan.size - 1));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, encodePreparedAlloc(failing.allocator(), segment, CancellationToken.fromAtomic(&canceled), &plan, plan.size));
+    try std.testing.expect(!failing.has_induced_failure);
     const header_len = try headerProbeLen(
         encoded.len,
         segment.source_graph_artifact_id,

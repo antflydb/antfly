@@ -97,6 +97,7 @@ pub fn main(init: std.process.Init) !void {
     try benchmarkStateful(&output);
     try benchmarkVectorWrites(&output);
     try benchmarkQuerySnapshots(init.io, &output);
+    try benchmarkMembership(init.io, &output);
     for ([_]usize{ 2_000, 20_000, 50_000 }) |nodes| {
         var fixture = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer fixture.deinit();
@@ -126,6 +127,36 @@ pub fn main(init: std.process.Init) !void {
         }
         const segment = graph.Segment{ .adjacencies = adjacencies };
         const payload = try graph.encodeAlloc(alloc, segment);
+        if (nodes == 50_000) for ([_]bool{ true, false }) |reference| {
+            var times: [5]u64 = undefined;
+            var last = PhaseAllocStats{};
+            for (0..6) |sample| {
+                var stats = PhaseAllocStats{};
+                var tracking = PhaseTrackingAllocator{ .backing = std.heap.smp_allocator, .stats = &stats };
+                const start = antfly.platform_time.monotonicNs();
+                const count = try metric.benchmarkRejectedOutput(tracking.allocator(), payload, reference);
+                const elapsed = antfly.platform_time.monotonicNs() - start;
+                if (count != nodes * degree or stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+                if (sample != 0) times[sample - 1] = elapsed;
+                last = stats;
+            }
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(alloc, .{
+                .mode = if (reference) "output_reject_after_kernel_reference" else "output_reject_before_kernel",
+                .nodes = nodes,
+                .edges = nodes * degree,
+                .median_ns = times[2],
+                .min_ns = times[0],
+                .max_ns = times[4],
+                .allocation_count = last.alloc_count,
+                .allocated_bytes = last.total_alloc_bytes,
+                .peak_bytes = last.peak_bytes,
+                .note = "includes source and projection preparation; reference computes and encodes PageRank before quota rejection; excludes fetch and upload",
+            }, .{});
+            try output.interface.writeAll(json);
+            try output.interface.writeByte('\n');
+            try output.flush();
+        };
         if (nodes == 50_000) for ([_]bool{ true, false }) |reference| {
             var times: [5]u64 = undefined;
             var last = PhaseAllocStats{};
@@ -398,6 +429,57 @@ fn benchmarkQuerySnapshots(io: std.Io, out: anytype) !void {
         try out.interface.writeByte('\n');
         try out.flush();
     };
+}
+
+fn benchmarkMembership(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-membership-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const store_path = try std.fmt.allocPrint(fixture, "{s}/store\x00", .{root});
+    const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
+    var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
+    defer store.close();
+    var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "graph", .{});
+    defer index.close();
+    const ids = try fixture.alloc([]const u8, 64);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
+    try index.benchmarkMembershipFixture(ids);
+    for ([_]bool{ true, false }) |reference| {
+        var times: [5]u64 = undefined;
+        var last = PhaseAllocStats{};
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            index.alloc = tracking.allocator();
+            defer index.alloc = alloc;
+            const start = antfly.platform_time.monotonicNs();
+            const count = try index.benchmarkMembershipRead(reference);
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (count != ids.len or stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+            last = stats;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "membership_partials_reference" else "membership_sealed_blocks",
+            .nodes = ids.len,
+            .producer_partials = ids.len * 256,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .allocation_count = last.alloc_count,
+            .allocated_bytes = last.total_alloc_bytes,
+            .peak_bytes = last.peak_bytes,
+            .note = "real default storage; includes transaction, canonical membership and dictionary validation; excludes fixture writes and numeric fold",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
 }
 
 fn benchmarkStateful(out: anytype) !void {

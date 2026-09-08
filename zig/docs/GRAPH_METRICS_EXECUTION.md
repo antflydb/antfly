@@ -21,12 +21,23 @@ full-graph calculation hidden inside a query or maintenance tick.
   publication prevents competing coordinators from regressing progress. A graph
   mutation invalidates the obsolete census; it cannot publish mixed-generation
   boundaries. Memory is bounded by the maximum 256 partitions, not graph size.
-- Reducers join the canonical node range with the ordinal dictionary using
+- Worker edge scans also range-seek past metadata and charge every physical
+  non-metadata record against their checkpoint limit, including excluded records.
+  Progress counts continue to describe matching graph edges, independently of
+  physical work. An unbounded final partition cannot walk all metric state.
+- Initialization writes canonical membership once in checksummed 256-row blocks,
+  alongside ordinal assignments. Completed initialization leaves seal exact row
+  counts. Iteration, convergence and publication read these addressed blocks,
+  not up to 256 producer partials per node on every checkpoint. Readers bind
+  block ordinals and node ranges to the leaf, validate resume-node identity, and
+  reject missing/truncated/misplaced blocks. Replayed writes accept only identical
+  rows even when checkpoint boundaries change.
+- Reducers join sealed canonical nodes with the ordinal dictionary using
   ordered cursors, then carry ordinals through numeric reads and writes. The
   canonical membership check is essential: a missing dictionary row is an error,
   not permission to omit a node. PageRank stores immutable out-degrees in exact
   `u64` chunks, avoiding per-node string-key lookups on every iteration.
-- Execution schema 10 fences older intermediate jobs. Published score epochs
+- Execution schema 11 fences older intermediate jobs. Published score epochs
   retain their existing read contract; an execution-format change does not hide
   previously published results.
 
@@ -41,6 +52,11 @@ full-graph calculation hidden inside a query or maintenance tick.
   construction is rejected. Exhausted publications cannot repeatedly construct
   unaffordable projections. A live-allocation limiter also covers scratch buffers
   and failure paths before a post-census size estimate is available.
+- Output has two admission phases too: a framing/row lower bound rejects
+  impossible output before kernels or warm-start reads; a prepared encoding plan
+  then reserves exact payload bytes before allocation. Compatible HITS lanes
+  reserve both outputs atomically before either upload, while encoding one at a
+  time. Allocation, cancellation and integrity failures refund reservations.
 - Reuse uses a single authenticated, provider-pinned range read. A table-wide
   `max_total_reuse_read_bytes` allowance (512 MiB by default) covers requested
   headers and cold full-content authentication. This allowance is separate from
@@ -54,7 +70,7 @@ full-graph calculation hidden inside a query or maintenance tick.
   “verified” flag bypasses authentication. Persisting verification evidence would
   require a defined trust and provider-generation contract, not just caching a
   boolean in a manifest.
-- Materializer epoch 14 captures changed rejection accounting. Serverless remains
+- Materializer epoch 15 captures changed output admission. Serverless remains
   current-version-only; no obsolete wire decoder or migration path is introduced.
 
 ## Query and operator views

@@ -30,6 +30,7 @@ const metric_kernels = @import("metrics.zig");
 pub const score_read = @import("score_read.zig");
 pub const vector_chunk = @import("vector_chunk.zig");
 const partition_census = @import("partition_census.zig");
+const membership = @import("membership.zig");
 const ordinal_blocks = @import("ordinal.zig");
 const adjacency_blocks = @import("adjacency.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
@@ -338,6 +339,34 @@ fn graphIndexEdgeKeyMatchesIndex(key: []const u8, index_name: []const u8) bool {
     if (!internal_keys.componentEquals(key, pos, index_name)) return false;
     pos = (internal_keys.findComponentTerminator(key, pos) orelse return false) + 2;
     return pos < key.len and key[pos] == internal_keys.graph_edge_record_kind;
+}
+
+/// Metric state can dwarf the edge set. Never enumerate it while finding the
+/// end of an edge partition, including the final unbounded partition.
+fn graphMetricSkipMetadata(cur: anytype, entry: anytype) !@TypeOf(entry) {
+    if (entry) |value| if (std.mem.startsWith(u8, value.key, "meta:"))
+        return try cur.seekAtOrAfter("meta;");
+    return entry;
+}
+
+test "graph metric edge scan skips an arbitrarily large metadata tail with one seek" {
+    const Entry = struct { key: []const u8 };
+    const Cursor = struct {
+        seeks: usize = 0,
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?Entry {
+            try std.testing.expectEqualStrings("meta;", key);
+            self.seeks += 1;
+            return .{ .key = "next-record" };
+        }
+    };
+    var cur = Cursor{};
+    const skipped = try graphMetricSkipMetadata(&cur, @as(?Entry, .{ .key = "meta:graph-metric/vector/0" }));
+    try std.testing.expectEqualStrings("next-record", skipped.?.key);
+    try std.testing.expectEqual(@as(usize, 1), cur.seeks);
+    const edge = try graphMetricSkipMetadata(&cur, @as(?Entry, .{ .key = "edge" }));
+    try std.testing.expectEqualStrings("edge", edge.?.key);
+    try std.testing.expectEqual(@as(usize, 1), cur.seeks);
+    try std.testing.expect((try graphMetricSkipMetadata(&cur, @as(?Entry, null))) == null);
 }
 
 const DecodedGraphKeyComponent = struct {
@@ -7049,8 +7078,9 @@ pub const GraphIndex = struct {
     // for every iterative build, independent of node count.
     // v8 retains attempt-fenced adjacency once and folds input vectors directly.
     // v9 packs producer fragments into dense, receipt-selected adjacency tiles.
+    // v10 bounds partition census work; v11 seals canonical membership blocks.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 10;
+    const graph_metric_build_execution_schema_version: u64 = 11;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -8941,21 +8971,24 @@ pub const GraphIndex = struct {
 
     fn collectGraphMetricOrdinalNodesInRange(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, lower: []const u8, upper: []const u8, resume_node: []const u8, limit: ?usize, nodes: *std.ArrayListUnmanaged([]u8), slots: *std.ArrayListUnmanaged(u64)) !bool {
         try self.validateGraphMetricVectorManifest(txn, metric_name, job_id);
-        // Join two ordered ranges rather than N dictionary point lookups.
-        // Canonical membership remains authoritative: a missing ordinal must
-        // fail closed, never silently remove a node from a materialization.
-        const complete = try self.collectPageRankScannedNodesInRange(txn, metric_name, job_id, lower, upper, resume_node, limit, nodes);
-        if (nodes.items.len == 0) return complete;
-        const start = try graphMetricNodeSlotKey(self.alloc, metric_name, job_id, nodes.items[0]);
+        // Initialization seals canonical blocks once. Iterations never revisit
+        // per-producer membership partials, even when a fold resumes many times.
+        const complete = try self.collectSealedGraphMetricMembership(txn, metric_name, job_id, lower, upper, resume_node, limit, nodes, slots);
+        try self.validateGraphMetricOrdinalDictionary(txn, metric_name, job_id, nodes.items, slots.items);
+        return complete;
+    }
+
+    fn validateGraphMetricOrdinalDictionary(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, nodes: []const []const u8, slots: []const u64) !void {
+        if (nodes.len == 0) return;
+        const start = try graphMetricNodeSlotKey(self.alloc, metric_name, job_id, nodes[0]);
         defer self.alloc.free(start);
-        const prefix_len = start.len - internal_keys.encodedComponentLen(nodes.items[0]);
+        const prefix_len = start.len - internal_keys.encodedComponentLen(nodes[0]);
         var component = std.ArrayListUnmanaged(u8).empty;
         defer component.deinit(self.alloc);
-        try slots.ensureUnusedCapacity(self.alloc, nodes.items.len);
         var cur = try txn.openCursor();
         defer cur.close();
         var item = try cur.seekAtOrAfter(start);
-        for (nodes.items) |node| {
+        for (nodes, slots) |node, expected_slot| {
             const entry = item orelse return error.InvalidGraphMetricBuildManifest;
             component.clearRetainingCapacity();
             try internal_keys.appendEncodedComponent(&component, self.alloc, node);
@@ -8963,11 +8996,152 @@ pub const GraphIndex = struct {
                 !std.mem.eql(u8, entry.key[prefix_len..], component.items) or entry.value.len != 8)
                 return error.InvalidGraphMetricBuildManifest;
             const slot = std.mem.readInt(u64, entry.value[0..8], .little);
-            if (slot == 0 or (slots.items.len != 0 and slot <= slots.items[slots.items.len - 1])) return error.InvalidGraphMetricBuildManifest;
-            slots.appendAssumeCapacity(slot);
+            if (slot != expected_slot) return error.InvalidGraphMetricBuildManifest;
             item = try cur.next();
         }
-        return complete;
+    }
+
+    fn graphMetricMembershipKey(self: *GraphIndex, metric: []const u8, job_id: u64, leaf: u64, block: u64) ![]u8 {
+        const prefix = try self.graphMetricBuildJobNamespacePrefixAlloc(metric, job_id);
+        defer self.alloc.free(prefix);
+        return std.fmt.allocPrint(self.alloc, "{s}membership/{d}/{d}", .{ prefix, leaf, block });
+    }
+
+    /// Benchmark fixture only: one canonical leaf with maximum producer fan-in.
+    pub fn benchmarkMembershipFixture(self: *GraphIndex, nodes: []const []const u8) !void {
+        if (nodes.len > graph_metric_build_target_reduce_page_units) return error.InvalidBenchmarkResult;
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try self.putGraphMetricBuildManifestInBatch(&batch, "bench-membership", .{ .job_id = 1, .node_count = nodes.len });
+        try self.putGraphMetricBuildPageInBatch(&batch, "bench-membership", .{ .job_id = 1, .phase = .initialize_ranks, .page_id = graph_metric_build_summary_leaf_base, .range_kind = .summary, .state = .complete, .completed_units = nodes.len, .total_units = nodes.len });
+        try self.writeGraphMetricMembership(&batch, "bench-membership", 1, 0, 0, nodes);
+        for (nodes, 0..) |node, i| {
+            const key = try graphMetricNodeSlotKey(self.alloc, "bench-membership", 1, node);
+            defer self.alloc.free(key);
+            try putU64(&batch, key, (@as(u64, 1) << 32) | i);
+            for (0..256) |producer| {
+                const partial = try self.graphMetricBuildPageRankNodePartialKeyAlloc("bench-membership", 1, node, producer);
+                defer self.alloc.free(partial);
+                try putU64(&batch, partial, 1);
+            }
+        }
+        try batch.commit();
+    }
+
+    /// Both paths validate the same dictionary; only canonical discovery differs.
+    pub fn benchmarkMembershipRead(self: *GraphIndex, reference: bool) !usize {
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        var nodes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (nodes.items) |node| self.alloc.free(node);
+            nodes.deinit(self.alloc);
+        }
+        if (reference) {
+            _ = try self.collectPageRankScannedNodesInRange(&txn, "bench-membership", 1, "", "", "", null, &nodes);
+            const slots = try self.alloc.alloc(u64, nodes.items.len);
+            defer self.alloc.free(slots);
+            for (slots, 0..) |*slot, i| slot.* = (@as(u64, 1) << 32) | i;
+            try self.validateGraphMetricOrdinalDictionary(&txn, "bench-membership", 1, nodes.items, slots);
+        } else {
+            _ = try self.collectGraphMetricInitializedNodesInRange(&txn, "bench-membership", 1, "", "", "", null, &nodes);
+        }
+        return nodes.items.len;
+    }
+
+    fn collectGraphMetricInitializedNodesInRange(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, lower: []const u8, upper: []const u8, resume_node: []const u8, limit: ?usize, nodes: *std.ArrayListUnmanaged([]u8)) !bool {
+        var slots = std.ArrayListUnmanaged(u64).empty;
+        defer slots.deinit(self.alloc);
+        return self.collectGraphMetricOrdinalNodesInRange(txn, metric, job_id, lower, upper, resume_node, limit, nodes, &slots);
+    }
+
+    fn writeGraphMetricMembership(self: *GraphIndex, batch: anytype, metric: []const u8, job_id: u64, leaf: u64, start: u64, nodes: []const []const u8) !void {
+        var offset: usize = 0;
+        while (offset < nodes.len) {
+            const row = start + offset;
+            const block_id = row / membership.capacity;
+            const within: usize = @intCast(row % membership.capacity);
+            const count = @min(nodes.len - offset, membership.capacity - within);
+            const key = try self.graphMetricMembershipKey(metric, job_id, leaf, block_id);
+            defer self.alloc.free(key);
+            var block = if (batch.get(key)) |raw| try membership.decode(raw) else |err| switch (err) {
+                error.NotFound => membership.Block{},
+                else => return err,
+            };
+            if (within > block.len) return error.InvalidGraphMetricBuildManifest;
+            for (nodes[offset..][0..count], 0..) |node, i| {
+                const slot = ((leaf + 1) << 32) | (row + i);
+                if (within + i < block.len and (!std.mem.eql(u8, block.rows[within + i].node, node) or block.rows[within + i].slot != slot))
+                    return error.InvalidGraphMetricBuildManifest;
+                block.rows[within + i] = .{ .node = node, .slot = slot };
+            }
+            block.len = @max(block.len, within + count);
+            const raw = try membership.encodeAlloc(self.alloc, block.rows[0..block.len]);
+            defer self.alloc.free(raw);
+            try batch.put(key, raw);
+            offset += count;
+        }
+    }
+
+    fn collectSealedGraphMetricMembership(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, lower: []const u8, upper: []const u8, resume_node: []const u8, limit: ?usize, nodes: *std.ArrayListUnmanaged([]u8), slots: *std.ArrayListUnmanaged(u64)) !bool {
+        const manifest = try self.metricBuildManifest(txn, metric, job_id) orelse return error.GraphMetricBuildManifestNotFound;
+        const leaf_count = graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
+        const seek = if (resume_node.len != 0) resume_node else lower;
+        // Locate one immutable leaf by range, not by enumerating every leaf or
+        // probing absent filtered boundary nodes in the ordinal dictionary.
+        var first: usize = 0;
+        var end = leaf_count;
+        while (first < end) {
+            const mid = first + (end - first) / 2;
+            const leaf = try self.metricBuildPage(txn, metric, job_id, .initialize_ranks, 0, graph_metric_build_summary_leaf_base + mid) orelse return error.InvalidGraphMetricBuildManifest;
+            if (leaf.range_upper.len != 0 and std.mem.order(u8, leaf.range_upper, seek) != .gt) first = mid + 1 else end = mid;
+        }
+        for (first..leaf_count) |leaf_index| {
+            const leaf = try self.metricBuildPage(txn, metric, job_id, .initialize_ranks, 0, graph_metric_build_summary_leaf_base + leaf_index) orelse return error.InvalidGraphMetricBuildManifest;
+            if (leaf.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
+            if (upper.len != 0 and std.mem.order(u8, leaf.range_lower, upper) != .lt) return true;
+            var position: u64 = 0;
+            if (leaf_index == first and resume_node.len != 0) {
+                const key = try graphMetricNodeSlotKey(self.alloc, metric, job_id, resume_node);
+                defer self.alloc.free(key);
+                const slot = try readU64OrZero(txn, key);
+                if (slot == 0 or slot >> 32 != leaf_index + 1) return error.InvalidGraphMetricBuildManifest;
+                position = (slot & std.math.maxInt(u32)) + 1;
+                if (position > leaf.completed_units) return error.InvalidGraphMetricBuildManifest;
+                const resume_key = try self.graphMetricMembershipKey(metric, job_id, leaf_index, (position - 1) / membership.capacity);
+                defer self.alloc.free(resume_key);
+                const resume_raw = txn.get(resume_key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidGraphMetricBuildManifest,
+                    else => return err,
+                };
+                const resume_block = try membership.decodeSealed(resume_raw, leaf_index, (position - 1) / membership.capacity, leaf.completed_units, leaf.range_lower, leaf.range_upper);
+                const within: usize = @intCast((position - 1) % membership.capacity);
+                if (within >= resume_block.len or resume_block.rows[within].slot != slot or !std.mem.eql(u8, resume_block.rows[within].node, resume_node))
+                    return error.InvalidGraphMetricBuildManifest;
+            }
+            while (position < leaf.completed_units) {
+                const block_id = position / membership.capacity;
+                const key = try self.graphMetricMembershipKey(metric, job_id, leaf_index, block_id);
+                defer self.alloc.free(key);
+                const raw = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidGraphMetricBuildManifest,
+                    else => return err,
+                };
+                const block = try membership.decodeSealed(raw, leaf_index, block_id, leaf.completed_units, leaf.range_lower, leaf.range_upper);
+                for (block.rows[@intCast(position % membership.capacity)..block.len]) |row| {
+                    if (upper.len != 0 and std.mem.order(u8, row.node, upper) != .lt) return true;
+                    if (lower.len == 0 or std.mem.order(u8, row.node, lower) != .lt) {
+                        if (limit) |cap| if (nodes.items.len == cap) return false;
+                        try nodes.ensureUnusedCapacity(self.alloc, 1);
+                        try slots.ensureUnusedCapacity(self.alloc, 1);
+                        nodes.appendAssumeCapacity(try self.alloc.dupe(u8, row.node));
+                        slots.appendAssumeCapacity(row.slot);
+                    }
+                    position += 1;
+                }
+            }
+        }
+        return true;
     }
 
     fn readGraphMetricVectorAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, lane: []const u8, iteration: u32, nodes: []const []const u8, required: bool) ![]f64 {
@@ -9042,25 +9216,26 @@ pub const GraphIndex = struct {
         var nodes = std.ArrayListUnmanaged([]const u8).empty;
         var cursor: []const u8 = "";
         var scanned: u64 = 0;
+        var visited: usize = 0;
         var complete = true;
         var filter = try CompiledGraphMetricEdgeFilter.init(temp, cfg.edge_filter);
         defer filter.deinit(temp);
         var cur = try txn.openCursor();
         defer cur.close();
         const seek = if (page.cursor.len > 0) page.cursor else page.range_lower;
-        var next = if (seek.len > 0) try cur.seekAtOrAfter(seek) else try cur.first();
-        while (next) |entry| : (next = try cur.next()) {
+        var next = try graphMetricSkipMetadata(&cur, if (seek.len > 0) try cur.seekAtOrAfter(seek) else try cur.first());
+        while (next) |entry| : (next = try graphMetricSkipMetadata(&cur, try cur.next())) {
             if (page.cursor.len > 0 and std.mem.order(u8, entry.key, page.cursor) != .gt) continue;
             if (page.range_upper.len > 0 and std.mem.order(u8, entry.key, page.range_upper) != .lt) break;
-            if (std.mem.startsWith(u8, entry.key, graph_meta_prefix)) continue;
-            var parsed = (try parseMetricReverseEdgeKeyView(temp, entry.key, self.index_name)) orelse continue;
-            defer parsed.deinit(temp);
-            if (scanned == limit) {
+            if (visited == limit) {
                 complete = false;
                 break;
             }
-            scanned += 1;
+            visited += 1;
             cursor = try temp.dupe(u8, entry.key);
+            var parsed = (try parseMetricReverseEdgeKeyView(temp, entry.key, self.index_name)) orelse continue;
+            defer parsed.deinit(temp);
+            scanned += 1;
             if (!filter.allows(parsed.edge_type.bytes)) continue;
             try nodes.append(temp, try temp.dupe(u8, parsed.source.bytes));
             try nodes.append(temp, try temp.dupe(u8, parsed.target.bytes));
@@ -9873,6 +10048,7 @@ pub const GraphIndex = struct {
                 if (prior != 0 and prior != ordinal) return error.InvalidGraphMetricBuildManifest;
                 try putU64(&batch, key, ordinal);
             }
+            try self.writeGraphMetricMembership(&batch, metric_name, job.job_id, page.page_id - graph_metric_build_summary_leaf_base, prior_completed_units, nodes.items);
             try batch.commit();
         }
 
@@ -10155,6 +10331,7 @@ pub const GraphIndex = struct {
         defer self.freeStringHashMapKeys(void, &nodes);
 
         var scanned_units: u64 = 0;
+        var visited_units: u64 = 0;
         var prior_completed_units: u64 = 0;
         var page_attempt = page.attempt;
         var reached_page_end = true;
@@ -10172,22 +10349,22 @@ pub const GraphIndex = struct {
             defer cur.close();
             const resume_cursor = execution_page.cursor;
             const seek_key = if (resume_cursor.len > 0) resume_cursor else execution_page.range_lower;
-            var entry_opt = if (seek_key.len > 0) try cur.seekAtOrAfter(seek_key) else try cur.first();
-            while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+            var entry_opt = try graphMetricSkipMetadata(&cur, if (seek_key.len > 0) try cur.seekAtOrAfter(seek_key) else try cur.first());
+            while (entry_opt) |entry| : (entry_opt = try graphMetricSkipMetadata(&cur, try cur.next())) {
                 if (resume_cursor.len > 0 and std.mem.order(u8, entry.key, resume_cursor) != .gt) continue;
                 if (execution_page.range_upper.len > 0 and std.mem.order(u8, entry.key, execution_page.range_upper) != .lt) break;
-                if (std.mem.startsWith(u8, entry.key, graph_meta_prefix)) continue;
-                var parsed = (try parseMetricReverseEdgeKeyView(self.alloc, entry.key, self.index_name)) orelse continue;
-                defer parsed.deinit(self.alloc);
                 if (max_scan_units) |limit| {
-                    if (scanned_units >= limit) {
+                    if (visited_units >= limit) {
                         reached_page_end = false;
                         break;
                     }
                 }
-                scanned_units += 1;
+                visited_units += 1;
                 last_scanned_key.clearRetainingCapacity();
                 try last_scanned_key.appendSlice(self.alloc, entry.key);
+                var parsed = (try parseMetricReverseEdgeKeyView(self.alloc, entry.key, self.index_name)) orelse continue;
+                defer parsed.deinit(self.alloc);
+                scanned_units += 1;
                 if (!compiled_filter.allows(parsed.edge_type.bytes)) continue;
                 try self.putPageRankScanNode(&nodes, parsed.source.bytes);
                 try self.putPageRankScanNode(&nodes, parsed.target.bytes);
@@ -11648,7 +11825,7 @@ pub const GraphIndex = struct {
         const reached_page_end = blk: {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
-            break :blk try self.collectPageRankScannedNodesInRange(
+            break :blk try self.collectGraphMetricInitializedNodesInRange(
                 &txn,
                 metric_name,
                 job.job_id,
@@ -11781,7 +11958,7 @@ pub const GraphIndex = struct {
         const reached_page_end = blk: {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
-            break :blk try self.collectPageRankScannedNodesInRange(
+            break :blk try self.collectGraphMetricInitializedNodesInRange(
                 &txn,
                 metric_name,
                 job.job_id,
@@ -11894,6 +12071,7 @@ pub const GraphIndex = struct {
         }
 
         var scanned_units: u64 = 0;
+        var visited_units: u64 = 0;
         var prior_completed_units: u64 = 0;
         var page_attempt = page.attempt;
         var reached_page_end = true;
@@ -11910,22 +12088,22 @@ pub const GraphIndex = struct {
             defer cur.close();
             const resume_cursor = execution_page.cursor;
             const seek_key = if (resume_cursor.len > 0) resume_cursor else execution_page.range_lower;
-            var entry_opt = if (seek_key.len > 0) try cur.seekAtOrAfter(seek_key) else try cur.first();
-            while (entry_opt) |entry| : (entry_opt = try cur.next()) {
+            var entry_opt = try graphMetricSkipMetadata(&cur, if (seek_key.len > 0) try cur.seekAtOrAfter(seek_key) else try cur.first());
+            while (entry_opt) |entry| : (entry_opt = try graphMetricSkipMetadata(&cur, try cur.next())) {
                 if (resume_cursor.len > 0 and std.mem.order(u8, entry.key, resume_cursor) != .gt) continue;
                 if (execution_page.range_upper.len > 0 and std.mem.order(u8, entry.key, execution_page.range_upper) != .lt) break;
-                if (std.mem.startsWith(u8, entry.key, graph_meta_prefix)) continue;
-                var parsed = (try parseMetricReverseEdgeKeyView(self.alloc, entry.key, self.index_name)) orelse continue;
-                defer parsed.deinit(self.alloc);
                 if (max_scan_units) |limit| {
-                    if (scanned_units >= limit) {
+                    if (visited_units >= limit) {
                         reached_page_end = false;
                         break;
                     }
                 }
-                scanned_units += 1;
+                visited_units += 1;
                 last_scanned_key.clearRetainingCapacity();
                 try last_scanned_key.appendSlice(self.alloc, entry.key);
+                var parsed = (try parseMetricReverseEdgeKeyView(self.alloc, entry.key, self.index_name)) orelse continue;
+                defer parsed.deinit(self.alloc);
+                scanned_units += 1;
                 if (!compiled_filter.allows(parsed.edge_type.bytes)) continue;
                 const source_idx = try self.getOrPutDegreeNode(&map, &nodes, parsed.source.bytes);
                 const target_idx = try self.getOrPutDegreeNode(&map, &nodes, parsed.target.bytes);
@@ -12202,7 +12380,7 @@ pub const GraphIndex = struct {
         const reached_end = blk: {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
-            break :blk try self.collectPageRankScannedNodesInRange(
+            break :blk try self.collectGraphMetricInitializedNodesInRange(
                 &txn,
                 metric_name,
                 job.job_id,
@@ -17058,6 +17236,34 @@ test "graph metric ordinal iterations reuse immutable adjacency without numeric 
     };
     try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{ .prepare_generation, .scan_edges_and_out_degree, .initialize_ranks });
     {
+        const key = try graph.graphMetricMembershipKey(cfg.name, job.job_id, 0, 0);
+        defer alloc.free(key);
+        const saved = blk: {
+            var batch = try graph.beginWriteReverseBatch();
+            errdefer batch.abort();
+            const raw = try alloc.dupe(u8, try batch.get(key));
+            errdefer alloc.free(raw);
+            try batch.delete(key);
+            try batch.commit();
+            break :blk raw;
+        };
+        defer alloc.free(saved);
+        {
+            var txn = try graph.beginReadReverseTxn();
+            defer txn.abort();
+            var nodes = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (nodes.items) |node| alloc.free(node);
+                nodes.deinit(alloc);
+            }
+            try std.testing.expectError(error.InvalidGraphMetricBuildManifest, graph.collectGraphMetricInitializedNodesInRange(&txn, cfg.name, job.job_id, "", "", "", null, &nodes));
+        }
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try batch.put(key, saved);
+        try batch.commit();
+    }
+    {
         const missing_key = try GraphIndex.graphMetricNodeSlotKey(alloc, cfg.name, job.job_id, "b");
         defer alloc.free(missing_key);
         var saved: [8]u8 = undefined;
@@ -17145,22 +17351,25 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
             var batch = try graph.beginWriteReverseBatch();
             errdefer batch.abort();
             try graph.putGraphMetricBuildManifestInBatch(&batch, "rank", .{ .job_id = 1, .node_count = 2 });
+            try graph.putGraphMetricBuildPageInBatch(&batch, "rank", .{ .job_id = 1, .phase = .initialize_ranks, .page_id = graph_metric_build_summary_leaf_base, .range_kind = .summary, .state = .complete, .completed_units = 2, .total_units = 2 });
+            try graph.writeGraphMetricMembership(&batch, "rank", 1, 0, 0, &nodes);
             try graph.putGraphMetricBuildPageInBatch(&batch, "rank", page);
             try graph.putGraphMetricBuildPageInBatch(&batch, "rank", .{ .job_id = 1, .phase = .iterate_contributions, .page_id = 3, .state = .complete, .attempt = 2 });
             for (nodes, 0..) |node, i| {
-                const slot = (@as(u64, 1) << 32) + i * 256;
+                const slot = (@as(u64, 1) << 32) + i;
                 const key = try GraphIndex.graphMetricNodeSlotKey(temp, "rank", 1, node);
                 try GraphIndex.putU64(&batch, key, slot);
                 const scanned_key = try graph.graphMetricBuildPageRankNodePartialKeyAlloc("rank", 1, node, 0);
                 defer alloc.free(scanned_key);
                 try GraphIndex.putU64(&batch, scanned_key, 1);
                 var vector: vector_chunk.Chunk = @splat(0);
-                try vector_chunk.put(&vector, 0, @floatFromInt(i + 2));
+                try vector_chunk.put(&vector, 0, 2);
+                try vector_chunk.put(&vector, 1, 3);
                 try batch.put(try GraphIndex.graphMetricVectorChunkKey(temp, "rank", 1, "rank", 0, slot / 256), &vector);
                 const prefix = try graph.ordinalAdjacencyPrefixAlloc("rank", 1, .iterate_contributions, slot / 256);
                 defer alloc.free(prefix);
                 for (0..6) |shard| {
-                    const canonical = try std.fmt.allocPrint(temp, "{s}{d:0>20}:{d:0>20}:{d:0>20}", .{ prefix, @as(u64, 3), @as(u64, if (shard == 0) 1 else 2), shard });
+                    const canonical = try std.fmt.allocPrint(temp, "{s}{d:0>20}:{d:0>20}:{d:0>20}", .{ prefix, @as(u64, 3), @as(u64, if (shard == 0) 1 else 2), i * 6 + shard });
                     var edges: [256]ordinal_blocks.Edge = @splat(.{ .source = if (shard == 0) 999 else slot, .target = slot });
                     try batch.put(canonical, try ordinal_blocks.encodeTopology(temp, .{ .edges = &edges, .cursor = @constCast(""), .scanned = edges.len, .complete = true }));
                 }
@@ -17169,10 +17378,8 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
         }
         // Packing has its own restart/takeover regression below. Here the
         // durable checkpoint must hold partial numeric folds of dense tiles.
-        for (0..nodes.len) |i| {
-            const chunk = ((@as(u64, 1) << 32) + i * 256) / 256;
-            try std.testing.expectEqual(@as(usize, 6), try graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
-        }
+        const chunk = (@as(u64, 1) << 32) / 256;
+        try std.testing.expectEqual(@as(usize, 12), try graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
         try std.testing.expectEqual(@as(usize, 2), try graph.executeOrdinalReduceSummary("rank", cfg, job, page, 256, 2));
     }
     var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
@@ -17206,6 +17413,71 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
     const raw = try graph.pageRankContributionsForNodesAlloc(&txn, "rank", 1, 0, &nodes);
     defer alloc.free(raw);
     try std.testing.expectEqualSlices(f64, &.{ 10 * 256, 15 * 256 }, raw);
+}
+
+test "graph metric membership resumes across sealed blocks and rejects corrupt resume ordinals" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-membership-resume");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-membership-resume");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    defer graph.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var ids: [300][]const u8 = undefined;
+    for (&ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(temp, "node-{d:0>4}", .{i});
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        // A filtered graph with 256 planning leaves and one populated leaf.
+        try graph.putGraphMetricBuildManifestInBatch(&batch, "rank", .{ .job_id = 1, .node_count = 131072 });
+        for (0..256) |i| try graph.putGraphMetricBuildPageInBatch(&batch, "rank", .{
+            .job_id = 1,
+            .phase = .initialize_ranks,
+            .page_id = graph_metric_build_summary_leaf_base + i,
+            .range_kind = .summary,
+            .state = .complete,
+            .range_lower = if (i == 0) "" else try std.fmt.allocPrint(temp, "z-{d:0>4}", .{i - 1}),
+            .range_upper = if (i == 255) "" else try std.fmt.allocPrint(temp, "z-{d:0>4}", .{i}),
+            .completed_units = if (i == 0) ids.len else 0,
+            .total_units = 512,
+        });
+        try graph.writeGraphMetricMembership(&batch, "rank", 1, 0, 0, ids[0..270]);
+        // Retry with a different checkpoint boundary, then append.
+        try graph.writeGraphMetricMembership(&batch, "rank", 1, 0, 200, ids[200..280]);
+        try graph.writeGraphMetricMembership(&batch, "rank", 1, 0, 280, ids[280..]);
+        for (ids, 0..) |id, i| try GraphIndex.putU64(&batch, try GraphIndex.graphMetricNodeSlotKey(temp, "rank", 1, id), (@as(u64, 1) << 32) | i);
+        try batch.commit();
+    }
+    for ([_]bool{ false, true }) |corrupt| {
+        if (corrupt) {
+            var batch = try graph.beginWriteReverseBatch();
+            errdefer batch.abort();
+            try GraphIndex.putU64(&batch, try GraphIndex.graphMetricNodeSlotKey(temp, "rank", 1, ids[255]), (@as(u64, 1) << 32) | 299);
+            try batch.commit();
+        }
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        var nodes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (nodes.items) |node| alloc.free(node);
+            nodes.deinit(alloc);
+        }
+        if (corrupt) {
+            try std.testing.expectError(error.InvalidGraphMetricBuildManifest, graph.collectGraphMetricInitializedNodesInRange(&txn, "rank", 1, "", "", ids[255], 2, &nodes));
+        } else {
+            try std.testing.expect(!try graph.collectGraphMetricInitializedNodesInRange(&txn, "rank", 1, "", "", ids[255], 2, &nodes));
+            try std.testing.expectEqual(@as(usize, 2), nodes.items.len);
+            try std.testing.expectEqualStrings(ids[256], nodes.items[0]);
+            try std.testing.expectEqualStrings(ids[257], nodes.items[1]);
+        }
+    }
 }
 
 test "graph metric vector chunks cache gathers across a bounded fold" {
@@ -17262,6 +17534,8 @@ test "graph metric ordinal packing densifies fragmented output and fences incomp
             var batch = try graph.beginWriteReverseBatch();
             errdefer batch.abort();
             try graph.putGraphMetricBuildManifestInBatch(&batch, "rank", .{ .job_id = 1, .node_count = 1 });
+            try graph.putGraphMetricBuildPageInBatch(&batch, "rank", .{ .job_id = 1, .phase = .initialize_ranks, .page_id = graph_metric_build_summary_leaf_base, .range_kind = .summary, .state = .complete, .completed_units = 1, .total_units = 1 });
+            try graph.writeGraphMetricMembership(&batch, "rank", 1, 0, 0, &.{"a"});
             try graph.putGraphMetricBuildPageInBatch(&batch, "rank", page);
             try graph.putGraphMetricBuildPageInBatch(&batch, "rank", .{ .job_id = 1, .phase = .iterate_contributions, .page_id = 3, .state = .complete, .attempt = 2 });
             try GraphIndex.putU64(&batch, try GraphIndex.graphMetricNodeSlotKey(temp, "rank", 1, "a"), slot);
