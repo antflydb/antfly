@@ -3302,26 +3302,31 @@ pub fn build(b: *std.Build) void {
     const bench_image_step = b.step("bench-image", "Run lib/image decode benchmarks");
     bench_image_step.dependOn(&run_lib_image_bench.step);
 
+    const pdf_bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "pdf-optimize",
+        "Optimization for the isolated PDF executable",
+    ) orelse .ReleaseFast;
     const pdf_bench_image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_image_mod.addImport("antfly_hash", hash_bench_mod);
     const pdf_bench_font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     const pdf_bench_pdf_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     const pdf_bench_standard_fonts_mod = b.createModule(.{
         .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
@@ -3334,13 +3339,19 @@ pub fn build(b: *std.Build) void {
     const pdf_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_mod.addImport("antfly_pdf", pdf_bench_pdf_mod);
     const lib_pdf_bench = b.addExecutable(.{
         .name = "lib-pdf-bench",
         .root_module = pdf_bench_mod,
     });
+    const install_lib_pdf_bench = b.addInstallArtifact(lib_pdf_bench, .{});
+    const lib_pdf_bench_build_step = b.step(
+        "lib-pdf-bench-install",
+        "Install the lib/pdf benchmark executable (pdf-only dependency closure)",
+    );
+    lib_pdf_bench_build_step.dependOn(&install_lib_pdf_bench.step);
     const run_lib_pdf_bench = b.addRunArtifact(lib_pdf_bench);
     if (b.args) |args| {
         run_lib_pdf_bench.addArgs(args);

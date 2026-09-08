@@ -67,7 +67,6 @@ pub fn main(init: std.process.Init) !void {
         try benchRenderFirstPage(alloc, path, iterations);
         return;
     }
-
     if (std.mem.eql(u8, subcommand, "render-pages")) {
         const path = args.next() orelse {
             printUsage(argv0);
@@ -75,6 +74,19 @@ pub fn main(init: std.process.Init) !void {
         };
         const dpi: u16 = @intCast(try parseIterations(args.next(), 150));
         try renderAllPages(alloc, path, dpi);
+        return;
+    }
+
+    if (std.mem.eql(u8, subcommand, "dump-text")) {
+        const path = args.next() orelse {
+            printUsage(argv0);
+            return BenchError.InvalidArguments;
+        };
+        const output_path = args.next() orelse {
+            printUsage(argv0);
+            return BenchError.InvalidArguments;
+        };
+        try dumpText(alloc, path, output_path);
         return;
     }
 
@@ -89,8 +101,9 @@ fn printUsage(argv0: []const u8) void {
         \\  {s} extract-text <pdf-path> [iterations]
         \\  {s} render-first-page <pdf-path> [iterations]
         \\  {s} render-pages <pdf-path> [dpi]
+        \\  {s} dump-text <pdf-path> <output-path>
         \\
-    , .{ argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0 });
 }
 
 fn parseIterations(maybe_value: ?[]const u8, default_value: usize) !usize {
@@ -159,6 +172,35 @@ fn renderAllPages(alloc: std.mem.Allocator, path: []const u8, dpi: u16) !void {
     const page_count = page_number - 1;
     if (page_count == 0) return error.EmptyPdfPageTree;
     printBenchLine("pdf-render-pages", path, page_count, monotonicNowNs() - start_ns, bytes.len, total_output_bytes);
+}
+/// One-shot text dump for external scoring harnesses: no warmup, no timing
+/// loop, output written to a file instead of stderr. Deliberately stricter
+/// than `Backend.extractText` / `Reader.extractPlainTextAlloc`, whose per-page
+/// `catch`/`continue` (reader.zig) silently drops pages that fail extraction;
+/// here the first per-page error propagates so a corrupt page surfaces as a
+/// nonzero exit and no output file instead of silently missing text. Uses the
+/// production page-text/region API, with no OCR or raster rendering.
+fn dumpText(alloc: std.mem.Allocator, path: []const u8, output_path: []const u8) !void {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
+    defer alloc.free(bytes);
+
+    var parsed = try pdf.reader.Reader.init(alloc, bytes);
+    defer parsed.deinit();
+
+    const page_count = try parsed.pageCount();
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+
+    for (1..page_count + 1) |page_num| {
+        var analysis = try parsed.extractPageTextAnalysisAlloc(page_num);
+        defer analysis.deinit(alloc);
+        try out.appendSlice(alloc, analysis.text);
+    }
+
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = output_path, .data = out.items });
 }
 
 fn timeExtractText(

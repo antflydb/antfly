@@ -614,7 +614,17 @@ pub const Scanner = struct {
             return .{ .boolean = false };
         }
         if (isInteger(text)) {
-            const value = try std.fmt.parseInt(i64, text, 10);
+            const value = std.fmt.parseInt(i64, text, 10) catch |err| switch (err) {
+                error.Overflow => {
+                    // Some producers serialize large real-valued bounds without
+                    // a decimal point. Preserve them in the real-number range.
+                    const real = try std.fmt.parseFloat(f64, text);
+                    if (!std.math.isFinite(real)) return error.Overflow;
+                    self.alloc.free(text);
+                    return .{ .real = real };
+                },
+                else => return err,
+            };
             self.alloc.free(text);
             return .{ .integer = value };
         }
@@ -913,6 +923,27 @@ test "scanner tokenizes strings names and numbers" {
         defer tok.deinit(alloc);
         try std.testing.expectEqual(@as(f64, -3.5), tok.real);
     }
+}
+
+test "scanner represents oversized finite integer tokens as real numbers" {
+    const alloc = std.testing.allocator;
+    var scanner = Scanner.init(
+        alloc,
+        "[9223372036854775807 -9223372036854775808 9223372036854775808 -9223372036854775809]",
+    );
+    defer scanner.deinit();
+    var numbers = try scanner.readObject();
+    defer numbers.deinit(alloc);
+    try std.testing.expectEqual(std.math.maxInt(i64), numbers.array[0].integer);
+    try std.testing.expectEqual(std.math.minInt(i64), numbers.array[1].integer);
+    try std.testing.expectEqual(@as(f64, 9223372036854775808.0), numbers.array[2].real);
+    try std.testing.expectEqual(@as(f64, -9223372036854775809.0), numbers.array[3].real);
+}
+
+test "scanner rejects integer tokens beyond finite real range" {
+    var scanner = Scanner.init(std.testing.allocator, "9" ** 400);
+    defer scanner.deinit();
+    try std.testing.expectError(error.Overflow, scanner.readObject());
 }
 
 test "scanner parses dict array object ref and objdef" {
