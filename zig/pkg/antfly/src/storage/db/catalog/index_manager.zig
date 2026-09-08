@@ -7981,6 +7981,27 @@ pub const IndexManager = struct {
     // resumes on the next maintenance pass.
     const dense_link_repair_max_nodes: usize = 4096;
 
+    /// Completion-only lane: never admits a new build or performs optional
+    /// tree repair. A busy mutation owner keeps the notification pending.
+    pub fn publishCompletedDensePostingCheckpoints(self: *IndexManager) !OnlineVectorBlockPublicationResult {
+        var result: OnlineVectorBlockPublicationResult = .{};
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.apply_mutex.tryLock()) {
+                result.deferred = true;
+                continue;
+            }
+            defer entry.apply_mutex.unlock();
+            const build = entry.index.experimental_posting_checkpoint_build orelse continue;
+            if (!build.completed.load(.acquire)) continue;
+            if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) {
+                result.published += 1;
+            } else if (entry.index.experimental_posting_checkpoint_build != null) {
+                result.deferred = true;
+            }
+        }
+        return result;
+    }
+
     pub fn runDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
@@ -39303,6 +39324,75 @@ test "authoritative posting capture starts inside an existing replay session" {
         error.PostingWalCaptureSuperseded,
         manager.finishDensePostingSidecarCaptureLeaseByName("dv_v1", second_lease, 0),
     );
+}
+
+test "completed native publication defers to capture ownership without starting maintenance" {
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.setIo(runtime.io());
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "completion",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+    const entry = manager.denseIndex("completion").?;
+    entry.index.attachResourceManager(&resources);
+    const Loader = struct {
+        fn load(_: *anyopaque, a: Allocator, _: u64, _: []const u8) ![]f32 {
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    var context: u8 = 0;
+    entry.index.setExternalVectorLoader(&context, Loader.load);
+    entry.index.setExperimentalPostingAuthorityTransitionPermitted(true);
+    try entry.index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = false, .make_authoritative = true });
+    try entry.index.beginExperimentalPostingMutationCapture();
+    try entry.index.batchInsertWithMetadataOptions(&.{.{ .vector_id = 1, .vector = &.{ 1, 0 }, .metadata = "doc:1" }}, .{ .skip_vector_store = true });
+    try entry.index.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
+    const epoch = resources.dense_checkpoint_ready.snapshot();
+    try std.testing.expect(try entry.index.requestExperimentalPostingFullCheckpointForReadiness());
+    const build = entry.index.experimental_posting_checkpoint_build.?;
+    const deadline = platform_time.monotonicNs() +| 10 * std.time.ns_per_s;
+    while (!build.completed.load(.acquire) or resources.dense_checkpoint_ready.snapshot() == epoch) {
+        if (platform_time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try runtime.io().sleep(.fromMilliseconds(1), .awake);
+    }
+    // Publication is nonblocking even when another lane owns the index lock.
+    {
+        try std.testing.expect(entry.apply_mutex.tryLock());
+        defer entry.apply_mutex.unlock();
+        const busy = try manager.publishCompletedDensePostingCheckpoints();
+        try std.testing.expect(busy.deferred);
+        try std.testing.expectEqual(@as(usize, 0), busy.published);
+    }
+    try entry.index.beginExperimentalPostingMutationCapture();
+    const capturing = try manager.publishCompletedDensePostingCheckpoints();
+    try std.testing.expect(capturing.deferred);
+    try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
+    try std.testing.expectEqual(build, entry.index.experimental_posting_checkpoint_build.?);
+    entry.index.cancelExperimentalPostingMutationCapture();
+    const published = try manager.publishCompletedDensePostingCheckpoints();
+    try std.testing.expectEqual(@as(usize, 1), published.published);
+    try std.testing.expect(!published.deferred);
+    try std.testing.expectEqual(@as(?u64, 1), entry.index.experimentalPostingDurableAppliedSequence());
+    const idle = try manager.publishCompletedDensePostingCheckpoints();
+    try std.testing.expectEqual(@as(usize, 0), idle.published);
+    try std.testing.expect(!idle.deferred);
+    try std.testing.expect(entry.index.experimental_posting_checkpoint_build == null);
 }
 
 test "stable native finalization certifies an empty dense index" {

@@ -24466,6 +24466,17 @@ pub const DB = struct {
         });
     }
 
+    pub fn publishCompletedDensePostingCheckpoints(self: *DB) !NativePublicationResult {
+        // Native backup closes and drains this same catalog barrier before
+        // selecting/pinning generated files. It excludes publication until
+        // hardlinks own the captured generation, without serializing ordinary
+        // primary commits behind the checkpoint handoff.
+        var catalog_lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .busy = true };
+        defer catalog_lease.release();
+        const result = try self.core.index_manager.publishCompletedDensePostingCheckpoints();
+        return .{ .published = result.published, .deferred = result.deferred };
+    }
+
     /// Cooperatively drain the posting dependency chain at a caller-proven
     /// quiet boundary. Individual repair pages remain bounded by the runtime
     /// policy and the drain stops when foreground dense work reappears.

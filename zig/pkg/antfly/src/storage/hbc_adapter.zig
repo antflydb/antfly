@@ -4413,6 +4413,7 @@ const ExperimentalPostingCheckpointBuild = struct {
                 cpu_ns,                       self.build_error == null,
             });
             self.completed.store(true, .release);
+            if (self.resource_manager) |manager| manager.dense_checkpoint_ready.notify();
         }
         var budget = if (self.resource_manager) |manager|
             resource_manager_mod.BudgetedAllocator.init(manager, .lsm_compaction_work, allocator(), 1)
@@ -23991,6 +23992,109 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
     var final_results = try final.search(&[_]f32{ 0.5, 0.5 }, 3);
     defer final_results.deinit();
     try std.testing.expectEqual(@as(usize, 3), final_results.items.items.len);
+}
+
+test "native suffix checkpoint preserves pinned readers tombstones and a concurrent WAL tail across restart" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    const Fixture = struct {
+        const vectors = [_][2]f32{ .{ 1, 0 }, .{ 0, 1 }, .{ 0.8, 0.2 }, .{ 0.2, 0.8 }, .{ 0.5, 0.5 } };
+        fn load(_: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            if (id == 0 or id > vectors.len) return error.NotFound;
+            return a.dupe(f32, &vectors[id - 1]);
+        }
+        fn insert(idx: *HBCIndex, id: u64) !void {
+            try idx.batchInsertWithMetadataOptions(&.{.{
+                .vector_id = id,
+                .vector = &vectors[id - 1],
+                .metadata = "document",
+            }}, .{ .skip_vector_store = true });
+        }
+        fn checkpoint(idx: *HBCIndex, kind: ExperimentalPostingCheckpointKind) !void {
+            try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, kind));
+            idx.experimental_posting_checkpoint_build.?.awaitCompletion();
+            try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
+        }
+    };
+    const options: HBCConfig = .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    };
+    var loader_context: u8 = 0;
+    {
+        var idx = try HBCIndex.open(alloc, path, options);
+        defer idx.close();
+        idx.setIo(runtime.io());
+        idx.setExternalVectorLoader(&loader_context, Fixture.load);
+        idx.setExperimentalPostingAuthorityTransitionPermitted(true);
+        try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = false, .make_authoritative = true });
+        try idx.beginExperimentalPostingMutationCapture();
+        try Fixture.insert(&idx, 1);
+        try Fixture.insert(&idx, 2);
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
+        try Fixture.checkpoint(&idx, .full);
+        try std.testing.expect(idx.nativePostingBaseHasVectors());
+
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.delete(1);
+        try Fixture.insert(&idx, 3);
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(3, .{});
+        try Fixture.checkpoint(&idx, .delta);
+        try idx.beginExperimentalPostingMutationCapture();
+        try Fixture.insert(&idx, 4);
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(4, .{});
+        try Fixture.checkpoint(&idx, .delta);
+        try std.testing.expectEqual(@as(usize, 2), idx.experimental_posting_write_store.?.deltaSegmentCount());
+
+        var pinned = try idx.beginReadTxn();
+        defer pinned.abort();
+        const before = idx.retainCurrentExperimentalPostingReadGeneration().?;
+        defer before.release();
+        const retained_base = experimentalPostingRootState(before).?.retained_segments[0].bytes().ptr;
+        try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, .compact_deltas));
+        // Commit after the builder's retained boundary. Publication must not
+        // flatten away this tail or resurrect the base's deleted vector.
+        try idx.beginExperimentalPostingMutationCapture();
+        try Fixture.insert(&idx, 5);
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(5, .{});
+        if (idx.experimental_posting_checkpoint_build) |build| {
+            build.awaitCompletion();
+            try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
+        }
+        try std.testing.expectEqual(@as(usize, 1), idx.experimental_posting_write_store.?.deltaSegmentCount());
+        try std.testing.expectEqual(@as(u64, 4), idx.experimental_posting_write_store.?.checkpoint.?.covered_source_sequence);
+        try std.testing.expect(idx.experimental_posting_write_store.?.wal_committed_bytes > 0);
+        const after = idx.retainCurrentExperimentalPostingReadGeneration().?;
+        defer after.release();
+        try std.testing.expectEqual(retained_base, experimentalPostingRootState(after).?.retained_segments[0].bytes().ptr);
+        try std.testing.expectEqual(@as(?u64, 5), idx.experimentalPostingDurableAppliedSequence());
+        try std.testing.expect((try idx.getMetadataInTxn(&pinned, 1)) == null);
+        try std.testing.expect((try idx.getMetadataInTxn(&pinned, 5)) == null);
+        try std.testing.expectEqualStrings("document", (try idx.getMetadataInTxn(&pinned, 4)).?);
+        var live = try idx.search(&Fixture.vectors[4], 5);
+        defer live.deinit();
+        try std.testing.expectEqual(@as(usize, 4), live.items.items.len);
+    }
+    var reopened = try HBCIndex.open(alloc, path, options);
+    defer reopened.close();
+    reopened.setIo(runtime.io());
+    reopened.setExternalVectorLoader(&loader_context, Fixture.load);
+    try reopened.activateExperimentalPostingReads(5);
+    var recovered = try reopened.search(&Fixture.vectors[4], 5);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 4), recovered.items.items.len);
+    var txn = try reopened.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expect((try reopened.getMetadataInTxn(&txn, 1)) == null);
+    try std.testing.expectEqualStrings("document", (try reopened.getMetadataInTxn(&txn, 5)).?);
 }
 
 test "prepared posting activation rejects incompatible metadata before CURRENT and keeps writes serviceable" {

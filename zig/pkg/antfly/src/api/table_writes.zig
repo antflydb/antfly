@@ -14466,6 +14466,32 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
+    pub fn publishCompletedDensePostingCheckpointsBestEffort(self: *ProvisionedTableWriteSource) !db_mod.DB.NativePublicationResult {
+        if (!self.local_db_mutex.tryLock()) return .{ .busy = true };
+        var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+        var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
+        defer {
+            for (leases.items) |*lease| lease.deinit(lease_alloc);
+            leases.deinit(lease_alloc);
+        }
+        {
+            defer self.local_db_mutex.unlock();
+            const cache = self.write_cache orelse return .{};
+            lease_alloc = cache.alloc;
+            for (cache.entries.items) |entry| try cache.appendMaintenanceLease(&leases, entry);
+        }
+        var result: db_mod.DB.NativePublicationResult = .{};
+        for (leases.items) |lease| {
+            const publication = try lease.db.publishCompletedDensePostingCheckpoints();
+            result.published += publication.published;
+            result.busy = result.busy or publication.busy;
+            result.deferred = result.deferred or publication.deferred;
+            if (publication.published != 0) if (lease.entry) |entry| self.invalidateReadCache(entry.table_name);
+        }
+        if (result.published != 0) self.replaceRuntimeStatusLeaseSnapshotsFailClosed(lease_alloc, leases.items);
+        return result;
+    }
+
     pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
         if (!self.local_db_mutex.tryLock()) return 0;
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;

@@ -9059,3 +9059,57 @@ ticks as nanoseconds). Original ticks and conversion factors are retained.
 user/system CPU only for identical observed intervals. Twenty-five focused
 Python tests pass with the benchmark's Python environment; the system Python
 3.9 invocation is unsupported by these existing Python 3.11+ harness helpers.
+
+##### Completion-driven checkpoint handoff and suffix lifecycle coverage
+
+The first 1M pair in `pr593-checkpoint-default-vs-baseline-20260907` has
+completed execution and paired recall qualification. The reversed 1M pair
+remains in progress. These binaries predate the completion-lane change below;
+none of these results measures that change or enables suffix compaction.
+
+| First 1M pair | Ready s | C30 QPS | C30 p95 ms | Live recall | Mixed write p95 ms | Mixed query p95 ms | Mixed catch-up s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Preserved no-copy | 387.473 | 790.4 | 83.137 | 99.08% | 98.937 | 52.013 | 39.817 |
+| Current checkpoint default | 354.622 | 661.8 | 94.241 | 99.04% | 461.439 | 100.741 | 105.457 |
+
+Current sampled load/read-only RSS is 5.751 GB versus 5.853 GB; mixed RSS is
+4.442 GB versus 5.899 GB. Allocated disk after restart is 3.827 GB versus
+3.813 GB. These modest load/RSS gains do not excuse the query and mixed-work
+regressions. This is not an overall performance win.
+
+The current 1M trace records completed workers waiting 3.015, 3.198, 5.871,
+7.597 and 9.720 seconds for publication. Delta installation itself sometimes
+takes about a second. A wakeup fix targets the measured *waiting* component;
+it does not eliminate installation cost or explain all query latency.
+
+Implemented a ResourceManager-owned, allocation-free coalesced completion
+signal and a separate joined `std.Io` publication task. The task only attempts
+already-completed HBC workers, uses nonblocking cache/catalog/index admission,
+respects source-capture ownership and HA owner eligibility, and starts no
+new compaction or tree repair. Busy owners retain pending work for a bounded
+retry; idle consumers wait on an event. Optional LSM/vector maintenance has
+its own task, so it cannot occupy this consumer. Shutdown joins the consumer
+and detaches the event's I/O runtime before releasing it; late producers
+retain only a notification epoch. The touched LSM lifecycle also now uses
+`std.Io`, not a directly spawned `std.Thread`.
+
+The catalog lease is also a backup boundary: native snapshot capture closes
+and drains it before selecting/hardlink-pinning generated files, and releases
+it only after those files are pinned. No extra primary apply lock is needed
+for completion-only publication. Per-index capture ownership remains the
+mutation boundary.
+
+Focused Debug validation passes: six storage checks (including completion
+ownership, signal lifecycle, concurrent-WAL rebasing and suffix retirement)
+and three data-runtime checks covering pressure, cadence and HA fencing.
+The new native suffix integration test pins an old reader, compacts two
+deltas while preserving the base mapping, appends a newer WAL transaction
+during staging, then checks tombstones, old/live visibility and restart.
+These checks establish lifecycle coverage, not a suffix performance win.
+
+ReleaseFast completion-lane binary SHA-256:
+`b69423318276dc4c648083a765b70c6004b931d5325f2fb30c99ea52e6375edd`.
+It is reserved for a separate matched comparison, not substituted into the
+running baseline matrix. No new experiment is promoted. True reusable
+physical checkpoint chunks remain unimplemented: folding a delta suffix
+retains the base but still rewrites the selected suffix's serving rows.

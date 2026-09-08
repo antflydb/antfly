@@ -2360,6 +2360,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_lsm_cached_write_dbs", "gauge", "Cached writable table DBs with local LSM state", @intCast(live_write_source.cachedWriteDbCountBestEffort()));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_active", "gauge", "Whether the data server LSM maintenance background worker is currently active", if (self.data_server.lsm_maintenance_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_started_total", "counter", "Data server LSM maintenance background worker wake cycles started", self.data_server.lsm_maintenance_started.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_dense_checkpoint_completion_rounds_total", "counter", "Completed dense checkpoint publication rounds independent of background compaction", self.data_server.dense_publication_rounds.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_completed_total", "counter", "Data server LSM maintenance background worker wake cycles completed with no immediate work remaining", self.data_server.lsm_maintenance_completed.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_failed_total", "counter", "Data server LSM maintenance background worker wake cycles that observed an error", self.data_server.lsm_maintenance_failed.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_lsm_maintenance_background_capacity_denied_total", "counter", "Data server LSM maintenance background wake cycles denied by resource capacity", self.data_server.lsm_maintenance_capacity_denied.load(.monotonic));
@@ -5585,7 +5586,10 @@ pub const DataServer = struct {
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
-    lsm_maintenance_thread: ?std.Thread = null,
+    lsm_maintenance_io: ?std.Io.Threaded = null,
+    lsm_maintenance_future: ?std.Io.Future(void) = null,
+    dense_publication_future: ?std.Io.Future(void) = null,
+    dense_publication_rounds: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_stop: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_wake: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_active: std.atomic.Value(bool) = .init(false),
@@ -7824,9 +7828,27 @@ pub const DataServer = struct {
         }
         if (!self.backgroundMaintenanceDue(now_ns)) return;
         self.lsm_maintenance_wake.store(true, .release);
-        if (self.lsm_maintenance_thread == null) {
+        if (self.lsm_maintenance_future == null) {
             self.lsm_maintenance_stop.store(false, .release);
-            self.lsm_maintenance_thread = try std.Thread.spawn(.{}, lsmMaintenanceWorkerMain, .{self});
+            // Independent, joined tasks: an in-progress vector build or LSM
+            // merge must not occupy the completed-publication consumer.
+            self.lsm_maintenance_io = std.Io.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(2) });
+            errdefer {
+                self.lsm_maintenance_io.?.deinit();
+                self.lsm_maintenance_io = null;
+            }
+            const io = self.lsm_maintenance_io.?.io();
+            const signal = &self.provisioned_storage.resource_manager.dense_checkpoint_ready;
+            try signal.bind(io);
+            errdefer signal.unbind();
+            self.dense_publication_future = try io.concurrent(densePublicationWorkerMain, .{self});
+            errdefer {
+                self.lsm_maintenance_stop.store(true, .release);
+                signal.notify();
+                self.dense_publication_future.?.await(io);
+                self.dense_publication_future = null;
+            }
+            self.lsm_maintenance_future = try io.concurrent(lsmMaintenanceWorkerMain, .{self});
         }
     }
 
@@ -7935,9 +7957,16 @@ pub const DataServer = struct {
     fn stopLsmMaintenanceBackground(self: *DataServer) void {
         self.lsm_maintenance_stop.store(true, .release);
         self.lsm_maintenance_wake.store(true, .release);
-        if (self.lsm_maintenance_thread) |thread| {
-            thread.join();
-            self.lsm_maintenance_thread = null;
+        if (self.lsm_maintenance_future) |*future| {
+            const signal = &self.provisioned_storage.resource_manager.dense_checkpoint_ready;
+            signal.notify();
+            future.await(self.lsm_maintenance_io.?.io());
+            self.lsm_maintenance_future = null;
+            self.dense_publication_future.?.await(self.lsm_maintenance_io.?.io());
+            self.dense_publication_future = null;
+            signal.unbind();
+            self.lsm_maintenance_io.?.deinit();
+            self.lsm_maintenance_io = null;
         }
         self.lsm_maintenance_active.store(false, .release);
     }
@@ -7963,21 +7992,55 @@ pub const DataServer = struct {
         }
     }
 
+    fn densePublicationWorkerMain(self: *DataServer) void {
+        const signal = &self.provisioned_storage.resource_manager.dense_checkpoint_ready;
+        var completion_epoch: u64 = 0;
+        var completion_pending = false;
+        while (!self.lsm_maintenance_stop.load(.acquire)) {
+            const observed = signal.snapshot();
+            if (observed != completion_epoch) {
+                completion_epoch = observed;
+                completion_pending = true;
+            }
+            // A finished builder has already paid staging/admission costs.
+            // Do not put its ownership-checked handoff behind optional LSM
+            // pressure, maintenance backoff, or the one-second vector timer.
+            if (completion_pending and self.haOwnerJobCanRun(.compaction_publish)) {
+                const publication = self.liveRuntimeWriteSource().publishCompletedDensePostingCheckpointsBestEffort() catch |err| blk: {
+                    std.log.warn("dense checkpoint completion publication failed: {}", .{err});
+                    break :blk antfly.db.DB.NativePublicationResult{ .deferred = true };
+                };
+                completion_pending = publication.busy or publication.deferred;
+                _ = self.dense_publication_rounds.fetchAdd(1, .release);
+                if (publication.published != 0) {
+                    self.runtime_status_dirty.store(true, .release);
+                    self.markStoreStatusDirtyImmediate();
+                }
+            }
+            if (self.lsm_maintenance_stop.load(.acquire)) break;
+            const timeout: std.Io.Timeout = if (completion_pending)
+                .{ .duration = .{ .raw = .fromNanoseconds(lsm_maintenance_worker_retry_sleep_ns), .clock = .awake } }
+            else
+                .none;
+            signal.waitSince(self.lsm_maintenance_io.?.io(), completion_epoch, timeout) catch {};
+        }
+    }
+
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
         var consecutive_lock_deferrals: usize = 0;
         while (!self.lsm_maintenance_stop.load(.acquire)) {
             const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
             const now_ns = platform_time.monotonicNs();
             if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) {
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             }
             if (!woke and !self.backgroundMaintenanceDue(now_ns)) {
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             }
             if (!self.haOwnerJobCanRun(.compaction_publish)) {
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             }
 
@@ -8014,14 +8077,14 @@ pub const DataServer = struct {
             if (self.resourcePressureDefersBackgroundMaintenance()) {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             }
 
             var reservation = self.provisioned_storage.resource_manager.reserve(.lsm_compaction_work, lsm_maintenance_background_reservation_bytes) catch {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
-                sleepLsmMaintenanceWorker();
+                self.sleepLsmMaintenanceWorker();
                 continue;
             };
             defer reservation.release();
@@ -8125,22 +8188,9 @@ pub const DataServer = struct {
         self.lsm_maintenance_active.store(false, .release);
     }
 
-    fn sleepLsmMaintenanceWorker() void {
-        var req = std.posix.timespec{
-            .sec = @intCast(@divTrunc(lsm_maintenance_worker_idle_sleep_ns, std.time.ns_per_s)),
-            .nsec = @intCast(@mod(lsm_maintenance_worker_idle_sleep_ns, std.time.ns_per_s)),
-        };
-        while (true) {
-            const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
-            switch (err) {
-                .SUCCESS => return,
-                .INTR => continue,
-                else => {
-                    platform.time.yieldBriefly();
-                    return;
-                },
-            }
-        }
+    fn sleepLsmMaintenanceWorker(self: *DataServer) void {
+        if (self.lsm_maintenance_stop.load(.acquire)) return;
+        self.lsm_maintenance_io.?.io().sleep(.fromNanoseconds(lsm_maintenance_worker_idle_sleep_ns), .awake) catch {};
     }
 
     pub fn baseUri(self: *DataServer, alloc: std.mem.Allocator) ![]u8 {
@@ -32740,7 +32790,7 @@ test "data server propagates standby HA write gate into provisioned write source
     try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
     try server.runLsmMaintenanceForegroundRound();
     try server.requestLsmMaintenanceBackground();
-    try std.testing.expect(server.lsm_maintenance_thread == null);
+    try std.testing.expect(server.lsm_maintenance_future == null);
 }
 
 test "storage.ha data server rejects writes and owner jobs after primary promotion fence" {
@@ -34497,6 +34547,26 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
     try std.testing.expect(server.resourcePressureDefersMaintenanceWake(100));
     server.vector_block_maintenance_next_eligible_ns.store(100, .release);
     try std.testing.expect(!server.resourcePressureDefersMaintenanceWake(100));
+
+    // Completed publications have a joined consumer independent of the
+    // pressure-deferred LSM task. An empty round must not start a build.
+    server.lsm_maintenance_next_eligible_ns.store(0, .release);
+    try server.requestLsmMaintenanceBackground();
+    try std.testing.expect(server.lsm_maintenance_future != null);
+    try std.testing.expect(server.dense_publication_future != null);
+    server.provisioned_storage.resource_manager.dense_checkpoint_ready.notify();
+    const deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (server.dense_publication_rounds.load(.acquire) == 0) {
+        if (platform_time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    server.stopLsmMaintenanceBackground();
+    try std.testing.expect(server.lsm_maintenance_future == null);
+    try std.testing.expect(server.dense_publication_future == null);
+    try std.testing.expect(server.lsm_maintenance_io == null);
+    // Producers can finish after this consumer shuts down, without retaining
+    // a dead I/O runtime or a callback into the DataServer.
+    server.provisioned_storage.resource_manager.dense_checkpoint_ready.notify();
 }
 
 test "data runtime background maintenance is due for dense posting cadence without lsm debt" {

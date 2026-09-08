@@ -757,6 +757,7 @@ test "dense aggregate resource manager bounds callers and helpers together" {
 }
 
 pub const ResourceManager = struct {
+    dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
     // Slots are never compacted while the manager is live: an invocation can
@@ -1453,6 +1454,7 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();
         if (self.dense_projection_pages.load(.acquire)) |cache| cache.deinit();
