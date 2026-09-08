@@ -237,6 +237,7 @@ fn runGraphVariant(
         ws.lazy_weights.deinit(allocator);
     }
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     var loop = training_loop_mod.TrainingLoop.init(allocator, .{

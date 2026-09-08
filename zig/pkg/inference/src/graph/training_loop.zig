@@ -703,6 +703,7 @@ test "TrainingLoop loss decreases" {
     // Set up native backend.
     var bws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &bws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     // Initialize training loop.
@@ -818,6 +819,7 @@ test "training loop exposes checkpoint summary and timing metrics" {
 
     var bws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &bws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     var loop = TrainingLoop.init(allocator, .{

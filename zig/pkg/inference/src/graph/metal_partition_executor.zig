@@ -8360,7 +8360,9 @@ fn valueForOrMaterializeParameter(
     if (index >= values.len or index >= value_device.len) return null;
     const node = graph.node(node_id);
     if (node.op != .parameter) return null;
-    const materialized = try cb.getWeight(graph.parameterName(node));
+    // Value slots own independent handles: alias-deduplicating graph cleanup
+    // must not collapse separate references to the same named weight.
+    const materialized = try cb.acquireWeight(graph.parameterName(node));
     values[index] = materialized;
     value_device[index] = device_id;
     return materialized;
@@ -16308,9 +16310,7 @@ fn materializePartitionParameters(
         if (rt_map.contains(node_id)) continue;
         const node = graph.node(node_id);
         if (node.op != .parameter) continue;
-        const materialized = try cb.getWeight(graph.parameterName(node));
-        values[i] = materialized;
-        value_device[i] = device_id;
+        const materialized = (try valueForOrMaterializeParameter(graph, cb, values, value_device, device_id, node_id)) orelse return error.MissingValue;
         if (stats) |s| {
             s.descriptor_materializations += 1;
             if (isMetalResidentOrQuantizedDescriptor(cb, materialized)) {
@@ -16321,6 +16321,100 @@ fn materializePartitionParameters(
                 s.host_materialized_parameter_outputs += 1;
                 if (traceMetalHostOutputsEnabled()) traceMetalHostOutput(graph, node_id, "parameter_materialization_host_output");
             }
+        }
+    }
+}
+
+fn testCompiledParameterWeightOwnership(allocator: std.mem.Allocator, lazy: bool, on_demand: bool) !void {
+    const native = @import("../ops/native_compute.zig");
+    const memory = @import("../runtime/tier/memory.zig");
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const first = try builder.parameter("shared", Shape.init(.f32, &.{2}));
+    const second = try builder.parameter("shared", Shape.init(.f32, &.{2}));
+    const sum = try builder.add(first, second);
+    try graph.markOutput(sum);
+
+    var data = [_]f32{ 1, -2 };
+    var shape = [_]i64{2};
+    const weight: weight_source_mod.LoadedWeight = .{ .tensor = .{
+        .data = std.mem.sliceAsBytes(&data),
+        .shape = &shape,
+        .dtype = .f32,
+        .name = "shared",
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+    } };
+    var store = native.WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.resident_weights.deinit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    if (lazy) {
+        try store.lazy_weights.put(allocator, "shared", .{
+            .tensor_ref = .{ .name = "shared" },
+            .loaded = weight,
+            .loaded_bytes = std.mem.sliceAsBytes(&data).len,
+        });
+    } else {
+        try store.resident_weights.put(allocator, "shared", weight);
+    }
+    var budget = memory.RunBudget.init(.{ .host_limit_bytes = 64 });
+    var compute = native.NativeCompute.init(allocator, &store, &budget);
+    defer native.deinitPrefetchQueue(&store);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var borrowed: ?CT = try cb.getWeight("shared");
+    defer if (borrowed) |ct| cb.free(ct);
+    var values = [_]?CT{ null, null, null };
+    defer for (values) |value| {
+        if (value) |ct| cb.free(ct);
+    };
+    var devices = [_]DeviceId{ 0, 0, 0 };
+    const reachable = [_]bool{ true, true, true };
+    const last_use = [_]u32{ sum, sum, std.math.maxInt(u32) };
+    // Re-visiting a materialized node must not acquire another reference.
+    for (0..2) |_| {
+        if (on_demand) {
+            _ = try valueForOrMaterializeParameter(&graph, &cb, &values, &devices, 0, first);
+            _ = try valueForOrMaterializeParameter(&graph, &cb, &values, &devices, 0, second);
+        } else {
+            try materializePartitionParameters(&graph, &cb, &values, &devices, &.{ first, second, sum }, &reachable, 0, .empty, null);
+        }
+    }
+    try std.testing.expect(values[first] != values[second]);
+    try std.testing.expect(values[first] != borrowed and values[second] != borrowed);
+    if (lazy) try std.testing.expectEqual(@as(usize, 3), store.lazy_weights.get("shared").?.pin_count);
+
+    // Both parameters die at the same consumer. The compiled executor's
+    // pointer-deduplicating cleanup must release both acquisitions.
+    const freed = try freeExpiredInputs(allocator, &graph, &cb, &values, &devices, sum, 0, &last_use, null, .empty, .empty, .{});
+    try std.testing.expectEqual(@as(usize, 2), freed.count);
+    try std.testing.expect(values[first] == null and values[second] == null);
+    const actual = try cb.toFloat32(borrowed.?, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &data, actual);
+    try std.testing.expectEqual(@as(usize, 8), budget.host_weight_bytes);
+    if (lazy) try std.testing.expectEqual(@as(usize, 1), store.lazy_weights.get("shared").?.pin_count);
+    cb.free(borrowed.?);
+    borrowed = null;
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.weight_handles.count());
+    if (lazy) try std.testing.expectEqual(@as(usize, 0), store.lazy_weights.get("shared").?.pin_count);
+}
+
+test "compiled parameter acquisitions release reservations and lazy pins independently" {
+    inline for (.{ false, true }) |lazy| {
+        inline for (.{ false, true }) |on_demand| {
+            try testCompiledParameterWeightOwnership(std.testing.allocator, lazy, on_demand);
+        }
+    }
+}
+
+test "compiled parameter acquisitions unwind allocation failures" {
+    inline for (.{ false, true }) |lazy| {
+        inline for (.{ false, true }) |on_demand| {
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompiledParameterWeightOwnership, .{ lazy, on_demand });
         }
     }
 }
@@ -16833,6 +16927,7 @@ test "metal partition executor consumes buffer plan and evaluates partition" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -16902,6 +16997,7 @@ test "metal partition executor command path handles add softmax and reshape" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -16981,6 +17077,7 @@ test "metal partition executor command path handles linear and norms" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -17203,6 +17300,7 @@ test "metal partition executor eager multi op chain matches host" {
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
     var mesh = try device_mesh_mod.DeviceMesh.init(allocator, &.{
         .{ .id = 0, .backend = &native_cb, .kind = .native },
@@ -17322,6 +17420,7 @@ test "metal partition executor fuses sibling no-bias linears into one pair comma
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -19386,6 +19485,7 @@ test "metal partition executor owned runtime region plan reuses cached plan" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
     var exec = MetalPartitionExecutor.initBorrowed(allocator, &g, &cb);
     exec.owned = true;
@@ -19990,6 +20090,7 @@ test "metal partition executor resident primitive chain stays device backed" {
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
     var mesh = try device_mesh_mod.DeviceMesh.init(allocator, &.{
         .{ .id = 0, .backend = &native_cb, .kind = .native },
@@ -20088,6 +20189,7 @@ test "metal partition executor resident concat prim stays device backed" {
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
     var mesh = try device_mesh_mod.DeviceMesh.init(allocator, &.{
         .{ .id = 0, .backend = &native_cb, .kind = .native },
@@ -20550,6 +20652,7 @@ test "metal partition executor resident last-dim reductions stay device backed" 
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
     var mesh = try device_mesh_mod.DeviceMesh.init(allocator, &.{
         .{ .id = 0, .backend = &native_cb, .kind = .native },
@@ -22146,6 +22249,7 @@ test "metal partition executor owned lifecycle deinitializes cleanly" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const exec = try MetalPartitionExecutor.create(allocator, &g, &cb);

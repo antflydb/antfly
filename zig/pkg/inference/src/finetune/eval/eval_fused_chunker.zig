@@ -366,6 +366,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var native_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer native_backend.deinit();
     const cb: ComputeBackend = native_backend.computeBackend();
 
     print("backend: native\n", .{});
