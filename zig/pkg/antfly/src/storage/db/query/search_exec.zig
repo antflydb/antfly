@@ -1820,8 +1820,20 @@ fn hasStoredPatternFilters(req: types.SearchRequest) bool {
         req.exclusion_query_json.len > 0;
 }
 
-fn requestAfterNativeFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
+fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
     var next = req;
+    // Native collectors have already enforced these predicates. Keep explicit
+    // identity constraints and residual predicates for hit hydration, but do not
+    // request ordinal lookups solely for predicates that no longer need them.
+    next.filter_text = null;
+    next.exclusion_text = null;
+    if (filter_query_json_resolved) next.filter_query_json = "";
+    if (exclusion_query_json_resolved) next.exclusion_query_json = "";
+    return next;
+}
+
+fn requestAfterNativeFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
+    var next = requestWithoutResolvedStoredFilters(req, filter_query_json_resolved, exclusion_query_json_resolved);
     // Candidate collectors enforce these constraints against their pinned native
     // snapshot. Only residual predicates belong in post-processing: applying an
     // admitted document filter again to a page discards the upstream total and
@@ -1834,10 +1846,6 @@ fn requestAfterNativeFilters(req: types.SearchRequest, filter_query_json_resolve
     next.resolved_doc_filter_owned = false;
     next.resolved_doc_filter_wire_context = null;
     next.resolved_text_doc_filter = null;
-    next.filter_text = null;
-    next.exclusion_text = null;
-    if (filter_query_json_resolved) next.filter_query_json = "";
-    if (exclusion_query_json_resolved) next.exclusion_query_json = "";
     return next;
 }
 
@@ -13182,6 +13190,11 @@ fn searchDenseInternal(
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
+    const hydration_req = requestWithoutResolvedStoredFilters(
+        req,
+        native_constraints.filter_query_json_resolved,
+        native_constraints.exclusion_query_json_resolved,
+    );
     const postprocess_req = requestAfterNativeFilters(
         req,
         native_constraints.filter_query_json_resolved,
@@ -13558,9 +13571,9 @@ fn searchDenseInternal(
             source_artifact_ref_owned = false;
         }
         const ordinal_lookup_start = platform_time.monotonicNs();
-        // Hit identity is materialized for the admitted request before its
-        // already-enforced filters are removed from the post-processing copy.
-        try lookupDenseHitDocOrdinals(alloc, req, executor, hit_vector_ids.items, hits.items);
+        // Hydration retains explicit identity requirements and residual
+        // predicates; post-processing also consumes the native ID constraints.
+        try lookupDenseHitDocOrdinals(alloc, hydration_req, executor, hit_vector_ids.items, hits.items);
         profile.doc_ordinal_lookup_ns += platform_time.monotonicNs() - ordinal_lookup_start;
 
         const postprocess_start = platform_time.monotonicNs();
