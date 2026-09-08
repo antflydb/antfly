@@ -1197,6 +1197,7 @@ const LayoutTextRun = struct {
     x: f64,
     y: f64,
     font_size: f64,
+    horizontal_scale: f64,
     a: f64 = 1,
     b: f64 = 0,
     c: f64 = 0,
@@ -16546,6 +16547,7 @@ fn appendTextRunDecodedString(
                 .x = position[0],
                 .y = position[1],
                 .font_size = state.font_size,
+                .horizontal_scale = state.horizontal_scale,
                 .a = basis_x[0],
                 .b = basis_x[1],
                 .c = basis_y[0],
@@ -16975,7 +16977,8 @@ fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
                 const axis = textRunAxisLength(prior);
                 const font_scale = @abs(prior.font_size) * axis;
                 const gap = textRunForwardGap(prior, run.*);
-                const word_gap = @max(0.5, font_scale * 0.12);
+                // Tz scales advances and TJ gaps, including sub-point spaces.
+                const word_gap = @max(0.5, font_scale * 0.12) * @abs(prior.horizontal_scale);
                 const caption_boundary =
                     prior.paint_order != run.paint_order and
                     endsWithColon(prior.text) and
@@ -20612,6 +20615,38 @@ test "reader preserves words split across text-showing operators" {
     const text = try reconstructTextFromRunsAlloc(alloc, &runs);
     defer alloc.free(text);
     try std.testing.expectEqualStrings("Hello world\n", text);
+}
+
+test "reader preserves scaled word gaps without splitting adjacent operators" {
+    const alloc = std.testing.allocator;
+    // 10% also puts a full Helvetica space below the old 0.5-point floor.
+    for ([_]u32{ 100, 25, 10 }) |horizontal_scale| {
+        const content = try std.fmt.allocPrint(alloc,
+            \\BT /F1 12 Tf {d} Tz 1 0 0 1 10 50 Tm
+            \\(Hel) Tj (lo) Tj [-278] TJ (World) Tj ET
+            \\
+        , .{horizontal_scale});
+        defer alloc.free(content);
+        const stream = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+        defer alloc.free(stream);
+        const objects = [_][]const u8{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+            stream,
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>\nendobj\n",
+        };
+        const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+        defer alloc.free(sample);
+        var reader = try Reader.init(alloc, sample);
+        defer reader.deinit();
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(alloc);
+        try std.testing.expectEqualStrings("Hello World\n", analysis.text);
+        const text = try reader.extractPageTextAlloc(1);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("Hello World\n", text);
+    }
 }
 
 test "reader clamps reconstructed spans after trimming line whitespace" {
