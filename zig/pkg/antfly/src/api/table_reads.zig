@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -6940,7 +6941,9 @@ test "distributed unit group hydration rejects a cross-revision unit payload" {
 
 test "hosted distributed grouped hierarchy expands the globally selected shard page" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-distributed-grouped-hierarchy";
+    var path_tmp = try TestDirectory.init("antfly-api-hosted-distributed-grouped-hierarchy");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -20691,7 +20694,9 @@ fn civilFromDays(days_since_epoch: i64) CivilDate {
 
 test "bound table read source uses feature db reads and returns version" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-reads";
+    var path_tmp = try TestDirectory.init("antfly-api-table-reads");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20720,7 +20725,9 @@ test "bound table read source uses feature db reads and returns version" {
 
 test "bound table read source scans keys as ndjson" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-scan";
+    var path_tmp = try TestDirectory.init("antfly-api-table-scan");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20758,7 +20765,9 @@ test "bound table read source scans keys as ndjson" {
 
 test "bound table read source formats query responses" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-query";
+    var path_tmp = try TestDirectory.init("antfly-api-table-query");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20789,7 +20798,9 @@ test "bound table read source formats query responses" {
 
 test "bound table read source preflights query requests" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-preflight";
+    var path_tmp = try TestDirectory.init("antfly-api-table-preflight");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20899,7 +20910,9 @@ test "merge runtime preflight summary preserves structured filter exact counts o
 
 test "bound table read source reranks hits after materialization" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-rerank";
+    var path_tmp = try TestDirectory.init("antfly-api-table-rerank");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20989,7 +21002,9 @@ test "bound table read source reranks hits after materialization" {
 
 test "provisioned table read source routes lookup and scan across ranges" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-reads";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-reads");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -21221,7 +21236,9 @@ test "fanout planner uses io cap and request shape" {
 
 test "provisioned table read source merges query results across ranges" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -21328,7 +21345,9 @@ test "provisioned table read source merges query results across ranges" {
 
 test "provisioned table read source serves dense queries for explicit external embeddings" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-dense");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -21439,7 +21458,9 @@ test "provisioned table read source serves dense queries for explicit external e
 
 test "provisioned local query execution returns stamped identity request" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-stamped-identity";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-stamped-identity");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -21896,7 +21917,9 @@ test "provisioned reads reject a group removed from the table topology" {
 
 test "provisioned local query reuses resident generation without readonly open" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-resident-db";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-resident-db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22372,7 +22395,9 @@ test "provisioned table read source managed runtime config carries inference url
 
 test "provisioned table read source serves public dense query requests with read_index" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense-public";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-dense-public");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22452,7 +22477,9 @@ test "provisioned table read source serves public dense query requests with read
 
 test "provisioned table read source serves profiled public dense query requests with read_index" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense-public-profiled";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-dense-public-profiled");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22536,7 +22563,9 @@ test "provisioned table read source serves profiled public dense query requests 
 
 test "provisioned table read source serves public dense query requests without explicit indexes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense-public-implicit-index";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-dense-public-implicit-index");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22616,7 +22645,9 @@ test "provisioned table read source serves public dense query requests without e
 
 test "provisioned table read source serves benchmark-shaped packed dense query with full-text present" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense-benchmark-shaped";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-dense-benchmark-shaped");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22703,7 +22734,9 @@ test "provisioned table read source serves benchmark-shaped packed dense query w
 
 test "provisioned table read source preflights every local group" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-preflight-multigroup";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-preflight-multigroup");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22786,7 +22819,9 @@ test "provisioned table read source preflights every local group" {
 
 test "provisioned local runtime statuses reconcile empty managed embeddings indexes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-runtime-status-managed";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-runtime-status-managed");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22876,7 +22911,9 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
 
 test "provisioned query db installs asset producer from indexes_json and replays assets" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-asset-enrichment";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-asset-enrichment");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -23015,7 +23052,9 @@ test "provisioned query db installs asset producer from indexes_json and replays
 
 test "provisioned table read source runtime status stays cache-only without shared snapshot" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-runtime-cache";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-runtime-cache");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -23159,7 +23198,9 @@ test "provisioned table read source runtime status falls back to shared snapshot
 
 test "provisioned table read source runtime status prefers shared snapshot cache" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-runtime-prefers-snapshot";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-runtime-prefers-snapshot");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -25816,7 +25857,9 @@ test "explicit text stats requests carry resolved doc filters and apply exact pr
 
 test "explicit text stats requests reject stale identity generation" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-text-stats-stale-identity-generation";
+    var path_tmp = try TestDirectory.init("antfly-api-text-stats-stale-identity-generation");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26001,7 +26044,9 @@ test "identity-only distributed unit groups consume envelopes without routed rea
 
 test "aggregation context rejects non-current identity generation" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-aggregation-context-identity-generation";
+    var path_tmp = try TestDirectory.init("antfly-api-aggregation-context-identity-generation");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26125,8 +26170,9 @@ test "aggregation full-result rerun can reuse snapped result identity generation
 
 test "provisioned distributed aggregations collect path terms nested cardinality" {
     const alloc = std.testing.allocator;
-    const path = try std.fmt.allocPrint(alloc, "/tmp/antfly-api-provisioned-algebraic-path-terms-cardinality-{d}", .{platform_time.monotonicNs()});
-    defer alloc.free(path);
+    var path_tmp = try TestDirectory.init("algebraic-path-terms-cardinality");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26442,7 +26488,9 @@ test "algebraic partial request accepts expression cache proofs without named ma
 
 test "algebraic partial request fails closed when lifecycle is stale" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-algebraic-partials-stale-lifecycle";
+    var path_tmp = try TestDirectory.init("antfly-api-algebraic-partials-stale-lifecycle");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26493,7 +26541,9 @@ test "algebraic partial request fails closed when lifecycle is stale" {
 
 test "algebraic partial request accepts current identity generation and rejects stale" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-algebraic-partials-stale-identity-generation";
+    var path_tmp = try TestDirectory.init("antfly-api-algebraic-partials-stale-identity-generation");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -26548,7 +26598,9 @@ test "algebraic partial request accepts current identity generation and rejects 
 
 test "algebraic partial request uses HLL at the current identity generation" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-algebraic-partials-current-generation-hll";
+    var path_tmp = try TestDirectory.init("antfly-api-algebraic-partials-current-generation-hll");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -27719,7 +27771,9 @@ test "distributed significant terms candidates use configured analyzers and boun
 
 test "hosted textStatsGroupLocal serves only the local group" {
     const test_alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-local-text-stats";
+    var path_tmp = try TestDirectory.init("antfly-api-hosted-local-text-stats");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -27862,7 +27916,9 @@ test "hosted textStatsGroupLocal serves only the local group" {
 
 test "hosted table read source preflights query locally" {
     const test_alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-local-preflight";
+    var path_tmp = try TestDirectory.init("antfly-api-hosted-local-preflight");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -27992,7 +28048,9 @@ test "hosted table read source preflights query locally" {
 
 test "hosted table read source preflights every local group" {
     const test_alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-local-preflight-multigroup";
+    var path_tmp = try TestDirectory.init("antfly-api-hosted-local-preflight-multigroup");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -28132,7 +28190,9 @@ test "hosted table read source preflights every local group" {
 
 test "hosted table read source preflights mixed local and remote groups" {
     const test_alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-preflight-mixed";
+    var path_tmp = try TestDirectory.init("antfly-api-hosted-preflight-mixed");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -28670,7 +28730,9 @@ test "conjunctive graph match requires coordination for a single source group" {
 
 test "hosted cross-range graph query expands explicit local start keys" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-explicit";
+    var path_tmp = try TestDirectory.init("antfly-api-hosted-cross-range-graph-explicit");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -28912,7 +28974,9 @@ test "hosted cross-range graph query expands explicit local start keys" {
 
 test "provisioned read cache keys entries by lsm root generation" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-generation";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-generation");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -28983,7 +29047,9 @@ test "provisioned read cache keys entries by lsm root generation" {
 
 test "provisioned read cache keys entries by identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-identity-namespace";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-identity-namespace");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29064,7 +29130,9 @@ test "provisioned read cache keys entries by identity namespace" {
 
 test "provisioned read cache invalidates repeated ownership moves with pinned leases" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-ownership-moves";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-ownership-moves");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29162,7 +29230,9 @@ test "provisioned read cache invalidates repeated ownership moves with pinned le
 
 test "graph edge local read rejects stale identity generation" {
     const alloc = std.testing.allocator;
-    const root = "/tmp/antfly-api-graph-edge-stale-identity-generation";
+    var root_tmp = try TestDirectory.init("antfly-api-graph-edge-stale-identity-generation");
+    defer root_tmp.cleanup();
+    const root = root_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29247,7 +29317,9 @@ test "graph edge local read rejects stale identity generation" {
 
 test "graph edge local read rejects stale identity namespace" {
     const alloc = std.testing.allocator;
-    const root = "/tmp/antfly-api-graph-edge-stale-identity-namespace";
+    var root_tmp = try TestDirectory.init("antfly-api-graph-edge-stale-identity-namespace");
+    defer root_tmp.cleanup();
+    const root = root_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29349,7 +29421,9 @@ test "graph edge local read rejects stale identity namespace" {
 
 test "provisioned lookup db opens with identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-lookup-identity-namespace";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-lookup-identity-namespace");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29369,7 +29443,9 @@ test "provisioned lookup db opens with identity namespace" {
 
 test "provisioned warm status db opens with identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-warm-status-identity-namespace";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-warm-status-identity-namespace");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29389,8 +29465,12 @@ test "provisioned warm status db opens with identity namespace" {
 
 test "provisioned direct read db opens reject stale identity namespace" {
     const alloc = std.testing.allocator;
-    const lookup_path = "/tmp/antfly-api-provisioned-lookup-stale-identity-namespace";
-    const status_path = "/tmp/antfly-api-provisioned-status-stale-identity-namespace";
+    var lookup_path_tmp = try TestDirectory.init("antfly-api-provisioned-lookup-stale-identity-namespace");
+    defer lookup_path_tmp.cleanup();
+    const lookup_path = lookup_path_tmp.path();
+    var status_path_tmp = try TestDirectory.init("antfly-api-provisioned-status-stale-identity-namespace");
+    defer status_path_tmp.cleanup();
+    const status_path = status_path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29445,7 +29525,9 @@ test "provisioned direct read db opens reject stale identity namespace" {
 
 test "provisioned query runtime db opens with catalog identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-runtime-identity-namespace";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-runtime-identity-namespace");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29509,7 +29591,9 @@ test "provisioned query runtime db opens with catalog identity namespace" {
 
 test "provisioned query runtime db rejects stale identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-runtime-stale-identity-namespace";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-runtime-stale-identity-namespace");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29586,7 +29670,9 @@ test "provisioned query runtime db rejects stale identity namespace" {
 
 test "provisioned primary lookup lease fails on identity namespace mismatch" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-primary-lookup-identity-mismatch";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-primary-lookup-identity-mismatch");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29716,7 +29802,9 @@ test "provisioned read cache clear preserves in-flight pending opens and bumps e
 
 test "provisioned read cache invalidate removes entries without dropping pending opens" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-invalidate";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-invalidate");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29791,7 +29879,9 @@ test "provisioned read cache invalidate removes entries without dropping pending
 
 test "provisioned read cache retires invalidated entries until the last lease is released" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-no-retire";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-no-retire");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29872,7 +29962,9 @@ test "provisioned read cache retires invalidated entries until the last lease is
 
 test "provisioned read cache exclusive access drains active read leases" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-exclusive-drain";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-exclusive-drain");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -29980,7 +30072,9 @@ test "provisioned read cache exclusive access drains active read leases" {
 
 test "provisioned read cache group exclusive drains only the published group" {
     const alloc = std.testing.allocator;
-    const root = "/tmp/antfly-api-provisioned-read-cache-group-exclusive";
+    var root_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-group-exclusive");
+    defer root_tmp.cleanup();
+    const root = root_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -30078,7 +30172,9 @@ test "provisioned read cache group exclusive drains only the published group" {
 test "provisioned read cache retirement is allocation-free after entry installation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
-    const path = "/tmp/antfly-api-provisioned-read-cache-retire-oom";
+    var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-retire-oom");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
