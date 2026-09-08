@@ -52,6 +52,26 @@ class QualificationRunnerTest(unittest.TestCase):
 
         def execute(command, **kwargs):
             calls.append((command, kwargs["env"].copy()))
+            arm = Path(command[1])
+            arm.mkdir(parents=True, exist_ok=True)
+            (arm / "qualification-summary.json").write_text(
+                json.dumps(
+                    {
+                        "runs": [
+                            {"label": "fixture-online-live", "recall": 0.99},
+                            {"label": "fixture-reopened-warm", "recall": 0.99},
+                        ]
+                    }
+                )
+            )
+            (arm / "public-query-profile.json").write_text(
+                json.dumps(
+                    {
+                        "count": profile_count if profile_count is not None else 1000,
+                        "recall": 0.99,
+                    }
+                )
+            )
             if (
                 kwargs["env"].get("ANTFLY_EXPERIMENT_COMPACT_SUBGROUP_ROUTING") == "1"
                 or kwargs["env"].get("ANTFLY_EXPERIMENT_PROJECTION_BORROW") == "1"
@@ -74,12 +94,16 @@ class QualificationRunnerTest(unittest.TestCase):
                 (arm / "public-query-profile.json").write_text(
                     json.dumps(
                         {
+                            "count": (
+                                profile_count if profile_count is not None else 1000
+                            ),
+                            "recall": 0.99,
                             "profile_values": {
                                 "hbc_subgroup_leaves_scored": {"mean": 12},
                                 "hbc_subgroup_vectors_skipped": {"mean": 120},
                                 "hbc_subgroup_compact_groups_scored": {"mean": 12},
                                 "hbc_rerank_vector_projection_borrows": {"mean": 12},
-                            }
+                            },
                         }
                     )
                 )

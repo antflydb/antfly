@@ -8988,3 +8988,74 @@ reversed ordering, 50K-before-1M gates, read-only/mixed work and restart. Both
 binaries and measurement dependencies are pinned. `--sample-process` adds
 Darwin attribution without suspending the server. No archived baseline is
 rewritten, and no additional product flag is promoted by these changes.
+
+##### Fresh checkpoint-default versus preserved no-copy baseline: 50K gate
+
+The accumulated experiment stack was checkpointed normally on this worktree as
+`d41ecd5a8`; no new worktree or checkpoint branch was created. The fresh matrix
+`pr593-checkpoint-default-vs-baseline-20260907` compares current ReleaseFast
+SHA-256 `bf7598858b6d8e94b0405642eac19fbfe2c1325d4c5d9a661130afdbf7ccc594`
+against preserved no-copy SHA-256
+`205803589eb952d8a097f03173aba1a3848601dc543c402123fa2a1ba5c75f09`.
+Both use no-copy, batch 100, four load workers, cosine/top-100, no full text,
+unchanged query effort, and **no additional experimental flags**. In particular,
+this is not a suffix-compaction treatment. Query durations are 30 seconds at
+C1/10/20/30, followed by a 30-second mixed workload offering 1,000 rows/s,
+restart checks and a fixed 1,000-query profile. This moderate offered write rate
+is not directly comparable to historical saturated mixed-write throughput.
+
+| Pair / arm | Ready s | C30 QPS | C30 p95 ms | Live recall | Mixed write p95 ms | Mixed query p95 ms | Catch-up s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 baseline | 17.365 | 1,592.2 | 50.419 | 98.49% | 164.3 | 58.8 | 1.153 |
+| 1 current | 14.584 | 1,639.8 | 49.371 | 98.25% | 338.5 | 74.5 | 4.066 |
+| 2 current | 25.713 | 1,628.9 | 52.530 | 98.35% | 311.3 | 77.3 | 2.516 |
+| 2 baseline | 27.937 | 1,750.1 | 49.745 | 98.47% | 348.5 | 77.6 | 2.453 |
+
+Both reversed pairs pass execution, live/reopened/fixed-profile recall parity
+(maximum observed loss 0.24 percentage points) and native readiness. Current
+loads faster in both pairs but does not consistently improve read-only QPS or
+p95. The first mixed result regresses; the reversed pair is close. Do not
+promote a new flag or claim a universal speedup from these measurements.
+
+| Pair / arm | Load + read-only sampled RSS GB | Mixed sampled RSS GB | Live physical-footprint ledger peak GB | Allocated disk after restart GB |
+| --- | ---: | ---: | ---: | ---: |
+| 1 baseline | 1.587 | 1.916 | 0.479 | 0.419 |
+| 1 current | 1.521 | 1.836 | 0.675 | 0.399 |
+| 2 current | 1.511 | 1.997 | 0.555 | 0.399 |
+| 2 baseline | 1.729 | 2.023 | 0.521 | 0.397 |
+
+Lower RSS does not establish lower physical footprint: current's live ledger
+peak is higher in both pairs. Raw arms and `50k-comparison.json` preserve the
+separate measurements, rather than replacing either archived baseline. No
+compiler or other benchmark owned by this investigation overlaps this matrix;
+another actor's vector-progress experiment is present on the shared host.
+That observation alone does not attribute the timing differences to contention.
+
+The current 50K initial full checkpoint builds take 100.8/84.7 ms; completed
+worker waits are 76.0/339.8 ms. These measured stages do not account for the
+4.032/8.042-second optimize intervals. During mixed work, delta builds take
+277.7/290.6 ms and wait another 802.9/1,418.5 ms before handoff. The publication
+owner currently checks completion during source/maintenance passes; the worker
+does not directly wake that owner. This is a concrete scheduling interval to
+investigate, not evidence that the final file encoder explains the old 799s run.
+The pinned VectorDBBench client polls readiness every two seconds, so its
+optimize duration is also a sampled upper bound, not an exact internal
+completion timestamp. Keep that polling contract identical across arms; do not
+attribute the whole interval to checkpoint work or silently shorten the poll
+to manufacture a load-time improvement.
+
+Detailed readiness logs also show matching vector coverage/count with a missing
+initial HBC base. Code tracing confirms `ensureVectorBlockBaseAtAppliedSequence`
+returns early for the already-certified vector generation before native merge
+or primary rescan. The caller then schedules HBC acceleration. Therefore the
+generic `boundary_mismatch` observation is not proof of repeated vector builds;
+simply suppressing maintenance on this condition could starve HBC publication.
+
+At this checkpoint the four 50K arms are complete and the 1M matrix is running;
+no 1M result is claimed yet. Measurement review corrected Darwin rusage CPU
+units using the Mach timebase (125/3 on this ARM64 host, rather than treating
+ticks as nanoseconds). Original ticks and conversion factors are retained.
+`summarize_process_phases.py` excludes restart/phase/clock crossings and combines
+user/system CPU only for identical observed intervals. Twenty-five focused
+Python tests pass with the benchmark's Python environment; the system Python
+3.9 invocation is unsupported by these existing Python 3.11+ harness helpers.

@@ -130,6 +130,42 @@ def validate_subgroup_treatment(arm, environment, filename="public-query-profile
     return observed
 
 
+def validate_pair_recall(control, candidate, profile_count):
+    """Completion is not a recall gate. Require parity before scaling a pair."""
+    observed = {}
+    for label in ("online-live", "reopened-warm"):
+        values = []
+        for arm in (control, candidate):
+            summary = json.loads((arm / "qualification-summary.json").read_text())
+            runs = [run for run in summary["runs"] if run["label"].endswith(label)]
+            if len(runs) != 1:
+                raise RuntimeError(f"missing unique {label} recall: {arm}")
+            values.append(runs[0]["recall"])
+        observed[label] = values
+    if profile_count:
+        values = []
+        for arm in (control, candidate):
+            profile = json.loads((arm / "public-query-profile.json").read_text())
+            if profile.get("count") != profile_count:
+                raise RuntimeError(f"incomplete fixed recall profile: {arm}")
+            values.append(profile["recall"])
+        observed["fixed-profile"] = values
+    for label, (before, after) in observed.items():
+        if not all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and 0 < value <= 1
+            for value in (before, after)
+        ):
+            raise RuntimeError(f"invalid paired recall for {label}")
+        if after + 0.010000000001 < before:
+            raise RuntimeError(
+                f"paired recall loss exceeds one percentage point for {label}: {before} -> {after}"
+            )
+    return observed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
@@ -401,6 +437,28 @@ def main():
                 if result.returncode:
                     raise RuntimeError(f"{arm.name} failed; later arms are gated")
                 print(f"Passed {arm.name}", flush=True)
+            control_mode, candidate_mode = (
+                ("control", "candidate")
+                if args.refinement or args.control_binary
+                else ("local_on", "local_off")
+            )
+            pair_receipt = next(
+                r
+                for r in reversed(receipts)
+                if r["case"] == case and r["pair"] == pair + 1
+            )
+            try:
+                recall = validate_pair_recall(
+                    root / f"{case}-{pair + 1}-{control_mode}",
+                    root / f"{case}-{pair + 1}-{candidate_mode}",
+                    args.profile_count,
+                )
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                pair_receipt["invalid_reason"] = f"paired recall gate failed: {error}"
+                save()
+                raise RuntimeError(pair_receipt["invalid_reason"]) from error
+            pair_receipt["paired_recall"] = recall
+            save()
 
 
 if __name__ == "__main__":

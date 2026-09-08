@@ -9,7 +9,9 @@ ABI: macOS SDK sys/resource.h rusage_info_v4, libproc.h proc_pid_rusage.
 import argparse
 import ctypes
 import errno
+import functools
 import json
+import math
 import signal
 import sys
 import time
@@ -59,6 +61,32 @@ class RusageInfoV4(ctypes.Structure):
     ]
 
 
+class MachTimebaseInfo(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+@functools.cache
+def mach_timebase():
+    info = MachTimebaseInfo()
+    libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    libsystem.mach_timebase_info.argtypes = [ctypes.POINTER(MachTimebaseInfo)]
+    libsystem.mach_timebase_info.restype = ctypes.c_int
+    if (
+        libsystem.mach_timebase_info(ctypes.byref(info)) != 0
+        or not info.numer
+        or not info.denom
+    ):
+        raise RuntimeError("cannot determine Mach CPU time units")
+    return info.numer, info.denom
+
+
+def cpu_nanoseconds(ticks, timebase):
+    numer, denom = timebase
+    if ticks < 0 or numer <= 0 or denom <= 0:
+        raise ValueError("invalid Mach timebase or counter")
+    return ticks * numer // denom
+
+
 def sample(libproc, pid):
     info = RusageInfoV4()
     if libproc.proc_pid_rusage(pid, 4, ctypes.byref(info)) != 0:
@@ -66,6 +94,7 @@ def sample(libproc, pid):
         if code == errno.ESRCH:
             return None
         raise OSError(code, "proc_pid_rusage failed", str(pid))
+    timebase = mach_timebase()
     return {
         "wall_time_s": time.time(),
         "monotonic_ns": time.monotonic_ns(),
@@ -77,10 +106,12 @@ def sample(libproc, pid):
         "disk_read_bytes": info.diskio_bytesread,
         "disk_written_bytes": info.diskio_byteswritten,
         "logical_written_bytes": info.logical_writes,
-        # Darwin rusage_info reports these CPU times in nanoseconds. Deltas
-        # belong to this process lifetime, not to an individual query/task.
-        "user_cpu_ns": info.user_time,
-        "system_cpu_ns": info.system_time,
+        # These rusage counters use Mach ticks (not ns on ARM64). Preserve the
+        # conversion in the receipt; process CPU is not per-query CPU.
+        "cpu_timebase_numer": timebase[0],
+        "cpu_timebase_denom": timebase[1],
+        "user_cpu_ns": cpu_nanoseconds(info.user_time, timebase),
+        "system_cpu_ns": cpu_nanoseconds(info.system_time, timebase),
         "pageins": info.pageins,
         "instructions": info.instructions,
         "cycles": info.cycles,
@@ -99,7 +130,9 @@ def main():
     if sys.platform != "darwin":
         parser.error("this sampler requires macOS")
     if (
-        args.seconds <= 0
+        not math.isfinite(args.seconds)
+        or not math.isfinite(args.interval)
+        or args.seconds <= 0
         or args.interval <= 0
         or (args.pid is not None and args.pid <= 0)
     ):
