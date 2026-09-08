@@ -81,6 +81,95 @@ pub fn identity(value_type: dv.ValueType, values: []const ?dv.TypedValue) [32]u8
 }
 
 pub const Count = struct { references: u64, bytes: u64 };
+
+/// Prepared only by the table's single column-maintenance owner. Namespace
+/// fencing and the build token must be checked before applying the resulting
+/// writes. Foreground mutations never edit payload ownership counts.
+pub const Delta = struct {
+    digest: [32]u8,
+    bytes: ?u64 = null,
+    encoded: ?[]const u8 = null,
+    retains: u64 = 0,
+    releases: u64 = 0,
+};
+
+pub const Prepared = struct {
+    writes: std.ArrayListUnmanaged(store.KVPair) = .empty,
+    deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    shared: u64 = 0,
+    new_bytes: u64 = 0,
+
+    pub fn apply(self: Prepared, txn: *store.DocStore.Txn) !void {
+        for (self.writes.items) |write| try txn.put(write.key, write.value);
+        for (self.deletes.items) |name| try txn.delete(name);
+    }
+};
+
+/// All output and temporary storage belongs to the caller's preparation arena.
+/// Aggregate before reading: one count lookup/update per distinct digest,
+/// independent of the number of column descriptors sharing that payload.
+pub fn prepare(target: *store.DocStore, alloc: std.mem.Allocator, generation: u64, deltas: []const Delta) !Prepared {
+    var result: Prepared = .{};
+    if (deltas.len == 0) return result;
+    const sorted = try alloc.dupe(Delta, deltas);
+    std.mem.sort(Delta, sorted, {}, struct {
+        fn less(_: void, a: Delta, b: Delta) bool {
+            return std.mem.order(u8, &a.digest, &b.digest) == .lt;
+        }
+    }.less);
+    var unique: usize = 0;
+    for (sorted) |delta| {
+        if (unique != 0 and std.mem.eql(u8, &sorted[unique - 1].digest, &delta.digest)) {
+            const previous = &sorted[unique - 1];
+            if (previous.bytes != null and delta.bytes != null and previous.bytes.? != delta.bytes.?) return error.InvalidColumnSegment;
+            previous.bytes = previous.bytes orelse delta.bytes;
+            previous.encoded = previous.encoded orelse delta.encoded;
+            previous.retains = std.math.add(u64, previous.retains, delta.retains) catch return error.InvalidColumnSegment;
+            previous.releases = std.math.add(u64, previous.releases, delta.releases) catch return error.InvalidColumnSegment;
+        } else {
+            sorted[unique] = delta;
+            unique += 1;
+        }
+    }
+    var offset: usize = 0;
+    while (offset < unique) {
+        const end = @min(offset + 128, unique);
+        var probe = try target.beginProbeTxn();
+        defer probe.abort();
+        var names: [128][]const u8 = undefined;
+        var values: [128]?[]const u8 = undefined;
+        for (sorted[offset..end], 0..) |delta, i| names[i] = try key(alloc, generation, delta.digest, true);
+        try probe.getManySorted(names[0 .. end - offset], values[0 .. end - offset]);
+        for (sorted[offset..end], names[0 .. end - offset], values[0 .. end - offset]) |delta, name, value| {
+            const previous: ?Count = if (value) |bytes| try decodeCount(bytes) else null;
+            if (previous) |count| if (delta.bytes) |bytes| {
+                if (bytes != count.bytes) return error.InvalidColumnSegment;
+            };
+            if (previous == null and delta.releases != 0) return error.InvalidColumnSegment;
+            const added = std.math.add(u64, if (previous) |count| count.references else 0, delta.retains) catch return error.InvalidColumnSegment;
+            const references = std.math.sub(u64, added, delta.releases) catch return error.InvalidColumnSegment;
+            if (references == 0) {
+                if (previous != null) {
+                    try result.deletes.append(alloc, try key(alloc, generation, delta.digest, false));
+                    try result.deletes.append(alloc, name);
+                }
+                continue;
+            }
+            const bytes = if (previous) |count| count.bytes else delta.bytes orelse return error.InvalidColumnSegment;
+            if (previous == null) {
+                const encoded = delta.encoded orelse return error.InvalidColumnSegment;
+                try (Ref{ .digest = delta.digest, .bytes = bytes, .source_rows = 0 }).validate(encoded);
+                try result.writes.append(alloc, .{ .key = try key(alloc, generation, delta.digest, false), .value = encoded });
+                result.new_bytes += bytes;
+            }
+            result.shared += delta.retains -| @as(u64, if (previous == null) 1 else 0);
+            const count = encodeCount(.{ .references = references, .bytes = bytes });
+            try result.writes.append(alloc, .{ .key = name, .value = try alloc.dupe(u8, &count) });
+        }
+        offset = end;
+    }
+    return result;
+}
 pub fn decodeCount(bytes: []const u8) !Count {
     if (bytes.len != 20 or std.hash.Crc32.hash(bytes[0..16]) != std.mem.readInt(u32, bytes[16..20], .little)) return error.InvalidColumnSegment;
     const result = Count{ .references = std.mem.readInt(u64, bytes[0..8], .little), .bytes = std.mem.readInt(u64, bytes[8..16], .little) };
@@ -108,47 +197,4 @@ pub fn lookup(txn: *store.DocStore.Txn, alloc: std.mem.Allocator, generation: u6
 
 pub fn key(alloc: std.mem.Allocator, generation: u64, digest: [32]u8, count: bool) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}{x:0>16}:{c}:{s}", .{ prefix, generation, @as(u8, if (count) 'q' else 'v'), digest });
-}
-
-/// Returns whether an existing payload was shared. Missing source references
-/// are corruption, never silently materialized from an unrelated generation.
-pub fn retain(txn: *store.DocStore.Txn, alloc: std.mem.Allocator, generation: u64, ref: Ref, encoded: ?[]const u8) !bool {
-    const count_key = try key(alloc, generation, ref.digest, true);
-    defer alloc.free(count_key);
-    const previous = txn.get(count_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    var count: u64 = 0;
-    if (previous) |bytes| {
-        const decoded = try decodeCount(bytes);
-        if (decoded.bytes != ref.bytes) return error.InvalidColumnSegment;
-        count = decoded.references;
-    } else {
-        const bytes = encoded orelse return error.InvalidColumnSegment;
-        try ref.validate(bytes);
-        const payload_key = try key(alloc, generation, ref.digest, false);
-        defer alloc.free(payload_key);
-        try txn.put(payload_key, bytes);
-    }
-    const next = encodeCount(.{ .references = std.math.add(u64, count, 1) catch return error.InvalidColumnSegment, .bytes = ref.bytes });
-    try txn.put(count_key, &next);
-    return count != 0;
-}
-
-pub fn release(txn: *store.DocStore.Txn, alloc: std.mem.Allocator, generation: u64, digest: [32]u8) !void {
-    const count_key = try key(alloc, generation, digest, true);
-    defer alloc.free(count_key);
-    const bytes = try txn.get(count_key);
-    const decoded = try decodeCount(bytes);
-    const count = decoded.references;
-    if (count == 1) {
-        const payload_key = try key(alloc, generation, digest, false);
-        defer alloc.free(payload_key);
-        try txn.delete(payload_key);
-        try txn.delete(count_key);
-    } else {
-        const next = encodeCount(.{ .references = count - 1, .bytes = decoded.bytes });
-        try txn.put(count_key, &next);
-    }
 }

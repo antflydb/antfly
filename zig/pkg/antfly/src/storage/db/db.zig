@@ -20278,7 +20278,7 @@ pub const DB = struct {
         // an owned get would copy every unselected byte of a wide row.
         var probe = try self.core.store.beginProbeTxn();
         defer probe.abort();
-        const raw = probe.get(store_key) catch |err| switch (err) {
+        const raw = probe.getLeased(store_key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
@@ -64246,6 +64246,199 @@ test "relational columnar bound scan benchmark" {
     }
 }
 
+test "relational columnar prepared ownership aggregates and aborts atomically" {
+    const payloads = @import("column_payloads.zig");
+    const alloc = std.testing.allocator;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = db_config.primary_lsm_options_default } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const digest = [_]u8{9} ** 32;
+        var encoded: [8]u8 = @splat(0);
+        std.mem.writeInt(u32, encoded[4..8], std.hash.Crc32.hash(encoded[0..4]), .little);
+        var deltas: [300]payloads.Delta = @splat(.{ .digest = digest, .bytes = encoded.len, .retains = 1 });
+        deltas[299].encoded = &encoded;
+        const Failure = struct {
+            fn run(failing: Allocator, target: *docstore_mod.DocStore, changes: []const payloads.Delta) !void {
+                var preparation = std.heap.ArenaAllocator.init(failing);
+                defer preparation.deinit();
+                _ = try payloads.prepare(target, preparation.allocator(), 1, changes);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, @as([]const payloads.Delta, &deltas) });
+        const prepared = try payloads.prepare(db.core.store, scratch, 1, &deltas);
+        try std.testing.expectEqual(@as(usize, 2), prepared.writes.items.len);
+        try std.testing.expectEqual(@as(u64, 299), prepared.shared);
+        const count_key = try payloads.key(scratch, 1, digest, true);
+        {
+            var write = try db.core.store.beginWriteTxn();
+            defer write.abort();
+            try prepared.apply(&write);
+        }
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, count_key));
+        {
+            var write = try db.core.store.beginWriteTxn();
+            errdefer write.abort();
+            try prepared.apply(&write);
+            try write.commit();
+        }
+        const count_bytes = try db.core.store.get(alloc, count_key);
+        defer alloc.free(count_bytes);
+        try std.testing.expectEqual(@as(u64, 300), (try payloads.decodeCount(count_bytes)).references);
+        try std.testing.expectError(error.InvalidColumnSegment, payloads.prepare(db.core.store, scratch, 1, &.{.{ .digest = digest, .releases = 301 }}));
+        try std.testing.expectError(error.InvalidColumnSegment, payloads.prepare(db.core.store, scratch, 1, &.{.{ .digest = digest, .bytes = 900, .retains = 1 }}));
+        const released = try payloads.prepare(db.core.store, scratch, 1, &.{.{ .digest = digest, .releases = 300 }});
+        try std.testing.expectEqual(@as(usize, 2), released.deletes.items.len);
+        {
+            var write = try db.core.store.beginWriteTxn();
+            errdefer write.abort();
+            try released.apply(&write);
+            try write.commit();
+        }
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, count_key));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, try payloads.key(scratch, 1, digest, false)));
+    }
+}
+
+test "relational columnar production LSM staging snapshot benchmark" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    defer relational_columns.test_snapshot_per_block = false;
+    var clones: [2]u64 = undefined;
+    var elapsed: [2]u64 = undefined;
+    for (0..2) |mode| {
+        relational_columns.test_snapshot_per_block = mode == 0;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .string }};
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const wide = try scratch.alloc(u8, 4096);
+        var random = std.Random.DefaultPrng.init(729);
+        var writes: [1024]types.BatchWrite = undefined;
+        for (&writes, 0..) |*write, i| {
+            for (wide) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+            write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = try std.fmt.allocPrint(scratch, "{{\"payload\":\"{s}\"}}", .{wide}) };
+        }
+        try db.batch(.{ .writes = &writes });
+        const backend = db.core.primary_store_owner.lsmBackend().?;
+        const before = backend.snapshotMaintenanceStats();
+        const started = platform_time.monotonicNs();
+        try drainTestRelationalMaintenance(&db);
+        elapsed[mode] = platform_time.monotonicNs() - started;
+        clones[mode] = backend.snapshotMaintenanceStats().mutable_snapshot_clone_bytes_total - before.mutable_snapshot_clone_bytes_total;
+        try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) >= 4);
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        var result = try db.scan(alloc, "", "", .{});
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(writes.len, result.hashes.len);
+    }
+    try std.testing.expect(clones[1] < clones[0]);
+    std.debug.print("\nproduction LSM staging: per-block/build snapshot ns={d}/{d}, cloned bytes={d}/{d}\n", .{ elapsed[0], elapsed[1], clones[0], clones[1] });
+}
+
+test "relational columnar production LSM physical churn benchmark" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var options = db_config.primary_lsm_options_default;
+    // Exercise real persisted files; make only the obsolete-file grace period
+    // deterministic. Pinned readers must still prevent premature reclamation.
+    options.obsolete_retention_ns = 0;
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = options } });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "n", .path = "n", .column_type = .integer },
+        .{ .name = "payload", .path = "payload", .column_type = .string },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var random = std.Random.DefaultPrng.init(417);
+    var payload: [4096]u8 = undefined;
+    var writes: [256]types.BatchWrite = undefined;
+    for (&writes, 0..) |*write, i| {
+        for (&payload) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+        write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d},\"payload\":\"{s}\"}}", .{ i, payload }) };
+    }
+    try db.batch(.{ .writes = &writes });
+    try drainTestRelationalMaintenance(&db);
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    try backend.sync(true);
+    var pinned = try db.core.store.beginReadTxn();
+    var pinned_live = true;
+    defer if (pinned_live) pinned.abort();
+    const owner_key = try internal_keys.relationalRowKeyAlloc(scratch, writes[0].key);
+    const original = try scratch.dupe(u8, try pinned.get(owner_key));
+    const before = backend.snapshotWriteStats();
+    var mutation_ns: [16]u64 = undefined;
+    var peak_physical: u64 = 0;
+    const Size = struct {
+        fn physical(b: *lsm_backend_mod.Backend) !u64 {
+            var bytes = b.snapshotMaintenanceStats().wal_retained_bytes;
+            for (b.runs.items) |run| if (run.path) |name| {
+                bytes += try b.storage.?.fileSize(name);
+            };
+            for (b.obsolete_paths.items) |obsolete| bytes += try b.storage.?.fileSize(obsolete.path);
+            return bytes;
+        }
+    };
+    for (&mutation_ns, 0..) |*ns, round| {
+        var turn = std.heap.ArenaAllocator.init(alloc);
+        defer turn.deinit();
+        var updates: [64]types.BatchWrite = undefined;
+        for (&updates, 0..) |*write, i| {
+            for (&payload) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+            const row = (round % 4) * 64 + i;
+            write.* = .{ .key = writes[row].key, .value = try std.fmt.allocPrint(turn.allocator(), "{{\"n\":{d},\"payload\":\"{s}\"}}", .{ row, payload }) };
+        }
+        const started = platform_time.monotonicNs();
+        try db.batch(.{ .writes = &updates });
+        ns.* = platform_time.monotonicNs() - started;
+        try drainTestRelationalMaintenance(&db);
+        // Checkpoint at measurement boundaries, not once per individual write.
+        try backend.sync(true);
+        peak_physical = @max(peak_physical, try Size.physical(backend));
+    }
+    try std.testing.expectEqualSlices(u8, original, try pinned.get(owner_key));
+    pinned.abort();
+    pinned_live = false;
+    var deletes: [128][]const u8 = undefined;
+    for (&deletes, 0..) |*key, i| key.* = writes[i * 2].key;
+    try db.batch(.{ .deletes = &deletes });
+    try drainTestRelationalMaintenance(&db);
+    try backend.sync(true);
+    try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+    var stats: types.ColumnarScanStats = .{};
+    var result = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .columnar_stats = &stats });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 128), result.documents.len);
+    try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
+    std.mem.sort(u64, &mutation_ns, {}, std.sort.asc(u64));
+    const after = backend.snapshotWriteStats();
+    std.debug.print("\nproduction LSM physical churn: SST/WAL written={d}/{d}, peak/settled SST+WAL={d}/{d}, batch median/max ns={d}/{d}, live column payload={d}, projected payload bytes={d}\n", .{
+        after.table_file_bytes - before.table_file_bytes,              after.wal_append_bytes - before.wal_append_bytes,
+        peak_physical,                                                 try Size.physical(backend),
+        mutation_ns[8],                                                mutation_ns[15],
+        try relational_columns.payloadStorageBytesForTest(&db, alloc), stats.payload_bytes_read,
+    });
+}
+
 test "relational point projection lease benchmark" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
@@ -64289,8 +64482,9 @@ test "relational point projection lease benchmark" {
             for (0..64) |_| {
                 var probe = try db.core.store.beginProbeTxn();
                 defer probe.abort();
-                const borrowed = try probe.get(key);
-                const owned = if (mode == 0) try alloc.dupe(u8, borrowed) else null;
+                const authenticated = db.core.store.valuesAreAuthenticated();
+                const borrowed = if (mode == 0) try probe.get(key) else try probe.getLeased(key);
+                const owned = if (mode == 0 and !authenticated) try alloc.dupe(u8, borrowed) else null;
                 defer if (owned) |bytes| alloc.free(bytes);
                 const raw = owned orelse borrowed;
                 const row = if (mode == 3 or db.core.store.valuesAreAuthenticated())

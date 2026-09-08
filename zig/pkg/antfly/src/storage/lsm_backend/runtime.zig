@@ -2794,6 +2794,11 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         stable_point_view: bool = false,
         stable_point_view_loaded: bool = false,
+        // Values from immutable generations/in-memory runs borrow their
+        // captured layout. Disk values are already owned by held_values or
+        // pinned by held_blocks and need no second whole-value allocation.
+        held_layouts: std.ArrayListUnmanaged(CurrentReadLayout(BackendType)) = .empty,
+        leased_values: std.ArrayListUnmanaged([]u8) = .empty,
         empty_state: State = .{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2821,6 +2826,9 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
+            for (self.held_layouts.items) |*layout| layout.deinitAfterUnlockedRead();
+            self.held_layouts.deinit(self.metadata_allocator);
+            releaseHeldValues(&self.leased_values, backend.allocator);
             if (self.stable_point_view_loaded) {
                 deinitRunGroups(self.metadata_allocator, self.l0_groups);
                 self.metadata_allocator.free(self.levels);
@@ -2865,33 +2873,48 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.getWithLease(key, false);
+        }
+
+        /// Opt-in for short projection scopes. Ordinary probes deliberately
+        /// copy values so long-lived maintenance probes do not pin generations.
+        pub fn getLeased(self: *@This(), key: []const u8) ![]const u8 {
+            return self.getWithLease(key, true);
+        }
+
+        fn getWithLease(self: *@This(), key: []const u8, lease: bool) ![]const u8 {
+            // Backend-owned decoded buffers can be transferred directly to
+            // this short lease without changing allocator ownership.
+            const value_allocator = if (lease) self.backend.allocator else self.allocator;
+            const held_values = if (lease) &self.leased_values else &self.held_values;
             if (self.stable_point_view) {
                 try self.ensureStablePointViewLoaded();
                 self.backend.recordPointGet();
-                switch (try getFromStableCachedPointView(self.backend, self.metadata_allocator, self.runs, self.l0_groups, self.levels, &self.last_l0_group_index, self.namespace, key)) {
+                if (!lease) switch (try getFromStableCachedPointView(self.backend, self.metadata_allocator, self.runs, self.l0_groups, self.levels, &self.last_l0_group_index, self.namespace, key)) {
                     .hit => |value| return try self.ownValue(value),
                     .miss => return error.NotFound,
-                    .unavailable => {
-                        const value = try getFromSnapshotRuns(
-                            self.backend,
-                            &self.empty_state,
-                            &.{},
-                            self.runs,
-                            self.l0_groups,
-                            self.levels,
-                            &self.last_l0_group_index,
-                            &self.read_hint,
-                            &self.held_blocks,
-                            &self.held_values,
-                            self.allocator,
-                            self.namespace,
-                            key,
-                            false,
-                            null,
-                        );
-                        return try self.ownValue(value);
-                    },
-                }
+                    .unavailable => {},
+                };
+                const value = try getFromSnapshotRuns(
+                    self.backend,
+                    &self.empty_state,
+                    &.{},
+                    self.runs,
+                    self.l0_groups,
+                    self.levels,
+                    &self.last_l0_group_index,
+                    &self.read_hint,
+                    &self.held_blocks,
+                    held_values,
+                    value_allocator,
+                    self.namespace,
+                    key,
+                    false,
+                    null,
+                );
+                if (!lease) return try self.ownValue(value);
+                recordPointValueBorrow(self.backend);
+                return value;
             }
             self.backend.recordPointGet();
 
@@ -2911,7 +2934,8 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 }
                 break :blk try CurrentReadLayout(BackendType).capture(self.backend, self.allocator);
             };
-            defer layout.deinitAfterUnlockedRead();
+            var retain_layout = false;
+            defer if (!retain_layout) layout.deinitAfterUnlockedRead();
             try layout.prepare();
 
             const value = try getFromSnapshotRuns(
@@ -2924,15 +2948,27 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 &self.last_l0_group_index,
                 &self.read_hint,
                 &self.held_blocks,
-                &self.held_values,
-                self.allocator,
+                held_values,
+                value_allocator,
                 self.namespace,
                 key,
                 false,
                 null,
             );
-            recordPointValueCopy(self.backend);
-            return try self.ownValue(value);
+            if (!lease) {
+                recordPointValueCopy(self.backend);
+                return try self.ownValue(value);
+            }
+            const needs_layout = layout.immutable_memtables.len != 0 or blk: {
+                for (layout.runs) |run| if (run.path == null) break :blk true;
+                break :blk false;
+            };
+            if (needs_layout) {
+                try self.held_layouts.append(self.metadata_allocator, layout);
+                retain_layout = true;
+            }
+            recordPointValueBorrow(self.backend);
+            return value;
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -5963,8 +5999,21 @@ fn getFromRunWithLocalIndex(
     backend_locked: bool,
 ) !?[]const u8 {
     const loaded = try findExactEntryWithLocalIndexMaybeLocked(backend, run, namespace, key, backend_locked) orelse return null;
-    defer backend.allocator.free(loaded.bytes);
+    var transferred = false;
+    defer if (!transferred) backend.allocator.free(loaded.bytes);
     if (loaded.entry.tombstone) return error.NotFound;
+
+    // Wide values dominate their block. Transfer the decoded allocation when
+    // its owner matches rather than copying the row out and immediately
+    // freeing it. Small metadata gets keep their compact value-only buffer;
+    // retained amplification is at most 2x for this transfer path.
+    if (loaded.entry.value.len >= 4096 and loaded.entry.value.len >= loaded.bytes.len / 2 and
+        value_allocator.ptr == backend.allocator.ptr and value_allocator.vtable == backend.allocator.vtable)
+    {
+        try held_values.append(value_allocator, loaded.bytes);
+        transferred = true;
+        return loaded.entry.value;
+    }
 
     const owned_value = try value_allocator.dupe(u8, loaded.entry.value);
     errdefer value_allocator.free(owned_value);

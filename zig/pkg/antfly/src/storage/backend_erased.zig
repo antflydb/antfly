@@ -325,6 +325,7 @@ pub const ProbeTxn = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        get_leased: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
     };
 
@@ -335,6 +336,12 @@ pub const ProbeTxn = struct {
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, key);
+    }
+
+    /// May pin an immutable generation until abort. Prefer get for long-lived
+    /// probes; use this for a short-lived point projection.
+    pub fn getLeased(self: *ProbeTxn, key: []const u8) ![]const u8 {
+        return try (self.vtable.get_leased orelse self.vtable.get)(self.ptr, key);
     }
 
     pub fn getManySorted(self: *ProbeTxn, keys: []const []const u8, values: []?[]const u8) !void {
@@ -1130,6 +1137,11 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             return try unbox(ptr).handle.get(key);
         }
 
+        fn getLeased(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
+            if (@hasDecl(Handle, "getLeased")) return try unbox(ptr).handle.getLeased(key);
+            return try unbox(ptr).handle.get(key);
+        }
+
         fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
             if (@hasDecl(Handle, "getManySorted")) {
@@ -1150,6 +1162,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
         .vtable = &.{
             .abort = vt.abort,
             .get = vt.get,
+            .get_leased = vt.getLeased,
             .get_many_sorted = vt.getManySorted,
         },
     };

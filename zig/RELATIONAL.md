@@ -500,14 +500,85 @@ measured rounds after warmup on a 1 MiB row with one selected integer. It measur
 
 | Backend | Copied + full verification | Leased + full verification | Leased + selected-group verification |
 | --- | ---: | ---: | ---: |
-| LMDB | 138.309 | 133.781 | 8.129 |
-| LSM | 11.604 | 7.609 | 7.665 |
+| LMDB | 123.189 | 118.829 | 7.101 |
+| LSM | 7.418 | 5.214 | 5.241 |
 
 LSM already authenticates its values; its last two modes deliberately follow
-the same path. A separate integrity-bypassing **diagnostic only** measured
-6.216 ms on LMDB, motivating grouped checks rather than accepting the remaining
-full-row verification cost. Public `DB.lookup` allocation is 209 bytes on both
-backends; timing above isolates store/projection work, not request/network cost.
+the same path. The LSM baseline uses the ordinary owning probe, while the other
+modes explicitly request a short value lease. A separate integrity-bypassing
+**diagnostic only** measured 6.008 ms on LMDB, motivating grouped checks rather than accepting the remaining
+full-row verification cost. Public `DB.lookup` request-allocator traffic is 209
+bytes on both backends. This excludes backend/cache allocations and must not be
+interpreted as total allocation for the operation; timing above isolates
+store/projection work, not request/network cost.
+
+### LSM ownership and physical amplification
+
+Column maintenance owns payload reference counts through the existing
+single-maintainer guard. Staging reuses its pinned build snapshot, with an owned
+build-local digest registry for payloads committed after that snapshot. It does
+not create a new mutable-memtable snapshot for each output block. Cleanup probes
+its job key before opening a snapshot and shares one snapshot across up to eight
+cleanup pages, retaining the per-page atomic commit and apply-lock release and
+the 50 ms cooperative quantum.
+
+Reference changes are prepared as aggregated digest deltas. Counts are fetched
+in sorted batches of at most 128 distinct keys outside publication; each digest
+produces one count update, regardless of how many descriptors share it. New
+payload bytes, counts, and owning metadata still commit atomically. Namespace
+and build-token validation prevent a prepared builder from publishing into a
+different namespace. The single-maintainer guard is required from preparation
+through commit: this is not a general multi-writer read/modify/write API.
+
+Point projection explicitly opts into `getLeased`. Immutable-generation values
+remain pinned until the probe aborts; SST values reuse the probe's owned buffer
+or block-cache handle rather than making a second full-row copy. Uncached wide
+values can transfer the decoded block allocation into the lease when allocator
+ownership matches and the value occupies at least half the block. Small metadata
+reads keep compact value-only buffers. Ordinary probes
+still copy and release generation pins promptly. Mutable values still need a
+copy because same-length mutable overwrites can modify their buffer in place.
+An uncached SST read may still decompress/materialize the entire physical block.
+Leasing is not independently addressable value chunks or zero-I/O projection.
+
+Production primary LSM options use a family-aware SST partition identity for
+generation-local `:v:` payload keys. Flush, sorted ingestion, and streaming
+compaction all honor the same boundaries, separating immutable payload output
+from metadata/count output without changing persisted keys or backup formats.
+Payloads remain ordinary LSM values: compaction can still rewrite them, and
+logical payload reclamation does not imply an immediate physical disk bound.
+
+The physical metadata-churn benchmark keeps a reader pinned while performing
+16 metadata commits beside 1 MiB of incompressible, unchanged payloads. It uses
+the real SST/WAL encoders on memory-backed files, not logical value counters:
+
+| SST partitioning | Additional SST bytes written | Retained file bytes |
+| --- | ---: | ---: |
+| First-byte only | 8,474,322 | 9,534,372 |
+| Payload family | 1,066,714 | 2,127,336 |
+
+This measures write amplification, not device latency. The production staging
+fixture uses the 32 MiB mutable threshold and 1,024 distinct 4 KiB rows; the
+per-block/build-snapshot modes copied 95,518,154/51,406,960 mutable-snapshot
+bytes in the measured run. These are cumulative bytes, not peak RSS. Other
+snapshot boundaries remain and are included in both totals.
+
+The native-file churn fixture uses production primary options (only the
+obsolete-file grace period is set to zero for deterministic reclamation), pins
+an old reader, performs 16 batches of overwrites, releases the reader, deletes
+half the rows, and validates column ownership and projected reads. It reports
+actual active/obsolete SST file sizes plus retained WAL, cumulative SST/WAL
+writes, and foreground batch median/max latency. It checkpoints at measurement
+boundaries and is not a concurrent-load or device-cold benchmark. In the measured
+native-file run, SST/WAL writes were 20,745,882/10,093,136 bytes, peak/settled
+SST+WAL footprint was 6,707,886/3,095,187 bytes, and the final integer projection
+read 1,050 column payload bytes with zero primary-row reads. No fixed
+physical-to-live-byte ratio is inferred from the logical churn tests.
+
+Reproduce with `zig build lib-storage-test -Doptimize=ReleaseFast --` and filters
+`'relational columnar production LSM'`, `'lsm payload family isolation'`, and
+`'lsm point leases'`. Timing is diagnostic; regression gates check ownership,
+snapshot-copy work, and physical write reduction rather than wall-clock limits.
 
 All 512 primary owners are still read and checked; the already-evaluated
 predicate is reused, not run twice. Allocation totals are allocator traffic,

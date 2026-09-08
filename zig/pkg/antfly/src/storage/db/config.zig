@@ -62,6 +62,28 @@ pub const PrimaryBackend = union(enum) {
     lsm: lsm_backend_mod.Options,
 };
 
+/// Keep immutable column payloads out of metadata/count SSTs. The family
+/// discriminator follows the generation, so each generation is independently
+/// reclaimable. All other keys retain the existing first-byte partitioning.
+pub fn primaryRunPartition(key: []const u8) []const u8 {
+    const columns = "\x00\x00__columnar__:blocks:";
+    const family = columns.len + 16;
+    if (key.len >= family + 3 and std.mem.startsWith(u8, key, columns) and
+        std.mem.eql(u8, key[family .. family + 3], ":v:")) return key[0 .. family + 3];
+    return key[0..@min(key.len, 1)];
+}
+
+test "primary LSM isolates relational payload generations from metadata" {
+    const payload = "\x00\x00__columnar__:blocks:0000000000000001:v:digest";
+    const count = "\x00\x00__columnar__:blocks:0000000000000001:q:digest";
+    try std.testing.expectEqualStrings("\x00", primaryRunPartition(count));
+    try std.testing.expectEqualStrings("\x00\x00__columnar__:blocks:0000000000000001:v:", primaryRunPartition(payload));
+    try std.testing.expect(!std.mem.eql(u8, primaryRunPartition(payload), primaryRunPartition("\x00\x00__columnar__:blocks:0000000000000002:v:digest")));
+    try std.testing.expectEqualStrings("\x01", primaryRunPartition("\x01row"));
+    try std.testing.expectEqualStrings("", primaryRunPartition(""));
+    for (0..payload.len) |len| _ = primaryRunPartition(payload[0..len]);
+}
+
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
@@ -86,6 +108,7 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .level_target_bytes_multiplier = doc_lsm_level_target_bytes_multiplier,
     .max_compaction_input_bytes = 2 * gib,
     .run_partition_prefix_bytes = 1,
+    .run_partition_key = primaryRunPartition,
     .wal_soft_limit_segments = primary_wal_soft_limit_segments,
     .wal_hard_limit_segments = primary_wal_hard_limit_segments,
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,

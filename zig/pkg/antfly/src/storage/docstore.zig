@@ -524,6 +524,13 @@ pub const DocStore = struct {
             return try self.read.?.get(key);
         }
 
+        /// Short-lived value lease, released when this transaction aborts.
+        /// Immutable LSM bytes may be pinned rather than copied.
+        pub fn getLeased(self: *Txn, key: []const u8) ![]const u8 {
+            if (self.probe) |*probe| return try probe.getLeased(key);
+            return try self.get(key);
+        }
+
         /// Block-scoped values from this exact snapshot. Close scopes before
         /// aborting the transaction (which also owns the portable-import fence).
         pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {

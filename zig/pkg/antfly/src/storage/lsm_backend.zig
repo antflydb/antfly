@@ -394,6 +394,11 @@ pub const Options = struct {
     /// Finish a run when the namespace or the first N key bytes change. This
     /// only controls run layout; the persisted table-file format is unchanged.
     run_partition_prefix_bytes: usize = 0,
+    /// Optional family-aware partition identity. Pure, allocation-free, and
+    /// stable for the backend lifetime. Only changes SST boundaries, never
+    /// ordering or the persisted entry format. Namespace isolation still
+    /// applies. Used instead of the fixed prefix when supplied.
+    run_partition_key: ?*const fn ([]const u8) []const u8 = null,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     table_prefix_extractor: lsm_table_file.PrefixExtractor = lsm_table_file.default_prefix_extractor,
@@ -9504,6 +9509,92 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
     try std.testing.expectEqualStrings("C", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:c"));
 }
 
+test "lsm point leases pin immutable values across flush and overwrite" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/lsm-point-lease", .{
+        .flush_threshold_bytes = 256,
+        .storage = storage.storage(),
+        .defer_flush_on_commit = true,
+    });
+    defer backend.close();
+    const payload = [_]u8{'x'} ** 1024;
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", &payload);
+        try write.commit();
+    }
+    var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+    defer probe.abort();
+    const borrowed = try probe.getLeased("row");
+    try std.testing.expectEqual(@as(usize, 0), probe.held_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.held_layouts.items.len);
+    const Failure = struct {
+        fn run(failing: Allocator, target: *Backend) !void {
+            var lease = try runtime_mod.BoundProbeTxn(Backend).open(target, .{});
+            defer lease.abort();
+            lease.allocator = failing;
+            lease.metadata_allocator = failing;
+            _ = try lease.getLeased("row");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Failure.run, .{&backend});
+    try backend.finalizeDeferredStorageWork();
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", "new");
+        try write.commit();
+    }
+    try std.testing.expectEqualStrings("new", try probe.get("row"));
+    try std.testing.expectEqualSlices(u8, &payload, borrowed);
+}
+
+test "lsm point leases avoid the second disk value copy" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |cached| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+        defer cache.deinit();
+        var backend = try Backend.open(alloc, "/lsm-point-disk-lease", .{
+            .flush_threshold = 1,
+            .storage = storage.storage(),
+            .cache = if (cached) &cache else null,
+        });
+        defer backend.close();
+        const payload = [_]u8{'x'} ** (1024 * 1024);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "row", &payload);
+            try write.commit();
+        }
+        var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+        defer probe.abort();
+        const borrowed = try probe.getLeased("row");
+        try std.testing.expectEqual(@as(usize, 0), probe.held_values.items.len);
+        try std.testing.expect(probe.leased_values.items.len <= @as(usize, if (cached) 0 else 1));
+        if (!cached) {
+            try std.testing.expectEqual(@as(usize, 1), probe.leased_values.items.len);
+            const buffer = probe.leased_values.items[0];
+            try std.testing.expect(@intFromPtr(borrowed.ptr) >= @intFromPtr(buffer.ptr));
+            try std.testing.expect(@intFromPtr(borrowed.ptr) + borrowed.len <= @intFromPtr(buffer.ptr) + buffer.len);
+        }
+        if (cached) try std.testing.expect(probe.held_blocks.items.len > 0);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.delete(.{}, "row");
+            try write.commit();
+        }
+        try backend.finalizeDeferredStorageWork();
+        try std.testing.expectEqualSlices(u8, &payload, borrowed);
+    }
+}
+
 test "lsm scoped reads bound retained values and preserve one disk snapshot" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -16739,6 +16830,67 @@ test "lsm backend preserves key family partitions in streaming compaction output
         try std.testing.expect(run.largest_key.len > 0);
         try std.testing.expectEqual(run.smallest_key[0], run.largest_key[0]);
     }
+}
+
+test "lsm payload family isolation physical churn benchmark" {
+    const alloc = std.testing.allocator;
+    const Family = struct {
+        fn extract(key: []const u8) []const u8 {
+            return key[0..(std.mem.indexOfScalar(u8, key, ':') orelse key.len)];
+        }
+    };
+    var written: [2]u64 = undefined;
+    var physical: [2]usize = undefined;
+    for (0..2) |mode| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        const options = Options{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+            .foreground_soft_compaction = true,
+            .level_target_runs_base = 100,
+            .level_target_bytes_base = 0,
+            .max_run_file_bytes = 8 * 1024 * 1024,
+            .run_partition_prefix_bytes = 1,
+            .run_partition_key = if (mode == 0) null else Family.extract,
+            .storage = storage.storage(),
+        };
+        var backend = try Backend.open(alloc, "/lsm-payload-family", options);
+        defer backend.close();
+        var random = std.Random.DefaultPrng.init(401);
+        var value: [16 * 1024]u8 = undefined;
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "\x00a:metadata", "0");
+            for (0..64) |i| {
+                var name: [32]u8 = undefined;
+                random.random().bytes(&value);
+                try write.put(.{}, try std.fmt.bufPrint(&name, "\x00v:{d:0>4}", .{i}), &value);
+            }
+            try write.commit();
+        }
+        const before = backend.snapshotWriteStats().table_file_bytes;
+        var old = try Backend.BoundReadTxn.open(&backend, .{});
+        defer old.abort();
+        for (0..16) |round| {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            var number: [16]u8 = undefined;
+            try write.put(.{}, "\x00a:metadata", try std.fmt.bufPrint(&number, "{d}", .{round + 1}));
+            try write.commit();
+        }
+        try backend.finalizeDeferredStorageWork();
+        written[mode] = backend.snapshotWriteStats().table_file_bytes - before;
+        physical[mode] = 0;
+        var files = storage.files.valueIterator();
+        while (files.next()) |bytes| physical[mode] += bytes.len;
+        try std.testing.expectEqualStrings("0", try old.get("\x00a:metadata"));
+        try std.testing.expectEqualSlices(u8, &value, try old.get("\x00v:0063"));
+        if (mode == 1) for (backend.runs.items) |run| try std.testing.expectEqualStrings(Family.extract(run.smallest_key), Family.extract(run.largest_key));
+        std.debug.print("\nLSM physical metadata churn: isolated={}, SST written bytes={d}, all retained file bytes={d}, compactions={d}\n", .{ mode == 1, written[mode], physical[mode], backend.compaction_stats.compactions });
+    }
+    try std.testing.expect(written[1] * 4 < written[0]);
 }
 
 test "lsm backend splits oversized compaction output into persisted run segments" {

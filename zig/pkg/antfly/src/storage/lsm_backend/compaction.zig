@@ -2064,6 +2064,7 @@ pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *B
                 winner.namespace_name,
                 winner.key,
                 backend.options.run_partition_prefix_bytes,
+                backend.options.run_partition_key,
             );
             if (partition_changed or
                 (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes + entry_bytes > target_bytes) or
@@ -2551,7 +2552,7 @@ pub fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, bac
     const target_bytes = targetRunFileBytes(BackendType, backend);
     var start: usize = 0;
     while (start < state.entries.items.len) {
-        const preferred_end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes);
+        const preferred_end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes, backend.options.run_partition_key);
         try runs.ensureUnusedCapacity(backend.allocator, 1);
 
         var output: PersistedOutputRunBuilder(BackendType) = undefined;
@@ -2609,7 +2610,7 @@ fn makeRunsFromStateAtLevel(comptime BackendType: type, backend: *BackendType, s
     var start: usize = 0;
     while (start < source_entries.items.len) {
         try runs.ensureUnusedCapacity(backend.allocator, 1);
-        const end = splitOwnedEntriesEnd(source_entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes);
+        const end = splitOwnedEntriesEnd(source_entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes, backend.options.run_partition_key);
 
         var chunk: State = .{};
         errdefer chunk.deinit(backend.allocator);
@@ -2640,7 +2641,7 @@ fn makeRunsFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *B
     var start: usize = 0;
     while (start < entries.len) {
         try runs.ensureUnusedCapacity(backend.allocator, 1);
-        const preferred_end = splitTableEntriesEnd(entries, start, target_bytes, backend.options.run_partition_prefix_bytes);
+        const preferred_end = splitTableEntriesEnd(entries, start, target_bytes, backend.options.run_partition_prefix_bytes, backend.options.run_partition_key);
         if (backend.root_dir == null) {
             const run = try makeRunFromSortedTableEntriesAtLevel(BackendType, backend, entries[start..preferred_end], level);
             runs.appendAssumeCapacity(run);
@@ -2889,7 +2890,9 @@ fn physicalRunFileLimit(comptime BackendType: type, backend: *BackendType) usize
     ));
 }
 
-fn splitOwnedEntriesEnd(entries: []const state_mod.OwnedEntry, start: usize, target_bytes: usize, partition_prefix_bytes: usize) usize {
+const PartitionKey = ?*const fn ([]const u8) []const u8;
+
+fn splitOwnedEntriesEnd(entries: []const state_mod.OwnedEntry, start: usize, target_bytes: usize, partition_prefix_bytes: usize, partition_key: PartitionKey) usize {
     var total: usize = 0;
     var end = start;
     while (end < entries.len) : (end += 1) {
@@ -2899,6 +2902,7 @@ fn splitOwnedEntriesEnd(entries: []const state_mod.OwnedEntry, start: usize, tar
             entries[end].namespace_name,
             entries[end].key,
             partition_prefix_bytes,
+            partition_key,
         )) break;
         const entry_bytes = estimateOwnedEntryBytes(entries[end]);
         if (end > start and total +| entry_bytes > target_bytes) break;
@@ -2907,7 +2911,7 @@ fn splitOwnedEntriesEnd(entries: []const state_mod.OwnedEntry, start: usize, tar
     return end;
 }
 
-fn splitTableEntriesEnd(entries: []const lsm_table_file.Entry, start: usize, target_bytes: usize, partition_prefix_bytes: usize) usize {
+fn splitTableEntriesEnd(entries: []const lsm_table_file.Entry, start: usize, target_bytes: usize, partition_prefix_bytes: usize, partition_key: PartitionKey) usize {
     var total: usize = 0;
     var end = start;
     while (end < entries.len) : (end += 1) {
@@ -2917,6 +2921,7 @@ fn splitTableEntriesEnd(entries: []const lsm_table_file.Entry, start: usize, tar
             entries[end].namespace_name,
             entries[end].key,
             partition_prefix_bytes,
+            partition_key,
         )) break;
         const entry_bytes = estimateTableEntryBytes(entries[end]);
         if (end > start and total +| entry_bytes > target_bytes) break;
@@ -2931,12 +2936,14 @@ fn sameRunPartition(
     rhs_namespace_name: ?[]const u8,
     rhs_key: []const u8,
     prefix_bytes: usize,
+    partition_key: PartitionKey,
 ) bool {
-    if (prefix_bytes == 0) return true;
+    if (prefix_bytes == 0 and partition_key == null) return true;
     if (state_mod.compareNamespace(
         .{ .name = lhs_namespace_name },
         .{ .name = rhs_namespace_name },
     ) != .eq) return false;
+    if (partition_key) |extract| return std.mem.eql(u8, extract(lhs_key), extract(rhs_key));
     const lhs_len = @min(prefix_bytes, lhs_key.len);
     const rhs_len = @min(prefix_bytes, rhs_key.len);
     return lhs_len == rhs_len and std.mem.eql(u8, lhs_key[0..lhs_len], rhs_key[0..rhs_len]);

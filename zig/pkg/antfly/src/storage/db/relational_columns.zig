@@ -52,6 +52,9 @@ pub var test_owner_limit: ?usize = null;
 pub var test_disable_deadline: bool = false;
 pub var test_cleanup_page_limit: ?usize = null;
 pub var test_now_ns: ?u64 = null;
+// Differential benchmark only: reproduce the previous per-block snapshot
+// cost without maintaining an alternative production path or storage format.
+pub var test_snapshot_per_block: bool = false;
 const maintenance_records = 256;
 const maintenance_bytes = 256 * 1024;
 const max_rows = read_cache.max_rows;
@@ -412,13 +415,21 @@ fn ColumnBuilder(comptime DBType: type) type {
         view: ?registry.SchemaView = null,
         rows: std.ArrayListUnmanaged(Row) = .empty,
         columns: std.AutoHashMapUnmanaged(u32, Column) = .empty,
+        payload_read: *store_mod.DocStore.Txn,
+        known_payloads: std.AutoHashMapUnmanaged([32]u8, payloads.Ref) = .empty,
 
         fn flush(self: *@This()) !void {
             if (self.rows.items.len == 0) return;
             const scratch = self.arena.allocator();
-            var payload_read = try self.db.core.store.beginReadTxn();
-            defer payload_read.abort();
-            var known_payloads = std.AutoHashMapUnmanaged([32]u8, payloads.Ref).empty;
+            // Reuse the build's immutable snapshot. A build-local registry
+            // covers payloads staged after it, without cloning the LSM mutable
+            // generation after every block commit.
+            var diagnostic_read: ?store_mod.DocStore.Txn = if (@import("builtin").is_test and test_snapshot_per_block)
+                try self.db.core.store.beginReadTxn()
+            else
+                null;
+            defer if (diagnostic_read) |*txn| txn.abort();
+            const payload_read = if (diagnostic_read) |*txn| txn else self.payload_read;
             var meta = std.ArrayListUnmanaged(u8).empty;
             try meta.appendSlice(scratch, "ACB8");
             try appendInt(&meta, scratch, u32, self.view.?.version());
@@ -442,8 +453,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                 try appendInt(&meta, scratch, u64, mask);
             }
             var writes = std.ArrayListUnmanaged(store_mod.KVPair).empty;
-            const Retain = struct { ref: payloads.Ref, encoded: ?[]const u8 = null };
-            var references = std.ArrayListUnmanaged(Retain).empty;
+            var references = std.ArrayListUnmanaged(payloads.Delta).empty;
             var columns = self.columns.iterator();
             while (columns.next()) |entry| {
                 const ordinal = entry.key_ptr.*;
@@ -478,7 +488,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                     if (fragment < fragments.len and fragments[fragment].first == row_first) {
                         const reused = fragments[fragment];
                         try appendPage(&directory, scratch, reused.end, reused.ref);
-                        try references.append(scratch, .{ .ref = reused.ref });
+                        try references.append(scratch, .{ .digest = reused.ref.digest, .bytes = reused.ref.bytes, .retains = 1 });
                         payload_bytes += reused.ref.bytes;
                         row_first = reused.end;
                         fragment += 1;
@@ -509,19 +519,19 @@ fn ColumnBuilder(comptime DBType: type) type {
                         var logical_cells: [max_rows]?dv.TypedValue = @splat(null);
                         for (local) |cell| logical_cells[cell.doc_id] = cell.value;
                         const digest = payloads.identity(writer.value_type, logical_cells[0 .. row_end - row_first]);
-                        reference = known_payloads.get(digest) orelse try payloads.lookup(&payload_read, scratch, self.generation, digest, row_end - row_first);
+                        reference = self.known_payloads.get(digest) orelse try payloads.lookup(payload_read, scratch, self.generation, digest, row_end - row_first);
                         if (reference) |*existing| {
                             existing.source_rows = @intCast(row_end - row_first);
-                            try references.append(scratch, .{ .ref = existing.* });
+                            try references.append(scratch, .{ .digest = digest, .bytes = existing.bytes, .retains = 1 });
                         } else {
                             writer.entries = .{ .items = local, .capacity = local.len };
                             _ = self.db.relational_column_maintenance.payload_encoding_bytes.fetchAdd(raw_bytes, .monotonic);
                             const values = try writer.build();
                             const encoded = try checked(scratch, values);
                             reference = .{ .digest = digest, .bytes = encoded.len, .source_rows = @intCast(row_end - row_first) };
-                            try references.append(scratch, .{ .ref = reference.?, .encoded = encoded });
+                            try references.append(scratch, .{ .digest = digest, .bytes = encoded.len, .retains = 1, .encoded = encoded });
                         }
-                        try known_payloads.put(scratch, digest, reference.?);
+                        try self.known_payloads.put(self.alloc, digest, reference.?);
                         payload_bytes += reference.?.bytes;
                     }
                     try appendPage(&directory, scratch, row_end, reference);
@@ -562,8 +572,9 @@ fn ColumnBuilder(comptime DBType: type) type {
                 errdefer self.alloc.free(candidate_value);
                 try self.candidates.append(self.alloc, .{ .key = candidate_key, .value = candidate_value });
             }
-            var shared_count: u64 = 0;
-            var new_payload_bytes: u64 = 0;
+            const prepared = try payloads.prepare(self.db.core.store, scratch, self.generation, references.items);
+            const shared_count = prepared.shared;
+            const new_payload_bytes = prepared.new_bytes;
             {
                 self.db.core.lockApplyShared();
                 defer self.db.core.unlockApplyShared();
@@ -572,11 +583,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                 var live = true;
                 defer if (live) txn.abort();
                 if (!try sameValue(&txn, manifest_key, &self.expected_manifest) or !try sameValue(&txn, building_key, &self.build_token)) return error.PreparedGenerationChanged;
-                for (references.items) |reference| {
-                    if (try payloads.retain(&txn, scratch, self.generation, reference.ref, reference.encoded)) {
-                        shared_count += 1;
-                    } else new_payload_bytes += reference.ref.bytes;
-                }
+                try prepared.apply(&txn);
                 for (writes.items) |write| try txn.put(write.key, write.value);
                 try txn.commit();
                 live = false;
@@ -873,6 +880,7 @@ fn ColumnBuilder(comptime DBType: type) type {
         }
 
         fn deinit(self: *@This()) void {
+            self.known_payloads.deinit(self.alloc);
             if (self.view) |*view| view.release();
             self.arena.deinit();
             for (self.directory.items) |entry| {
@@ -1176,8 +1184,24 @@ fn stageCleanup(db: anytype, alloc: alloc_type, read: *store_mod.DocStore.Txn, f
 /// One bounded, atomic cleanup page per quantum. Deleting the page is the
 /// durable continuation; cleanup never scans/rebuilds already published rows.
 fn drainCleanup(db: anytype, alloc: alloc_type, generation: u64, namespace: u64) !bool {
+    return drainCleanupWithLimit(db, alloc, generation, namespace, 1);
+}
+
+fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namespace: u64, limit: usize) !bool {
+    // Most maintenance turns have no cleanup job. Do not clone a busy LSM
+    // mutable generation merely to prove that this single key is absent.
+    {
+        var probe = try db.core.store.beginProbeTxn();
+        defer probe.abort();
+        _ = probe.get(cleanup_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+    }
+    const started = platform_time.monotonicNs();
     db.core.lockApplyShared();
-    defer db.core.unlockApplyShared();
+    var locked = true;
+    defer if (locked) db.core.unlockApplyShared();
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
     if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
     var read = try db.core.store.beginReadTxn();
@@ -1191,39 +1215,47 @@ fn drainCleanup(db: anytype, alloc: alloc_type, generation: u64, namespace: u64)
     if (std.mem.readInt(u64, token[0..8], .little) != generation) return error.InvalidColumnSegment;
     var cursor = try read.openCursor();
     defer cursor.close();
-    const entry = try cursor.seekAtOrAfter(page_prefix);
-    var txn = try db.core.store.beginWriteTxn();
-    var live = true;
-    defer if (live) txn.abort();
-    if (!try sameValue(&txn, cleanup_key, token)) return error.PreparedGenerationChanged;
-    const current = txn.get(manifest_key) catch |err| switch (err) {
-        error.NotFound => return error.PreparedGenerationChanged,
-        else => return err,
-    };
-    const manifest = try Manifest.decode(current);
-    if (!manifest.ready or manifest.generation != generation) return error.PreparedGenerationChanged;
-    var cleared: u64 = 0;
-    if (entry) |page| {
-        if (std.mem.startsWith(u8, page.key, page_prefix)) {
-            cleared = try clearPage(&txn, try verified(page.value));
-            try txn.delete(page.key);
-            const following = try cursor.next();
-            if (following == null or !std.mem.startsWith(u8, following.?.key, page_prefix)) try txn.delete(cleanup_key);
-        } else try txn.delete(cleanup_key);
-    } else try txn.delete(cleanup_key);
-    try txn.commit();
-    live = false;
-    _ = db.relational_column_maintenance.dirty_markers_cleared.fetchAdd(cleared, .monotonic);
+    var entry = try cursor.seekAtOrAfter(page_prefix);
+    for (0..limit) |_| {
+        if (!locked) {
+            db.core.lockApplyShared();
+            locked = true;
+        }
+        if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+        var txn = try db.core.store.beginWriteTxn();
+        var live = true;
+        defer if (live) txn.abort();
+        if (!try sameValue(&txn, cleanup_key, token)) return error.PreparedGenerationChanged;
+        const current = txn.get(manifest_key) catch |err| switch (err) {
+            error.NotFound => return error.PreparedGenerationChanged,
+            else => return err,
+        };
+        const manifest = try Manifest.decode(current);
+        if (!manifest.ready or manifest.generation != generation) return error.PreparedGenerationChanged;
+        var cleared: u64 = 0;
+        if (entry) |page| {
+            if (std.mem.startsWith(u8, page.key, page_prefix)) {
+                cleared = try clearPage(&txn, try verified(page.value));
+                try txn.delete(page.key);
+                entry = try cursor.next();
+            } else entry = null;
+        }
+        const done = entry == null or !std.mem.startsWith(u8, entry.?.key, page_prefix);
+        if (done) try txn.delete(cleanup_key);
+        try txn.commit();
+        live = false;
+        _ = db.relational_column_maintenance.dirty_markers_cleared.fetchAdd(cleared, .monotonic);
+        db.core.unlockApplyShared();
+        locked = false;
+        if (done or platform_time.monotonicNs() -| started >= 50 * std.time.ns_per_ms) break;
+    }
     return true;
 }
 
 fn finishCleanupQuantum(db: anytype, alloc: alloc_type, generation: u64, namespace: u64) !void {
-    const started = platform_time.monotonicNs();
     const pages: usize = if (@import("builtin").is_test and test_cleanup_page_limit != null) 1 else 8;
-    for (0..pages) |_| {
-        if (!try drainCleanup(db, alloc, generation, namespace)) break;
-        if (platform_time.monotonicNs() -| started >= 50 * std.time.ns_per_ms) break;
-    }
+    _ = try drainCleanupWithLimit(db, alloc, generation, namespace, pages);
 }
 
 const Range = struct { key: []const u8, value: []const u8, start: []const u8, end: []const u8, block: u64 };
@@ -1920,6 +1952,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     locked = false;
     var builder = ColumnBuilder(@TypeOf(db)){
         .db = db,
+        .payload_read = &read,
         .alloc = alloc,
         .arena = std.heap.ArenaAllocator.init(alloc),
         .generation = manifest.generation,
@@ -2142,13 +2175,20 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
         deleted: usize = 0,
         fn flush(self: *@This()) !void {
             if (self.deletes.items.len == 0 and self.completion == null) return;
+            const scratch = self.arena.allocator();
+            var deltas = std.ArrayListUnmanaged(payloads.Delta).empty;
+            for (self.references.items) |digest| try deltas.append(scratch, .{ .digest = digest, .releases = 1 });
+            const prepared = if (self.release_generation) |generation|
+                try payloads.prepare(self.db.core.store, scratch, generation, deltas.items)
+            else
+                payloads.Prepared{};
             self.db.core.lockApplyShared();
             defer self.db.core.unlockApplyShared();
             if (self.namespace != self.db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             var txn = try self.db.core.store.beginWriteTxn();
             var live = true;
             defer if (live) txn.abort();
-            if (self.release_generation) |generation| for (self.references.items) |digest| try payloads.release(&txn, self.arena.allocator(), generation, digest);
+            try prepared.apply(&txn);
             for (self.deletes.items) |key| try txn.delete(key);
             if (self.exhausted) if (self.completion) |intent| {
                 if (try sameValue(&txn, intent.key, intent.value)) try txn.delete(intent.key);
