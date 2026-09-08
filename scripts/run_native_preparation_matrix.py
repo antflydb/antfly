@@ -64,7 +64,7 @@ def main():
                 command += ["--common-refinement", "subgroups_4"]
             if large:
                 command.append("--include-1m")
-            if large or args.resume:
+            if large or (args.resume and (root / name / "ab-runs.json").exists()):
                 command.append("--resume")
             row = {
                 "experiment": name,

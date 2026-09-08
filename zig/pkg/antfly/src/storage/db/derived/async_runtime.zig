@@ -747,13 +747,8 @@ fn truncateWithRecoverableRetry(runtime: *DerivedRuntime, worker: *Worker, seque
 }
 
 fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) !void {
-    if (!worker.catch_up_open) {
-        worker.catch_up_token = if (runtime.begin_catch_up_fn) |begin_catch_up|
-            try begin_catch_up(runtime.ctx, worker.kind)
-        else
-            .{};
-        worker.catch_up_open = true;
-    }
+    if (!catch_up_policy.deferSourceCapture(worker.kind, runtime.backlog.resource_manager))
+        try ensureWorkerSourceCapture(runtime, worker);
     if (worker.replay_cursor == null) {
         worker.replay_cursor = try runtime.replay_source.openMatchingCursor(
             runtime.alloc,
@@ -762,6 +757,21 @@ fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequ
         );
         worker.replay_cursor_open_sequence = from_sequence;
     }
+}
+
+fn ensureWorkerSourceCapture(runtime: *DerivedRuntime, worker: *Worker) !void {
+    if (!worker.catch_up_open) {
+        worker.catch_up_token = if (runtime.begin_catch_up_fn) |begin_catch_up|
+            try begin_catch_up(runtime.ctx, worker.kind)
+        else
+            .{};
+        worker.catch_up_open = true;
+    }
+}
+
+fn beginCollectedWindowCapture(ctx: *anyopaque, _: index_manager_mod.ManagedIndexRef) !void {
+    const worker: *Worker = @ptrCast(@alignCast(ctx));
+    try ensureWorkerSourceCapture(worker.runtime, worker);
 }
 
 fn closeWorkerReplayCursor(runtime: *DerivedRuntime, worker: *Worker) void {
@@ -892,7 +902,9 @@ fn sleepNs(ns: u64) void {
 
 fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.CatchUpStats {
     const policy = catch_up_policy.forIndex(worker.kind, runtime.backlog.resource_manager);
-    return try derived_worker.catchUpIndexFromMatchingCursor(
+    const deferred_capture = catch_up_policy.deferSourceCapture(worker.kind, runtime.backlog.resource_manager);
+    const capture_before_collection = worker.catch_up_open;
+    const stats = try derived_worker.catchUpIndexFromMatchingCursor(
         runtime.alloc,
         &worker.replay_cursor.?,
         worker.kind,
@@ -900,6 +912,8 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
         runtime.apply_fn,
         .{
             .resource_manager = runtime.backlog.resource_manager,
+            .window_ctx = worker,
+            .begin_window_fn = if (deferred_capture) beginCollectedWindowCapture else null,
             .max_windows_per_call = policy.max_windows_per_publish,
             .max_call_ns = policy.max_call_ns,
             .max_call_bytes = policy.max_call_bytes,
@@ -909,6 +923,12 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
             .target_sequence = worker.target_sequence,
         },
     );
+    if (worker.kind.kind == .dense_vector and @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES"))
+        std.log.info("dense replay collection sequence={} records={} applied_windows={} deferred_capture={} capture_before_collection={} collect_ns={} apply_ns={}", .{
+            stats.last_sequence,       stats.scanned_entries,   stats.applied_entries, deferred_capture,
+            capture_before_collection, stats.window_collect_ns, stats.apply_ns,
+        });
+    return stats;
 }
 
 fn shouldRefreshReplayCursor(worker: *const Worker, caught_up_sequence: u64) bool {
@@ -928,6 +948,7 @@ fn lock(runtime: *DerivedRuntime) void {
 }
 
 const TestRuntimeCapture = struct {
+    require_capture_worker: ?*Worker = null,
     alloc: Allocator,
     apply_calls: std.atomic.Value(u64) = .init(0),
     begin_calls: std.atomic.Value(u64) = .init(0),
@@ -949,6 +970,11 @@ const TestRuntimeCapture = struct {
 
 fn testRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
     const capture: *TestRuntimeCapture = @ptrCast(@alignCast(ctx));
+    if (capture.require_capture_worker) |worker| {
+        try std.testing.expect(worker.catch_up_open);
+        try std.testing.expect(!worker.catch_up_token.isNone());
+        try std.testing.expect(worker.replay_cursor != null);
+    }
     _ = capture.apply_calls.fetchAdd(1, .monotonic);
     capture.last_applied_batch_sequence.store(batch.sequence, .monotonic);
     if (index_ref.kind == .dense_vector and capture.fail_next_dense_apply_not_found.swap(false, .monotonic)) {
@@ -1025,6 +1051,46 @@ fn testInMemoryJournalOpenOptions() change_journal_mod.OpenOptions {
             .obsolete_retention_ns = 0,
         },
     };
+}
+
+test "async deferred source capture begins before apply but not empty collection" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/late-capture", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    const payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(payload);
+    _ = try journal.appendOpaque(payload);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    manager.dense_deferred_source_capture = true;
+    var capture: TestRuntimeCapture = .{ .alloc = alloc };
+    var runtime = DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testRuntimeApply, testRuntimePersist, testRuntimeTruncate, testRuntimeBeginCatchUp, testRuntimeFinishCatchUp, null, null, &manager);
+    defer runtime.deinit();
+    var name = "dense".*;
+    var worker: Worker = .{ .runtime = &runtime, .name = &name, .kind = .{ .name = &name, .kind = .dense_vector }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1 };
+    defer _ = closeWorkerCatchUpState(&runtime, &worker, 0, false) catch {};
+    capture.require_capture_worker = &worker;
+    try ensureWorkerCatchUpState(&runtime, &worker, 0);
+    try std.testing.expect(worker.replay_cursor != null and !worker.catch_up_open);
+    const stats = try catchUpWorker(&runtime, &worker);
+    try std.testing.expectEqual(@as(u64, 1), stats.last_sequence);
+    try std.testing.expectEqual(@as(u64, 1), capture.begin_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+    _ = try closeWorkerCatchUpState(&runtime, &worker, 1, true);
+    try ensureWorkerCatchUpState(&runtime, &worker, 1);
+    const empty = try catchUpWorker(&runtime, &worker);
+    try std.testing.expectEqual(@as(u64, 0), empty.last_sequence);
+    try std.testing.expect(!worker.catch_up_open);
+    _ = try closeWorkerCatchUpState(&runtime, &worker, 1, true);
+    try std.testing.expectEqual(@as(u64, 1), capture.finish_calls.load(.monotonic));
 }
 
 test "async dense replay wait policy bounds a busy tail" {

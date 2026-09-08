@@ -1,9 +1,20 @@
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
-from native_preparation_experiments import checkpoint_evidence
+from native_preparation_experiments import checkpoint_evidence, require_disk_headroom
 
 
 class NativePreparationTests(unittest.TestCase):
+    def test_launch_guard_never_removes_data(self):
+        with patch(
+            "native_preparation_experiments.shutil.disk_usage",
+            return_value=SimpleNamespace(free=4 * 1024**3),
+        ):
+            require_disk_headroom(".", "Performance1536D50K")
+            with self.assertRaisesRegex(RuntimeError, "no test database was created"):
+                require_disk_headroom(".", "Performance768D1M")
+
     def test_flag_or_failed_worker_is_not_publication(self):
         flag = {"ANTFLY_EXPERIMENT_STAGE_POSTING_READERS": "1"}
         for lines in (

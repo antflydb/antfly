@@ -13,6 +13,8 @@ EVENTS = {
     "dense checkpoint rebase worker ": "rebase_worker",
     "dense checkpoint completion blockers ": "completion_blockers",
     "dense posting checkpoint staging ": "staging",
+    "dense replay collection ": "replay_collection",
+    "dense capture stages ": "capture_finish",
 }
 
 
@@ -83,6 +85,7 @@ def summarize_lines(lines):
             "Historical logs without worker/handoff events cannot attribute queue or completion waiting.",
             "Capture overlap and rebase worker time can overlap each other inside completed_wait; do not add them or label the remainder scheduling time.",
             "Lock deferrals count failed admission observations, not lock-held duration; they can include time before the worker completed.",
+            "Replay collection/apply and capture finish are separate stages; completed checkpoint capture overlap may intersect them and is not additive.",
         ],
     }
 

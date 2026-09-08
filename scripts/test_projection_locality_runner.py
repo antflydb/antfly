@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import run_posting_locality_ab as posting_runner
 import run_projection_locality_ab as runner
@@ -41,6 +42,9 @@ class QualificationRunnerTest(unittest.TestCase):
         harness.write_text("harness fixture")
         for name in MEASUREMENT_HELPERS:
             (scripts / name).write_text("measurement fixture")
+        (scripts / "native_preparation_experiments.py").write_text(
+            "native evidence fixture"
+        )
         unused = scripts / "run_vector_store_enrichment_ab.py"
         unused.write_text("not used by this workload")
         binary = base / "antfly"
@@ -54,6 +58,12 @@ class QualificationRunnerTest(unittest.TestCase):
             calls.append((command, kwargs["env"].copy()))
             arm = Path(command[1])
             arm.mkdir(parents=True, exist_ok=True)
+            (arm / "antfly-initial.log").write_text(
+                "dense checkpoint worker generation=2 readers_stage_ns=20 success=true\n"
+                "dense checkpoint rebase worker generation=2 rebase_stage_ns=20 success=true\n"
+                "dense checkpoint encoded row reuse generation=2 reused_bytes=4096\n"
+                "dense posting checkpoint published generation=2 kind=full\n"
+            )
             (arm / "qualification-summary.json").write_text(
                 json.dumps(
                     {
@@ -73,7 +83,9 @@ class QualificationRunnerTest(unittest.TestCase):
                 )
             )
             if (
-                kwargs["env"].get("ANTFLY_EXPERIMENT_COMPACT_SUBGROUP_ROUTING") == "1"
+                kwargs["env"].get("ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS") == "1"
+                or kwargs["env"].get("ANTFLY_EXPERIMENT_COMPACT_SUBGROUP_ROUTING")
+                == "1"
                 or kwargs["env"].get("ANTFLY_EXPERIMENT_PROJECTION_BORROW") == "1"
                 or (
                     any(
@@ -101,6 +113,7 @@ class QualificationRunnerTest(unittest.TestCase):
                             "profile_values": {
                                 "hbc_subgroup_leaves_scored": {"mean": 12},
                                 "hbc_subgroup_vectors_skipped": {"mean": 120},
+                                "hbc_traversal_bound_stops": {"mean": 3},
                                 "hbc_subgroup_compact_groups_scored": {"mean": 12},
                                 "hbc_rerank_vector_projection_borrows": {"mean": 12},
                             },
@@ -130,6 +143,10 @@ class QualificationRunnerTest(unittest.TestCase):
             patch.object(runner, "__file__", str(script)),
             patch.object(sys, "argv", args),
             patch.object(runner.subprocess, "run", side_effect=execute),
+            patch(
+                "native_preparation_experiments.shutil.disk_usage",
+                return_value=SimpleNamespace(free=32 * 1024**3),
+            ),
             patch.dict(
                 runner.os.environ,
                 {
@@ -354,7 +371,10 @@ class QualificationRunnerTest(unittest.TestCase):
 
     def test_refinements_are_independent_and_keep_no_copy_constant(self):
         for name, controls in posting_runner.REFINEMENTS.items():
-            calls, receipts = self.run_fixture(module=posting_runner, refinement=name)
+            common = "subgroups_4" if name == "certified_subgroups" else None
+            calls, receipts = self.run_fixture(
+                module=posting_runner, refinement=name, common_refinement=common
+            )
             self.assertEqual(
                 [r["mode"] for r in receipts],
                 ["control", "candidate", "candidate", "control"] * 2,
@@ -369,6 +389,8 @@ class QualificationRunnerTest(unittest.TestCase):
                         self.assertEqual(
                             env[key], "1" if receipt["mode"] == "candidate" else "0"
                         )
+                    elif common and key in posting_runner.REFINEMENTS[common]:
+                        self.assertEqual(env[key], "1")
                     else:
                         self.assertNotIn(key, env)
 

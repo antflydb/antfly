@@ -97,14 +97,37 @@ pub const View = struct {
     pub fn lowerBoundScaled(self: View, group: usize, query: []const f32, scale: f64) ?f32 {
         if (self.radii.len != self.ends.len or group >= self.ends.len or query.len != self.dims) return null;
         if (!std.math.isFinite(scale) or scale <= 0 or !std.math.isFinite(self.radii[group]) or self.radii[group] < 0) return null;
-        var distance: f64 = 0;
-        for (query, self.centers[group * self.dims ..][0..self.dims]) |q, center| {
-            const diff = @as(f64, q) * scale - center;
-            distance += diff * diff;
+        const center = self.centers[group * self.dims ..][0..self.dims];
+        var dots: @Vector(8, f64) = @splat(0);
+        var norms: @Vector(8, f64) = @splat(0);
+        var offset: usize = 0;
+        while (offset + 8 <= query.len) : (offset += 8) {
+            const q: @Vector(8, f32) = query[offset..][0..8].*;
+            const c: @Vector(8, f32) = center[offset..][0..8].*;
+            const qw: @Vector(8, f64) = @floatCast(q);
+            const cw: @Vector(8, f64) = @floatCast(c);
+            dots += qw * cw;
+            norms += cw * cw;
         }
-        const chord = @max(0, @sqrt(distance) - self.radii[group]);
+        var dot = @reduce(.Add, dots);
+        var norm = @reduce(.Add, norms);
+        while (offset < query.len) : (offset += 1) {
+            dot += @as(f64, query[offset]) * center[offset];
+            norm += @as(f64, center[offset]) * center[offset];
+        }
+        if (norm <= 0 or !std.math.isFinite(norm)) return null;
+        const center_norm = @sqrt(norm);
+        // Intersect the covering ball with the unit sphere instead of using
+        // only a Euclidean triangle bound. Expand for normalization of the
+        // rounded stored center, so existing certificates remain valid.
+        const radius = self.radii[group] + @abs(center_norm - 1);
         const slack = 8 * @as(f64, @floatFromInt(self.dims)) * std.math.floatEps(f32);
-        return @floatCast(chord * chord * 0.5 - slack);
+        if (radius >= 2) return @floatCast(-slack);
+        const cosine = std.math.clamp(dot * scale / center_norm, -1, 1);
+        const cap_cosine = 1 - radius * radius * 0.5;
+        if (cosine >= cap_cosine) return @floatCast(-slack);
+        const maximum_dot = cosine * cap_cosine + @sqrt(@max(0, (1 - cosine * cosine) * (1 - cap_cosine * cap_cosine)));
+        return @floatCast(1 - maximum_dot - slack);
     }
 
     /// Little-endian, length-framed extension. No native ABI padding is stored.
@@ -452,6 +475,47 @@ fn certifiedAllocationExercise(alloc: Allocator) !void {
 test "certified subgroup bounds cover authoritative perturbations and allocation failures" {
     try certifiedAllocationExercise(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, certifiedAllocationExercise, .{});
+}
+
+test "certified subgroup spherical bounds cover SIMD tails high dimensions and scaled queries" {
+    const alloc = std.testing.allocator;
+    const simple: View = .{ .dims = 2, .rows = &.{0}, .ends = &.{1}, .centers = &.{ 1, 0 }, .radii = &.{0.2} };
+    // The ambient Euclidean bound is about 0.737; intersecting the source
+    // ball with the unit sphere certifies a tighter distance above 0.79.
+    try std.testing.expect(simple.lowerBound(0, &.{ 0, 1 }).? > 0.79);
+    var random = std.Random.DefaultPrng.init(791);
+    for ([_]usize{ 3, 8, 17, 768 }) |dims| {
+        const vectors = try alloc.alloc(f32, 8 * dims);
+        defer alloc.free(vectors);
+        for (0..8) |row| {
+            vectors[row * dims] = if (row < 4) 1 else -1;
+            for (1..dims) |d| vectors[row * dims + d] = @sin(@as(f32, @floatFromInt(row * 13 + d))) * 0.03;
+        }
+        var plan = try Plan.build(alloc, vectors, dims, 4, null);
+        defer plan.deinit();
+        const errors = [_]Plan.SourceError{.{ .norm_error = 0.001, .decoded_norm_lower_bound = 0.99 }} ** 8;
+        try plan.certify(vectors, &errors);
+        const query = try alloc.alloc(f32, dims);
+        defer alloc.free(query);
+        for (0..24) |trial| {
+            for (query) |*q| q.* = (random.random().float(f32) - 0.5) * (if (trial % 2 == 0) @as(f32, 0.01) else 99);
+            for (0..4) |group| {
+                const bound = plan.view.lowerBound(group, query).?;
+                const r = plan.view.range(group);
+                for (plan.view.rows[r.start..r.end]) |row| {
+                    var norm: f64 = 0;
+                    var dot: f64 = 0;
+                    for (query, vectors[row * dims ..][0..dims]) |q, decoded| {
+                        const authoritative = @as(f64, decoded) + 0.00001 / @sqrt(@as(f64, @floatFromInt(dims)));
+                        norm += authoritative * authoritative;
+                        dot += @as(f64, q) * authoritative;
+                    }
+                    const exact = 1 - dot * View.queryScale(query).? / @sqrt(norm);
+                    try std.testing.expect(@as(f64, bound) <= exact);
+                }
+            }
+        }
+    }
 }
 
 test "subgroup plans are balanced deterministic and allocation safe" {

@@ -7,6 +7,7 @@ retain the ordinary execution, restart, visibility and paired recall gates.
 import json
 import math
 import re
+import shutil
 
 REFINEMENTS = {
     "staged_readers": ["ANTFLY_EXPERIMENT_STAGE_POSTING_READERS"],
@@ -14,6 +15,21 @@ REFINEMENTS = {
     "certified_subgroups": ["ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS"],
     "reused_posting_rows": ["ANTFLY_EXPERIMENT_REUSE_POSTING_ROWS"],
 }
+
+
+def require_disk_headroom(root, case):
+    """Leave room for a fresh arm's live, staged and restart generations.
+
+    This is a launch guard, not a reservation against unrelated disk writers.
+    It never reclaims existing evidence or baseline data automatically.
+    """
+    needed = (12 if case == "Performance768D1M" else 3) * 1024**3
+    free = shutil.disk_usage(root).free
+    if free < needed:
+        raise RuntimeError(
+            f"insufficient disk headroom for {case}: {free / 1024**3:.1f} GiB free, "
+            f"{needed / 1024**3:.0f} GiB required; no test database was created"
+        )
 
 
 def events(lines, marker):

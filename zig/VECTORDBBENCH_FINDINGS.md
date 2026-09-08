@@ -9278,3 +9278,129 @@ second 1M candidate finished and these changes compiled; its binaries and
 measurement inputs remain pinned. The new comparisons must use the same
 binary on/off, retain C1/10/20/30 and mixed workload measurements, and require
 the existing native visibility/restart and one-percentage-point recall gates.
+
+Checkpoint `b099035d7` contains these guarded implementations and focused
+tests. ReleaseFast binary
+`.benchmark-assets/pr593-native-preparation-20260908/bin/antfly` is pinned at
+SHA-256 `52ec86674d9efb51780c697cabb5c43327ddd10fca7f57a8b25200d036dc072d`.
+Compilation completed before resuming the old matrix's final 1M control.
+The worktree also contains independent source-vector/GC changes; all new A/B
+arms must use this same binary so those common changes are not attributed to
+the native preparation flags. Only 33–34 GiB is currently free: a per-arm
+headroom gate is required, and preserved baselines must not be reclaimed.
+
+The completion-lane matrix's first 1M control sharpens the routing diagnosis:
+its fixed profile performs 239,192 approximate scores and reads 23.117 MB of
+leaf scan data per query. All seven frontier-bound checks overlap; missing
+posting bounds and incomplete-top-k fallbacks are zero. The recorded suffix
+lower bound is 0 versus a mean top-k upper bound of 0.17528. The current issue
+is therefore loose resolved bounds, not the previously fixed NaN-radius gap.
+
+Post-checkpoint review added explicit score-scratch capacity before certified
+top-k calculations: a cold fused/global path must not rely on a prior rerank
+having populated scratch. It also tightens group proofs by intersecting the
+covering ball with the unit sphere, using cross-platform Zig SIMD for the
+representative dot/norm calculation. These follow-ups require new Debug tests
+and a separately pinned binary before routing qualification; they are not in
+the `52ec8667` reader-staging executable above.
+
+##### Completed wakeup-only 1M qualification and query-window attribution
+
+All four 1M arms of
+`.benchmark-results/pr593-completion-lane-ab-20260908-retry` passed execution,
+restart, visibility, and paired recall gates. They do **not** qualify the
+wakeup lane as an end-to-end performance improvement:
+
+| Pair / arm | Ready s | C30 QPS | C30 p95 ms | Recall % | Mixed write p95 ms | Mixed query p95 ms | Catch-up s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 control | 299.815 | 861.319 | 67.083 | 99.02 | 116.799 | 52.522 | 43.506 |
+| 1 completion lane | 361.712 | 622.877 | 102.318 | 99.01 | 663.107 | 111.883 | 64.460 |
+| 2 completion lane | 422.928 | 672.493 | 96.185 | 99.05 | 134.710 | 57.648 | 73.648 |
+| 2 control | 385.090 | 762.882 | 84.931 | 99.03 | 100.841 | 53.772 | 46.535 |
+
+Read-only RSS, mixed RSS, and post-restart allocated disk in decimal GB were
+5.220/5.200/3.821 (control 1), 5.729/4.921/3.817 (candidate 1),
+5.970/4.780/3.831 (candidate 2), and 5.442/5.454/3.819 (control 2).
+RSS is not physical footprint. Full receipts and every original metric remain
+in `full-comparison.json`; no historical best was substituted for a control.
+
+`scripts/summarize_native_query_windows.py` joins the explicit client C1/10/20/30
+start/end timestamps to the **inner** Prometheus snapshots. Both candidate
+C30 windows have zero checkpoint-completion-round increments. Thus active
+checkpoint publication during those sampled windows does not explain their
+query regression. Mean admission wait per sampled grant was 6.978/9.004 ms
+in pair 1 and 7.893/8.332 ms in pair 2 (control/candidate). Peak sampled active
+queries was 17 in every arm. These observations neither explain all missing
+throughput nor establish host contention or an admission-policy root cause.
+Counter windows cover 27–29 seconds, not the entire client wave; absent control
+completion counters remain absent rather than being fabricated as zero.
+
+The same-binary reader-staging matrix is separately in progress at
+`.benchmark-results/pr593-staged-readers-ab-20260908/staged_readers`.
+Its first mixed 50K delta moved 63.682 ms of control reader installation to
+60.981 ms of candidate worker preparation; candidate writer reader work was
+0.001 ms. However, that candidate still waited 1,211.271 ms after file-worker
+completion, including 1,061.006 ms overlapping source capture, with 13 failed
+lock observations. Control overlap was 909.016 ms of 1,052.732 ms waiting.
+These are different live capture windows, not an isolated speedup ratio.
+The candidate's final rebase/prepublication preparation was only 0.974 ms.
+The data supports moving reader work but identifies capture lifetime—not that
+small final rebase—as the dominant remaining blocker in this 50K sample.
+
+Follow-up Debug native flat/tree certificate lifecycle tests pass with actual
+bound pruning and float32 score/order parity. The Python runner/evidence/window
+suite passes 29 tests, including hermetic disk-headroom checks. New runner
+inputs and binaries are hashed in each arm receipt and must not be edited while
+the matrix is active. No new experiment has been promoted to a default.
+
+##### Capture preparation experiment (implementation, not yet qualified)
+
+The measured capture overlap includes work preceding capture completion; it
+must not be mislabeled as a one-second WAL fsync. Replay currently acquires its
+source capture **before** opening the primary journal cursor and collecting,
+decoding, and allocating the next replay window. That preparation is read-only.
+
+`ANTFLY_EXPERIMENT_DEFER_SOURCE_CAPTURE` moves capture acquisition to the
+existing post-collection/pre-apply window hook in both threaded executors.
+The worker still owns one exact session token from the first mutation through
+durable finish. Additional coalesced windows retain that token. Empty cursors
+need no mutation capture, and acquisition failure aborts before any apply and
+retries from the durable sequence. Index deletion and shadow activation already
+stop/join the worker before replacing its index; this change does not bypass
+that lifecycle fence. Primary cursor leases remain owned until close.
+
+This experiment does not change batch size, replay byte/item limits, public
+sync semantics, or atomic source coverage. It does **not** move artifact loading
+inside the apply callback or tree mutation off the writer lane. Common
+`ANTFLY_EXPERIMENT_CAPTURE_STAGES` tracing now reports collection and apply
+separately from capture-finalization timers. Compare those stages and checkpoint
+capture overlap before claiming it recovers a material part of the stall.
+The active reader-staging matrix still uses its original pinned executable.
+
+Validation: both new executor tests pass. A broader Debug run passes 25 tests
+(both replay executors plus native flat/tree certificate lifecycle); five
+additional ownership/empty-target checks pass. The additional existing
+`db dense auto bulk finish wakes weak-sync replay and publishes visibility after
+catch-up` test fails its `publish_blocking_checkpoint_clean` assertion with the
+capture flag **both on and off in the same Debug executable**. The suite is not
+fully green; do not suppress that separate lifecycle qualification issue or
+attribute it to this treatment. Python analysis/runner tests pass 30 checks.
+
+The first complete 1M reader-staging pair reports control/candidate readiness
+340.271/306.589 s, C30 610.884/836.803 QPS, p95 101.487/72.747 ms, recall
+99.04/99.03%, mixed write p95 160.417/91.437 ms, mixed query p95
+56.103/42.316 ms, and catch-up 50.163/35.592 s. Read-only RSS increases
+5.058→6.471 GB and mixed RSS 4.812→5.421 GB, while measured attributable
+live demand falls 1.728→1.182 GB. Allocated disk is 3.815/3.797 GB.
+This one pair is encouraging for latency but not an all-metric win, and the
+post-restart fixed-query mean increases 11.653→12.318 ms. The reversed pair
+remains necessary; first-pair results are not a promoted baseline.
+
+The new ReleaseFast build failed after an intermediate `kmeans_metal.o` became
+unavailable in the shared `/tmp/zig-local-cache`. No new performance executable
+was produced; retry with a dedicated cache. The second reader-staging candidate
+load briefly overlapped the failed build's remaining compiler before it was
+terminated, so that load sample is not clean compiler-isolated evidence. Its
+pinned binary/inputs are unchanged. Available disk meanwhile rose to about
+160 GiB without this task deleting any benchmark data; the earlier headroom
+blocker no longer applies.

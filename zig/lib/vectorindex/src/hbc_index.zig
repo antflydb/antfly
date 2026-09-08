@@ -3813,8 +3813,13 @@ fn drainGlobalSubgroups(self: anytype, txn: anytype, scratch: anytype, req: sear
         // A stale upper bound from k already-observed members remains safe.
         // Refresh in bounded waves, not by sorting the candidate heap for
         // every tiny group. This changes proof tightness, not search effort.
-        if (certified and (certified_upper == null or leaf_index % 64 == 0))
+        if (certified and (certified_upper == null or leaf_index % 64 == 0)) {
+            // A cold fused/global scan may never have allocated score scratch.
+            // Do not silently disable certification until a prior rerank happens
+            // to leave a sufficiently large buffer in the scratch pool.
+            try scratch.ensureScoreCapacity(self.alloc, results.items.items.len);
             certified_upper = approxTopKUpperBound(results.items.items, req.k, scratch.distances);
+        }
         var ranges: [16]quantizer_mod.ScoreRange = undefined;
         var count: usize = 0;
         var selected_rows: usize = 0;

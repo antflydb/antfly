@@ -17,6 +17,11 @@ import time
 from pathlib import Path
 
 from projection_locality_inputs import input_paths, receipt_passed
+from native_preparation_experiments import (
+    REFINEMENTS as NATIVE_REFINEMENTS,
+    require_disk_headroom,
+    validate_native_treatment,
+)
 
 REFINEMENTS = {
     "pages": ["ANTFLY_EXPERIMENT_PROJECTION_PAGES"],
@@ -86,6 +91,7 @@ REFINEMENTS["recovery_v2"] = list(
 REFINEMENTS["admitted_quantized_routing"] = (
     REFINEMENTS["aggregate"] + REFINEMENTS["quantized_routing"]
 )
+REFINEMENTS.update(NATIVE_REFINEMENTS)
 ALL_REFINEMENT_FLAGS = sorted(
     {flag for flags in REFINEMENTS.values() for flag in flags}
 )
@@ -227,6 +233,12 @@ def main():
     candidate_flags = common_flags.union(REFINEMENTS.get(args.refinement, []))
     if len(candidate_flags.intersection(layout_flags)) > 1:
         parser.error("choose only one physical subgroup layout per fresh-load A/B")
+    if "ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS" in candidate_flags and (
+        not candidate_flags.intersection(layout_flags) or args.profile_count <= 0
+    ):
+        parser.error(
+            "certified subgroup qualification requires a physical subgroup layout and a nonempty public profile"
+        )
     if (
         candidate_flags.intersection(layout_flags)
         and candidate_flags.intersection(
@@ -252,6 +264,7 @@ def main():
     # of silently combining different measurement implementations.
     inputs = input_paths(binary, Path(__file__).resolve())
     inputs.add(control_binary)
+    inputs.add(scripts / "native_preparation_experiments.py")
     if args.sample_process:
         inputs.add(scripts / "sample_macos_process_memory.py")
     expected = {str(path): digest(path) for path in sorted(inputs)}
@@ -361,6 +374,7 @@ def main():
                             f"cannot resume failed or changed arm: {arm.name}"
                         )
                     continue
+                require_disk_headroom(root, case)
                 receipt = {
                     "case": case,
                     "pair": pair + 1,
@@ -429,6 +443,11 @@ def main():
                         observation = validate_subgroup_treatment(arm, arm_environment)
                         if observation is not None:
                             receipt["treatment_observation"] = observation
+                        native_observation = validate_native_treatment(
+                            arm, arm_environment
+                        )
+                        if native_observation is not None:
+                            receipt["native_treatment_observation"] = native_observation
                 except RuntimeError as error:
                     receipt["invalid_reason"] = str(error)
                     save()

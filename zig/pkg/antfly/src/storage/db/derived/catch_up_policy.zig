@@ -206,6 +206,14 @@ pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: 
     };
 }
 
+/// Journal cursor/collection work is read-only. The capture and its snapshot
+/// mutation lease need to cover apply through durable finish, not preparation.
+/// Keep this independent of forIndex(), which adapts the replay byte budget.
+pub fn deferSourceCapture(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: ?*resource_manager_mod.ResourceManager) bool {
+    if (index_ref.kind != .dense_vector) return false;
+    return if (resource_manager) |manager| manager.dense_deferred_source_capture else false;
+}
+
 /// Reuse one source capture across bounded apply chunks at an idle backlog.
 /// Split the existing byte envelope, never multiply it. Foreground traffic
 /// keeps one publication window; the executor also rechecks between chunks.

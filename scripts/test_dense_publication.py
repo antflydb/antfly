@@ -4,6 +4,20 @@ from summarize_dense_publication import summarize_lines
 
 
 class PublicationTest(unittest.TestCase):
+    def test_collection_and_capture_finish_remain_separate(self):
+        result = summarize_lines(
+            [
+                "dense replay collection sequence=8 records=4 applied_windows=1 deferred_capture=true capture_before_collection=false collect_ns=30000000 apply_ns=80000000",
+                "dense capture stages batch=9 sequence=8 completed=true patch_ns=1000000 wal_ns=2000000 total_ns=3000000",
+            ]
+        )
+        groups = result["groups"]
+        self.assertEqual(
+            groups["replay_collection"]["timings"]["collect_ns"]["sum_ms"], 30
+        )
+        self.assertEqual(groups["capture_finish"]["timings"]["total_ns"]["sum_ms"], 3)
+        self.assertNotIn("completed_wait_ns", groups["replay_collection"]["timings"])
+
     def test_blocker_overlap_is_not_additive(self):
         result = summarize_lines(
             [
