@@ -1095,9 +1095,15 @@ test "storage.ha primary adoption serializes standby ownership transfer" {
         .slot_store_path = paths.slots.ptr,
         .handoff = handoff,
     };
-    var thread = std.Thread.spawn(.{}, Adoption.run, .{&adoption}) catch |err| {
+    defer if (adoption.primary) |*result| result.close();
+    var thread = std.testing.io.concurrent(Adoption.run, .{&adoption}) catch |err| {
         standby.unlockExclusive();
         return err;
+    };
+    var thread_awaited = false;
+    defer if (!thread_awaited) {
+        standby.unlockExclusive();
+        thread.await(std.testing.io);
     };
     while (!adoption.started.load(.acquire)) std.atomic.spinLoopHint();
     for (0..10_000) |_| {
@@ -1107,9 +1113,11 @@ test "storage.ha primary adoption serializes standby ownership transfer" {
     try std.testing.expect(!adoption.finished.load(.acquire));
 
     standby.unlockExclusive();
-    thread.join();
+    thread.await(std.testing.io);
+    thread_awaited = true;
     if (adoption.err) |err| return err;
     var primary = adoption.primary orelse return error.TestExpectedEqual;
+    adoption.primary = null;
     defer primary.close();
 
     try std.testing.expectError(error.StandbyConsumed, standby.applyAvailable(&apply_ctx, noOpApply));

@@ -20,6 +20,8 @@ const platform_time = @import("antfly_platform").time;
 const routes = @import("routes.zig");
 
 pub const HttpDriverConfig = struct {
+    /// Exclusive sender capacity borrowed from the enclosing runtime owner.
+    sender_io: ?std.Io = null,
     request_timeout_ms: u32 = 5_000,
     max_batch_bytes: usize = common_http.default_max_request_bytes,
     async_send_queue_max: usize = 4096,
@@ -82,6 +84,8 @@ pub const HttpFrameDriver = struct {
     cfg: HttpDriverConfig,
     executor: common.RequestExecutor,
     io: std.Io,
+    // Dedicated capacity keeps Raft senders independent of request/artifact fan-out.
+    sender_io: ?std.Io.Threaded = null,
     workers: []std.Io.Future(void) = &.{},
     isolated_executors: []common_http.StdHttpExecutor = &.{},
     mutex: std.Io.Mutex = .init,
@@ -182,6 +186,10 @@ pub const HttpFrameDriver = struct {
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
     }
 
+    fn senderIo(self: *@This()) std.Io {
+        return self.cfg.sender_io orelse self.sender_io.?.io();
+    }
+
     fn startAsyncSender(self: *HttpFrameDriver) !void {
         if (self.workers.len != 0) return;
         // A zero-sized pool is the explicit synchronous mode. It is useful to
@@ -198,27 +206,37 @@ pub const HttpFrameDriver = struct {
         }
         errdefer self.deinitIsolatedExecutors();
         self.workers = try self.alloc.alloc(std.Io.Future(void), self.cfg.async_send_worker_count);
+        if (self.cfg.sender_io == null) self.sender_io = std.Io.Threaded.init(self.alloc, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(self.cfg.async_send_worker_count),
+        });
+        errdefer {
+            if (self.sender_io) |*owned| owned.deinit();
+            self.sender_io = null;
+        }
         var started: usize = 0;
         errdefer {
             self.mutex.lockUncancelable(self.io);
             self.closing = true;
             self.cond.broadcast(self.io);
             self.mutex.unlock(self.io);
-            for (self.workers[0..started]) |*worker| _ = worker.await(self.io);
+            for (self.workers[0..started]) |*future| future.await(self.senderIo());
             self.alloc.free(self.workers);
             self.workers = &.{};
         }
         while (started < self.workers.len) : (started += 1) {
-            self.workers[started] = try self.io.concurrent(asyncSenderMain, .{ self, started });
+            self.workers[started] = try self.senderIo().concurrent(asyncSenderMain, .{ self, started });
         }
     }
 
     fn stopAsyncSender(self: *HttpFrameDriver) void {
         if (self.workers.len == 0) return;
         self.beginShutdown();
-        for (self.workers) |*worker| _ = worker.await(self.io);
+        for (self.workers) |*worker| _ = worker.await(self.senderIo());
         self.alloc.free(self.workers);
         self.workers = &.{};
+        if (self.sender_io) |*owned| owned.deinit();
+        self.sender_io = null;
         self.deinitIsolatedExecutors();
     }
 
@@ -588,7 +606,10 @@ test "http frame driver isolates blocked peers without reordering a peer lane" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -630,7 +651,7 @@ test "http frame driver isolates blocked peers without reordering a peer lane" {
     });
 
     const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-    while (executor.callCount() < 2 and platform_time.monotonicNs() < deadline_ns) std.Thread.yield() catch {};
+    while (executor.callCount() < 2 and platform_time.monotonicNs() < deadline_ns) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     // One worker may block per peer. The second peer-2 frame stays queued while
     // peer 3 progresses independently.
     try std.testing.expectEqual(@as(usize, 2), executor.callCount());
@@ -699,4 +720,66 @@ test "http frame driver split shutdown wakes idle senders before deinit" {
     driver.beginShutdown();
     try std.testing.expect(driver.closing);
     driver.deinit();
+}
+
+test "http frame sender drains partial startup and releases private capacity" {
+    const UnusedExecutor = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+    };
+    const executor: common.RequestExecutor = .{
+        .ptr = undefined,
+        .vtable = &.{ .execute = UnusedExecutor.execute },
+    };
+    var shared = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer shared.deinit();
+    var concurrency_failures: usize = 0;
+    for (0..32) |fail_index| {
+        // Idle senders do not allocate: future allocation/destruction and
+        // startup rollback all happen on this test's owning task.
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var driver = HttpFrameDriver.init(failing.allocator(), .{ .async_send_worker_count = 2 }, executor, shared.io());
+        defer driver.deinit();
+        driver.startAsyncSender() catch |err| {
+            switch (err) {
+                error.OutOfMemory => {},
+                error.ConcurrencyUnavailable => concurrency_failures += 1,
+            }
+            try std.testing.expectEqual(@as(usize, 0), driver.workers.len);
+            try std.testing.expect(driver.sender_io == null);
+            continue;
+        };
+        driver.stopAsyncSender();
+        try std.testing.expectEqual(@as(usize, 0), driver.workers.len);
+        try std.testing.expect(driver.sender_io == null);
+        // Exercise failure on both first and later future allocations.
+        try std.testing.expect(concurrency_failures >= 2);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "http frame sender borrows capacity and drains a refused partial startup" {
+    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer lane.deinit();
+    const Unused = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+        fn done() void {}
+    };
+    var driver = HttpFrameDriver.init(std.testing.allocator, .{ .sender_io = lane.io(), .async_send_worker_count = 2 }, .{
+        .ptr = undefined,
+        .vtable = &.{ .execute = Unused.execute },
+    }, std.testing.io);
+    defer driver.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, driver.startAsyncSender());
+    try std.testing.expectEqual(@as(usize, 0), driver.workers.len);
+    try std.testing.expect(driver.sender_io == null);
+    var probe = try lane.io().concurrent(Unused.done, .{});
+    probe.await(lane.io());
 }

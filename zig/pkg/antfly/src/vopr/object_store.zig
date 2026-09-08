@@ -6,6 +6,7 @@
 //! manifests, WAL, and progress stores remain their production implementations.
 
 const std = @import("std");
+const vopr = @import("vopr");
 const objectstore = @import("objectstore");
 const artifacts_object_store = @import("../serverless/artifacts/object_store.zig");
 const manifest_object_store = @import("../serverless/manifest/object_store.zig");
@@ -462,6 +463,8 @@ test "serverless object store VOPR consumes stale enrichment generation without 
 
 test "serverless object store VOPR enrichment conflict preserves pruning progress" {
     const alloc = std.testing.allocator;
+    var sim = try vopr.vopr_io.VoprIo.init(.{ .required = .of(&.{ .clock_read, .synchronization, .task_scheduling }) });
+    defer sim.deinit();
     var memory = objectstore.MemoryClient.init(alloc);
     defer memory.deinit();
 
@@ -508,7 +511,7 @@ test "serverless object store VOPR enrichment conflict preserves pruning progres
     var rejecting_impl = RejectConditionalAppendWal{ .inner = &wal };
     var rejecting_wal = rejecting_impl.walStore();
     defer rejecting_wal.deinit();
-    var runtime = runtime_manager.ManagedRuntime.init(alloc, .{
+    var runtime = runtime_manager.ManagedRuntime.init(alloc, sim.io(), .{
         .publish_enabled = false,
         .compaction_enabled = false,
         .prune_enabled = true,

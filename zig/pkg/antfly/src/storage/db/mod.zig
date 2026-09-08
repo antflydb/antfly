@@ -52,7 +52,6 @@ pub const replay_stream = @import("derived/replay_stream.zig");
 pub const replay_source = @import("derived/replay_source.zig");
 pub const runtime_backend = @import("../runtime_backend.zig");
 pub const background_runtime = @import("../background_runtime.zig");
-pub const async_runtime = @import("derived/async_runtime.zig");
 pub const io_threaded_runtime = @import("derived/io_threaded_runtime.zig");
 pub const ttl_runtime = @import("maintenance/ttl_runtime.zig");
 pub const transaction_runtime = @import("maintenance/transaction_runtime.zig");
@@ -210,7 +209,6 @@ test {
     _ = replay_source;
     _ = runtime_backend;
     _ = background_runtime;
-    _ = async_runtime;
     _ = io_threaded_runtime;
     _ = ttl_runtime;
     _ = transaction_runtime;

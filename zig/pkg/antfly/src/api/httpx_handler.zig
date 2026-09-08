@@ -6772,7 +6772,7 @@ const HttpxE2eServer = struct {
     io_impl: std.Io.Threaded,
     server: httpx.Server,
     handler: AntflyApiHandler,
-    thread: ?std.Thread = null,
+    thread: ?std.Io.Future(void) = null,
 
     fn init(self: *HttpxE2eServer, allocator: std.mem.Allocator, api_server: *ApiHttpServer) !void {
         return self.initWithLimits(allocator, api_server, 32, 1_000);
@@ -6814,13 +6814,13 @@ const HttpxE2eServer = struct {
         try self.handler.registerRoutes(&self.server);
 
         try self.server.bind();
-        self.thread = try std.Thread.spawn(.{}, listenHttpxE2eServer, .{&self.server});
+        self.thread = try std.testing.io.concurrent(listenHttpxE2eServer, .{&self.server});
     }
 
     fn deinit(self: *HttpxE2eServer) void {
-        if (self.thread) |thread| {
+        if (self.thread) |*thread| {
             self.server.stop();
-            thread.join();
+            thread.await(std.testing.io);
         }
         self.handler.deinitRuntime();
         self.server.deinit();

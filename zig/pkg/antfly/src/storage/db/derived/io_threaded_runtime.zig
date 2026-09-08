@@ -23,20 +23,20 @@ const backlog_tracker_mod = @import("backlog_tracker.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
-const async_runtime_mod = @import("async_runtime.zig");
+const runtime_types = @import("runtime_types.zig");
 const change_journal_mod = @import("change_journal.zig");
 const derived_types = @import("derived_types.zig");
 const threaded_io_limits = @import("../../../common/threaded_io_limits.zig");
 const platform_time = @import("antfly_platform").time;
 
-pub const RuntimeError = async_runtime_mod.RuntimeError;
-pub const ApplyFn = async_runtime_mod.ApplyFn;
-pub const PersistFn = async_runtime_mod.PersistFn;
-pub const TruncateFn = async_runtime_mod.TruncateFn;
-pub const BeginCatchUpFn = async_runtime_mod.BeginCatchUpFn;
-pub const FinishCatchUpFn = async_runtime_mod.FinishCatchUpFn;
-pub const CanAdvanceToTargetFn = async_runtime_mod.CanAdvanceToTargetFn;
-pub const AppliedSequenceAdvancedFn = async_runtime_mod.AppliedSequenceAdvancedFn;
+pub const RuntimeError = runtime_types.RuntimeError;
+pub const ApplyFn = runtime_types.ApplyFn;
+pub const PersistFn = runtime_types.PersistFn;
+pub const TruncateFn = runtime_types.TruncateFn;
+pub const BeginCatchUpFn = runtime_types.BeginCatchUpFn;
+pub const FinishCatchUpFn = runtime_types.FinishCatchUpFn;
+pub const CanAdvanceToTargetFn = runtime_types.CanAdvanceToTargetFn;
+pub const AppliedSequenceAdvancedFn = runtime_types.AppliedSequenceAdvancedFn;
 
 const Worker = struct {
     runtime: *DerivedRuntime,
@@ -1593,11 +1593,11 @@ test "io threaded wait observes worker-owned catch-up close" {
         }
     };
     var race = Race{ .runtime = &runtime };
-    const wait_thread = try std.Thread.spawn(.{}, Race.wait, .{&race});
+    var wait_thread = try std.testing.io.concurrent(Race.wait, .{&race});
     var wait_joined = false;
     defer if (!wait_joined) {
         capture.release_finish.store(true, .release);
-        wait_thread.join();
+        wait_thread.await(std.testing.io);
     };
 
     for (0..5_000) |_| {
@@ -1623,7 +1623,7 @@ test "io threaded wait observes worker-owned catch-up close" {
     }
 
     capture.release_finish.store(true, .release);
-    wait_thread.join();
+    wait_thread.await(std.testing.io);
     wait_joined = true;
 
     try std.testing.expect(!race.wait_failed.load(.acquire));
@@ -1686,11 +1686,11 @@ test "io threaded wait requests prompt worker catch-up close" {
         }
     };
     var wait = Wait{ .runtime = &runtime };
-    const wait_thread = try std.Thread.spawn(.{}, Wait.run, .{&wait});
+    var wait_thread = try std.testing.io.concurrent(Wait.run, .{&wait});
     var wait_joined = false;
     defer if (!wait_joined) {
         capture.release_finish.store(true, .release);
-        wait_thread.join();
+        wait_thread.await(std.testing.io);
     };
 
     // Dense workers normally retain an idle session for reuse. A synchronous
@@ -1703,7 +1703,7 @@ test "io threaded wait requests prompt worker catch-up close" {
     try std.testing.expect(!wait.done.load(.acquire));
 
     capture.release_finish.store(true, .release);
-    wait_thread.join();
+    wait_thread.await(std.testing.io);
     wait_joined = true;
     try std.testing.expect(!wait.failed.load(.acquire));
     try std.testing.expect(wait.done.load(.acquire));
@@ -1775,18 +1775,18 @@ test "io threaded wait observes failed worker-owned catch-up close" {
         }
     };
     var wait = Wait{ .runtime = &runtime };
-    const wait_thread = try std.Thread.spawn(.{}, Wait.run, .{&wait});
+    var wait_thread = try std.testing.io.concurrent(Wait.run, .{&wait});
     var wait_joined = false;
     defer if (!wait_joined) {
         wait.failRuntime();
-        wait_thread.join();
+        wait_thread.await(std.testing.io);
     };
 
     io.sleep(Io.Duration.fromMilliseconds(25), .awake) catch {};
     try std.testing.expect(!wait.done.load(.acquire));
 
     wait.failRuntime();
-    wait_thread.join();
+    wait_thread.await(std.testing.io);
     wait_joined = true;
     try std.testing.expect(wait.done.load(.acquire));
     try std.testing.expect(wait.saw_expected_error.load(.acquire));

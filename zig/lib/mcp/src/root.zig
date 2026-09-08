@@ -943,15 +943,20 @@ test "mcp session close is synchronized across callers" {
             for (assigned) |id| _ = store.iface().close(id);
         }
     };
-    var workers: [worker_count]std.Thread = undefined;
+    var workers: [worker_count]std.Io.Future(void) = undefined;
     const per_worker = session_count / worker_count;
+    var started_tasks: usize = 0;
+    defer {
+        for (workers[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
     for (&workers, 0..) |*worker, i| {
-        worker.* = try std.Thread.spawn(.{}, Worker.run, .{
+        worker.* = try std.testing.io.concurrent(Worker.run, .{
             &sessions,
             ids[i * per_worker .. (i + 1) * per_worker],
         });
+        started_tasks += 1;
     }
-    for (&workers) |*worker| worker.join();
+    for (&workers) |*worker| worker.await(std.testing.io);
     for (ids) |id| try std.testing.expect(!sessions.iface().exists(id));
 }
 

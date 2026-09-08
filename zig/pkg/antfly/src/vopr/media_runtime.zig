@@ -198,6 +198,7 @@ pub const Scenario = struct {
             // bounded. Only the timeout mode installs a request deadline;
             // otherwise an intentionally starved runnable task could turn a
             // success/retry property into a timeout property.
+            options.client.timeouts.connect_ms = 0;
             options.client.timeouts.request_ms = 0;
             options.client.timeouts.read_ms = 0;
             options.client.timeouts.write_ms = 0;

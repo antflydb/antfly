@@ -121,6 +121,9 @@ pub fn stableRandomSeed(group_id: u64, local_node_id: u64) u64 {
 }
 
 pub const HostDeps = struct {
+    /// Borrowed synchronization context; must outlive the host. The default
+    /// supports blocking mutex waits without allocating a worker pool.
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
     replica_catalog: ?catalog.ReplicaCatalog = null,
     peer_resolver: ?peer_resolver.PeerResolver = null,
     runtime_hooks: RuntimeHooks = .{},
@@ -402,7 +405,7 @@ pub const Host = struct {
     runtime_host: raft_engine.runtime.MultiRaft,
     bootstrap_statuses: std.AutoHashMapUnmanaged(u64, OwnedBootstrapStatus) = .empty,
     admission_conflicts: std.AutoHashMapUnmanaged(u64, raft_engine.runtime.group.ReplicaAdmissionConflict) = .empty,
-    inbound_mutex: std.atomic.Mutex = .unlocked,
+    inbound_mutex: std.Io.Mutex = .init,
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
@@ -424,7 +427,7 @@ pub const Host = struct {
         var pending = self.pending_inbound;
         self.pending_inbound = .empty;
         self.metrics.pending_inbound_messages = 0;
-        self.inbound_mutex.unlock();
+        self.inbound_mutex.unlock(self.deps.io);
         for (pending.items) |*item| item.deinit(self.alloc);
         pending.deinit(self.alloc);
         var bootstrap_it = self.bootstrap_statuses.valueIterator();
@@ -1029,7 +1032,7 @@ pub const Host = struct {
 
         if (pending.items.len > 0) {
             self.lockInbound();
-            defer self.inbound_mutex.unlock();
+            defer self.inbound_mutex.unlock(self.deps.io);
 
             try self.pending_inbound.ensureUnusedCapacity(self.alloc, pending.items.len);
             for (pending.items) |item| self.pending_inbound.appendAssumeCapacity(item);
@@ -1051,7 +1054,7 @@ pub const Host = struct {
         const drain_count = @min(max_messages, self.pending_inbound.items.len);
         if (drain_count > 0) {
             pending.ensureTotalCapacity(self.alloc, drain_count) catch |err| {
-                self.inbound_mutex.unlock();
+                self.inbound_mutex.unlock(self.deps.io);
                 return err;
             };
             pending.appendSliceAssumeCapacity(self.pending_inbound.items[0..drain_count]);
@@ -1068,7 +1071,7 @@ pub const Host = struct {
             }
         }
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
-        self.inbound_mutex.unlock();
+        self.inbound_mutex.unlock(self.deps.io);
 
         var drained: usize = 0;
         for (pending.items) |item| {
@@ -1085,9 +1088,7 @@ pub const Host = struct {
     }
 
     fn lockInbound(self: *Host) void {
-        while (!self.inbound_mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
+        self.inbound_mutex.lockUncancelable(self.deps.io);
     }
 
     fn mapGroupActivityError(err: anyerror) anyerror {
@@ -1179,7 +1180,7 @@ pub const Host = struct {
         errdefer msg.deinit(self.alloc);
 
         self.lockInbound();
-        defer self.inbound_mutex.unlock();
+        defer self.inbound_mutex.unlock(self.deps.io);
         try self.pending_inbound.append(self.alloc, .{
             .group_id = upload.group_id,
             .message = msg,
@@ -1338,6 +1339,7 @@ pub const Host = struct {
 };
 
 pub const HttpHost = struct {
+    worker_leases: [5]?backend_runtime_mod.BackendRuntime.WorkerLease = @splat(null),
     alloc: std.mem.Allocator,
     cfg: HttpHostConfig,
     deps: HttpHostDeps,
@@ -1352,6 +1354,12 @@ pub const HttpHost = struct {
     listener: ?*transport.StdHttpListener,
 
     pub fn init(alloc: std.mem.Allocator, cfg: HttpHostConfig, deps: HttpHostDeps) !HttpHost {
+        var worker_leases: [5]?backend_runtime_mod.BackendRuntime.WorkerLease = @splat(null);
+        errdefer for (&worker_leases) |*slot| {
+            if (slot.*) |*lease| lease.release();
+        };
+        var listener_config = cfg.listener;
+
         var executor: ?*transport.StdHttpExecutor = null;
         const request_executor = if (deps.request_executor) |override| override else blk: {
             const owned = try alloc.create(transport.StdHttpExecutor);
@@ -1368,6 +1376,11 @@ pub const HttpHost = struct {
             errdefer owned.deinit();
             executor = owned;
             break :blk owned.executor();
+        };
+
+        errdefer if (executor) |owned| {
+            owned.deinit();
+            alloc.destroy(owned);
         };
 
         const transport_stack = try alloc.create(transport.HttpTransportStack);
@@ -1387,6 +1400,25 @@ pub const HttpHost = struct {
             null;
         const transport_io = if (deps.backend_runtime) |runtime| runtime.raftOutboundIo() else null;
         var transport_config = cfg.transport;
+        if (deps.backend_runtime) |runtime| {
+            if (transport_config.driver.async_send_worker_count > 0) {
+                worker_leases[0] = try runtime.acquireWorkers(.{ .capacity = transport_config.driver.async_send_worker_count });
+                transport_config.driver.sender_io = worker_leases[0].?.io();
+            }
+            if (transport_config.snapshot.async_send_worker_count > 0) {
+                worker_leases[1] = try runtime.acquireWorkers(.{ .capacity = transport_config.snapshot.async_send_worker_count });
+                transport_config.snapshot.sender_io = worker_leases[1].?.io();
+            }
+            // StdHttpListener owns native sockets. Hybrid fixtures retain its
+            // native scheduling fallback; a virtual lane must never block in accept.
+            if (!deps.listener_disabled and !runtime.usesBorrowedIo()) {
+                worker_leases[2] = try runtime.acquireWorkers(.{ .stack_size = cfg.listener.thread_stack_size });
+                worker_leases[3] = try runtime.acquireWorkers(.{ .stack_size = @import("../runtime_thread_config.zig").minimum_partitioned_stack_size });
+                listener_config.accept_io = worker_leases[2].?.io();
+                listener_config.observer_io = worker_leases[3].?.io();
+            }
+            if (deps.snapshot_store == null) worker_leases[4] = try runtime.acquireWorkers(.{});
+        }
         // V1 snapshots are one HTTP body in both directions. Bound publication
         // by the stricter listener/executor ceiling so a default-compatible
         // host cannot accept an artifact that another host cannot fetch.
@@ -1433,6 +1465,7 @@ pub const HttpHost = struct {
                 // this independently through the capability endpoint.
                 .max_chunk_bytes = @min(snapshot_transfer.max_chunk_bytes, cfg.listener.max_request_bytes),
                 .artifact_policy = cfg.snapshot_artifact_policy,
+                .maintenance_io = if (worker_leases[4]) |*lease| lease.io() else null,
             });
             break :blk snapshot_store;
         } else null;
@@ -1465,11 +1498,11 @@ pub const HttpHost = struct {
             errdefer alloc.destroy(owned);
             owned.* = if (deps.backend_runtime) |backend_runtime|
                 if (backend_runtime.raftInboundIoImpl()) |io_impl|
-                    transport.StdHttpListener.initShared(alloc, cfg.listener, server.executor(), io_impl)
+                    transport.StdHttpListener.initShared(alloc, listener_config, server.executor(), io_impl)
                 else
-                    transport.StdHttpListener.init(alloc, cfg.listener, server.executor())
+                    transport.StdHttpListener.init(alloc, listener_config, server.executor())
             else
-                transport.StdHttpListener.init(alloc, cfg.listener, server.executor());
+                transport.StdHttpListener.init(alloc, listener_config, server.executor());
             break :blk owned;
         };
 
@@ -1479,6 +1512,7 @@ pub const HttpHost = struct {
             .deps = deps,
             .executor = executor,
             .request_executor = request_executor,
+            .worker_leases = worker_leases,
             .transport_stack = transport_stack,
             .owned_snapshot_resolver = owned_snapshot_resolver,
             .owned_snapshot_store = owned_snapshot_store,
@@ -1508,6 +1542,9 @@ pub const HttpHost = struct {
         if (self.executor) |executor| {
             executor.deinit();
             self.alloc.destroy(executor);
+        }
+        for (&self.worker_leases) |*slot| {
+            if (slot.*) |*lease| lease.release();
         }
         self.* = undefined;
     }
@@ -2962,4 +2999,34 @@ test "http host starts listener and serves health route" {
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("ok", resp.body);
+}
+
+test "http host reserves service workers through its runtime and rolls back overcommit" {
+    for (0..5) |capacity| {
+        var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{ .worker_capacity = capacity });
+        defer runtime.deinit();
+        try std.testing.expectError(error.WorkerCapacityExceeded, HttpHost.init(std.testing.allocator, .{
+            .host = .{ .local_node_id = 1 },
+            .transport = .{ .driver = .{ .async_send_worker_count = 1 }, .snapshot = .{ .root_dir = "/tmp", .async_send_worker_count = 1 } },
+        }, .{ .backend_runtime = runtime.ptr() }));
+        try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+        try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
+    }
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{ .worker_capacity = 5 });
+    defer runtime.deinit();
+    var host = try HttpHost.init(std.testing.allocator, .{
+        .host = .{ .local_node_id = 1 },
+        .transport = .{ .driver = .{ .async_send_worker_count = 1 }, .snapshot = .{ .root_dir = "/tmp", .async_send_worker_count = 1 } },
+    }, .{ .backend_runtime = runtime.ptr() });
+    var live = true;
+    defer if (live) host.deinit();
+    try host.start();
+    try std.testing.expectEqual(@as(usize, 5), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expect(host.transport_stack.driver.sender_io == null);
+    try std.testing.expect(host.transport_stack.snapshot_transport.sender_io == null);
+    try std.testing.expect(host.listener.?.accept_io == null);
+    try std.testing.expect(host.listener.?.peer_observer.?.control_io == null);
+    host.deinit();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
 }

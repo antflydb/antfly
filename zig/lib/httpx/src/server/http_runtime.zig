@@ -29,6 +29,8 @@ pub const HttpRuntime = struct {
         /// The reservation is virtual on supported hosts; embedders may set an
         /// explicit smaller value only after validating every deployment target.
         observer_thread_stack_size: ?usize = null,
+        /// Reserved native observer scheduling capacity, borrowed until deinit.
+        observer_io: ?std.Io = null,
         /// Caller-owned backend-neutral lanes. When present, HttpRuntime owns
         /// only admission/lifecycle state and never constructs Threaded
         /// executors or a native descriptor observer.
@@ -108,6 +110,7 @@ pub const HttpRuntime = struct {
     };
 
     observer: CancellationObserver,
+    owned_observer_io: ?std.Io.Threaded,
     listener_io_impl: ?std.Io.Threaded,
     connection_io_impl: ?std.Io.Threaded,
     request_io_impl: ?std.Io.Threaded,
@@ -133,6 +136,7 @@ pub const HttpRuntime = struct {
             .connection_capacity = connection_capacity,
             .request_capacity = request_capacity,
             .listener_capacity = listener_capacity,
+            .owned_observer_io = null,
             .listener_io_impl = null,
             .connection_io_impl = null,
             .request_io_impl = null,
@@ -140,6 +144,11 @@ pub const HttpRuntime = struct {
             .observer = CancellationObserver.init(alloc, 0, config.observer_thread_stack_size),
         };
         return .{
+            .owned_observer_io = if (config.observer_io == null) std.Io.Threaded.init(alloc, .{
+                .stack_size = config.observer_thread_stack_size orelse (std.Io.Threaded.InitOptions{}).stack_size,
+                .async_limit = .nothing,
+                .concurrent_limit = .limited(1),
+            }) else null,
             .h1_request_capacity = config.max_active_h1_requests,
             .connection_capacity = connection_capacity,
             .request_capacity = request_capacity,
@@ -153,11 +162,11 @@ pub const HttpRuntime = struct {
             .request_io_impl = std.Io.Threaded.init(alloc, .{
                 .concurrent_limit = .limited(request_capacity),
             }),
-            .observer = CancellationObserver.init(
-                alloc,
-                config.max_active_h1_requests,
-                config.observer_thread_stack_size,
-            ),
+            .observer = blk: {
+                var observer = CancellationObserver.init(alloc, config.max_active_h1_requests, config.observer_thread_stack_size);
+                observer.scheduling_io = config.observer_io;
+                break :blk observer;
+            },
             .borrowed_io = null,
         };
     }
@@ -165,6 +174,7 @@ pub const HttpRuntime = struct {
     pub fn deinit(self: *HttpRuntime) void {
         std.debug.assert(self.listener_leases.load(.acquire) == 0);
         self.observer.deinit();
+        if (self.owned_observer_io) |*owned| owned.deinit();
         if (self.listener_io_impl) |*io_impl| io_impl.deinit();
         if (self.connection_io_impl) |*io_impl| io_impl.deinit();
         if (self.request_io_impl) |*io_impl| io_impl.deinit();
@@ -189,8 +199,9 @@ pub const HttpRuntime = struct {
             return error.HttpRuntimeConnectionCapacityExceeded;
         if (requirements.max_requests > self.request_capacity -| reserved_requests)
             return error.HttpRuntimeRequestCapacityExceeded;
-        if (reserved_h1 == 0 and requirements.max_h1_requests > 0) {
+        if (requirements.max_h1_requests > 0 and self.observer.future == null) {
             if (self.borrowed_io != null) return error.NativeCancellationObserverUnavailable;
+            if (self.observer.scheduling_io == null) self.observer.scheduling_io = self.owned_observer_io.?.io();
             try self.observer.start();
         }
         self.listener_leases.store(leases + 1, .release);
@@ -266,7 +277,11 @@ pub const HttpRuntime = struct {
         self.reserved_h1_request_capacity.store(remaining_h1, .release);
         self.reserved_connection_capacity.store(current_connections - reserved_connections, .release);
         self.reserved_request_capacity.store(current_requests - reserved_requests, .release);
-        if (reserved_h1 > 0 and remaining_h1 == 0) self.observer.stop();
+        // The observer's reserved worker belongs to the runtime, including
+        // intervals with no H1 listeners. Future.await can return before a
+        // Threaded worker releases its concurrency slot, so stopping here and
+        // immediately reacquiring a listener can spuriously fail to restart.
+        // Keep the idle observer until deinit, which joins its final task.
     }
 
     fn lock(self: *HttpRuntime) void {
@@ -292,8 +307,13 @@ test "HTTP runtime listener leases share one cancellation observer lifecycle" {
         .max_requests = 1,
     };
     var control = try runtime.acquireListener(control_requirements);
+    defer control.release();
     var first = try runtime.acquireListener(one_request);
+    defer first.release();
     var second = try runtime.acquireListener(one_request);
+    defer second.release();
+    const observer_future = runtime.observer.future.?.any_future;
+    try std.testing.expect(runtime.observer.control_io == null);
     try std.testing.expectEqual(@as(usize, 3), runtime.stats().active_listener_leases);
     try std.testing.expectEqual(@as(usize, 2), runtime.stats().reserved_h1_request_capacity);
     try std.testing.expectError(error.HttpRuntimeCapacityExceeded, runtime.acquireListener(one_request));
@@ -302,14 +322,51 @@ test "HTTP runtime listener leases share one cancellation observer lifecycle" {
     second.release();
     try std.testing.expectEqual(@as(usize, 1), runtime.stats().active_listener_leases);
     try std.testing.expectEqual(@as(usize, 0), runtime.stats().reserved_h1_request_capacity);
-    var restarted = try runtime.acquireListener(.{
-        .max_h1_requests = 2,
-        .max_connections = 2,
-        .max_requests = 2,
-    });
-    restarted.release();
+    // Listener churn must reuse the reserved worker even when only a control
+    // listener remains between application listeners.
+    for (0..100) |_| {
+        var restarted = try runtime.acquireListener(.{
+            .max_h1_requests = 2,
+            .max_connections = 2,
+            .max_requests = 2,
+        });
+        defer restarted.release();
+        try std.testing.expectEqual(observer_future, runtime.observer.future.?.any_future);
+    }
     control.release();
     try std.testing.expectEqual(@as(usize, 0), runtime.stats().active_listener_leases);
+}
+
+test "HTTP runtime observer startup failure preserves control listener reservations" {
+    if (@import("builtin").os.tag == .freestanding) return;
+    var observer_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer observer_io.deinit();
+    var runtime = HttpRuntime.init(std.testing.allocator, .{
+        .max_active_h1_requests = 1,
+        .observer_io = observer_io.io(),
+    });
+    defer runtime.deinit();
+    var control = try runtime.acquireListener(.{
+        .max_h1_requests = 0,
+        .max_connections = 0,
+        .max_requests = 0,
+    });
+    defer control.release();
+    for (0..2) |_| {
+        try std.testing.expectError(error.CancellationObserverThreadSpawnFailed, runtime.acquireListener(.{
+            .max_h1_requests = 1,
+            .max_connections = 1,
+            .max_requests = 1,
+        }));
+        const snapshot = runtime.stats();
+        try std.testing.expectEqual(@as(usize, 1), snapshot.active_listener_leases);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.reserved_h1_request_capacity);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.reserved_connection_capacity);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.reserved_request_capacity);
+    }
 }
 
 test "HTTP runtime reserves bounded dedicated listener workers" {

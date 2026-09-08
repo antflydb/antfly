@@ -3189,8 +3189,8 @@ test "data raft apply store prepared snapshot retains its MVCC view across later
         }
     };
     var worker = Worker{ .source = source };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    thread.join();
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    thread.await(std.testing.io);
     if (worker.failure) |err| return err;
     var materialized = worker.snapshot orelse return error.MissingDataSnapshot;
     defer materialized.deinit(std.heap.page_allocator);
@@ -3250,10 +3250,11 @@ test "data raft apply store orders independent groups through separate shards" {
 
     var first = Worker{ .store = &store, .group_id = 1 };
     var second = Worker{ .store = &store, .group_id = 2 };
-    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
-    first_thread.join();
-    second_thread.join();
+    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
+    defer first_thread.await(std.testing.io);
+    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
     if (first.result) |err| return err;
     if (second.result) |err| return err;
     try std.testing.expectEqual(@as(u64, 1), (try store.latestBatch(1)).?.commit_index);
@@ -5068,11 +5069,11 @@ test "data raft snapshot staging blocks only the target group" {
     test_block_snapshot_staging.store(true, .release);
     defer test_block_snapshot_staging.store(false, .release);
     var install_ctx = InstallContext{ .store = &target, .snapshot = snapshot };
-    var install_thread = try std.Thread.spawn(.{}, InstallContext.run, .{&install_ctx});
+    var install_thread = try std.testing.io.concurrent(InstallContext.run, .{&install_ctx});
     var install_joined = false;
     defer if (!install_joined) {
         test_block_snapshot_staging.store(false, .release);
-        install_thread.join();
+        install_thread.await(std.testing.io);
     };
 
     var attempts: usize = 0;
@@ -5093,17 +5094,17 @@ test "data raft snapshot staging blocks only the target group" {
     }
 
     var read_ctx = ReadContext{ .store = &target };
-    var read_thread = try std.Thread.spawn(.{}, ReadContext.run, .{&read_ctx});
+    var read_thread = try std.testing.io.concurrent(ReadContext.run, .{&read_ctx});
     var read_joined = false;
-    defer if (!read_joined) read_thread.join();
+    defer if (!read_joined) read_thread.await(std.testing.io);
     attempts = 0;
     while (!read_ctx.completed.load(.acquire) and attempts < 100_000) : (attempts += 1) platform.time.yieldBriefly();
     const colliding_group_completed_during_staging = read_ctx.completed.load(.acquire);
 
     test_block_snapshot_staging.store(false, .release);
-    read_thread.join();
+    read_thread.await(std.testing.io);
     read_joined = true;
-    install_thread.join();
+    install_thread.await(std.testing.io);
     install_joined = true;
     if (read_ctx.failure) |err| return err;
     if (install_ctx.failure) |err| return err;

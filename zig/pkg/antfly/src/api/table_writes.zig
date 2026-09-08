@@ -35612,15 +35612,15 @@ test "HA ownership transition serializes with active writer cache mutation" {
     var worker = Worker{ .source = &source, .gate_state = &gate_state };
 
     lockAtomic(&source.local_db_mutex);
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
     var attempts: usize = 0;
-    while (attempts < 1_000) : (attempts += 1) std.Thread.yield() catch {};
+    while (attempts < 1_000) : (attempts += 1) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const completed_while_locked = worker.completed.load(.acquire);
     const gate_changed_while_locked = source.ha_write_gate != null;
     const metadata_count_while_locked = write_cache.table_metadata.items.len;
     source.local_db_mutex.unlock();
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(!completed_while_locked);
     try std.testing.expect(!gate_changed_while_locked);
@@ -36533,7 +36533,7 @@ test "provisioned read preparation does not block on same-table batch after earl
     defer test_before_batch_execution_hook = null;
 
     var batch_worker = BatchWorker{ .source = &source, .alloc = alloc };
-    const batch_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&batch_worker});
+    var batch_thread = try std.testing.io.concurrent(BatchWorker.run, .{&batch_worker});
 
     const ReadWorker = struct {
         source: *ProvisionedTableWriteSource,
@@ -36550,9 +36550,9 @@ test "provisioned read preparation does not block on same-table batch after earl
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var read_worker = ReadWorker{ .source = &source };
-    const read_thread = std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker}) catch |err| {
+    var read_thread = std.testing.io.concurrent(ReadWorker.run, .{&read_worker}) catch |err| {
         probe.release.store(true, .release);
-        batch_thread.join();
+        batch_thread.await(std.testing.io);
         return err;
     };
     var threads_joined = false;
@@ -36560,8 +36560,8 @@ test "provisioned read preparation does not block on same-table batch after earl
         // A failed assertion must release both workers before joining them;
         // otherwise this regression masks the failure as a hung test shard.
         probe.release.store(true, .release);
-        read_thread.join();
-        batch_thread.join();
+        read_thread.await(std.testing.io);
+        batch_thread.await(std.testing.io);
     };
 
     while (!read_worker.started.load(.acquire)) std.atomic.spinLoopHint();
@@ -36571,14 +36571,14 @@ test "provisioned read preparation does not block on same-table batch after earl
             completed_before_batch_release = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     const cached_entries_before_batch_release = write_cache.entries.items.len;
     const dirty_before_batch_release = source.isWriteCacheDirtyForTable("docs");
 
     probe.release.store(true, .release);
-    read_thread.join();
-    batch_thread.join();
+    read_thread.await(std.testing.io);
+    batch_thread.await(std.testing.io);
     threads_joined = true;
 
     try std.testing.expect(completed_before_batch_release);
@@ -38388,20 +38388,32 @@ test "provisioned table write source coalesces same-group waiters" {
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        probe.release_first.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":\"beta\"}" };
     var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
-    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
-    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    defer {
+        probe.release_first.store(true, .release);
+        second_thread.await(std.testing.io);
+    }
+    var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    defer {
+        probe.release_first.store(true, .release);
+        third_thread.await(std.testing.io);
+    }
 
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
-    first_thread.join();
-    second_thread.join();
-    third_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
+    third_thread.await(std.testing.io);
     if (first.err) |err| return err;
     if (second.err) |err| return err;
     if (third.err) |err| return err;
@@ -38440,21 +38452,37 @@ test "provisioned table write coalescer hands off after owner completes" {
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        for (&probe.release) |*release| release.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.entered[0].load(.acquire)) std.atomic.spinLoopHint();
 
     var owner_completed: std.atomic.Value(bool) = .init(false);
     var owner = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{}", .completed = &owner_completed };
     var peer = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{}" };
-    const owner_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&owner});
-    const peer_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&peer});
+    var owner_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&owner});
+    defer {
+        for (&probe.release) |*release| release.store(true, .release);
+        owner_thread.await(std.testing.io);
+    }
+    var peer_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&peer});
+    defer {
+        for (&probe.release) |*release| release.store(true, .release);
+        peer_thread.await(std.testing.io);
+    }
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
 
     probe.release[0].store(true, .release);
     while (!probe.entered[1].load(.acquire)) std.atomic.spinLoopHint();
 
     var successor = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:d", .value = "{}" };
-    const successor_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&successor});
+    var successor_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&successor});
+    defer {
+        for (&probe.release) |*release| release.store(true, .release);
+        successor_thread.await(std.testing.io);
+    }
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
     probe.release[1].store(true, .release);
     while (!probe.entered[2].load(.acquire)) std.atomic.spinLoopHint();
@@ -38464,10 +38492,10 @@ test "provisioned table write coalescer hands off after owner completes" {
     const owner_returned_before_successor_finished = owner_completed.load(.acquire);
     probe.release[2].store(true, .release);
 
-    first_thread.join();
-    owner_thread.join();
-    peer_thread.join();
-    successor_thread.join();
+    first_thread.await(std.testing.io);
+    owner_thread.await(std.testing.io);
+    peer_thread.await(std.testing.io);
+    successor_thread.await(std.testing.io);
     if (first.err) |err| return err;
     if (owner.err) |err| return err;
     if (peer.err) |err| return err;
@@ -38500,21 +38528,33 @@ test "provisioned table write source preserves same-key delete then write across
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        probe.release_first.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
     var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{\"title\":\"beta\"}" };
-    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    defer {
+        probe.release_first.store(true, .release);
+        second_thread.await(std.testing.io);
+    }
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
-    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    defer {
+        probe.release_first.store(true, .release);
+        third_thread.await(std.testing.io);
+    }
 
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
-    first_thread.join();
-    second_thread.join();
-    third_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
+    third_thread.await(std.testing.io);
     if (first.err) |err| return err;
     if (second.err) |err| return err;
     if (third.err) |err| return err;
@@ -38552,7 +38592,11 @@ test "provisioned table write coalescer isolates invalid waiter on same-key over
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        probe.release_first.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
     // An invalid write and a later delete of the same key land in one
@@ -38561,16 +38605,24 @@ test "provisioned table write coalescer isolates invalid waiter on same-key over
     // delete succeeds independently.
     var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{not json" };
     var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
-    const second_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+    defer {
+        probe.release_first.store(true, .release);
+        second_thread.await(std.testing.io);
+    }
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
-    const third_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+    defer {
+        probe.release_first.store(true, .release);
+        third_thread.await(std.testing.io);
+    }
 
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
-    first_thread.join();
-    second_thread.join();
-    third_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
+    third_thread.await(std.testing.io);
     if (first.err) |err| return err;
     try std.testing.expect(second.err != null);
     if (third.err) |err| return err;
@@ -38606,20 +38658,32 @@ test "provisioned table write coalescer isolates failed waiters" {
     defer test_before_batch_execution_hook = null;
 
     var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-    const first_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+    defer {
+        probe.release_first.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
     while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var invalid = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":" };
     var valid = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
-    const invalid_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&invalid});
-    const valid_thread = try std.Thread.spawn(.{}, ProvisionedWriteCoalesceBatchWorker.run, .{&valid});
+    var invalid_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&invalid});
+    defer {
+        probe.release_first.store(true, .release);
+        invalid_thread.await(std.testing.io);
+    }
+    var valid_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&valid});
+    defer {
+        probe.release_first.store(true, .release);
+        valid_thread.await(std.testing.io);
+    }
 
     try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
     probe.release_first.store(true, .release);
 
-    first_thread.join();
-    invalid_thread.join();
-    valid_thread.join();
+    first_thread.await(std.testing.io);
+    invalid_thread.await(std.testing.io);
+    valid_thread.await(std.testing.io);
     if (first.err) |err| return err;
     try std.testing.expect(invalid.err != null);
     if (valid.err) |err| return err;
@@ -40602,18 +40666,18 @@ test "provider shutdown barrier joins an in-flight generated embedding call" {
         }
     };
     var close = Close{ .cache = &cache };
-    const thread = try std.Thread.spawn(.{}, Close.run, .{&close});
+    var thread = try std.testing.io.concurrent(Close.run, .{&close});
     var thread_joined = false;
     defer if (!thread_joined) {
         provider.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
     while (!close.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(10 * std.time.ns_per_ms);
     try std.testing.expect(!close.returned.load(.acquire));
 
     provider.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(!close.failed.load(.acquire));
     try std.testing.expect(close.returned.load(.acquire));
@@ -42231,18 +42295,18 @@ test "resident group write releases queued reads before remote completion" {
     defer if (operation_active) source.endGroupOperation("docs", 7001);
 
     var queued_writer = WriterWorker{ .source = &source };
-    const writer_thread = try std.Thread.spawn(.{}, WriterWorker.run, .{&queued_writer});
+    var writer_thread = try std.testing.io.concurrent(WriterWorker.run, .{&queued_writer});
     defer {
         queued_writer.release.store(true, .release);
-        writer_thread.join();
+        writer_thread.await(std.testing.io);
     }
     while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
     var worker = ReaderWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(ReaderWorker.run, .{&worker});
     defer {
         worker.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     }
 
     // The writer remains exclusive until it has leased the authoritative
@@ -42322,10 +42386,10 @@ test "provisioned table transition waiter queues ahead of later writers" {
     defer if (operation_active) source.endGroupOperation("docs", 7001);
 
     var worker = Worker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     defer {
         worker.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     }
     while (source.testingGroupTransitionWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
@@ -42376,18 +42440,18 @@ test "provisioned table transition waiter queues ahead of later readers" {
     defer if (initial_read_active) initial_read.deinit();
 
     var transition_worker = TransitionWorker{ .source = &source };
-    const transition_thread = try std.Thread.spawn(.{}, TransitionWorker.run, .{&transition_worker});
+    var transition_thread = try std.testing.io.concurrent(TransitionWorker.run, .{&transition_worker});
     defer {
         transition_worker.release.store(true, .release);
-        transition_thread.join();
+        transition_thread.await(std.testing.io);
     }
     while (source.testingGroupTransitionWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
     var reader_worker = ReaderWorker{ .source = &source };
-    const reader_thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&reader_worker});
+    var reader_thread = try std.testing.io.concurrent(ReaderWorker.run, .{&reader_worker});
     defer {
         transition_worker.release.store(true, .release);
-        reader_thread.join();
+        reader_thread.await(std.testing.io);
     }
     for (0..10_000) |_| std.atomic.spinLoopHint();
     try std.testing.expect(!reader_worker.entered.load(.acquire));
@@ -42567,23 +42631,23 @@ test "provisioned table restore preparation blocks writes while allowing reads" 
     errdefer if (restore_lifecycle_active) source.endRestoreLifecycleActivity("docs");
 
     var worker = RequestWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(RequestWorker.run, .{&worker});
     var read_worker = ReadWorker{ .source = &source };
-    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
+    var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!worker.entered.load(.acquire));
     try std.testing.expect(read_worker.entered.load(.acquire));
-    read_thread.join();
+    read_thread.await(std.testing.io);
 
     source.endRestoreLifecycleActivity("docs");
     restore_lifecycle_active = false;
     while (!worker.entered.load(.acquire)) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    thread.join();
+    thread.await(std.testing.io);
 }
 
 test "HA seed request admission drains accepted writes and closes the preflight race" {
@@ -42638,18 +42702,28 @@ test "HA seed request admission drains accepted writes and closes the preflight 
     // activity/cache lifecycle until preflight and snapshot finish.
     var capture_lease = try source.acquireHASeedTableRequestAdmissionLease();
     var request_worker = RequestWorker{ .source = &source };
-    const request_thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&request_worker});
+    var request_thread = try std.testing.io.concurrent(RequestWorker.run, .{&request_worker});
+    defer {
+        capture_lease.release();
+        request_thread.await(std.testing.io);
+    }
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!request_worker.entered.load(.acquire));
     capture_lease.release();
-    request_thread.join();
+    request_thread.await(std.testing.io);
     try std.testing.expect(request_worker.entered.load(.acquire));
 
     // Closing admission while a request is already active waits without
     // holding the mutex that request needs to publish its completion.
     source.beginTableRequest("docs");
     var capture_worker = CaptureWorker{ .source = &source };
-    const capture_thread = try std.Thread.spawn(.{}, CaptureWorker.run, .{&capture_worker});
+    var capture_thread = try std.testing.io.concurrent(CaptureWorker.run, .{&capture_worker});
+    var capture_thread_awaited = false;
+    defer if (!capture_thread_awaited) {
+        source.endTableRequest("docs");
+        capture_worker.release.store(true, .release);
+        capture_thread.await(std.testing.io);
+    };
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!capture_worker.acquired.load(.acquire));
     source.endTableRequest("docs");
@@ -42657,7 +42731,8 @@ test "HA seed request admission drains accepted writes and closes the preflight 
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     capture_worker.release.store(true, .release);
-    capture_thread.join();
+    capture_thread.await(std.testing.io);
+    capture_thread_awaited = true;
 }
 
 test "provisioned table restore lifecycle reserves forwarded owner and caller sources" {
@@ -43179,10 +43254,10 @@ test "provisioned table group operation waiter queues ahead of later readers" {
     defer if (initial_read_active) initial_read.deinit();
 
     var write_worker = WriteWorker{ .source = &source };
-    const write_thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&write_worker});
+    var write_thread = try std.testing.io.concurrent(WriteWorker.run, .{&write_worker});
     defer {
         write_worker.release.store(true, .release);
-        write_thread.join();
+        write_thread.await(std.testing.io);
     }
     while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
@@ -43198,8 +43273,8 @@ test "provisioned table group operation waiter queues ahead of later readers" {
     )) == null);
 
     var read_worker = ReadWorker{ .source = &source };
-    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
-    defer read_thread.join();
+    var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
+    defer read_thread.await(std.testing.io);
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -43293,7 +43368,15 @@ test "provisioned table write request queues structural reconcile ahead of later
     errdefer if (request_active) source.endTableRequest("docs");
 
     var worker = ReconcileWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, ReconcileWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(ReconcileWorker.run, .{&worker});
+    defer {
+        if (request_active) {
+            source.endTableRequest("docs");
+            request_active = false;
+        }
+        worker.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -43303,7 +43386,15 @@ test "provisioned table write request queues structural reconcile ahead of later
     try std.testing.expect(!worker.entered.load(.acquire));
 
     var write_worker = WriteWorker{ .source = &source };
-    const write_thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&write_worker});
+    var write_thread = try std.testing.io.concurrent(WriteWorker.run, .{&write_worker});
+    defer {
+        if (request_active) {
+            source.endTableRequest("docs");
+            request_active = false;
+        }
+        worker.release.store(true, .release);
+        write_thread.await(std.testing.io);
+    }
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!write_worker.entered.load(.acquire));
 
@@ -43314,11 +43405,11 @@ test "provisioned table write request queues structural reconcile ahead of later
     }
     try std.testing.expect(!write_worker.entered.load(.acquire));
     worker.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     while (!write_worker.entered.load(.acquire)) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    write_thread.join();
+    write_thread.await(std.testing.io);
 }
 
 const StructuralReconcileTestCatalog = struct {
@@ -44049,7 +44140,7 @@ test "duplicate activation cannot observe accepted before admission commits" {
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const ActivationCall = struct {
@@ -44098,15 +44189,23 @@ test "duplicate activation cannot observe accepted before admission commits" {
 
     var first = ActivationCall{ .source = &source, .target = target };
     var duplicate = ActivationCall{ .source = &source, .target = target };
-    const first_thread = try std.Thread.spawn(.{}, ActivationCall.run, .{&first});
-    while (!barrier.entered.load(.acquire)) std.Thread.yield() catch {};
-    const duplicate_thread = try std.Thread.spawn(.{}, ActivationCall.run, .{&duplicate});
-    while (test_index_activation_admission_waits.load(.acquire) == 0) std.Thread.yield() catch {};
+    var first_thread = try std.testing.io.concurrent(ActivationCall.run, .{&first});
+    defer {
+        barrier.release.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
+    while (!barrier.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    var duplicate_thread = try std.testing.io.concurrent(ActivationCall.run, .{&duplicate});
+    defer {
+        barrier.release.store(true, .release);
+        duplicate_thread.await(std.testing.io);
+    }
+    while (test_index_activation_admission_waits.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!duplicate.returned.load(.acquire));
 
     barrier.release.store(true, .release);
-    first_thread.join();
-    duplicate_thread.join();
+    first_thread.await(std.testing.io);
+    duplicate_thread.await(std.testing.io);
     try std.testing.expectEqual(error.TestStructuralReconcileSubmitFailure, first.err.?);
     try std.testing.expect(duplicate.err == null);
 }
@@ -46470,11 +46569,19 @@ test "best effort table request admission does not deadlock behind queued reconc
     var request_active = true;
 
     var worker = ReconcileWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, ReconcileWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(ReconcileWorker.run, .{&worker});
+    defer {
+        if (request_active) {
+            source.endTableRequest("docs");
+            request_active = false;
+        }
+        worker.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
     var thread_joined = false;
     defer {
         if (request_active) source.endTableRequest("docs");
-        if (!thread_joined) thread.join();
+        if (!thread_joined) thread.await(std.testing.io);
     }
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -46488,7 +46595,7 @@ test "best effort table request admission does not deadlock behind queued reconc
 
     source.endTableRequest("docs");
     request_active = false;
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(worker.entered.load(.acquire));
 }
@@ -46523,7 +46630,7 @@ test "provisioned structural reconcile blocks table write admission" {
     errdefer if (reconcile_active) source.endStructuralReconcileActivity("docs");
 
     var worker = WriteWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(WriteWorker.run, .{&worker});
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -46535,7 +46642,7 @@ test "provisioned structural reconcile blocks table write admission" {
     while (!worker.entered.load(.acquire)) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    thread.join();
+    thread.await(std.testing.io);
 }
 
 test "provisioned table write source group operation blocks read admission" {
@@ -46577,7 +46684,7 @@ test "provisioned table write source group operation blocks read admission" {
     errdefer if (group_active) source.endGroupOperation("docs", 7001);
 
     var worker = ReadWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(ReadWorker.run, .{&worker});
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -46589,7 +46696,7 @@ test "provisioned table write source group operation blocks read admission" {
     while (!worker.entered.load(.acquire)) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
-    thread.join();
+    thread.await(std.testing.io);
 }
 
 test "provisioned schema reconcile keeps reads and status available" {
@@ -53300,7 +53407,11 @@ test "provisioned group apply releases source mutex and retires readers opened d
     defer test_before_batch_execution_hook = null;
 
     var worker = BatchWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(BatchWorker.run, .{&worker});
+    defer {
+        probe.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
 
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(source.local_db_mutex.tryLock());
@@ -53311,7 +53422,7 @@ test "provisioned group apply releases source mutex and retires readers opened d
     pre_commit.release();
 
     probe.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     if (worker.err) |err| return err;
 
@@ -53579,7 +53690,7 @@ test "provisioned source quiesce closes cleanup admission and drains accepted ow
         fn run(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn deinit(ptr: *anyopaque) void {
@@ -53613,19 +53724,19 @@ test "provisioned source quiesce closes cleanup admission and drains accepted ow
         .run = JobProbe.run,
         .deinit = JobProbe.deinit,
     });
-    while (!probe.entered.load(.acquire)) std.Thread.yield() catch {};
+    while (!probe.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     var quiesce = Quiesce{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});
+    var thread = try std.testing.io.concurrent(Quiesce.run, .{&quiesce});
     var thread_joined = false;
     defer if (!thread_joined) {
         probe.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
-    while (source.lifecycle.load(.acquire) == .open) std.Thread.yield() catch {};
+    while (source.lifecycle.load(.acquire) == .open) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!quiesce.complete.load(.acquire));
     probe.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
 
     try std.testing.expect(quiesce.complete.load(.acquire));
@@ -54205,12 +54316,12 @@ test "provisioned table write source drop table does not hold local db mutex dur
     defer test_before_drop_table_delete_hook = null;
 
     var worker = DropWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});
-    thread.join();
+    var thread = try std.testing.io.concurrent(DropWorker.run, .{&worker});
+    thread.await(std.testing.io);
 
     if (worker.err) |err| return err;
 
-    while (!probe.entered.load(.acquire)) std.Thread.yield() catch {};
+    while (!probe.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(source.local_db_mutex.tryLock());
     source.local_db_mutex.unlock();
 
@@ -54378,22 +54489,31 @@ test "provisioned table write source drop table waits for in-flight group batch 
     defer test_before_drop_table_delete_hook = null;
 
     var batch_worker = BatchWorker{ .source = &source };
-    const batch_thread = try std.Thread.spawn(.{}, BatchWorker.run, .{&batch_worker});
+    var batch_thread = try std.testing.io.concurrent(BatchWorker.run, .{&batch_worker});
+    defer {
+        batch_probe.release.store(true, .release);
+        batch_thread.await(std.testing.io);
+    }
     while (!batch_probe.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     var drop_worker = DropWorker{ .source = &source };
-    const drop_thread = try std.Thread.spawn(.{}, DropWorker.run, .{&drop_worker});
+    var drop_thread = try std.testing.io.concurrent(DropWorker.run, .{&drop_worker});
+    defer {
+        batch_probe.release.store(true, .release);
+        drop_probe.release.store(true, .release);
+        drop_thread.await(std.testing.io);
+    }
 
     sleepNs(10 * std.time.ns_per_ms);
     try std.testing.expect(!drop_probe.entered.load(.acquire));
 
     batch_probe.release.store(true, .release);
-    batch_thread.join();
+    batch_thread.await(std.testing.io);
     if (batch_worker.err) |err| return err;
 
     while (!drop_probe.entered.load(.acquire)) std.atomic.spinLoopHint();
     drop_probe.release.store(true, .release);
-    drop_thread.join();
+    drop_thread.await(std.testing.io);
     if (drop_worker.err) |err| return err;
 }
 
@@ -54599,9 +54719,9 @@ test "provisioned table write source drop table waits for active read cache leas
     defer test_before_drop_table_delete_hook = null;
 
     var worker = DropWorker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(DropWorker.run, .{&worker});
     var thread_joined = false;
-    defer if (!thread_joined) thread.join();
+    defer if (!thread_joined) thread.await(std.testing.io);
 
     // Observe the actual exclusive-cache barrier before checking deletion.
     // A fixed sleep can false-pass when the worker has not been scheduled.
@@ -54615,7 +54735,7 @@ test "provisioned table write source drop table waits for active read cache leas
     if (!barrier_observed) {
         read_lease.release();
         read_lease_active = false;
-        thread.join();
+        thread.await(std.testing.io);
         thread_joined = true;
         if (worker.err) |err| return err;
         return error.TestUnexpectedResult;
@@ -54627,7 +54747,7 @@ test "provisioned table write source drop table waits for active read cache leas
     // The production drain contract bounds this join even if lease retirement
     // regresses. The hook is observation-only, so the test itself cannot
     // manufacture an unbounded worker lifetime.
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     if (worker.err) |err| return err;
     try std.testing.expect(probe.entered.load(.acquire));
@@ -54756,7 +54876,15 @@ test "provisioned table write source backup releases read cache exclusive before
     defer test_before_native_backup_copy_hook = null;
 
     var backup_worker = BackupWorker{ .source = &source, .backup_root = backup_root };
-    const backup_thread = try std.Thread.spawn(.{}, BackupWorker.run, .{&backup_worker});
+    var backup_thread = try std.testing.io.concurrent(BackupWorker.run, .{&backup_worker});
+    defer {
+        if (read_lease_active) {
+            read_lease.release();
+            read_lease_active = false;
+        }
+        copy_probe.release.store(true, .release);
+        backup_thread.await(std.testing.io);
+    }
 
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!copy_probe.entered.load(.acquire));
@@ -54768,7 +54896,11 @@ test "provisioned table write source backup releases read cache exclusive before
     }
 
     var read_worker = ReadWorker{ .path = path, .cache = &read_cache };
-    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
+    var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
+    defer {
+        copy_probe.release.store(true, .release);
+        read_thread.await(std.testing.io);
+    }
     const read_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
     while (!read_worker.entered.load(.acquire) and platform_time.monotonicNs() < read_deadline_ns) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -54776,8 +54908,8 @@ test "provisioned table write source backup releases read cache exclusive before
     const read_entered_during_copy = read_worker.entered.load(.acquire);
 
     copy_probe.release.store(true, .release);
-    read_thread.join();
-    backup_thread.join();
+    read_thread.await(std.testing.io);
+    backup_thread.await(std.testing.io);
 
     if (read_worker.err) |err| return err;
     if (backup_worker.err) |err| return err;
@@ -54869,14 +55001,18 @@ test "provisioned table write source drop index does not hold local db mutex dur
     defer test_before_drop_index_work_hook = null;
 
     var worker = Worker{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    defer {
+        probe.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
 
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(source.local_db_mutex.tryLock());
     source.local_db_mutex.unlock();
 
     probe.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     if (worker.err) |err| return err;
 
@@ -55805,14 +55941,18 @@ test "provisioned table write source restore table does not hold local db mutex 
         .source = &source,
         .manifest = &manifest,
     };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    defer {
+        probe.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
 
     while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(source.local_db_mutex.tryLock());
     source.local_db_mutex.unlock();
 
     probe.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     if (worker.err) |err| return err;
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
@@ -55864,7 +56004,7 @@ test "provisioned table write source deinit drains restore repair work group" {
     var ctx = DrainCtx{};
     try source.restore_repair_work_group.concurrent(source.tableActivityIo(), DrainCtx.run, .{&ctx});
 
-    while (ctx.started.load(.acquire) == 0) std.Thread.yield() catch {};
+    while (ctx.started.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     source.deinit();
 
     try std.testing.expectEqual(@as(u32, 1), ctx.started.load(.acquire));
@@ -57642,16 +57782,16 @@ test "write cache local mutation preempts stale startup writer" {
         .write_cache = &write_cache,
         .path = path,
     };
-    const thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+    var thread = try std.testing.io.concurrent(Context.run, .{&context});
     var joined = false;
-    defer if (!joined) thread.join();
+    defer if (!joined) thread.await(std.testing.io);
 
     while (!context.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(10 * std.time.ns_per_ms);
     try std.testing.expect(!context.completed.load(.acquire));
 
     startup.deinit(alloc);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
     if (context.err) |err| return err;
     try std.testing.expect(context.completed.load(.acquire));
@@ -58257,9 +58397,9 @@ test "resident DB retry preparation waits outside admission for writer publicati
     defer if (open_locked) startup_cache.open_mutex.unlock();
 
     var context = Context{ .source = &source };
-    const thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+    var thread = try std.testing.io.concurrent(Context.run, .{&context});
     var thread_joined = false;
-    defer if (!thread_joined) thread.join();
+    defer if (!thread_joined) thread.await(std.testing.io);
 
     while (!context.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(10 * std.time.ns_per_ms);
@@ -58281,7 +58421,7 @@ test "resident DB retry preparation waits outside admission for writer publicati
     startup_cache.open_mutex.unlock();
     open_locked = false;
 
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(context.completed.load(.acquire));
     try std.testing.expect(!context.failed.load(.acquire));

@@ -749,7 +749,7 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
         ) std.Io.Cancelable!void {
             state.completed_at = std.Io.Clock.Timestamp.now(task_io, .awake);
             published.store(true, .release);
-            while (!release.load(.acquire)) std.Thread.yield() catch {};
+            while (!release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             state.done.set(task_io);
         }
     };
@@ -840,7 +840,7 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
         release.store(true, .release);
         group.cancel(task_io);
     };
-    while (!published.load(.acquire)) std.Thread.yield() catch {};
+    while (!published.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const race_deadline = std.Io.Clock.Timestamp.fromNow(task_io, .{
         .raw = std.Io.Duration.fromMilliseconds(25),
@@ -851,9 +851,9 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
     try std.testing.expect(!raced.done.isSet());
 
     var release_task = ReleaseTask{ .release = &release };
-    const release_thread = try std.Thread.spawn(.{}, ReleaseTask.run, .{&release_task});
+    var release_thread = try std.testing.io.concurrent(ReleaseTask.run, .{&release_task});
     var release_thread_joined = false;
-    defer if (!release_thread_joined) release_thread.join();
+    defer if (!release_thread_joined) release_thread.await(std.testing.io);
     const raced_result = StdHttpExecutor.cancelAndFinishControlledRequest(
         &group,
         &raced,
@@ -864,7 +864,7 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
     );
     raced_owned = false;
     group_active = false;
-    release_thread.join();
+    release_thread.await(std.testing.io);
     release_thread_joined = true;
     var raced_response = try raced_result;
     defer raced_response.deinit(std.testing.allocator);
@@ -1008,9 +1008,9 @@ test "resolved std http executor bounds queued requests before delivery" {
 
     var cancellation: common.RequestCancellation = .{};
     var cancel_task = CancelTask{ .cancellation = &cancellation };
-    const cancel_thread = try std.Thread.spawn(.{}, CancelTask.run, .{&cancel_task});
+    var cancel_thread = try std.testing.io.concurrent(CancelTask.run, .{&cancel_task});
     var cancel_thread_joined = false;
-    defer if (!cancel_thread_joined) cancel_thread.join();
+    defer if (!cancel_thread_joined) cancel_thread.await(std.testing.io);
 
     var cancelled_delivery: common.RequestDeliveryTracker = .{};
     try std.testing.expectError(error.Cancelled, executor.executor().execute(std.testing.allocator, .{
@@ -1020,7 +1020,7 @@ test "resolved std http executor bounds queued requests before delivery" {
         .cancellation = &cancellation,
         .delivery_tracker = &cancelled_delivery,
     }));
-    cancel_thread.join();
+    cancel_thread.await(std.testing.io);
     cancel_thread_joined = true;
     try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, cancelled_delivery.load());
     try std.testing.expectEqual(@as(usize, 0), app.calls.load(.acquire));
@@ -1100,14 +1100,14 @@ test "std http executor cancellation interrupts a request queued for the pooled 
         .executor = executor.executor(),
         .cancellation = &cancellation,
     };
-    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request_state});
+    var request_thread = try std.testing.io.concurrent(RequestThread.run, .{&request_state});
     var request_joined = false;
     defer if (!request_joined) {
         if (client_locked) {
             executor.client_mutex.unlock(io);
             client_locked = false;
         }
-        request_thread.join();
+        request_thread.await(std.testing.io);
     };
 
     var admitted = false;
@@ -1131,7 +1131,7 @@ test "std http executor cancellation interrupts a request queued for the pooled 
 
     executor.client_mutex.unlock(io);
     client_locked = false;
-    request_thread.join();
+    request_thread.await(std.testing.io);
     request_joined = true;
     try std.testing.expect(cancelled_while_queued);
     try std.testing.expectEqual(@as(u8, 1), request_state.outcome.load(.acquire));

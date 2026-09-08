@@ -2257,11 +2257,20 @@ fn benchConcurrentDirectHandler(
     query_bodies: []const []const u8,
     cfg: Config,
 ) !ConcurrentStats {
+    var worker_io = std.Io.Threaded.init(alloc, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(cfg.search_threads),
+        .stack_size = 512 * 1024,
+    });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     const workers = try alloc.alloc(DirectHandlerWorkerContext, cfg.search_threads);
     defer alloc.free(workers);
-    const threads = try alloc.alloc(std.Thread, cfg.search_threads);
+    const threads = try alloc.alloc(std.Io.Future(void), cfg.search_threads);
     defer alloc.free(threads);
 
+    var started_tasks: usize = 0;
+    defer for (threads[0..started_tasks]) |*future| future.await(scheduling_io);
     for (workers, 0..) |*worker, i| {
         worker.* = .{
             .alloc = alloc,
@@ -2269,12 +2278,13 @@ fn benchConcurrentDirectHandler(
             .query_bodies = query_bodies,
             .repeats = cfg.repeats,
         };
-        threads[i] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, DirectHandlerWorkerContext.run, .{worker});
+        threads[i] = try scheduling_io.concurrent(DirectHandlerWorkerContext.run, .{worker});
+        started_tasks += 1;
     }
 
     var combined: ConcurrentStats = .{};
-    for (threads, workers) |thread, *worker| {
-        thread.join();
+    for (threads, workers) |*future, *worker| {
+        future.await(scheduling_io);
         if (worker.err) |err| return err;
         combined.total_ns = @max(combined.total_ns, worker.stats.total_ns);
         combined.request_ns += worker.stats.request_ns;
@@ -2296,6 +2306,13 @@ fn benchConcurrentHttpWithPolling(
     cfg: Config,
     rss_pid: ?std.process.Child.Id,
 ) !ConcurrentRun {
+    var worker_io = std.Io.Threaded.init(alloc, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(cfg.search_threads + 4),
+        .stack_size = 512 * 1024,
+    });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     const exact_recall_responses = try makeExactRecallCapturedResponses(alloc, cfg);
     errdefer {
         for (exact_recall_responses) |captured| alloc.free(captured.hit_doc_indices);
@@ -2323,26 +2340,26 @@ fn benchConcurrentHttpWithPolling(
         .poll_interval_ms = cfg.poll_interval_ms,
         .stop = &stop,
     } else null;
-    var health_thread: ?std.Thread = null;
-    var metrics_thread: ?std.Thread = null;
-    var status_thread: ?std.Thread = null;
-    var rss_thread: ?std.Thread = null;
+    var health_thread: ?std.Io.Future(void) = null;
+    var metrics_thread: ?std.Io.Future(void) = null;
+    var status_thread: ?std.Io.Future(void) = null;
+    var rss_thread: ?std.Io.Future(void) = null;
     defer {
         // Pollers borrow stack-owned contexts, so every exit path must stop
-        // and join each successfully spawned thread before those contexts go
-        // out of scope. joinOptionalThread clears consumed handles and keeps
+        // and await each successfully started task before those contexts go
+        // out of scope. awaitOptionalFuture clears consumed futures and keeps
         // this cleanup safe after the normal-path joins below.
         stop.store(true, .release);
-        joinOptionalThread(&health_thread);
-        joinOptionalThread(&metrics_thread);
-        joinOptionalThread(&status_thread);
-        joinOptionalThread(&rss_thread);
+        awaitOptionalFuture(scheduling_io, &health_thread);
+        awaitOptionalFuture(scheduling_io, &metrics_thread);
+        awaitOptionalFuture(scheduling_io, &status_thread);
+        awaitOptionalFuture(scheduling_io, &rss_thread);
     }
-    health_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&health_poller});
-    metrics_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&metrics_poller});
+    health_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&health_poller});
+    metrics_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&metrics_poller});
     status_thread = blk: {
         if (status_poller) |*poller| {
-            break :blk try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{poller});
+            break :blk try scheduling_io.concurrent(EndpointPollerContext.run, .{poller});
         }
         break :blk null;
     };
@@ -2354,24 +2371,24 @@ fn benchConcurrentHttpWithPolling(
         .stop = &stop,
     } else null;
     rss_thread = if (rss_poller != null)
-        try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, RssPollerContext.run, .{&rss_poller.?})
+        try scheduling_io.concurrent(RssPollerContext.run, .{&rss_poller.?})
     else
         null;
 
     const workers = try alloc.alloc(HttpWorkerContext, cfg.search_threads);
     defer alloc.free(workers);
-    const threads = try alloc.alloc(std.Thread, cfg.search_threads);
+    const threads = try alloc.alloc(std.Io.Future(void), cfg.search_threads);
     defer alloc.free(threads);
 
     var start_gate = ConcurrentStartGate{};
     var spawned_threads: usize = 0;
     var joined_threads: usize = 0;
     errdefer {
-        // Release workers waiting after a partial spawn and join only handles
+        // Release workers waiting after partial startup and await only futures
         // that have not already been consumed by the normal join loop.
         start_gate.aborted.store(true, .release);
         start_gate.start.store(true, .release);
-        for (threads[joined_threads..spawned_threads]) |thread| thread.join();
+        for (threads[joined_threads..spawned_threads]) |*future| future.await(scheduling_io);
     }
     for (workers, 0..) |*worker, i| {
         worker.* = .{
@@ -2385,7 +2402,7 @@ fn benchConcurrentHttpWithPolling(
             // lane's routing and cache pressure without duplicate ownership.
             .exact_recall_responses = if (i == 0) exact_recall_responses else &.{},
         };
-        threads[i] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, HttpWorkerContext.run, .{worker});
+        threads[i] = try scheduling_io.concurrent(HttpWorkerContext.run, .{worker});
         spawned_threads += 1;
     }
     while (start_gate.ready.load(.acquire) != cfg.search_threads) platform_time.yieldBriefly();
@@ -2393,8 +2410,8 @@ fn benchConcurrentHttpWithPolling(
 
     var combined: ConcurrentStats = .{};
     var worker_err: ?anyerror = null;
-    for (threads, workers) |thread, *worker| {
-        thread.join();
+    for (threads, workers) |*future, *worker| {
+        future.await(scheduling_io);
         joined_threads += 1;
         if (worker.err) |err| {
             if (worker_err == null) worker_err = err;
@@ -2409,10 +2426,10 @@ fn benchConcurrentHttpWithPolling(
     if (worker_err) |err| return err;
 
     stop.store(true, .release);
-    joinOptionalThread(&health_thread);
-    joinOptionalThread(&metrics_thread);
-    joinOptionalThread(&status_thread);
-    joinOptionalThread(&rss_thread);
+    awaitOptionalFuture(scheduling_io, &health_thread);
+    awaitOptionalFuture(scheduling_io, &metrics_thread);
+    awaitOptionalFuture(scheduling_io, &status_thread);
+    awaitOptionalFuture(scheduling_io, &rss_thread);
     if (health_poller.err) |err| return err;
     if (metrics_poller.err) |err| return err;
     if (status_poller) |ctx| if (ctx.err) |err| return err;
@@ -2431,10 +2448,9 @@ fn benchConcurrentHttpWithPolling(
     };
 }
 
-fn joinOptionalThread(thread: *?std.Thread) void {
-    const spawned = thread.* orelse return;
-    thread.* = null;
-    spawned.join();
+fn awaitOptionalFuture(io: std.Io, task: *?std.Io.Future(void)) void {
+    if (task.*) |*future| future.await(io);
+    task.* = null;
 }
 
 fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, elapsed_ns: u64, raw_body: []const u8, cfg: Config, query_idx: usize) !void {
@@ -3711,9 +3727,13 @@ fn seedStandalone(
         .poll_interval_ms = cfg.poll_interval_ms,
         .stop = &stop,
     };
-    const health_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&health_poller});
-    const metrics_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&metrics_poller});
-    const status_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&status_poller});
+    var worker_io = std.Io.Threaded.init(alloc, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(4),
+        .stack_size = 512 * 1024,
+    });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     var rss_poller = RssPollerContext{
         .alloc = alloc,
         .io = io,
@@ -3721,17 +3741,21 @@ fn seedStandalone(
         .poll_interval_ms = cfg.poll_interval_ms,
         .stop = &stop,
     };
-    const rss_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, RssPollerContext.run, .{&rss_poller});
-    var pollers_joined = false;
+    var health_thread: ?std.Io.Future(void) = null;
+    var metrics_thread: ?std.Io.Future(void) = null;
+    var status_thread: ?std.Io.Future(void) = null;
+    var rss_thread: ?std.Io.Future(void) = null;
     defer {
-        if (!pollers_joined) {
-            stop.store(true, .release);
-            health_thread.join();
-            metrics_thread.join();
-            status_thread.join();
-            rss_thread.join();
-        }
+        stop.store(true, .release);
+        awaitOptionalFuture(scheduling_io, &health_thread);
+        awaitOptionalFuture(scheduling_io, &metrics_thread);
+        awaitOptionalFuture(scheduling_io, &status_thread);
+        awaitOptionalFuture(scheduling_io, &rss_thread);
     }
+    health_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&health_poller});
+    metrics_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&metrics_poller});
+    status_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&status_poller});
+    rss_thread = try scheduling_io.concurrent(RssPollerContext.run, .{&rss_poller});
 
     const load_started_ns = nowNs();
     const insert_started_ns = load_started_ns;
@@ -3800,11 +3824,10 @@ fn seedStandalone(
     const visibility = try waitForQueryIndexesReady(alloc, base_uri, cfg.docs, cfg.index_ready_timeout_ms, cfg);
     const visibility_wait_ns = elapsedSince(visibility_started_ns);
     stop.store(true, .release);
-    health_thread.join();
-    metrics_thread.join();
-    status_thread.join();
-    rss_thread.join();
-    pollers_joined = true;
+    awaitOptionalFuture(scheduling_io, &health_thread);
+    awaitOptionalFuture(scheduling_io, &metrics_thread);
+    awaitOptionalFuture(scheduling_io, &status_thread);
+    awaitOptionalFuture(scheduling_io, &rss_thread);
     if (health_poller.err) |err| return err;
     if (metrics_poller.err) |err| return err;
     if (status_poller.err) |err| return err;

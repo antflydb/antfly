@@ -46,6 +46,7 @@ pub const SnapshotArtifactPolicy = struct {
 };
 
 pub const FileSnapshotStoreConfig = struct {
+    maintenance_io: ?std.Io = null,
     root_dir: []const u8,
     max_snapshot_bytes: usize = 1 << 30,
     max_chunk_bytes: usize = snapshot_transfer.max_chunk_bytes,
@@ -89,7 +90,7 @@ pub const FileSnapshotStore = struct {
     artifact_usage_reconciliations: std.atomic.Value(u64) = .init(0),
     next_artifact_maintenance_ns: std.atomic.Value(u64) = .init(0),
     artifact_maintenance_mutex: std.atomic.Mutex = .unlocked,
-    artifact_maintenance_thread: ?std.Thread = null,
+    artifact_maintenance_future: ?std.Io.Future(void) = null,
     artifact_maintenance_event: std.Io.Event = .unset,
     artifact_maintenance_stop: std.atomic.Value(bool) = .init(false),
     artifact_maintenance_requested: std.atomic.Value(bool) = .init(false),
@@ -132,10 +133,11 @@ pub const FileSnapshotStore = struct {
     pub fn deinit(self: *FileSnapshotStore) void {
         platform_sync.lockYielding(&self.artifact_maintenance_mutex);
         self.artifact_maintenance_stop.store(true, .release);
-        const maintenance_thread = self.artifact_maintenance_thread;
-        if (maintenance_thread != null) self.artifact_maintenance_event.set(io(self));
+        var maintenance_future = self.artifact_maintenance_future;
+        self.artifact_maintenance_future = null;
+        if (maintenance_future != null) self.artifact_maintenance_event.set(io(self));
         self.artifact_maintenance_mutex.unlock();
-        if (maintenance_thread) |thread| thread.join();
+        if (maintenance_future) |*future| future.await(self.cfg.maintenance_io orelse io(self));
         var lease_keys = self.fetch_leases.keyIterator();
         while (lease_keys.next()) |key| self.alloc.free(key.*);
         self.fetch_leases.deinit(self.alloc);
@@ -924,9 +926,8 @@ pub const FileSnapshotStore = struct {
             self.artifact_maintenance_mutex.unlock();
             return;
         }
-        if (self.artifact_maintenance_thread == null) {
-            self.artifact_maintenance_thread = std.Thread.spawn(
-                .{},
+        if (self.artifact_maintenance_future == null) {
+            self.artifact_maintenance_future = (self.cfg.maintenance_io orelse io(self)).concurrent(
                 artifactMaintenanceMain,
                 .{self},
             ) catch |err| {

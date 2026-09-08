@@ -1839,13 +1839,23 @@ test "usermgr HA seed lease excludes auth mutations until capture completes" {
     };
     var ctx = Context{ .manager = &manager, .started = &started, .finished = &finished };
     var lease = manager.acquireSeedCaptureLease();
-    const thread = try std.Thread.spawn(.{}, Context.run, .{&ctx});
+    var lease_active = true;
+    defer if (lease_active) lease.release();
+    var thread = try std.testing.io.concurrent(Context.run, .{&ctx});
+    defer {
+        if (lease_active) {
+            lease.release();
+            lease_active = false;
+        }
+        thread.await(std.testing.io);
+    }
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     var attempts: usize = 0;
-    while (attempts < 1024) : (attempts += 1) std.Thread.yield() catch {};
+    while (attempts < 1024) : (attempts += 1) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!finished.load(.acquire));
     lease.release();
-    thread.join();
+    lease_active = false;
+    thread.await(std.testing.io);
     try std.testing.expect(finished.load(.acquire));
     var authenticated = try manager.authenticateUser("alice", "after");
     defer authenticated.deinit(alloc);

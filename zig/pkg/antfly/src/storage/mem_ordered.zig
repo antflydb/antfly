@@ -751,9 +751,16 @@ test "concurrent snapshot retain/release does not corrupt the refcount" {
 
     var workers: [8]Worker = undefined;
     for (&workers) |*w| w.* = .{ .shared = &base, .gpa = alloc };
-    var threads: [8]std.Thread = undefined;
-    for (&threads, &workers) |*t, *w| t.* = try std.Thread.spawn(.{}, Worker.run, .{w});
-    for (&threads) |t| t.join();
+    var threads: [8]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
+    for (&threads, &workers) |*t, *w| {
+        t.* = try std.testing.io.concurrent(Worker.run, .{w});
+        started_tasks += 1;
+    }
+    for (&threads) |*t| t.await(std.testing.io);
 
     for (&workers) |w| try testing.expect(w.ok);
     // The base must survive with exactly its original single reference: every

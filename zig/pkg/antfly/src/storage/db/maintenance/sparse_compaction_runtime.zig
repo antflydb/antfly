@@ -380,7 +380,7 @@ fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) !bool {
 }
 
 fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.Thread.yield() catch {};
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn consumeTestStartFailure() bool {
@@ -485,7 +485,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
         fn run(ctx: *@This()) void {
             ctx.apply_lock.lockShared();
             ctx.held.store(true, .release);
-            while (!ctx.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!ctx.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             ctx.apply_lock.unlockShared();
         }
     };
@@ -510,13 +510,13 @@ test "sparse compaction defers backend cancellation through mandatory retirement
         .held = &blocker_held,
         .release = &release_blocker,
     };
-    const blocker_thread = try std.Thread.spawn(.{}, Blocker.run, .{&blocker_ctx});
+    var blocker_thread = try std.testing.io.concurrent(Blocker.run, .{&blocker_ctx});
     var blocker_active = true;
     defer if (blocker_active) {
         release_blocker.store(true, .release);
-        blocker_thread.join();
+        blocker_thread.await(std.testing.io);
     };
-    while (!blocker_held.load(.acquire)) std.Thread.yield() catch {};
+    while (!blocker_held.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     var cancellation_point_ready = std.atomic.Value(bool).init(false);
     var retired = std.atomic.Value(bool).init(false);
@@ -544,7 +544,7 @@ test "sparse compaction defers backend cancellation through mandatory retirement
     const result = future.cancel(io);
     future_active = false;
     release_blocker.store(true, .release);
-    blocker_thread.join();
+    blocker_thread.await(std.testing.io);
     blocker_active = false;
 
     try std.testing.expectError(error.Canceled, result);

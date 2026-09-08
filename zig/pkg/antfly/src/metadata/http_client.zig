@@ -3493,14 +3493,14 @@ test "metadata http client round-trips server endpoints" {
     defer listener.deinit();
     try server.registerRoutes(&listener);
     try listener.bind();
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn listen(http_server: *httpx.Server) void {
             http_server.listen() catch |err| std.debug.panic("metadata httpx test listener failed: {s}", .{@errorName(err)});
         }
     }.listen, .{&listener});
     defer {
         listener.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
 
     const address = listener.boundAddress() orelse return error.AddressNotAvailable;

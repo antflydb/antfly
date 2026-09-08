@@ -245,6 +245,10 @@ pub const HealthSource = struct {
             try append(writer, "antfly_executor_inference_peak_leases", "gauge", "Peak inference executor lifetime leases", lanes.inference_peak_leases);
             try append(writer, "antfly_executor_inference_acquisitions_total", "counter", "Successful inference executor lease acquisitions", lanes.inference_acquisitions_total);
             try append(writer, "antfly_executor_inference_rejections_total", "counter", "Inference executor lease acquisitions rejected during shutdown", lanes.inference_rejections_total);
+            try append(writer, "antfly_executor_worker_capacity", "gauge", "Maximum dedicated service worker reservations", lanes.worker_capacity);
+            try append(writer, "antfly_executor_reserved_workers", "gauge", "Dedicated service workers reserved by runtime owners", lanes.reserved_workers);
+            try append(writer, "antfly_executor_peak_reserved_workers", "gauge", "Peak dedicated service worker reservations", lanes.peak_reserved_workers);
+            try append(writer, "antfly_executor_worker_active_leases", "gauge", "Active dedicated service worker owners", lanes.worker_active_leases);
             try append(writer, "antfly_executor_control_active_leases", "gauge", "Active control executor lifetime leases", lanes.control_active_leases);
             try append(writer, "antfly_executor_control_peak_leases", "gauge", "Peak control executor lifetime leases", lanes.control_peak_leases);
             try append(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
@@ -1118,11 +1122,14 @@ pub fn runFromIterator(
     defer alloc.free(admin_uri);
     std.debug.print("metadata admin api listening on {s}\n", .{admin_uri});
 
+    var raft_progress_lease = try (try server.server.svc.ensureBackendRuntime()).acquireWorkers(.{});
+    defer raft_progress_lease.release();
     var raft_progress = antfly.raft.ManagedProgressDriver.init(
         setup_io.io(),
         server.raftProgressSource(),
         runtime_cadence.raft_tick_ns,
     );
+    raft_progress.scheduling_io = raft_progress_lease.io();
     defer raft_progress.deinit();
     try raft_progress.start();
 

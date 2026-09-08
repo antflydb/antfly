@@ -6600,12 +6600,12 @@ pub fn testRemoteEmbeddingCancellation() !void {
         }
     };
     var err_out: ?anyerror = null;
-    const worker = try std.Thread.spawn(.{}, Worker.run, .{ &managed, &err_out });
+    var worker = try std.testing.io.concurrent(Worker.run, .{ &managed, &err_out });
     while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     const started_ns = monotonicNowNs();
     cancellation.store(true, .release);
-    worker.join();
+    worker.await(std.testing.io);
     const elapsed_ns = monotonicNowNs() - started_ns;
     app.release.store(true, .release);
     while (!app.completed.load(.acquire)) std.atomic.spinLoopHint();
@@ -6650,12 +6650,12 @@ pub fn testRemoteEmbeddingCancellation() !void {
         }
     };
     err_out = null;
-    const parts_worker = try std.Thread.spawn(.{}, PartsWorker.run, .{ &multimodal, &err_out });
+    var parts_worker = try std.testing.io.concurrent(PartsWorker.run, .{ &multimodal, &err_out });
     while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     const parts_started_ns = monotonicNowNs();
     parts_cancellation.store(true, .release);
-    parts_worker.join();
+    parts_worker.await(std.testing.io);
     const parts_elapsed_ns = monotonicNowNs() - parts_started_ns;
     app.release.store(true, .release);
     while (!app.completed.load(.acquire)) std.atomic.spinLoopHint();

@@ -864,13 +864,14 @@ test "concurrent pruners observe gc watermark conflict" {
         .pruner_a = Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store),
         .pruner_b = Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store),
     };
-    const thread_a = try std.Thread.spawn(.{}, RaceState.runA, .{&state});
-    const thread_b = try std.Thread.spawn(.{}, RaceState.runB, .{&state});
-    thread_a.join();
-    thread_b.join();
-
     defer if (state.result_a) |*result| result.deinit(alloc);
     defer if (state.result_b) |*result| result.deinit(alloc);
+    var thread_a = try std.testing.io.concurrent(RaceState.runA, .{&state});
+    defer thread_a.await(std.testing.io);
+    var thread_b = try std.testing.io.concurrent(RaceState.runB, .{&state});
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
+
     try std.testing.expect(state.result_a != null);
     try std.testing.expect(state.result_b != null);
     try std.testing.expectEqual(@as(?u64, 1), try progress_store.getGcWatermark("docs"));

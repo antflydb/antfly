@@ -53,7 +53,6 @@ comptime {
     _ = @import("db/db.zig");
     _ = @import("db/dense_exact.zig");
     _ = @import("db/derived/apply_state.zig");
-    _ = @import("db/derived/async_runtime.zig");
     _ = @import("db/derived/backlog_tracker.zig");
     _ = @import("db/derived/catch_up_policy.zig");
     _ = @import("db/derived/change_journal.zig");

@@ -801,9 +801,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         fn deinit(self: *HostFallbackNative) void {
             self.cb.deinit();
-            self.weight_store.resident_weights.deinit(self.allocator);
-            self.weight_store.lazy_weights.deinit(self.allocator);
-            native_compute_mod.deinitPrefetchQueue(&self.weight_store);
+            self.weight_store.deinitOwned();
         }
     };
 

@@ -573,7 +573,7 @@ fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 }
@@ -2542,7 +2542,7 @@ pub const IndexManager = struct {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 
@@ -26670,12 +26670,18 @@ test "observed analyzer publication waits for active analysis readers" {
     };
 
     entry.lockAnalysisShared();
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var thread_awaited = false;
+    defer if (!thread_awaited) {
+        entry.unlockAnalysisShared();
+        thread.await(std.testing.io);
+    };
     while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..128) |_| std.Thread.yield() catch {};
+    for (0..128) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!worker.finished.load(.acquire));
     entry.unlockAnalysisShared();
-    thread.join();
+    thread.await(std.testing.io);
+    thread_awaited = true;
 
     if (worker.err) |err| return err;
     try std.testing.expect(worker.finished.load(.acquire));
@@ -28129,23 +28135,25 @@ test "loadConfiguredIndexesParallel quarantines worker errors on borrowed std Io
         try setup_manager.openConfiguredIndex(&store, configs[0], false, false);
     }
 
-    var manager = try IndexManager.init(alloc, path);
-    defer manager.deinit();
-    manager.setIo(std.testing.io);
-    manager.updateRange(.{ .start = "", .end = "" });
+    for ([_]?std.Io{ std.testing.io, null }) |scheduling_io| {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.setIo(scheduling_io);
+        manager.updateRange(.{ .start = "", .end = "" });
 
-    for (configs) |cfg| {
-        try manager.ensureConfiguredIndexDir(cfg);
+        for (configs) |cfg| {
+            try manager.ensureConfiguredIndexDir(cfg);
+        }
+
+        // A worker error no longer fails the load: the failing index is
+        // quarantined (config retained, error recorded) while the healthy one
+        // loads normally. Both concurrent and inline execution drain all work.
+        try manager.loadConfiguredIndexesParallel(&store, &configs, 2);
+        try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
+        try std.testing.expect(manager.denseIndex("dv_bad") == null);
+        const recorded = manager.loadFailure("dv_bad") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("InvalidIndexConfig", recorded);
     }
-
-    // A worker error no longer fails the load: the failing index is
-    // quarantined (config retained, error recorded) while the healthy one
-    // loads normally — and the borrowed std.Io group drains exactly once.
-    try manager.loadConfiguredIndexesParallel(&store, &configs, 2);
-    try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
-    try std.testing.expect(manager.denseIndex("dv_bad") == null);
-    const recorded = manager.loadFailure("dv_bad") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("InvalidIndexConfig", recorded);
 }
 
 test "dense apply resource manager accounts working bytes and releases them" {

@@ -2190,6 +2190,10 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_executor_inference_peak_leases", "gauge", "Peak inference executor lifetime leases", lanes.inference_peak_leases);
             try health_metrics.appendPromMetric(writer, "antfly_executor_inference_acquisitions_total", "counter", "Successful inference executor lease acquisitions", lanes.inference_acquisitions_total);
             try health_metrics.appendPromMetric(writer, "antfly_executor_inference_rejections_total", "counter", "Inference executor lease acquisitions rejected during shutdown", lanes.inference_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_worker_capacity", "gauge", "Maximum dedicated service worker reservations", lanes.worker_capacity);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_reserved_workers", "gauge", "Dedicated service workers reserved by runtime owners", lanes.reserved_workers);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_peak_reserved_workers", "gauge", "Peak dedicated service worker reservations", lanes.peak_reserved_workers);
+            try health_metrics.appendPromMetric(writer, "antfly_executor_worker_active_leases", "gauge", "Active dedicated service worker owners", lanes.worker_active_leases);
             try health_metrics.appendPromMetric(writer, "antfly_executor_control_active_leases", "gauge", "Active control executor lifetime leases", lanes.control_active_leases);
             try health_metrics.appendPromMetric(writer, "antfly_executor_control_peak_leases", "gauge", "Peak control executor lifetime leases", lanes.control_peak_leases);
             try health_metrics.appendPromMetric(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
@@ -3538,7 +3542,7 @@ test "data server repair owner cancels and drains through backend runtime" {
         fn run(ptr: *anyopaque) !void {
             const data_server: *DataServer = @ptrCast(@alignCast(ptr));
             while (!data_server.provisioned_index_repair_shutdown.load(.acquire)) {
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
 
@@ -4870,7 +4874,7 @@ test "runtime status disk scan retries across a reallocation fence and group inv
             const call = self.calls.fetchAdd(1, .acq_rel);
             if (call == 0) {
                 self.entered.store(true, .release);
-                while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+                while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 return 111;
             }
             return 222;
@@ -4918,14 +4922,14 @@ test "runtime status disk scan retries across a reallocation fence and group inv
 
     var controlled = ControlledScanner{};
     var scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
-    const thread = try std.Thread.spawn(.{}, ScanThread.run, .{&scan_thread});
-    while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
+    var thread = try std.testing.io.concurrent(ScanThread.run, .{&scan_thread});
+    while (!controlled.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     // A request arriving during the scan fences its observation and
     // invalidates the entry. Only the retry may acknowledge the request.
     server.observeReallocationRequest(.{ .request_id = 44, .requested_at_ms = 55 });
     controlled.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expectEqual(@as(u64, 222), scan_thread.result.?.disk_bytes);
     try std.testing.expect(
@@ -4958,11 +4962,11 @@ test "runtime status disk scan retries across a reallocation fence and group inv
     controlled.release.store(false, .release);
     controlled.calls.store(0, .release);
     var unrelated_scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
-    const unrelated_thread = try std.Thread.spawn(.{}, ScanThread.run, .{&unrelated_scan_thread});
-    while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
+    var unrelated_thread = try std.testing.io.concurrent(ScanThread.run, .{&unrelated_scan_thread});
+    while (!controlled.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     server.invalidateRuntimeStatusDiskUsageCacheForGroup(8);
     controlled.release.store(true, .release);
-    unrelated_thread.join();
+    unrelated_thread.await(std.testing.io);
 
     try std.testing.expectEqual(@as(u64, 111), unrelated_scan_thread.result.?.disk_bytes);
     try std.testing.expectEqual(@as(u32, 1), controlled.calls.load(.acquire));
@@ -5602,6 +5606,11 @@ pub const DataServer = struct {
     provisioned_warmup_last_duration_ns: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_mutex: std.atomic.Mutex = .unlocked,
     provisioned_startup_catch_up_active: std.atomic.Value(bool) = .init(false),
+    // Persistent maintenance has an independent runtime reservation.
+    // Finite warmup/recovery/refresh work uses owner-scoped durable jobs.
+    background_worker_mutex: std.atomic.Mutex = .unlocked,
+    maintenance_worker_lease: ?backend_runtime_mod.BackendRuntime.WorkerLease = null,
+    background_worker_closing: bool = false,
     background_work_quiesced: bool = false,
     external_provider_users_quiesced: bool = false,
     provisioned_startup_catch_up_target_mutex: std.atomic.Mutex = .unlocked,
@@ -5749,10 +5758,12 @@ pub const DataServer = struct {
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     /// Process-role HTTP transport services are distinct from storage/API
     /// executor lanes and may be shared by every httpx listener in this role.
+    http_observer_lease: ?backend_runtime_mod.BackendRuntime.WorkerLease = null,
     owned_http_runtime: ?*httpx.HttpRuntime = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
+    lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_future: ?std.Io.Future(void) = null,
     lsm_maintenance_stop: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_wake: std.atomic.Value(bool) = .init(false),
@@ -7567,15 +7578,11 @@ pub const DataServer = struct {
         if (self.store_registration != null) {
             self.store_status_dirty.store(true, .release);
         }
-        self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
-            => std.log.warn("runtime status refresh start deferred err={}", .{err}),
-            else => return err,
-        };
+        self.requestRuntimeStatusRefresh() catch |err| std.log.warn("runtime status refresh start deferred err={}", .{err});
         self.requestProvisionedStartupCatchUp() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
+            error.ConcurrencyUnavailable,
+            error.OutOfMemory,
+            error.BackgroundOwnerClosing,
             => std.log.warn("provisioned startup catch-up start deferred err={}", .{err}),
             else => return err,
         };
@@ -7955,10 +7962,15 @@ pub const DataServer = struct {
     ) void {
         if (self.background_work_quiesced) return;
         self.background_work_quiesced = true;
+        lockAtomic(&self.background_worker_mutex);
+        self.background_worker_closing = true;
+        self.background_worker_mutex.unlock();
         self.unregisterMetadataLocalProviders();
         if (self.data_raft) |raft| raft.stop();
         self.stopLsmMaintenanceBackground();
         self.stopDataServerBackgroundJobs();
+        if (self.maintenance_worker_lease) |*lease| lease.release();
+        self.maintenance_worker_lease = null;
         self.stopProvisionedIndexRepair();
         self.stopReplicatedTransitionActions();
         self.clearProvisionedStartupCatchUpTarget();
@@ -7969,6 +7981,8 @@ pub const DataServer = struct {
             self.alloc.destroy(http_runtime);
             self.owned_http_runtime = null;
         }
+        if (self.http_observer_lease) |*lease| lease.release();
+        self.http_observer_lease = null;
         if (self.http_server) |*http_server| http_server.deinit();
         self.http_server = null;
         _ = self.read_source.withAntflyProvider(null);
@@ -8107,12 +8121,16 @@ pub const DataServer = struct {
             } else null
         else
             null;
+        var observer_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{});
+        errdefer observer_lease.release();
         runtime.* = httpx.HttpRuntime.init(self.alloc, .{
+            .observer_io = observer_lease.io(),
             .max_active_h1_requests = listener_config.max_connections,
             .max_active_connections = @as(usize, listener_config.max_connections) +| health_metrics.max_connections,
             .max_active_requests = @as(usize, listener_config.max_request_tasks) +| health_metrics.max_connections,
             .borrowed_io = borrowed_io,
         });
+        self.http_observer_lease = observer_lease;
         self.owned_http_runtime = runtime;
         return runtime;
     }
@@ -8149,6 +8167,23 @@ pub const DataServer = struct {
         };
     }
 
+    const BackgroundLane = enum { maintenance };
+
+    fn ensureBackgroundWorkerIo(self: *DataServer, lane: BackgroundLane) !std.Io {
+        lockAtomic(&self.background_worker_mutex);
+        defer self.background_worker_mutex.unlock();
+        if (self.background_worker_closing) return error.BackgroundOwnerClosing;
+        const slot = switch (lane) {
+            .maintenance => &self.maintenance_worker_lease,
+        };
+        if (slot.* == null) slot.* = try (try self.ensureBackendRuntime()).acquireWorkers(.{
+            .capacity = switch (lane) {
+                .maintenance => 1,
+            },
+        });
+        return slot.*.?.io();
+    }
+
     fn requestLsmMaintenanceBackground(self: *DataServer) !void {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         const now_ns = self.backgroundMonotonicNs();
@@ -8164,9 +8199,10 @@ pub const DataServer = struct {
     }
 
     fn startLsmMaintenanceWorker(self: *DataServer) !void {
+        lockAtomic(&self.lsm_maintenance_mutex);
+        defer self.lsm_maintenance_mutex.unlock();
         if (self.lsm_maintenance_future == null) {
-            const runtime = try self.ensureBackendRuntime();
-            const io = runtime.io() orelse return error.BackendRuntimeUnavailable;
+            const io = try self.ensureBackgroundWorkerIo(.maintenance);
             self.lsm_maintenance_stop.store(false, .release);
             self.lsm_maintenance_future = try io.concurrent(lsmMaintenanceWorkerMain, .{self});
         }
@@ -8270,12 +8306,12 @@ pub const DataServer = struct {
     }
 
     fn stopLsmMaintenanceBackground(self: *DataServer) void {
+        lockAtomic(&self.lsm_maintenance_mutex);
+        defer self.lsm_maintenance_mutex.unlock();
         self.lsm_maintenance_stop.store(true, .release);
         self.lsm_maintenance_wake.store(true, .release);
         if (self.lsm_maintenance_future) |*future| {
-            if (self.backend_runtime) |runtime| {
-                if (runtime.io()) |io| future.cancel(io);
-            }
+            future.cancel(self.maintenance_worker_lease.?.io());
             self.lsm_maintenance_future = null;
         }
         self.lsm_maintenance_active.store(false, .release);
@@ -10724,8 +10760,9 @@ pub const DataServer = struct {
             // periodic control loop remain the lost-notification fallback.
             self.provisioned_startup_catch_up_dirty.store(true, .release);
             self.maybeRequestProvisionedStartupCatchUp() catch |err| switch (err) {
-                error.ThreadQuotaExceeded,
-                error.SystemResources,
+                error.ConcurrencyUnavailable,
+                error.OutOfMemory,
+                error.BackgroundOwnerClosing,
                 => std.log.debug("startup catch-up admission wake deferred table={s} err={s}", .{ table_name, @errorName(err) }),
                 else => std.log.warn("startup catch-up admission wake failed table={s} err={s}", .{ table_name, @errorName(err) }),
             };
@@ -10735,12 +10772,7 @@ pub const DataServer = struct {
             self.markRuntimeStatusDirty(table_name, kind);
             self.embedding_activity_status_dirty.store(true, .release);
             if (self.store_registration != null) {
-                self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-                    error.ThreadQuotaExceeded,
-                    error.SystemResources,
-                    => std.log.warn("runtime activity refresh deferred table={s} err={s}", .{ table_name, @errorName(err) }),
-                    else => std.log.warn("runtime activity refresh failed table={s} err={s}", .{ table_name, @errorName(err) }),
-                };
+                self.requestRuntimeStatusRefresh() catch |err| std.log.warn("runtime activity refresh deferred table={s} err={s}", .{ table_name, @errorName(err) });
             }
             return;
         }
@@ -10748,12 +10780,7 @@ pub const DataServer = struct {
             self.markRuntimeStatusDirty(table_name, kind);
             self.markStoreStatusDirtyImmediate();
             if (self.store_registration != null) {
-                self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-                    error.ThreadQuotaExceeded,
-                    error.SystemResources,
-                    => std.log.warn("runtime status hook refresh deferred table={s} err={s}", .{ table_name, @errorName(err) }),
-                    else => std.log.warn("runtime status hook refresh failed table={s} err={s}", .{ table_name, @errorName(err) }),
-                };
+                self.requestRuntimeStatusRefresh() catch |err| std.log.warn("runtime status hook refresh deferred table={s} err={s}", .{ table_name, @errorName(err) });
             }
             return;
         }
@@ -15957,8 +15984,9 @@ pub const DataServer = struct {
         // Otherwise a harmless early warmup miss can leave the process serving
         // only its stale persisted status until unrelated traffic wakes it.
         defer self.requestProvisionedStartupCatchUp() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
+            error.ConcurrencyUnavailable,
+            error.OutOfMemory,
+            error.BackgroundOwnerClosing,
             => std.log.warn("provisioned cache warmup startup catch-up deferred err={}", .{err}),
             else => {
                 _ = self.provisioned_warmup_failed.fetchAdd(1, .monotonic);
@@ -16003,15 +16031,7 @@ pub const DataServer = struct {
             };
             stats.warmed_group_count += warmed_groups;
         }
-        self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
-            => std.log.warn("provisioned cache warmup runtime status refresh deferred err={}", .{err}),
-            else => {
-                _ = self.provisioned_warmup_failed.fetchAdd(1, .monotonic);
-                std.log.warn("provisioned cache warmup runtime status refresh failed err={}", .{err});
-            },
-        };
+        self.requestRuntimeStatusRefresh() catch |err| std.log.warn("provisioned cache warmup runtime status refresh deferred err={}", .{err});
         _ = self.provisioned_warmup_completed.fetchAdd(1, .monotonic);
         return stats;
     }
@@ -16342,12 +16362,7 @@ pub const DataServer = struct {
             self.runtime_status_dirty.store(true, .release);
             self.store_status_dirty.store(true, .release);
             self.provisioned_root_refresh_dirty.store(true, .release);
-            self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-                error.ThreadQuotaExceeded,
-                error.SystemResources,
-                => std.log.warn("provisioned startup catch-up runtime status refresh deferred err={}", .{err}),
-                else => std.log.warn("provisioned startup catch-up runtime status refresh failed err={}", .{err}),
-            };
+            self.requestRuntimeStatusRefresh() catch |err| std.log.warn("provisioned startup catch-up runtime status refresh deferred err={}", .{err});
         }
         return stats;
     }
@@ -17312,15 +17327,7 @@ pub const DataServer = struct {
         if (finished) {
             self.runtime_status_dirty.store(true, .release);
             self.store_status_dirty.store(true, .release);
-            self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-                error.ThreadQuotaExceeded,
-                error.SystemResources,
-                => std.log.warn("auto bulk ingest finish runtime status refresh deferred err={}", .{err}),
-                else => {
-                    _ = self.auto_bulk_finish_failed.fetchAdd(1, .monotonic);
-                    std.log.warn("auto bulk ingest finish runtime status refresh failed err={}", .{err});
-                },
-            };
+            self.requestRuntimeStatusRefresh() catch |err| std.log.warn("auto bulk ingest finish runtime status refresh deferred err={}", .{err});
         }
         _ = self.auto_bulk_finish_completed.fetchAdd(1, .monotonic);
     }
@@ -23846,11 +23853,17 @@ pub fn runFromIterator(
     if (metadata_api_urls.urls.len > 1) std.debug.print(" (+{d} more)", .{metadata_api_urls.urls.len - 1});
     std.debug.print("\n", .{});
 
+    var raft_progress_lease: ?backend_runtime_mod.BackendRuntime.WorkerLease = if (data_server.data_raft != null)
+        try (try data_server.ensureBackendRuntime()).acquireWorkers(.{})
+    else
+        null;
+    defer if (raft_progress_lease) |*lease| lease.release();
     var raft_progress = antfly.raft.ManagedProgressDriver.init(
         setup_io.io(),
         data_server.raftProgressSource(),
         runtime_cadence.raft_tick_ns,
     );
+    raft_progress.scheduling_io = if (raft_progress_lease) |*lease| lease.io() else null;
     defer raft_progress.deinit();
     if (data_server.data_raft != null) try raft_progress.start();
 
@@ -38260,7 +38273,7 @@ test "data server HA replication network wait leaves state mutex available" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.endsWith(u8, req.uri, antfly.internal.routes.ha_replication_start)) {
                 self.entered.store(true, .release);
-                while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+                while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             return try self.upstream.execute(alloc_arg, req);
         }
@@ -38345,16 +38358,16 @@ test "data server HA replication network wait leaves state mutex available" {
     try server.initApiServer();
 
     var replication_thread = ReplicationThread{ .server = &server };
-    const thread = try std.Thread.spawn(.{}, ReplicationThread.run, .{&replication_thread});
+    var thread = try std.testing.io.concurrent(ReplicationThread.run, .{&replication_thread});
     var joined = false;
     defer if (!joined) {
         blocking_executor.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
 
     var spins: usize = 0;
     while (!blocking_executor.entered.load(.acquire) and spins < 1_000_000) : (spins += 1) {
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(blocking_executor.entered.load(.acquire));
 
@@ -38371,7 +38384,7 @@ test "data server HA replication network wait leaves state mutex available" {
         server.ha_state_mutex.unlock();
     }
     blocking_executor.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
 
     try std.testing.expect(mutex_available);
@@ -40368,4 +40381,68 @@ test "remote catalog watches reserve the outer deadline for replica failover" {
             25 * std.time.ns_per_ms,
         ),
     );
+}
+
+test "data runtime background worker capacity is reserved and closes with its owner" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            "/tmp/unused-data-worker-capacity",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            "/tmp/unused-data-worker-capacity",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .nothing,
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+    const io = try server.ensureBackgroundWorkerIo(.maintenance);
+    var release: std.Io.Event = .unset;
+    const Worker = struct {
+        fn run(task_io: std.Io, event: *std.Io.Event) void {
+            event.waitUncancelable(task_io);
+        }
+    };
+    {
+        var tasks: [1]std.Io.Future(void) = undefined;
+        var started: usize = 0;
+        defer {
+            release.set(io);
+            for (tasks[0..started]) |*task| task.await(io);
+        }
+        for (&tasks) |*task| {
+            task.* = try io.concurrent(Worker.run, .{ io, &release });
+            started += 1;
+        }
+        try std.testing.expectError(error.ConcurrencyUnavailable, io.concurrent(Worker.run, .{ io, &release }));
+    }
+    const Job = struct {
+        fn run(ptr: *anyopaque) !void {
+            const owner: *DataServer = @ptrCast(@alignCast(ptr));
+            _ = owner.provisioned_warmup_completed.fetchAdd(1, .release);
+        }
+        fn deinit(_: *anyopaque) void {}
+    };
+    const runtime = server.backend_runtime.?;
+    const owner_id = try server.dataServerBackgroundOwnerId(runtime);
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner_id,
+        .class = .maintenance,
+        .ptr = &server,
+        .run = Job.run,
+        .deinit = Job.deinit,
+    });
+    server.quiesceBackgroundWork();
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_completed.load(.acquire));
+    try std.testing.expectError(error.BackgroundOwnerClosing, server.dataServerBackgroundOwnerId(runtime));
+    try std.testing.expectEqual(@as(usize, 0), server.backend_runtime.?.laneStats().reserved_workers);
+    try std.testing.expect(server.maintenance_worker_lease == null);
+    try std.testing.expectError(error.BackgroundOwnerClosing, server.ensureBackgroundWorkerIo(.maintenance));
 }

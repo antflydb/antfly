@@ -1086,7 +1086,7 @@ fn lockYielding(mutex: *std.atomic.Mutex) void {
             std.atomic.spinLoopHint();
             spins += 1;
         } else {
-            std.Thread.yield() catch std.atomic.spinLoopHint();
+            @import("antfly_platform").time.yieldNow();
         }
     }
 }

@@ -4938,7 +4938,7 @@ pub const Node = struct {
         const workers = model.load_workers orelse ops.A4bInferenceConfig.default_load_workers;
         const started_ns = embedTimingNowNs();
         if ((model.prepared_pack orelse .auto) != .off) {
-            if (try a4b_prepared_pack.prefetchInstalled(allocator, model_path, gguf_path, workers)) |prepared| {
+            if (try a4b_prepared_pack.prefetchInstalled(io_impl.io(), allocator, model_path, gguf_path, workers)) |prepared| {
                 std.log.info(
                     "prefetched A4B prepared pack model={s} shards={d} bytes={d} workers={d} elapsed_ms={d}",
                     .{ model.name, prepared.shard_count, prepared.bytes, prepared.workers, elapsedMs(started_ns, embedTimingNowNs()) },
@@ -4948,7 +4948,7 @@ pub const Node = struct {
                 return error.A4bPreparedPackRequired;
             }
         }
-        const result = try c_file.prefetchFile(allocator, gguf_path, workers);
+        const result = try c_file.prefetchFile(io_impl.io(), allocator, gguf_path, workers);
         std.log.info(
             "prefetched inference generator model={s} artifact={s} bytes={d} workers={d} elapsed_ms={d}",
             .{ model.name, gguf_path, result.bytes, result.workers, elapsedMs(started_ns, embedTimingNowNs()) },

@@ -12889,7 +12889,11 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
     );
 
     var dispatch = Dispatch{ .store = &store };
-    var dispatch_thread = try std.Thread.spawn(.{}, Dispatch.run, .{&dispatch});
+    var dispatch_thread = try std.testing.io.concurrent(Dispatch.run, .{&dispatch});
+    defer {
+        owned.release.set(std.Options.debug_io);
+        dispatch_thread.await(std.testing.io);
+    }
     owned.entered.waitUncancelable(std.Options.debug_io);
 
     var detach = Detach{ .store = &store, .registration = registration };
@@ -12902,7 +12906,12 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
         .contended = &detach_lock_contended,
     };
     defer test_lifecycle_detach_lock_barrier = null;
-    var detach_thread = try std.Thread.spawn(.{}, Detach.run, .{&detach});
+    var detach_thread = try std.testing.io.concurrent(Detach.run, .{&detach});
+    defer {
+        detach_lock_resume.set(std.Options.debug_io);
+        owned.release.set(std.Options.debug_io);
+        detach_thread.await(std.testing.io);
+    }
     detach.started.waitUncancelable(std.Options.debug_io);
     detach_lock_entered.waitUncancelable(std.Options.debug_io);
     // The detach call reached the exact apply-lock boundary while the callback
@@ -12912,8 +12921,8 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
     const apply_lock_was_contended = detach_lock_contended.load(.acquire);
     detach_lock_resume.set(std.Options.debug_io);
     owned.release.set(std.Options.debug_io);
-    dispatch_thread.join();
-    detach_thread.join();
+    dispatch_thread.await(std.testing.io);
+    detach_thread.await(std.testing.io);
     try std.testing.expect(blocked_at_lock_boundary);
     try std.testing.expect(apply_lock_was_contended);
     try std.testing.expect(detach.removed);

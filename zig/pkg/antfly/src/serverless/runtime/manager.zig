@@ -87,6 +87,7 @@ pub const ManagedRuntime = struct {
     stats_mu: std.atomic.Mutex = .unlocked,
     run_mu: std.atomic.Mutex = .unlocked,
     cumulative_stats: RuntimeRunStats = .{},
+    lifecycle_mutex: std.Io.Mutex = .init,
     future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
     stop_wake: std.Io.Event = .unset,
@@ -100,11 +101,12 @@ pub const ManagedRuntime = struct {
 
     pub fn init(
         alloc: Allocator,
+        io: std.Io,
         cfg: RuntimeConfig,
         catalog: *catalog_mod.CatalogService,
         pruner: build_mod.Pruner,
     ) ManagedRuntime {
-        return initWithIo(alloc, std.Options.debug_io, cfg, catalog, pruner);
+        return initWithIo(alloc, io, cfg, catalog, pruner);
     }
 
     pub fn initWithIo(
@@ -140,6 +142,8 @@ pub const ManagedRuntime = struct {
     }
 
     pub fn start(self: *ManagedRuntime) !void {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
         if (self.future != null) return error.AlreadyStarted;
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return;
         self.stop_requested.store(false, .monotonic);
@@ -156,6 +160,8 @@ pub const ManagedRuntime = struct {
     }
 
     pub fn stopWithDeadline(self: *ManagedRuntime, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
         self.stop_requested.store(true, .monotonic);
         self.stop_wake.set(self.io);
         if (self.future) |*future| {
@@ -611,7 +617,7 @@ test "managed runtime publishes and prunes based on namespace policy" {
     var ingest_c = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 300, .mutations = &batch_c });
     defer ingest_c.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
     const stats = try runtime.runOnce();
@@ -634,6 +640,24 @@ test "managed runtime publishes and prunes based on namespace policy" {
     try runtime.start();
     runtime.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMillisecondsWithIo(runtime.io, 0));
     try std.testing.expectEqual(@as(?anyerror, null), runtime.runtimeFailure());
+    {
+        var unavailable = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
+        defer unavailable.deinit();
+        runtime.io = unavailable.io();
+        defer {
+            runtime.stop();
+            runtime.io = std.testing.io;
+        }
+        try std.testing.expectError(error.ConcurrencyUnavailable, runtime.start());
+        try std.testing.expect(runtime.future == null);
+    }
+    runtime.cfg.tick_interval_ms = 60_000;
+    for (0..2) |_| {
+        try runtime.start();
+        try std.testing.expectError(error.AlreadyStarted, runtime.start());
+        runtime.stop();
+        try std.testing.expect(runtime.future == null);
+    }
 }
 
 test "managed runtime query-only role skips maintenance work" {
@@ -684,7 +708,7 @@ test "managed runtime query-only role skips maintenance work" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .role = .query_only,
     }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
@@ -743,7 +767,7 @@ test "managed runtime api-only role skips maintenance work" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .role = .api_only,
     }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
@@ -806,7 +830,7 @@ test "managed runtime honors maintenance feature flags" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .publish_enabled = false,
         .compaction_enabled = false,
@@ -884,7 +908,7 @@ test "managed runtime compacts head when namespace exceeds compaction threshold"
     var build_second = try builder.publishNamespace("docs");
     defer build_second.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setCompactor(build_mod.Compactor.init(alloc, &artifact_store, &manifest_store, &progress_store));
     defer runtime.deinit();
 
@@ -952,7 +976,7 @@ test "managed runtime runs sparse enrichment for opted-in namespaces" {
     var build = try builder.publishNamespace("docs");
     defer build.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setEnricher(enrichment_mod.SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
