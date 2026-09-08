@@ -83877,11 +83877,10 @@ test "db thin replay marks artifact deletes for managed index replay" {
 
 test "db generated replay atomically promotes staged artifacts and deletes stale generation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    var test_dir = try TestDirectory.init("db");
+    defer test_dir.cleanup();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    var db = try DB.open(alloc, test_dir.path(), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .enable_without_producers = true },
