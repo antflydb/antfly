@@ -7708,7 +7708,9 @@ pub fn build(b: *std.Build) void {
             "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
             "actionable repair remains visible while retained generation stays queryable",
             "serviceable full text replacement remains queryable while rebuilding",
-            "serviceable repair cannot mask sibling shard serving failures",
+            "serviceable repair preserves sibling shard dense catch-up fallback",
+            "serviceable repair cannot mask sibling shard load failure",
+            "index encoders preserve sibling replay debt during serviceable repair",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
