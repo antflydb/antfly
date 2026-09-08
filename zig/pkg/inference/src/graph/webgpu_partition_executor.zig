@@ -929,6 +929,7 @@ test "webgpu partition executor delegates through partition executor path" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -1008,6 +1009,7 @@ test "webgpu partition executor direct softmax reduction commands" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -1096,6 +1098,7 @@ test "webgpu partition executor direct mask select commands" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -1184,6 +1187,7 @@ test "webgpu partition executor direct view movement commands" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -1270,6 +1274,7 @@ test "webgpu partition executor direct transformer dense commands" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const x_data = [_]f32{ 0.5, -1.0, 2.0, 3.0, -2.0, 0.25, 1.5, -0.75 };
@@ -1441,6 +1446,7 @@ test "webgpu partition executor direct planned grouped transformer commands" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const x_data = try allocator.alloc(f32, rows * hidden);
@@ -1586,6 +1592,7 @@ test "webgpu partition executor direct planned pair projection commands" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const x_data = try allocator.alloc(f32, rows * hidden);
@@ -1734,6 +1741,7 @@ test "webgpu partition executor resident transformer block parity with planned q
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const x_data = try allocator.alloc(f32, rows * hidden);

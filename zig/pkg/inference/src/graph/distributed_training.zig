@@ -261,7 +261,9 @@ test "2-device gradient averaging" {
     var ws_a = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var ws_b = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute_a = NativeCompute.init(allocator, &ws_a, null);
+    defer compute_a.deinit();
     var compute_b = NativeCompute.init(allocator, &ws_b, null);
+    defer compute_b.deinit();
     var cb_a = compute_a.computeBackend();
     var cb_b = compute_b.computeBackend();
 
@@ -318,7 +320,9 @@ test "distributed loss decreases" {
     var ws_a = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var ws_b = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute_a = NativeCompute.init(allocator, &ws_a, null);
+    defer compute_a.deinit();
     var compute_b = NativeCompute.init(allocator, &ws_b, null);
+    defer compute_b.deinit();
     var cb_a = compute_a.computeBackend();
     var cb_b = compute_b.computeBackend();
 

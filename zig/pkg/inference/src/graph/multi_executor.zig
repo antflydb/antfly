@@ -768,6 +768,7 @@ test "graph backend partition executes through native partition executor path" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
     var mesh = try DeviceMesh.init(allocator, &.{.{ .id = 0, .backend = &cb, .kind = .native }});
     defer mesh.deinit();
@@ -814,11 +815,13 @@ test "native partition executor transfers borrowed runtime input across devices"
     var weight_store_a = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store_a, allocator);
     var compute_a = native_compute.NativeCompute.init(allocator, &weight_store_a, null);
+    defer compute_a.deinit();
     var cb_a = compute_a.computeBackend();
 
     var weight_store_b = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store_b, allocator);
     var compute_b = native_compute.NativeCompute.init(allocator, &weight_store_b, null);
+    defer compute_b.deinit();
     var cb_b = compute_b.computeBackend();
 
     var mesh = try DeviceMesh.init(allocator, &.{
@@ -878,6 +881,7 @@ test "multi-executor keeps metal partition outputs resident until final readback
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
 
     var metal_weight_store = initEmptyMetalWeightStore(allocator);
@@ -946,6 +950,7 @@ test "multi-executor metal graph outputs survive plan-slot reuse across executio
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
 
     var metal_weight_store = initEmptyMetalWeightStore(allocator);

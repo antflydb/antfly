@@ -4946,7 +4946,7 @@ fn makeMetalHostedComputeBackend(
             self.metal_jit_scope,
             self.kernel_jit_load_context,
         );
-    return compute.computeBackend();
+    return compute.ownedComputeBackend();
 }
 
 fn initGpuHostedPrefetch(self: *ArchSession) !void {

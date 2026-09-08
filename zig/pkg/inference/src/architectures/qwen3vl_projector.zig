@@ -1887,7 +1887,7 @@ test "Qwen3-VL projector cancellation unwinds live vision intermediates with cac
     var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer native_compute.deinitPrefetchQueue(&store);
     var compute = native_compute.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute.vtable_impl };
     // The first layer norm really executes. Cancellation at its following
     // projection must release that intermediate even when weights are cached.
@@ -1946,7 +1946,7 @@ test "Qwen3-VL prompt preparation keeps M-RoPE mask and DeepStack aligned" {
     errdefer tensor.deinit();
     try store.resident_weights.put(allocator, name, weight_source.LoadedWeight{ .tensor = tensor });
     var compute = native_compute.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute.vtable_impl };
     var projected = ProjectedImages{
         .allocator = allocator,

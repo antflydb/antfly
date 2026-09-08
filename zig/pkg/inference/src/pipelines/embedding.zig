@@ -2717,6 +2717,7 @@ test "resident masked mean pooling uses backend primitives" {
         native_mod.deinitPrefetchQueue(&weight_store);
     }
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const values = [_]f32{
@@ -2758,6 +2759,7 @@ test "resident text pooling handles flattened batch sequence hidden states" {
         native_mod.deinitPrefetchQueue(&weight_store);
     }
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const values = [_]f32{
@@ -2937,6 +2939,7 @@ test "resident projected input selection supports 3d cls pooling" {
         native_mod.deinitPrefetchQueue(&weight_store);
     }
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const values = [_]f32{
@@ -2991,6 +2994,7 @@ test "resident 2d embedding extraction normalizes before host readback" {
         native_mod.deinitPrefetchQueue(&weight_store);
     }
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const values = [_]f32{ 3.0, 4.0, 0.0, 0.0 };

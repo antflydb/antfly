@@ -973,6 +973,7 @@ test "graph bridge linear classifier one step updates head" {
     const native_compute = @import("../ops/native_compute.zig");
     var ws = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = native_compute.NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     var graph_bundle = try LinearClassifierGraph.init(allocator, 4, 3, 2);
@@ -1020,6 +1021,7 @@ test "graph bridge mlp classifier one step updates head" {
     const native_compute = @import("../ops/native_compute.zig");
     var ws = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = native_compute.NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     var graph_bundle = try MlpClassifierGraph.init(allocator, 4, 3, 5, 2);
@@ -1076,6 +1078,7 @@ test "graph bridge lora linear one step updates adapters" {
     const native_compute = @import("../ops/native_compute.zig");
     var ws = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = native_compute.NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     var graph_bundle = try LoRALinearGraph.init(allocator, 3, 4, 4, 2, 4.0);
