@@ -23,6 +23,11 @@ const arm = @import("arm_crc.zig");
 const x86_ieee = @import("x86_crc32.zig");
 const x86_castagnoli = @import("x86_crc32c.zig");
 
+// Zig 0.16's non-LLVM x86 backend cannot encode either PCLMULQDQ or
+// CRC32 r64,r64. Keep those kernels out of semantic analysis in Debug builds
+// using that backend; LLVM release builds retain hardware acceleration.
+const asm_kernels_supported = builtin.zig_backend != .stage2_c and builtin.zig_backend != .stage2_x86_64;
+
 pub const Crc32 = Crc(false);
 pub const Crc32c = Crc(true);
 pub const Implementation = enum { slicing_by_eight, arm_crc, x86_pclmul, x86_crc };
@@ -46,7 +51,7 @@ fn Crc(comptime castagnoli: bool) type {
         }
 
         fn select(features: cpu.Features) Implementation {
-            if (comptime builtin.zig_backend == .stage2_c) return .slicing_by_eight;
+            if (comptime !asm_kernels_supported) return .slicing_by_eight;
             return switch (builtin.cpu.arch) {
                 .aarch64 => if (features.arm_crc) .arm_crc else .slicing_by_eight,
                 .x86_64 => if (castagnoli)
@@ -63,7 +68,7 @@ fn Crc(comptime castagnoli: bool) type {
                 self.updatePortable(bytes);
                 return;
             }
-            if (comptime builtin.zig_backend != .stage2_c) {
+            if (comptime asm_kernels_supported) {
                 if (comptime builtin.cpu.arch == .aarch64) {
                     if (implementation() == .arm_crc) {
                         self.crc = arm.update(castagnoli, self.crc, bytes);

@@ -20,7 +20,9 @@ builds use CPUID. The cache is atomic and allocation-free; optional instructions
 are isolated in non-inlined kernels. PCLMUL requires SSE2 but not AVX, SSE4.1,
 or SSE4.2. SSE4.2's CRC instruction is used only for Castagnoli, never IEEE.
 Other platforms retain target guarantees or portable code. Freestanding builds
-only use target-guaranteed features; the C backend uses portable code. A libc-free
+only use target-guaranteed features; the C backend uses portable code. Zig 0.16's
+non-LLVM x86 backend cannot encode the CRC instructions, so it also uses portable
+CRC32/CRC32C kernels; LLVM release builds retain hardware acceleration. A libc-free
 Linux library without startup-provided auxv also stays portable.
 
 CRC tables occupy 8 KiB per 32-bit polynomial and 16 KiB for CRC64/NVME.
@@ -52,6 +54,9 @@ zig build lib-hash-test lib-image-png-test -Doptimize=Debug
 zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
 zig build lib-hash-test -Doptimize=ReleaseFast -- throughput
 ```
+
+On Linux x86-64, CI also runs `zig test lib/hash/src/mod.zig -O Debug
+-mcpu=baseline -fno-llvm` to exercise the non-LLVM backend's portable kernels.
 
 Hash and PNG tests also run with `unit-test`. Correctness checks cover known
 vectors, portable versus dispatched kernels, unaligned buffers, folding/tail

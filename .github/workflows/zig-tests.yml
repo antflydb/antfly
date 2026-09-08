@@ -338,7 +338,9 @@ jobs:
 
       - name: Test baseline checksum runtime dispatch
         working-directory: zig
-        run: zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
+        run: |
+          zig test lib/hash/src/mod.zig -O Debug -mcpu=baseline -fno-llvm
+          zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
 
       - name: Check generated sources
         run: make zig-generated-check
