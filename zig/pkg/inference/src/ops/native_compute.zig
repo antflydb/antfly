@@ -791,6 +791,8 @@ const Buf = struct {
     data: []f32,
     allocator: std.mem.Allocator,
     owned: bool,
+    weight_handle_name: ?[]const u8 = null,
+    weight_handle_refs: usize = 0,
     shared_data_refcount: ?*usize = null,
     logical_shape: ?[]i64 = null,
     logical_shape_inline: bool = false,
@@ -947,6 +949,9 @@ fn getData(ct: CT) []f32 {
 
 fn ownedDenseBufWithMaxSharedRefs(ct: CT, max_shared_refs: usize) ?*Buf {
     const buf = toBuf(ct);
+    // Named weights and their views remain immutable even if the dense
+    // conversion itself is allocator-owned and has only one host reference.
+    if (buf.name.len != 0) return null;
     if (!buf.owned or buf.shared_data_refcount == null) return null;
     if (buf.shared_data_refcount.?.* == 0 or buf.shared_data_refcount.?.* > max_shared_refs) return null;
     if (buf.view_strides != null) return null;
@@ -966,9 +971,10 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
 
     if (source.owned and source.shared_data_refcount != null) {
         source.shared_data_refcount.?.* += 1;
+        errdefer source.shared_data_refcount.?.* -= 1;
 
         const alias = try self.allocator.create(Buf);
-        errdefer source.shared_data_refcount.?.* -= 1;
+        errdefer self.allocator.destroy(alias);
         alias.* = .{
             .data = source.data,
             .allocator = self.allocator,
@@ -990,6 +996,7 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
     }
 
     const alias = try self.allocator.create(Buf);
+    errdefer self.allocator.destroy(alias);
     alias.* = .{
         .data = source.data,
         .allocator = self.allocator,
@@ -3908,6 +3915,7 @@ pub const NativeCompute = struct {
     data: *WeightStore,
     run_budget: ?*run_memory.RunBudget = null,
     weight_reservations: std.StringHashMapUnmanaged(ReservationState) = .empty,
+    weight_handles: std.StringHashMapUnmanaged(CT) = .empty,
     /// Optional Io for parallel GEMM dispatch.  When non-null, sgemm calls
     /// route through linalg's Io-aware variants and parallel work is
     /// scheduled on the runtime's thread pool.  When null, sgemm uses the
@@ -4064,6 +4072,7 @@ pub const NativeCompute = struct {
         source_tensor: ?*const tensor_mod.Tensor,
     ) !CT {
         const b = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(b);
         var shared_data_refcount: ?*usize = null;
         errdefer if (shared_data_refcount) |refcount| self.allocator.destroy(refcount);
         if (owned) {
@@ -4504,6 +4513,7 @@ fn backendKind(_: *anyopaque) BackendKind {
 
 fn deinitBackend(ctx: *anyopaque) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    deinitWeightHandles(self);
     if (self.run_budget) |run_budget| {
         var it = self.weight_reservations.iterator();
         while (it.next()) |entry| {
@@ -4521,6 +4531,15 @@ fn deinitBackend(ctx: *anyopaque) void {
 fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const b = toBuf(tensor);
+    const handle_name = b.weight_handle_name;
+    if (handle_name) |name| {
+        std.debug.assert(b.weight_handle_refs > 0);
+        b.weight_handle_refs -= 1;
+        if (b.weight_handle_refs != 0) return;
+        std.debug.assert(self.weight_handles.remove(name));
+        b.weight_handle_name = null;
+    }
+    defer if (handle_name) |name| self.allocator.free(name);
     if (b.lazy_entry) |entry| {
         if (entry.guard) |guard| {
             while (!guard.tryLock()) {
@@ -4735,8 +4754,38 @@ test "native weight handles reserve and release run budget capacity" {
     try std.testing.expectEqual(@as(usize, 0), compute.weight_reservations.count());
 }
 
+fn deinitWeightHandles(self: *NativeCompute) void {
+    var it = self.weight_handles.iterator();
+    while (it.next()) |entry| {
+        toBuf(entry.value_ptr.*).weight_handle_name = null;
+        freeTensor(self, entry.value_ptr.*);
+        self.allocator.free(entry.key_ptr.*);
+    }
+    self.weight_handles.deinit(self.allocator);
+    self.weight_handles = .empty;
+}
+
 fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (self.weight_handles.get(name)) |tensor| {
+        toBuf(tensor).weight_handle_refs += 1;
+        return tensor;
+    }
+    try self.weight_handles.ensureUnusedCapacity(self.allocator, 1);
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
+    // Views copy Buf.name without retaining the handle. Use the model-store
+    // key, whose lifetime also covers views after an early handle release.
+    const stable_name = self.data.resident_weights.getKey(name) orelse
+        self.data.lazy_weights.getKey(name) orelse name;
+    const tensor = try loadWeight(self, stable_name);
+    toBuf(tensor).weight_handle_name = owned_name;
+    toBuf(tensor).weight_handle_refs = 1;
+    self.weight_handles.putAssumeCapacityNoClobber(owned_name, tensor);
+    return tensor;
+}
+
+fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
     if (self.data.resident_weights.getPtr(name)) |w| {
         if (w.quantized_storage) |*storage| {
             try ensurePreparedKBlock(self, storage, null);
@@ -45973,6 +46022,75 @@ test "embeddingLookup dequantizes quantized GGUF rows" {
     }
 }
 
+fn testWeightHandleLifetime(allocator: std.mem.Allocator, lazy: bool) !void {
+    var bytes = [_]u8{ 0x80, 0x3f, 0x20, 0xc0, 0x00, 0x3f, 0x40, 0x40 };
+    var shape = [_]i64{ 2, 2 };
+    const weight = LoadedWeight{ .tensor = .{
+        .data = &bytes,
+        .shape = &shape,
+        .dtype = .bf16,
+        .name = "weight",
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+    } };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.resident_weights.deinit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    if (lazy) {
+        try store.lazy_weights.put(allocator, "weight", .{
+            .tensor_ref = .{ .name = "weight" },
+            .loaded = weight,
+            .loaded_bytes = bytes.len,
+        });
+    } else {
+        try store.resident_weights.put(allocator, "weight", weight);
+    }
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 64 });
+    {
+        const compute = try allocator.create(NativeCompute);
+        compute.* = NativeCompute.init(allocator, &store, &budget);
+        defer store.prefetch.deinit();
+        defer deinitBackend(compute);
+        const first = try getWeight(compute, "weight");
+        const alias = if (!lazy) try aliasDenseBufWithShape(compute, first, &.{4}) else null;
+        defer if (alias) |view| freeTensor(compute, view);
+        for (0..1000) |_| try std.testing.expectEqual(first, try getWeight(compute, "weight"));
+        try std.testing.expectEqual(@as(usize, 1), compute.weight_handles.count());
+        try std.testing.expectEqual(@as(usize, 1), compute.weight_reservations.count());
+        if (lazy) try std.testing.expectEqual(@as(usize, 1), store.lazy_weights.get("weight").?.pin_count);
+        try std.testing.expectEqualSlices(f32, &.{ 1, -2.5, 0.5, 3 }, getData(first));
+        try std.testing.expectEqual(@as(?CT, null), try unaryConsumeOp(compute, .relu, first));
+        // Releasing one caller must not invalidate the other borrowers.
+        for (0..1000) |_| freeTensor(compute, first);
+        try std.testing.expectEqualSlices(f32, &.{ 1, -2.5, 0.5, 3 }, getData(first));
+        freeTensor(compute, first);
+        if (alias) |view| {
+            try std.testing.expectEqualSlices(f32, &.{ 1, -2.5, 0.5, 3 }, getData(view));
+            try std.testing.expectEqualStrings("weight", toBuf(view).name);
+            try std.testing.expectEqual(@as(?CT, null), try unaryConsumeOp(compute, .relu, view));
+        }
+        try std.testing.expectEqual(@as(usize, 0), compute.weight_handles.count());
+        try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+        if (lazy) try std.testing.expectEqual(@as(usize, 0), store.lazy_weights.get("weight").?.pin_count);
+        // Florence-style callers leave their lookups to backend teardown.
+        _ = try getWeight(compute, "weight");
+        _ = try getWeight(compute, "weight");
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    if (lazy) try std.testing.expectEqual(@as(usize, 0), store.lazy_weights.get("weight").?.pin_count);
+}
+
+test "native weight handle lifetime is bounded and releases reservations and lazy pins" {
+    try testWeightHandleLifetime(std.testing.allocator, false);
+    try testWeightHandleLifetime(std.testing.allocator, true);
+}
+
+test "native weight handle lifetime unwinds allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{false});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{true});
+}
+
 test "getWeight preserves resident dense tensor shape metadata" {
     const allocator = std.testing.allocator;
 
@@ -46017,6 +46135,7 @@ test "getWeight preserves resident dense tensor shape metadata" {
     var run_budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 1024 });
     var compute = NativeCompute.init(allocator, &weight_store, &run_budget);
     defer compute.weight_reservations.deinit(allocator);
+    defer deinitWeightHandles(&compute);
     const cb = compute.computeBackend();
 
     const weight = try cb.getWeight(name);
