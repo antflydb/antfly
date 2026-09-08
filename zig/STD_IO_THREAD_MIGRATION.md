@@ -38,6 +38,13 @@ and releasing leases; startup failure preserves active flags and retry state.
 Manual runtimes use the explicit foreground paths rather than submitting a
 recursive pipeline inline while its admission lock is held.
 
+Durable-owner drains wait for callbacks and payload destruction without holding
+the lane-wide reaper lock, allowing these jobs to close child database owners.
+Only completed futures are reaped under that lock; runtime shutdown first waits
+for all owners to become idle. Concurrent drains retain the same owner completion
+barrier, and draining an open owner never waits for newly admitted work under
+the reaper lock.
+
 The internal LSM flush worker accepts borrowed scheduling Io, reuses an owned
 backend runtime when present, and otherwise owns a one-task executor. Io mutex
 and event waits replace idle polling while preserving obsolete-file deadlines.
@@ -143,6 +150,13 @@ Validated on macOS ARM64, Zig 0.16.0, after integrating PR head `80f499cfe`:
   feature-cache test introduced by the main merge to futures and an event.
 - Formatting and whitespace checks passed. No new Linux/GPU execution or
   aggregate all-unit validation is claimed by this follow-up.
+
+The nested-owner drain correction also passed all 39 background-runtime tests
+and 149 DataServer tests on the same platform. Its deterministic regression
+covers nested closes from job callbacks and payload destructors during owner
+drain, owner close, and runtime shutdown, plus concurrent drains of one owner.
+The nested-close regression fails with the former locking restored in an isolated
+source copy.
 
 ## HTTP control executor follow-up
 

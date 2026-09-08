@@ -703,6 +703,18 @@ const OwnerRegistry = struct {
         }
     }
 
+    fn waitAllIdle(self: *OwnerRegistry) void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (true) {
+            var states = self.states.valueIterator();
+            while (states.next()) |state| {
+                if (state.in_flight != 0) break;
+            } else return;
+            self.idle.waitUncancelable(self.sync_io, &self.mutex);
+        }
+    }
+
     fn retireClosed(self: *OwnerRegistry, owner_id: u64) void {
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
@@ -1516,6 +1528,9 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn drainAll(self: *ThreadedDurableJobLane) void {
+        // Admission is closed before shutdown reaches here. Jobs and payload
+        // destructors may drain other owners, so none may run under reap_mutex.
+        self.owners.waitAllIdle();
         lockAtomic(&self.reap_mutex);
         defer self.reap_mutex.unlock();
         while (true) {
@@ -1525,10 +1540,14 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn drainMatching(self: *ThreadedDurableJobLane, owner_id: u64) void {
+        // Owner completion includes payload destruction. Wait without the
+        // lane-wide reaper lock: a running job can close a child DB owner on
+        // this same lane. Concurrent drains still share this completion barrier.
+        self.owners.waitIdle(owner_id);
         lockAtomic(&self.reap_mutex);
         defer self.reap_mutex.unlock();
         while (true) {
-            const entry = self.popOwner(owner_id) orelse return;
+            const entry = self.popCompletedOwner(owner_id) orelse return;
             self.awaitAndDestroy(entry);
         }
     }
@@ -1570,11 +1589,15 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         return self.entries.swapRemove(0);
     }
 
-    fn popOwner(self: *ThreadedDurableJobLane, owner_id: u64) ?*Entry {
+    fn popCompletedOwner(self: *ThreadedDurableJobLane, owner_id: u64) ?*Entry {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         for (self.entries.items, 0..) |entry, idx| {
-            if (entry.job.owner_id == owner_id) return self.entries.swapRemove(idx);
+            // drainOwner does not close admission. A successor may have been
+            // submitted after waitIdle returned; never await it under the lock.
+            // A worker still publishing its completion is left for the reaper.
+            if (entry.job.owner_id == owner_id and entry.completed.load(.acquire))
+                return self.entries.swapRemove(idx);
         }
         return null;
     }
@@ -2507,6 +2530,181 @@ test "backend runtime owner close rejects recursive submit from draining job" {
     const run_count = ctx.run_count.load(.acquire);
     try std.testing.expect(run_count >= 1);
     try std.testing.expectEqual(run_count, ctx.deinits.load(.acquire));
+}
+
+// Observe entry into an owner completion wait without timing-dependent sleeps.
+const OwnerDrainWaitProbe = struct {
+    first_wait: Io.Event = .unset,
+    second_wait: Io.Event = .unset,
+    waits: std.atomic.Value(usize) = .init(0),
+    vtable: Io.VTable = undefined,
+
+    fn io(self: *@This()) Io {
+        self.vtable = std.testing.io.vtable.*;
+        self.vtable.futexWaitUncancelable = wait;
+        self.vtable.futexWake = wake;
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn wait(ptr: ?*anyopaque, address: *const u32, expected: u32) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr.?));
+        const previous = self.waits.fetchAdd(1, .acq_rel);
+        if (previous == 0) self.first_wait.set(std.testing.io);
+        if (previous == 1) self.second_wait.set(std.testing.io);
+        std.testing.io.vtable.futexWaitUncancelable(std.testing.io.userdata, address, expected);
+    }
+
+    fn wake(_: ?*anyopaque, address: *const u32, count: u32) void {
+        std.testing.io.vtable.futexWake(std.testing.io.userdata, address, count);
+    }
+
+    fn expectWait(event: *Io.Event) void {
+        event.waitTimeout(std.testing.io, .{
+            .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+        }) catch @panic("owner drain did not reach its unlocked completion barrier");
+    }
+};
+
+test "backend runtime nested owner teardown completes during drain close and shutdown" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Mode = enum { drain, close, shutdown };
+    const Ctx = struct {
+        handle: *BackendRuntimeHandle,
+        parent_id: u64,
+        child_id: u64,
+        close_in_deinit: bool,
+        mode: Mode,
+        parent_release: Io.Event = .unset,
+        child_release: Io.Event = .unset,
+        deinits: std.atomic.Value(usize) = .init(0),
+        child_closed: std.atomic.Value(bool) = .init(false),
+
+        fn closeChild(self: *@This()) void {
+            self.handle.ptr().durable_jobs.closeOwner(self.child_id);
+            self.child_closed.store(true, .release);
+        }
+        fn parentRun(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.parent_release.waitUncancelable(std.testing.io);
+            if (!self.close_in_deinit) self.closeChild();
+        }
+        fn parentDeinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.close_in_deinit) self.closeChild();
+            _ = self.deinits.fetchAdd(1, .release);
+        }
+        fn childRun(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.child_release.waitUncancelable(std.testing.io);
+        }
+        fn childDeinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.deinits.fetchAdd(1, .release);
+        }
+        fn drain(self: *@This()) void {
+            switch (self.mode) {
+                .drain => self.handle.ptr().durable_jobs.drainOwner(self.parent_id),
+                .close => self.handle.ptr().durable_jobs.closeOwner(self.parent_id),
+                .shutdown => self.handle.deinit(),
+            }
+        }
+    };
+
+    for ([_]Mode{ .drain, .close, .shutdown }) |mode| {
+        for ([_]bool{ false, true }) |close_in_deinit| {
+            var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{});
+            var live = true;
+            defer if (live) handle.deinit();
+            var probe: OwnerDrainWaitProbe = .{};
+            handle.ptr().owner_registry.sync_io = probe.io();
+            var ctx: Ctx = .{
+                .handle = &handle,
+                .parent_id = try handle.ptr().allocOwnerId(),
+                .child_id = try handle.ptr().allocOwnerId(),
+                .close_in_deinit = close_in_deinit,
+                .mode = mode,
+            };
+            defer {
+                ctx.parent_release.set(std.testing.io);
+                ctx.child_release.set(std.testing.io);
+            }
+            try handle.ptr().durable_jobs.submit(.{
+                .owner_id = ctx.parent_id,
+                .class = .maintenance,
+                .ptr = &ctx,
+                .run = Ctx.parentRun,
+                .deinit = Ctx.parentDeinit,
+            });
+            try handle.ptr().durable_jobs.submit(.{
+                .owner_id = ctx.child_id,
+                .class = .cleanup,
+                .ptr = &ctx,
+                .run = Ctx.childRun,
+                .deinit = Ctx.childDeinit,
+            });
+            var draining = try std.testing.io.concurrent(Ctx.drain, .{&ctx});
+            if (mode == .shutdown) live = false;
+            defer {
+                ctx.parent_release.set(std.testing.io);
+                ctx.child_release.set(std.testing.io);
+                draining.await(std.testing.io);
+            }
+            OwnerDrainWaitProbe.expectWait(&probe.first_wait);
+            ctx.parent_release.set(std.testing.io);
+            OwnerDrainWaitProbe.expectWait(&probe.second_wait);
+            try std.testing.expect(!ctx.child_closed.load(.acquire));
+            ctx.child_release.set(std.testing.io);
+            draining.await(std.testing.io);
+            try std.testing.expect(ctx.child_closed.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 2), ctx.deinits.load(.acquire));
+        }
+    }
+}
+
+test "backend runtime concurrent owner drains both wait for payload teardown" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Ctx = struct {
+        lane: DurableJobLane,
+        owner_id: u64,
+        release: Io.Event = .unset,
+        finished_drains: std.atomic.Value(usize) = .init(0),
+        deinits: std.atomic.Value(usize) = .init(0),
+        fn run(_: *anyopaque) !void {}
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.release.waitUncancelable(std.testing.io);
+            _ = self.deinits.fetchAdd(1, .release);
+        }
+        fn drain(self: *@This()) void {
+            self.lane.drainOwner(self.owner_id);
+            _ = self.finished_drains.fetchAdd(1, .release);
+        }
+    };
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer handle.deinit();
+    var probe: OwnerDrainWaitProbe = .{};
+    handle.ptr().owner_registry.sync_io = probe.io();
+    var ctx: Ctx = .{ .lane = handle.ptr().durable_jobs, .owner_id = try handle.ptr().allocOwnerId() };
+    defer ctx.release.set(std.testing.io);
+    try ctx.lane.submit(.{ .owner_id = ctx.owner_id, .class = .cleanup, .ptr = &ctx, .run = Ctx.run, .deinit = Ctx.deinit });
+    var first = try std.testing.io.concurrent(Ctx.drain, .{&ctx});
+    defer {
+        ctx.release.set(std.testing.io);
+        first.await(std.testing.io);
+    }
+    OwnerDrainWaitProbe.expectWait(&probe.first_wait);
+    var second = try std.testing.io.concurrent(Ctx.drain, .{&ctx});
+    defer {
+        ctx.release.set(std.testing.io);
+        second.await(std.testing.io);
+    }
+    OwnerDrainWaitProbe.expectWait(&probe.second_wait);
+    try std.testing.expectEqual(@as(usize, 0), ctx.finished_drains.load(.acquire));
+    ctx.release.set(std.testing.io);
+    first.await(std.testing.io);
+    second.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 2), ctx.finished_drains.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), ctx.deinits.load(.acquire));
 }
 
 test "backend runtime durable lane deinits threaded job payload after completion" {
