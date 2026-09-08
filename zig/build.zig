@@ -6719,6 +6719,7 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, api_derived_coverage_test_mod, true, true);
     const lib_api_derived_coverage_tests = b.addTest(.{
         .root_module = api_derived_coverage_test_mod,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
             "live repair admission supersedes cached vector serviceability",
             "coverage policy accepts only the public embeddings contract",
@@ -6832,6 +6833,7 @@ pub fn build(b: *std.Build) void {
             "opening embeddings observation requires explicit serviceability authority",
             "cached owner observation preserves serving authority without convergence authority",
             "index-local convergence fence does not revoke a completed sibling",
+            "accepted target observation survives late snapshots but not new commit fences",
             "single group synthetic publication preserves owner runtime authority",
             "target-scoped stale full text observation cannot publish old readiness",
             "targeted full text sibling remains authoritative during table catch up",

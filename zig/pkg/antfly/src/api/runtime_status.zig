@@ -268,6 +268,10 @@ const TargetedIndexAuthority = struct {
         // it only through its own applied replay witness. One watermark keeps
         // this bounded regardless of coalesced writes or observation gaps.
         reducing_source_sequence: u64,
+        // Accepted observation is authority for this exact requirement, not
+        // a property that a late owner snapshot may revoke. A new commit or
+        // incarnation replaces the requirement and clears this proof.
+        observed: bool = false,
     };
 
     const TerminalFailure = struct {
@@ -899,6 +903,7 @@ pub const TableRuntimeSnapshotCache = struct {
             // Durable DB replay ordering deduplicates repeated notifications
             // and proves that the sampled source target includes the commit.
             source_target_sequence: u64,
+            observed: bool = false,
         };
 
         ref_count: std.atomic.Value(usize) = .init(1),
@@ -3693,20 +3698,20 @@ pub const TableRuntimeSnapshotCache = struct {
         observed_revision: u64,
     ) void {
         _ = self;
-        const required = state.required_target_observation_revisions.get(group_id) orelse TableState.TargetObservationRequirement{
-            .event_revision = 0,
-            .source_target_sequence = 0,
-        };
-        status.metadata.target_observation_complete = status.metadata.target_observation_complete and
-            observed_revision >= required.event_revision and
-            status.metadata.target_observation_revision >= required.source_target_sequence;
+        if (state.required_target_observation_revisions.getPtr(group_id)) |required| {
+            const includes_target = status.metadata.target_observation_revision >= required.source_target_sequence;
+            if (status.metadata.target_observation_complete and includes_target and
+                observed_revision >= required.event_revision) required.observed = true;
+            status.metadata.target_observation_complete = required.observed and includes_target;
+        }
         for (status.stats.indexes) |*item| {
             item.runtime_target_observation_complete = true;
             const authority = state.index_authorities.get(item.name) orelse continue;
             if (!targetAuthorityAcceptsIdentity(authority, item.*)) continue;
-            const index_required = authority.convergence_requirements.get(group_id) orelse continue;
-            item.runtime_target_observation_complete = observed_revision >= index_required.event_revision and
-                item.replay_target_sequence >= index_required.source_target_sequence;
+            const index_required = authority.convergence_requirements.getPtr(group_id) orelse continue;
+            const includes_target = item.replay_target_sequence >= index_required.source_target_sequence;
+            if (observed_revision >= index_required.event_revision and includes_target) index_required.observed = true;
+            item.runtime_target_observation_complete = index_required.observed and includes_target;
         }
     }
 };
@@ -9191,6 +9196,61 @@ test "table runtime snapshot cache lifecycle transition replaces and fences obse
     try std.testing.expect(observed.metadata.target_observation_complete);
 }
 
+test "accepted target observation survives late snapshots but not new commit fences" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .replay_target_sequence = 6,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(initial, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 6 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    const identity = TableRuntimeSnapshotCache.IndexIdentity{ .index_name = "thumbnail", .kind = .dense_vector, .incarnation = 42, .config_hash = 99 };
+    const before_event = try cache.capturePublicationToken("docs");
+    cache.markGroupTargetObservationPending("docs", 7, 6);
+    cache.markIndexTargetObservationPending("docs", 7, identity, 6);
+    const current = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(current, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 6 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    // A later callback can carry a pre-event token and an already fenced
+    // metadata projection. It cannot revoke an accepted exact-target proof.
+    var late = try cache.capturePublicationToken("docs");
+    late.target_observation_revision = before_event.target_observation_revision;
+    _ = try cache.publishGroup(late, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 6, .target_observation_complete = false },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    var settled = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer settled.deinit(alloc);
+    try std.testing.expect(settled.metadata.target_observation_complete);
+    try std.testing.expect(settled.stats.indexes[0].runtime_target_observation_complete);
+    cache.markGroupTargetObservationPending("docs", 7, 7);
+    cache.markIndexTargetObservationPending("docs", 7, identity, 7);
+    indexes[0].replay_target_sequence = 7;
+    _ = try cache.publishGroup(late, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 7 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    var fenced = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer fenced.deinit(alloc);
+    try std.testing.expect(!fenced.metadata.target_observation_complete);
+    try std.testing.expect(!fenced.stats.indexes[0].runtime_target_observation_complete);
+}
+
 test "runtime owner retirement preserves serving snapshot and fences convergence" {
     const alloc = std.testing.allocator;
     var cache = TableRuntimeSnapshotCache.init(alloc);
@@ -10856,6 +10916,7 @@ test "table runtime snapshot cache preserves existing status on replacement allo
 
             _ = publishGroupForTest(&cache, "docs", replacement) catch |err| switch (err) {
                 error.OutOfMemory => {},
+                else => return err,
             };
 
             var docs = (try cache.snapshot(alloc, "docs")).?;
