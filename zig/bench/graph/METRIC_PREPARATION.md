@@ -12,15 +12,15 @@ Additional measurements on the same host/toolchain (one warmup, five samples):
 
 | Phase | Former path median | Current median | Allocations, before → after |
 | --- | ---: | ---: | ---: |
-| Canonical membership read, 64 nodes / 16,384 producer partials | 1.963 ms | 0.070 ms | 16,398 → 90 |
-| Exhausted output quota, 50,000 nodes / 400,000 edges | 10.848 ms | 6.713 ms | 34 → 20 |
+| Canonical membership read, 64 nodes / 16,384 producer partials | 1.962 ms | 0.061 ms | 16,398 → 90 |
+| Exhausted output quota, 50,000 nodes / 400,000 edges | 10.302 ms | 6.448 ms | 34 → 20 |
 
 Membership uses real default storage and the same ordered dictionary validation
 in both paths. It includes transaction and output ownership, but excludes fixture
 writes and numerical folds. The fixture deliberately exercises maximum producer
 fan-in: speedups will be smaller with fewer duplicate producer rows. Cumulative
 allocation fell from 216,797 to 6,259 bytes; tracked peak increased slightly from
-2,774 to 3,192 bytes. Times ranged 1.947–2.235 ms versus 0.063–0.073 ms.
+2,774 to 3,192 bytes. Times ranged 1.958–2.031 ms versus 0.060–0.063 ms.
 
 Output rejection includes one source and projection preparation in both paths.
 The reference computes and encodes PageRank before rejecting an exhausted output
@@ -28,7 +28,7 @@ quota; production rejects before numerical allocation or encoding. The symmetric
 degree-eight ring can converge early (maximum three iterations); this does not
 claim savings for three complete iterations. Cumulative allocation fell from
 19,553,871 to 16,306,596 bytes, while peak remained 12,906,304 bytes because shared
-preparation dominates. Times ranged 10.749–11.395 ms versus 6.489–7.118 ms.
+preparation dominates. Times ranged 10.264–10.342 ms versus 6.437–6.481 ms.
 Fetch, upload, rejection-sidecar encoding and cloud latency are excluded.
 
 Metadata-tail skipping is checked as an operation-count regression: encountering
