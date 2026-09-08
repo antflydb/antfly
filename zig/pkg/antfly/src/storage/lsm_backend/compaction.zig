@@ -23,6 +23,13 @@ const State = state_mod.State;
 const Run = repository_mod.Run;
 pub const max_remembered_compaction_run_ids = 64;
 pub const max_exact_l0_overlap_runs = 64;
+/// Differential benchmark switch only; there is no production legacy planner
+/// mode for a configured compaction domain.
+pub var test_output_partitions_only: bool = false;
+
+fn domainPlanningEnabled(backend: anytype) bool {
+    return backend.options.run_partition_key != null and !(@import("builtin").is_test and test_output_partitions_only);
+}
 
 const CompactionWork = struct {
     score: u64,
@@ -45,7 +52,145 @@ pub const CompactionPlan = struct {
     target_start: usize,
     target_len: usize,
     output_level: u32,
+    // Domain-local positions map to the immutable global run version. The
+    // selecting caller owns this slice until build/publication completes.
+    run_indices: ?[]const usize = null,
+    partition_key: PartitionKey = null,
+
+    fn sourceIndex(self: @This(), i: usize) usize {
+        const index = self.source_start + i;
+        return if (self.run_indices) |indices| indices[index] else index;
+    }
+
+    fn targetIndex(self: @This(), i: usize) usize {
+        const index = self.target_start + i;
+        return if (self.run_indices) |indices| indices[index] else index;
+    }
 };
+
+const SelectedPlan = struct {
+    plan: CompactionPlan,
+    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        if (self.plan.run_indices) |indices| allocator.free(indices);
+    }
+};
+
+fn sameDomain(a: Run, b: Run, partition: *const fn ([]const u8) []const u8) bool {
+    return state_mod.compareNamespace(.{ .name = a.smallest_namespace_name }, .{ .name = b.smallest_namespace_name }) == .eq and
+        std.mem.eql(u8, partition(a.smallest_key), partition(b.smallest_key));
+}
+
+fn pureDomain(run: Run, partition: *const fn ([]const u8) []const u8) bool {
+    return state_mod.compareNamespace(.{ .name = run.smallest_namespace_name }, .{ .name = run.largest_namespace_name }) == .eq and
+        std.mem.eql(u8, partition(run.smallest_key), partition(run.largest_key));
+}
+
+/// Project each independently compactable domain into the existing leveled
+/// planner. L0 precedence and target closure are unchanged *within* a domain;
+/// unrelated interleaved runs are never added merely to make a global slice.
+fn selectDomainPlan(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
+    const allocator = backend.allocator;
+    const runs = backend.runs.items;
+    const partition = backend.options.run_partition_key.?;
+    for (runs) |run| if (!pureDomain(run, partition)) {
+        // Previously written mixed SSTs must first be reshaped with the full
+        // overlap closure. Never hide overlapping data behind a new domain.
+        const plan = if (l0_only)
+            selectL0CompactionWithStats(runs, l0_limit, max_bytes, allow_oversized, stats)
+        else
+            selectCompactionPlanWithStats(runs, l0_limit, backend.options.l0_overlap_compact_threshold_runs, backend.options.level_target_runs_base, backend.options.level_target_runs_multiplier, backend.options.level_target_bytes_base, backend.options.level_target_bytes_multiplier, max_bytes, allow_oversized, stats);
+        return if (plan) |selected| .{ .plan = selected } else null;
+    };
+    const order = try allocator.alloc(usize, runs.len);
+    defer allocator.free(order);
+    for (order, 0..) |*slot, i| slot.* = i;
+    const Context = struct {
+        runs: []const Run,
+        partition: *const fn ([]const u8) []const u8,
+        fn less(self: @This(), a: usize, b: usize) bool {
+            const lhs = self.runs[a];
+            const rhs = self.runs[b];
+            const ns = state_mod.compareNamespace(.{ .name = lhs.smallest_namespace_name }, .{ .name = rhs.smallest_namespace_name });
+            if (ns != .eq) return ns == .lt;
+            const domain = std.mem.order(u8, self.partition(lhs.smallest_key), self.partition(rhs.smallest_key));
+            return if (domain == .eq) a < b else domain == .lt;
+        }
+    };
+    std.mem.sort(usize, order, Context{ .runs = runs, .partition = partition }, Context.less);
+    const projected = try allocator.alloc(Run, runs.len);
+    defer allocator.free(projected);
+    var best: ?SelectedPlan = null;
+    errdefer if (best) |selected| selected.deinit(allocator);
+    var best_score: ?ScoredCompactionPlan = null;
+    const global_l0 = countLeadingL0Runs(runs);
+    var first: usize = 0;
+    while (first < order.len) {
+        var end = first + 1;
+        while (end < order.len and sameDomain(runs[order[first]], runs[order[end]], partition)) : (end += 1) {}
+        const indices = order[first..end];
+        const local = projected[0..indices.len];
+        for (indices, local) |index, *run| run.* = runs[index];
+        first = end;
+        const local_l0 = countLeadingL0Runs(local);
+        // Global admission pressure must still make progress when many small
+        // domains each have fewer runs than the ordinary per-domain limit.
+        const local_limit = if (global_l0 > l0_limit and local_l0 != 0) @min(l0_limit, local_l0 - 1) else l0_limit;
+        const candidate = (if (l0_only) null else selectCompactionPlanWithStats(local, local_limit, backend.options.l0_overlap_compact_threshold_runs, backend.options.level_target_runs_base, backend.options.level_target_runs_multiplier, backend.options.level_target_bytes_base, backend.options.level_target_bytes_multiplier, max_bytes, allow_oversized, stats)) orelse
+            selectL0CompactionWithStats(local, local_limit, max_bytes, allow_oversized, stats) orelse continue;
+        const priority = if (candidate.source_level == 0) normalizedPressurePriority(local_l0, @max(@as(usize, 1), local_limit)) else @as(u64, @intCast(candidate.source_len)) * 750;
+        const scored = scoredPlan(local, candidate, priority);
+        if (best_score) |previous| if (!scored.betterThan(previous)) continue;
+        const mapping = try allocator.dupe(usize, indices);
+        if (best) |previous| previous.deinit(allocator);
+        var plan = candidate;
+        plan.run_indices = mapping;
+        plan.partition_key = partition;
+        best = .{ .plan = plan };
+        best_score = scored;
+    }
+    return best;
+}
+
+fn compactDomainPlan(comptime BackendType: type, backend: *BackendType, l0_limit: usize, l0_only: bool, comptime scheduled: bool, score: u64, max_bytes: u64, allow_oversized: bool) !bool {
+    var stats: CompactionSelectionStats = .{};
+    defer noteCompactionSelectionStats(BackendType, backend, stats);
+    const selected = try selectDomainPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats) orelse return false;
+    defer selected.deinit(backend.allocator);
+    if (scheduled) {
+        var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, selected.plan, score);
+        defer work.deinit(backend.allocator);
+        var grant = backend.acquireCompactionGrant(work) orelse return false;
+        defer grant.complete();
+        try compactPlanAt(BackendType, backend, selected.plan);
+    } else try compactPlanAt(BackendType, backend, selected.plan);
+    return true;
+}
+
+fn relocateDomainPlan(allocator: std.mem.Allocator, runs: []const Run, plan: CompactionPlan, ids: []const u64) !?SelectedPlan {
+    const partition = plan.partition_key.?;
+    if (ids.len == 0) return null;
+    var anchor: ?Run = null;
+    for (runs) |run| {
+        if (!pureDomain(run, partition)) return null;
+        if (run.id == ids[0]) anchor = run;
+    }
+    const domain = anchor orelse return null;
+    var indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer indices.deinit(allocator);
+    var local: std.ArrayListUnmanaged(Run) = .empty;
+    defer local.deinit(allocator);
+    for (runs, 0..) |run, i| if (sameDomain(run, domain, partition)) {
+        try indices.append(allocator, i);
+        try local.append(allocator, run);
+    };
+    var original = plan;
+    original.run_indices = null;
+    original.partition_key = null;
+    var relocated = relocatePlanIfInputsStillMatch(local.items, original, ids) orelse return null;
+    relocated.run_indices = try indices.toOwnedSlice(allocator);
+    relocated.partition_key = partition;
+    return .{ .plan = relocated };
+}
 
 pub const RememberedCompaction = struct {
     plan: CompactionPlan,
@@ -119,6 +264,7 @@ pub fn flushMutable(comptime BackendType: type, backend: *BackendType) !void {
         const elapsed_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) elapsedNs(BackendType, backend, start_ns) else 0;
         backend.recordFlushWriteStats(input_entries, new_runs.items, elapsed_ns);
     }
+    if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
     try appendOwnedRuns(&backend.runs, backend.allocator, &new_runs);
     sortRuns(backend.runs.items);
     if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
@@ -141,6 +287,10 @@ pub fn flushMutable(comptime BackendType: type, backend: *BackendType) !void {
 }
 
 pub fn maybeCompactRuns(comptime BackendType: type, backend: *BackendType) !void {
+    if (domainPlanningEnabled(backend)) {
+        while (try compactDomainPlan(BackendType, backend, backend.options.compact_threshold_runs, false, false, 0, 0, false)) {}
+        return;
+    }
     while (selectCompactionPlan(
         backend.runs.items,
         backend.options.compact_threshold_runs,
@@ -166,6 +316,7 @@ pub fn maybeCompactRunsScheduledWithL0Limit(
     l0_limit: usize,
     score: u64,
 ) !bool {
+    if (domainPlanningEnabled(backend)) return compactDomainPlan(BackendType, backend, l0_limit, false, true, score, backend.options.max_compaction_input_bytes, allowOversizedSingleCompactionInput(backend));
     if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
 
     var selection_stats: CompactionSelectionStats = .{};
@@ -198,16 +349,25 @@ pub fn maybeCompactRunsScheduledWithL0Limit(
 }
 
 pub fn compactOldestPair(comptime BackendType: type, backend: *BackendType) !void {
+    if (domainPlanningEnabled(backend)) {
+        _ = try compactDomainPlan(BackendType, backend, 0, true, false, 0, 0, false);
+        return;
+    }
     const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
 pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_limit: usize) !void {
+    if (domainPlanningEnabled(backend)) {
+        _ = try compactDomainPlan(BackendType, backend, l0_limit, true, false, 0, 0, false);
+        return;
+    }
     const plan = selectL0Compaction(backend.runs.items, l0_limit, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
 pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendType, l0_limit: usize, score: u64) !bool {
+    if (domainPlanningEnabled(backend)) return compactDomainPlan(BackendType, backend, l0_limit, true, true, score, backend.options.max_compaction_input_bytes, allowOversizedSingleCompactionInput(backend));
     if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
 
     var selection_stats: CompactionSelectionStats = .{};
@@ -245,6 +405,7 @@ pub fn compactL0ToLimitScheduledWithinBudget(
         if (option_limit > 0) @min(option_limit, explicit_limit) else explicit_limit
     else
         option_limit;
+    if (domainPlanningEnabled(backend)) return compactDomainPlan(BackendType, backend, l0_limit, true, true, score, effective_limit, max_input_bytes == null and allowOversizedSingleCompactionInput(backend));
     var selection_stats: CompactionSelectionStats = .{};
     const plan = selectL0CompactionWithStats(
         backend.runs.items,
@@ -268,6 +429,10 @@ pub fn compactL0ToLimitScheduledWithinBudget(
 }
 
 pub fn compactAllRuns(comptime BackendType: type, backend: *BackendType) !void {
+    if (domainPlanningEnabled(backend)) {
+        while (try compactDomainPlan(BackendType, backend, 0, false, false, 0, 0, false)) {}
+        return;
+    }
     while (selectCompactionPlan(
         backend.runs.items,
         0,
@@ -298,14 +463,16 @@ fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: []const Run, plan: 
     var input_bytes: u64 = 0;
     var run_count: usize = 0;
     var key_range: ?compaction_scheduler_mod.KeyRange = null;
-    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
+    for (0..plan.source_len) |i| {
+        const run = runs[plan.sourceIndex(i)];
         input_runs += 1;
         input_bytes +|= run.size_bytes;
         includeRunInWorkKeyRange(&key_range, plan.output_level, run);
         run_ids[run_count] = run.id;
         run_count += 1;
     }
-    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
+    for (0..plan.target_len) |i| {
+        const run = runs[plan.targetIndex(i)];
         input_runs += 1;
         input_bytes +|= run.size_bytes;
         includeRunInWorkKeyRange(&key_range, plan.output_level, run);
@@ -352,18 +519,22 @@ fn planWithinInputBudget(runs: []const Run, plan: CompactionPlan, max_input_byte
 
 fn compactionInputBytes(runs: []const Run, plan: CompactionPlan) u64 {
     var input_bytes: u64 = 0;
-    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
+    for (0..plan.source_len) |i| {
+        const run = runs[plan.sourceIndex(i)];
         input_bytes +|= run.size_bytes;
     }
-    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
+    for (0..plan.target_len) |i| {
+        const run = runs[plan.targetIndex(i)];
         input_bytes +|= run.size_bytes;
     }
     return input_bytes;
 }
 
 fn planScoreForPlan(runs: []const Run, plan: CompactionPlan) PlanScore {
-    const source_bytes = sumRunBytes(runs[plan.source_start .. plan.source_start + plan.source_len]);
-    const target_bytes = sumRunBytes(runs[plan.target_start .. plan.target_start + plan.target_len]);
+    var source_bytes: u64 = 0;
+    var target_bytes: u64 = 0;
+    for (0..plan.source_len) |i| source_bytes +|= runs[plan.sourceIndex(i)].size_bytes;
+    for (0..plan.target_len) |i| target_bytes +|= runs[plan.targetIndex(i)].size_bytes;
     return .{
         .rewrite_bytes = source_bytes +| target_bytes,
         .target_bytes = target_bytes,
@@ -435,6 +606,9 @@ fn rememberDeniedCompaction(comptime BackendType: type, backend: *BackendType, p
 }
 
 fn rememberCompactionPlan(runs: []const Run, plan: CompactionPlan, score: u64) ?RememberedCompaction {
+    // Domain plans own a transient mapping. A denied job is reselected from
+    // the latest version instead of retaining pointers into planning scratch.
+    if (plan.run_indices != null) return null;
     const total_runs = plan.source_len + plan.target_len;
     if (total_runs == 0 or total_runs > max_remembered_compaction_run_ids) return null;
     if (!planInBounds(runs, plan)) return null;
@@ -477,13 +651,19 @@ fn validateRememberedCompaction(runs: []const Run, remembered: RememberedCompact
 
 fn planInBounds(runs: []const Run, plan: CompactionPlan) bool {
     if (plan.source_len == 0) return false;
-    if (plan.source_start > runs.len or plan.source_len > runs.len - plan.source_start) return false;
-    if (plan.target_start > runs.len or plan.target_len > runs.len - plan.target_start) return false;
+    const len = if (plan.run_indices) |indices| indices.len else runs.len;
+    if (plan.source_start > len or plan.source_len > len - plan.source_start) return false;
+    if (plan.target_start > len or plan.target_len > len - plan.target_start) return false;
+    if (plan.run_indices) |indices| for (indices) |index| if (index >= runs.len) return false;
     return true;
 }
 
 pub fn compactOldestWindow(comptime BackendType: type, backend: *BackendType, window_len: usize) !void {
     _ = window_len;
+    if (domainPlanningEnabled(backend)) {
+        _ = try compactDomainPlan(BackendType, backend, 0, true, false, 0, 0, false);
+        return;
+    }
     const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
@@ -506,6 +686,24 @@ pub fn sortRuns(runs: []Run) void {
 }
 
 fn compactPlanAt(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+    if (plan.partition_key != null and plan.source_len == 1 and plan.target_len == 0) {
+        // A closed, nonoverlapping domain needs only a manifest-level move.
+        // SST bytes and file identity are immutable; do not decode/re-encode
+        // a cold payload just to change its level.
+        if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
+        const run = &backend.runs.items[plan.sourceIndex(0)];
+        const bytes = run.size_bytes;
+        run.level = plan.output_level;
+        sortRuns(backend.runs.items);
+        if (@hasDecl(BackendType, "markManifestDirty")) backend.markManifestDirty();
+        if (@hasField(BackendType, "compaction_stats")) {
+            backend.compaction_stats.compactions += 1;
+            backend.compaction_stats.input_runs += 1;
+            backend.compaction_stats.input_bytes +|= bytes;
+            backend.compaction_stats.output_bytes +|= bytes;
+        }
+        return;
+    }
     if (comptime supportsUnlockedBackendCompaction(BackendType)) {
         try compactPlanAtWithUnlockedBuild(BackendType, backend, plan);
         return;
@@ -528,11 +726,13 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     var selected = try backend.allocator.alloc(*Run, plan.source_len + plan.target_len);
     defer backend.allocator.free(selected);
     var selected_len: usize = 0;
-    for (backend.runs.items[plan.source_start .. plan.source_start + plan.source_len]) |*run| {
+    for (0..plan.source_len) |i| {
+        const run = &backend.runs.items[plan.sourceIndex(i)];
         selected[selected_len] = run;
         selected_len += 1;
     }
-    for (backend.runs.items[plan.target_start .. plan.target_start + plan.target_len]) |*run| {
+    for (0..plan.target_len) |i| {
+        const run = &backend.runs.items[plan.targetIndex(i)];
         selected[selected_len] = run;
         selected_len += 1;
     }
@@ -561,8 +761,8 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     var remove = try backend.allocator.alloc(bool, backend.runs.items.len);
     defer backend.allocator.free(remove);
     @memset(remove, false);
-    for (plan.source_start..plan.source_start + plan.source_len) |i| remove[i] = true;
-    for (plan.target_start..plan.target_start + plan.target_len) |i| remove[i] = true;
+    for (0..plan.source_len) |i| remove[plan.sourceIndex(i)] = true;
+    for (0..plan.target_len) |i| remove[plan.targetIndex(i)] = true;
 
     // Prepare every allocation before transferring ownership from the active
     // version. A failed compaction publication must leave both the live run
@@ -608,6 +808,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
         backend.compaction_stats.output_bytes += output_bytes;
     }
 
+    if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
     backend.runs.deinit(backend.allocator);
     backend.runs = retained;
     retained = .empty;
@@ -677,7 +878,12 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         return err;
     }
 
-    const publish_plan = relocatePlanIfInputsStillMatch(backend.runs.items, plan, selected_run_ids) orelse {
+    const domain_plan = if (plan.partition_key != null) try relocateDomainPlan(backend.allocator, backend.runs.items, plan, selected_run_ids) else null;
+    defer if (domain_plan) |selected_plan| selected_plan.deinit(backend.allocator);
+    const publish_plan = (if (plan.partition_key != null)
+        if (domain_plan) |selected_plan| selected_plan.plan else null
+    else
+        relocatePlanIfInputsStillMatch(backend.runs.items, plan, selected_run_ids)) orelse {
         if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
         discardOutputRuns(BackendType, backend, &build_result);
@@ -706,10 +912,12 @@ fn appendPlanRunSnapshots(
     out: *std.ArrayListUnmanaged(Run),
 ) !void {
     try out.ensureUnusedCapacity(backend.allocator, plan.source_len + plan.target_len);
-    for (backend.runs.items[plan.source_start .. plan.source_start + plan.source_len]) |run| {
+    for (0..plan.source_len) |i| {
+        const run = backend.runs.items[plan.sourceIndex(i)];
         try appendCompactionSnapshot(BackendType, backend, out, run);
     }
-    for (backend.runs.items[plan.target_start .. plan.target_start + plan.target_len]) |run| {
+    for (0..plan.target_len) |i| {
+        const run = backend.runs.items[plan.targetIndex(i)];
         try appendCompactionSnapshot(BackendType, backend, out, run);
     }
 }
@@ -864,8 +1072,8 @@ fn installCompactedRuns(
     var remove = try backend.allocator.alloc(bool, backend.runs.items.len);
     defer backend.allocator.free(remove);
     @memset(remove, false);
-    for (plan.source_start..plan.source_start + plan.source_len) |i| remove[i] = true;
-    for (plan.target_start..plan.target_start + plan.target_len) |i| remove[i] = true;
+    for (0..plan.source_len) |i| remove[plan.sourceIndex(i)] = true;
+    for (0..plan.target_len) |i| remove[plan.targetIndex(i)] = true;
 
     // The build ran without the backend lock. After revalidation, stage every
     // remaining allocation before changing the live version so OOM leaves the
@@ -911,6 +1119,7 @@ fn installCompactedRuns(
         backend.compaction_stats.output_bytes += output_bytes;
     }
 
+    if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
     backend.runs.deinit(backend.allocator);
     backend.runs = retained;
     retained = .empty;
@@ -1705,6 +1914,50 @@ fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u
         .owns_bloom_filter = false,
         .state = null,
     };
+}
+
+test "domain compaction maps interleaved inputs and revalidates concurrent publication" {
+    const Family = struct {
+        fn key(bytes: []const u8) []const u8 {
+            return bytes[0..@min(bytes.len, 1)];
+        }
+    };
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        runs: std.ArrayListUnmanaged(Run),
+        options: struct {
+            run_partition_key: PartitionKey = Family.key,
+            l0_overlap_compact_threshold_runs: usize = 2,
+            level_target_runs_base: usize = 100,
+            level_target_runs_multiplier: usize = 10,
+            level_target_bytes_base: usize = 0,
+            level_target_bytes_multiplier: usize = 10,
+        } = .{},
+    };
+    var runs = [_]Run{
+        testRun(10, 0, "a", "a", 1), testRun(9, 0, "z", "z", 1),
+        testRun(8, 0, "a", "a", 1),  testRun(7, 0, "v", "v", 1024 * 1024),
+        testRun(6, 1, "a", "a", 1),  testRun(5, 1, "v", "v", 1024 * 1024),
+        testRun(4, 1, "z", "z", 1),
+    };
+    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
+    var stats: CompactionSelectionStats = .{};
+    const selected = (try selectDomainPlan(&backend, 2, true, 8, false, &stats)).?;
+    defer selected.deinit(backend.allocator);
+    const plan = selected.plan;
+    try std.testing.expect(plan.run_indices != null);
+    try std.testing.expect(compactionInputBytes(&runs, plan) <= 8);
+    var work = try compactionWorkForPlan(backend.allocator, &runs, plan, 1);
+    defer work.deinit(backend.allocator);
+    for (work.run_ids) |id| try std.testing.expect(id != 7 and id != 5);
+    var concurrent = [_]Run{ testRun(12, 0, "a", "a", 1), testRun(11, 0, "z", "z", 1) } ++ runs;
+    const relocated = (try relocateDomainPlan(backend.allocator, &concurrent, plan, work.run_ids)).?;
+    defer relocated.deinit(backend.allocator);
+    var current = try compactionWorkForPlan(backend.allocator, &concurrent, relocated.plan, 1);
+    defer current.deinit(backend.allocator);
+    try std.testing.expectEqualSlices(u64, work.run_ids, current.run_ids);
+    concurrent[relocated.plan.targetIndex(0)].id = 99;
+    try std.testing.expect((try relocateDomainPlan(backend.allocator, &concurrent, plan, work.run_ids)) == null);
 }
 
 test "unlocked compaction publication relocates inputs after concurrent L0 prepend" {

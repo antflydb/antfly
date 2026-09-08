@@ -331,6 +331,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasField(BackendType, "mutable_snapshot_reader_ref_by_state")) {
         backend.mutable_snapshot_reader_ref_by_state.deinit(backend.allocator);
     }
+    if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
     for (backend.runs.items) |*run| {
         if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
         if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);

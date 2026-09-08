@@ -395,9 +395,10 @@ pub const Options = struct {
     /// only controls run layout; the persisted table-file format is unchanged.
     run_partition_prefix_bytes: usize = 0,
     /// Optional family-aware partition identity. Pure, allocation-free, and
-    /// stable for the backend lifetime. Only changes SST boundaries, never
-    /// ordering or the persisted entry format. Namespace isolation still
-    /// applies. Used instead of the fixed prefix when supplied.
+    /// stable for the backend lifetime. Each identity must describe one
+    /// contiguous key interval. Controls both SST boundaries and independent
+    /// compaction input domains, never entry ordering or the persisted format.
+    /// Namespace isolation still applies. Overrides the fixed prefix.
     run_partition_key: ?*const fn ([]const u8) []const u8 = null,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
@@ -613,6 +614,7 @@ fn walOperationLockPathAlloc(allocator: Allocator, root_dir: []const u8) ![]u8 {
 }
 
 pub const Backend = struct {
+    pub var test_deep_mutable_snapshots: bool = false;
     pub const OpenPhase = enum {
         idle,
         initializing_storage,
@@ -779,6 +781,8 @@ pub const Backend = struct {
     };
 
     pub const MaintenanceStats = struct {
+        read_version_builds: u64 = 0,
+        read_version_pins: u64 = 0,
         mutable_entries: u64 = 0,
         mutable_bytes: u64 = 0,
         mutable_snapshot_clone_calls: u64 = 0,
@@ -884,6 +888,8 @@ pub const Backend = struct {
     };
 
     pub fn accumulateMaintenanceStats(dst: *MaintenanceStats, src: MaintenanceStats) void {
+        dst.read_version_builds +|= src.read_version_builds;
+        dst.read_version_pins +|= src.read_version_pins;
         dst.mutable_entries +|= src.mutable_entries;
         dst.mutable_bytes +|= src.mutable_bytes;
         dst.mutable_snapshot_clone_calls +|= src.mutable_snapshot_clone_calls;
@@ -1540,6 +1546,9 @@ pub const Backend = struct {
     closing: std.atomic.Value(bool) = .init(false),
     recovery_replaying_wal: bool = false,
     runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty,
+    read_version: ?*runtime_mod.ReadVersion = null,
+    read_version_builds: u64 = 0,
+    read_version_pins: u64 = 0,
 
     const BoundStore = runtime_mod.BoundStore(Backend);
     const BoundReadTxn = runtime_mod.BoundReadTxn(Backend);
@@ -2017,6 +2026,8 @@ pub const Backend = struct {
 
     fn snapshotMaintenanceStatsLockedWithOptions(self: *Backend, include_retention: bool) MaintenanceStats {
         var stats = MaintenanceStats{
+            .read_version_builds = self.read_version_builds,
+            .read_version_pins = self.read_version_pins,
             .mutable_entries = @intCast(self.mutable.entries.items.len),
             .mutable_bytes = estimateStateBytes(&self.mutable),
             .mutable_snapshot_clone_calls = self.mutable_snapshot_clone_calls,
@@ -2762,9 +2773,18 @@ pub const Backend = struct {
     }
 
     fn cloneMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !State {
-        var snapshot = try self.mutable.cloneArena(self.allocator);
+        var snapshot = if (builtin.is_test and test_deep_mutable_snapshots)
+            try self.mutable.cloneArena(self.allocator)
+        else
+            try self.mutable.snapshot(self.allocator);
         errdefer snapshot.deinit(self.allocator);
-        const snapshot_bytes = estimateStateBytes(&snapshot);
+        // Shared values are retained, not copied. Attribute actual index and
+        // fallback owned-byte copying separately from retained-state pressure.
+        var snapshot_bytes: u64 = @as(u64, @intCast(snapshot.entries.items.len)) * @sizeOf(state_mod.OwnedEntry);
+        for (snapshot.entries.items) |entry| if (entry.shared == null) {
+            snapshot_bytes +|= entry.key.len + entry.value.len;
+            if (entry.namespace_name) |name| snapshot_bytes +|= name.len;
+        };
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
@@ -3031,6 +3051,7 @@ pub const Backend = struct {
             total +|= arena.queryCapacity();
         } else {
             for (state.entries.items) |entry| {
+                total +|= entry.sharedOverheadBytes();
                 if (entry.namespace_name) |name| total += name.len;
                 total += entry.key.len;
                 total += entry.value.len;
@@ -3320,6 +3341,8 @@ pub const Backend = struct {
 
         const allocator = self.allocator;
         var old_runs = self.runs;
+        self.invalidateReadVersion();
+        defer self.invalidateReadVersion();
         self.runs = .empty;
         var ownership_committed = false;
         errdefer {
@@ -3650,6 +3673,7 @@ pub const Backend = struct {
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
         try self.reserveImmutableMemtableRetirement(state);
+        self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
         self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
@@ -3730,6 +3754,7 @@ pub const Backend = struct {
         // retirement, publication is allocation-free except for installing
         // the new run pointers themselves.
         try self.reserveImmutableMemtableRetirement(state);
+        self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &build_result);
         self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
@@ -3893,6 +3918,7 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
 
         compaction_mod.sortRuns(self.runs.items);
@@ -3925,6 +3951,7 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
         self.unpublished_wal_logical_bytes +|= input_logical_bytes;
         self.unpublished_wal_max_batch_logical_bytes = @max(
@@ -3979,6 +4006,7 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
 
         compaction_mod.sortRuns(self.runs.items);
@@ -4230,11 +4258,9 @@ pub const Backend = struct {
         }
 
         fn entryAllocator(self: *@This(), default_allocator: Allocator) !Allocator {
-            // ActiveMemTable owns structural containers on the backend allocator.
-            // During recovery, entry byte copies live in the current mutable
-            // arena, which is transferred to the immutable flush window and
-            // released wholesale when that flush retires.
-            _ = try self.backend.mutable.ensureRecoveryAllocator(default_allocator);
+            // Replayed entries enter the same independently reclaimable,
+            // snapshot-shareable ownership boundary as ordinary writes.
+            _ = self;
             return default_allocator;
         }
     };
@@ -4444,6 +4470,12 @@ pub const Backend = struct {
             try obsolete_path_refs.retain(path);
             run.version_ref_pinned = true;
         }
+    }
+
+    pub fn invalidateReadVersion(self: *Backend) void {
+        const version = self.read_version orelse return;
+        self.read_version = null;
+        version.release(self);
     }
 
     pub fn retainRunSnapshotRef(_: *Backend, run: *Run) !void {
@@ -6609,6 +6641,7 @@ fn clearRunsAndFiles(backend: *Backend) !void {
         if (run.path) |path| repository_mod.deleteFileAbsoluteWithStorage(backend.storage.?, path) catch {};
         run.deinit(backend.allocator);
     }
+    backend.invalidateReadVersion();
     backend.runs.deinit(backend.allocator);
     backend.runs = .empty;
     backend.invalidateMutableReadSnapshot();
@@ -9990,21 +10023,25 @@ test "lsm backend byte flush threshold controls mutable flushes" {
     try std.testing.expectEqualStrings(value[0..], try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
-test "lsm backend mutable byte estimate includes arena and hash index capacity" {
+test "lsm backend mutable byte estimate includes shared ownership and hash index capacity" {
     var mutable: ActiveMemTable = .{};
     defer mutable.deinit(std.testing.allocator);
 
     try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:a", "one", false);
     try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:b", "two", false);
 
-    const arena_bytes: u64 = @intCast(mutable.arena_owner.?.queryCapacity());
+    var owned_bytes: u64 = 0;
+    for (mutable.entries.items) |entry| {
+        owned_bytes += entry.sharedOverheadBytes() + entry.key.len + entry.value.len;
+        if (entry.namespace_name) |name| owned_bytes += name.len;
+    }
     const entries_bytes: u64 = @as(u64, @intCast(mutable.entries.capacity)) * @sizeOf(state_mod.OwnedEntry);
     const index_bytes = mutable.estimatedIndexMemoryBytes();
     const logical_bytes = 2 * @sizeOf(state_mod.OwnedEntry) +
         2 * "docs".len + "doc:a".len + "one".len + "doc:b".len + "two".len;
     try std.testing.expect(index_bytes > 0);
     try std.testing.expectEqual(@as(u64, logical_bytes), mutable.estimatedLogicalBytes());
-    try std.testing.expectEqual(entries_bytes +| arena_bytes +| index_bytes, Backend.estimateStateBytes(&mutable));
+    try std.testing.expectEqual(entries_bytes +| owned_bytes +| index_bytes, Backend.estimateStateBytes(&mutable));
 
     try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:a", "replacement", false);
     try std.testing.expectEqual(
@@ -10019,19 +10056,20 @@ test "lsm backend preserves logical flush sizing with an actual memory guard" {
 
     const value = [_]u8{'x'} ** (256 * 1024);
     for (0..8) |i| {
-        // Replacements leave the superseded value in the arena until the
-        // memtable is released, while the logical state remains one entry.
+        // Unpinned replacements reclaim the superseded allocation immediately.
         const value_len: usize = if (i % 2 == 0) 64 * 1024 else value.len;
         try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "hot-key", value[0..value_len], false);
     }
 
     const logical_bytes = Backend.estimateStateLogicalBytes(&mutable);
     const actual_bytes = Backend.estimateStateBytes(&mutable);
-    try std.testing.expect(actual_bytes >= (logical_bytes + 1) * mutable_memory_guard_multiplier);
+    try std.testing.expect(actual_bytes < (logical_bytes + 1) * mutable_memory_guard_multiplier);
 
     // Capacity alone below the guard must not change normal run geometry.
     try std.testing.expect(!Backend.stateMeetsByteFlushThreshold(&mutable, actual_bytes));
-    // Arena growth beyond 2x the logical target activates the safety flush.
+    try std.testing.expect(!Backend.stateMeetsByteFlushThreshold(&mutable, logical_bytes + 1));
+    // Excess index capacity still participates in the actual memory guard.
+    try mutable.entries.ensureTotalCapacity(std.testing.allocator, 16384);
     try std.testing.expect(Backend.stateMeetsByteFlushThreshold(&mutable, logical_bytes + 1));
 }
 
@@ -16832,6 +16870,198 @@ test "lsm backend preserves key family partitions in streaming compaction output
     }
 }
 
+test "lsm mutable point leases retain one immutable entry without copying its value" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/mutable-entry-lease", .{ .storage = storage.storage(), .flush_threshold = 1000 });
+    defer backend.close();
+    const bytes = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(bytes);
+    @memset(bytes, 'a');
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", bytes);
+        try write.commit();
+    }
+    const original = try backend.mutable.get(.{}, "row");
+    var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+    defer probe.abort();
+    const leased = try probe.getLeased("row");
+    try std.testing.expectEqual(original.ptr, leased.ptr);
+    try std.testing.expectEqual(@as(usize, 0), probe.held_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.leased_entries.items.len);
+    @memset(bytes, 'b');
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", bytes);
+        try write.commit();
+    }
+    try backend.sync(true);
+    try std.testing.expectEqual(@as(u8, 'a'), leased[0]);
+    try std.testing.expectEqual(@as(u8, 'a'), leased[leased.len - 1]);
+    var current = try Backend.BoundReadTxn.open(&backend, .{});
+    defer current.abort();
+    try std.testing.expectEqualSlices(u8, bytes, try current.get("row"));
+}
+
+test "lsm shared read versions reuse topology and scoped batches preserve old values" {
+    const alloc = std.testing.allocator;
+    for (0..2) |cache_mode| {
+        var cache = Cache.init(alloc, 64 * 1024);
+        defer cache.deinit();
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var backend = try Backend.open(alloc, "/shared-read-version", .{ .storage = storage.storage(), .flush_threshold = 1, .compact_threshold_runs = 1000, .cache = if (cache_mode == 1) &cache else null });
+        defer backend.close();
+        for (0..16) |i| {
+            var name: [16]u8 = undefined;
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, try std.fmt.bufPrint(&name, "k{d:0>4}", .{i}), "old");
+            try write.commit();
+        }
+        var old = try Backend.BoundReadTxn.open(&backend, .{});
+        defer old.abort();
+        const builds = backend.read_version_builds;
+        for (0..64) |_| {
+            var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+            defer probe.abort();
+            try std.testing.expectEqualStrings("old", try probe.getLeased("k0000"));
+        }
+        try std.testing.expectEqual(builds, backend.read_version_builds);
+        try std.testing.expect(backend.read_version_pins >= 65);
+        var scope_arena = std.heap.ArenaAllocator.init(alloc);
+        defer scope_arena.deinit();
+        var scope = try old.openReadScope(scope_arena.allocator());
+        defer scope.close();
+        const names = [_][]const u8{ "k0000", "k0001", "k0001", "missing" };
+        var values: [names.len]?[]const u8 = undefined;
+        try scope.getManySorted(&names, &values);
+        try std.testing.expectEqualStrings("old", values[0].?);
+        try std.testing.expectEqualStrings("old", values[2].?);
+        try std.testing.expect(values[3] == null);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "k0000", "new");
+            try write.delete(.{}, "k0001");
+            try write.commit();
+        }
+        var current = try Backend.BoundReadTxn.open(&backend, .{});
+        defer current.abort();
+        try std.testing.expect(backend.read_version_builds > builds);
+        try std.testing.expectEqualStrings("new", try current.get("k0000"));
+        try std.testing.expectError(error.NotFound, current.get("k0001"));
+        try std.testing.expectEqualStrings("old", try scope.get("k0000"));
+        try std.testing.expectEqualStrings("old", values[1].?);
+    }
+}
+
+test "lsm shared read version point setup benchmark" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/read-version-benchmark", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+        .l0_soft_limit_runs = 10000,
+        .l0_hard_limit_runs = 10000,
+    });
+    defer backend.close();
+    for (0..256) |i| {
+        var key: [16]u8 = undefined;
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, try std.fmt.bufPrint(&key, "k{d:0>4}", .{i}), "value");
+        try write.commit();
+    }
+    defer runtime_mod.test_private_read_versions = false;
+    var times: [2][7]u64 = undefined;
+    var groups: [2]u64 = undefined;
+    for (0..7) |sample| for (0..2) |turn| {
+        const mode = (sample + turn) % 2;
+        runtime_mod.test_private_read_versions = mode == 0;
+        const before = backend.snapshotReadStats().run_group_builds;
+        const started = platform.time.monotonicNs();
+        for (0..64) |i| {
+            var key: [16]u8 = undefined;
+            var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+            defer probe.abort();
+            try std.testing.expectEqualStrings("value", try probe.getLeased(try std.fmt.bufPrint(&key, "k{d:0>4}", .{i * 3})));
+        }
+        times[mode][sample] = platform.time.monotonicNs() - started;
+        groups[mode] = backend.snapshotReadStats().run_group_builds - before;
+    };
+    for (&times) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    std.debug.print("\nLSM 256 SST / 64 point reads private/shared: topology builds={d}/{d}, median ns={d}/{d}\n", .{ groups[0], groups[1], times[0][3], times[1][3] });
+    try std.testing.expectEqual(@as(u64, 64), groups[0]);
+    try std.testing.expectEqual(@as(u64, 0), groups[1]);
+}
+
+test "lsm compaction domains bound two-sided metadata churn physical writes" {
+    const alloc = std.testing.allocator;
+    const Family = struct {
+        fn extract(key: []const u8) []const u8 {
+            return key[0..@min(key.len, 1)];
+        }
+    };
+    defer compaction_mod.test_output_partitions_only = false;
+    var written: [2]u64 = undefined;
+    for (0..2) |mode| {
+        compaction_mod.test_output_partitions_only = mode == 0;
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var backend = try Backend.open(alloc, "/two-sided-domain-churn", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+            .foreground_soft_compaction = true,
+            .level_target_runs_base = 100,
+            .level_target_bytes_base = 0,
+            .max_run_file_bytes = 8 * 1024 * 1024,
+            .run_partition_key = Family.extract,
+        });
+        defer backend.close();
+        var random = std.Random.DefaultPrng.init(187);
+        var value: [16 * 1024]u8 = undefined;
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "a:counts", "0");
+            try write.put(.{}, "z:manifest", "0");
+            for (0..64) |i| {
+                var name: [16]u8 = undefined;
+                random.random().bytes(&value);
+                try write.put(.{}, try std.fmt.bufPrint(&name, "v:{d:0>4}", .{i}), &value);
+            }
+            try write.commit();
+        }
+        try backend.finalizeDeferredStorageWork();
+        var old = try Backend.BoundReadTxn.open(&backend, .{});
+        defer old.abort();
+        const before = backend.snapshotWriteStats().table_file_bytes;
+        for (0..16) |round| {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            var number: [16]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&number, "{d}", .{round + 1});
+            try write.put(.{}, "a:counts", bytes);
+            try write.put(.{}, "z:manifest", bytes);
+            try write.commit();
+        }
+        try backend.finalizeDeferredStorageWork();
+        written[mode] = backend.snapshotWriteStats().table_file_bytes - before;
+        try std.testing.expectEqualStrings("0", try old.get("z:manifest"));
+        try std.testing.expectEqualSlices(u8, &value, try old.get("v:0063"));
+        std.debug.print("\nLSM two-sided churn: domains={}, SST bytes written={d}\n", .{ mode == 1, written[mode] });
+    }
+    try std.testing.expect(written[1] * 4 < written[0]);
+}
+
 test "lsm payload family isolation physical churn benchmark" {
     const alloc = std.testing.allocator;
     const Family = struct {
@@ -17206,7 +17436,7 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
     }
 }
 
-test "lsm backend recovery replay stores mutable entries in a flush-scoped arena" {
+test "lsm backend recovery replay stores snapshot-shareable mutable entries" {
     var memory_storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer memory_storage.deinit();
 
@@ -17232,12 +17462,10 @@ test "lsm backend recovery replay stores mutable entries in a flush-scoped arena
     });
     defer reopened.close();
 
-    try std.testing.expect(reopened.mutable.arena_owner != null);
+    try std.testing.expect(reopened.mutable.arena_owner == null);
     try std.testing.expectEqual(@as(usize, 2), reopened.mutable.entries.items.len);
     for (reopened.mutable.entries.items) |entry| {
-        try std.testing.expect(entry.namespace_from_arena);
-        try std.testing.expect(entry.key_from_arena);
-        try std.testing.expect(entry.value_from_arena);
+        try std.testing.expect(entry.shared != null);
     }
     try std.testing.expectEqualStrings("alpha", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
 

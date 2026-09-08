@@ -99,6 +99,9 @@ fn hashMapAllocationBytes(comptime Key: type, comptime Value: type, capacity: us
 }
 
 pub const OwnedEntry = struct {
+    /// Immutable, independently reclaimable bytes shared with read epochs.
+    /// Only the last owning writer may reuse a same-sized value in place.
+    shared: ?*SharedEntry = null,
     namespace_name: ?[]u8,
     namespace_from_arena: bool = false,
     key: []u8,
@@ -108,6 +111,11 @@ pub const OwnedEntry = struct {
     tombstone: bool,
 
     pub fn deinit(self: *OwnedEntry, allocator: Allocator) void {
+        if (self.shared) |owner| {
+            owner.release();
+            self.* = undefined;
+            return;
+        }
         if (self.namespace_name) |name| {
             if (!self.namespace_from_arena) allocator.free(name);
         }
@@ -123,7 +131,42 @@ pub const OwnedEntry = struct {
             .value = self.value,
         };
     }
+
+    pub fn sharedOverheadBytes(self: OwnedEntry) u64 {
+        return if (self.shared != null) @sizeOf(SharedEntry) else 0;
+    }
 };
+
+const SharedEntry = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    allocator: Allocator,
+    allocation_len: usize,
+
+    fn release(self: *@This()) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        const bytes: [*]align(@alignOf(SharedEntry)) u8 = @ptrCast(self);
+        allocator.free(bytes[0..self.allocation_len]);
+    }
+};
+
+fn initSharedEntry(allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, value: []const u8, tombstone: bool) !OwnedEntry {
+    const namespace_len = if (namespace.name) |name| name.len else 0;
+    const allocation = try allocator.alignedAlloc(u8, .of(SharedEntry), @sizeOf(SharedEntry) + namespace_len + key.len + value.len);
+    const owner: *SharedEntry = @ptrCast(allocation.ptr);
+    owner.* = .{ .allocator = allocator, .allocation_len = allocation.len };
+    const bytes = allocation[@sizeOf(SharedEntry)..];
+    if (namespace.name) |name| @memcpy(bytes[0..namespace_len], name);
+    @memcpy(bytes[namespace_len..][0..key.len], key);
+    @memcpy(bytes[namespace_len + key.len ..], value);
+    return .{
+        .shared = owner,
+        .namespace_name = if (namespace.name != null) bytes[0..namespace_len] else null,
+        .key = bytes[namespace_len..][0..key.len],
+        .value = bytes[namespace_len + key.len ..],
+        .tombstone = tombstone,
+    };
+}
 
 pub const State = struct {
     entries: std.ArrayListUnmanaged(OwnedEntry) = .empty,
@@ -191,7 +234,8 @@ pub const State = struct {
         }
 
         const idx = self.lowerBound(namespace, key);
-        try self.entries.insert(allocator, idx, try initEntry(allocator, namespace, key, value, tombstone));
+        try self.entries.ensureUnusedCapacity(allocator, 1);
+        self.entries.insertAssumeCapacity(idx, try initEntry(allocator, namespace, key, value, tombstone));
     }
 
     pub fn appendUpsert(
@@ -203,7 +247,8 @@ pub const State = struct {
         tombstone: bool,
     ) !void {
         if (self.entries.items.len == 0) {
-            try self.entries.append(allocator, try initEntry(allocator, namespace, key, value, tombstone));
+            try self.entries.ensureUnusedCapacity(allocator, 1);
+            self.entries.appendAssumeCapacity(try initEntry(allocator, namespace, key, value, tombstone));
             return;
         }
 
@@ -211,7 +256,8 @@ pub const State = struct {
         const last = self.entries.items[last_idx];
         switch (compareEntryTo(last, namespace, key)) {
             .lt => {
-                try self.entries.append(allocator, try initEntry(allocator, namespace, key, value, tombstone));
+                try self.entries.ensureUnusedCapacity(allocator, 1);
+                self.entries.appendAssumeCapacity(try initEntry(allocator, namespace, key, value, tombstone));
             },
             .eq => {
                 try replaceEntryValueCopy(&self.entries.items[last_idx], allocator, value, tombstone, false);
@@ -316,6 +362,13 @@ pub const ActiveMemTable = struct {
         return out;
     }
 
+    /// Snapshot just the ordered index; shared entry bytes are immutable for
+    /// this epoch. Overwrites replace only the affected entry, and retired
+    /// values are released with the last reader instead of a whole arena.
+    pub fn snapshot(self: *const ActiveMemTable, allocator: Allocator) !State {
+        return self.clone(allocator);
+    }
+
     pub fn toStateMove(self: *ActiveMemTable, allocator: Allocator) !State {
         var out = State{
             .entries = self.entries,
@@ -354,10 +407,6 @@ pub const ActiveMemTable = struct {
         return self.arena_owner.?.allocator();
     }
 
-    pub fn ensureRecoveryAllocator(self: *ActiveMemTable, allocator: Allocator) !Allocator {
-        return try self.ensureArenaAllocator(allocator);
-    }
-
     pub fn get(self: *const ActiveMemTable, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
         const idx = self.findIndex(namespace, key) orelse return error.NotFound;
         const entry = self.entries.items[idx];
@@ -385,33 +434,35 @@ pub const ActiveMemTable = struct {
         value: []const u8,
         tombstone: bool,
     ) !void {
-        const entry_allocator = try self.ensureArenaAllocator(allocator);
-        const entry_from_arena = true;
         const key_hash = hashEntryKey(namespace, key);
         if (self.index.find(self.entries.items, key_hash, namespace, key)) |idx| {
             const old_value_len: u64 = @intCast(self.entries.items[idx].value.len);
-            try replaceEntryValueCopy(&self.entries.items[idx], entry_allocator, value, tombstone, entry_from_arena);
+            try replaceEntryValueCopy(&self.entries.items[idx], allocator, value, tombstone, false);
             self.logical_bytes = self.logical_bytes -| old_value_len +| @as(u64, @intCast(value.len));
             return;
         }
 
-        var owned = try initEntry(entry_allocator, namespace, key, value, tombstone);
-        owned.namespace_from_arena = entry_from_arena;
-        owned.key_from_arena = entry_from_arena;
-        owned.value_from_arena = entry_from_arena;
+        var owned = try initSharedEntry(allocator, namespace, key, value, tombstone);
         errdefer owned.deinit(allocator);
-        try self.entries.append(allocator, owned);
-        owned = undefined;
-        const idx = self.entries.items.len - 1;
-        self.index.insert(allocator, key_hash, idx) catch |err| {
-            var removed = self.entries.pop().?;
-            removed.deinit(allocator);
-            return err;
-        };
+        try self.entries.ensureUnusedCapacity(allocator, 1);
+        const idx = self.entries.items.len;
+        try self.index.insert(allocator, key_hash, idx);
+        self.entries.appendAssumeCapacity(owned);
         self.logical_bytes +|= logicalEntryBytes(self.entries.items[idx]);
     }
 
     pub fn upsertMove(self: *ActiveMemTable, allocator: Allocator, entry: OwnedEntry) !void {
+        if (entry.shared != null) return self.upsertSharedMove(allocator, entry);
+        // Normalize replay/ingest ownership once at the mutable boundary.
+        // Ordinary write batches already move shared allocations directly.
+        var shared = try initSharedEntry(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
+        errdefer shared.deinit(allocator);
+        try self.upsertSharedMove(allocator, shared);
+        var moved = entry;
+        moved.deinit(allocator);
+    }
+
+    fn upsertSharedMove(self: *ActiveMemTable, allocator: Allocator, entry: OwnedEntry) !void {
         const namespace = namespaceOf(entry);
         const key_hash = hashEntryKey(namespace, entry.key);
         if (self.index.find(self.entries.items, key_hash, namespace, entry.key)) |idx| {
@@ -422,13 +473,10 @@ pub const ActiveMemTable = struct {
             return;
         }
 
-        try self.entries.append(allocator, entry);
-        const idx = self.entries.items.len - 1;
-        self.index.insert(allocator, key_hash, idx) catch |err| {
-            var removed = self.entries.pop().?;
-            removed.deinit(allocator);
-            return err;
-        };
+        try self.entries.ensureUnusedCapacity(allocator, 1);
+        const idx = self.entries.items.len;
+        try self.index.insert(allocator, key_hash, idx);
+        self.entries.appendAssumeCapacity(entry);
         self.logical_bytes +|= logicalEntryBytes(self.entries.items[idx]);
     }
 
@@ -464,15 +512,11 @@ pub const SplitStates = struct {
 };
 
 pub fn cloneEntry(allocator: Allocator, entry: OwnedEntry) !OwnedEntry {
-    return .{
-        .namespace_name = if (entry.namespace_name) |name| try allocator.dupe(u8, name) else null,
-        .namespace_from_arena = false,
-        .key = try allocator.dupe(u8, entry.key),
-        .key_from_arena = false,
-        .value = try allocator.dupe(u8, entry.value),
-        .value_from_arena = false,
-        .tombstone = entry.tombstone,
-    };
+    if (entry.shared) |owner| {
+        _ = owner.references.fetchAdd(1, .monotonic);
+        return entry;
+    }
+    return initEntry(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
 }
 
 pub fn initEntry(
@@ -482,10 +526,14 @@ pub fn initEntry(
     value: []const u8,
     tombstone: bool,
 ) !OwnedEntry {
+    const name = if (namespace.name) |value_name| try allocator.dupe(u8, value_name) else null;
+    errdefer if (name) |value_name| allocator.free(value_name);
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
     return .{
-        .namespace_name = if (namespace.name) |name| try allocator.dupe(u8, name) else null,
+        .namespace_name = name,
         .namespace_from_arena = false,
-        .key = try allocator.dupe(u8, key),
+        .key = owned_key,
         .key_from_arena = false,
         .value = try allocator.dupe(u8, value),
         .value_from_arena = false,
@@ -741,8 +789,14 @@ fn applyStateMoveToActive(target: *ActiveMemTable, allocator: Allocator, source:
         return;
     }
 
+    var transferred: usize = 0;
+    errdefer {
+        std.mem.copyForwards(OwnedEntry, source.entries.items, source.entries.items[transferred..]);
+        source.entries.items.len -= transferred;
+    }
     for (source.entries.items) |entry| {
         try target.upsertMove(allocator, entry);
+        transferred += 1;
     }
     source.entries.items.len = 0;
     source.entries.deinit(allocator);
@@ -762,13 +816,26 @@ fn applyActiveMoveToMutable(target: anytype, allocator: Allocator, source: *Acti
         return;
     }
 
+    var transferred: usize = 0;
+    errdefer {
+        // Failed commit preparation must still leave one owner per entry.
+        // The source is discarded by its caller; its index is no longer used.
+        std.mem.copyForwards(OwnedEntry, source.entries.items, source.entries.items[transferred..]);
+        source.entries.items.len -= transferred;
+    }
     for (source.entries.items) |entry| {
         try target.upsertMove(allocator, entry);
+        transferred += 1;
     }
     source.resetAfterEntriesMoved(allocator);
 }
 
 fn replaceEntryValueMove(target: *OwnedEntry, allocator: Allocator, source: OwnedEntry) void {
+    if (target.shared != null or source.shared != null) {
+        target.deinit(allocator);
+        target.* = source;
+        return;
+    }
     if (!target.value_from_arena) allocator.free(target.value);
     target.value = source.value;
     target.value_from_arena = source.value_from_arena;
@@ -780,6 +847,17 @@ fn replaceEntryValueMove(target: *OwnedEntry, allocator: Allocator, source: Owne
 }
 
 fn replaceEntryValueCopy(target: *OwnedEntry, allocator: Allocator, value: []const u8, tombstone: bool, replacement_from_arena: bool) !void {
+    if (target.shared) |owner| {
+        if (owner.references.load(.acquire) == 1 and target.value.len == value.len) {
+            @memcpy(target.value, value);
+            target.tombstone = tombstone;
+            return;
+        }
+        const replacement = try initSharedEntry(owner.allocator, namespaceOf(target.*), target.key, value, tombstone);
+        target.deinit(allocator);
+        target.* = replacement;
+        return;
+    }
     if (target.value.len == value.len) {
         @memcpy(target.value, value);
         target.tombstone = tombstone;
@@ -806,6 +884,43 @@ pub fn stripTombstones(state: *State, allocator: Allocator) !void {
     }
     state.deinit(allocator);
     state.entries = filtered;
+}
+
+test "mutable snapshot shares immutable bytes and copy-on-writes only overwritten entries" {
+    const alloc = std.testing.allocator;
+    var mutable: ActiveMemTable = .{};
+    defer mutable.deinit(alloc);
+    try mutable.upsert(alloc, .{}, "a", "original", false);
+    try mutable.upsert(alloc, .{}, "b", "untouched", false);
+    var snapshot = try mutable.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual((try mutable.get(.{}, "a")).ptr, (try snapshot.get(.{}, "a")).ptr);
+    try mutable.upsert(alloc, .{}, "a", "replaced", false);
+    try mutable.upsert(alloc, .{}, "b", "", true);
+    try std.testing.expectEqualStrings("original", try snapshot.get(.{}, "a"));
+    try std.testing.expectEqualStrings("untouched", try snapshot.get(.{}, "b"));
+    try std.testing.expectEqualStrings("replaced", try mutable.get(.{}, "a"));
+    try std.testing.expectError(error.NotFound, mutable.get(.{}, "b"));
+    mutable.deinit(alloc);
+    try std.testing.expectEqualStrings("original", try snapshot.get(.{}, "a"));
+}
+
+test "mutable shared entry snapshot ownership survives allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(alloc: Allocator) !void {
+            var mutable: ActiveMemTable = .{};
+            defer mutable.deinit(alloc);
+            try mutable.upsert(alloc, .{ .name = "docs" }, "a", "original", false);
+            var snapshot = try mutable.snapshot(alloc);
+            defer snapshot.deinit(alloc);
+            try mutable.upsert(alloc, .{ .name = "docs" }, "a", "replacement", false);
+            try std.testing.expectEqualStrings("original", try snapshot.get(.{ .name = "docs" }, "a"));
+            var state: State = .{};
+            defer state.deinit(alloc);
+            try state.upsert(alloc, .{}, "b", "moved", false);
+            try applyStateMoveToActive(&mutable, alloc, &state);
+        }
+    }.run, .{});
 }
 
 test "mergeStates prefers newer entries and preserves ordering" {
@@ -888,31 +1003,31 @@ test "applyStateMove copies arena backed source into active mutable" {
 
     try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), target.entries.items.len);
-    try std.testing.expect(target.arena_owner != null);
-    try std.testing.expect(target.entries.items[0].key_from_arena);
-    try std.testing.expect(target.entries.items[0].value_from_arena);
+    try std.testing.expect(target.arena_owner == null);
+    try std.testing.expect(target.entries.items[0].shared != null);
     try std.testing.expectEqualStrings("A1", try target.get(.{}, "doc:a"));
 }
 
-test "applyMutableMoveToMutable copies arena backed active source into target arena" {
+test "applyMutableMoveToMutable transfers shared active entries without copying" {
     var target: ActiveMemTable = .{};
     defer target.deinit(std.testing.allocator);
 
     var source: ActiveMemTable = .{};
     try source.upsert(std.testing.allocator, .{}, "doc:a", "A1", false);
     try source.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:b", "B1", false);
+    const first_bytes = (try source.get(.{}, "doc:a")).ptr;
 
     try applyMutableMoveToMutable(&target, std.testing.allocator, &source);
 
     try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
     try std.testing.expect(source.arena_owner == null);
-    try std.testing.expect(target.arena_owner != null);
+    try std.testing.expect(target.arena_owner == null);
     try std.testing.expectEqual(@as(usize, 2), target.entries.items.len);
     for (target.entries.items) |entry| {
-        try std.testing.expect(entry.key_from_arena);
-        try std.testing.expect(entry.value_from_arena);
+        try std.testing.expect(entry.shared != null);
     }
     try std.testing.expectEqualStrings("A1", try target.get(.{}, "doc:a"));
+    try std.testing.expectEqual(first_bytes, (try target.get(.{}, "doc:a")).ptr);
     try std.testing.expectEqualStrings("B1", try target.get(.{ .name = "docs" }, "doc:b"));
 }
 
@@ -947,10 +1062,9 @@ test "ActiveMemTable overwrites by hash index and materializes sorted state" {
     try active.upsert(std.testing.allocator, .{}, "doc:c", "C2", false);
 
     try std.testing.expectEqual(@as(usize, 3), active.entries.items.len);
-    try std.testing.expect(active.arena_owner != null);
+    try std.testing.expect(active.arena_owner == null);
     for (active.entries.items) |entry| {
-        try std.testing.expect(entry.key_from_arena);
-        try std.testing.expect(entry.value_from_arena);
+        try std.testing.expect(entry.shared != null);
     }
     try std.testing.expectEqualStrings("C2", try active.get(.{}, "doc:c"));
 
@@ -967,7 +1081,8 @@ test "ActiveMemTable overwrites by hash index and materializes sorted state" {
     try std.testing.expectEqual(@as(usize, 0), active.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), active.index.count());
     try std.testing.expect(active.arena_owner == null);
-    try std.testing.expect(moved.arena_owner != null);
+    try std.testing.expect(moved.arena_owner == null);
+    for (moved.entries.items) |entry| try std.testing.expect(entry.shared != null);
     try std.testing.expectEqual(@as(usize, 3), moved.entries.items.len);
     try std.testing.expectEqualStrings("doc:a", moved.entries.items[0].key);
     try std.testing.expectEqualStrings("doc:c", moved.entries.items[1].key);

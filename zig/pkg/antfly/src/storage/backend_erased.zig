@@ -215,10 +215,21 @@ pub const ReadScope = struct {
     vtable: *const VTable,
     const VTable = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
     };
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
         return self.vtable.get(self.ptr, key);
+    }
+    /// Results share the scope lifetime, not the parent snapshot's lifetime.
+    pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        if (self.vtable.get_many_sorted) |get_many| return get_many(self.ptr, keys, values);
+        for (keys, values) |key, *value| value.* = self.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
     }
     pub fn close(self: *@This()) void {
         self.vtable.close(self.allocator, self.ptr);
@@ -238,6 +249,10 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.get(key);
         }
+        fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getManySorted(keys, values);
+        }
         fn close(a: Allocator, ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.handle.close();
@@ -247,7 +262,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try alloc.create(State);
     state.* = .{ .handle = handle, .parent = parent };
-    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .close = State.close } };
+    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies

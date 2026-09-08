@@ -536,19 +536,33 @@ or block-cache handle rather than making a second full-row copy. Uncached wide
 values can transfer the decoded block allocation into the lease when allocator
 ownership matches and the value occupies at least half the block. Small metadata
 reads keep compact value-only buffers. Ordinary probes
-still copy and release generation pins promptly. Mutable values still need a
-copy because same-length mutable overwrites can modify their buffer in place.
+still copy and release generation pins promptly. Mutable entries now use
+independently reference-counted immutable allocations. Short point leases pin
+one entry without copying its value; an overwrite copy-on-writes that entry
+when another reader owns it. Unpinned same-sized updates may reuse their bytes.
 An uncached SST read may still decompress/materialize the entire physical block.
 Leasing is not independently addressable value chunks or zero-I/O projection.
 
-Production primary LSM options use a family-aware SST partition identity for
-generation-local `:v:` payload keys. Flush, sorted ingestion, and streaming
-compaction all honor the same boundaries, separating immutable payload output
-from metadata/count output without changing persisted keys or backup formats.
-Payloads remain ordinary LSM values: compaction can still rewrite them, and
-logical payload reclamation does not imply an immediate physical disk bound.
+Production primary LSM options use contiguous compaction domains. Each
+generation's metadata before `:v:` stays together, its immutable payloads form a
+separate domain, and metadata outside the column-generation interval cannot
+jump across that interval. This holds even in a metadata-only flush with no
+payload keys present. Flush, sorted ingestion, and streaming compaction honor
+the same boundaries without changing persisted keys or backup formats.
 
-The physical metadata-churn benchmark keeps a reader pinned while performing
+Compaction selection projects each domain into the existing leveled planner,
+preserving newest-first L0 precedence and complete target overlap closure within
+that domain. A mapping selects noncontiguous global inputs without including
+intervening cold families. Publication relocates exact input IDs and recomputes
+the domain closure after an unlocked build. Changed closures reject stale work.
+Global L0 pressure still drains small domains, input-byte admission still applies,
+and a single nonoverlapping input moves levels through the manifest without
+rewriting its SST. Existing mixed SSTs use the complete global overlap closure
+until reshaped; they are never hidden from a domain-local read or merge.
+Payloads remain ordinary LSM values: payload-domain compaction can rewrite them,
+and physical retention still depends on live readers and obsolete-file grace.
+
+The original output-partitioning benchmark kept a reader pinned while performing
 16 metadata commits beside 1 MiB of incompressible, unchanged payloads. It uses
 the real SST/WAL encoders on memory-backed files, not logical value counters:
 
@@ -557,11 +571,62 @@ the real SST/WAL encoders on memory-backed files, not logical value counters:
 | First-byte only | 8,474,322 | 9,534,372 |
 | Payload family | 1,066,714 | 2,127,336 |
 
-This measures write amplification, not device latency. The production staging
-fixture uses the 32 MiB mutable threshold and 1,024 distinct 4 KiB rows; the
-per-block/build-snapshot modes copied 95,518,154/51,406,960 mutable-snapshot
-bytes in the measured run. These are cumulative bytes, not peak RSS. Other
-snapshot boundaries remain and are included in both totals.
+Those historical measurements cover output splitting, not domain-aware input
+selection, and measure write amplification rather than device latency.
+
+### Shared LSM read versions and bounded column batches
+
+Run membership and precomputed L0/lower-level lookup topology are owned by one
+reference-counted read version. Point probes and read transactions pin that
+version instead of cloning all run descriptors for each request. Every run-set
+publication invalidates the backend's cached reference; existing readers retain
+their old descriptors and file references. A version owns its metadata rather
+than borrowing from an obsolete run list. Cache-index hints are mutex-protected;
+shared descriptors never acquire unsynchronized lazy Bloom-filter ownership.
+The topology is built lazily once per version under the backend mutex, not once
+per key. SST I/O remains outside the writer lock.
+
+Mutable snapshots retain immutable entry allocations and copy/sort only their
+ordered index. Values overwritten after a snapshot remain alive until their
+last owner releases them; unreferenced overwritten bytes are reclaimed without
+waiting for a whole arena to flush. This does **not** make mutable snapshot
+creation O(1): index construction remains O(keys log keys), and retained-state
+pressure accounting is conservative when states share bytes. It removes
+whole-value copying without forcing smaller flushes or additional SSTs.
+`mutable_snapshot_clone_bytes_total` now counts copied index/owned bytes rather
+than counting shared payload bytes as copies. `read_version_builds` and
+`read_version_pins` distinguish topology publication from request pinning.
+
+Column read scopes expose snapshot-consistent sorted multi-get with scope-local
+result ownership. Predicate metadata is gathered in bounded batches; payload
+requests retain predicate-stage and survivor-only projection selection. Physical
+keys are sorted and deduplicated, cached decoded payloads are skipped, and a
+batch is capped at 32 pages / 256 KiB of encoded payload (one indivisible
+oversized value is allowed). Cancellation is checked between batches. No new
+thread primitives, speculative all-column reads, or unbounded prefetch queues
+are introduced.
+
+New differential fixtures use diagnostic-only controls, not alternative
+production formats or legacy compatibility modes. A ReleaseFast development
+run measured:
+
+| Fixture | Baseline | Shared/domain/batched |
+| --- | ---: | ---: |
+| Two-sided metadata churn, additional SST bytes | 16,957,275 | 20,625 |
+| 256 SSTs / 64 point reads, median milliseconds | 3.390 | 1.151 |
+| Topology builds for those 64 point reads | 64 | 0 after warmup |
+| 32-column projection, SST block loads | 78 | 52 |
+| 32-column projection, SST block bytes | 461,515 | 259,199 |
+| 32-column projection, median milliseconds | 6.204 | 4.376 |
+| 1,024 × 4 KiB staging, copied snapshot bytes | 42,308,576 | 2,485,568 |
+
+The two-sided fixture uses actual SST/WAL encoders on memory-backed files and
+keeps an old reader pinned. The projection fixture uses native files with local
+and shared decoded-block caches disabled; OS page-cache state is unspecified.
+The staging fixture uses the production 32 MiB threshold and compares deep
+versus shared snapshots with the same build-snapshot reuse in both modes. Its
+100.337/95.703 ms sample shows that the large byte reduction is not an equivalent
+end-to-end throughput multiplier. Timings are diagnostics, not regression gates.
 
 The native-file churn fixture uses production primary options (only the
 obsolete-file grace period is set to zero for deterministic reclamation), pins
@@ -569,15 +634,31 @@ an old reader, performs 16 batches of overwrites, releases the reader, deletes
 half the rows, and validates column ownership and projected reads. It reports
 actual active/obsolete SST file sizes plus retained WAL, cumulative SST/WAL
 writes, and foreground batch median/max latency. It checkpoints at measurement
-boundaries and is not a concurrent-load or device-cold benchmark. In the measured
-native-file run, SST/WAL writes were 20,745,882/10,093,136 bytes, peak/settled
-SST+WAL footprint was 6,707,886/3,095,187 bytes, and the final integer projection
-read 1,050 column payload bytes with zero primary-row reads. No fixed
-physical-to-live-byte ratio is inferred from the logical churn tests.
+boundaries and is not a concurrent-load or device-cold benchmark. Comparing the
+previous commit's output-only partitioning with domain selection measured:
+
+| Native churn | Output-only | Domain selection |
+| --- | ---: | ---: |
+| Cumulative SST bytes written | 20,745,889 | 16,248,094 |
+| Cumulative WAL bytes written | 10,093,136 | 10,093,136 |
+| Peak SST+WAL bytes, reader pinned | 6,707,877 | 8,868,177 |
+| Settled SST+WAL bytes | 3,095,189 | 3,097,601 |
+| Foreground batch median / max, ms | 32.555 / 34.283 | 32.904 / 36.064 |
+
+Both read 1,050 column payload bytes for the final integer projection with zero
+primary-row reads. Domain isolation reduced total SST writes by about 22%, but
+did not improve foreground write latency in this sample and increased pinned
+peak disk usage by about 32%; settled usage was nearly unchanged. Timings were
+collected on a development host with other compilation work and are not
+isolated-machine latency claims. Independent domains change compaction geometry;
+less rewriting is not a universal peak-footprint bound. Long readers still need
+retention limits and operational disk headroom. No fixed physical-to-live-byte
+ratio is inferred from the logical churn tests.
 
 Reproduce with `zig build lib-storage-test -Doptimize=ReleaseFast --` and filters
 `'relational columnar production LSM'`, `'lsm payload family isolation'`, and
-`'lsm point leases'`. Timing is diagnostic; regression gates check ownership,
+`'lsm point leases'`, plus `'lsm shared read version'` and
+`'lsm compaction domains'`. Timing is diagnostic; regression gates check ownership,
 snapshot-copy work, and physical write reduction rather than wall-clock limits.
 
 All 512 primary owners are still read and checked; the already-evaluated

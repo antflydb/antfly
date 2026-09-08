@@ -52,9 +52,7 @@ pub var test_owner_limit: ?usize = null;
 pub var test_disable_deadline: bool = false;
 pub var test_cleanup_page_limit: ?usize = null;
 pub var test_now_ns: ?u64 = null;
-// Differential benchmark only: reproduce the previous per-block snapshot
-// cost without maintaining an alternative production path or storage format.
-pub var test_snapshot_per_block: bool = false;
+pub var test_scalar_reads: bool = false;
 const maintenance_records = 256;
 const maintenance_bytes = 256 * 1024;
 const max_rows = read_cache.max_rows;
@@ -424,12 +422,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             // Reuse the build's immutable snapshot. A build-local registry
             // covers payloads staged after it, without cloning the LSM mutable
             // generation after every block commit.
-            var diagnostic_read: ?store_mod.DocStore.Txn = if (@import("builtin").is_test and test_snapshot_per_block)
-                try self.db.core.store.beginReadTxn()
-            else
-                null;
-            defer if (diagnostic_read) |*txn| txn.abort();
-            const payload_read = if (diagnostic_read) |*txn| txn else self.payload_read;
+            const payload_read = self.payload_read;
             var meta = std.ArrayListUnmanaged(u8).empty;
             try meta.appendSlice(scratch, "ACB8");
             try appendInt(&meta, scratch, u32, self.view.?.version());
@@ -2317,6 +2310,7 @@ const Block = struct {
     rows: []Row,
     ordinal_pages: []const u8,
     values: std.AutoHashMapUnmanaged(u32, *ColumnView) = .empty,
+    prefetched_metadata: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     orders: std.AutoHashMapUnmanaged(usize, []const usize) = .empty,
     decoded_payloads: std.AutoHashMapUnmanaged([32]u8, *read_cache.Payload) = .empty,
     payload_cache: ?*read_cache.Cache = null,
@@ -2363,11 +2357,7 @@ const Block = struct {
         }
     };
 
-    fn column(self: *@This(), ordinal: u32) !*ColumnView {
-        if (self.values.get(ordinal)) |value| return value;
-        const value = try self.alloc.create(ColumnView);
-        value.* = .{};
-        if (self.stats) |stats| stats.column_view_bytes += @sizeOf(ColumnView);
+    fn hasColumn(self: *@This(), ordinal: u32) bool {
         var low: usize = 0;
         var high = self.ordinal_pages.len / 12;
         while (low < high) {
@@ -2378,23 +2368,88 @@ const Block = struct {
         }
         if (low < self.ordinal_pages.len / 12) {
             const page = self.ordinal_pages[low * 12 ..][0..12];
-            if (std.mem.readInt(u32, page[0..4], .little) == ordinal / 64 and
-                std.mem.readInt(u64, page[4..12], .little) & (@as(u64, 1) << @intCast(ordinal % 64)) != 0)
-            {
-                const meta = try verified(try self.scope.get(try columnMetaKey(self.alloc, self.generation, self.index, ordinal)));
-                value.pages = try ColumnPages.init(meta, self.rows.len);
-                if (meta[0] > 1) return error.InvalidColumnSegment;
-                value.bounds = .{ .present = meta[0] == 1, .minimum = @bitCast(std.mem.readInt(u64, meta[1..9], .little)), .maximum = @bitCast(std.mem.readInt(u64, meta[9..17], .little)) };
-                if (!std.math.isFinite(value.bounds.minimum) or !std.math.isFinite(value.bounds.maximum) or value.bounds.minimum > value.bounds.maximum) return error.InvalidColumnSegment;
-                value.payload_bytes = std.mem.readInt(u64, meta[17..25], .little);
-                value.bitmaps = meta[25 .. 25 + 2 * null_bytes];
-                for (value.bitmaps[0..null_bytes], value.bitmaps[null_bytes..]) |presence, nulls| if (nulls & ~presence != 0) return error.InvalidColumnSegment;
-                for (self.rows.len..max_rows) |row| if (value.bitmaps[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return error.InvalidColumnSegment;
-                if (self.stats) |stats| {
-                    stats.metadata_bytes_read += meta.len + 4;
-                    stats.encoded_bytes_read += meta.len + 4;
-                    stats.column_metadata_reads += 1;
+            return std.mem.readInt(u32, page[0..4], .little) == ordinal / 64 and
+                std.mem.readInt(u64, page[4..12], .little) & (@as(u64, 1) << @intCast(ordinal % 64)) != 0;
+        }
+        return false;
+    }
+
+    fn prefetchMetadata(self: *@This(), ordinals: []const u32) !void {
+        var pending: [32]u32 = undefined;
+        var count: usize = 0;
+        for (ordinals) |ordinal| {
+            if (!self.hasColumn(ordinal) or self.values.contains(ordinal) or self.prefetched_metadata.contains(ordinal)) continue;
+            if (std.mem.indexOfScalar(u32, pending[0..count], ordinal) != null) continue;
+            pending[count] = ordinal;
+            count += 1;
+            if (count == pending.len) {
+                try self.fetchMetadata(pending[0..count]);
+                count = 0;
+            }
+        }
+        try self.fetchMetadata(pending[0..count]);
+    }
+
+    fn prefetchFilterMetadata(self: *@This(), filter: scan_plan.Filter) !void {
+        const Collector = struct {
+            block: *Block,
+            pending: [32]u32 = undefined,
+            count: usize = 0,
+            fn visit(c: *@This(), value: scan_plan.Filter) anyerror!void {
+                switch (value) {
+                    .field_matcher => |matcher| if (matcher.ordinal) |ordinal| {
+                        c.pending[c.count] = ordinal;
+                        c.count += 1;
+                        if (c.count == c.pending.len) {
+                            try c.block.prefetchMetadata(c.pending[0..c.count]);
+                            c.count = 0;
+                        }
+                    },
+                    .conjuncts, .disjuncts => |items| for (items) |item| try c.visit(item),
+                    .bool_query => |query| {
+                        for (query.must) |item| try c.visit(item);
+                        if (query.min_should > 0) for (query.should) |item| try c.visit(item);
+                        for (query.must_not) |item| try c.visit(item);
+                    },
+                    else => {},
                 }
+            }
+        };
+        var collector = Collector{ .block = self };
+        try collector.visit(filter);
+        try self.prefetchMetadata(collector.pending[0..collector.count]);
+    }
+
+    fn fetchMetadata(self: *@This(), ordinals: []u32) !void {
+        if (ordinals.len == 0) return;
+        try self.checkWork();
+        std.mem.sort(u32, ordinals, {}, std.sort.asc(u32));
+        var names: [32][]const u8 = undefined;
+        var encoded: [32]?[]const u8 = undefined;
+        for (ordinals, 0..) |ordinal, i| names[i] = try columnMetaKey(self.alloc, self.generation, self.index, ordinal);
+        try self.readMany(names[0..ordinals.len], encoded[0..ordinals.len]);
+        for (ordinals, encoded[0..ordinals.len]) |ordinal, bytes| try self.prefetched_metadata.put(self.alloc, ordinal, bytes orelse return error.InvalidColumnSegment);
+    }
+
+    fn column(self: *@This(), ordinal: u32) !*ColumnView {
+        if (self.values.get(ordinal)) |value| return value;
+        const value = try self.alloc.create(ColumnView);
+        value.* = .{};
+        if (self.stats) |stats| stats.column_view_bytes += @sizeOf(ColumnView);
+        if (self.hasColumn(ordinal)) {
+            const meta = try verified(self.prefetched_metadata.get(ordinal) orelse try self.scope.get(try columnMetaKey(self.alloc, self.generation, self.index, ordinal)));
+            value.pages = try ColumnPages.init(meta, self.rows.len);
+            if (meta[0] > 1) return error.InvalidColumnSegment;
+            value.bounds = .{ .present = meta[0] == 1, .minimum = @bitCast(std.mem.readInt(u64, meta[1..9], .little)), .maximum = @bitCast(std.mem.readInt(u64, meta[9..17], .little)) };
+            if (!std.math.isFinite(value.bounds.minimum) or !std.math.isFinite(value.bounds.maximum) or value.bounds.minimum > value.bounds.maximum) return error.InvalidColumnSegment;
+            value.payload_bytes = std.mem.readInt(u64, meta[17..25], .little);
+            value.bitmaps = meta[25 .. 25 + 2 * null_bytes];
+            for (value.bitmaps[0..null_bytes], value.bitmaps[null_bytes..]) |presence, nulls| if (nulls & ~presence != 0) return error.InvalidColumnSegment;
+            for (self.rows.len..max_rows) |row| if (value.bitmaps[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return error.InvalidColumnSegment;
+            if (self.stats) |stats| {
+                stats.metadata_bytes_read += meta.len + 4;
+                stats.encoded_bytes_read += meta.len + 4;
+                stats.column_metadata_reads += 1;
             }
         }
         try self.values.put(self.alloc, ordinal, value);
@@ -2430,20 +2485,104 @@ const Block = struct {
         const values = try self.initCells(ordinal);
         const column_view = try self.column(ordinal);
         if (column_view.pages) |pages| {
+            var pending: [32]PageRead = undefined;
+            var count: usize = 0;
+            var bytes: u64 = 0;
             for (0..pages.count()) |page| {
                 if (column_view.loaded_pages.isSet(page) or pages.size(page) == 0) continue;
                 for (pages.first(page)..pages.end(page)) |i| {
                     if (candidates[i] and column_view.present(i) and values[i] == null) {
-                        try self.loadPage(ordinal, page);
+                        const ref = pages.reference(page);
+                        if (count != 0 and (count == pending.len or bytes +| ref.bytes > 256 * 1024)) {
+                            try self.fetchPages(pending[0..count]);
+                            count = 0;
+                            bytes = 0;
+                        }
+                        pending[count] = .{ .ordinal = ordinal, .page = page, .ref = ref };
+                        count += 1;
+                        bytes +|= ref.bytes;
                         break;
                     }
                 }
             }
+            try self.fetchPages(pending[0..count]);
         }
         return values;
     }
 
     fn loadPage(self: *@This(), ordinal: u32, page: usize) !void {
+        return self.loadPageEncoded(ordinal, page, null);
+    }
+
+    const PageRead = struct { ordinal: u32, page: usize, ref: payloads.Ref };
+
+    fn readMany(self: *@This(), names: []const []const u8, values: []?[]const u8) !void {
+        if (@import("builtin").is_test and test_scalar_reads) {
+            for (names, values) |name, *value| value.* = self.scope.get(name) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            return;
+        }
+        return self.scope.getManySorted(names, values);
+    }
+
+    /// Sort/deduplicate the physical reads, while retaining the caller's
+    /// predicate/projection selection. At most 32 pages / 256 KiB are queued
+    /// (one indivisible oversized value is allowed). No speculative columns.
+    fn fetchPages(self: *@This(), pending: []PageRead) !void {
+        if (pending.len == 0) return;
+        try self.checkWork();
+        std.mem.sort(PageRead, pending, {}, struct {
+            fn less(_: void, a: PageRead, b: PageRead) bool {
+                return std.mem.order(u8, &a.ref.digest, &b.ref.digest) == .lt;
+            }
+        }.less);
+        var names: [32][]const u8 = undefined;
+        var encoded: [32]?[]const u8 = undefined;
+        var slots: [32]?usize = @splat(null);
+        var count: usize = 0;
+        for (pending, 0..) |request, i| {
+            if (self.decoded_payloads.contains(request.ref.digest) or (if (self.payload_cache) |cache| cache.contains(request.ref.digest) else false)) continue;
+            if (i != 0 and std.mem.eql(u8, &pending[i - 1].ref.digest, &request.ref.digest)) {
+                slots[i] = slots[i - 1];
+                continue;
+            }
+            slots[i] = count;
+            names[count] = try payloads.key(self.alloc, self.generation, request.ref.digest, false);
+            count += 1;
+        }
+        if (count != 0) try self.readMany(names[0..count], encoded[0..count]);
+        for (pending, slots[0..pending.len]) |request, slot| {
+            try self.loadPageEncoded(request.ordinal, request.page, if (slot) |i| encoded[i] orelse return error.InvalidColumnSegment else null);
+        }
+    }
+
+    fn prefetchProjection(self: *@This(), ordinals: []const u32, row: usize) !void {
+        try self.prefetchMetadata(ordinals);
+        var pending: [32]PageRead = undefined;
+        var count: usize = 0;
+        var bytes: u64 = 0;
+        for (ordinals) |ordinal| {
+            const value = try self.column(ordinal);
+            if (!value.present(row) or value.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) continue;
+            const pages = value.pages.?;
+            const page = pages.containing(row);
+            if (value.loaded_pages.isSet(page)) continue;
+            const ref = pages.reference(page);
+            if (count != 0 and (count == pending.len or bytes +| ref.bytes > 256 * 1024)) {
+                try self.fetchPages(pending[0..count]);
+                count = 0;
+                bytes = 0;
+            }
+            pending[count] = .{ .ordinal = ordinal, .page = page, .ref = ref };
+            count += 1;
+            bytes +|= ref.bytes;
+        }
+        try self.fetchPages(pending[0..count]);
+    }
+
+    fn loadPageEncoded(self: *@This(), ordinal: u32, page: usize, prefetched: ?[]const u8) !void {
         try self.checkWork();
         const values = try self.initCells(ordinal);
         const column_view = try self.column(ordinal);
@@ -2454,7 +2593,7 @@ const Block = struct {
         const ref = pages.reference(page);
         const decoded = self.decoded_payloads.get(ref.digest) orelse blk: {
             const result = (if (self.payload_cache) |cache| cache.get(ref.digest) else null) orelse decode: {
-                const encoded = try self.scope.get(try payloads.key(self.alloc, self.generation, ref.digest, false));
+                const encoded = prefetched orelse try self.scope.get(try payloads.key(self.alloc, self.generation, ref.digest, false));
                 if (self.stats) |stats| {
                     stats.payload_pages_read += 1;
                     stats.encoded_bytes_read += encoded.len;
@@ -2886,6 +3025,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
         var candidates: [max_rows]bool = @splat(false);
         var known: [max_rows]bool = @splat(false);
         for (rows, 0..) |row, i| candidates[i] = std.mem.order(u8, row.key, range.start) != .lt and (range.end.len == 0 or std.mem.order(u8, row.key, range.end) == .lt) and eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns);
+        if (std.mem.indexOfScalar(bool, candidates[0..rows.len], true) != null) if (schema_plan.filter) |bound_filter| try block.prefetchFilterMetadata(bound_filter);
         // Full/special output pays primary I/O only for survivors. For an
         // scan with at least a block of remaining output budget, measure the
         // actual selection before choosing random materialization versus a
@@ -2949,6 +3089,7 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                 const row_alloc = row_arena.allocator();
                 if (opts.include_documents) {
                     if (schema_plan.projected) |projection| {
+                        try block.prefetchProjection(projection.base.ordinals, i);
                         var object = ProjectionPlan.Sources.empty;
                         for (projection.base.ordinals) |ordinal| {
                             const name = block.table.relational_columns[ordinal].name;

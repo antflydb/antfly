@@ -66,6 +66,7 @@ pub const Run = struct {
     cached_table_index: ?usize = null,
     table_index: ?lsm_table_file.TableIndex = null,
     version_ref_pinned: bool = false,
+    shared_read_version: bool = false,
     state: ?state_mod.State,
 
     pub fn deinit(self: *Run, allocator: Allocator) void {

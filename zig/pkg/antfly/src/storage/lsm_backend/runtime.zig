@@ -31,6 +31,7 @@ const platform_time = @import("antfly_platform").time;
 const Run = repository_mod.Run;
 const State = state_mod.State;
 const ActiveMemTable = state_mod.ActiveMemTable;
+pub var test_private_read_versions: bool = false;
 const namespaceOf = state_mod.namespaceOf;
 const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
@@ -2408,6 +2409,92 @@ fn lowerBoundRunStart(keys: []const []const u8, namespace: backend_types.Namespa
     return lo;
 }
 
+/// Immutable run membership and search topology, shared by all reads of one
+/// published LSM version. Mutable cache-index hints in Run are only accessed
+/// under the backend mutex; lazy Bloom ownership is disabled for these runs.
+pub const ReadVersion = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    allocator: Allocator,
+    runs: []Run,
+    l0_groups: []RunGroup,
+    levels: []RunLevel,
+
+    fn create(backend: anytype) !*ReadVersion {
+        const allocator = runtimeScratchAllocator(backend.allocator);
+        const version = try allocator.create(ReadVersion);
+        errdefer allocator.destroy(version);
+        const runs = try allocator.alloc(Run, backend.runs.items.len);
+        var count: usize = 0;
+        errdefer {
+            for (runs[0..count]) |*run| {
+                backend.releaseRunSnapshotRef(run);
+                run.deinit(allocator);
+            }
+            allocator.free(runs);
+        }
+        for (backend.runs.items, 0..) |run, i| {
+            runs[i] = try repository_mod.cloneRunCompactionSnapshot(allocator, run);
+            count += 1;
+            runs[i].shared_read_version = true;
+            try backend.retainRunSnapshotRef(&runs[i]);
+        }
+        const groups = try buildL0RunGroupsWithStats(backend, allocator, runs);
+        errdefer deinitRunGroups(allocator, groups);
+        const levels = try buildLowerLevels(allocator, runs);
+        version.* = .{ .allocator = allocator, .runs = runs, .l0_groups = groups, .levels = levels };
+        return version;
+    }
+
+    pub fn release(self: *ReadVersion, backend: anytype) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        for (self.runs) |*run| {
+            backend.releaseRunSnapshotRef(run);
+            run.deinit(allocator);
+        }
+        allocator.free(self.runs);
+        deinitRunGroups(allocator, self.l0_groups);
+        allocator.free(self.levels);
+        allocator.destroy(self);
+    }
+};
+
+const RunReadView = struct {
+    allocator: Allocator,
+    runs: []Run,
+    l0_groups: []RunGroup,
+    levels: []RunLevel,
+    version: ?*ReadVersion = null,
+
+    /// Caller holds the backend mutex. Publishing a new run set invalidates
+    /// the backend's reference; readers continue owning the previous version.
+    fn capture(backend: anytype, allocator: Allocator) !RunReadView {
+        if (comptime @hasField(@TypeOf(backend.*), "read_version")) if (!(builtin.is_test and test_private_read_versions)) {
+            if (backend.read_version == null) {
+                backend.read_version = try ReadVersion.create(backend);
+                backend.read_version_builds +|= 1;
+            }
+            const version = backend.read_version.?;
+            _ = version.references.fetchAdd(1, .monotonic);
+            backend.read_version_pins +|= 1;
+            return .{ .allocator = version.allocator, .runs = version.runs, .l0_groups = version.l0_groups, .levels = version.levels, .version = version };
+        };
+        const BackendType = @TypeOf(backend.*);
+        const runs = try borrowRunSnapshotList(BackendType, backend, allocator, backend.runs.items);
+        errdefer freeRunSnapshotList(BackendType, backend, allocator, runs);
+        const groups = try buildL0RunGroupsWithStats(backend, allocator, runs);
+        errdefer deinitRunGroups(allocator, groups);
+        return .{ .allocator = allocator, .runs = runs, .l0_groups = groups, .levels = try buildLowerLevels(allocator, runs) };
+    }
+
+    fn release(self: RunReadView, backend: anytype) void {
+        if (self.version) |version| return version.release(backend);
+        freeRunSnapshotList(@TypeOf(backend.*), backend, self.allocator, self.runs);
+        deinitRunGroups(self.allocator, self.l0_groups);
+        self.allocator.free(self.levels);
+    }
+};
+
 fn CurrentReadLayout(comptime BackendType: type) type {
     return struct {
         backend: *BackendType,
@@ -2416,15 +2503,14 @@ fn CurrentReadLayout(comptime BackendType: type) type {
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
         levels: []RunLevel = &.{},
-        prepared: bool = false,
+        read_view: RunReadView,
 
-        /// Capture only the generation-pinned pieces that must be selected
-        /// while the backend lock is held. Run grouping and table reads can be
-        /// prepared after releasing the writer lock.
+        /// Pin the published topology and exact immutable generations under
+        /// the backend lock. SST I/O runs after releasing that lock.
         fn capture(backend: *BackendType, allocator: Allocator) !@This() {
             const metadata_allocator = runtimeScratchAllocator(allocator);
-            const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
-            errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
+            const read_view = try RunReadView.capture(backend, metadata_allocator);
+            errdefer read_view.release(backend);
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
@@ -2434,33 +2520,19 @@ fn CurrentReadLayout(comptime BackendType: type) type {
                 .backend = backend,
                 .metadata_allocator = metadata_allocator,
                 .immutable_memtables = immutable_memtables,
-                .runs = runs,
+                .runs = read_view.runs,
+                .l0_groups = read_view.l0_groups,
+                .levels = read_view.levels,
+                .read_view = read_view,
             };
         }
 
-        fn prepare(self: *@This()) !void {
-            if (self.prepared) return;
-            const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, self.runs);
-            errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
-            const levels = try buildLowerLevels(self.metadata_allocator, self.runs);
-            self.l0_groups = l0_groups;
-            self.levels = levels;
-            self.prepared = true;
-        }
-
         fn init(backend: *BackendType, allocator: Allocator) !@This() {
-            var layout = try @This().capture(backend, allocator);
-            errdefer layout.deinit();
-            try layout.prepare();
-            return layout;
+            return @This().capture(backend, allocator);
         }
 
         fn deinit(self: *@This()) void {
-            if (self.prepared) {
-                deinitRunGroups(self.metadata_allocator, self.l0_groups);
-                self.metadata_allocator.free(self.levels);
-            }
-            freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.runs);
+            self.read_view.release(self.backend);
             releaseImmutableMemtableSnapshotList(BackendType, self.backend, self.immutable_memtables);
             self.* = undefined;
         }
@@ -2470,11 +2542,7 @@ fn CurrentReadLayout(comptime BackendType: type) type {
         /// writer lock and reacquire it only for the exact pin handoff.
         fn deinitAfterUnlockedRead(self: *@This()) void {
             const backend = self.backend;
-            if (self.prepared) {
-                deinitRunGroups(self.metadata_allocator, self.l0_groups);
-                self.metadata_allocator.free(self.levels);
-            }
-            freeRunSnapshotList(BackendType, backend, self.metadata_allocator, self.runs);
+            self.read_view.release(backend);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
@@ -2560,6 +2628,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         mutable_snapshot: *const State,
         owns_mutable_snapshot: bool = false,
+        read_view: RunReadView,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2583,6 +2652,26 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 return getFromSnapshotRuns(p.backend, p.mutable_snapshot, p.immutable_memtables, p.runs, p.l0_groups, p.levels, &self.last_l0_group_index, &self.read_hint, &self.held_blocks, &self.held_values, self.allocator, p.namespace, key, false, null);
             }
 
+            pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+                if (keys.len != values.len) return error.InvalidBatch;
+                @memset(values, null);
+                const p = self.parent;
+                p.backend.recordGetManySorted(keys.len);
+                p.backend.recordGetManySortedLocality(keys);
+                const plan = chooseMultiGetPlan(keys, .snapshot);
+                recordMultiGetPlan(p.backend, plan);
+                const result = switch (plan) {
+                    .cursor => blk: {
+                        var cursor = try p.openCursor();
+                        defer cursor.close();
+                        break :blk try readManySortedFromCursor(p.backend, self.allocator, &self.held_blocks, &self.held_values, &cursor, keys, values);
+                    },
+                    .sorted_by_run => try readManySortedByRunFromSnapshot(p.backend, p.mutable_snapshot, p.immutable_memtables, p.runs, p.l0_groups, p.levels, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, false),
+                    .point => try readManySortedPointFromSnapshot(p.backend, p.mutable_snapshot, p.immutable_memtables, p.runs, p.l0_groups, p.levels, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, false),
+                };
+                p.backend.recordGetManySortedResults(result.hits, result.misses);
+            }
+
             pub fn close(self: *@This()) void {
                 releaseHeldBlocks(&self.held_blocks, self.parent.backend.allocator);
                 releaseHeldValues(&self.held_values, self.allocator);
@@ -2598,12 +2687,8 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
-            const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
-            errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
-            const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
-            errdefer deinitRunGroups(metadata_allocator, l0_groups);
-            const levels = try buildLowerLevels(metadata_allocator, runs);
-            errdefer metadata_allocator.free(levels);
+            const read_view = try RunReadView.capture(backend, metadata_allocator);
+            errdefer read_view.release(backend);
             try retainReadReader(BackendType, backend, .bound_read_txn);
             errdefer releaseReadReader(BackendType, backend, .bound_read_txn);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
@@ -2630,9 +2715,10 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 .mutable_snapshot = mutable_snapshot.state,
                 .owns_mutable_snapshot = mutable_snapshot.owned,
                 .immutable_memtables = immutable_memtables,
-                .runs = runs,
-                .l0_groups = l0_groups,
-                .levels = levels,
+                .read_view = read_view,
+                .runs = read_view.runs,
+                .l0_groups = read_view.l0_groups,
+                .levels = read_view.levels,
             };
         }
 
@@ -2643,9 +2729,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 owned.deinit(self.allocator);
                 self.allocator.destroy(owned);
             }
-            deinitRunGroups(self.metadata_allocator, self.l0_groups);
-            self.metadata_allocator.free(self.levels);
-            freeRunSnapshotList(BackendType, backend, self.metadata_allocator, self.runs);
+            self.read_view.release(backend);
             releaseHeldBlocks(&self.held_blocks, backend.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
@@ -2794,11 +2878,13 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         stable_point_view: bool = false,
         stable_point_view_loaded: bool = false,
+        read_view: ?RunReadView = null,
         // Values from immutable generations/in-memory runs borrow their
         // captured layout. Disk values are already owned by held_values or
         // pinned by held_blocks and need no second whole-value allocation.
         held_layouts: std.ArrayListUnmanaged(CurrentReadLayout(BackendType)) = .empty,
         leased_values: std.ArrayListUnmanaged([]u8) = .empty,
+        leased_entries: std.ArrayListUnmanaged(state_mod.OwnedEntry) = .empty,
         empty_state: State = .{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2829,10 +2915,10 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             for (self.held_layouts.items) |*layout| layout.deinitAfterUnlockedRead();
             self.held_layouts.deinit(self.metadata_allocator);
             releaseHeldValues(&self.leased_values, backend.allocator);
+            for (self.leased_entries.items) |*entry| entry.deinit(self.allocator);
+            self.leased_entries.deinit(self.metadata_allocator);
             if (self.stable_point_view_loaded) {
-                deinitRunGroups(self.metadata_allocator, self.l0_groups);
-                self.metadata_allocator.free(self.levels);
-                freeRunSnapshotList(BackendType, backend, self.metadata_allocator, self.runs);
+                self.read_view.?.release(backend);
             }
             releaseHeldBlocks(&self.held_blocks, backend.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
@@ -2860,15 +2946,11 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             if (!self.stable_point_view or self.stable_point_view_loaded) return;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
-            const runs = try borrowRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.backend.runs.items);
-            errdefer freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, runs);
-            const l0_groups = try buildL0RunGroupsWithStats(self.backend, self.metadata_allocator, runs);
-            errdefer deinitRunGroups(self.metadata_allocator, l0_groups);
-            const levels = try buildLowerLevels(self.metadata_allocator, runs);
-            errdefer self.metadata_allocator.free(levels);
-            self.runs = runs;
-            self.l0_groups = l0_groups;
-            self.levels = levels;
+            const read_view = try RunReadView.capture(self.backend, self.metadata_allocator);
+            self.read_view = read_view;
+            self.runs = read_view.runs;
+            self.l0_groups = read_view.l0_groups;
+            self.levels = read_view.levels;
             self.stable_point_view_loaded = true;
         }
 
@@ -2929,6 +3011,12 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     const entry = self.backend.mutable.entries.items[idx];
                     if (entry.tombstone) return error.NotFound;
                     self.backend.recordMutableHit();
+                    if (lease and entry.shared != null) {
+                        try self.leased_entries.ensureUnusedCapacity(self.metadata_allocator, 1);
+                        self.leased_entries.appendAssumeCapacity(try state_mod.cloneEntry(self.allocator, entry));
+                        recordPointValueBorrow(self.backend);
+                        return entry.value;
+                    }
                     recordPointValueCopy(self.backend);
                     return try self.ownValue(entry.value);
                 }
@@ -2936,7 +3024,6 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             };
             var retain_layout = false;
             defer if (!retain_layout) layout.deinitAfterUnlockedRead();
-            try layout.prepare();
 
             const value = try getFromSnapshotRuns(
                 self.backend,
@@ -3053,7 +3140,6 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 
                 if (maybe_layout) |*layout| {
                     defer layout.deinitAfterUnlockedRead();
-                    try layout.prepare();
 
                     const unresolved_keys = try self.metadata_allocator.alloc([]const u8, unresolved_count);
                     defer self.metadata_allocator.free(unresolved_keys);
@@ -4043,6 +4129,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         backend: *BackendType,
         mutable_snapshot: *const State,
         owns_mutable_snapshot: bool = false,
+        read_view: RunReadView,
         snapshot: ?State = null,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
@@ -4057,12 +4144,8 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
-            const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
-            errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
-            const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
-            errdefer deinitRunGroups(metadata_allocator, l0_groups);
-            const levels = try buildLowerLevels(metadata_allocator, runs);
-            errdefer metadata_allocator.free(levels);
+            const read_view = try RunReadView.capture(backend, metadata_allocator);
+            errdefer read_view.release(backend);
             try retainReadReader(BackendType, backend, .namespace_read_txn);
             errdefer releaseReadReader(BackendType, backend, .namespace_read_txn);
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
@@ -4088,9 +4171,10 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
                 .mutable_snapshot = mutable_snapshot.state,
                 .owns_mutable_snapshot = mutable_snapshot.owned,
                 .immutable_memtables = immutable_memtables,
-                .runs = runs,
-                .l0_groups = l0_groups,
-                .levels = levels,
+                .read_view = read_view,
+                .runs = read_view.runs,
+                .l0_groups = read_view.l0_groups,
+                .levels = read_view.levels,
             };
         }
 
@@ -4101,9 +4185,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
                 owned.deinit(self.allocator);
                 self.allocator.destroy(owned);
             }
-            deinitRunGroups(self.metadata_allocator, self.l0_groups);
-            self.metadata_allocator.free(self.levels);
-            freeRunSnapshotList(BackendType, self.backend, self.metadata_allocator, self.runs);
+            self.read_view.release(backend);
             if (self.snapshot) |*snapshot| snapshot.deinit(self.allocator);
             releaseHeldBlocks(&self.held_blocks, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
@@ -6076,6 +6158,7 @@ fn runMayContainWithFilterMaybeLocked(
 }
 
 fn ensureRunBloomFilterForRead(backend: anytype, run: *Run) !?bloom.OwnedFilter {
+    if (run.shared_read_version) return null;
     if (run.bloom_filter) |filter| return filter;
     // Cache-backed reads retain the table-index handle that owns the Bloom
     // filter. There is no per-run filter to materialize, so taking the backend
@@ -6094,6 +6177,7 @@ fn ensureRunBloomFilterForReadMaybeLocked(backend: anytype, run: *Run, backend_l
 }
 
 fn ensureRunBloomFilterForReadLocked(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
+    if (run.shared_read_version) return null;
     if (run.bloom_filter) |filter| return filter;
 
     if (@hasField(@TypeOf(backend.*), "runs")) {

@@ -64309,11 +64309,11 @@ test "relational columnar production LSM staging snapshot benchmark" {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    defer relational_columns.test_snapshot_per_block = false;
+    defer lsm_backend_mod.Backend.test_deep_mutable_snapshots = false;
     var clones: [2]u64 = undefined;
     var elapsed: [2]u64 = undefined;
     for (0..2) |mode| {
-        relational_columns.test_snapshot_per_block = mode == 0;
+        lsm_backend_mod.Backend.test_deep_mutable_snapshots = mode == 0;
         var path_buf: [256]u8 = undefined;
         const path = tempPath(&path_buf);
         defer cleanupTempDir(path);
@@ -64345,7 +64345,7 @@ test "relational columnar production LSM staging snapshot benchmark" {
         try std.testing.expectEqual(writes.len, result.hashes.len);
     }
     try std.testing.expect(clones[1] < clones[0]);
-    std.debug.print("\nproduction LSM staging: per-block/build snapshot ns={d}/{d}, cloned bytes={d}/{d}\n", .{ elapsed[0], elapsed[1], clones[0], clones[1] });
+    std.debug.print("\nproduction LSM staging: deep/shared snapshot ns={d}/{d}, copied bytes={d}/{d}\n", .{ elapsed[0], elapsed[1], clones[0], clones[1] });
 }
 
 test "relational columnar production LSM physical churn benchmark" {
@@ -64437,6 +64437,64 @@ test "relational columnar production LSM physical churn benchmark" {
         mutation_ns[8],                                                mutation_ns[15],
         try relational_columns.payloadStorageBytesForTest(&db, alloc), stats.payload_bytes_read,
     });
+}
+
+test "relational columnar production LSM batched cold block read benchmark" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var columns: [32]schema_mod.RelationalColumn = undefined;
+    var fields: [32][]const u8 = undefined;
+    for (&columns, &fields, 0..) |*column, *field, i| {
+        field.* = try std.fmt.allocPrint(scratch, "f{d:0>4}", .{i});
+        column.* = .{ .name = field.*, .path = field.*, .column_type = .integer };
+    }
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var writes: [128]types.BatchWrite = undefined;
+    for (&writes, 0..) |*write, row| {
+        var object = std.json.ObjectMap.empty;
+        for (fields, 0..) |field, i| try object.put(scratch, field, .{ .integer = @intCast(i * 10000 + row) });
+        write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{row}), .value = try std.json.Stringify.valueAlloc(scratch, std.json.Value{ .object = object }, .{}) };
+    }
+    try db.batch(.{ .writes = &writes });
+    try drainTestRelationalMaintenance(&db);
+    const backend = db.core.primary_store_owner.lsmBackend().?;
+    try backend.sync(true);
+    // No local/shared decoded-block cache. OS page-cache state is deliberately
+    // unspecified; physical block loads/bytes are the deterministic gate.
+    try std.testing.expect(!backend.options.local_block_cache_enabled and backend.options.cache == null);
+    defer relational_columns.test_scalar_reads = false;
+    var loads: [2]u64 = undefined;
+    var bytes: [2]u64 = undefined;
+    var times: [2][7]u64 = undefined;
+    var expected: ?[]const u8 = null;
+    for (0..7) |sample| for (0..2) |turn| {
+        const mode = (sample + turn) % 2;
+        relational_columns.test_scalar_reads = mode == 0;
+        const before = backend.snapshotReadStats();
+        const started = platform_time.monotonicNs();
+        var stats: types.ColumnarScanStats = .{};
+        var result = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &fields, .limit = 1, .columnar_stats = &stats });
+        defer result.deinit(alloc);
+        times[mode][sample] = platform_time.monotonicNs() - started;
+        const after = backend.snapshotReadStats();
+        loads[mode] = after.table_block_loads - before.table_block_loads;
+        bytes[mode] = after.table_block_bytes - before.table_block_bytes;
+        try std.testing.expectEqual(@as(usize, 1), result.documents.len);
+        try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
+        const encoded = try std.json.Stringify.valueAlloc(scratch, result.documents[0], .{});
+        if (expected) |old| try std.testing.expectEqualStrings(old, encoded) else expected = encoded;
+    };
+    for (&times) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    std.debug.print("\nLSM column batches scalar/batched: block loads={d}/{d}, bytes={d}/{d}, median ns={d}/{d}\n", .{ loads[0], loads[1], bytes[0], bytes[1], times[0][3], times[1][3] });
+    try std.testing.expect(loads[1] < loads[0]);
+    try std.testing.expect(bytes[1] < bytes[0]);
 }
 
 test "relational point projection lease benchmark" {
