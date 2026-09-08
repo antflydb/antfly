@@ -20706,11 +20706,17 @@ pub const IndexManager = struct {
             try self.clearDenseVectorMappingTxnWithOrdinal(store_txn, entry.config.name, pending.doc_key, pending.vector_id, pending.ordinal);
         }
 
-        entry.index.batchApply(&.{}, vector_ids.items) catch |err| switch (err) {
+        const reused_rows_before = entry.index.write_profile.delete_reused_vector_rows;
+        entry.index.batchApplyOptions(&.{}, vector_ids.items, .{
+            .reuse_delete_vectors = if (self.resource_manager) |rm| rm.dense_reused_delete_vectors else false,
+        }) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
         };
         try store_batch.commit();
+        if (benchMetricsEnabled()) std.log.info("dense delete apply index={s} keys={d} vectors={d} reused_rows={d}", .{
+            entry.config.name, keys.len, vector_ids.items.len, entry.index.write_profile.delete_reused_vector_rows -| reused_rows_before,
+        });
         for (pending_deletes.items) |pending| {
             if (pending.ordinal) |ordinal| {
                 _ = entry.ordinal_vector_ids.remove(ordinal);

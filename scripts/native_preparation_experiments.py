@@ -15,6 +15,12 @@ REFINEMENTS = {
     "certified_subgroups": ["ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS"],
     "reused_posting_rows": ["ANTFLY_EXPERIMENT_REUSE_POSTING_ROWS"],
     "deferred_capture": ["ANTFLY_EXPERIMENT_DEFER_SOURCE_CAPTURE"],
+    "coalesced_deletes": ["ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES"],
+    "reused_delete_vectors": ["ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS"],
+    "dense_delete_plan": [
+        "ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES",
+        "ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS",
+    ],
 }
 
 
@@ -111,6 +117,7 @@ def validate_native_treatment(arm, environment):
         return None
     lines = (arm / "antfly-initial.log").read_text(errors="replace").splitlines()
     result = checkpoint_evidence(lines, environment)
+    result.update(delete_preparation_evidence(lines, environment))
     if "ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS" in active:
         profile = json.loads((arm / "public-query-profile.json").read_text())
         for key in (
@@ -127,4 +134,37 @@ def validate_native_treatment(arm, environment):
             if not math.isfinite(value) or value <= 0:
                 raise RuntimeError(f"inert certified-routing treatment: {key}")
             result[key] = value
+    return result
+
+
+def delete_preparation_evidence(lines, environment):
+    """Require actual work reduction; ordinary lifecycle/recall gates still apply."""
+    result = {}
+    for flag, marker, key in (
+        (
+            "ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES",
+            "dense replay delete plan ",
+            "deduplicated_keys",
+        ),
+        (
+            "ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS",
+            "dense delete apply ",
+            "reused_vector_rows",
+        ),
+    ):
+        if environment.get(flag) != "1":
+            continue
+        try:
+            rows = events(lines, marker)
+            values = [
+                int(row["requested"]) - int(row["unique"])
+                if key == "deduplicated_keys"
+                else int(row["reused_rows"])
+                for row in rows
+            ]
+        except (KeyError, ValueError) as error:
+            raise RuntimeError(f"invalid delete treatment evidence: {flag}") from error
+        if not values or min(values) < 0 or max(values) <= 0:
+            raise RuntimeError(f"inert delete treatment: {flag}")
+        result[key] = {"events": len(values), "sum": sum(values), "max": max(values)}
     return result

@@ -47591,8 +47591,6 @@ fn applyDerivedBatchToIndexContextProfiled(
             // filtering keeps that intent out of the batch-wide delete lane.
             const replacement_keys = try collectDenseEmbeddingReplacementKeys(ctx.alloc, dense_embeddings.writes);
             defer if (replacement_keys.len > 0) ctx.alloc.free(replacement_keys);
-            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replay_delete_keys, batch_options);
-            try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replacement_keys, batch_options);
             const chunk_backed = if (ctx.index_manager.denseIndex(index_ref.name)) |entry|
                 entry.chunk_name != null
             else
@@ -47604,8 +47602,20 @@ fn applyDerivedBatchToIndexContextProfiled(
             // with only a partial physical corpus. Non-chunked generated and
             // inline vectors still require parent-wide replacement to retire
             // provisional or previous identities.
-            if (!chunk_backed) {
-                try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
+            const overwritten_keys = if (chunk_backed) &.{} else batch.overwritten_doc_keys;
+            if (if (ctx.index_manager.resource_manager) |rm| rm.dense_coalesced_replay_deletes else false) {
+                const delete_keys = try collectDenseReplayDeleteKeys(ctx.alloc, replay_delete_keys, replacement_keys, overwritten_keys);
+                defer ctx.alloc.free(delete_keys);
+                try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, delete_keys, batch_options);
+                if (benchMetricsEnabled()) std.log.info("dense replay delete plan sequence={d} requested={d} unique={d}", .{
+                    batch.sequence,
+                    replay_delete_keys.len + replacement_keys.len + overwritten_keys.len,
+                    delete_keys.len,
+                });
+            } else {
+                try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replay_delete_keys, batch_options);
+                try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, replacement_keys, batch_options);
+                try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, overwritten_keys, batch_options);
             }
             try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
             if (ctx.index_manager.denseIndexUsesManagedDirectField(index_ref.name) or
@@ -48923,6 +48933,36 @@ fn collectDenseEmbeddingWritesForArtifacts(
     const index_ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .dense_vector };
     for (artifact_keys) |artifact_key| {
         var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, index_manager, index_ref, artifact_key)) orelse continue;
+/// One ordered delete set for one index/source transaction. Do not broaden
+/// chunk identity deletes to parent documents; callers supply only the keys
+/// permitted by the projection's existing lifecycle policy.
+fn collectDenseReplayDeleteKeys(alloc: Allocator, deleted: []const []const u8, replacements: []const []const u8, overwritten: []const []const u8) ![]const []const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer keys.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for ([_][]const []const u8{ deleted, replacements, overwritten }) |source| {
+        for (source) |key| try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
+    }
+    return try keys.toOwnedSlice(alloc);
+}
+
+test "dense replay delete plan preserves ordered union and chunk boundaries" {
+    const alloc = std.testing.allocator;
+    const keys = try collectDenseReplayDeleteKeys(alloc, &.{ "deleted", "shared" }, &.{ "shared", "replacement", "replacement" }, &.{ "replacement", "parent" });
+    defer alloc.free(keys);
+    try std.testing.expectEqual(@as(usize, 4), keys.len);
+    for (keys, [_][]const u8{ "deleted", "shared", "replacement", "parent" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
+    const chunks = try collectDenseReplayDeleteKeys(alloc, &.{"parent/chunk-1"}, &.{"parent/chunk-2"}, &.{});
+    defer alloc.free(chunks);
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expectEqualStrings("parent/chunk-1", chunks[0]);
+    try std.testing.expectEqualStrings("parent/chunk-2", chunks[1]);
+    const empty = try collectDenseReplayDeleteKeys(alloc, &.{}, &.{}, &.{});
+    defer alloc.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
         var identity_transferred = false;
         errdefer if (!identity_transferred) identity.deinit(alloc);
         try filtered.append(alloc, .{
@@ -53357,7 +53397,15 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     // beginDerivedCatchUpSessionAsync; this callback alone owns the right to
     // append to it. Foreground/enrichment callers use the non-borrowing path
     // and yield if this window is still active.
-    try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, true);
+    if (benchMetricsEnabled()) {
+        var profile = BatchProfile{};
+        const start = monotonicTimeNs();
+        try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, &profile, true);
+        profile.total_ns = monotonicTimeNs() - start;
+        logDerivedWorkerProfile(index_ref, batch, profile);
+    } else {
+        try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, true);
+    }
 
     if (index_ref.kind == .dense_vector) {
         setDenseCatchUpProgress(ctx, .{

@@ -2,10 +2,36 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from native_preparation_experiments import checkpoint_evidence, require_disk_headroom
+from native_preparation_experiments import (
+    checkpoint_evidence,
+    require_disk_headroom,
+    delete_preparation_evidence,
+)
 
 
 class NativePreparationTests(unittest.TestCase):
+    def test_delete_treatments_require_saved_work(self):
+        flags = {
+            "ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES": "1",
+            "ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS": "1",
+        }
+        lines = [
+            "dense replay delete plan sequence=10 requested=12 unique=7",
+            "dense delete apply index=vector keys=7 vectors=7 reused_rows=40",
+        ]
+        result = delete_preparation_evidence(lines, flags)
+        self.assertEqual(5, result["deduplicated_keys"]["sum"])
+        self.assertEqual(40, result["reused_vector_rows"]["sum"])
+        for bad in (
+            [],
+            ["dense replay delete plan requested=7 unique=7"],
+            ["dense replay delete plan requested=1 unique=2"],
+            ["dense replay delete plan requested=x unique=2"],
+        ):
+            with self.assertRaises(RuntimeError):
+                delete_preparation_evidence(bad, flags)
+        self.assertEqual({}, delete_preparation_evidence([], {}))
+
     def test_launch_guard_never_removes_data(self):
         with patch(
             "native_preparation_experiments.shutil.disk_usage",

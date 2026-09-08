@@ -192,6 +192,7 @@ pub const WriteProfile = struct {
     external_vector_cache_hits: u64 = 0,
     external_vector_cache_misses: u64 = 0,
     centroid_recompute_calls: u64 = 0,
+    delete_reused_vector_rows: u64 = 0,
     centroid_recompute_members_total: u64 = 0,
     centroid_recompute_members_max: u64 = 0,
     save_split_range_ns: u64 = 0,
@@ -290,6 +291,9 @@ pub const BatchVectorLookup = struct {
 };
 
 pub const BatchInsertOptions = struct {
+    /// Share one authoritative transformed leaf matrix between centroid and
+    /// payload refresh on eager batch deletes. Does not defer either refresh.
+    reuse_delete_vectors: bool = false,
     defer_quantized_rebuild: bool = false,
     defer_quantized_rebuild_to_bulk_finish: bool = false,
     centroid_only_routing: bool = false,

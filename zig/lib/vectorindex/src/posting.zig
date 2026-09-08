@@ -266,6 +266,17 @@ pub const PostingStore = struct {
 
     pub fn recomputeCentroid(index: anytype, txn: anytype, node: *types.Node) !void {
         if (!node.is_leaf) return error.ExpectedLeaf;
+        const Index = switch (@typeInfo(@TypeOf(index))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(index),
+        };
+        if (comptime @hasDecl(Index, "loadPostingVectorsTransformed")) {
+            const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
+            const vectors = try index.alloc.alloc(f32, matrix_len);
+            defer index.alloc.free(vectors);
+            if (node.members.len != 0) try index.loadPostingVectorsTransformed(txn, node.members, vectors);
+            return recomputeCentroidFromTransformedVectors(index, node, vectors);
+        }
         if (node.members.len == 0) {
             @memset(node.centroid, 0);
             node.covering_radius = 0;
@@ -285,21 +296,7 @@ pub const PostingStore = struct {
         }
         @memset(node.centroid, 0);
 
-        const Index = switch (@typeInfo(@TypeOf(index))) {
-            .pointer => |ptr| ptr.child,
-            else => @TypeOf(index),
-        };
-        var loaded_vectors: ?[]f32 = null;
-        defer if (loaded_vectors) |vectors| index.alloc.free(vectors);
-        if (comptime @hasDecl(Index, "loadPostingVectorsTransformed")) {
-            const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
-            const vectors = try index.alloc.alloc(f32, matrix_len);
-            loaded_vectors = vectors;
-            try index.loadPostingVectorsTransformed(txn, node.members, vectors);
-            for (0..node.members.len) |i| {
-                vec.add(node.centroid, vectors[i * index.config.dims ..][0..index.config.dims]);
-            }
-        } else {
+        {
             const vector_scratch = try index.alloc.alloc(f32, index.config.dims);
             defer index.alloc.free(vector_scratch);
             const transformed = try index.alloc.alloc(f32, index.config.dims);
@@ -314,14 +311,10 @@ pub const PostingStore = struct {
         vec.scale(1.0 / @as(f32, @floatFromInt(node.members.len)), node.centroid);
         normalizeCentroidForMetric(index, node.centroid);
         if (index.config.metric != .inner_product) {
-            var radius_only_vectors: ?[]f32 = null;
-            defer if (radius_only_vectors) |vectors| index.alloc.free(vectors);
-            if (loaded_vectors == null) {
-                const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
-                radius_only_vectors = try index.alloc.alloc(f32, matrix_len);
-            }
-            const vectors = loaded_vectors orelse radius_only_vectors.?;
-            if (comptime !@hasDecl(Index, "loadPostingVectorsTransformed")) {
+            const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
+            const vectors = try index.alloc.alloc(f32, matrix_len);
+            defer index.alloc.free(vectors);
+            {
                 const raw_scratch = try index.alloc.alloc(f32, index.config.dims);
                 defer index.alloc.free(raw_scratch);
                 for (node.members, 0..) |member_id, row| {
@@ -333,6 +326,37 @@ pub const PostingStore = struct {
         } else {
             node.covering_radius = std.math.nan(f32);
         }
+        noteCentroidRefreshed(node);
+    }
+
+    /// The matrix is authoritative, transformed source data in member order.
+    /// Callers may retain it for payload refresh in the SAME mutation; it is
+    /// never a cache of source vectors across revisions or transactions.
+    pub fn recomputeCentroidFromTransformedVectors(index: anytype, node: *types.Node, vectors: []const f32) !void {
+        if (!node.is_leaf) return error.ExpectedLeaf;
+        const dims = index.config.dims;
+        if (vectors.len != try std.math.mul(usize, node.members.len, dims)) return error.InvalidArgument;
+        if (node.members.len == 0) {
+            @memset(node.centroid, 0);
+            node.covering_radius = 0;
+            noteCentroidRefreshed(node);
+            return;
+        }
+        index.write_profile.centroid_recompute_calls += 1;
+        index.write_profile.centroid_recompute_members_total += @intCast(node.members.len);
+        index.write_profile.centroid_recompute_members_max = @max(index.write_profile.centroid_recompute_members_max, node.members.len);
+        if (node.centroid.len != dims) {
+            // Allocate before releasing the old centroid so error cleanup can
+            // still deinitialize the unchanged node on allocation failure.
+            const centroid = try index.alloc.alloc(f32, dims);
+            if (node.centroid.len > 0) index.alloc.free(node.centroid);
+            node.centroid = centroid;
+        }
+        @memset(node.centroid, 0);
+        for (0..node.members.len) |row| vec.add(node.centroid, vectors[row * dims ..][0..dims]);
+        vec.scale(1.0 / @as(f32, @floatFromInt(node.members.len)), node.centroid);
+        normalizeCentroidForMetric(index, node.centroid);
+        node.covering_radius = coveringRadiusForMatrix(index.config.metric, node.centroid, vectors, node.members.len);
         noteCentroidRefreshed(node);
     }
 

@@ -13145,41 +13145,45 @@ pub const HBCIndex = struct {
     }
 
     fn cacheNodeLocalLocked(self: *HBCIndex, node: Node) !void {
-        var owned = node;
-        errdefer owned.deinit(self.alloc);
+        // Ownership transfers only after all fallible preparation. Callers
+        // still own the payload if this function returns an error.
+        const owned = node;
+        if (self.node_clock_keys.len == 0) return error.CacheDisabled;
+        try self.node_cache.ensureUnusedCapacity(self.alloc, 1);
+        try self.node_cache_slots.ensureUnusedCapacity(self.alloc, 1);
+        const entry = try self.alloc.create(NodeCacheEntry);
+        errdefer self.alloc.destroy(entry);
         const reserved_slot = self.ensureLocalNodeCacheCapacityLocked(owned.id);
         if (self.node_cache_slots.fetchRemove(owned.id)) |removed_slot| {
             self.node_clock_keys[removed_slot.value] = 0;
             self.node_clock_refs[removed_slot.value] = false;
         }
         if (self.node_cache.fetchRemove(owned.id)) |removed| self.releaseLocalNodeEntry(removed.value);
-        const entry = try self.alloc.create(NodeCacheEntry);
-        errdefer self.alloc.destroy(entry);
         entry.* = .{ .node = owned };
-        errdefer releaseNodeCacheEntry(self.alloc, entry);
-        try self.node_cache.put(self.alloc, owned.id, entry);
         const slot = reserved_slot orelse claimLocalClockSlot(self.node_clock_keys, self.node_clock_hand, owned.id) orelse return error.CacheDisabled;
+        self.node_cache.putAssumeCapacity(owned.id, entry);
         self.node_clock_refs[slot] = true;
-        try self.node_cache_slots.put(self.alloc, owned.id, slot);
+        self.node_cache_slots.putAssumeCapacity(owned.id, slot);
     }
 
     fn cacheQuantizedLocalLocked(self: *HBCIndex, node_id: u64, qs: QuantizedSet) !void {
-        var owned = qs;
-        errdefer owned.deinit(self.alloc);
+        const owned = qs;
+        if (self.quantized_clock_keys.len == 0) return error.CacheDisabled;
+        try self.quantized_cache.ensureUnusedCapacity(self.alloc, 1);
+        try self.quantized_cache_slots.ensureUnusedCapacity(self.alloc, 1);
+        const entry = try self.alloc.create(QuantizedCacheEntry);
+        errdefer self.alloc.destroy(entry);
         const reserved_slot = self.ensureLocalQuantizedCacheCapacityLocked(node_id);
         if (self.quantized_cache_slots.fetchRemove(node_id)) |removed_slot| {
             self.quantized_clock_keys[removed_slot.value] = 0;
             self.quantized_clock_refs[removed_slot.value] = false;
         }
         if (self.quantized_cache.fetchRemove(node_id)) |removed| self.releaseLocalQuantizedEntry(removed.value);
-        const entry = try self.alloc.create(QuantizedCacheEntry);
-        errdefer self.alloc.destroy(entry);
         entry.* = .{ .quantized = owned };
-        errdefer releaseQuantizedCacheEntry(self.alloc, entry);
-        try self.quantized_cache.put(self.alloc, node_id, entry);
         const slot = reserved_slot orelse claimLocalClockSlot(self.quantized_clock_keys, self.quantized_clock_hand, node_id) orelse return error.CacheDisabled;
+        self.quantized_cache.putAssumeCapacity(node_id, entry);
         self.quantized_clock_refs[slot] = true;
-        try self.quantized_cache_slots.put(self.alloc, node_id, slot);
+        self.quantized_cache_slots.putAssumeCapacity(node_id, slot);
     }
 
     fn cachePinnedNodeLocked(self: *HBCIndex, node: *const Node, replace_existing: bool) !void {
@@ -13231,37 +13235,41 @@ pub const HBCIndex = struct {
     }
 
     fn cacheVectorLocalLocked(self: *HBCIndex, vector_id: u64, vector_data: []const f32) ![]const f32 {
+        if (self.vector_clock_keys.len == 0) return error.CacheDisabled;
         if (self.vector_cache.get(vector_id)) |existing| {
             if (std.mem.eql(f32, existing.vector, vector_data)) return existing.vector;
         }
-        const reserved_slot = self.ensureLocalVectorCacheCapacityLocked(vector_id);
-        self.invalidateLocalVectorCacheLocked(vector_id);
+        try self.vector_cache.ensureUnusedCapacity(self.alloc, 1);
+        try self.vector_cache_slots.ensureUnusedCapacity(self.alloc, 1);
         const copied = try self.alloc.dupe(f32, vector_data);
         errdefer self.alloc.free(copied);
         const entry = try self.alloc.create(VectorCacheEntry);
         errdefer self.alloc.destroy(entry);
         entry.* = .{ .vector = copied };
-        errdefer releaseVectorCacheEntry(self.alloc, entry);
-        try self.vector_cache.put(self.alloc, vector_id, entry);
+        const reserved_slot = self.ensureLocalVectorCacheCapacityLocked(vector_id);
+        self.invalidateLocalVectorCacheLocked(vector_id);
         const slot = reserved_slot orelse claimLocalClockSlot(self.vector_clock_keys, self.vector_clock_hand, vector_id) orelse return error.CacheDisabled;
+        self.vector_cache.putAssumeCapacity(vector_id, entry);
         self.vector_clock_refs[slot] = true;
-        try self.vector_cache_slots.put(self.alloc, vector_id, slot);
+        self.vector_cache_slots.putAssumeCapacity(vector_id, slot);
         return entry.vector;
     }
 
     fn cacheMetadataLocalLocked(self: *HBCIndex, vector_id: u64, metadata: []const u8) !void {
-        const reserved_slot = self.ensureLocalMetadataCacheCapacityLocked(vector_id);
-        self.invalidateLocalMetadataCacheLocked(vector_id);
+        if (self.metadata_clock_keys.len == 0) return error.CacheDisabled;
+        try self.metadata_cache.ensureUnusedCapacity(self.alloc, 1);
+        try self.metadata_cache_slots.ensureUnusedCapacity(self.alloc, 1);
         const copied = try self.alloc.dupe(u8, metadata);
         errdefer self.alloc.free(copied);
         const entry = try self.alloc.create(MetadataCacheEntry);
         errdefer self.alloc.destroy(entry);
         entry.* = .{ .metadata = copied };
-        errdefer releaseMetadataCacheEntry(self.alloc, entry);
-        try self.metadata_cache.put(self.alloc, vector_id, entry);
+        const reserved_slot = self.ensureLocalMetadataCacheCapacityLocked(vector_id);
+        self.invalidateLocalMetadataCacheLocked(vector_id);
         const slot = reserved_slot orelse claimLocalClockSlot(self.metadata_clock_keys, self.metadata_clock_hand, vector_id) orelse return error.CacheDisabled;
+        self.metadata_cache.putAssumeCapacity(vector_id, entry);
         self.metadata_clock_refs[slot] = true;
-        try self.metadata_cache_slots.put(self.alloc, vector_id, slot);
+        self.metadata_cache_slots.putAssumeCapacity(vector_id, slot);
     }
 
     fn clearNodeCache(self: *HBCIndex) void {
@@ -13463,6 +13471,7 @@ pub const HBCIndex = struct {
                 try cache.cacheNode(self.cache_namespace, node);
             return;
         }
+        if (self.config.max_cached_nodes == 0) return;
         const cloned = try node.clone(self.alloc);
         errdefer {
             var owned = cloned;
@@ -13530,6 +13539,7 @@ pub const HBCIndex = struct {
                 try cache.cacheQuantized(self.cache_namespace, node_id, qs);
             return;
         }
+        if (self.config.max_cached_nodes == 0) return;
         var cloned = try qs.clone(self.alloc);
         errdefer cloned.deinit(self.alloc);
         self.cache_mu.lockExclusive();
@@ -13570,6 +13580,8 @@ pub const HBCIndex = struct {
             try cache.cacheQuantizedOwned(self.cache_namespace, node_id, qs);
             return;
         }
+        var owned = qs;
+        errdefer owned.deinit(self.alloc);
         self.cache_mu.lockExclusive();
         defer self.cache_mu.unlockExclusive();
         var admission = self.prepareHbcCacheAdmission(.quantized, node_id, estimateQuantizedCacheBytes(&qs)) orelse HbcCacheAdmission.none(self);
@@ -13687,6 +13699,7 @@ pub const HBCIndex = struct {
         precharged: bool,
         inserted_out: ?*bool,
     ) ![]const f32 {
+        if (self.config.max_cached_vectors == 0) return vector_data;
         const stripe = vectorCacheFillStripe(vector_id);
         const epoch = &self.vector_cache_fill_epochs[stripe];
         if (self.shared_cache) |cache| {
@@ -27871,6 +27884,149 @@ test "hilbert split produces balanced clusters" {
     try std.testing.expectEqual(@as(usize, 3), hits.len);
     for (hits) |hit| {
         try std.testing.expect(hit.vector_id <= 3);
+    }
+}
+
+test "hbc local cache admission has one owner across allocation failures" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2, .max_cached_vectors = 4, .max_cached_metadata = 4, .max_cached_nodes = 4 });
+    defer idx.close();
+    const Attempt = struct {
+        const Kind = enum { node, quantized, vector, metadata };
+        fn run(index: *HBCIndex, kind: Kind) !void {
+            switch (kind) {
+                .vector => _ = try index.cacheVectorLocalLocked(17, &.{ 1, 2 }),
+                .metadata => try index.cacheMetadataLocalLocked(17, "member"),
+                .node => {
+                    var node: Node = .{ .id = 17, .is_leaf = true, .level = 0, .parent = 0, .centroid = try index.alloc.dupe(f32, &.{ 1, 2 }), .children = &.{}, .members = &.{} };
+                    errdefer node.deinit(index.alloc);
+                    try index.cacheNodeLocalLocked(node);
+                },
+                .quantized => {
+                    var qs: QuantizedSet = .{ .nonquant = .{ .vectors = .{ .dims = 2, .count = 1, .data = try index.alloc.dupe(f32, &.{ 1, 2 }) } } };
+                    errdefer qs.deinit(index.alloc);
+                    try index.cacheQuantizedLocalLocked(17, qs);
+                },
+            }
+        }
+    };
+    for (std.enums.values(Attempt.Kind)) |kind| {
+        var passed = false;
+        var failures: usize = 0;
+        for (0..12) |fail_index| {
+            idx.clearNodeCache();
+            idx.clearQuantizedCache();
+            idx.clearVectorCache();
+            idx.clearMetadataCache();
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+            idx.alloc = failing.allocator();
+            const result = Attempt.run(&idx, kind);
+            idx.alloc = alloc;
+            if (result) |_| {
+                passed = true;
+                break;
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failures += 1;
+                try std.testing.expectEqual(@as(u32, 0), idx.node_cache.count());
+                try std.testing.expectEqual(@as(u32, 0), idx.quantized_cache.count());
+                try std.testing.expectEqual(@as(u32, 0), idx.vector_cache.count());
+                try std.testing.expectEqual(@as(u32, 0), idx.metadata_cache.count());
+                try std.testing.expectEqual(@as(u32, 0), idx.node_cache_slots.count());
+                try std.testing.expectEqual(@as(u32, 0), idx.quantized_cache_slots.count());
+                try std.testing.expectEqual(@as(u32, 0), idx.vector_cache_slots.count());
+                try std.testing.expectEqual(@as(u32, 0), idx.metadata_cache_slots.count());
+            }
+        }
+        try std.testing.expect(passed and failures > 0);
+    }
+}
+
+test "hbc reused delete vectors preserve eager payloads bounds and reopen" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        calls: usize = 0,
+        fn vector(id: u64) [4]f32 {
+            const n: f32 = @floatFromInt(id);
+            return .{ n, 1, @floatFromInt(id % 7), @floatFromInt(id % 3) };
+        }
+        fn load(ctx: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return a.dupe(f32, &vector(id));
+        }
+    };
+    for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
+        for ([_]usize{ 4, 32 }) |count| {
+            var control_path: TestPath = .{};
+            const cpath = control_path.init();
+            defer control_path.cleanup();
+            var candidate_path: TestPath = .{};
+            const tpath = candidate_path.init();
+            defer candidate_path.cleanup();
+            const config: HBCConfig = .{ .dims = 4, .metric = metric, .leaf_size = 8, .use_quantization = true, .max_cached_vectors = 0 };
+            var c_loader = Loader{};
+            var t_loader = Loader{};
+            {
+                var control = try HBCIndex.open(alloc, cpath, config);
+                defer control.close();
+                var candidate = try HBCIndex.open(alloc, tpath, config);
+                defer candidate.close();
+                control.setExternalVectorLoader(&c_loader, Loader.load);
+                candidate.setExternalVectorLoader(&t_loader, Loader.load);
+                for (1..count + 1) |id| {
+                    const v = Loader.vector(id);
+                    const item = [_]BatchInsertItem{.{ .vector_id = id, .vector = &v, .metadata = "member" }};
+                    try control.batchInsertWithMetadataOptions(&item, .{ .skip_vector_store = true });
+                    try candidate.batchInsertWithMetadataOptions(&item, .{ .skip_vector_store = true });
+                }
+                c_loader.calls = 0;
+                t_loader.calls = 0;
+                try control.batchApplyOptions(&.{}, &.{ 1, 3 }, .{});
+                try candidate.batchApplyOptions(&.{}, &.{ 1, 3 }, .{ .reuse_delete_vectors = true });
+                try std.testing.expect(t_loader.calls > 0);
+                try std.testing.expect(t_loader.calls < c_loader.calls);
+                // Single-item dispatch must also carry the reuse option.
+                try control.batchApplyOptions(&.{}, &.{2}, .{});
+                try candidate.batchApplyOptions(&.{}, &.{2}, .{ .reuse_delete_vectors = true });
+                try std.testing.expectEqual(control.metadata.active_count, candidate.metadata.active_count);
+                try std.testing.expectError(error.NotFound, control.batchApplyOptions(&.{}, &.{2}, .{}));
+                try std.testing.expectError(error.NotFound, candidate.batchApplyOptions(&.{}, &.{2}, .{ .reuse_delete_vectors = true }));
+            }
+            var control = try HBCIndex.open(alloc, cpath, config);
+            defer control.close();
+            var candidate = try HBCIndex.open(alloc, tpath, config);
+            defer candidate.close();
+            control.setExternalVectorLoader(&c_loader, Loader.load);
+            candidate.setExternalVectorLoader(&t_loader, Loader.load);
+            var c_txn = try control.beginReadTxn();
+            defer c_txn.abort();
+            var t_txn = try candidate.beginReadTxn();
+            defer t_txn.abort();
+            for (4..count + 1) |id| {
+                const c_leaf_id = try control.getVecLeaf(&c_txn, id);
+                try std.testing.expectEqual(c_leaf_id, try candidate.getVecLeaf(&t_txn, id));
+                var c_leaf = try control.loadNode(&c_txn, c_leaf_id);
+                defer c_leaf.deinit(alloc);
+                var t_leaf = try candidate.loadNode(&t_txn, c_leaf_id);
+                defer t_leaf.deinit(alloc);
+                try std.testing.expectEqualSlices(u64, c_leaf.members, t_leaf.members);
+                try std.testing.expectEqualSlices(f32, c_leaf.centroid, t_leaf.centroid);
+                try std.testing.expectEqual(@as(u32, @bitCast(c_leaf.covering_radius)), @as(u32, @bitCast(t_leaf.covering_radius)));
+                try std.testing.expectEqualDeep(c_leaf.posting_state, t_leaf.posting_state);
+            }
+            for ([_]u64{ 1, 4, 17 }) |id| {
+                const query = Loader.vector(id);
+                var c_result = try control.search(&query, 8);
+                defer c_result.deinit();
+                var t_result = try candidate.search(&query, 8);
+                defer t_result.deinit();
+                try std.testing.expectEqualDeep(c_result.getHits(), t_result.getHits());
+            }
+        }
     }
 }
 

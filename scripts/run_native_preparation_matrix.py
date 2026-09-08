@@ -60,7 +60,12 @@ def main():
             # pruning from the pre-existing balanced physical subgroup layout.
             if name == "staged_rebase":
                 command += ["--common-refinement", "staged_readers"]
-            if name == "deferred_capture":
+            if name in (
+                "deferred_capture",
+                "coalesced_deletes",
+                "reused_delete_vectors",
+                "dense_delete_plan",
+            ):
                 command += ["--common-refinement", "staged_readers", "--capture-stages"]
             if name == "certified_subgroups":
                 command += ["--common-refinement", "subgroups_4"]

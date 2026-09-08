@@ -9445,3 +9445,68 @@ configuration clears the projection loader when neither retention nor subgroup
 training is enabled. No redundant fix was made there. Remaining capture work
 includes mutation/application and intentional session reuse; the delayed-begin
 experiment only removes initial read-only preparation from that interval.
+
+#### Dense replay delete planning and single-read eager leaf refresh (2026-09-08)
+
+The deferred-capture matrix stopped in its first 50K control during the official
+cold-restart client: `httpx.ConnectError: [Errno 49] Can't assign requested address`.
+The server had reopened and no matching crash/quarantine was found. This is an
+unqualified arm, not a product or performance pass. Its data/logs remain under
+`.benchmark-results/pr593-deferred-capture-ab-20260908/deferred_capture/`.
+No candidate or 1M result was produced by that matrix.
+
+The more substantial target is capture-held **apply**, not journal collection.
+On a separate resumed 50K diagnostic, 800 updates took approximately 608–642 ms
+in apply while HBC insertion itself took only 28–29 ms. Collection took roughly
+0.3–1.4 ms in the original control. The diagnostic lives under
+`.benchmark-results/pr593-apply-attribution-20260908/`; its initial relative-path
+invocation failed result discovery, so it is not a fresh qualification result.
+The absolute-path `-apply`, `-sample`, and `-earlysample` diagnostic resumes
+completed. These repeatedly mutate one corpus and are attribution, not paired
+readiness/recall/QPS evidence.
+
+A five-second live sample, `/private/tmp/pr593-dense-apply-early-sample-20260908.txt`,
+recorded 2,936 samples below async derived apply. Of these, 1,694 were in the
+replacement-delete call and 945 in the subsequent overwritten-document delete
+call (about 90% combined). The first included 1,167 samples in eager centroid
+recomputation and 394 in leaf save/payload rebuilding. The second included 735
+samples in batch deletion, almost entirely its missing-mapping full-tree fallback.
+These are sampled stack observations, not independently additive timers.
+
+Two independent default-off treatments now target that work:
+
+- `ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES`: build one ordered union of permitted
+  replay deletes, per-index embedding replacements, and non-chunk parent
+  overwrites. Deduplicate before any mutation, retaining the existing chunk
+  ownership exclusions. One source capture still owns the entire operation.
+- `ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS`: eager batch deletion loads each
+  surviving leaf's authoritative transformed vectors once, then uses the same
+  leaf-scoped matrix for centroid/radius and the existing payload refresh.
+  Member ordering, arithmetic, dirty versions, quantization, and exact completion
+  remain unchanged. Lazy/deferred refreshes, empty leaves, and nonquantized
+  indexes retain their old paths. The matrix is reported as apply workspace and
+  released before the next leaf; no cross-revision vector cache is introduced.
+
+The zero-vector-cache test also exposed an existing local-cache ownership bug:
+fallible admission could publish an entry, free it through overlapping error
+handlers, and leave the cache pointing at freed memory. Local node, quantized,
+vector and metadata admission now reserves both maps and allocates ownership
+before publication; the two map inserts cannot allocate. Payload ownership
+transfers only on success. Disabled local vector caching declines admission.
+
+Seven focused Debug tests passed without leaks, including allocation-failure
+sweeps for all four local caches, randomized tree churn, existing deferred
+quantization, and delete-refresh parity across L2/cosine/inner-product with root
+and split-leaf payloads. The parity test verifies fewer authoritative loader
+calls, single-delete error behavior, and identical membership, centroid bits,
+radius bits, posting versions and query results after reopen. Seven Python
+experiment tests passed. The runner supports each treatment independently and
+`dense_delete_plan` together, with equal stage instrumentation in both arms and
+nonzero work-reduction evidence required.
+
+No performance default is promoted. This reduces work inside the capture; it
+does **not** implement private off-writer HBC mutation, bounded reader rebase, or
+reusable physical checkpoint chunks. Same-vector replacement elision is also
+intentionally excluded: the latest primary artifact is not proof of the vector
+revision represented by the existing HBC payload. Matched public batch-100
+50K/1M and mixed-workload results remain required before promotion.

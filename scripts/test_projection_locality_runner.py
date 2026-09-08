@@ -71,6 +71,8 @@ class QualificationRunnerTest(unittest.TestCase):
                 "dense posting checkpoint published generation=2 kind=full\n"
                 f"dense replay collection token=7 sequence=12 records=4 applied_windows=1 deferred_capture={str(deferred).lower()} capture_before_collection={str(not deferred).lower()} collect_ns=30 apply_ns=60\n"
                 "dense replay capture finish token=7 sequence=12 success=true applied_sequence_persisted=true\n"
+                "dense replay delete plan sequence=12 requested=8 unique=4\n"
+                "dense delete apply index=vector keys=4 vectors=4 reused_rows=120\n"
             )
             (arm / "qualification-summary.json").write_text(
                 json.dumps(
@@ -414,6 +416,11 @@ class QualificationRunnerTest(unittest.TestCase):
                     env["ANTFLY_EXPERIMENT_POSTING_LOCAL_PROJECTIONS"], "0"
                 )
                 self.assertEqual(receipt["refinement"], name)
+                if name in (
+                    "coalesced_deletes", "reused_delete_vectors", "dense_delete_plan"
+                ):
+                    self.assertEqual(env["ANTFLY_BENCH_BATCH_PROFILE"], "1")
+                    self.assertEqual(env["ANTFLY_BENCH_HBC_WRITE_PROFILE"], "1")
                 for key in posting_runner.ALL_REFINEMENT_FLAGS:
                     if key in controls:
                         self.assertEqual(

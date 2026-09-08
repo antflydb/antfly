@@ -7055,6 +7055,48 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
     try batchDeleteTxnOptions(self, txn, vector_ids, .{});
 }
 
+/// Eager deletion used to load every surviving vector twice: once for the
+/// centroid/radius and again for the scoring payload. Keep one leaf-scoped
+/// matrix, preserving the exact arithmetic, member order and dirty versions.
+/// Lazy/deferred policies deliberately retain their existing lifecycle.
+fn tryRefreshDeletedLeaf(self: anytype, txn: anytype, leaf: *types.Node, options: hbc_runtime.BatchInsertOptions) !bool {
+    if (!options.reuse_delete_vectors or !self.config.use_quantization or
+        self.config.lazy_posting_maintenance or options.defer_quantized_rebuild or
+        options.suppress_quantized_payload_persist or leaf.members.len == 0) return false;
+
+    const matrix_len = try std.math.mul(usize, leaf.members.len, self.config.dims);
+    const matrix_bytes = try std.math.mul(usize, matrix_len, @sizeOf(f32));
+    const matrix = try self.alloc.alloc(f32, matrix_len);
+    addApplyWorkspaceBytes(self, @intCast(matrix_bytes));
+    defer {
+        releaseApplyWorkspaceBytes(self, @intCast(matrix_bytes));
+        self.alloc.free(matrix);
+    }
+    // Do not use pending insert vectors: this is the surviving membership of
+    // the delete phase, before the insertion phase of a mixed batch.
+    try posting.PostingStore.loadTransformedVectorsForQuantizedRefresh(self, txn, leaf, matrix, .{});
+    try posting.PostingStore.recomputeCentroidFromTransformedVectors(self, leaf, matrix);
+
+    const start = nowNsU64Fixed();
+    defer {
+        self.write_profile.save_node_ns += elapsedSinceU64Fixed(start);
+        self.write_profile.save_node_calls += 1;
+    }
+    try savePackedNodeValue(self, txn, leaf);
+    const quant_start = nowNsU64Fixed();
+    try posting.PostingStore.refreshQuantizedPayload(self, txn, leaf, matrix, nowNsU64Fixed, elapsedSinceU64Fixed);
+    if (usesNonQuantizedPayload(leaf)) noteSplitWorkspaceLeafPayloadCoverage(self, leaf.members);
+    self.write_profile.refresh_quantized_ns += elapsedSinceU64Fixed(quant_start);
+    posting.PostingStore.notePayloadRefreshed(leaf);
+    try posting.PostingStore.saveState(self, txn, leaf.id, leaf.posting_state);
+    try self.cacheNode(leaf);
+    const range_start = nowNsU64Fixed();
+    try saveNodeSplitRange(self, txn, leaf, isNotFoundGeneric);
+    self.write_profile.save_split_range_ns += elapsedSinceU64Fixed(range_start);
+    self.write_profile.delete_reused_vector_rows += @intCast(leaf.members.len);
+    return true;
+}
+
 fn batchDeleteTxnOptions(self: anytype, txn: anytype, vector_ids: []const u64, options: hbc_runtime.BatchInsertOptions) !void {
     try self.bindTxnLike(txn);
     if (vector_ids.len == 0) return;
@@ -7108,7 +7150,10 @@ fn batchDeleteTxnOptions(self: anytype, txn: anytype, vector_ids: []const u64, o
             continue;
         }
 
-        if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
+        const leaf_refreshed = try tryRefreshDeletedLeaf(self, txn, &leaf, options);
+        if (leaf_refreshed) {
+            // Centroid, bounds, payload and state were saved together above.
+        } else if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
             self.write_profile.posting_lazy_centroid_deferrals += 1;
         } else if (leaf.members.len > 0) {
             try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
@@ -7137,7 +7182,7 @@ fn batchDeleteTxnOptions(self: anytype, txn: anytype, vector_ids: []const u64, o
                     try deleteNode(self, txn, leaf_id);
                 }
             }
-        } else {
+        } else if (!leaf_refreshed) {
             try self.saveNodeWithOptions(txn, &leaf, options);
         }
 
@@ -7505,7 +7550,10 @@ fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_ru
     try posting.PostingStore.removeMember(self.alloc, &leaf, vector_id);
     leaf.covering_radius = if (leaf.members.len == 0) 0 else std.math.nan(f32);
 
-    if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
+    const leaf_refreshed = try tryRefreshDeletedLeaf(self, txn, &leaf, options);
+    if (leaf_refreshed) {
+        // Centroid, bounds, payload and state were saved together above.
+    } else if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
     } else if (leaf.members.len > 0) {
         try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
@@ -7536,7 +7584,7 @@ fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_ru
             try deleteNode(self, txn, leaf_id);
         }
     } else {
-        try self.saveNodeWithOptions(txn, &leaf, options);
+        if (!leaf_refreshed) try self.saveNodeWithOptions(txn, &leaf, options);
 
         if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) skip_merge: {
             var parent = loadNode(self, txn, leaf.parent) catch |err| {
@@ -8931,7 +8979,7 @@ pub fn batchApplyOptions(
 ) !void {
     if (writes.len == 0 and deletes.len == 0) return;
     if (writes.len == 0) {
-        if (deletes.len == 1 and !options.defer_quantized_rebuild) return self.delete(deletes[0]);
+        if (deletes.len == 1 and !options.defer_quantized_rebuild and !options.reuse_delete_vectors) return self.delete(deletes[0]);
 
         const Index = comptime childType(@TypeOf(self));
         const publishing = try beginPublishSearchStateIfSupported(self);
@@ -8942,7 +8990,13 @@ pub fn batchApplyOptions(
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
         errdefer abortVectorCacheMutationsIfSupported(self);
-        try batchDeleteTxnOptions(self, &batch, deletes, options);
+        if (deletes.len == 1 and !options.defer_quantized_rebuild) {
+            // Preserve the eager single-delete NotFound contract when the
+            // reuse option prevents dispatch through self.delete above.
+            try deleteTxnOptions(self, &batch, deletes[0], options);
+        } else {
+            try batchDeleteTxnOptions(self, &batch, deletes, options);
+        }
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
         try markPublishSearchStateCommittingIfSupported(self, publishing);

@@ -331,6 +331,12 @@ def main():
                     arm_environment[key] = "1"
                 if args.capture_stages:
                     arm_environment["ANTFLY_EXPERIMENT_CAPTURE_STAGES"] = "1"
+                if args.refinement in (
+                    "coalesced_deletes", "reused_delete_vectors", "dense_delete_plan"
+                ):
+                    # Identical stage instrumentation in control and treatment.
+                    arm_environment["ANTFLY_BENCH_BATCH_PROFILE"] = "1"
+                    arm_environment["ANTFLY_BENCH_HBC_WRITE_PROFILE"] = "1"
                 arm = root / f"{case}-{pair + 1}-{mode}"
                 command = [
                     str(harness),
