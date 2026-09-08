@@ -36,10 +36,19 @@ from conftest import (
     InferenceGeneratorServer,
     InferenceRerankerServer,
     StandaloneAntflyServer,
+    defer_module_tempdir_cleanup,
     resolve_binary_path,
 )
 from helpers import wait_until
 from port_reservations import find_free_port
+
+
+# enrichment_runtime.zig permits six worker attempts, each containing six
+# provider attempts. Inline sleeps total 7.75s per worker attempt; the five
+# worker backoffs total 15.5s. Exhaustion therefore needs 62s of scheduled
+# backoff alone, plus HTTP/storage work and scheduling. Keep this finite
+# allowance aligned with that policy instead of relying on no-op retry sleeps.
+TRANSIENT_EMBEDDING_SETTLE_TIMEOUT_S = 90.0
 
 
 class TinyImageServer:
@@ -108,7 +117,7 @@ def cli_media_server():
 
 
 @pytest.fixture(scope="module")
-def cli_server(cli_inference_servers):
+def cli_server(cli_inference_servers, request):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"antfly binary not found: {binary}")
@@ -117,7 +126,10 @@ def cli_server(cli_inference_servers):
     server = StandaloneAntflyServer(binary, "127.0.0.1", port)
     server.cli_inference_urls = cli_inference_servers
     yield server
-    server.stop()
+    # Stop processes now, but wait for the final teardown report before deciding
+    # whether this module's runtime directory should be retained for diagnostics.
+    defer_module_tempdir_cleanup(request.node, server.tempdir)
+    server.stop(cleanup_root=False)
 
 
 @pytest.fixture(scope="module")
@@ -724,12 +736,23 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                 return status
             return None
 
+        retry_started = time.monotonic()
         settled_failure = wait_until(
-            isolated_failure_is_settled, timeout_s=30.0, interval_s=0.05
+            isolated_failure_is_settled,
+            timeout_s=TRANSIENT_EMBEDDING_SETTLE_TIMEOUT_S,
+            interval_s=0.05,
         )
-        assert settled_failure is not None, cli(
-            "index", "get", "--table", table, "--index", "thumbnail"
-        ).stdout
+        retry_elapsed = time.monotonic() - retry_started
+        retry_requests = embedder_server.transient_embedding_requests
+        assert settled_failure is not None, (
+            f"ClipClap failure did not settle after {retry_elapsed:.2f}s; "
+            f"provider_requests={retry_requests}\n"
+            + cli("index", "get", "--table", table, "--index", "thumbnail").stdout
+        )
+        print(
+            f"ClipClap retries settled after {retry_elapsed:.2f}s "
+            f"({retry_requests} provider requests)"
+        )
         embedder_server.release_transient_embedding_failures()
         assert embedder_server.transient_embedding_requests > 1
         assert settled_failure["enrichment_runtime"]["worker_failed"] is False

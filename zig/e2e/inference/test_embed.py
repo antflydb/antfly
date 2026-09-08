@@ -267,6 +267,7 @@ def test_clipclap_image_embedding_golden_contract(tmp_path):
                 str(model_dir),
                 "--backend",
                 "native",
+                "--print-timing",
                 "--image",
                 str(image_path),
             ],
@@ -275,13 +276,11 @@ def test_clipclap_image_embedding_golden_contract(tmp_path):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        combined = [*result.stdout.splitlines(), *result.stderr.splitlines()]
-        response_line = next(
-            line
-            for line in reversed(combined)
-            if line.startswith("{") and '"embeddings"' in line
-        )
-        return json.loads(response_line)["embeddings"][0]
+        # stdout is a single machine-readable result; diagnostics stay on stderr.
+        response = json.loads(result.stdout)
+        assert "timing_ms:" in result.stderr
+        assert '"embeddings":' not in result.stderr
+        return response["embeddings"][0]
 
     first = run_embedding()
     second = run_embedding()
