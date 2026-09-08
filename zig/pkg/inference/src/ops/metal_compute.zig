@@ -727,6 +727,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         metal_tensor: ?MetalTensor = null,
         lazy_multiply: ?LazyMultiply = null,
         lazy_entry: ?*gpu_hosted_store_mod.LazyWeightEntry = null,
+        // Source metadata is useful even when the dense cache owns the pin.
+        owns_lazy_pin: bool = false,
         quantized_storage: ?*const QuantizedStorage = null,
         runtime_quantized_storage: ?*const QuantizedStorage = null,
         owned_quantized_storage: ?*QuantizedStorage = null,
@@ -3547,6 +3549,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .shared_data_refcount = shared_data_refcount,
             .logical_shape = logical_shape,
             .lazy_entry = lazy_entry,
+            .owns_lazy_pin = lazy_entry != null,
             .quantized_storage = quantized_storage,
             .runtime_quantized_storage = runtime_quantized_storage,
             .native_dense_bytes = null,
@@ -3598,8 +3601,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const shape = try self.allocator.dupe(i64, cached.logical_shape);
         errdefer self.allocator.free(shape);
         // The dense cache owns the source pin and native bytes, not each view.
-        const tensor = try self.makeWeightBuf(cached.data, false, shape, null, null, cached.runtime_quantized_storage);
+        const tensor = try self.makeWeightBuf(cached.data, false, shape, cached.lazy_entry, null, cached.runtime_quantized_storage);
         const buf = toBuf(tensor);
+        buf.owns_lazy_pin = false;
         buf.native_dense_bytes = cached.native_dense_bytes;
         buf.native_dense_dtype = cached.native_dense_dtype;
         buf.native_dense_mmap_source_bytes = cached.native_dense_mmap_source_bytes;
@@ -6366,7 +6370,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.allocator.free(name);
             buf.weight_handle_name = null;
         }
-        if (buf.lazy_entry) |entry| {
+        if (buf.owns_lazy_pin) {
+            const entry = buf.lazy_entry.?;
             const self: *MetalCompute = @ptrCast(@alignCast(ctx));
             self.data.prefetch.lock();
             defer self.data.prefetch.unlock();
@@ -21249,6 +21254,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn getWeightOp(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        return lookupWeight(ctx, name, true);
+    }
+
+    fn acquireWeightOp(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        return lookupWeight(ctx, name, false);
+    }
+
+    fn lookupWeight(ctx: *anyopaque, name: []const u8, shared: bool) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
 
         var name_buf: [1024]u8 = undefined;
@@ -21265,6 +21278,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             break :blk name_buf[0..written.len :0];
         };
         const full_name = name_z[0..name_z.len];
+
+        if (!shared) return self.loadWeight(name, full_name);
 
         if (self.weight_handles.get(full_name)) |tensor| {
             toBuf(tensor).weight_handle_refs += 1;
@@ -28380,6 +28395,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.reserveGraphPlanSlots = reserveGraphPlanSlotsOp;
         vt.freeTensor = freeOp;
         vt.getWeight = getWeightOp;
+        vt.acquireWeight = acquireWeightOp;
         vt.prefetchWeightHint = prefetchWeightHintOp;
         vt.drainPrefetchBudget = drainPrefetchBudgetOp;
         vt.fromFloat32 = fromFloat32Op;
@@ -35162,6 +35178,12 @@ fn testMetalWeightHandleLifetime(allocator: std.mem.Allocator, quantized: bool) 
     var compute = MetalCompute{ .allocator = allocator, .data = &store, .provider_impl = undefined };
     defer compute.deinitWeightCaches();
     const first = try MetalCompute.getWeightOp(&compute, "weight");
+    {
+        const acquired = try MetalCompute.acquireWeightOp(&compute, "weight");
+        defer MetalCompute.freeOp(&compute, acquired);
+        try std.testing.expect(first != acquired);
+        try std.testing.expectEqual(@as(usize, if (quantized) 2 else 1), entry.pin_count);
+    }
     const alias = if (!quantized) try compute.aliasHostBufferWithShape(first, &.{4}) else null;
     defer if (alias) |view| MetalCompute.freeOp(&compute, view);
     var peer: ?CT = null;
@@ -35202,6 +35224,7 @@ test "metal_compute: weight handle lifetime bounds materializations and lazy pin
 }
 
 test "metal_compute: weight handle lifetime unwinds allocation failures" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{false});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{true});
 }
@@ -35231,6 +35254,54 @@ test "metal_compute: dense cache owns native bytes independently of weight handl
     const values = try MetalCompute.toFloat32Op(&compute, second, allocator);
     defer allocator.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 1, -2.5 }, values);
+}
+
+test "metal_compute: acquired dense weights preserve host fallback and cache pin ownership" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var bytes = [_]u8{ 0x80, 0x3f, 0, 0, 0, 0, 0x80, 0x3f };
+    var shape = [_]i64{ 2, 2 };
+    var store = testMetalWeightStoreInit(allocator);
+    store.prefetch = gpu_hosted_store_mod.PrefetchQueue.init(allocator, &store, gpu_hosted_store_mod.simplePrefetchProcess);
+    defer store.prefetch.deinit();
+    defer store.lazy_weights.deinit(allocator);
+    try store.lazy_weights.put(allocator, "weight", .{
+        .tensor_ref = .{ .name = "weight" },
+        .host_loaded = .{ .tensor = .{
+            .data = &bytes,
+            .shape = &shape,
+            .dtype = .bf16,
+            .name = "weight",
+            .allocator = allocator,
+            .owns_data = false,
+            .owns_shape = false,
+        } },
+    });
+    var provider: MetalCompute.ProviderImpl = undefined;
+    provider.raw_decode_runtime = null;
+    var compute = MetalCompute{ .allocator = allocator, .data = &store, .provider_impl = &provider };
+    defer compute.deinitWeightCaches();
+    const cb = compute.computeBackend();
+    const first = try cb.getWeight("weight");
+    const second = try cb.acquireWeight("weight");
+    defer cb.free(second);
+    const third = try cb.acquireWeight("weight");
+    defer cb.free(third);
+    try std.testing.expect(first != second and second != third and first != third);
+    const entry = store.lazy_weights.getPtr("weight").?;
+    try std.testing.expectEqual(@as(usize, 1), entry.pin_count);
+    try std.testing.expectEqual(entry, MetalCompute.toBuf(second).lazy_entry.?);
+    try std.testing.expect(!MetalCompute.toBuf(second).owns_lazy_pin);
+    try std.testing.expectEqual(MetalCompute.toBuf(first).native_dense_bytes.?.ptr, MetalCompute.toBuf(second).native_dense_bytes.?.ptr);
+    cb.free(first);
+    try std.testing.expectEqual(@as(usize, 1), entry.pin_count);
+    const input = try cb.fromFloat32(&.{ 3, 4 });
+    defer cb.free(input);
+    const output = try MetalCompute.linearNoBiasOpWithPlannedDispatch(&compute, input, second, 1, 2, 2, null);
+    defer cb.free(output);
+    const actual = try cb.toFloat32(output, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, actual);
 }
 
 test "metal_compute: toFloat32 materializes zero-copy bf16 weights" {

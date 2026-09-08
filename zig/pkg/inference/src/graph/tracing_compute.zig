@@ -191,6 +191,7 @@ pub const TracingCompute = struct {
         .deinitBackend = &deinitBackend,
         .freeTensor = &freeTensor,
         .getWeight = &getWeight,
+        .acquireWeight = &getWeight,
         .prefetchWeightHint = &prefetchWeightHint,
         .drainPrefetchBudget = &drainPrefetchBudget,
         .embeddingLookup = &embeddingLookup,

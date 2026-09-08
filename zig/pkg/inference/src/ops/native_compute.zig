@@ -4397,6 +4397,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .freeTensor = &freeTensor,
     .getIo = &getIo,
     .getWeight = &getWeight,
+    .acquireWeight = &acquireWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .embeddingLookup = &embeddingLookup,
@@ -4783,6 +4784,13 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     toBuf(tensor).weight_handle_refs = 1;
     self.weight_handles.putAssumeCapacityNoClobber(owned_name, tensor);
     return tensor;
+}
+
+fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const stable_name = self.data.resident_weights.getKey(name) orelse
+        self.data.lazy_weights.getKey(name) orelse name;
+    return loadWeight(self, stable_name);
 }
 
 fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
@@ -34701,7 +34709,8 @@ fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.relu(output);
-    const result = try self.makeBuf(output, true);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(ctx, result);
     return propagateLogicalShapeLike(self, result, input);
 }
 
@@ -46053,6 +46062,17 @@ fn testWeightHandleLifetime(allocator: std.mem.Allocator, lazy: bool) !void {
         defer store.prefetch.deinit();
         defer deinitBackend(compute);
         const first = try getWeight(compute, "weight");
+        {
+            const owned = try acquireWeight(compute, "weight");
+            defer freeTensor(compute, owned);
+            const other = try acquireWeight(compute, "weight");
+            defer freeTensor(compute, other);
+            try std.testing.expect(first != owned and owned != other and first != other);
+            try std.testing.expectEqualSlices(f32, getData(first), getData(owned));
+            if (lazy) try std.testing.expectEqual(@as(usize, 3), store.lazy_weights.get("weight").?.pin_count);
+            try std.testing.expectEqual(@as(usize, 3), compute.weight_reservations.get("weight").?.count);
+            try std.testing.expectEqual(@as(?CT, null), try unaryConsumeOp(compute, .relu, owned));
+        }
         const alias = if (!lazy) try aliasDenseBufWithShape(compute, first, &.{4}) else null;
         defer if (alias) |view| freeTensor(compute, view);
         for (0..1000) |_| try std.testing.expectEqual(first, try getWeight(compute, "weight"));

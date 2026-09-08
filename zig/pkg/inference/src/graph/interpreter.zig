@@ -855,6 +855,20 @@ pub fn execute(
     //    the cached weight handle for future executions. Detect this by
     //    comparing output CT pointers against runtime input CTs.
     const outputs = try allocator.alloc(CT, graph.outputs.items.len);
+    errdefer allocator.free(outputs);
+    var output_count: usize = 0;
+    errdefer for (outputs[0..output_count]) |output| {
+        // The values cleanup owns ordinary outputs; only detached runtime-input
+        // copies need separate cleanup if assembling later outputs fails.
+        var in_values = false;
+        for (values) |value| {
+            if (value == output) {
+                in_values = true;
+                break;
+            }
+        }
+        if (!in_values) cb.free(output);
+    };
     for (graph.outputs.items, 0..) |out_id, idx| {
         const ct = values[out_id] orelse return error.MissingRuntimeInput;
         // Check if this output CT pointer aliases any non-donated runtime input.
@@ -876,10 +890,11 @@ pub fn execute(
         } else {
             outputs[idx] = ct;
         }
+        output_count += 1;
     }
 
-    // 7. Free remaining parameter handles. getWeight() allocates a new
-    //    handle each call (e.g. native buffer); the underlying weight data is
+    // 7. Free remaining parameter handles. acquireWeight() returns a distinct
+    //    caller-owned handle each call; the underlying weight data may be
     //    borrowed, but the handle itself must be freed. Skip outputs
     //    (caller owns them) and runtime inputs (caller owns them).
     //
@@ -952,6 +967,14 @@ pub fn captureNodeValues(
     const values = try allocator.alloc(?CT, count);
     defer allocator.free(values);
     @memset(values, null);
+    // Captures are detached copies. All graph-owned values, including unused
+    // parameter handles and outputs, must be released on success and failure.
+    defer for (0..values.len) |i| {
+        const ct = values[i] orelse continue;
+        if (isBorrowedRuntimeValue(options, ct)) continue;
+        nullCtAliases(values, ct);
+        cb.free(ct);
+    };
 
     const shape_capture = if (options.cached_analysis) |ca| ca.runtime_shape_capture else try computeRuntimeShapeCaptureSet(allocator, graph);
     defer if (!have_cache) allocator.free(shape_capture);
@@ -1037,8 +1060,8 @@ pub fn captureNodeValues(
                             continue;
                         }
                     }
+                    nullCtAliases(values, ct);
                     cb.free(ct);
-                    values[input_id] = null;
                 }
             }
         }
@@ -2312,7 +2335,7 @@ pub fn executeNode(
         .parameter => |attrs| {
             const name = graph.parameterName(n);
             _ = attrs;
-            return cb.getWeight(name);
+            return cb.acquireWeight(name);
         },
 
         .constant => |attrs| {
@@ -4592,6 +4615,7 @@ const TestCompute = struct {
         .deinitBackend = &deinitBackend,
         .freeTensor = &freeTensor,
         .getWeight = &getWeight,
+        .acquireWeight = &getWeight,
         .prefetchWeightHint = &prefetchHint,
         .drainPrefetchBudget = &drainPrefetch,
         .embeddingLookup = &embeddingLookupOp,
@@ -5704,6 +5728,73 @@ test "native interpreter does not donate a reshape view before a future sibling 
     const original_data = try cb_val.toFloat32(x_ct, allocator);
     defer allocator.free(original_data);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, original_data);
+}
+
+fn testDuplicateWeightParameters(allocator: std.mem.Allocator, capture: bool) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const first = try builder.parameter("shared", Shape.init(.f32, &.{2}));
+    const second = try builder.parameter("shared", Shape.init(.f32, &.{2}));
+    const activated = try builder.relu(first);
+    try graph.markOutput(activated);
+    try graph.markOutput(second);
+    // Repeated output nodes own one handle, unlike repeated acquisitions.
+    try graph.markOutput(second);
+    var data = [_]f32{ 1, -2 };
+    var shape = [_]i64{2};
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.resident_weights.deinit(allocator);
+    try store.resident_weights.put(allocator, "shared", .{ .tensor = .{
+        .data = std.mem.sliceAsBytes(&data),
+        .shape = &shape,
+        .dtype = .f32,
+        .name = "shared",
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+    } });
+    var budget = @import("../runtime/tier/memory.zig").RunBudget.init(.{ .host_limit_bytes = 64 });
+    const compute = try allocator.create(NativeCompute);
+    compute.* = NativeCompute.init(allocator, &store, &budget);
+    defer store.prefetch.deinit();
+    const cb = compute.computeBackend();
+    defer cb.deinit();
+    // Graph acquisition must neither reuse nor release a borrowed eager handle.
+    const borrowed = try cb.getWeight("shared");
+    defer cb.free(borrowed);
+    if (capture) {
+        var result = try captureNodeValues(allocator, &graph, &cb, .{}, &.{ activated, second });
+        defer result.deinit(&cb);
+        const actual = try cb.toFloat32(result.values[1], allocator);
+        defer allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, &data, actual);
+    } else {
+        var result = try execute(allocator, &graph, &cb, .{});
+        defer result.deinit(&cb);
+        try std.testing.expect(result.outputs[1] != borrowed);
+        try std.testing.expectEqual(result.outputs[1], result.outputs[2]);
+        const actual = try cb.toFloat32(result.outputs[1], allocator);
+        defer allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, &data, actual);
+    }
+    try std.testing.expectEqual(@as(usize, 1), compute.weight_handles.count());
+    const actual = try cb.toFloat32(borrowed, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &data, actual);
+    try std.testing.expectEqual(@as(usize, 8), budget.host_weight_bytes);
+}
+
+test "native graph duplicate weight parameters preserve live siblings and borrowed handles" {
+    try testDuplicateWeightParameters(std.testing.allocator, false);
+    try testDuplicateWeightParameters(std.testing.allocator, true);
+}
+
+test "native graph weight acquisition unwinds allocation failures" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testDuplicateWeightParameters, .{false});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testDuplicateWeightParameters, .{true});
 }
 
 test "execute lowered graph through native backend" {
