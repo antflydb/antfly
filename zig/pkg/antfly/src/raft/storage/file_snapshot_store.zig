@@ -46,6 +46,7 @@ pub const SnapshotArtifactPolicy = struct {
 };
 
 pub const FileSnapshotStoreConfig = struct {
+    maintenance_io: ?std.Io = null,
     root_dir: []const u8,
     max_snapshot_bytes: usize = 1 << 30,
     max_chunk_bytes: usize = snapshot_transfer.max_chunk_bytes,
@@ -136,7 +137,7 @@ pub const FileSnapshotStore = struct {
         self.artifact_maintenance_future = null;
         if (maintenance_future != null) self.artifact_maintenance_event.set(io(self));
         self.artifact_maintenance_mutex.unlock();
-        if (maintenance_future) |*future| future.await(io(self));
+        if (maintenance_future) |*future| future.await(self.cfg.maintenance_io orelse io(self));
         var lease_keys = self.fetch_leases.keyIterator();
         while (lease_keys.next()) |key| self.alloc.free(key.*);
         self.fetch_leases.deinit(self.alloc);
@@ -926,7 +927,7 @@ pub const FileSnapshotStore = struct {
             return;
         }
         if (self.artifact_maintenance_future == null) {
-            self.artifact_maintenance_future = io(self).concurrent(
+            self.artifact_maintenance_future = (self.cfg.maintenance_io orelse io(self)).concurrent(
                 artifactMaintenanceMain,
                 .{self},
             ) catch |err| {

@@ -83,6 +83,9 @@ fn isRequestCancellation(err: anyerror) bool {
 }
 
 pub const StdHttpListenerConfig = struct {
+    /// Dedicated capabilities borrowed until stop; neither may share request capacity.
+    accept_io: ?std.Io = null,
+    observer_io: ?std.Io = null,
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
     kernel_backlog: u31 = 512,
@@ -209,6 +212,10 @@ pub const StdHttpListener = struct {
         self.* = undefined;
     }
 
+    fn acceptIo(self: *StdHttpListener) std.Io {
+        return self.cfg.accept_io orelse self.accept_io.?.io();
+    }
+
     pub fn start(self: *StdHttpListener) !void {
         return self.startWithControlLimit(.limited(1));
     }
@@ -221,13 +228,13 @@ pub const StdHttpListener = struct {
         if (self.server != null) return error.AlreadyListening;
         self.stopping.store(false, .release);
         self.stop_event = .unset;
-        self.accept_io = std.Io.Threaded.init(self.alloc, .{
+        if (self.cfg.accept_io == null) self.accept_io = std.Io.Threaded.init(self.alloc, .{
             .stack_size = self.cfg.thread_stack_size,
             .async_limit = .nothing,
             .concurrent_limit = limit,
         });
         errdefer {
-            self.accept_io.?.deinit();
+            if (self.accept_io) |*owned| owned.deinit();
             self.accept_io = null;
         }
 
@@ -238,6 +245,7 @@ pub const StdHttpListener = struct {
         else
             64;
         self.peer_observer = PeerObserver.init(self.alloc, observer_capacity);
+        self.peer_observer.?.scheduling_io = self.cfg.observer_io;
         self.peer_observer.?.start() catch |err| {
             self.peer_observer.?.deinit();
             self.peer_observer = null;
@@ -286,7 +294,7 @@ pub const StdHttpListener = struct {
             self.server = null;
         }
 
-        self.accept_future = try self.accept_io.?.io().concurrent(serve, .{self});
+        self.accept_future = try self.acceptIo().concurrent(serve, .{self});
     }
 
     pub fn stop(self: *StdHttpListener) void {
@@ -298,7 +306,7 @@ pub const StdHttpListener = struct {
         self.stopping.store(true, .release);
         self.shutdownActiveStreams(io);
         if (self.accept_future) |*future| {
-            self.stop_event.set(self.accept_io.?.io());
+            self.stop_event.set(self.acceptIo());
             if (bound_addr) |addr| {
                 const wake_io = std.Io.Threaded.global_single_threaded.io();
                 const wake_addr = listenerWakeAddress(addr);
@@ -307,7 +315,7 @@ pub const StdHttpListener = struct {
                     wake_stream.close(wake_io);
                 } else |_| {}
             }
-            future.await(self.accept_io.?.io());
+            future.await(self.acceptIo());
             self.accept_future = null;
         }
         self.shutdownActiveStreams(io);
@@ -327,7 +335,7 @@ pub const StdHttpListener = struct {
     }
 
     fn waitForAcceptRetry(self: *StdHttpListener, ms: u32) void {
-        self.stop_event.waitTimeout(self.accept_io.?.io(), .{
+        self.stop_event.waitTimeout(self.acceptIo(), .{
             .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake },
         }) catch {};
     }

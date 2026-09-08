@@ -69,6 +69,7 @@ pub const Observer = struct {
     next_id: u64 = 1,
     stopping: std.atomic.Value(bool) = .init(false),
     // One reserved worker for all registrations, independent of request Io.
+    scheduling_io: ?std.Io = null,
     control_io: ?std.Io.Threaded = null,
     future: ?std.Io.Future(void) = null,
     running: std.atomic.Value(bool) = .init(false),
@@ -86,6 +87,10 @@ pub const Observer = struct {
             .capacity = capacity,
             .thread_stack_size = thread_stack_size,
         };
+    }
+
+    fn schedulingIo(self: *Observer) std.Io {
+        return self.scheduling_io orelse self.control_io.?.io();
     }
 
     pub fn start(self: *Observer) !void {
@@ -112,18 +117,18 @@ pub const Observer = struct {
         self.stopping.store(false, .release);
         self.healthy.store(true, .release);
         self.stop_event = .unset;
-        self.control_io = std.Io.Threaded.init(self.alloc, .{
+        if (self.scheduling_io == null) self.control_io = std.Io.Threaded.init(self.alloc, .{
             .stack_size = self.thread_stack_size orelse (std.Io.Threaded.InitOptions{}).stack_size,
             .async_limit = .nothing,
             .concurrent_limit = limit,
         });
         errdefer {
-            self.control_io.?.deinit();
+            if (self.control_io) |*owned| owned.deinit();
             self.control_io = null;
         }
         // Io collapses worker allocation/spawn errors into ConcurrencyUnavailable.
         // Retain the existing component-specific startup error at the API boundary.
-        self.future = self.control_io.?.io().concurrent(run, .{self}) catch return error.CancellationObserverThreadSpawnFailed;
+        self.future = self.schedulingIo().concurrent(run, .{self}) catch return error.CancellationObserverThreadSpawnFailed;
         self.running.store(true, .release);
     }
 
@@ -135,8 +140,8 @@ pub const Observer = struct {
         self.stopping.store(true, .release);
         self.running.store(false, .release);
         if (self.future) |*future| {
-            self.stop_event.set(self.control_io.?.io());
-            future.await(self.control_io.?.io());
+            self.stop_event.set(self.schedulingIo());
+            future.await(self.schedulingIo());
             self.future = null;
         }
         if (self.control_io) |*control| control.deinit();
@@ -219,7 +224,7 @@ pub const Observer = struct {
     // finite 25 ms timeout, so draining never relies on Io cancellation being
     // able to interrupt poll, kevent, or WSAPoll.
     fn waitForObservation(self: *Observer) void {
-        self.stop_event.waitTimeout(self.control_io.?.io(), .{
+        self.stop_event.waitTimeout(self.schedulingIo(), .{
             .duration = .{ .raw = .fromMilliseconds(observation_interval_ms), .clock = .awake },
         }) catch {};
     }
@@ -505,4 +510,22 @@ test "cancellation observer rolls back refused control capacity and restarts" {
         try std.testing.expect(observer.kernel_fd == null);
         try std.testing.expectError(error.ObserverUnavailable, observer.register(undefined, &cancellation));
     }
+}
+
+test "observer borrows reserved capacity without owning its executor" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer lane.deinit();
+    var observer = Observer.init(std.testing.allocator, 2, null);
+    defer observer.deinit();
+    observer.scheduling_io = unavailable.io();
+    try std.testing.expectError(error.CancellationObserverThreadSpawnFailed, observer.start());
+    try std.testing.expect(observer.control_io == null);
+    try std.testing.expect(observer.future == null);
+    try std.testing.expect(observer.kernel_fd == null);
+    observer.scheduling_io = lane.io();
+    try observer.start();
+    try std.testing.expect(observer.control_io == null);
 }

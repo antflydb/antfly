@@ -20,6 +20,8 @@ const platform_time = @import("antfly_platform").time;
 const routes = @import("routes.zig");
 
 pub const HttpDriverConfig = struct {
+    /// Exclusive sender capacity borrowed from the enclosing runtime owner.
+    sender_io: ?std.Io = null,
     request_timeout_ms: u32 = 5_000,
     max_batch_bytes: usize = common_http.default_max_request_bytes,
     async_send_queue_max: usize = 4096,
@@ -173,6 +175,10 @@ pub const HttpFrameDriver = struct {
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
     }
 
+    fn senderIo(self: *@This()) std.Io {
+        return self.cfg.sender_io orelse self.sender_io.?.io();
+    }
+
     fn startAsyncSender(self: *HttpFrameDriver) !void {
         if (self.workers.len != 0) return;
         if (self.cfg.async_send_worker_count == 0) return error.InvalidAsyncSendWorkerCount;
@@ -185,12 +191,12 @@ pub const HttpFrameDriver = struct {
         }
         errdefer self.deinitIsolatedExecutors();
         self.workers = try self.alloc.alloc(std.Io.Future(void), self.cfg.async_send_worker_count);
-        self.sender_io = std.Io.Threaded.init(self.alloc, .{
+        if (self.cfg.sender_io == null) self.sender_io = std.Io.Threaded.init(self.alloc, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(self.cfg.async_send_worker_count),
         });
         errdefer {
-            self.sender_io.?.deinit();
+            if (self.sender_io) |*owned| owned.deinit();
             self.sender_io = null;
         }
         var started: usize = 0;
@@ -199,12 +205,12 @@ pub const HttpFrameDriver = struct {
             self.closing = true;
             self.cond.broadcast(self.io);
             self.mutex.unlock(self.io);
-            for (self.workers[0..started]) |*future| future.await(self.sender_io.?.io());
+            for (self.workers[0..started]) |*future| future.await(self.senderIo());
             self.alloc.free(self.workers);
             self.workers = &.{};
         }
         while (started < self.workers.len) : (started += 1) {
-            self.workers[started] = try self.sender_io.?.io().concurrent(asyncSenderMain, .{ self, started });
+            self.workers[started] = try self.senderIo().concurrent(asyncSenderMain, .{ self, started });
         }
     }
 
@@ -214,10 +220,10 @@ pub const HttpFrameDriver = struct {
         self.closing = true;
         self.cond.broadcast(self.io);
         self.mutex.unlock(self.io);
-        for (self.workers) |*future| future.await(self.sender_io.?.io());
+        for (self.workers) |*future| future.await(self.senderIo());
         self.alloc.free(self.workers);
         self.workers = &.{};
-        self.sender_io.?.deinit();
+        if (self.sender_io) |*owned| owned.deinit();
         self.sender_io = null;
         self.deinitIsolatedExecutors();
     }
@@ -720,4 +726,25 @@ test "http frame sender drains partial startup and releases private capacity" {
         return;
     }
     return error.TestUnexpectedResult;
+}
+
+test "http frame sender borrows capacity and drains a refused partial startup" {
+    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer lane.deinit();
+    const Unused = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+        fn done() void {}
+    };
+    var driver = HttpFrameDriver.init(std.testing.allocator, .{ .sender_io = lane.io(), .async_send_worker_count = 2 }, .{
+        .ptr = undefined,
+        .vtable = &.{ .execute = Unused.execute },
+    }, std.testing.io);
+    defer driver.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, driver.startAsyncSender());
+    try std.testing.expectEqual(@as(usize, 0), driver.workers.len);
+    try std.testing.expect(driver.sender_io == null);
+    var probe = try lane.io().concurrent(Unused.done, .{});
+    probe.await(lane.io());
 }

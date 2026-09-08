@@ -4447,6 +4447,7 @@ pub fn build(b: *std.Build) void {
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
     const raft_runtime_default_filters = [_][]const u8{
+        "http host reserves service workers through its runtime and rolls back overcommit",
         "managed raft progress driver advances independently and joins on stop",
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
@@ -4761,6 +4762,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime background worker capacity is reserved and closes with its owner",
         "data runtime background worker capacity is reserved and closes with its owner",
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",

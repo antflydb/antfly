@@ -26,6 +26,8 @@ const routes = @import("routes.zig");
 const snapshot_transfer = @import("snapshot_transfer.zig");
 
 pub const HttpSnapshotConfig = struct {
+    /// Exclusive sender capacity borrowed from the enclosing runtime owner.
+    sender_io: ?std.Io = null,
     root_dir: []const u8,
     chunk_size: usize = snapshot_transfer.max_chunk_bytes,
     /// Bounded request fan-out for v2 payload chunks. Executors that do not
@@ -493,6 +495,10 @@ pub const HttpSnapshotTransport = struct {
         };
     }
 
+    fn senderIo(self: *@This()) std.Io {
+        return self.cfg.sender_io orelse self.sender_io.?.io();
+    }
+
     pub fn startAsyncSender(self: *HttpSnapshotTransport) !void {
         self.send_mutex.lockUncancelable(self.artifact_io);
         while (self.send_state == .starting)
@@ -529,12 +535,12 @@ pub const HttpSnapshotTransport = struct {
         }
         @memset(self.send_active_jobs, null);
         self.send_workers = try self.alloc.alloc(std.Io.Future(void), worker_count);
-        self.sender_io = std.Io.Threaded.init(self.alloc, .{
+        if (self.cfg.sender_io == null) self.sender_io = std.Io.Threaded.init(self.alloc, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(worker_count),
         });
         errdefer {
-            self.sender_io.?.deinit();
+            if (self.sender_io) |*owned| owned.deinit();
             self.sender_io = null;
         }
         var started: usize = 0;
@@ -543,12 +549,12 @@ pub const HttpSnapshotTransport = struct {
             self.send_state = .closing;
             self.send_ready.broadcast(self.artifact_io);
             self.send_mutex.unlock(self.artifact_io);
-            for (self.send_workers[0..started]) |*future| future.await(self.sender_io.?.io());
+            for (self.send_workers[0..started]) |*future| future.await(self.senderIo());
             self.alloc.free(self.send_workers);
             self.send_workers = &.{};
         }
         while (started < self.send_workers.len) : (started += 1) {
-            self.send_workers[started] = try self.sender_io.?.io().concurrent(asyncSnapshotSenderMain, .{ self, started });
+            self.send_workers[started] = try self.senderIo().concurrent(asyncSnapshotSenderMain, .{ self, started });
         }
         // Publish running only after every worker handle is initialized. This
         // keeps concurrent stop from ever joining uninitialized storage, while
@@ -582,7 +588,7 @@ pub const HttpSnapshotTransport = struct {
         while (self.send_reserved_jobs != 0)
             self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
         self.send_mutex.unlock(self.artifact_io);
-        for (self.send_workers) |*future| future.await(self.sender_io.?.io());
+        for (self.send_workers) |*future| future.await(self.senderIo());
         if (self.send_workers.len > 0) self.alloc.free(self.send_workers);
         self.send_workers = &.{};
         if (self.sender_io) |*sender_io| sender_io.deinit();
@@ -3430,4 +3436,36 @@ test "async snapshot sender rolls back partial startup and can restart without s
         return;
     }
     return error.TestUnexpectedResult;
+}
+
+test "http snapshot sender borrows capacity and restarts after refused partial startup" {
+    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer lane.deinit();
+    var full_lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+    defer full_lane.deinit();
+    const Unused = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+        fn supportsConcurrent(_: *const anyopaque) bool {
+            return true;
+        }
+        fn done() void {}
+    };
+    var transport = try HttpSnapshotTransport.initShared(std.testing.allocator, .{
+        .root_dir = "/tmp",
+        .sender_io = lane.io(),
+        .async_send_worker_count = 2,
+    }, .{ .ptr = undefined, .vtable = &.{ .execute = Unused.execute, .supports_concurrent_requests = Unused.supportsConcurrent } }, null, std.testing.io);
+    defer transport.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, transport.startAsyncSender());
+    try std.testing.expectEqual(HttpSnapshotTransport.SenderState.stopped, transport.send_state);
+    try std.testing.expectEqual(@as(usize, 0), transport.send_workers.len);
+    try std.testing.expect(transport.sender_io == null);
+    var probe = try lane.io().concurrent(Unused.done, .{});
+    probe.await(lane.io());
+    transport.cfg.sender_io = full_lane.io();
+    try transport.startAsyncSender();
+    transport.stopAsyncSender();
+    try std.testing.expect(transport.sender_io == null);
 }

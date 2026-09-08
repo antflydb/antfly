@@ -29,6 +29,8 @@ pub const HttpRuntime = struct {
         /// The reservation is virtual on supported hosts; embedders may set an
         /// explicit smaller value only after validating every deployment target.
         observer_thread_stack_size: ?usize = null,
+        /// Reserved observer scheduling capacity, borrowed until deinit.
+        observer_io: ?std.Io = null,
     };
 
     pub const Stats = struct {
@@ -95,6 +97,7 @@ pub const HttpRuntime = struct {
     };
 
     observer: CancellationObserver,
+    owned_observer_io: ?std.Io.Threaded,
     listener_io_impl: std.Io.Threaded,
     connection_io_impl: std.Io.Threaded,
     request_io_impl: std.Io.Threaded,
@@ -114,6 +117,11 @@ pub const HttpRuntime = struct {
         const connection_capacity = @max(config.max_active_connections orelse config.max_active_h1_requests, 1);
         const request_capacity = @max(config.max_active_requests orelse connection_capacity, 1);
         return .{
+            .owned_observer_io = if (config.observer_io == null) std.Io.Threaded.init(alloc, .{
+                .stack_size = config.observer_thread_stack_size orelse (std.Io.Threaded.InitOptions{}).stack_size,
+                .async_limit = .nothing,
+                .concurrent_limit = .limited(1),
+            }) else null,
             .h1_request_capacity = config.max_active_h1_requests,
             .connection_capacity = connection_capacity,
             .request_capacity = request_capacity,
@@ -127,17 +135,18 @@ pub const HttpRuntime = struct {
             .request_io_impl = std.Io.Threaded.init(alloc, .{
                 .concurrent_limit = .limited(request_capacity),
             }),
-            .observer = CancellationObserver.init(
-                alloc,
-                config.max_active_h1_requests,
-                config.observer_thread_stack_size,
-            ),
+            .observer = blk: {
+                var observer = CancellationObserver.init(alloc, config.max_active_h1_requests, config.observer_thread_stack_size);
+                observer.scheduling_io = config.observer_io;
+                break :blk observer;
+            },
         };
     }
 
     pub fn deinit(self: *HttpRuntime) void {
         std.debug.assert(self.listener_leases.load(.acquire) == 0);
         self.observer.deinit();
+        if (self.owned_observer_io) |*owned| owned.deinit();
         self.listener_io_impl.deinit();
         self.connection_io_impl.deinit();
         self.request_io_impl.deinit();
@@ -162,6 +171,7 @@ pub const HttpRuntime = struct {
             return error.HttpRuntimeConnectionCapacityExceeded;
         if (requirements.max_requests > self.request_capacity -| reserved_requests)
             return error.HttpRuntimeRequestCapacityExceeded;
+        if (self.observer.scheduling_io == null) self.observer.scheduling_io = self.owned_observer_io.?.io();
         if (reserved_h1 == 0 and requirements.max_h1_requests > 0) try self.observer.start();
         self.listener_leases.store(leases + 1, .release);
         self.reserved_h1_request_capacity.store(reserved_h1 + requirements.max_h1_requests, .release);
@@ -254,6 +264,7 @@ test "HTTP runtime listener leases share one cancellation observer lifecycle" {
     var control = try runtime.acquireListener(control_requirements);
     var first = try runtime.acquireListener(one_request);
     var second = try runtime.acquireListener(one_request);
+    try std.testing.expect(runtime.observer.control_io == null);
     try std.testing.expectEqual(@as(usize, 3), runtime.stats().active_listener_leases);
     try std.testing.expectEqual(@as(usize, 2), runtime.stats().reserved_h1_request_capacity);
     try std.testing.expectError(error.HttpRuntimeCapacityExceeded, runtime.acquireListener(one_request));

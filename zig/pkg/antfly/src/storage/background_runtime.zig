@@ -454,6 +454,8 @@ pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.service;
 
 pub const Config = struct {
+    /// Aggregate ceiling for dedicated service-worker reservations.
+    worker_capacity: usize = threaded_io_limits.service,
     backend: Backend = runtime_backend.defaultExecutorBackend(),
     /// Optional caller-owned synchronous filesystem authority. Manual
     /// runtimes use this for lifecycle locks and durable metadata without
@@ -488,16 +490,19 @@ const LaneLeaseGate = struct {
     }
 
     fn release(self: *LaneLeaseGate, coordinator_io: ?Io) void {
-        const previous = self.state.fetchSub(1, .acq_rel);
-        std.debug.assert(previous & count_mask > 0);
-        if (previous & closed_bit != 0 and previous & count_mask == 1) {
-            if (coordinator_io) |io| {
-                // Synchronize with waitDrained's final state check so a last
-                // release cannot race between that check and parking.
-                self.drain_mutex.lockUncancelable(io);
+        if (coordinator_io) |io| {
+            // Hold the drain lock before publishing the last release. Otherwise
+            // waitDrained could observe zero and destroy this gate/executor
+            // before the releasing caller finished its notification.
+            self.drain_mutex.lockUncancelable(io);
+            defer self.drain_mutex.unlock(io);
+            const previous = self.state.fetchSub(1, .acq_rel);
+            std.debug.assert(previous & count_mask > 0);
+            if (previous & closed_bit != 0 and previous & count_mask == 1)
                 self.drained.broadcast(io);
-                self.drain_mutex.unlock(io);
-            }
+        } else {
+            const previous = self.state.fetchSub(1, .acq_rel);
+            std.debug.assert(previous & count_mask > 0);
         }
     }
 
@@ -742,6 +747,10 @@ pub const BackendRuntime = struct {
     inference_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     inference_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
     inference_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    worker_lane_gate: LaneLeaseGate = .{},
+    worker_capacity: usize = threaded_io_limits.service,
+    reserved_workers: std.atomic.Value(usize) = .init(0),
+    peak_reserved_workers: std.atomic.Value(usize) = .init(0),
     control_lane_gate: LaneLeaseGate = .{},
     control_lane_peak_leases: std.atomic.Value(usize) = .init(0),
     control_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
@@ -774,6 +783,7 @@ pub const BackendRuntime = struct {
             .native_storage_pool = native_storage_pool,
             .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
             .borrowed_filesystem_io = config.filesystem_io,
+            .worker_capacity = config.worker_capacity,
             .durable_jobs = undefined,
         };
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
@@ -825,9 +835,11 @@ pub const BackendRuntime = struct {
         // not debug-only diagnostics: no executor is destroyed while a lease
         // can still expose its std.Io interface.
         const coordinator_io = self.io();
+        self.worker_lane_gate.close();
         self.api_lane_gate.close();
         self.inference_lane_gate.close();
         self.control_lane_gate.close();
+        self.worker_lane_gate.waitDrained(coordinator_io);
         self.api_lane_gate.waitDrained(coordinator_io);
         self.inference_lane_gate.waitDrained(coordinator_io);
         self.control_lane_gate.waitDrained(coordinator_io);
@@ -1137,7 +1149,65 @@ pub const BackendRuntime = struct {
         return self.control_lane_gate.active();
     }
 
+    pub const WorkerOptions = struct {
+        capacity: usize = 1,
+        stack_size: usize = (Io.Threaded.InitOptions{}).stack_size,
+    };
+
+    /// An exclusive scheduling lane, separate from request and durable-job
+    /// capacity. The runtime allocates its executor at a stable address and
+    /// accounts for every reserved slot. The owner must stop/wake and join all
+    /// users before release; runtime deinit closes admission and waits for it.
+    /// Pass only io() to leaf components, never the database runtime itself.
+    pub const WorkerLease = struct {
+        runtime: ?*BackendRuntime = null,
+        io_impl: *IoImpl,
+        capacity: usize,
+
+        pub fn io(self: *const WorkerLease) Io {
+            std.debug.assert(self.runtime != null);
+            if (comptime builtin.os.tag == .freestanding) unreachable;
+            return self.io_impl.io();
+        }
+
+        pub fn release(self: *WorkerLease) void {
+            const runtime = self.runtime orelse return;
+            deinitIoLane(runtime.alloc, self.io_impl);
+            _ = runtime.reserved_workers.fetchSub(self.capacity, .acq_rel);
+            self.runtime = null;
+            runtime.worker_lane_gate.release(runtime.io());
+        }
+    };
+
+    pub fn acquireWorkers(self: *BackendRuntime, options: WorkerOptions) !WorkerLease {
+        if (comptime builtin.os.tag == .freestanding) return error.BackendRuntimeUnavailable;
+        _ = self.worker_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+        errdefer self.worker_lane_gate.release(self.io());
+        if (self.io() == null) return error.BackendRuntimeUnavailable;
+        if (options.capacity == 0) return error.InvalidWorkerCapacity;
+        var reserved = self.reserved_workers.load(.acquire);
+        while (true) {
+            if (options.capacity > self.worker_capacity -| reserved) return error.WorkerCapacityExceeded;
+            if (self.reserved_workers.cmpxchgWeak(reserved, reserved + options.capacity, .acq_rel, .acquire)) |actual| {
+                reserved = actual;
+            } else break;
+        }
+        errdefer _ = self.reserved_workers.fetchSub(options.capacity, .acq_rel);
+        const io_impl = try self.alloc.create(IoImpl);
+        io_impl.* = Io.Threaded.init(self.alloc, .{
+            .stack_size = options.stack_size,
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(options.capacity),
+        });
+        updateAtomicMax(&self.peak_reserved_workers, reserved + options.capacity);
+        return .{ .runtime = self, .io_impl = io_impl, .capacity = options.capacity };
+    }
+
     pub const LaneStats = struct {
+        worker_capacity: usize,
+        reserved_workers: usize,
+        peak_reserved_workers: usize,
+        worker_active_leases: usize,
         api_active_leases: usize,
         api_peak_leases: usize,
         api_acquisitions_total: u64,
@@ -1154,6 +1224,10 @@ pub const BackendRuntime = struct {
 
     pub fn laneStats(self: *const BackendRuntime) LaneStats {
         return .{
+            .worker_capacity = self.worker_capacity,
+            .reserved_workers = self.reserved_workers.load(.acquire),
+            .peak_reserved_workers = self.peak_reserved_workers.load(.acquire),
+            .worker_active_leases = self.worker_lane_gate.active(),
             .api_active_leases = self.api_lane_gate.active(),
             .api_peak_leases = self.api_lane_peak_leases.load(.acquire),
             .api_acquisitions_total = self.api_lane_acquisitions_total.load(.acquire),
@@ -2522,4 +2596,129 @@ test "backend runtime threaded worker releases payload before reaper joins" {
     }
     try std.testing.expect(ctx.ran.load(.acquire));
     try std.testing.expect(ctx.deinit_called.load(.acquire));
+}
+
+test "backend runtime worker reservations isolate capacity and reject overcommit" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{ .worker_capacity = 2 });
+    defer runtime.deinit();
+    var first = try runtime.ptr().acquireWorkers(.{});
+    defer first.release();
+    var second = try runtime.ptr().acquireWorkers(.{});
+    defer second.release();
+    try std.testing.expectError(error.WorkerCapacityExceeded, runtime.ptr().acquireWorkers(.{}));
+    try std.testing.expectEqual(@as(usize, 2), runtime.ptr().laneStats().reserved_workers);
+    const Worker = struct {
+        fn wait(io: Io, event: *Io.Event) void {
+            event.waitUncancelable(io);
+        }
+        fn done() void {}
+    };
+    var wake: Io.Event = .unset;
+    var blocked = try first.io().concurrent(Worker.wait, .{ first.io(), &wake });
+    defer {
+        wake.set(first.io());
+        blocked.await(first.io());
+    }
+    try std.testing.expectError(error.ConcurrencyUnavailable, first.io().concurrent(Worker.done, .{}));
+    var independent = try second.io().concurrent(Worker.done, .{});
+    independent.await(second.io());
+    second.release();
+    try std.testing.expectEqual(@as(usize, 1), runtime.ptr().laneStats().reserved_workers);
+    var replacement = try runtime.ptr().acquireWorkers(.{});
+    defer replacement.release();
+}
+
+test "backend runtime shutdown waits for worker owners and closes reservations" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{});
+    var handle_live = true;
+    defer if (handle_live) handle.deinit();
+    const runtime = handle.ptr();
+    var lease = try runtime.acquireWorkers(.{});
+    defer lease.release();
+    var destroyed: std.atomic.Value(bool) = .init(false);
+    var closer = try std.testing.io.concurrent(struct {
+        fn close(h: *BackendRuntimeHandle, flag: *std.atomic.Value(bool)) void {
+            h.deinit();
+            flag.store(true, .release);
+        }
+    }.close, .{ &handle, &destroyed });
+    handle_live = false;
+    defer {
+        lease.release();
+        closer.await(std.testing.io);
+    }
+    while (!runtime.worker_lane_gate.isClosed()) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireWorkers(.{}));
+    try std.testing.expect(!destroyed.load(.acquire));
+    lease.release();
+    closer.await(std.testing.io);
+    try std.testing.expect(destroyed.load(.acquire));
+}
+
+test "manual backend runtime never creates reserved worker executors" {
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+    try std.testing.expectError(error.BackendRuntimeUnavailable, handle.ptr().acquireWorkers(.{}));
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().laneStats().worker_active_leases);
+}
+
+test "lane release retains its lifetime count while shutdown owns the drain lock" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = struct {
+        parked: Io.Event = .unset,
+        fn wait(ptr: ?*anyopaque, address: *const u32, expected: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.parked.set(std.testing.io);
+            std.testing.io.vtable.futexWaitUncancelable(std.testing.io.userdata, address, expected);
+        }
+        fn wake(_: ?*anyopaque, address: *const u32, count: u32) void {
+            std.testing.io.vtable.futexWake(std.testing.io.userdata, address, count);
+        }
+        fn release(gate: *LaneLeaseGate, io: Io) void {
+            gate.release(io);
+        }
+    };
+    var probe = Probe{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.futexWaitUncancelable = Probe.wait;
+    vtable.futexWake = Probe.wake;
+    const observed_io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var gate = LaneLeaseGate{};
+    _ = gate.tryAcquire().?;
+    gate.close();
+    gate.drain_mutex.lockUncancelable(std.testing.io);
+    var locked = true;
+    defer if (locked) gate.drain_mutex.unlock(std.testing.io);
+    var releasing = try std.testing.io.concurrent(Probe.release, .{ &gate, observed_io });
+    defer {
+        if (locked) {
+            gate.drain_mutex.unlock(std.testing.io);
+            locked = false;
+        }
+        releasing.await(std.testing.io);
+    }
+    probe.parked.waitUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), gate.active());
+    gate.drain_mutex.unlock(std.testing.io);
+    locked = false;
+    releasing.await(std.testing.io);
+    gate.waitDrained(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), gate.active());
+}
+
+test "backend runtime worker allocation failure returns its capacity and lifetime lease" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var handle = try BackendRuntimeHandle.init(failing.allocator(), .{ .worker_capacity = 1 });
+    defer handle.deinit();
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, handle.ptr().acquireWorkers(.{}));
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 0), handle.ptr().laneStats().worker_active_leases);
+    failing.fail_index = std.math.maxInt(usize);
+    var lease = try handle.ptr().acquireWorkers(.{});
+    defer lease.release();
 }

@@ -125,6 +125,7 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
 
 test {
     _ = runtime_loop;
+    std.testing.refAllDecls(@import("raft/host.zig"));
     _ = hosted_shard_ops;
     _ = service;
     _ = shard_ops;

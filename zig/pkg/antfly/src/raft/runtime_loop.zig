@@ -69,6 +69,7 @@ pub const ManagedProgressDriver = struct {
     source: ProgressSource,
     interval_ns: u64,
     // Progress must remain independent of capacity in the caller's executor.
+    scheduling_io: ?std.Io = null,
     progress_io: ?std.Io.Threaded = null,
     future: ?std.Io.Future(void) = null,
     state: State = .initialized,
@@ -106,20 +107,24 @@ pub const ManagedProgressDriver = struct {
         };
     }
 
+    fn schedulingIo(self: *ManagedProgressDriver) std.Io {
+        return self.scheduling_io orelse self.progress_io.?.io();
+    }
+
     pub fn start(self: *ManagedProgressDriver) !void {
         if (self.state != .initialized) return error.AlreadyStarted;
         if (self.interval_ns == 0) return error.InvalidInterval;
         if (comptime builtin.single_threaded) return error.UnsupportedPlatform;
 
-        self.progress_io = std.Io.Threaded.init(std.heap.page_allocator, .{
+        if (self.scheduling_io == null) self.progress_io = std.Io.Threaded.init(std.heap.page_allocator, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(1),
         });
         errdefer {
-            self.progress_io.?.deinit();
+            if (self.progress_io) |*owned| owned.deinit();
             self.progress_io = null;
         }
-        self.future = try self.progress_io.?.io().concurrent(run, .{self});
+        self.future = try self.schedulingIo().concurrent(run, .{self});
         self.state = .running;
     }
 
@@ -158,9 +163,9 @@ pub const ManagedProgressDriver = struct {
     pub fn stop(self: *ManagedProgressDriver) void {
         if (self.state != .running) return;
         self.stop_event.set(self.io);
-        if (self.future) |*future| future.await(self.progress_io.?.io());
+        if (self.future) |*future| future.await(self.schedulingIo());
         self.future = null;
-        self.progress_io.?.deinit();
+        if (self.progress_io) |*owned| owned.deinit();
         self.progress_io = null;
         self.state = .stopped;
     }
@@ -477,13 +482,17 @@ test "managed raft progress driver advances independently and joins on stop" {
         .concurrent_limit = .nothing,
     });
     defer io_impl.deinit();
+    var reserved = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer reserved.deinit();
     var counter = Counter{};
     var driver = ManagedProgressDriver.init(io_impl.io(), .{
         .ptr = &counter,
         .run_once = Counter.runOnce,
     }, std.time.ns_per_ms);
+    driver.scheduling_io = reserved.io();
     defer driver.deinit();
     try driver.start();
+    try std.testing.expect(driver.progress_io == null);
 
     const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
     while (counter.count.load(.acquire) < 3) {

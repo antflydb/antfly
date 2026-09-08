@@ -29,11 +29,14 @@ sending and closing its response to avoid TCP resets from unread request data.
 A graph traversal fixture also supplies the routing callbacks now required by
 the catalog interface; production routing behavior is unchanged.
 
-Data-server work uses six reserved executor slots, one per single-flight
-worker. This keeps runtime/local-group status independent of expensive work
-and of backend durable jobs that the workers may synchronously drain. Closing
-admission precedes task draining and executor destruction. Startup failure
-clears active flags and preserves existing retry/coalescing bookkeeping.
+Data-server warmup, startup catch-up, and root refresh use owner-scoped durable
+jobs. Each submitted job has a closeable owner, drained before its DataServer
+state is released. Maintenance reserves one runtime-owned worker, status
+reserves two, and auto-bulk finishing reserves its own worker. This keeps status
+independent of expensive storage work. Closing admission precedes draining jobs
+and releasing leases; startup failure preserves active flags and retry state.
+Manual runtimes use the explicit foreground paths rather than submitting a
+recursive pipeline inline while its admission lock is held.
 
 The internal LSM flush worker accepts borrowed scheduling Io, reuses an owned
 backend runtime when present, and otherwise owns a one-task executor. Io mutex
@@ -101,13 +104,54 @@ Validation for the yield/LMDB/linalg/CUDA follow-up:
 - Final `zig build antfly -j1` and `zig build antfly -Dcuda=true -j1` both passed, along with CLI `--help` smoke checks. The CUDA-enabled build validates the full production loading path; GPU transfer execution still requires hardware.
 - Optional `zig build install-wasm -j1` does not pass: it reports broader freestanding/32-bit compilation problems, including unsupported PATH_MAX, 64-bit atomics, architecture constants, and unrelated missing members. No successful WASM validation is claimed.
 
+## Backend runtime worker ownership
+
+`BackendRuntime.acquireWorkers` reserves an exclusive, heap-stable executor with
+async scheduling disabled. The configurable aggregate `worker_capacity` defaults
+to 256. These reservations are separate from API, inference, control-request,
+and durable-job capacity. Failed acquisition rolls back accounting; manual
+runtimes reject automatic workers. Worker capacity, current/peak reservations,
+and active leases are exposed in lane stats and metadata/data health metrics.
+
+Owners stop and join leaf workers before releasing their leases. Runtime
+shutdown closes all lane admission and waits for leases before destroying any
+executor. The lease gate holds its drain mutex before publishing a final release,
+so teardown cannot overtake that release's final notification.
+
+Raft HTTP hosts reserve frame senders, snapshot senders, acceptance, peer
+observation, and artifact maintenance before constructing the transport. Node
+entry points separately reserve Raft progress capacity. This retains independent
+progress and stop-before-drain semantics without importing database runtime types
+into transport, observer, or progress-driver implementations.
+
+### Worker ownership validation after integrating main
+
+Validated on macOS ARM64, Zig 0.16.0, after integrating PR head `80f499cfe`:
+
+- `zig build -Dmetal=false -j1`: production build passed.
+- `zig build lib-storage-test -Dmetal=false -j1 -- storage.background_runtime`:
+  37 passed, including capacity isolation/refusal, allocation rollback, manual
+  mode, shutdown waiting, and the deterministic final-release race regression.
+- The combined `raft-runtime-test raft-transport-test raft-storage-test
+  lib-data-runtime-test api-http-runtime-test lib-httpx-test
+  lib-standalone-runtime-test serverless-test -Dmetal=false -j1` build passed
+  with loopback access: 149 DataServer, 16 Raft runtime, six Ready continuation,
+  43 transport, 135 snapshot-storage, 101 API HTTP, 95 standalone, and 140
+  serverless tests passed. One snapshot-suite external soak and two serverless
+  tests skipped; no failures or leaks. The standalone httpx suite also passed.
+- `zig build lib-hash-test -j1`: passed after converting the concurrent CPU
+  feature-cache test introduced by the main merge to futures and an event.
+- Formatting and whitespace checks passed. No new Linux/GPU execution or
+  aggregate all-unit validation is claimed by this follow-up.
+
 ## HTTP control executor follow-up
 
 The std HTTP accept loop, peer/deadline observer, and httpx cancellation observer
-now each own one guaranteed-concurrent future on a private `Io.Threaded` executor
-with async capacity disabled and a one-worker concurrent limit. Executors are
-initialized at the owner's stable address during start and destroyed after the
-future drains. Configured accept/httpx stack sizes and the peer observer's 4 MiB
+each run one guaranteed-concurrent future with capacity independent of requests.
+Application runtime owners now acquire dedicated `BackendRuntime.WorkerLease`
+reservations and pass borrowed scheduling `Io` to these components. The httpx
+`HttpRuntime` owns a bounded observer executor when no capability is injected;
+standalone std HTTP components retain their bounded fallback. Configured accept/httpx stack sizes and the peer observer's 4 MiB
 stack floor are preserved. The accept loop still uses the request executor for
 socket I/O and connection handoff, including inline fallback when that executor
 has zero concurrent capacity. Neither observer consumes request pool capacity.

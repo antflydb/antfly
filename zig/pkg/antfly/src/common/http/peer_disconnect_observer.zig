@@ -136,6 +136,7 @@ pub const Observer = struct {
     deadline_expirations_total: std.atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     // One reserved worker for all registrations, independent of request Io.
+    scheduling_io: ?std.Io = null,
     control_io: ?std.Io.Threaded = null,
     future: ?std.Io.Future(void) = null,
     running: std.atomic.Value(bool) = .init(false),
@@ -146,6 +147,10 @@ pub const Observer = struct {
 
     pub fn init(alloc: std.mem.Allocator, capacity: usize) Observer {
         return .{ .alloc = alloc, .capacity = capacity };
+    }
+
+    fn schedulingIo(self: *Observer) std.Io {
+        return self.scheduling_io orelse self.control_io.?.io();
     }
 
     pub fn start(self: *Observer) !void {
@@ -171,16 +176,16 @@ pub const Observer = struct {
         };
         self.stopping.store(false, .release);
         self.stop_event = .unset;
-        self.control_io = std.Io.Threaded.init(self.alloc, .{
+        if (self.scheduling_io == null) self.control_io = std.Io.Threaded.init(self.alloc, .{
             .stack_size = thread_config.minimum_partitioned_stack_size,
             .async_limit = .nothing,
             .concurrent_limit = limit,
         });
         errdefer {
-            self.control_io.?.deinit();
+            if (self.control_io) |*owned| owned.deinit();
             self.control_io = null;
         }
-        self.future = try self.control_io.?.io().concurrent(run, .{self});
+        self.future = try self.schedulingIo().concurrent(run, .{self});
         self.running.store(true, .release);
     }
 
@@ -191,8 +196,8 @@ pub const Observer = struct {
         self.stopping.store(true, .release);
         self.running.store(false, .release);
         if (self.future) |*future| {
-            self.stop_event.set(self.control_io.?.io());
-            future.await(self.control_io.?.io());
+            self.stop_event.set(self.schedulingIo());
+            future.await(self.schedulingIo());
             self.future = null;
         }
         if (self.control_io) |*control| control.deinit();
@@ -350,7 +355,7 @@ pub const Observer = struct {
     // finite 25 ms timeout, so draining never relies on Io cancellation being
     // able to interrupt poll, kevent, or WSAPoll.
     fn waitForObservation(self: *Observer) void {
-        self.stop_event.waitTimeout(self.control_io.?.io(), .{
+        self.stop_event.waitTimeout(self.schedulingIo(), .{
             .duration = .{ .raw = .fromMilliseconds(observation_interval_ms), .clock = .awake },
         }) catch {};
     }
@@ -862,4 +867,22 @@ test "peer observer rolls back refused control capacity before retry" {
     try observer.start();
     try std.testing.expectError(error.AlreadyStarted, observer.start());
     try std.testing.expectError(error.ConcurrencyUnavailable, observer.control_io.?.io().concurrent(Noop.run, .{}));
+}
+
+test "observer borrows reserved capacity without owning its executor" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows) return error.SkipZigTest;
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer lane.deinit();
+    var observer = Observer.init(std.testing.allocator, 2);
+    defer observer.deinit();
+    observer.scheduling_io = unavailable.io();
+    try std.testing.expectError(error.ConcurrencyUnavailable, observer.start());
+    try std.testing.expect(observer.control_io == null);
+    try std.testing.expect(observer.future == null);
+    try std.testing.expect(observer.kernel_fd == null);
+    observer.scheduling_io = lane.io();
+    try observer.start();
+    try std.testing.expect(observer.control_io == null);
 }

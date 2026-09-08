@@ -2591,7 +2591,10 @@ pub fn runFromIterator(
 
     var unified_lifecycle = UnifiedServerLifecycle.init(control_io);
     const public_http_config = publicHttpServerConfig(bind_host, bind_port);
+    var http_observer_lease = try node_backend_runtime.ptr().acquireWorkers(.{});
+    defer http_observer_lease.release();
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
+        .observer_io = http_observer_lease.io(),
         .max_active_h1_requests = public_http_config.max_connections,
         .max_active_connections = @as(usize, public_http_config.max_connections) +| antfly.common.health_server.max_connections,
         .max_active_requests = @as(usize, public_http_config.max_request_tasks) +| antfly.common.health_server.max_connections,
