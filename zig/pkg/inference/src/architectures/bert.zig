@@ -949,6 +949,7 @@ const EmbeddingLayerNormResidentProbe = struct {
     const vtable = blk: {
         var vt = native_compute_mod.vtable_impl;
         vt.getWeight = getWeight;
+        vt.acquireWeight = getWeight;
         vt.decoderRuntimeApplyLayerNorm = applyLayerNorm;
         break :blk vt;
     };

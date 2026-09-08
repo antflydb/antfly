@@ -899,6 +899,7 @@ test "native graph runtime attaches native partition executors" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     var runtime = try Runtime.init(allocator, &graph, &cb, .partitioned);
@@ -938,6 +939,7 @@ test "native partitioned runtimes restore request dimensions after flattened pro
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const x_data = [_]f32{

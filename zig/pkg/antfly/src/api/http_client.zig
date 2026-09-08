@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
 const platform_time = @import("antfly_platform").time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
@@ -5082,7 +5083,9 @@ test "api http client round-trips public transaction commit route" {
     const table_writes = @import("table_writes.zig");
 
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-client-txn";
+    var path_tmp = try TestDirectory.init("antfly-api-http-client-txn");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -5179,7 +5182,9 @@ test "api http client round-trips long-lived public transaction session routes" 
     const raft_mod = @import("../raft/mod.zig");
 
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-client-session-txn";
+    var path_tmp = try TestDirectory.init("antfly-api-http-client-session-txn");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
