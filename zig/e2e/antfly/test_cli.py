@@ -612,7 +612,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         image_coverage = image_status["status"]["source_coverage"]
         assert image_coverage["policy"] == "partial"
         assert image_coverage["total"] == 3
-        assert image_coverage["covered"] >= 1
+        # The query-visible vector count and asynchronous source census have
+        # independent publication points. searchable-artifacts only promises
+        # the former; check exact source outcomes after complete readiness below.
         assert image_coverage["failed"] == 0
         assert image_status["status"]["readiness"]["queryable"] is True
         assert image_status["status"]["searchable_vectors"] >= 1

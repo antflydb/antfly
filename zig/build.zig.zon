@@ -38,6 +38,7 @@
         "e2e/inference",
         "lib/audio",
         "lib/chunker",
+        "lib/hash",
         "lib/httpx",
         "lib/jinja",
         "lib/json",

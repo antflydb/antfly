@@ -6172,6 +6172,18 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
+        // A replacement opens only its target generation, but named artifact
+        // sources still depend on the canonical durable producer/resolver
+        // contracts. Load those read-only before validating the index, just as
+        // ordinary catalog loading does; do not recreate or persist them.
+        const enrichment_checkpoint = self.enrichments.items.len;
+        const resolver_checkpoint = self.resolvers.items.len;
+        errdefer {
+            self.truncateEnrichments(enrichment_checkpoint);
+            self.truncateResolvers(resolver_checkpoint);
+        }
+        if (enrichment_checkpoint == 0) try self.loadEnrichmentCatalog(store);
+        if (resolver_checkpoint == 0) try self.loadResolverCatalog(store);
         try self.openConfiguredIndex(store, cfg, false, false);
         errdefer self.removeInMemory(cfg.name);
         try self.refreshGeneratedEnrichmentTargetCache();
