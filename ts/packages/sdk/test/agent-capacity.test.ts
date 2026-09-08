@@ -94,7 +94,11 @@ describe("agent capacity errors", () => {
   });
 });
 
-const chatConfig = { table: "docs", semanticIndexes: ["embedding"] };
+const chatConfig = {
+  table: "docs",
+  semanticIndexes: ["embedding"],
+  generator: { provider: "antfly" as const, model: "fixture" },
+};
 
 describe("streaming chat terminal lifecycle", () => {
   it.each([
@@ -196,4 +200,58 @@ it.each([
   });
   await expect(result).rejects.toBeInstanceOf(QueryTemporarilyUnavailableError);
   await expect(result).rejects.toMatchObject({ code, retryable: true, retryAfterSeconds: 1 });
+});
+
+it.each([
+  "json",
+  "sse-done-only",
+  "sse-final-answer",
+])("preserves the final chat answer from %s", async (format) => {
+  const finalResult = { status: "completed", generation: "final answer", hits: [] };
+  const body =
+    format === "json"
+      ? JSON.stringify(finalResult)
+      : (format === "sse-final-answer" ? 'event: generation\ndata: "partial"\n\n' : "") +
+        `event: done\ndata: ${JSON.stringify(finalResult)}\n\n`;
+  vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+    new Response(body, {
+      headers: { "Content-Type": format === "json" ? "application/json" : "text/event-stream" },
+    })
+  );
+  const onAssistantMessage = vi.fn();
+  const onMessagesUpdated = vi.fn();
+  const turn = await new AntflyClient({ baseUrl: "http://localhost:8080" }).chatAgent(
+    "question",
+    chatConfig,
+    [],
+    { onAssistantMessage, onMessagesUpdated }
+  );
+  if (!("abortController" in turn)) throw new Error("expected streaming turn");
+  const messages = await turn.messages;
+  expect(messages.at(-1)).toEqual({ role: "assistant", content: "final answer" });
+  expect(onAssistantMessage).toHaveBeenCalledExactlyOnceWith("final answer");
+  expect(onMessagesUpdated).toHaveBeenCalledExactlyOnceWith(messages);
+});
+
+it("preserves server-provided chat history on JSON fallback", async () => {
+  const messages = [
+    { role: "system", content: "server context" },
+    { role: "user", content: "question" },
+    { role: "assistant", content: "final answer" },
+  ];
+  vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+    new Response(JSON.stringify({ status: "completed", generation: "final answer", messages }), {
+      headers: { "Content-Type": "application/json" },
+    })
+  );
+  const onMessagesUpdated = vi.fn();
+  const turn = await new AntflyClient({ baseUrl: "http://localhost:8080" }).chatAgent(
+    "question",
+    chatConfig,
+    [],
+    { onMessagesUpdated }
+  );
+  if (!("abortController" in turn)) throw new Error("expected streaming turn");
+  await expect(turn.messages).resolves.toEqual(messages);
+  expect(onMessagesUpdated).toHaveBeenCalledExactlyOnceWith(messages);
 });

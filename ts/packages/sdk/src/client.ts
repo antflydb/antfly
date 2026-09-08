@@ -948,12 +948,16 @@ export class AntflyClient {
           callbacks.onGeneration?.(chunk);
         },
         onDone: (data) => {
-          // Build updated messages with assistant response
-          const updatedMessages: ChatMessage[] = [
-            ...history,
-            { role: "user", content: userMessage },
-            { role: "assistant", content: answerText },
-          ];
+          // The terminal result also covers JSON fallback and streams without
+          // generation deltas. Prefer its complete answer and conversation.
+          answerText = data.generation ?? answerText;
+          const updatedMessages: ChatMessage[] = data.messages?.length
+            ? data.messages
+            : [
+                ...history,
+                { role: "user", content: userMessage },
+                { role: "assistant", content: answerText },
+              ];
           settled = true;
           removeAbortListener();
           resolveMessages(updatedMessages);
