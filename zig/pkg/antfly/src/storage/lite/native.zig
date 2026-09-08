@@ -18,6 +18,7 @@
 //! layout plus the first native page stores used by the Lite backend.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -4279,7 +4280,7 @@ fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
     std.mem.writeInt(u32, out[8..12], @intCast(payload.len), .little);
     @memcpy(out[page_header_size..][0..payload.len], payload);
 
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(out[0..page_crc_offset]);
     crc.update(out[page_header_size..][0..payload.len]);
     std.mem.writeInt(u32, out[page_crc_offset..][0..4], crc.final(), .little);
@@ -4303,7 +4304,7 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
     const payload_len = std.mem.readInt(u32, raw[8..12], .little);
     if (payload_len > raw.len - page_header_size) return error.InvalidNativePageLength;
 
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(raw[0..page_crc_offset]);
     crc.update(raw[page_header_size..][0..payload_len]);
     const expected_crc = std.mem.readInt(u32, raw[page_crc_offset..][0..4], .little);
@@ -4631,7 +4632,7 @@ fn readHeaderExactAt(file: std.Io.File, io: std.Io, out: *[header_size]u8) !void
 }
 
 fn headerChecksum(raw: []const u8) u32 {
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
     crc.update(raw[checkpoint_slots_end..header_checksum_offset]);
@@ -4639,7 +4640,7 @@ fn headerChecksum(raw: []const u8) u32 {
 }
 
 fn checkpointSlotChecksum(raw: []const u8) u32 {
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(raw[0..checkpoint_slot_payload_size]);
     return crc.final();
 }

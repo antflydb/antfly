@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -459,7 +460,7 @@ fn encodeState(alloc: Allocator, owner_generation: ?u64, complete: bool, key: []
     pos += rebuild_state_key_length_bytes;
     @memcpy(encoded[pos .. pos + key.len], key);
     pos += key.len;
-    std.mem.writeInt(u32, encoded[pos..][0..rebuild_state_checksum_bytes], std.hash.Crc32.hash(encoded[0..pos]), .little);
+    std.mem.writeInt(u32, encoded[pos..][0..rebuild_state_checksum_bytes], Crc32.hash(encoded[0..pos]), .little);
     return encoded;
 }
 
@@ -501,7 +502,7 @@ fn decodeState(alloc: Allocator, encoded: []const u8) !DecodedCursor {
 
     const checksum_offset = encoded.len - rebuild_state_checksum_bytes;
     const stored_checksum = std.mem.readInt(u32, encoded[checksum_offset..][0..rebuild_state_checksum_bytes], .little);
-    if (stored_checksum != std.hash.Crc32.hash(encoded[0..checksum_offset])) {
+    if (stored_checksum != Crc32.hash(encoded[0..checksum_offset])) {
         return error.InvalidRebuildState;
     }
     const complete = flags & rebuild_state_flag_complete != 0;

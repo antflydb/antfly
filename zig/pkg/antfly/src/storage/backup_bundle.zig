@@ -11,6 +11,7 @@
 //! in backup_repository.zig and address complete manifests by SHA-256.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 
 pub const manifest_schema_version: u32 = 1;
 pub const afb_reader_version: u32 = 2;
@@ -375,14 +376,14 @@ pub fn encodeTrailer(trailer: Trailer) [trailer_size]u8 {
     @memcpy(out[0..trailer_magic.len], &trailer_magic);
     std.mem.writeInt(u64, out[8..16], trailer.footer_offset, .little);
     std.mem.writeInt(u64, out[16..24], trailer.footer_payload_size, .little);
-    std.mem.writeInt(u32, out[28..32], std.hash.Crc32.hash(out[0..28]), .little);
+    std.mem.writeInt(u32, out[28..32], Crc32.hash(out[0..28]), .little);
     return out;
 }
 
 pub fn decodeTrailer(encoded: *const [trailer_size]u8, bundle_size: u64) !Trailer {
     if (bundle_size < trailer_size) return error.InvalidBundleFooter;
     if (!std.mem.eql(u8, encoded[0..trailer_magic.len], &trailer_magic) or
-        std.mem.readInt(u32, encoded[28..32], .little) != std.hash.Crc32.hash(encoded[0..28]))
+        std.mem.readInt(u32, encoded[28..32], .little) != Crc32.hash(encoded[0..28]))
         return error.InvalidBundleFooter;
     const trailer: Trailer = .{
         .footer_offset = std.mem.readInt(u64, encoded[8..16], .little),
