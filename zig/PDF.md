@@ -5055,12 +5055,30 @@ forced-OCR text suite, including the newspaper, with no OCR failures and complet
 chunk/vector coverage. All three previously failing multi-table E2E cases pass.
 These are correctness checks, not an RC-versus-branch throughput comparison.
 
-The additional four-document, ten-page suite is not qualified: its required-OCR
-administrative scan produces no chunks or searchable vectors. The same scan
-fails in a fresh one-document process, without a reported OCR execution error;
-the failure does not require cross-document batching. Rendering, decoded OCR
-content and text-selection behavior still need separate diagnosis for that
-fixture. Successful admission must not be treated as proof of useful OCR output.
+The additional four-document, ten-page suite exposed an OCR selection bug on
+the required-OCR administrative scan. Its persisted page metadata recorded zero
+embedded characters and 45 OCR characters. Both candidates were below the
+50-character quality threshold, but absent embedded text had a zero
+single-character-word ratio and won against the OCR candidate's 0.2727 ratio.
+The same failure reproduced in a fresh one-document process; it did not require
+cross-document batching.
+
+Selection now checks candidate availability before comparing quality: empty
+embedded text cannot beat meaningful OCR. Empty, punctuation-only and prompt-echo
+OCR remain rejected, and a short transcription still cannot replace substantial
+embedded content merely because its other ratios look cleaner. Selected OCR
+that retains quality failures carries `ocr_selected_low_quality`, in addition to
+the existing per-candidate quality metadata and any render/provider warnings.
+Selection, execution success and transcription quality are separate outcomes.
+Regressions cover empty/whitespace candidates, rejected output, nonempty-content
+protection, numeric-table preservation and transactional allocation failure.
+Previously persisted empty artifacts need explicit reprocessing; restarting a
+node does not rerun already completed document extraction.
+
+The scan also contains substantially more visible text than 45 characters.
+Recovering a chunk/vector therefore does not by itself qualify transcription
+accuracy. Real-model qualification must check content against the source page,
+not only nonempty artifacts and searchable-vector counts.
 
 `BackendRuntime` lazily owns one maintenance scheduler. TTL, transaction recovery,
 text merging, sparse compaction, enrichment, resolution/promotion, derived-index

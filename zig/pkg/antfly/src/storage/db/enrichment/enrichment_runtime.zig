@@ -15289,6 +15289,16 @@ fn applyRuntimeGeneratedUnitTextInPlace(
             parsed.deinit(alloc);
             return;
         }
+        // Selection and quality are independent: useful short OCR is better
+        // than absence, but retaining it must not hide its quality flags.
+        if (output_quality.needsFallback()) {
+            const quality_warning = if (parsed.warning) |warning|
+                try std.fmt.allocPrint(alloc, "{s};ocr_selected_low_quality", .{warning})
+            else
+                try alloc.dupe(u8, "ocr_selected_low_quality");
+            if (parsed.warning) |warning| alloc.free(warning);
+            parsed.warning = quality_warning;
+        }
         if (text_choice == .ocr_with_embedded_numeric_rows) {
             const merged = try document_extraction_mod.mergeOcrWithEmbeddedNumericRowsAlloc(alloc, unit.text, parsed.text);
             alloc.free(parsed.text);
@@ -26501,6 +26511,63 @@ test "document extraction generated OCR applies unit updates transactionally" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "document extraction generated OCR preserves short scan text and quality warnings transactionally" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const fixture = document_extraction_mod.Unit{
+                .unit_id = @constCast("page-1"),
+                .unit_type = @constCast("page"),
+                .text = @constCast(""),
+                .method = @constCast("pdf_text"),
+                .extraction_status = @constCast("pending_ocr"),
+                .extraction_warning = @constCast("render_warning"),
+                .page_number = 1,
+            };
+            var unit = try cloneDocumentExtractionUnit(alloc, fixture);
+            defer unit.deinit(alloc);
+            const text = "A short note with I and a reference";
+            const produced = try alloc.dupe(u8, "{\"text\":\"" ++ text ++ "\",\"warning\":\"provider_warning\"}");
+            applyRuntimeGeneratedUnitText(alloc, alloc, &unit, produced, "reader", "completed", .ocr, .{}, "<OCR>") catch |err| {
+                try std.testing.expectEqualStrings("", unit.text);
+                try std.testing.expectEqualStrings("pdf_text", unit.method);
+                try std.testing.expectEqualStrings("pending_ocr", unit.extraction_status.?);
+                try std.testing.expectEqualStrings("render_warning", unit.extraction_warning.?);
+                try std.testing.expect(!unit.ocr_used);
+                try std.testing.expect(unit.ocr_output_quality == null);
+                return err;
+            };
+            try std.testing.expectEqualStrings(text, unit.text);
+            try std.testing.expect(unit.ocr_attempted and unit.ocr_used);
+            try std.testing.expectEqualStrings("reader", unit.method);
+            try std.testing.expectEqualStrings("completed", unit.extraction_status.?);
+            try std.testing.expectEqualStrings("render_warning;provider_warning;ocr_selected_low_quality", unit.extraction_warning.?);
+            try std.testing.expect(std.mem.indexOf(u8, unit.ocr_output_quality.?, "\"too_short\":true") != null);
+            try std.testing.expectEqual(@as(?u32, text.len), unit.char_end);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "document extraction generated OCR rejects empty punctuation and prompt echoes on empty pages" {
+    const alloc = std.testing.allocator;
+    const fixture = document_extraction_mod.Unit{
+        .unit_id = @constCast("page-1"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = @constCast("pdf_text"),
+        .extraction_status = @constCast("pending_ocr"),
+    };
+    for ([_][]const u8{ "", " \t\n", "--- ...", "<OCR>" }) |output| {
+        var unit = try cloneDocumentExtractionUnit(alloc, fixture);
+        defer unit.deinit(alloc);
+        const expected = if (std.mem.eql(u8, output, "<OCR>")) error.OcrPromptEcho else error.TrivialOcrOutput;
+        try std.testing.expectError(expected, applyRuntimeGeneratedUnitText(alloc, alloc, &unit, try alloc.dupe(u8, output), "reader", "completed", .ocr, .{}, "<OCR>"));
+        try std.testing.expectEqualStrings("", unit.text);
+        try std.testing.expectEqualStrings("pending_ocr", unit.extraction_status.?);
+        try std.testing.expect(!unit.ocr_used);
+    }
 }
 
 test "synchronous document extraction OCR batches honor request execution item cap" {

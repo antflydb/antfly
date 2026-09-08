@@ -1054,6 +1054,10 @@ fn fontCorruptionScore(text_raw: []const u8) f64 {
 }
 
 pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
+    // Absence is not a clean candidate. Empty text has zero corruption ratios
+    // and must not win those tie-breakers against a short transcription.
+    if (ocr.trimmed_len == 0) return false;
+    if (embedded.trimmed_len == 0) return true;
     // A trivial OCR response must never erase a substantial embedded
     // candidate. This can otherwise happen when both candidates have one
     // quality failure (for example embedded `.garbled` versus OCR
@@ -1081,6 +1085,10 @@ const max_numeric_recall_unique_tokens: usize = 65_536;
 const max_numeric_recall_token_occurrences: usize = 1_000_000;
 
 pub fn chooseOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: OcrQuality, ocr: OcrQuality) !OcrTextChoice {
+    // Apply content eligibility before comparing two available candidates.
+    // Prompt-echo validation remains the executor's responsibility.
+    if (!hasMeaningfulOcrContent(ocr_text)) return .embedded;
+    if (std.mem.trim(u8, embedded_text, &std.ascii.whitespace).len == 0) return .ocr;
     const quality_prefers_ocr = preferOcrText(embedded, ocr);
     if (!quality_prefers_ocr) return .embedded;
     const numeric_recall = try numericTokenRecallAlloc(alloc, embedded_text, ocr_text);
@@ -4472,6 +4480,32 @@ test "OCR text selection retains embedded text on ties and chooses a better tran
     try std.testing.expect(trivial_ocr.too_short);
     try std.testing.expect(!embedded.too_short);
     try std.testing.expect(!preferOcrText(embedded, trivial_ocr));
+}
+
+test "OCR text selection checks availability before quality ratios" {
+    const alloc = std.testing.allocator;
+    const config = OcrQualityConfig{};
+    // Reproduce the scan's shape: both candidates are too short, but OCR has
+    // single-letter words, whereas absent embedded text has a zero ratio.
+    const short_text = "A short note with I and a reference";
+    const short_quality = assessOcrQuality(short_text, config);
+    try std.testing.expect(short_quality.too_short);
+    try std.testing.expect(short_quality.single_char_word_ratio > 0);
+    for ([_][]const u8{ "", " \t\n" }) |absent| {
+        const absent_quality = assessOcrQuality(absent, config);
+        try std.testing.expectEqual(OcrTextChoice.ocr, try chooseOcrTextForContentAlloc(alloc, absent, short_text, absent_quality, short_quality));
+        try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, short_text, absent, short_quality, absent_quality));
+        try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, absent, absent, absent_quality, absent_quality));
+    }
+    const empty = assessOcrQuality("", config);
+    try std.testing.expect(preferOcrText(empty, short_quality));
+    try std.testing.expect(!preferOcrText(short_quality, empty));
+    try std.testing.expect(!preferOcrText(empty, empty));
+    const punctuation = "--- ...";
+    try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, "", punctuation, empty, assessOcrQuality(punctuation, config)));
+    const substantial = "This is substantial readable embedded content that must not be replaced by a short OCR response.";
+    const substantial_quality = assessOcrQuality(substantial, config);
+    try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, substantial, short_text, substantial_quality, short_quality));
 }
 
 test "OCR text selection preserves dense embedded numeric tables" {
