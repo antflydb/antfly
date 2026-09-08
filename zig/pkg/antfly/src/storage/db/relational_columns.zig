@@ -172,7 +172,7 @@ const Manifest = struct {
         std.mem.writeInt(u64, out[13..21], self.sequence, .little);
         std.mem.writeInt(u64, out[21..29], self.blocks, .little);
         std.mem.writeInt(u64, out[29..37], self.ranges, .little);
-        std.mem.writeInt(u32, out[37..41], std.hash.Crc32.hash(out[0..37]), .little);
+        std.mem.writeInt(u32, out[37..41], @import("antfly_hash").Crc32.hash(out[0..37]), .little);
         return out;
     }
 
@@ -186,14 +186,14 @@ const Manifest = struct {
 fn checked(alloc: alloc_type, bytes: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, bytes.len + 4);
     @memcpy(out[0..bytes.len], bytes);
-    std.mem.writeInt(u32, out[bytes.len..][0..4], std.hash.Crc32.hash(bytes), .little);
+    std.mem.writeInt(u32, out[bytes.len..][0..4], @import("antfly_hash").Crc32.hash(bytes), .little);
     return out;
 }
 
 fn verified(bytes: []const u8) ![]const u8 {
     if (bytes.len < 4) return error.InvalidColumnSegment;
     const body = bytes[0 .. bytes.len - 4];
-    if (std.hash.Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidColumnSegment;
+    if (@import("antfly_hash").Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidColumnSegment;
     return body;
 }
 
@@ -385,7 +385,7 @@ test "relational columnar payload identity binds type ordinal and bytes" {
     var count: [20]u8 = @splat(0);
     std.mem.writeInt(u64, count[0..8], 2, .little);
     std.mem.writeInt(u64, count[8..16], 100, .little);
-    std.mem.writeInt(u32, count[16..20], std.hash.Crc32.hash(count[0..16]), .little);
+    std.mem.writeInt(u32, count[16..20], @import("antfly_hash").Crc32.hash(count[0..16]), .little);
     try std.testing.expectEqual(@as(u64, 2), (try payloads.decodeCount(&count)).references);
     count[0] ^= 1;
     try std.testing.expectError(error.InvalidColumnSegment, payloads.decodeCount(&count));

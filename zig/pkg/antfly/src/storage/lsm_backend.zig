@@ -16943,6 +16943,25 @@ test "lsm shared read versions reuse topology and scoped batches preserve old va
         try std.testing.expectEqualStrings("old", values[0].?);
         try std.testing.expectEqualStrings("old", values[2].?);
         try std.testing.expect(values[3] == null);
+        // Exercise both native batch plans with a scope allocator distinct
+        // from the backend's cache-handle allocator, not just duplicate-key
+        // point fallback. Retain their values across the later publication.
+        var batch_values: [2][32]?[]const u8 = undefined;
+        const plans_before = backend.snapshotReadStats();
+        for (0..2) |mode| {
+            var key_bytes: [32][16]u8 = undefined;
+            var keys: [32][]const u8 = undefined;
+            for (&keys, 0..) |*key, i| key.* = try std.fmt.bufPrint(&key_bytes[i], "k{d:0>4}", .{if (mode == 0) i else i * 100});
+            try scope.getManySorted(&keys, &batch_values[mode]);
+            for (batch_values[mode], 0..) |value, i| {
+                if (if (mode == 0) i < 16 else i == 0) {
+                    try std.testing.expectEqualStrings("old", value.?);
+                } else try std.testing.expect(value == null);
+            }
+        }
+        const plans_after = backend.snapshotReadStats();
+        try std.testing.expectEqual(plans_before.get_many_sorted_plan_cursor + 1, plans_after.get_many_sorted_plan_cursor);
+        try std.testing.expectEqual(plans_before.get_many_sorted_plan_sorted_by_run + 1, plans_after.get_many_sorted_plan_sorted_by_run);
         {
             var write = try backend.beginWrite();
             errdefer write.abort();
@@ -16957,6 +16976,8 @@ test "lsm shared read versions reuse topology and scoped batches preserve old va
         try std.testing.expectError(error.NotFound, current.get("k0001"));
         try std.testing.expectEqualStrings("old", try scope.get("k0000"));
         try std.testing.expectEqualStrings("old", values[1].?);
+        try std.testing.expectEqualStrings("old", batch_values[0][0].?);
+        try std.testing.expectEqualStrings("old", batch_values[1][0].?);
     }
 }
 

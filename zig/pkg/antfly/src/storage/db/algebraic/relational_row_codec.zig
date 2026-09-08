@@ -494,7 +494,7 @@ const ChecksumGroups = struct {
         if (body_len < checksum_group_threshold or body_len > value.len - checksum_group_footer_len) return error.InvalidRelationalRow;
         const directory = value[body_len .. value.len - checksum_group_footer_len];
         if (directory.len / checksum_len != checksumGroupCount(body_len) or directory.len % checksum_len != 0) return error.InvalidRelationalRow;
-        if (verify_directory and std.hash.Crc32.hash(value[body_len .. value.len - checksum_len]) != std.mem.readInt(u32, value[value.len - checksum_len ..][0..4], .little)) return error.RelationalRowChecksumMismatch;
+        if (verify_directory and @import("antfly_hash").Crc32.hash(value[body_len .. value.len - checksum_len]) != std.mem.readInt(u32, value[value.len - checksum_len ..][0..4], .little)) return error.RelationalRowChecksumMismatch;
         return .{ .body = value[0..body_len], .directory = directory };
     }
 
@@ -504,7 +504,7 @@ const ChecksumGroups = struct {
         for (start / checksum_group_bytes..checksumGroupCount(end)) |i| {
             const offset = i * checksum_group_bytes;
             const bytes = self.body[offset..][0..@min(checksum_group_bytes, self.body.len - offset)];
-            if (std.hash.Crc32.hash(bytes) != std.mem.readInt(u32, self.directory[i * checksum_len ..][0..4], .little)) return error.RelationalRowChecksumMismatch;
+            if (@import("antfly_hash").Crc32.hash(bytes) != std.mem.readInt(u32, self.directory[i * checksum_len ..][0..4], .little)) return error.RelationalRowChecksumMismatch;
         }
     }
 };
@@ -512,7 +512,7 @@ const ChecksumGroups = struct {
 fn verifyOrdinalChecksum(value: []const u8) !void {
     if (try ChecksumGroups.init(value, true)) |groups| return groups.verify(0, groups.body.len);
     const stored = std.mem.readInt(u32, value[value.len - checksum_len ..][0..4], .little);
-    if (std.hash.Crc32.hash(value[0 .. value.len - checksum_len]) != stored) return error.RelationalRowChecksumMismatch;
+    if (@import("antfly_hash").Crc32.hash(value[0 .. value.len - checksum_len]) != stored) return error.RelationalRowChecksumMismatch;
 }
 
 fn finalizeOrdinalChecksum(value: []u8) !void {
@@ -520,10 +520,10 @@ fn finalizeOrdinalChecksum(value: []u8) !void {
         for (0..checksumGroupCount(groups.body.len)) |i| {
             const offset = i * checksum_group_bytes;
             const bytes = groups.body[offset..][0..@min(checksum_group_bytes, groups.body.len - offset)];
-            std.mem.writeInt(u32, value[groups.body.len + i * checksum_len ..][0..4], std.hash.Crc32.hash(bytes), .little);
+            std.mem.writeInt(u32, value[groups.body.len + i * checksum_len ..][0..4], @import("antfly_hash").Crc32.hash(bytes), .little);
         }
-        std.mem.writeInt(u32, value[value.len - checksum_len ..][0..4], std.hash.Crc32.hash(value[groups.body.len .. value.len - checksum_len]), .little);
-    } else std.mem.writeInt(u32, value[value.len - checksum_len ..][0..4], std.hash.Crc32.hash(value[0 .. value.len - checksum_len]), .little);
+        std.mem.writeInt(u32, value[value.len - checksum_len ..][0..4], @import("antfly_hash").Crc32.hash(value[groups.body.len .. value.len - checksum_len]), .little);
+    } else std.mem.writeInt(u32, value[value.len - checksum_len ..][0..4], @import("antfly_hash").Crc32.hash(value[0 .. value.len - checksum_len]), .little);
 }
 
 pub fn rowSchemaVersion(value: []const u8) !u32 {

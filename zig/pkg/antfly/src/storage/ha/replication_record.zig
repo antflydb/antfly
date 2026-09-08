@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Crc32 = std.hash.Crc32;
+const Crc32 = @import("antfly_hash").Crc32;
 
 pub const magic = [8]u8{ 'A', 'F', 'H', 'A', 'W', 'A', 'L', '\n' };
 pub const format_version: u16 = 1;

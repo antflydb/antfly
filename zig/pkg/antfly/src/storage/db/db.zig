@@ -346,7 +346,7 @@ fn encodeDurableHAOutboxAlloc(alloc: Allocator, from_lsn: u64, payload: []const 
     std.mem.writeInt(u64, out[4..12], from_lsn, .little);
     std.mem.writeInt(u32, out[12..16], payload_len, .little);
     @memcpy(out[ha_outbox_header_len..][0..payload.len], payload);
-    const checksum = std.hash.Crc32.hash(out[0 .. out.len - ha_outbox_checksum_len]);
+    const checksum = @import("antfly_hash").Crc32.hash(out[0 .. out.len - ha_outbox_checksum_len]);
     std.mem.writeInt(u32, out[out.len - ha_outbox_checksum_len ..][0..ha_outbox_checksum_len], checksum, .little);
     return out;
 }
@@ -357,7 +357,7 @@ fn decodeDurableHAOutbox(raw: []const u8) !DurableHAOutbox {
     const payload_len: usize = @intCast(std.mem.readInt(u32, raw[12..16], .little));
     if (payload_len != raw.len - ha_outbox_header_len - ha_outbox_checksum_len) return error.InvalidHAOutbox;
     const checksum = std.mem.readInt(u32, raw[raw.len - ha_outbox_checksum_len ..][0..ha_outbox_checksum_len], .little);
-    if (std.hash.Crc32.hash(raw[0 .. raw.len - ha_outbox_checksum_len]) != checksum) return error.InvalidHAOutbox;
+    if (@import("antfly_hash").Crc32.hash(raw[0 .. raw.len - ha_outbox_checksum_len]) != checksum) return error.InvalidHAOutbox;
     const from_lsn = std.mem.readInt(u64, raw[4..12], .little);
     if (from_lsn == 0) return error.InvalidHAOutbox;
     return .{ .from_lsn = from_lsn, .payload = raw[ha_outbox_header_len .. raw.len - ha_outbox_checksum_len] };

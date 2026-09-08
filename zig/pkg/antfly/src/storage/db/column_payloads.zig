@@ -28,7 +28,7 @@ pub const Ref = struct {
 
     pub fn validate(self: Ref, bytes: []const u8) !void {
         if (bytes.len != self.bytes) return error.InvalidColumnSegment;
-        if (bytes.len < 4 or std.hash.Crc32.hash(bytes[0 .. bytes.len - 4]) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidColumnSegment;
+        if (bytes.len < 4 or @import("antfly_hash").Crc32.hash(bytes[0 .. bytes.len - 4]) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidColumnSegment;
     }
 };
 
@@ -171,7 +171,7 @@ pub fn prepare(target: *store.DocStore, alloc: std.mem.Allocator, generation: u6
     return result;
 }
 pub fn decodeCount(bytes: []const u8) !Count {
-    if (bytes.len != 20 or std.hash.Crc32.hash(bytes[0..16]) != std.mem.readInt(u32, bytes[16..20], .little)) return error.InvalidColumnSegment;
+    if (bytes.len != 20 or @import("antfly_hash").Crc32.hash(bytes[0..16]) != std.mem.readInt(u32, bytes[16..20], .little)) return error.InvalidColumnSegment;
     const result = Count{ .references = std.mem.readInt(u64, bytes[0..8], .little), .bytes = std.mem.readInt(u64, bytes[8..16], .little) };
     if (result.references == 0 or result.bytes <= 4) return error.InvalidColumnSegment;
     return result;
@@ -180,7 +180,7 @@ fn encodeCount(count: Count) [20]u8 {
     var result: [20]u8 = undefined;
     std.mem.writeInt(u64, result[0..8], count.references, .little);
     std.mem.writeInt(u64, result[8..16], count.bytes, .little);
-    std.mem.writeInt(u32, result[16..20], std.hash.Crc32.hash(result[0..16]), .little);
+    std.mem.writeInt(u32, result[16..20], @import("antfly_hash").Crc32.hash(result[0..16]), .little);
     return result;
 }
 

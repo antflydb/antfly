@@ -608,7 +608,7 @@ are introduced.
 
 New differential fixtures use diagnostic-only controls, not alternative
 production formats or legacy compatibility modes. A ReleaseFast development
-run measured:
+run before merging main's accelerated checksum implementation measured:
 
 | Fixture | Baseline | Shared/domain/batched |
 | --- | ---: | ---: |

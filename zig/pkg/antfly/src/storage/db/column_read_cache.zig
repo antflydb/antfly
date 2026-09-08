@@ -258,7 +258,7 @@ fn testEncoded(alloc: Allocator, values: []const ?dv.TypedValue, value_type: dv.
     defer alloc.free(raw);
     const bytes = try alloc.alloc(u8, raw.len + 4);
     @memcpy(bytes[0..raw.len], raw);
-    std.mem.writeInt(u32, bytes[raw.len..][0..4], std.hash.Crc32.hash(raw), .little);
+    std.mem.writeInt(u32, bytes[raw.len..][0..4], @import("antfly_hash").Crc32.hash(raw), .little);
     return .{ .bytes = bytes, .ref = .{ .digest = payloads.identity(value_type, values), .bytes = bytes.len, .source_rows = @intCast(values.len) } };
 }
 
