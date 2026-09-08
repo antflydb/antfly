@@ -6408,7 +6408,7 @@ pub const ApiHttpServer = struct {
             error.AgentContextLimitExceeded => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query planning context limit exceeded"),
             error.UnsupportedAgentToolProvider, error.UnsupportedQueryBuilderGeneration => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "query planning requires a tool-capable generator"),
             error.GenerateRequestFailed => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query generation failed"),
-            error.GenerationCapacityUnavailable => try contextualRetryableTextResponse(self.alloc, 503, "inference capacity temporarily unavailable"),
+            error.GenerationCapacityUnavailable => try contextualCapacityResponse(self.alloc, connections_api.generationCapacityFailure()),
             error.EmptyResponse => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "generator returned no answer or tool calls"),
             error.DocIdentityNamespaceMismatch => try contextual_operations.jsonErrorAlloc(self.alloc, 503, "doc identity unavailable"),
             error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query embedding input too large"),
@@ -18673,7 +18673,11 @@ test "ambiguous mutation response is explicitly non-retryable" {
 }
 
 fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
-    var response = try contextualJsonResponse(alloc, 503, connections_api.inferenceAdmissionFailure());
+    return contextualCapacityResponse(alloc, connections_api.inferenceAdmissionFailure());
+}
+
+fn contextualCapacityResponse(alloc: std.mem.Allocator, payload: connections_api.InferenceAdmissionFailure) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonResponse(alloc, 503, payload);
     errdefer response.deinit(alloc);
     const headers = try alloc.alloc(contextual_operations.Header, 1);
     errdefer alloc.free(headers);
@@ -18686,6 +18690,22 @@ fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_ope
     };
     response.headers = headers;
     return response;
+}
+
+test "contextual generation capacity response preserves public retry contract" {
+    const alloc = std.testing.allocator;
+    var response = try contextualCapacityResponse(alloc, connections_api.generationCapacityFailure());
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
+    try std.testing.expectEqualStrings("Retry-After", response.headers[0].name);
+    try std.testing.expectEqualStrings("1", response.headers[0].value);
+    const parsed = try std.json.parseFromSlice(metadata_openapi.InferenceCapacityError, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("GenerationCapacityUnavailable", parsed.value.@"error");
+    try std.testing.expect(parsed.value.message.len > 0);
+    try std.testing.expect(parsed.value.retryable);
+    try std.testing.expectEqual(@as(i64, 1000), parsed.value.retry_after_ms);
 }
 
 fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {

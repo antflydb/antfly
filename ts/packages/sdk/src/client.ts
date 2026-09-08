@@ -7,6 +7,7 @@ import createClient, { type Client } from "openapi-fetch";
 import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import { validateGraphQueryResponses } from "./graph-results.js";
 import { validateCreateIndexRequestRelationships } from "./index-config.js";
+import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
 import type { paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
 import type {
@@ -273,6 +274,9 @@ function errorMessage(error: unknown): string {
 }
 
 function queryError(prefix: string, error: unknown, response: Response | undefined): Error {
+  if (response?.status === 503 && isTransientCapacityError(error)) {
+    return new InferenceCapacityError(error);
+  }
   const stale = error && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
   if (
     response?.status === 409 &&
@@ -720,7 +724,13 @@ export class AntflyClient {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Retrieval agent request failed: ${response.status} ${errorText}`);
+      let error: unknown = errorText;
+      try {
+        error = JSON.parse(errorText);
+      } catch {
+        // Older servers may return plain text.
+      }
+      throw queryError("Retrieval agent request failed", error, response);
     }
 
     if (!response.body) {
@@ -805,6 +815,7 @@ export class AntflyClient {
             }
             case "error": {
               const parsed = JSON.parse(frame.data);
+              if (isTransientCapacityError(parsed)) throw new InferenceCapacityError(parsed);
               const message =
                 parsed !== null && typeof parsed === "object" && parsed.error
                   ? String(parsed.error)
@@ -816,7 +827,9 @@ export class AntflyClient {
         throw new Error("Retrieval agent stream ended before done");
       } catch (error) {
         if (!abortController.signal.aborted) {
-          callbacks.onError?.(error instanceof Error ? error.message : String(error));
+          const detail = error instanceof Error ? error : new Error(String(error));
+          callbacks.onErrorDetail?.(detail);
+          callbacks.onError?.(detail.message);
         }
       }
     })();
@@ -963,10 +976,10 @@ export class AntflyClient {
    * @returns Promise with QueryBuilderResult containing the generated query, explanation, and confidence
    */
   async queryBuilderAgent(request: QueryBuilderRequest): Promise<QueryBuilderResult> {
-    const { data, error } = await this.client.POST("/db/v1/agents/query-builder", {
+    const { data, error, response } = await this.client.POST("/db/v1/agents/query-builder", {
       body: request,
     });
-    if (error) throw new Error(`Query builder agent failed: ${error.error}`);
+    if (error) throw queryError("Query builder agent failed", error, response);
     // biome-ignore lint/style/noNonNullAssertion: data is guaranteed defined after error check
     return data! as unknown as QueryBuilderResult;
   }
