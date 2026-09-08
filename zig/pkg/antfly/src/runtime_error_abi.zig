@@ -347,6 +347,7 @@ pub const Detail = enum(c_int) {
     generate_request_failed,
     generation_rate_limit,
     unsupported_tensor_type,
+    generation_capacity_unavailable,
 };
 
 pub const Status = extern struct {
@@ -533,6 +534,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.IncompatibleModel => status(.invalid_argument, .incompatible_model),
         error.UnsupportedGeneratorProvider => status(.unsupported, .unsupported_generator_provider),
         error.GenerateRequestFailed => status(.unavailable, .generate_request_failed),
+        error.GenerationCapacityUnavailable => status(.retryable, .generation_capacity_unavailable),
         error.RateLimit => status(.retryable, .generation_rate_limit),
         error.InvalidRateLimitPolicy => status(.invalid_argument, .invalid_rate_limit_policy),
         error.ConflictingRateLimitPolicy => status(.conflict, .conflicting_rate_limit_policy),
@@ -1004,6 +1006,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .incompatible_model => "IncompatibleModel",
         .unsupported_generator_provider => "UnsupportedGeneratorProvider",
         .generate_request_failed => "GenerateRequestFailed",
+        .generation_capacity_unavailable => "GenerationCapacityUnavailable",
         .generation_rate_limit => "RateLimit",
         .invalid_rate_limit_policy => "InvalidRateLimitPolicy",
         .conflicting_rate_limit_policy => "ConflictingRateLimitPolicy",
@@ -1110,4 +1113,10 @@ test "provider quota errors retain stable boundary details" {
     try std.testing.expectEqual(error.ProviderQuotaRegistryFull, errorFromStatus(statusFromError(error.ProviderQuotaRegistryFull)));
     try std.testing.expectEqual(error.UnsupportedMediaTokenBudget, errorFromStatus(statusFromError(error.UnsupportedMediaTokenBudget)));
     try std.testing.expectEqual(error.UnsupportedLocalRateLimit, errorFromStatus(statusFromError(error.UnsupportedLocalRateLimit)));
+}
+
+test "generation capacity retains retryability across the runtime boundary" {
+    const result = statusFromError(error.GenerationCapacityUnavailable);
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), result.code);
+    try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
 }
