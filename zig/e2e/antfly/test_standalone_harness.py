@@ -16,6 +16,7 @@
 
 import pytest
 import requests
+import threading
 from types import SimpleNamespace
 
 import conftest as e2e_conftest
@@ -205,6 +206,93 @@ def _http_error(status: int, body: bytes, **headers: str) -> requests.HTTPError:
     response._content = body
     response.headers.update(headers)
     return requests.HTTPError(response=response)
+
+
+def _cleanup_api(monkeypatch, outcomes, *, exit_status=None):
+    calls = []
+    pending = iter(outcomes)
+
+    def delete(url, **kwargs):
+        calls.append((url, kwargs))
+        outcome = next(pending)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return _http_error(outcome, b"delete response").response
+
+    monkeypatch.setattr(e2e_conftest.time, "sleep", lambda _: None)
+    server = SimpleNamespace(
+        proc=SimpleNamespace(poll=lambda: exit_status),
+        debug_logs=lambda: "cleanup server diagnostics",
+    )
+    return (
+        SimpleNamespace(
+            s=SimpleNamespace(delete=delete),
+            url="http://localhost/api/v1",
+            _server=server,
+            _request_lock=threading.Lock(),
+        ),
+        calls,
+    )
+
+
+@pytest.mark.parametrize("status", [200, 202, 204, 404])
+def test_table_cleanup_retries_reset_including_already_deleted(monkeypatch, status):
+    api, calls = _cleanup_api(
+        monkeypatch, [requests.ConnectionError("connection reset"), status]
+    )
+    assert e2e_conftest._cleanup_created_tables(api, {"table/a"}) == []
+    assert len(calls) == 2
+    assert all(url.endswith("/tables/table%2Fa") for url, _ in calls)
+
+
+def test_table_cleanup_stops_retrying_and_keeps_diagnostics(monkeypatch):
+    api, calls = _cleanup_api(
+        monkeypatch, [requests.ConnectionError("connection reset")] * 3 + [204]
+    )
+    errors = e2e_conftest._cleanup_created_tables(api, {"z_table", "a_table"})
+    assert len(errors) == 1
+    assert "z_table: connection reset" in errors[0]
+    assert "cleanup server diagnostics" in errors[0]
+    assert "proc: None" in errors[0]
+    assert len(calls) == 4  # Other owned tables still get cleaned up.
+
+
+def test_table_cleanup_preserves_http_failures_without_retry(monkeypatch):
+    api, calls = _cleanup_api(monkeypatch, [500])
+    errors = e2e_conftest._cleanup_created_tables(api, {"table"})
+    assert len(errors) == 1
+    assert "HTTP 500 delete response" in errors[0]
+    assert len(calls) == 1
+
+
+def test_table_cleanup_rejects_exited_server_before_request(monkeypatch):
+    api, calls = _cleanup_api(monkeypatch, [204], exit_status=-11)
+    errors = e2e_conftest._cleanup_created_tables(api, {"table"})
+    assert len(errors) == 1
+    assert "proc: -11" in errors[0]
+    assert "cleanup server diagnostics" in errors[0]
+    assert calls == []
+
+
+@pytest.mark.parametrize("outcome", [requests.ConnectionError("connection reset"), 204])
+def test_table_cleanup_does_not_hide_server_crash(monkeypatch, outcome):
+    api, calls = _cleanup_api(monkeypatch, [outcome, 204])
+    api._server.proc.poll = lambda: -11 if calls else None
+    errors = e2e_conftest._cleanup_created_tables(api, {"table"})
+    assert len(errors) == 1
+    assert "proc: -11" in errors[0]
+    assert len(calls) == 1
+
+
+def test_table_cleanup_does_not_retry_after_deadline(monkeypatch):
+    api, calls = _cleanup_api(monkeypatch, [requests.Timeout("delete timed out"), 204])
+    clock = iter([0.0, 0.0, 30.0])
+    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: next(clock))
+    errors = e2e_conftest._cleanup_created_tables(api, {"table"})
+    assert len(errors) == 1
+    assert "delete timed out" in errors[0]
+    assert len(calls) == 1
+    assert calls[0][1]["timeout"] == 30
 
 
 def test_wait_until_retries_structured_retryable_service_unavailable():
