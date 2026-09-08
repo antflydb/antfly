@@ -8655,10 +8655,13 @@ pub const MetadataHttpService = struct {
             self.lockRuntime();
             {
                 defer self.unlockRuntime();
+                // The cadence driver owns election and heartbeat time. A
+                // read waiter may drain inbound/Ready work, but ticking here
+                // makes the Raft clock run faster with concurrent read load.
                 if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
+                    _ = try self.raft.syncPendingRaftProgressOnly();
                 } else {
-                    try self.raft.runRaftRoundOnly();
+                    try self.raft.runRaftProgressOnly();
                 }
                 raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
                 latest_raft_diagnostics_snapshot = raft_diagnostics_snapshot;
@@ -18283,7 +18286,7 @@ test "metadata http service catalog cache is independent from volatile projectio
     try std.testing.expectError(error.ServiceClosing, svc.ensureLifecycleListenerRegistered());
 }
 
-test "metadata http service linearizable read waits for leader discovery" {
+test "metadata http service linearizable reads leave elections to the cadence driver" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -18371,7 +18374,20 @@ test "metadata http service linearizable read waits for leader discovery" {
     });
 
     try std.testing.expect(!svc.raft.host.http_host.host.isLocalLeader(2910));
+    const before_discovery = svc.raft.host.http_host.host.runtime_host.virtualTimeMs();
+    try std.testing.expectError(error.DeadlineExceeded, svc.ensureLinearizableReadWithContext(.{
+        .deadline_ns = platform_time.monotonicNs() + 50 * std.time.ns_per_ms,
+    }));
+    try std.testing.expectEqual(before_discovery, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try std.testing.expect(!svc.raft.host.http_host.host.isLocalLeader(2910));
+
+    // Only the cadence owner advances elections. Once it discovers a leader,
+    // the read waiter must still drain ReadIndex work without another tick.
+    for (0..20) |_| try svc.runRaftRoundOnly();
+    try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
+    const before_read = svc.raft.host.http_host.host.runtime_host.virtualTimeMs();
     try svc.ensureLinearizableRead();
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
     try std.testing.expect(svc.metrics().read_lease_requests > 0);
 }

@@ -492,12 +492,14 @@ def _seed_cluster(monkeypatch, outcomes):
         outcome = next(pending)
         if isinstance(outcome, Exception):
             raise outcome
-        status, body = outcome
+        status, body, *headers = outcome
         response = requests.Response()
         response.status_code = status
         response._content = body
         response.url = url
         response.request = requests.Request("POST", url).prepare()
+        if headers:
+            response.headers.update(headers[0])
         return response
 
     return (
@@ -509,6 +511,123 @@ def _seed_cluster(monkeypatch, outcomes):
         SimpleNamespace(post=post),
         calls,
     )
+
+
+def _create_not_admitted():
+    return (
+        503,
+        b'{"code":"metadata_leader_unavailable","retryable":true}',
+        {"X-Antfly-Metadata-Mutation-Not-Admitted": "true", "Retry-After": "1"},
+    )
+
+
+@pytest.mark.parametrize("success_status", [200, 202])
+def test_cluster_create_retries_only_proven_non_admission(
+    monkeypatch, capsys, success_status
+):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch, [_create_not_admitted(), (success_status, b"{}")]
+    )
+    definition = {"num_shards": 3, "description": "backup"}
+    assert (
+        backups._create_cluster_table_when_admitted(
+            cluster, session, "docs", definition
+        )
+        == {}
+    )
+    assert [call["json"] for call in calls] == [definition, definition]
+    assert [call["timeout"] for call in calls] == [30.0, 29.0]
+    assert "admitted after 2 attempts" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        (
+            409,
+            b"table mutation outcome is unknown; observe table state before retrying",
+        ),
+        (409, b"table already exists"),
+        (503, _create_not_admitted()[1]),
+        (503, _create_not_admitted()[1], {"X-Antfly-Metadata-Not-Leader": "true"}),
+        (
+            503,
+            _create_not_admitted()[1],
+            {"X-Antfly-Metadata-Mutation-Not-Admitted": "false"},
+        ),
+        (
+            503,
+            _create_not_admitted()[1],
+            {
+                **_create_not_admitted()[2],
+                "X-Antfly-Raft-Mutation-Outcome": "unknown-v1",
+            },
+        ),
+        (
+            503,
+            _create_not_admitted()[1],
+            {
+                **_create_not_admitted()[2],
+                "X-Antfly-Raft-Mutation-Outcome": "committed-v1",
+            },
+        ),
+        (
+            503,
+            b'{"code":"metadata_leader_unavailable","retryable":false}',
+            _create_not_admitted()[2],
+        ),
+        (
+            503,
+            b'{"code":"different_error","retryable":true}',
+            _create_not_admitted()[2],
+        ),
+        (503, b"malformed response", _create_not_admitted()[2]),
+        (500, b"internal failure"),
+        requests.ConnectionError("response lost"),
+        requests.Timeout("request timed out"),
+    ],
+)
+def test_cluster_create_does_not_replay_uncertain_outcomes(monkeypatch, outcome):
+    cluster, session, calls = _seed_cluster(monkeypatch, [outcome])
+    with pytest.raises(AssertionError, match="cluster write diagnostics"):
+        backups._create_cluster_table_when_admitted(cluster, session, "docs", {})
+    assert len(calls) == 1
+
+
+def test_cluster_create_deadline_bounds_requests_and_retains_rejection(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [_create_not_admitted()] * 3)
+    with pytest.raises(AssertionError, match="admission deadline exceeded") as exc:
+        backups._create_cluster_table_when_admitted(
+            cluster, session, "docs", {}, timeout_s=2.5
+        )
+    assert [call["timeout"] for call in calls] == [2.5, 1.5, 0.5]
+    assert "last_status=503" in str(exc.value)
+    assert "cluster write diagnostics" in str(exc.value)
+
+
+def test_cluster_create_does_not_send_after_backoff_overshoots_deadline(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [_create_not_admitted()])
+    monkeypatch.setattr(
+        backups.time,
+        "sleep",
+        lambda _: monkeypatch.setattr(backups.time, "monotonic", lambda: 31.0),
+    )
+    with pytest.raises(AssertionError, match="admission deadline exceeded"):
+        backups._create_cluster_table_when_admitted(cluster, session, "docs", {})
+    assert len(calls) == 1
+
+
+def test_cluster_create_stops_when_server_exits(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [_create_not_admitted()])
+
+    def assert_alive():
+        if calls:
+            raise RuntimeError("data server exited")
+
+    cluster.assert_processes_alive = assert_alive
+    with pytest.raises(RuntimeError, match="data server exited"):
+        backups._create_cluster_table_when_admitted(cluster, session, "docs", {})
+    assert len(calls) == 1
 
 
 def test_cluster_seed_waits_for_precommit_write_admission(monkeypatch):
