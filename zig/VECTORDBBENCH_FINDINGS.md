@@ -9160,3 +9160,69 @@ as cumulative disk savings. On the first pre-lane 1M candidate it finds 11
 delta and two full handoffs, writing 1.631 GB and 0.422 GB respectively, and
 no suffix publication (the flag was off, as intended). These are checkpoint
 write totals, not total primary/source/WAL amplification or peak disk usage.
+
+##### Wakeup-only 50K qualification and off-writer reader preparation
+
+All four 50K arms of `pr593-completion-lane-ab-20260908-retry` passed execution,
+native readiness/restart and paired recall gates. This compares the new
+completion lane with the pre-lane current binary, not with the older preserved
+no-copy binary. The separate 1M comparison is still running.
+
+| Pair / arm | Ready s | C30 QPS | C30 p95 ms | Live recall | Mixed write p95 ms | Mixed query p95 ms | Mixed catch-up s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 pre-lane | 15.334 | 1,771.0 | 41.595 | 98.42% | 148.791 | 58.810 | 1.157 |
+| 1 completion lane | 15.479 | 1,685.2 | 46.222 | 98.46% | 149.490 | 57.920 | 1.146 |
+| 2 completion lane | 17.104 | 1,674.0 | 47.884 | 98.30% | 151.097 | 58.629 | 1.250 |
+| 2 pre-lane | 15.082 | 1,731.5 | 45.556 | 98.36% | 148.866 | 57.737 | 1.039 |
+
+| Pair / arm | Load/read RSS GB | Mixed RSS GB | Live physical-footprint ledger peak GB | Allocated disk GB |
+| --- | ---: | ---: | ---: | ---: |
+| 1 pre-lane | 1.611 | 1.735 | 0.567 | 0.418 |
+| 1 completion lane | 1.514 | 1.428 | 0.783 | 0.425 |
+| 2 completion lane | 1.531 | 1.820 | 0.571 | 0.418 |
+| 2 pre-lane | 1.453 | 1.536 | 0.805 | 0.423 |
+
+The initial full checkpoint's completed-worker wait falls from 153.397 ms
+in the first control to 0.017/0.015 ms in the two candidates. Mixed delta
+waits remain 708.640/764.389 and 749.135/982.890 ms, versus
+732.796/670.627 ms in the first control. Wakeup removes the idle scheduling
+interval but does not remove mutation ownership or installation work. C30
+throughput is lower and p95 higher in both candidate pairs; memory and disk
+are mixed. This is not an established end-to-end performance win. Raw stage
+logs and `50k-comparison.json` retain the evidence without blaming host
+contention or conflating a microsecond handoff improvement with request p95.
+
+Implemented the next guarded experiment in `01123472c`:
+`ANTFLY_EXPERIMENT_STAGE_POSTING_READERS=1`. The checkpoint worker opens
+immutable readers, validates metadata and builds scan-admission/delta indexes
+before signaling completion. This preparation performs no WAL rotation,
+recovery replay or CURRENT write. The mutation owner independently prepares
+the real durable transaction and checks every staged file descriptor,
+namespace and checkpoint coverage before reusing those readers. It then
+rebinds the root to the actual WAL identity and rebases newer immutable
+mutation blobs, retaining tombstones and concurrent source coverage. Reader
+roots own their allocation lifetime through the last query lease; the builder
+does not leave a pointer to its temporary allocator behind.
+
+Seven focused Debug tests pass with the flag enabled; nine pass with it
+disabled, with no reported leaks. They include stale cached-reader rejection,
+unchanged CURRENT/live-WAL during staging, every staged-reader allocation
+failure, source-capture ownership and the full/delta/suffix pinned-reader plus
+concurrent-tail/restart scenario. Small fixture traces show reader installation
+at 0–1 microseconds with preparation in the worker. These fixture timings are
+not 50K/1M performance results. `readers_stage_ns` is nested in worker build
+wall time and must not be added to it.
+
+ReleaseFast binary reserved for the separate reader-staging A/B:
+`.benchmark-assets/pr593-staged-posting-readers-20260908/bin/antfly`, SHA-256
+`3a77c694eb8d436b9d33e661485dba473cd268134c632006001fd5dee13043b7`.
+The active wakeup matrix still uses its original pinned binaries. This new
+flag remains off; its load/query/RSS tradeoffs have not yet been measured.
+Rebase work remains in the mutation lane, and true reusable physical leaf
+chunks remain unimplemented. Staging readers is not a substitute for either.
+
+Review also corrected the suffix evidence reader to consult the matched
+runner's complete environment receipt: the older harness's short environment
+allowlist does not record the suffix flag. Missing/inconsistent binary or arm
+receipts now fail qualification, and eight Python checks pass. An absent
+flag in a partial harness receipt must not be interpreted as proof it was off.
