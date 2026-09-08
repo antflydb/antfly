@@ -22,6 +22,7 @@
 //! segment blob.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const posting = @import("posting.zig");
 const checked_region = @import("checked_region.zig");
@@ -30,7 +31,6 @@ pub const PostingId = posting.PostingId;
 
 const magic: [4]u8 = "AFPS".*;
 const version: u16 = 4;
-const min_supported_version: u16 = 2;
 const index_entry_size: usize = 8 + 1 + 8 + 8 + 8 + 4;
 const footer_size: usize = 8 + 8 + 4 + 2 + 2 + 4 + 4;
 
@@ -102,7 +102,7 @@ const IndexEntry = struct {
 
     fn value(self: IndexEntry, data: []const u8) ![]const u8 {
         const bytes = try self.rawValue(data);
-        if (std.hash.Crc32.hash(bytes) != self.checksum) return error.PostingSegmentChecksumMismatch;
+        if (Crc32.hash(bytes) != self.checksum) return error.PostingSegmentChecksumMismatch;
         return bytes;
     }
 
@@ -299,7 +299,7 @@ pub const Writer = struct {
             const offset = out.items.len;
             try out.appendSlice(self.alloc, entry.value);
             const value_len = entry.value.len;
-            const checksum = std.hash.Crc32.hash(entry.value);
+            const checksum = Crc32.hash(entry.value);
             if (entry.owned) self.alloc.free(@constCast(entry.value));
             entry.value = &.{};
             entry.owned = false;
@@ -318,11 +318,11 @@ pub const Writer = struct {
         const index_bytes = out.items[index_offset..];
         try appendU64(self.alloc, &out, @intCast(index_offset));
         try appendU64(self.alloc, &out, @intCast(index_entries.items.len));
-        try appendU32(self.alloc, &out, std.hash.Crc32.hash(index_bytes));
+        try appendU32(self.alloc, &out, Crc32.hash(index_bytes));
         try appendU16(self.alloc, &out, version);
         try appendU16(self.alloc, &out, 0);
         const footer_without_checksum = out.items[out.items.len - 24 ..];
-        try appendU32(self.alloc, &out, std.hash.Crc32.hash(footer_without_checksum));
+        try appendU32(self.alloc, &out, Crc32.hash(footer_without_checksum));
         try out.appendSlice(self.alloc, &magic);
         std.debug.assert(out.items.len == output_len);
         return try out.toOwnedSlice(self.alloc);
@@ -371,7 +371,7 @@ pub const StreamingWriter = struct {
             .sequence = sequence,
             .offset = offset,
             .len = value.len,
-            .checksum = std.hash.Crc32.hash(value),
+            .checksum = Crc32.hash(value),
         });
     }
 
@@ -415,7 +415,7 @@ pub const StreamingWriter = struct {
         try rejectDuplicateIndexEntries(self.entries.items);
 
         const index_offset = sink.len();
-        var admission_crc = std.hash.Crc32.init();
+        var admission_crc = Crc32.init();
         for (self.entries.items) |entry| {
             const encoded = encodeIndexEntry(entry);
             try sink.appendSlice(&encoded);
@@ -428,7 +428,7 @@ pub const StreamingWriter = struct {
         std.mem.writeInt(u32, footer[16..20], admission_crc.final(), .big);
         std.mem.writeInt(u16, footer[20..22], version, .big);
         std.mem.writeInt(u16, footer[22..24], 0, .big);
-        std.mem.writeInt(u32, footer[24..28], std.hash.Crc32.hash(footer[0..24]), .big);
+        std.mem.writeInt(u32, footer[24..28], Crc32.hash(footer[0..24]), .big);
         @memcpy(footer[28..32], &magic);
         try sink.appendSlice(&footer);
 
@@ -450,9 +450,9 @@ pub const Reader = struct {
         const footer = data[data.len - footer_size ..];
         if (!std.mem.eql(u8, footer[footer_size - magic.len ..], &magic)) return error.BadPostingSegmentMagic;
         const segment_version = readU16(footer[20..22]);
-        if (segment_version < min_supported_version or segment_version > version) return error.UnsupportedPostingSegmentVersion;
+        if (segment_version != version) return error.UnsupportedPostingSegmentVersion;
         if (readU16(footer[22..24]) != 0) return error.UnsupportedPostingSegmentFlags;
-        if (readU32(footer[24..28]) != std.hash.Crc32.hash(footer[0..24])) return error.PostingSegmentChecksumMismatch;
+        if (readU32(footer[24..28]) != Crc32.hash(footer[0..24])) return error.PostingSegmentChecksumMismatch;
         const entry_count_u64 = readU64(footer[8..16]);
         const entry_count = std.math.cast(usize, entry_count_u64) orelse return error.CorruptedPostingSegment;
         const index_region = checked_region.exactTail(
@@ -463,7 +463,7 @@ pub const Reader = struct {
             entry_count_u64,
             index_entry_size,
         ) catch return error.CorruptedPostingSegment;
-        if (readU32(footer[16..20]) != std.hash.Crc32.hash(index_region.slice(data))) return error.PostingSegmentChecksumMismatch;
+        if (readU32(footer[16..20]) != Crc32.hash(index_region.slice(data))) return error.PostingSegmentChecksumMismatch;
         const reader: Reader = .{
             .data = data,
             .index_offset = index_region.offset,
@@ -514,7 +514,7 @@ pub const Reader = struct {
     /// opaque payload pages. `init` has already checked their shape and the
     /// index carries a checksum for every payload value.
     pub fn admissionChecksum(self: Reader) u32 {
-        return std.hash.Crc32.hash(self.data[self.index_offset..]);
+        return Crc32.hash(self.data[self.index_offset..]);
     }
 
     pub fn deltas(self: Reader, posting_id: PostingId) DeltaIterator {
@@ -712,7 +712,7 @@ pub const VerifiedReader = struct {
             corrupt => return error.PostingSegmentChecksumMismatch,
             else => {},
         }
-        if (std.hash.Crc32.hash(bytes) != entry.checksum) {
+        if (Crc32.hash(bytes) != entry.checksum) {
             self.verification[index].store(corrupt, .release);
             return error.PostingSegmentChecksumMismatch;
         }
@@ -952,6 +952,13 @@ pub fn testValidatesFooterAndVersion() !void {
     defer alloc.free(bad_magic);
     bad_magic[bad_magic.len - 1] = 'x';
     try std.testing.expectError(error.BadPostingSegmentMagic, Reader.init(bad_magic));
+
+    const unsupported_segment = try alloc.dupe(u8, bytes);
+    defer alloc.free(unsupported_segment);
+    for ([_]u16{ 0, 1, 2, 3, version + 1 }) |unsupported| {
+        std.mem.writeInt(u16, unsupported_segment[unsupported_segment.len - footer_size + 20 ..][0..2], unsupported, .big);
+        try std.testing.expectError(error.UnsupportedPostingSegmentVersion, Reader.init(unsupported_segment));
+    }
 
     var bad_version = try alloc.dupe(u8, bytes);
     defer alloc.free(bad_version);

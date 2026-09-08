@@ -3670,6 +3670,13 @@ pub const ProvisionedTableWriteCache = struct {
         };
     }
 
+    /// Allocation is completed before acquiring the next lifetime pin. The
+    /// caller owns the entire batch and must release it on every exit.
+    fn appendMaintenanceLease(self: *ProvisionedTableWriteCache, leases: *std.ArrayListUnmanaged(CachedDb), entry: *Entry) !void {
+        try leases.ensureUnusedCapacity(self.alloc, 1);
+        leases.appendAssumeCapacity(self.leaseEntryLocked(entry));
+    }
+
     fn leaseLiveEntryForLocalMutationLocked(
         self: *ProvisionedTableWriteCache,
         group_id: u64,
@@ -6488,6 +6495,7 @@ pub const BoundTableWriteSource = struct {
         const db = try self.activeDb();
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
+        try db.configureTableStorage(req.storage);
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
         const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, raw_indexes_json, schema_json);
         defer alloc.free(expanded_indexes_json);
@@ -7310,6 +7318,10 @@ pub const ProvisionedTableWriteSource = struct {
         repair_health: RepairHealthObservation = .unknown,
         busy: bool = false,
         made_progress: bool = false,
+        // A native publication attempt yielded to another admitted owner or
+        // an advancing/stabilizing source boundary. Keep readiness debt, but
+        // do not count a deliberately deferred non-attempt as a failed pass.
+        native_publication_busy: bool = false,
         quarantined: bool = false,
         quarantine_retry_scheduled: bool = false,
         retry_at_ms: u64 = 0,
@@ -12666,6 +12678,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (db.overlayRuntimeStatusBestEffort(snapshot_cache.alloc, &status.stats)) {
             self.markManagedWriterRuntimeStatus(&status);
         }
+        // Enrichment activity hooks can run inside the DB apply boundary.
+        // Source counters have their own nonblocking lock; sampling unrelated
+        // LSM counters here would reenter the DB lock and stall publication.
+        if (db.sourceVectorStats()) |stats| status.source_vectors = stats;
         _ = snapshot_cache.publishGroup(publication_token, table_name, status) catch |err| {
             std.log.warn("managed runtime status overlay publish failed table={s} group_id={} err={s}", .{
                 table_name,
@@ -14310,7 +14326,7 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.startup_catch_up_backoff_mutex);
         defer self.startup_catch_up_backoff_mutex.unlock();
         if (self.startup_catch_up_backoff_epoch.load(.acquire) != expected_epoch) return;
-        if (result.busy) return;
+        if (result.busy or result.native_publication_busy) return;
         // Durable generation repair has its own owner, queue, and retry
         // policy. Once catch-up has handed that debt off, retaining a startup
         // backoff would make two schedulers compete for the same DB and can
@@ -14454,6 +14470,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (!self.local_db_mutex.tryLock()) return 0;
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
+        defer {
+            for (leases.items) |*lease| lease.deinit(lease_alloc);
+            leases.deinit(lease_alloc);
+        }
         {
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return 0;
@@ -14461,12 +14481,8 @@ pub const ProvisionedTableWriteSource = struct {
             for (cache.entries.items) |entry| {
                 if (entry.bulk_ingest_session_open) continue;
                 if (entry.db.hasActiveDenseBulkWork()) continue;
-                try leases.append(lease_alloc, cache.leaseEntryLocked(entry));
+                try cache.appendMaintenanceLease(&leases, entry);
             }
-        }
-        defer {
-            for (leases.items) |*lease| lease.deinit(lease_alloc);
-            leases.deinit(lease_alloc);
         }
         var total_steps: usize = 0;
         for (leases.items) |lease| {
@@ -14498,6 +14514,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (!self.local_db_mutex.tryLock()) return 0;
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
+        defer {
+            for (leases.items) |*lease| lease.deinit(lease_alloc);
+            leases.deinit(lease_alloc);
+        }
         {
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return 0;
@@ -14505,12 +14525,8 @@ pub const ProvisionedTableWriteSource = struct {
             for (cache.entries.items) |entry| {
                 if (entry.bulk_ingest_session_open) continue;
                 if (entry.db.hasActiveDenseBulkWork()) continue;
-                try leases.append(lease_alloc, cache.leaseEntryLocked(entry));
+                try cache.appendMaintenanceLease(&leases, entry);
             }
-        }
-        defer {
-            for (leases.items) |*lease| lease.deinit(lease_alloc);
-            leases.deinit(lease_alloc);
         }
         // Projection readiness is fail-closed. Invalidate before publishing
         // from the same leased writers so a best-effort refresh that loses a
@@ -14531,7 +14547,9 @@ pub const ProvisionedTableWriteSource = struct {
                 total_steps += 1;
                 continue;
             }
-            total_steps += try lease.db.runVectorBlockMaintenanceForIdle();
+            const published = try lease.db.runVectorBlockMaintenanceForIdle();
+            total_steps += published;
+            if (published != 0 and try lease.db.finalizeDenseProjectionLifecycleForIdle()) total_steps += 1;
         }
         return total_steps;
     }
@@ -15234,6 +15252,7 @@ pub const ProvisionedTableWriteSource = struct {
                         }
                         if (lifecycle_observed) self.markManagedWriterRuntimeStatus(&status);
                         status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
+                        if (owned.db.sourceVectorStats()) |stats| status.source_vectors = stats;
                         if (status.created_at_millis == 0) {
                             status.created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0;
                         }
@@ -15245,6 +15264,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0,
                     .stats = try owned.db.runtimeStatusStatsConsistent(alloc),
                     .lsm_storage_stats = lsmStorageStatsFromDb(owned.db),
+                    .source_vectors = owned.db.sourceVectorStats(),
                 };
                 self.markManagedWriterRuntimeStatus(&status);
                 break :blk status;
@@ -15269,6 +15289,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.markManagedWriterRuntimeStatus(status);
                 }
                 status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
+                if (owned.db.sourceVectorStats()) |stats| status.source_vectors = stats;
                 if (status.created_at_millis == 0) {
                     status.created_at_millis = (owned.db.getGroupCreatedAtMillis(std.heap.page_allocator, group_id) catch null) orelse 0;
                 }
@@ -17622,6 +17643,13 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, reconcile_options);
             if (reconcile_summary.indexes_pending != 0) {
+                // Embedded/standalone sources have no resident data-server
+                // maintenance lane. A matching definition can remain pending
+                // solely because replay finished after the preceding native
+                // publication pass. Advance that independent dependency from
+                // this background structural owner, not from replay callbacks.
+                if (self.local_index_repair_debt_hook == null)
+                    _ = try db.finalizeDenseProjectionLifecycleForIdle();
                 _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                 if (try db.hasPendingIndexRepairIntents(alloc)) {
                     if (self.local_index_repair_debt_hook != null) {
@@ -18225,6 +18253,7 @@ pub const ProvisionedTableWriteSource = struct {
                         }
                         target_generations[group_index] = entry.lsm_root_generation;
                         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
+                        try cached.db.configureTableStorage(req.storage);
                         try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                         // Catalog admission and local create can race an earlier
                         // startup/status open of this generation. The entry
@@ -18355,6 +18384,7 @@ pub const ProvisionedTableWriteSource = struct {
                 },
             );
             defer if (opened) |*db| db.close();
+            try opened.?.configureTableStorage(req.storage);
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
             // Register entity resolvers declared in the index config. Indexes
             // and enrichments are provisioned through the managed-open path, but
@@ -25832,7 +25862,14 @@ const ManagedIndexCreateCatchUp = union(enum) {
 /// its BackendRuntime owns both dependency progress and retry scheduling.
 fn drainStandaloneManagedIndexRepairDependencies(db: *db_mod.DB) !bool {
     db.runUntilIdleWithoutWaitingForEnrichmentRetries() catch |err| switch (err) {
-        error.EnrichmentRetryInProgress, error.ArtifactRepairRequired => return false,
+        error.EnrichmentRetryInProgress => return false,
+        error.ArtifactRepairRequired => {
+            // Replay can be waiting for this very generation's readiness
+            // proof. Its independently covered native publication must still
+            // progress before the standalone owner retires this DB.
+            _ = try db.finalizeDenseProjectionLifecycleForIdle();
+            return false;
+        },
         else => return err,
     };
     return true;
@@ -27832,6 +27869,7 @@ fn captureStructuralRuntimeStatusObservation(
         .group_id = group_id,
         .disk_bytes = disk_bytes,
         .created_at_millis = created_at_millis,
+        .source_vectors = db.sourceVectorStats(),
         .stats = try db.runtimeStatusStatsConsistent(alloc),
     };
     errdefer status.deinit(alloc);
@@ -28159,6 +28197,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
+            if (db.sourceVectorStats()) |stats| status.source_vectors = stats;
             try publishRuntimeStatusGroupAfterObservationMode(snapshot_cache, publication_token, table_name, status, mode);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
@@ -28170,6 +28209,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
+            if (db.sourceVectorStats()) |stats| status.source_vectors = stats;
             try publishRuntimeStatusGroupAfterObservationMode(snapshot_cache, publication_token, table_name, status, mode);
         }
         return;
@@ -28262,6 +28302,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         };
         status_initialized = true;
     }
+    if (db.sourceVectorStats()) |stats| status.source_vectors = stats;
     var startup = startupCatchUpStatsForPhase(phase, db);
     if (!startup.wal_retention_known and cached_startup.wal_retention_known) {
         startup.wal_retention_known = true;
@@ -29069,6 +29110,7 @@ fn mergeLiveIndexRepairResult(
     result.cleared_debt = result.cleared_debt or repair.cleared_debt;
     result.made_progress = result.made_progress or repair.made_progress;
     result.busy = repair.busy;
+    result.native_publication_busy = result.native_publication_busy or repair.native_publication_busy;
     result.index_repair_pending = repair.index_repair_pending;
     result.automatic_index_repair_discovery_pending =
         result.automatic_index_repair_discovery_pending or
@@ -29092,6 +29134,14 @@ const ManagedCatchUpMode = enum {
     // work after the caller releases broad lifecycle exclusivity.
     index_repair_prerequisite,
 };
+
+/// Both the initial and final audit must classify the same replay owner.
+/// Resident lag remains visible in index status, but is not startup repair.
+fn hasStartupOwnedReplayDebt(statuses: []const db_mod.DerivedReplayDebtStatus, resident_owns_derived: bool) bool {
+    if (resident_owns_derived) return false;
+    for (statuses) |status| if (status.catch_up_required) return true;
+    return false;
+}
 
 /// Detects the crash window where generated-enrichment replay reached its
 /// durable watermark but source outcomes for the current index incarnation
@@ -29181,9 +29231,7 @@ fn managedDbHasNonRepairCatchUpDebt(
         for (replay_debt) |*status| status.deinit(alloc);
         alloc.free(replay_debt);
     }
-    for (replay_debt) |status| {
-        if (status.catch_up_required and !resident_owns_derived) return true;
-    }
+    if (hasStartupOwnedReplayDebt(replay_debt, resident_owns_derived)) return true;
     if (pending_work.repair_metadata_rebuild_pending) return true;
     const enrichment = pending_work.enrichment;
     const resident_owns_enrichment = owner == .live_writer and
@@ -29196,7 +29244,10 @@ fn managedDbHasNonRepairCatchUpDebt(
         return true;
     }
     if (try db.restoreRuntimeRepairNeeded()) return true;
-    if (db.nativeVectorProjectionMaintenanceNeeded()) return true;
+    // The resident acceleration lane owns optimistic native publication.
+    // Its pending files are not permission to acquire the group-exclusive
+    // startup owner and block otherwise serviceable reads/writes.
+    if (owner == .isolated and db.nativeVectorProjectionMaintenanceNeeded()) return true;
     return try db.denseArtifactRebuildMaintenanceNeeded(alloc);
 }
 
@@ -29267,14 +29318,8 @@ fn catchUpManagedDb(
         resident_enrichment.worker_started and
         !resident_enrichment.worker_failed;
     var had_debt = generated_coverage_replay_needed;
-    var derived_replay_debt = false;
-    for (before) |status| {
-        if (!status.catch_up_required) continue;
-        if (resident_owns_derived) continue;
-        had_debt = true;
-        derived_replay_debt = true;
-        break;
-    }
+    const derived_replay_debt = hasStartupOwnedReplayDebt(before, resident_owns_derived);
+    had_debt = had_debt or derived_replay_debt;
     const repair_metadata_rebuild_pending = pending_work_before.repair_metadata_rebuild_pending;
     const enrichment_before = pending_work_before.enrichment;
     if (enrichment_before.enabled and
@@ -29377,6 +29422,7 @@ fn catchUpManagedDb(
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts = false;
     var repaired_native_vector_projection = false;
+    var native_publication_busy = false;
     var repaired_artifact_metadata = false;
     var attempted_index_repairs: usize = 0;
     var repaired_indexes: usize = 0;
@@ -29526,7 +29572,14 @@ fn catchUpManagedDb(
     if (runs_broad_debt and db.nativeVectorProjectionMaintenanceNeeded()) {
         progress_ctx.phase = .artifact_rebuild;
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-        repaired_native_vector_projection = try db.publishVectorBlockBasesAtStableTip() != 0;
+        const publication: db_mod.DB.NativePublicationResult = if (owner == .live_writer)
+            try db.publishVectorBlockBasesOnlineReported(.{
+                .cancel_check = index_repair_options.cancel_check,
+            })
+        else
+            .{ .published = try db.publishVectorBlockBasesAtStableTip() };
+        native_publication_busy = publication.busy or publication.deferred;
+        repaired_native_vector_projection = publication.published != 0;
         made_progress = made_progress or repaired_native_vector_projection;
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
     }
@@ -29576,6 +29629,12 @@ fn catchUpManagedDb(
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
     }
 
+    // Source-outcome completion and acceleration publication are separate
+    // lanes. Repair may have supplied the last missing artifact after the
+    // earlier broad pass; retry the nonblocking handoff before auditing debt.
+    // A newly started posting builder remains pending for the next round.
+    if (try db.finalizeDenseProjectionLifecycleForIdle()) made_progress = true;
+
     if (mode == .all_debt and !initial_repair_debt and !repaired_restore_runtime and !repaired_dense_artifacts) {
         return .{};
     }
@@ -29588,6 +29647,7 @@ fn catchUpManagedDb(
             // before trusting this completion edge.
             .cleared_debt = initial_broad_debt,
             .made_progress = made_progress,
+            .native_publication_busy = native_publication_busy,
             .index_repair_pending = advance_index_repairs,
         };
     }
@@ -29633,6 +29693,28 @@ fn catchUpManagedDb(
         }
     }
 
+    // Repair activation can change the authoritative posting-generation
+    // identity after the broad projection pass above. Complete the native
+    // exact-vector handoff before auditing remaining debt. A live repair must
+    // use the same optimistic lane as recurring maintenance: posting authority
+    // is already durable, and acceleration must not drain/rebuild unrelated
+    // indexes while holding the foreground write fence. If source traffic
+    // wins publication, the recurring lane still owns the pending boundary.
+    if (repaired_indexes != 0 and db.nativeVectorProjectionMaintenanceNeeded()) {
+        progress_ctx.phase = .artifact_rebuild;
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        const published = if (owner == .live_writer)
+            try db.publishVectorBlockBasesOnline(.{
+                .cancel_check = index_repair_options.cancel_check,
+                .require_quiescence = false,
+            })
+        else
+            try db.publishVectorBlockBasesAtStableTip();
+        repaired_native_vector_projection = repaired_native_vector_projection or published != 0;
+        made_progress = made_progress or published != 0;
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+    }
+
     if (mode == .all_debt) {
         const after = db.listDerivedReplayDebt(alloc) catch |err| {
             std.log.warn("managed startup catch-up post-check debt failed table={s} err={}", .{ table_name, err });
@@ -29643,8 +29725,7 @@ fn catchUpManagedDb(
             alloc.free(after);
         }
 
-        for (after) |status| {
-            if (!status.catch_up_required) continue;
+        if (hasStartupOwnedReplayDebt(after, resident_owns_derived)) {
             return .{
                 .had_debt = initial_repair_debt,
                 .cleared_debt = false,
@@ -29666,6 +29747,7 @@ fn catchUpManagedDb(
                 .had_debt = initial_repair_debt,
                 .cleared_debt = false,
                 .made_progress = made_progress,
+                .native_publication_busy = native_publication_busy,
             };
         }
         if (db.pendingWorkStats().repair_metadata_rebuild_pending) {
@@ -33996,6 +34078,34 @@ test "auto bulk max-window request waits for idle finish" {
     try std.testing.expectEqual(primary_before_idle.manifest_writes, primary_after_idle.manifest_writes);
     try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.active_bulk_ingest_sessions.items.len);
+}
+
+test "maintenance lease batch releases all pins on every allocation failure" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            // This tests lifetime acquisition only: the DB handles are never
+            // dereferenced or owned by the cache's live/retired entry arrays.
+            var entries: [32]ProvisionedTableWriteCache.Entry = undefined;
+            for (&entries) |*entry| entry.* = .{
+                .group_id = 0,
+                .lsm_root_generation = 0,
+                .table_name = undefined,
+                .managed_config_fingerprint = undefined,
+                .db = undefined,
+            };
+            defer for (entries) |entry| std.debug.assert(entry.active_leases == 0);
+            var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+            defer {
+                for (leases.items) |*lease| lease.deinit(alloc);
+                leases.deinit(alloc);
+            }
+            for (&entries) |*entry| try cache.appendMaintenanceLease(&leases, entry);
+            for (entries) |entry| try std.testing.expectEqual(@as(usize, 1), entry.active_leases);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "auto bulk background finish skips entries with active foreground leases" {
@@ -48167,6 +48277,45 @@ test "managed startup catch-up quarantines repeated zero progress with bounded b
     try std.testing.expectEqual(@as(usize, 0), source.startup_catch_up_backoffs.count());
 }
 
+test "managed startup catch-up does not quarantine native publication contention" {
+    const lagging = [_]db_mod.DerivedReplayDebtStatus{.{
+        .index_name = "vec",
+        .kind = .dense_vector,
+        .applied_sequence = 126,
+        .target_sequence = 501,
+        .catch_up_required = true,
+    }};
+    // The final audit must reach native deferral, not return zero progress
+    // for a journal owned by a different worker. Isolated owners still repair
+    // that same durable lag; neither check changes the public watermark.
+    try std.testing.expect(!hasStartupOwnedReplayDebt(&lagging, true));
+    try std.testing.expect(hasStartupOwnedReplayDebt(&lagging, false));
+    try std.testing.expect(!hasStartupOwnedReplayDebt(&.{}, false));
+    var handoff = ProvisionedTableWriteSource.StartupCatchUpResult{ .native_publication_busy = true };
+    mergeLiveIndexRepairResult(&handoff, .{});
+    try std.testing.expect(handoff.native_publication_busy);
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-native-publication-backoff", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    const epoch = source.startup_catch_up_backoff_epoch.load(.acquire);
+    for (0..16) |attempt| {
+        var result = ProvisionedTableWriteSource.StartupCatchUpResult{
+            .had_debt = true,
+            .native_publication_busy = true,
+        };
+        source.updateStartupCatchUpBackoff(7001, 1000 + attempt, epoch, &result);
+        try std.testing.expect(!result.quarantined);
+        try std.testing.expect(!result.made_progress);
+        try std.testing.expect(!result.cleared_debt);
+    }
+    // Once admission succeeds, genuine non-progress still has the original
+    // bounded retry policy. Contention never certifies readiness or repair.
+    for (0..startup_catch_up_no_progress_threshold) |attempt| {
+        var result = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+        source.updateStartupCatchUpBackoff(7001, 2000 + attempt, epoch, &result);
+        try std.testing.expectEqual(attempt + 1 == startup_catch_up_no_progress_threshold, result.quarantined);
+    }
+}
+
 test "managed startup catch-up releases writer ownership when repair is delegated" {
     try std.testing.expect(ProvisionedTableWriteSource.shouldPreserveStartupWriteCache(.{
         .had_debt = true,
@@ -48292,8 +48441,13 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     try source.clearStartupWriteCachePreservingPublishedStatus("docs", stale_token);
     // A catalog/storage epoch newer than the preserved publication always
     // wins, even if another observation repopulated the cache before the old
-    // startup writer retired.
-    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    // startup writer retired. Owner retirement keeps the last immutable
+    // serving observation but withdraws its target-convergence authority.
+    var retired = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer retired.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), retired.items.len);
+    try std.testing.expectEqual(@as(u64, 2), retired.items[0].stats.doc_count);
+    try std.testing.expect(!retired.items[0].metadata.target_observation_complete);
 }
 
 test "clean generated startup inspection does not retain a resident writer" {
@@ -55634,4 +55788,35 @@ test "hosted background writes carry the selected catalog fence through routed R
         .sync_level = .write,
     });
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "source vector status activity overlay never reenters the held DB apply lock" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-status-overlay", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{
+        .table_storage = .{ .dense_embeddings = .vector_store },
+    });
+    defer db.close();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
+        .group_id = 7001,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{},
+    });
+    var source = ProvisionedTableWriteSource.init("/unused-source-status-overlay", undefined);
+    source.runtime_status_cache = &snapshot_cache;
+    {
+        db.core.lockApplyExclusive();
+        defer db.core.unlockApplyExclusive();
+        try std.testing.expect(source.overlayCachedManagedRuntimeStatusBestEffort("docs", 7001, &db));
+    }
+    var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), statuses.items[0].source_vectors.?.retained_payloads);
+    // Unavailable LSM counters are not fabricated as zero-valued samples.
+    try std.testing.expect(statuses.items[0].lsm_storage_stats == null);
 }

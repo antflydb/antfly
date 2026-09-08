@@ -2771,8 +2771,11 @@ def stateful_api(request: pytest.FixtureRequest):
             num_shards: int = 1,
             description: str | None = None,
             indexes: dict[str, dict] | None = None,
+            storage: dict[str, str] | None = None,
         ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
+            if storage is not None:
+                payload["storage"] = storage
             if description is not None:
                 payload["description"] = description
             if indexes is not None:

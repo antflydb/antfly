@@ -313,7 +313,7 @@ pub const PostingStore = struct {
         }
         vec.scale(1.0 / @as(f32, @floatFromInt(node.members.len)), node.centroid);
         normalizeCentroidForMetric(index, node.centroid);
-        if (index.config.metric == .l2_squared) {
+        if (index.config.metric != .inner_product) {
             var radius_only_vectors: ?[]f32 = null;
             defer if (radius_only_vectors) |vectors| index.alloc.free(vectors);
             if (loaded_vectors == null) {
@@ -329,17 +329,7 @@ pub const PostingStore = struct {
                     _ = index.transformVector(raw, vectors[row * index.config.dims ..][0..index.config.dims]);
                 }
             }
-            var max_squared: f32 = 0;
-            for (0..node.members.len) |row| {
-                const candidate = vectors[row * index.config.dims ..][0..index.config.dims];
-                var squared: f32 = 0;
-                for (node.centroid, candidate) |center, value| {
-                    const delta = value - center;
-                    squared += delta * delta;
-                }
-                max_squared = @max(max_squared, squared);
-            }
-            node.covering_radius = @sqrt(max_squared);
+            node.covering_radius = coveringRadiusForMatrix(index.config.metric, node.centroid, vectors, node.members.len);
         } else {
             node.covering_radius = std.math.nan(f32);
         }
@@ -512,6 +502,94 @@ fn containsMember(members: []const VectorId, vector_id: VectorId) bool {
     return indexOfMember(members, vector_id) != null;
 }
 
+/// Shared by full refresh, bulk construction and splits. Cosine balls live
+/// on the unit sphere, not in raw embedding space. Zero/non-finite vectors
+/// cannot certify that metric ball and deliberately retain the search fallback.
+pub fn coveringRadiusForMatrix(metric: vec.DistanceMetric, centroid: []const f32, vectors: []const f32, count: usize) f32 {
+    if (metric == .inner_product) return std.math.nan(f32);
+    if (count == 0) return 0;
+    const length = std.math.mul(usize, count, centroid.len) catch return std.math.nan(f32);
+    if (centroid.len == 0 or vectors.len < length) return std.math.nan(f32);
+    if (metric == .cosine) {
+        var center_squared: f64 = 0;
+        for (centroid) |value| center_squared += @as(f64, value) * value;
+        if (!(center_squared > 0) or !std.math.isFinite(center_squared)) return std.math.nan(f32);
+        var max_squared: f64 = 0;
+        for (0..count) |row| {
+            const candidate = vectors[row * centroid.len ..][0..centroid.len];
+            var norm_squared: f64 = 0;
+            var dot: f64 = 0;
+            for (centroid, candidate) |center, value| {
+                norm_squared += @as(f64, value) * value;
+                dot += @as(f64, center) * value;
+            }
+            if (!(norm_squared > 0) or !std.math.isFinite(norm_squared) or !std.math.isFinite(dot)) return std.math.nan(f32);
+            const squared = @max(@as(f64, 0), 2 - 2 * dot / @sqrt(center_squared * norm_squared));
+            max_squared = @max(max_squared, squared);
+        }
+        return conservativeCosineRadius(@floatCast(@sqrt(max_squared)));
+    }
+    var max_squared: f32 = 0;
+    for (0..count) |row| {
+        const candidate = vectors[row * centroid.len ..][0..centroid.len];
+        var squared: f32 = 0;
+        for (centroid, candidate) |center, value| {
+            const delta = value - center;
+            squared += delta * delta;
+        }
+        if (!std.math.isFinite(squared)) return std.math.nan(f32);
+        max_squared = @max(max_squared, squared);
+    }
+    return @sqrt(max_squared);
+}
+
+pub fn conservativeCosineRadius(radius: f32) f32 {
+    if (!std.math.isFinite(radius) or radius < 0) return std.math.nan(f32);
+    return std.math.nextAfter(f32, radius * 1.000001 + 0.000001, std.math.inf(f32));
+}
+
+/// Tight spherical-cap bound from an existing normalized chord radius. If
+/// alpha is the query/center angle and theta the cap angle, every member has
+/// angle >= max(0, alpha-theta). Evaluate cos(alpha-theta) in f64 without
+/// inverse trig; round inputs and output toward the non-pruning direction.
+/// The caller must supply a conservative cosine-distance lower bound.
+pub fn cosineAngularLowerBound(distance_lower: f32, radius: f32) ?f32 {
+    if (!std.math.isFinite(distance_lower) or !std.math.isFinite(radius) or radius < 0) return null;
+    const guard: f64 = 8 * std.math.floatEps(f32);
+    const distance: f64 = @min(2, @max(0, @as(f64, distance_lower) - guard));
+    const chord: f64 = @min(2, @as(f64, radius) + guard);
+    const cap_distance = 0.5 * chord * chord;
+    if (distance <= cap_distance) return 0;
+    const cos_alpha = 1 - distance;
+    const cos_theta = 1 - cap_distance;
+    const sin_alpha = @sqrt(@max(0, distance * (2 - distance)));
+    const sin_theta = @sqrt(@max(0, cap_distance * (2 - cap_distance)));
+    const lower = 1 - (cos_alpha * cos_theta + sin_alpha * sin_theta);
+    return @floatCast(@max(0, lower - 2 * guard));
+}
+
+test "angular cosine cap bound is conservative over the sphere and tighter than chord subtraction" {
+    const pi: f64 = std.math.pi;
+    for (0..33) |a| for (0..33) |t| {
+        const alpha = @as(f64, @floatFromInt(a)) * pi / 32;
+        const theta = @as(f64, @floatFromInt(t)) * pi / 32;
+        const radius = conservativeCosineRadius(@floatCast(2 * @sin(theta / 2)));
+        const lower = cosineAngularLowerBound(@floatCast(1 - @cos(alpha)), radius).?;
+        for (0..3) |b| for (0..9) |p| {
+            const beta = theta * @as(f64, @floatFromInt(b)) / 2;
+            const phi = @as(f64, @floatFromInt(p)) * pi / 4;
+            const exact = 1 - (@cos(alpha) * @cos(beta) + @sin(alpha) * @sin(beta) * @cos(phi));
+            try std.testing.expect(@as(f64, lower) <= exact + 1e-12);
+        };
+    };
+    const radius: f32 = @floatCast(2 * @sin(pi / 12));
+    const angular = cosineAngularLowerBound(1, radius).?;
+    const chord = 0.5 * std.math.pow(f32, @sqrt(@as(f32, 2)) - radius, 2);
+    try std.testing.expect(angular > chord + 0.09);
+    try std.testing.expect(cosineAngularLowerBound(1, std.math.nan(f32)) == null);
+    try std.testing.expectEqual(@as(f32, 0), cosineAngularLowerBound(1, 2).?);
+}
+
 fn normalizeCentroidForMetric(index: anytype, centroid: []f32) void {
     if (index.config.metric == .cosine and centroid.len > 0) {
         _ = vec.normalize(centroid);
@@ -674,6 +752,11 @@ test "posting centroid recompute uses batch transformed vector loader" {
         fn loadPostingVectorsTransformed(self: *@This(), _: void, ids: []const u64, matrix: []f32) !void {
             self.batch_calls += 1;
             for (ids, 0..) |id, i| {
+                if (self.config.metric == .cosine) {
+                    matrix[i * 2] = if (id == 1) 1 else 0;
+                    matrix[i * 2 + 1] = if (id == 1) 0 else 1;
+                    continue;
+                }
                 matrix[i * 2] = @floatFromInt(id);
                 matrix[i * 2 + 1] = @floatFromInt(id * 2);
             }
@@ -699,6 +782,31 @@ test "posting centroid recompute uses batch transformed vector loader" {
     try std.testing.expectEqual(@as(usize, 1), index.batch_calls);
     try std.testing.expectApproxEqAbs(@as(f32, 2), node.centroid[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 4), node.centroid[1], 0.0001);
+    index.config.metric = .cosine;
+    try PostingStore.recomputeCentroid(&index, {}, &node);
+    try std.testing.expectEqual(@as(usize, 2), index.batch_calls);
+    try std.testing.expect(std.math.isFinite(node.covering_radius));
+    const expected = @sqrt(@as(f64, 2) - @sqrt(@as(f64, 2)));
+    try std.testing.expect(@as(f64, node.covering_radius) >= expected);
+    try std.testing.expect(@as(f64, node.covering_radius) < expected + 0.00001);
+}
+
+test "cosine covering radius is scale invariant conservative and fails closed for degenerate input" {
+    const center = [_]f32{ 8, 6, 0 };
+    const vectors = [_]f32{ 6, 8, 0, 9.6, 2.8, 0, 8, 4.8, 3.6 };
+    const radius = coveringRadiusForMatrix(.cosine, &center, &vectors, 3);
+    try std.testing.expect(std.math.isFinite(radius));
+    for (0..3) |row| {
+        const candidate = vectors[row * 3 ..][0..3];
+        const exact_chord = @sqrt(2.0 * vec.distance(&center, candidate, .cosine));
+        try std.testing.expect(radius >= exact_chord);
+    }
+    try std.testing.expect(std.math.isNan(coveringRadiusForMatrix(.cosine, &.{ 0, 0 }, &.{ 1, 0 }, 1)));
+    try std.testing.expect(std.math.isNan(coveringRadiusForMatrix(.cosine, &.{ 1, 0 }, &.{ 0, 0 }, 1)));
+    try std.testing.expect(std.math.isNan(coveringRadiusForMatrix(.cosine, &.{ 1, 0 }, &.{ std.math.nan(f32), 0 }, 1)));
+    try std.testing.expect(std.math.isNan(coveringRadiusForMatrix(.cosine, &.{ 1, 0 }, &.{ 1, 0 }, 2)));
+    try std.testing.expect(std.math.isNan(coveringRadiusForMatrix(.inner_product, &.{ 1, 0 }, &.{ 1, 0 }, 1)));
+    try std.testing.expectEqual(@as(f32, 0), coveringRadiusForMatrix(.cosine, &.{}, &.{}, 0));
 }
 
 test "quantized refresh uses batch transformed vector loader with options" {

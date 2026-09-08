@@ -82,6 +82,24 @@ pub fn nowSeconds() u64 {
     return monotonicNs() / std.time.ns_per_s;
 }
 
+/// CPU consumed by the calling OS thread, not elapsed wall time or node-wide
+/// CPU. Use only around synchronous work on the same thread. Unsupported
+/// targets and clock failures are explicit absence, never a fabricated zero.
+pub fn threadCpuNs() ?u64 {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return null;
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.THREAD_CPUTIME_ID, &ts))) {
+        .SUCCESS => return std.math.cast(u64, @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return null,
+    }
+}
+
+test "thread CPU clock is monotonic where supported" {
+    const before = threadCpuNs() orelse return;
+    const after = threadCpuNs() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(after >= before);
+}
+
 pub fn residentBytes() usize {
     if (comptime builtin.os.tag == .freestanding) return 0;
 

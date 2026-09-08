@@ -1605,8 +1605,9 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
     assert doc_key in _query_hit_ids(artifact_semantic)
 
 
+@pytest.mark.parametrize("dense_embeddings", ["primary_lsm", "vector_store"])
 def test_executable_embedding_artifact_producer_survives_restart(
-    stateful_api, openai_embedder
+    stateful_api, openai_embedder, dense_embeddings
 ):
     """Exercise a public chunk/embedding chain without an embedding-index owner."""
 
@@ -1617,7 +1618,8 @@ def test_executable_embedding_artifact_producer_survives_restart(
     doc_key = "artifact-registry-doc"
     restarted_doc_key = "artifact-registry-doc-after-restart"
 
-    stateful_api.create_table(table_name, num_shards=1)
+    stateful_api.create_table(table_name, num_shards=1, storage={"dense_embeddings": dense_embeddings})
+    assert stateful_api.get_table(table_name)["storage"]["dense_embeddings"] == dense_embeddings
     stateful_api.put(
         f"{_table_artifact_path(table_name, chunk_name)}/enrichment",
         {

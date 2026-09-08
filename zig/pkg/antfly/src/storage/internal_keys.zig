@@ -87,6 +87,7 @@ pub const artifact_source_revision_kind: u8 = 0x3e;
 /// ordered by source priority and state identity so winner fallback can stop at
 /// the first surviving record.
 pub const graph_global_edge_contender_kind: u8 = 0x3f;
+pub const table_storage_settings_key = [_]u8{ replay_namespace, 0xff, 0x40 };
 pub const enrichment_terminal_failure_generation_counter_key = [_]u8{
     replay_namespace,
     0xff,

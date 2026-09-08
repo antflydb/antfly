@@ -50,6 +50,7 @@ const persistent_mod = @import("../../persistent.zig");
 const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const vector_block_store_mod = @import("../../vector_block_store.zig");
+const native_read_scratch_pool = @import("../../native_read_scratch_pool.zig");
 const posting_segment_store_mod = @import("../../posting_segment_store.zig");
 const vector_block_mod = @import("antfly_vectorindex").vector_block;
 const background_runtime_mod = @import("../../background_runtime.zig");
@@ -285,6 +286,10 @@ pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_vector_block_primary_snapshot_builds: usize = 0;
+pub var test_before_vector_block_primary_snapshot_build: ?struct {
+    ctx: *anyopaque,
+    call: *const fn (*anyopaque) anyerror!void,
+} = null;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
@@ -1256,9 +1261,13 @@ pub const DenseSplitHandoff = struct {
     }
 };
 
+const source_payload_store_mod = @import("../../vector_payload_store.zig");
+const source_payload_mod = @import("../../artifact_payload.zig");
+
 const SharedVectorBlockGeneration = struct {
     alloc: Allocator,
     opened: vector_block_store_mod.Opened,
+    source_snapshot: ?vector_block_store_mod.Opened = null,
     refs: std.atomic.Value(u64) = .init(1),
 
     fn create(alloc: Allocator, opened: vector_block_store_mod.Opened) !*SharedVectorBlockGeneration {
@@ -1278,6 +1287,7 @@ const SharedVectorBlockGeneration = struct {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const alloc = self.alloc;
         self.opened.deinit();
+        if (self.source_snapshot) |*snapshot| snapshot.deinit();
         alloc.destroy(self);
     }
 };
@@ -1288,9 +1298,28 @@ const SplitSide = enum {
 };
 
 pub const IndexManager = struct {
+    pub fn tryAcquireCatalogRead(self: *IndexManager) bool {
+        const closed: u32 = @as(u32, 1) << 31;
+        var observed = self.published_dense_admission.load(.monotonic);
+        while (true) {
+            if (observed & closed != 0 or observed & (closed - 1) == closed - 1) return false;
+            if (self.published_dense_admission.cmpxchgWeak(observed, observed + 1, .acquire, .monotonic)) |actual| {
+                observed = actual;
+            } else return true;
+        }
+    }
+
+    pub fn releaseCatalogRead(self: *IndexManager) void {
+        const previous = self.published_dense_admission.fetchSub(1, .release);
+        std.debug.assert(previous & ((@as(u32, 1) << 31) - 1) != 0);
+    }
+
     pub const dense_native_backup_backend_id = "hbc-native-v1";
     const max_retired_lsm_owner_stats: usize = 1024;
     const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
+    /// Stable-address lifetime admission shared by DB searches and background
+    /// publishers. The high bit closes admission during structural changes.
+    published_dense_admission: std.atomic.Value(u32) = .init(0),
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -1314,7 +1343,13 @@ pub const IndexManager = struct {
     hbc_cache: ?*hbc_mod.Cache,
     lsm_root_generation: u64,
     io: ?std.Io,
+    // Experimental table-owned payloads outlive their last ANN consumer.
+    // Retain source namespaces (including chunk parents); document/enrichment
+    // deletion, rather than index retirement, determines their liveness.
+    table_owns_embedding_artifacts: bool = false,
+    source_payload_store: ?*source_payload_store_mod.Store = null,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    native_read_scratch: *native_read_scratch_pool.Pool,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
     retained_vector_cache_enabled: ?bool,
@@ -1352,6 +1387,9 @@ pub const IndexManager = struct {
     vector_block_stable_tip_sequence: std.atomic.Value(u64) = .init(0),
     vector_block_stable_tip_index: std.atomic.Value(usize) = .init(0),
     vector_block_generation: ?*SharedVectorBlockGeneration = null,
+    /// Wake deferred posting acceleration for same-sequence vector rebuilds
+    /// as well as new source writes. No borrowed pointer/ABA identity escapes.
+    vector_block_publication_revision: std.atomic.Value(u64) = .init(1),
     // Once a source transaction changes dense artifacts, an older immutable
     // base must never receive later coverage-only watermarks. Keeping CURRENT
     // at its last genuinely covered sequence is also the crash-safe dirty
@@ -2081,6 +2119,7 @@ pub const IndexManager = struct {
             location: vector_block_store_mod.LocatedValue,
             byte_offset: usize,
             byte_len: usize,
+            borrowed_bytes: ?[]const u8 = null,
         };
 
         const ReadTxnKind = enum {
@@ -2102,11 +2141,18 @@ pub const IndexManager = struct {
         native_vector_source_sequence: ?u64 = null,
         native_vector_locations: std.AutoHashMapUnmanaged(u64, CachedNativeProjection) = .empty,
         native_vector_projection_bytes: std.ArrayListUnmanaged(u8) = .empty,
+        native_projection_borrows: vector_block_store_mod.ProjectionBorrowScope = .{},
+        native_projection_borrow_budget: ?resource_manager_mod.BudgetedAllocator = null,
         /// Bounded payload destinations and request descriptors owned only
         /// while one native positional-read wave is active. This makes the
         /// concurrency experiment visible to the same dense-search resource
         /// envelope as retained query projections.
         native_vector_io_bytes: u64 = 0,
+        /// Reused across exact-completion batches in this query only. Its
+        /// backing allocator reserves before growth; destruction releases all
+        /// capacity, so high concurrency cannot leave an idle residual cache.
+        residual_budget: ?resource_manager_mod.BudgetedAllocator = null,
+        residual_arena: ?std.heap.ArenaAllocator = null,
         raw_cache_hits: u64 = 0,
         raw_cache_misses: u64 = 0,
         raw_batch_reads: u64 = 0,
@@ -2153,6 +2199,10 @@ pub const IndexManager = struct {
             self.clearNativeVectorLocations();
             self.native_vector_locations.deinit(self.context.manager.alloc);
             self.native_vector_projection_bytes.deinit(self.context.manager.alloc);
+            self.native_projection_borrows.deinit(self.projectionBorrowAllocator());
+            if (self.native_projection_borrow_budget) |*budget| budget.deinit();
+            if (self.residual_arena) |*arena| arena.deinit();
+            if (self.residual_budget) |*budget| budget.deinit();
             self.context.manager.observeDenseWorkingBytes(self.working_slice, &self.working_bytes_current, 0);
             if (self.read_txn) |*txn| txn.abort();
             if (self.decoded_residency_lease) |*lease| lease.deinit();
@@ -2162,6 +2212,7 @@ pub const IndexManager = struct {
         fn clearNativeVectorLocations(self: *@This()) void {
             self.native_vector_locations.clearRetainingCapacity();
             self.native_vector_projection_bytes.clearRetainingCapacity();
+            self.native_projection_borrows.clear();
             if (self.native_vector_generation) |generation| generation.release();
             self.native_vector_generation = null;
             self.native_vector_source_sequence = null;
@@ -2186,6 +2237,15 @@ pub const IndexManager = struct {
             projection: vector_block_store_mod.LoadedProjection,
         ) void {
             if (self.native_vector_locations.contains(vector_id)) return;
+            if (projection.borrowed) {
+                self.native_vector_locations.put(self.context.manager.alloc, vector_id, .{
+                    .location = projection.located,
+                    .byte_offset = 0,
+                    .byte_len = projection.value.bytes.len,
+                    .borrowed_bytes = projection.value.bytes,
+                }) catch {};
+                return;
+            }
             const old_len = self.native_vector_projection_bytes.items.len;
             self.native_vector_projection_bytes.appendSlice(
                 self.context.manager.alloc,
@@ -2211,17 +2271,24 @@ pub const IndexManager = struct {
             if (self.native_vector_generation == null or self.native_vector_source_sequence != source_sequence)
                 return null;
             const cached = self.native_vector_locations.get(vector_id) orelse return null;
-            if (cached.byte_offset > self.native_vector_projection_bytes.items.len or
-                cached.byte_len > self.native_vector_projection_bytes.items.len - cached.byte_offset)
+            if (cached.borrowed_bytes == null and (cached.byte_offset > self.native_vector_projection_bytes.items.len or
+                cached.byte_len > self.native_vector_projection_bytes.items.len - cached.byte_offset))
             {
                 return null;
             }
-            const bytes = self.native_vector_projection_bytes.items[cached.byte_offset..][0..cached.byte_len];
+            const bytes = cached.borrowed_bytes orelse self.native_vector_projection_bytes.items[cached.byte_offset..][0..cached.byte_len];
             const value = switch (cached.location) {
                 .wal => |wal| wal,
                 .block => |block| block.location.projectionValueFromPayload(bytes) catch return null,
             };
             return .{ .located = cached.location, .value = value };
+        }
+
+        fn projectionBorrowAllocator(self: *@This()) Allocator {
+            if (self.native_projection_borrow_budget == null) {
+                if (self.context.manager.resource_manager) |manager| self.native_projection_borrow_budget = resource_manager_mod.BudgetedAllocator.init(manager, self.working_slice, self.context.manager.alloc, 1);
+            }
+            return if (self.native_projection_borrow_budget) |*budget| budget.allocator() else self.context.manager.alloc;
         }
 
         fn cacheDecodedVector(self: *@This(), index: *hbc_mod.HBCIndex, vector_id: u64, vector: []const f32) void {
@@ -2264,6 +2331,32 @@ pub const IndexManager = struct {
         fn setNativeVectorIoBytes(self: *@This(), bytes: u64) void {
             self.native_vector_io_bytes = bytes;
             self.observeWorkingBytes();
+        }
+
+        fn beginResidualScratch(self: *@This()) std.mem.Allocator {
+            if (self.residual_arena == null) {
+                if (self.context.manager.resource_manager) |manager|
+                    self.residual_budget = resource_manager_mod.BudgetedAllocator.init(manager, self.working_slice, std.heap.page_allocator, 1);
+                // These buffers live for a joined read batch/query, not an
+                // index lifetime. Return their pages on teardown instead of
+                // leaving burst-sized arenas in libc's medium allocation
+                // cache. Retain/reuse within a query and pre-growth resource
+                // admission are unchanged.
+                self.residual_arena = std.heap.ArenaAllocator.init(if (self.residual_budget) |*budget| budget.allocator() else std.heap.page_allocator);
+            }
+            _ = self.residual_arena.?.reset(.retain_capacity);
+            return self.residual_arena.?.allocator();
+        }
+
+        fn endResidualScratch(self: *@This()) void {
+            // All read tasks must have joined before this reset. Borrowed
+            // generation pointers never escape a completion call.
+            if (self.residual_arena) |*arena| _ = arena.reset(.retain_capacity);
+        }
+
+        fn residualAllocationError(self: *const @This(), err: error{OutOfMemory}) anyerror {
+            if (self.residual_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+            return err;
         }
 
         fn observeWorkingBytes(self: *@This()) void {
@@ -2537,13 +2630,57 @@ pub const IndexManager = struct {
     };
 
     threadlocal var active_dense_vector_load_session: ?*DenseVectorLoadSession = null;
+    /// One builder owns this scratch and must keep its address stable after
+    /// first use. Only leaf-local keys/request descriptors live here; returned
+    /// projections always borrow the caller's separately owned payload buffer.
+    const DenseProjectionBuildScratch = struct {
+        arena: ?std.heap.ArenaAllocator = null,
+        budget: ?resource_manager_mod.BudgetedAllocator = null,
+
+        fn allocator(self: *@This(), backing: Allocator, manager: ?*resource_manager_mod.ResourceManager) Allocator {
+            if (self.arena == null) {
+                if (manager) |resources| {
+                    self.budget = resource_manager_mod.BudgetedAllocator.init(resources, .dense_vector_block_build_working_set, backing, 1);
+                }
+                self.arena = std.heap.ArenaAllocator.init(if (self.budget) |*budget| budget.allocator() else backing);
+            }
+            return self.arena.?.allocator();
+        }
+
+        fn reset(self: *@This()) void {
+            if (self.arena) |*arena| _ = arena.reset(.retain_capacity);
+        }
+
+        fn allocationError(self: *const @This(), err: anyerror) anyerror {
+            if (err == error.OutOfMemory) if (self.budget) |*budget| {
+                if (budget.denied()) return error.ResourceBudgetExceeded;
+            };
+            return err;
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.arena) |*arena| arena.deinit();
+            if (self.budget) |*budget| budget.deinit();
+            self.* = .{};
+        }
+    };
+
     const DenseProjectionBuildSession = struct {
         context: *DenseVectorLoadContext,
         source_sequence: u64,
         generation: *SharedVectorBlockGeneration,
         cold_reader: ?vector_block_store_mod.Opened.ColdProjectionSession,
+        scratch: DenseProjectionBuildScratch = .{},
+        started_ns: u64 = 0,
+        lookup_ns: u64 = 0,
+        read_ns: u64 = 0,
+        batches: u64 = 0,
+        vectors: u64 = 0,
+        physical_reads: u64 = 0,
+        physical_bytes: u64 = 0,
 
         fn deinit(self: *@This()) void {
+            self.scratch.deinit();
             if (self.cold_reader) |*reader| reader.deinit();
             self.generation.release();
             self.* = undefined;
@@ -2662,6 +2799,8 @@ pub const IndexManager = struct {
             alloc.destroy(manager);
         };
         const bind_cache_resource_manager = opts.bind_cache_resource_manager and owned_resource_manager == null;
+        const native_read_scratch = try native_read_scratch_pool.Pool.create(alloc, resource_manager);
+        errdefer native_read_scratch.destroy();
 
         var owned_vector_block_storage: ?*lsm_backend_mod.NativeStorage = null;
         errdefer if (owned_vector_block_storage) |storage| {
@@ -2746,6 +2885,7 @@ pub const IndexManager = struct {
             .io = null,
             .resource_manager = resource_manager,
             .owned_resource_manager = owned_resource_manager,
+            .native_read_scratch = native_read_scratch,
             .bind_cache_resource_manager = bind_cache_resource_manager,
             .retained_vector_cache_enabled = opts.retained_vector_cache_enabled,
             .dense_native_migration_policy_source = opts.dense_native_migration_policy_source,
@@ -2945,6 +3085,42 @@ pub const IndexManager = struct {
         }
     }
 
+    /// Status-only opens consume durable catalog and lifecycle records from the
+    /// primary store, but never serve vectors or own native-file maintenance.
+    /// Keep that observational binding separate from the runtime binding:
+    /// loading a vector generation here would also reclaim unreferenced files,
+    /// turning a public status read into synchronous, mutating disk work.
+    fn bindPrimaryStoreForStatus(self: *IndexManager, store: anytype) void {
+        const Store = @TypeOf(store);
+        if (comptime Store == *docstore_mod.DocStore) self.primary_store = store;
+    }
+
+    fn createVectorBlockGeneration(self: *IndexManager, opened: vector_block_store_mod.Opened) !*SharedVectorBlockGeneration {
+        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        errdefer self.alloc.destroy(generation); // caller still owns opened on error
+        if (self.source_payload_store) |source| {
+            generation.source_snapshot = try source.snapshot(self.alloc);
+            generation.opened.external_payloads = &generation.source_snapshot.?;
+        }
+        return generation;
+    }
+
+    pub fn refreshSourcePayloadGeneration(self: *IndexManager) !void {
+        if (self.source_payload_store == null) return;
+        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        defer self.vector_block_build_mu.unlock();
+        const current = self.acquireVectorBlockGeneration() orelse return;
+        defer current.release();
+        var opened = try current.opened.clone(self.alloc);
+        errdefer opened.deinit();
+        const successor = try self.createVectorBlockGeneration(opened);
+        self.installVectorBlockGeneration(successor);
+    }
+
+    fn vectorBlockStorageEncoding(self: *const IndexManager) vector_block_store_mod.Encoding {
+        return if (self.source_payload_store != null) .artifact_reference else denseVectorBlockPreferredEncoding();
+    }
+
     fn vectorBlockRootAlloc(self: *const IndexManager) ![]u8 {
         return try std.fs.path.join(self.alloc, &.{ self.base_path, "vector-blocks" });
     }
@@ -3007,6 +3183,23 @@ pub const IndexManager = struct {
             total = std.math.add(u64, total, coverage.vector_count) catch return null;
         }
         return total;
+    }
+
+    /// Catalog membership, including currently quarantined indexes, determines
+    /// which durable ANN scopes still own lagging source versions.
+    pub fn sourcePayloadScopeHashesAlloc(self: *IndexManager, configs: []const types.IndexConfig) ![]u64 {
+        var hashes = std.ArrayListUnmanaged(u64).empty;
+        errdefer hashes.deinit(self.alloc);
+        for (configs) |cfg| {
+            if (cfg.kind != .dense_vector) continue;
+            var refs = try self.artifactRefsFromConfig(cfg);
+            defer refs.deinit(self.alloc);
+            if (refs.embedding_names.len != 0) {
+                for (refs.embedding_names) |name| try hashes.append(self.alloc, internal_keys.embeddingArtifactScopeHashForName(name));
+            } else try hashes.append(self.alloc, internal_keys.embeddingArtifactScopeHashForName(refs.embedding_name orelse cfg.name));
+        }
+        std.mem.sort(u64, hashes.items, {}, std.sort.asc(u64));
+        return hashes.toOwnedSlice(self.alloc);
     }
 
     fn vectorBlockArtifactScopeHashesAlloc(self: *const IndexManager) ![]u64 {
@@ -3082,7 +3275,7 @@ pub const IndexManager = struct {
                 );
                 var opened_owned = true;
                 errdefer if (opened_owned) opened.deinit();
-                const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+                const generation = try self.createVectorBlockGeneration(opened);
                 opened_owned = false;
                 self.installVectorBlockGeneration(generation);
             }
@@ -3101,7 +3294,7 @@ pub const IndexManager = struct {
         defer writer.deinit();
         if (writer.manifest == null) {
             try writer.publishEmptyBase(1, snapshot_sequence, .{
-                .encoding = denseVectorBlockPreferredEncoding(),
+                .encoding = self.vectorBlockStorageEncoding(),
                 .artifact_scope_hashes = scope_hashes,
             });
         } else {
@@ -3112,7 +3305,7 @@ pub const IndexManager = struct {
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
         if (!openedVectorBlockGenerationExactAtSequence(&opened, snapshot_sequence)) return false;
-        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        const generation = try self.createVectorBlockGeneration(opened);
         opened_owned = false;
         self.installVectorBlockGeneration(generation);
         self.vector_block_projection_dirty.store(false, .release);
@@ -3168,9 +3361,9 @@ pub const IndexManager = struct {
         source_sequence: u64,
     ) bool {
         if (opened.store.covered_source_sequence != source_sequence or
-            !opened.usesBaseEncoding(denseVectorBlockPreferredEncoding())) return false;
+            !opened.usesBaseEncoding(denseVectorBlockPreferredEncoding()) and !opened.usesBaseEncoding(.artifact_reference)) return false;
         const score_precision = opened.scorePrecision();
-        return score_precision == .authoritative_float32 or
+        return score_precision == .artifact_reference or score_precision == .authoritative_float32 or
             score_precision == .authoritative_float32_with_bounded_float16;
     }
 
@@ -3267,6 +3460,8 @@ pub const IndexManager = struct {
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
+        if (entry.native_physical_v2 and entry.index.stats().active_count != 0 and
+            !entry.index.nativePostingBaseHasVectors()) return false;
         // Public replay/status watermarks can include unrelated table metadata
         // writes. Exact-vector consistency is tied to the immutable HBC
         // generation lease, whose durable posting boundary is the sequence
@@ -3313,6 +3508,8 @@ pub const IndexManager = struct {
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
+        if (entry.native_physical_v2 and expected_count != 0 and
+            !entry.index.nativePostingBaseHasVectors()) return false;
         return self.vectorBlockReadyAtSequenceAndCount(
             source_sequence,
             entry,
@@ -3344,14 +3541,20 @@ pub const IndexManager = struct {
             defer generation.release();
             const manifest = generation.opened.store.manifest.?;
             std.log.info(
-                "shared vector-block maintenance needed index={s} reason=boundary_mismatch posting_sequence={?} covered_sequence={} preferred_encoding={} shard_count={} expected_shards={}",
+                "shared vector-block maintenance needed index={s} reason=boundary_mismatch posting_sequence={?} covered_sequence={} preferred_encoding={} shard_count={} expected_shards={} stable_tip_finalizing={} posting_base_has_vectors={} vector_base_count={?} expected_count={} sequence_ready={} count_ready={}",
                 .{
                     entry.config.name,
                     posting_sequence,
                     generation.opened.store.covered_source_sequence,
-                    generation.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding()),
+                    generation.opened.usesBaseEncoding(self.vectorBlockStorageEncoding()),
                     manifest.shard_count,
                     (vector_block_store_mod.BaseBuildOptions{}).shard_count,
+                    self.vectorBlockStableTipFinalizingEntry(entry),
+                    entry.index.nativePostingBaseHasVectors(),
+                    generation.opened.baseVectorCount(),
+                    entry.index.stats().active_count,
+                    if (posting_sequence) |sequence| vectorBlockGenerationReadyAtSequence(generation, sequence) else false,
+                    if (posting_sequence) |sequence| vectorBlockGenerationReadyAtSequenceAndCount(generation, sequence, entry, entry.index.stats().active_count) else false,
                 },
             );
             return true;
@@ -3372,9 +3575,11 @@ pub const IndexManager = struct {
     }
 
     fn installVectorBlockGeneration(self: *IndexManager, generation: *SharedVectorBlockGeneration) void {
+        generation.opened.resource_manager = self.resource_manager;
         lockAtomicWithBackoff(&self.vector_block_generation_mu);
         const previous = self.vector_block_generation;
         self.vector_block_generation = generation;
+        self.advanceVectorBlockPublicationRevision();
         self.vector_block_generation_mu.unlock();
         // The mmap generation is itself exact-vector residency. Keeping the
         // insertion-time HBC vector cache would duplicate the corpus in heap
@@ -3384,16 +3589,54 @@ pub const IndexManager = struct {
         if (previous) |old| old.release();
     }
 
+    fn advanceVectorBlockPublicationRevision(self: *IndexManager) void {
+        if (self.vector_block_publication_revision.fetchAdd(1, .release) == std.math.maxInt(u64))
+            @panic("vector publication revision exhausted");
+    }
+
+    fn denseVectorProjectionBuildRevision(ctx: *anyopaque) u64 {
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        return loader.manager.vector_block_publication_revision.load(.acquire);
+    }
+
     fn clearVectorBlockGeneration(self: *IndexManager) void {
         lockAtomicWithBackoff(&self.vector_block_generation_mu);
         const previous = self.vector_block_generation;
         self.vector_block_generation = null;
+        self.advanceVectorBlockPublicationRevision();
         self.vector_block_generation_mu.unlock();
         // A replacement build can temporarily leave primary artifacts as the
         // only exact-vector authority. Restore governed decoded residency for
         // that interval; the next install clears it atomically.
         for (self.dense_indexes.items) |*entry| entry.index.setBypassExternalVectorCache(false);
         if (previous) |old| old.release();
+    }
+
+    /// Requires vector_block_build_mu. Allocate the complete serving
+    /// successor before CURRENT changes the append target; old query leases
+    /// keep their persistent vector-WAL view without replay or payload copies.
+    fn sealVectorBlockWal(self: *IndexManager) !void {
+        const current = self.acquireVectorBlockGeneration() orelse return;
+        defer current.release();
+        var opened = try current.opened.clone(self.alloc);
+        var owned = true;
+        defer if (owned) opened.deinit();
+        const generation = try self.createVectorBlockGeneration(opened);
+        owned = false;
+        var installed = false;
+        defer if (!installed) generation.release();
+        const sealed = generation.opened.store.sealWal() catch |err| {
+            if (generation.opened.store.poisoned) self.clearVectorBlockGeneration();
+            return err;
+        };
+        if (!sealed) return;
+        self.installVectorBlockGeneration(generation);
+        installed = true;
+    }
+
+    pub fn clearVectorBlockGenerationForTest(self: *IndexManager) void {
+        if (!builtin.is_test) @compileError("test-only native generation fixture");
+        self.clearVectorBlockGeneration();
     }
 
     /// Durably certifies that a source-only commit did not alter the exact
@@ -3404,32 +3647,84 @@ pub const IndexManager = struct {
     fn advanceVectorBlockCoverage(self: *IndexManager, covered_source_sequence: u64) !bool {
         if (self.vector_block_storage == null) return false;
         if (self.vector_block_projection_dirty.load(.acquire)) return false;
-        const storage = self.vector_block_storage orelse return false;
         const current = self.acquireVectorBlockGeneration() orelse return false;
         defer current.release();
         const current_coverage = current.opened.store.covered_source_sequence;
         if (covered_source_sequence <= current_coverage) return false;
 
-        const root = try self.vectorBlockRootAlloc();
-        defer self.alloc.free(root);
-        {
-            var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
-            defer writer.deinit();
-            if (writer.covered_source_sequence < covered_source_sequence) {
-                const batch_id = try writer.nextBatchId();
-                try writer.appendCoverage(batch_id, covered_source_sequence, .{});
-            }
-        }
-
-        var opened = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &current.opened);
+        var writer = try current.opened.store.clone(self.alloc);
+        defer writer.deinit();
+        var encoded = try writer.encodeCoverage(try writer.nextBatchId(), covered_source_sequence);
+        defer encoded.deinit();
+        var opened = try current.opened.prepareWalSuccessor(self.alloc, &encoded, false);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
         if (opened.store.covered_source_sequence < covered_source_sequence)
             return error.VectorBlockCoverageCommitMissing;
-        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        const generation = try self.createVectorBlockGeneration(opened);
         opened_owned = false;
+        errdefer generation.release();
+        try writer.appendEncodedBatch(&encoded, &.{}, .{});
         self.installVectorBlockGeneration(generation);
         return true;
+    }
+
+    /// Certify the complete authoritative bytes (including artifact headers),
+    /// but resolve sorted batches instead of one LSM point lookup per vector.
+    /// Keep record order unchanged: duplicate mutations, when present, must
+    /// retain their transaction ordering. Tombstones require no source read.
+    fn certifyVectorMutationRevisions(alloc: Allocator, txn: anytype, references: bool, records: []vector_block_store_mod.BatchRecord) !void {
+        const Read = struct {
+            key: []const u8,
+            position: usize,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            }
+        };
+        var reads = std.ArrayListUnmanaged(Read).empty;
+        defer reads.deinit(alloc);
+        for (records, 0..) |record, position| {
+            if (record.kind == .upsert) try reads.append(alloc, .{ .key = record.key, .position = position });
+        }
+        std.mem.sort(Read, reads.items, {}, Read.lessThan);
+        if (references) {
+            // Probe multi-get captures mutable hits and the immutable layout
+            // under one backend lock. One batch selects a coherent tip without
+            // cloning/sorting the entire primary memtable. Its materialization
+            // is only O(number of references), independent of vector dimension.
+            const keys = try alloc.alloc([]const u8, reads.items.len);
+            defer alloc.free(keys);
+            const values = try alloc.alloc(?[]const u8, reads.items.len);
+            defer alloc.free(values);
+            for (reads.items, keys) |read, *key| key.* = read.key;
+            if (@hasDecl(@TypeOf(txn.*), "getManySortedPhysical")) try txn.getManySortedPhysical(keys, values) else return error.Unsupported;
+            for (reads.items, values) |read, value| {
+                const raw = value orelse return error.NotFound;
+                const ref = try source_payload_mod.Reference.decode(raw);
+                records[read.position].revision = std.hash.XxHash64.hash(0, raw);
+                records[read.position].reference = .{ .digest = ref.digest, .dims = ref.dims };
+                records[read.position].vector = &.{};
+            }
+            return;
+        }
+        // Bound the primary transaction's batch materialization independently
+        // of the size of the coalesced source window.
+        var keys: [256][]const u8 = undefined;
+        var values: [256]?[]const u8 = undefined;
+        var start: usize = 0;
+        while (start < reads.items.len) {
+            const end = @min(reads.items.len, start + keys.len);
+            const batch = reads.items[start..end];
+            for (batch, 0..) |read, i| keys[i] = read.key;
+            @memset(values[0..batch.len], null);
+            try txn.getManySorted(keys[0..batch.len], values[0..batch.len]);
+            for (batch, values[0..batch.len]) |read, value| {
+                const raw = value orelse return error.NotFound;
+                records[read.position].revision = std.hash.XxHash64.hash(0, raw);
+            }
+            start = end;
+        }
     }
 
     fn publishVectorBlockMutationWal(
@@ -3438,6 +3733,7 @@ pub const IndexManager = struct {
         mutations: []const hbc_mod.ExperimentalExactVectorMutation,
         covered_source_sequence: u64,
     ) !bool {
+        const started_ns = platform_time.monotonicNs();
         if (mutations.len == 0) return false;
         const storage = self.vector_block_storage orelse return false;
         const current = self.acquireVectorBlockGeneration() orelse return false;
@@ -3447,12 +3743,12 @@ pub const IndexManager = struct {
 
         const root = try self.vectorBlockRootAlloc();
         defer self.alloc.free(root);
-        var store = try vector_block_store_mod.Store.open(self.alloc, storage, root);
+        var store = try current.opened.store.clone(self.alloc);
         defer store.deinit();
         if (store.manifest == null or store.covered_source_sequence != current_coverage) return false;
         const batch_id = try store.nextBatchId();
         const primary = self.primary_store orelse return error.MissingPrimaryStore;
-        var primary_txn = try primary.beginReadTxn();
+        var primary_txn = if (self.source_payload_store != null) try primary.beginProbeTxn() else try primary.beginReadTxn();
         defer primary_txn.abort();
 
         const records = try self.alloc.alloc(vector_block_store_mod.BatchRecord, mutations.len);
@@ -3472,14 +3768,6 @@ pub const IndexManager = struct {
             const key = try denseVectorArtifactKeyForMetadataAlloc(self.alloc, entry, mutation.metadata);
             keys[index] = key;
             key_count += 1;
-            const revision = switch (mutation.kind) {
-                // Match the full-base builder's revision certificate exactly,
-                // including a managed artifact's source-hash header. Reading
-                // the just-committed primary value also detects any accidental
-                // mismatch between HBC capture and authoritative storage.
-                .upsert => std.hash.XxHash64.hash(0, try primary_txn.get(key)),
-                .tombstone => batch_id,
-            };
             records[index] = .{
                 .kind = switch (mutation.kind) {
                     .upsert => .upsert,
@@ -3487,15 +3775,24 @@ pub const IndexManager = struct {
                 },
                 .key = key,
                 .source_sequence = covered_source_sequence,
-                .revision = revision,
+                .revision = if (mutation.kind == .tombstone) batch_id else 0,
                 .vector = mutation.vector,
             };
         }
-        try store.appendBatch(batch_id, records, covered_source_sequence, .{});
-
-        var opened = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &current.opened);
+        try certifyVectorMutationRevisions(self.alloc, &primary_txn, self.source_payload_store != null, records);
+        const certified_ns = platform_time.monotonicNs();
+        var encoded = try store.encodeBatch(batch_id, records, covered_source_sequence);
+        defer encoded.deinit();
+        var opened = try current.opened.prepareWalSuccessor(self.alloc, &encoded, true);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
+        const generation = try self.alloc.create(SharedVectorBlockGeneration);
+        errdefer self.alloc.destroy(generation);
+        var source_snapshot: ?vector_block_store_mod.Opened = if (self.source_payload_store) |source| try source.snapshot(self.alloc) else null;
+        errdefer if (source_snapshot) |*snapshot| snapshot.deinit();
+        const prepared_ns = platform_time.monotonicNs();
+        try store.appendEncodedBatch(&encoded, records, .{});
+        const committed_ns = platform_time.monotonicNs();
         if (!self.vector_block_base_staging.load(.acquire) and try opened.checkpointWalToDelta(false)) {
             // Publication rotated WAL and CURRENT. Reopen so the installed
             // query lease owns exactly the new sparse generation rather than
@@ -3513,7 +3810,17 @@ pub const IndexManager = struct {
                 return error.VectorBlockMutationCommitMissing;
             }
         }
-        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        const checkpointed_ns = platform_time.monotonicNs();
+        if (checkpointed_ns -| started_ns >= 100 * std.time.ns_per_ms) {
+            std.log.info("shared vector mutation stages sequence={} vectors={} certify_ns={} prepare_ns={} commit_ns={} checkpoint_ns={} total_ns={}", .{
+                covered_source_sequence,       mutations.len,
+                certified_ns -| started_ns,    prepared_ns -| certified_ns,
+                committed_ns -| prepared_ns,   checkpointed_ns -| committed_ns,
+                checkpointed_ns -| started_ns,
+            });
+        }
+        generation.* = .{ .alloc = self.alloc, .opened = opened, .source_snapshot = source_snapshot };
+        if (generation.source_snapshot) |*snapshot| generation.opened.external_payloads = snapshot;
         opened_owned = false;
         self.installVectorBlockGeneration(generation);
         self.vector_block_projection_dirty.store(false, .release);
@@ -3530,13 +3837,15 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         covered_source_sequence: u64,
     ) !bool {
-        const storage = self.vector_block_storage orelse return false;
+        if (self.vector_block_storage == null) return false;
         if (self.vector_block_base_staging.load(.acquire)) return false;
         lockAtomicWithBackoff(&self.vector_block_build_mu);
-        defer self.vector_block_build_mu.unlock();
-        if (self.vector_block_base_staging.load(.acquire)) return false;
+        var locked = true;
+        defer if (locked) self.vector_block_build_mu.unlock();
+        if (self.vector_block_base_staging.swap(true, .acq_rel)) return false;
+        defer self.vector_block_base_staging.store(false, .release);
 
-        const current = self.acquireVectorBlockGeneration() orelse return false;
+        var current = self.acquireVectorBlockGeneration() orelse return false;
         defer current.release();
         // This operation creates the preferred shard layout. Requiring that
         // layout here makes the native initial-load path unreachable and
@@ -3545,43 +3854,94 @@ pub const IndexManager = struct {
         // certified again on the compacted base before installation.
         if (!vectorBlockGenerationExactAtSequence(current, covered_source_sequence)) return false;
         if (current.opened.baseOnlyVectorCount() != null) return false;
+        try self.sealVectorBlockWal();
+        if (self.source_payload_store) |source| try source.checkpoint();
+        const sealed_current = self.acquireVectorBlockGeneration() orelse return error.VectorBlockStoreRequiresReopen;
+        current.release();
+        current = sealed_current;
 
-        const root = try self.vectorBlockRootAlloc();
-        defer self.alloc.free(root);
-        var opened = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &current.opened);
+        var budget = if (self.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .lsm_compaction_work, self.alloc, 1)
+        else
+            null;
+        defer if (budget) |*bounded| bounded.deinit();
+        const build_alloc = if (budget) |*bounded| bounded.allocator() else self.alloc;
+        const reserved_generation = current.opened.store.manifest.?.latest_generation;
+        const prefix = current.opened.store.walPrefixBoundary();
+        // Native merges obey the same optimistic reservation as primary-scan
+        // builds. Capture continues appending while immutable shards stage.
+        self.vector_block_build_mu.unlock();
+        locked = false;
+        var opened = try current.opened.clone(build_alloc);
         defer opened.deinit();
-        if (!try opened.compactDeltasToBaseWithShardCount(
+        if (builtin.is_test) if (test_before_vector_block_primary_snapshot_build) |hook| try hook.call(hook.ctx);
+        var build = (try opened.stageDeltasToBaseWithShardCount(
             (vector_block_store_mod.BaseBuildOptions{}).shard_count,
             (vector_block_store_mod.BaseBuildOptions{}).spool_buffer_bytes,
-        )) return false;
+        )) orelse return false;
+        defer build.deinit();
 
-        var compacted = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &opened);
-        var compacted_owned = true;
-        errdefer if (compacted_owned) compacted.deinit();
-        const coverage_count = denseVectorArtifactCoverageCount(&compacted, entry);
-        if (compacted.store.covered_source_sequence != covered_source_sequence or
-            coverage_count == null or coverage_count.? != entry.index.stats().active_count)
-        {
-            // The shared empty generation can predate this index's artifact
-            // scope. Delta compaction preserves only scopes already declared
-            // by its base manifest, so it remains exact as a mutation store
-            // but cannot certify the new logical projection. Likewise, a
-            // cardinality mismatch is repair debt rather than permission to
-            // install the compacted layout. Keep it unpublished and let the
-            // caller's pinned-primary snapshot path rebuild the complete scope
-            // set at this same stable source boundary.
-            self.vector_block_projection_dirty.store(true, .release);
-            return false;
+        // Reuse the staged corpus across bounded optimistic retries. Only the
+        // committed suffix and replacement reader metadata need preparation
+        // again when a concurrent source transaction wins publication.
+        for (0..3) |_| {
+            const live = self.acquireVectorBlockGeneration() orelse return error.VectorBlockSnapshotAdvancedWithoutWal;
+            defer live.release();
+            var publisher = try live.opened.store.clone(build_alloc);
+            defer publisher.deinit();
+            const latest = if (publisher.manifest) |manifest| manifest.latest_generation else 0;
+            if (latest != reserved_generation) {
+                if (latest >= build.generation) build.disarmCleanup();
+                return error.VectorBlockGenerationReservationLost;
+            }
+            var prepared = try publisher.prepareStagedBaseBuild(&build, .{ .flatten_prefix = prefix });
+            defer prepared.deinit();
+            var compacted = try prepared.openReaders(self.alloc, &live.opened);
+            var compacted_owned = true;
+            defer if (compacted_owned) compacted.deinit();
+            const coverage_count = denseVectorArtifactCoverageCount(&compacted, entry);
+            if (compacted.store.covered_source_sequence < covered_source_sequence or
+                (compacted.store.covered_source_sequence == covered_source_sequence and
+                    (coverage_count == null or coverage_count.? != entry.index.stats().active_count)))
+                return false;
+            const generation = try self.createVectorBlockGeneration(compacted);
+            compacted_owned = false;
+            var installed = false;
+            defer if (!installed) generation.release();
+
+            lockAtomicWithBackoff(&self.vector_block_build_mu);
+            locked = true;
+            const tip = self.acquireVectorBlockGeneration();
+            const unchanged = tip == live and !self.vector_block_projection_dirty.load(.acquire);
+            if (tip) |lease| lease.release();
+            if (!unchanged) {
+                self.vector_block_build_mu.unlock();
+                locked = false;
+                continue;
+            }
+            publisher.commitPrepared(&prepared) catch |err| {
+                // CURRENT may already refer to these files. Fence the stale
+                // in-process writer until recovery reopens durable authority.
+                if (publisher.poisoned) {
+                    build.disarmCleanup();
+                    self.vector_block_projection_dirty.store(true, .release);
+                    self.clearVectorBlockGeneration();
+                }
+                self.vector_block_build_mu.unlock();
+                locked = false;
+                return err;
+            };
+            build.disarmCleanup();
+            self.installVectorBlockGeneration(generation);
+            installed = true;
+            self.vector_block_projection_dirty.store(false, .release);
+            self.vector_block_build_mu.unlock();
+            locked = false;
+            prepared.reclaimObsolete();
+            std.log.info("shared vector-block native generations compacted sequence={} vectors={}", .{ covered_source_sequence, entry.index.stats().active_count });
+            return true;
         }
-        const generation = try SharedVectorBlockGeneration.create(self.alloc, compacted);
-        compacted_owned = false;
-        self.installVectorBlockGeneration(generation);
-        self.vector_block_projection_dirty.store(false, .release);
-        std.log.info(
-            "shared vector-block native generations compacted sequence={} vectors={}",
-            .{ covered_source_sequence, entry.index.stats().active_count },
-        );
-        return true;
+        return error.VectorBlockSnapshotAdvancedWithoutWal;
     }
 
     fn loadVectorBlockGenerationIfPresent(self: *IndexManager) !void {
@@ -3623,7 +3983,7 @@ pub const IndexManager = struct {
             opened_owned = false;
             return;
         }
-        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        const generation = try self.createVectorBlockGeneration(opened);
         opened_owned = false;
         self.installVectorBlockGeneration(generation);
     }
@@ -3722,7 +4082,7 @@ pub const IndexManager = struct {
 
         if (self.acquireVectorBlockGeneration()) |current| {
             const current_coverage = current.opened.store.covered_source_sequence;
-            const preferred_encoding = current.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding());
+            const preferred_encoding = current.opened.usesBaseEncoding(self.vectorBlockStorageEncoding());
             const preferred_layout = current.opened.store.manifest.?.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count;
             const base_only = current.opened.baseOnlyVectorCount() != null;
             const established_overlay = !base_only and (current.opened.baseVectorCount() orelse 0) != 0;
@@ -3778,6 +4138,7 @@ pub const IndexManager = struct {
             null;
         defer if (budgeted_alloc) |*budget| budget.deinit();
         const build_alloc = if (budgeted_alloc) |*budget| budget.allocator() else self.alloc;
+        try self.sealVectorBlockWal();
         var store = vector_block_store_mod.Store.open(build_alloc, storage, root) catch |err| {
             if (err == error.OutOfMemory and budgeted_alloc != null and budgeted_alloc.?.denied())
                 return error.ResourceBudgetExceeded;
@@ -3816,6 +4177,8 @@ pub const IndexManager = struct {
         self.vector_block_build_mu.unlock();
         build_mu_locked = false;
 
+        if (builtin.is_test) if (test_before_vector_block_primary_snapshot_build) |hook|
+            try hook.call(hook.ctx);
         const started = platform_time.monotonicNs();
         if (builtin.is_test) test_vector_block_primary_snapshot_builds += 1;
         std.log.info(
@@ -3825,7 +4188,7 @@ pub const IndexManager = struct {
         const artifact_scope_hashes = try self.vectorBlockArtifactScopeHashesAlloc();
         defer self.alloc.free(artifact_scope_hashes);
         var build = store.stageBaseFromArtifactsTxn(primary, &source_txn, generation, applied_sequence, .{
-            .encoding = denseVectorBlockPreferredEncoding(),
+            .encoding = self.vectorBlockStorageEncoding(),
             .artifact_scope_hashes = artifact_scope_hashes,
         }) catch |err| {
             if (err == error.OutOfMemory and budgeted_alloc != null and budgeted_alloc.?.denied())
@@ -3851,6 +4214,8 @@ pub const IndexManager = struct {
             return error.VectorBlockGenerationReservationLost;
         }
 
+        var disposition: vector_block_store_mod.BaseWalDisposition = .no_tail;
+        var requires_stable_source = false;
         if (prefix_boundary) |prefix| {
             // Every concurrent source mutation must still have an exact-vector
             // generation on which capture was enabled. A failed/uncaptured
@@ -3870,7 +4235,7 @@ pub const IndexManager = struct {
                 can_preserve_snapshot_tail = false;
             }
             if (can_preserve_snapshot_tail) {
-                try publisher.publishStagedBaseBuild(&build, .{ .flatten_prefix = prefix });
+                disposition = .{ .flatten_prefix = prefix };
             } else {
                 // WAL capture was unavailable or fenced, so no suffix can be
                 // trusted. A complete snapshot may still replace it when the
@@ -3878,15 +4243,15 @@ pub const IndexManager = struct {
                 // current WAL only after proving that stronger boundary.
                 if (primary.lastReplaySequence(0) != applied_sequence)
                     return error.VectorBlockSnapshotAdvancedWithoutWal;
+                requires_stable_source = true;
                 if (applied_sequence < publisher.covered_source_sequence) {
-                    try publisher.publishStagedBaseBuild(&build, .reset_source_epoch);
+                    disposition = .reset_source_epoch;
                 } else {
-                    try publisher.publishStagedBaseBuild(&build, .{
-                        .flatten_prefix = publisher.walPrefixBoundary(),
-                    });
+                    disposition = .{ .flatten_prefix = publisher.walPrefixBoundary() };
                 }
             }
         } else if (publisher.manifest != null and primary.lastReplaySequence(0) == applied_sequence) {
+            requires_stable_source = true;
             // The prior projection was behind when the snapshot was pinned.
             // With the source still at that exact snapshot, every currently
             // committed WAL record is represented by the new base. Flatten
@@ -3896,36 +4261,65 @@ pub const IndexManager = struct {
                 // sequence restarts below the imported projection epoch. The
                 // stable-tip proof above makes it safe to atomically replace
                 // that base and discard its incomparable old WAL.
-                try publisher.publishStagedBaseBuild(&build, .reset_source_epoch);
+                disposition = .reset_source_epoch;
             } else {
-                try publisher.publishStagedBaseBuild(&build, .{
-                    .flatten_prefix = publisher.walPrefixBoundary(),
-                });
+                disposition = .{ .flatten_prefix = publisher.walPrefixBoundary() };
             }
         } else {
             // Without an established WAL authority, concurrent source progress
             // cannot be reconstructed from a suffix. Publish only if the
             // pinned snapshot is still the table tip.
             if (primary.lastReplaySequence(0) != applied_sequence) return error.VectorBlockSnapshotAdvancedWithoutWal;
-            try publisher.publishStagedBaseBuild(&build, .no_tail);
+            requires_stable_source = true;
         }
         const stats = build.stats;
 
-        // Open and install the new generation before admitting another WAL
-        // mutation. Existing queries retain the old mmap lease; new queries
-        // atomically observe the replacement base plus its preserved suffix.
         const previous = self.acquireVectorBlockGeneration();
         defer if (previous) |generation_lease| generation_lease.release();
-        var opened = if (previous) |generation_lease|
-            try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &generation_lease.opened)
-        else
-            try vector_block_store_mod.Store.openWithBlocks(self.alloc, storage, root);
+        const was_dirty = self.vector_block_projection_dirty.load(.acquire);
+        self.vector_block_build_mu.unlock();
+        build_mu_locked = false;
+        var prepared = try publisher.prepareStagedBaseBuild(&build, disposition);
+        defer prepared.deinit();
+        var opened = try prepared.openReaders(self.alloc, if (previous) |lease| &lease.opened else null);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
-        const shared = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        const shared = try self.createVectorBlockGeneration(opened);
         opened_owned = false;
+        var installed = false;
+        defer if (!installed) shared.release();
+
+        // The copied suffix and replacement readers are fully prepared. The
+        // source proof and in-process generation must still be the same at
+        // publication; no allocation or reader admission follows CURRENT.
+        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        build_mu_locked = true;
+        const tip = self.acquireVectorBlockGeneration();
+        const unchanged = tip == previous and was_dirty == self.vector_block_projection_dirty.load(.acquire) and
+            (!requires_stable_source or primary.lastReplaySequence(0) == applied_sequence);
+        if (tip) |lease| lease.release();
+        if (!unchanged) {
+            self.vector_block_build_mu.unlock();
+            build_mu_locked = false;
+            return error.VectorBlockSnapshotAdvancedWithoutWal;
+        }
+        publisher.commitPrepared(&prepared) catch |err| {
+            if (publisher.poisoned) {
+                build.disarmCleanup();
+                self.vector_block_projection_dirty.store(true, .release);
+                self.clearVectorBlockGeneration();
+            }
+            self.vector_block_build_mu.unlock();
+            build_mu_locked = false;
+            return err;
+        };
+        build.disarmCleanup();
         self.installVectorBlockGeneration(shared);
+        installed = true;
         self.vector_block_projection_dirty.store(false, .release);
+        self.vector_block_build_mu.unlock();
+        build_mu_locked = false;
+        prepared.reclaimObsolete();
 
         std.log.info(
             "shared vector-block base published generation={} sequence={} vectors={} vector_bytes={} artifact_bytes={} block_bytes={} elapsed_ms={}",
@@ -4616,12 +5010,7 @@ pub const IndexManager = struct {
         entry.index.setExternalVectorBatchBoundedDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatchBounded);
         entry.index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
         entry.index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
-        entry.index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
-        entry.index.setExternalVectorProjectionBuildLifecycle(
-            vector_loader_context,
-            beginDenseVectorProjectionBuild,
-            endDenseVectorProjectionBuild,
-        );
+        configureDensePostingProjectionBuild(entry.index, vector_loader_context);
         self.attachVectorBlockResidencyPolicy(entry.index);
 
         // Repair/rebuild reopens must restore the same physical-format
@@ -4900,6 +5289,7 @@ pub const IndexManager = struct {
             self.alloc.destroy(storage);
         }
         self.alloc.free(self.base_path);
+        self.native_read_scratch.destroy();
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
@@ -6565,6 +6955,20 @@ pub const IndexManager = struct {
                         .source = .{ .immutable_file = source },
                     });
                 }
+                for (generation.sealed_wals[0..generation.sealed_wal_count]) |extent| {
+                    const source = try self.retainNativeBackupAllocation(
+                        &native_owned,
+                        try posting_segment_store_mod.checkpointWalPathAlloc(self.alloc, generation.root_dir, extent.generation),
+                    );
+                    const relative = try self.retainNativeBackupAllocation(
+                        &native_owned,
+                        try std.fmt.allocPrint(self.alloc, "indexes/{s}/posting-segments/wal-{d}.afpw", .{ entry.config.name, extent.generation }),
+                    );
+                    try native_specs.append(self.alloc, .{
+                        .relative_path = relative,
+                        .source = .{ .immutable_file = source },
+                    });
+                }
                 const wal_source = try self.retainNativeBackupAllocation(
                     &native_owned,
                     try posting_segment_store_mod.checkpointWalPathAlloc(
@@ -6607,7 +7011,8 @@ pub const IndexManager = struct {
                     if (store.covered_source_sequence == capture_target_sequence) {
                         var manifest = manifest_value;
                         manifest.wal_committed_bytes = store.wal_committed_bytes;
-                        manifest.covered_source_sequence = store.covered_source_sequence;
+                        // CURRENT retains its physical base floor. WAL
+                        // receipts/replay certify the newer backup target.
                         const current_bytes = try self.retainNativeBackupAllocation(
                             &native_owned,
                             try manifest.encodeAlloc(self.alloc),
@@ -6643,6 +7048,11 @@ pub const IndexManager = struct {
                                 .source = .{ .immutable_file = source },
                             });
                         }
+                        for (manifest.sealed_wals.slice()) |extent| {
+                            const source = try self.retainNativeBackupAllocation(&native_owned, try vector_block_store_mod.checkpointWalPathAlloc(self.alloc, root, extent.generation));
+                            const relative = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "indexes/vector-blocks/wal-{d}.afvw", .{extent.generation}));
+                            try native_specs.append(self.alloc, .{ .relative_path = relative, .source = .{ .immutable_file = source } });
+                        }
                         const wal_source = try self.retainNativeBackupAllocation(
                             &native_owned,
                             try vector_block_store_mod.checkpointWalPathAlloc(
@@ -6664,7 +7074,7 @@ pub const IndexManager = struct {
                             .source = .{ .committed_prefix = .{
                                 .storage = store.storage,
                                 .path = wal_source,
-                                .bytes = store.wal_committed_bytes,
+                                .bytes = store.wal_committed_bytes - try manifest.sealed_wals.bytes(),
                             } },
                         });
                     }
@@ -7723,6 +8133,117 @@ pub const IndexManager = struct {
         return total_steps;
     }
 
+    pub const OnlineVectorBlockPublicationOptions = struct {
+        cancel_check: ?types.RepairCancelCheck = null,
+        /// The repair owner has verified terminal source-outcome coverage for
+        /// this rebuilding index. This permits staging only; serving and the
+        /// clean marker still require the final source/identity revalidation.
+        covered_rebuilding_index: ?[]const u8 = null,
+        only_index: ?[]const u8 = null,
+        /// Recurring work debounces quiet gaps in streaming input; explicit
+        /// repair handoffs may immediately attempt their committed boundary.
+        require_quiescence: bool = true,
+    };
+
+    /// Bring acceleration up to an already durable posting boundary without
+    /// mutating postings or acquiring the table's exclusive apply lease.
+    /// The caller pins the catalog lifetime without holding apply. Immutable vector
+    /// staging preserves concurrent WAL suffixes and validates publication;
+    /// losing the source-tip race is pending work, never false readiness.
+    pub fn publishVectorBlockBasesOnline(
+        self: *IndexManager,
+        options: OnlineVectorBlockPublicationOptions,
+    ) !usize {
+        return (try self.publishVectorBlockBasesOnlineReported(options)).published;
+    }
+
+    pub const OnlineVectorBlockPublicationResult = struct {
+        published: usize = 0,
+        /// A source boundary, debounce, or an existing publication owner must
+        /// advance before this pass can attempt its remaining work.
+        deferred: bool = false,
+    };
+
+    pub fn publishVectorBlockBasesOnlineReported(
+        self: *IndexManager,
+        options: OnlineVectorBlockPublicationOptions,
+    ) !OnlineVectorBlockPublicationResult {
+        if (self.vector_block_storage == null) return .{};
+        const primary = self.primary_store orelse return .{};
+        var published: usize = 0;
+        var deferred = false;
+        for (self.dense_indexes.items) |*entry| {
+            if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
+            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
+            if (self.repairUnavailable(entry.config.name) and
+                !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) continue;
+            if (self.vectorBlockReadyForDenseIndex(entry.config.name) and !entry.index.nativePostingAccelerationPending()) continue;
+            const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
+            if (sequence != primary.lastReplaySequence(0)) {
+                deferred = true;
+                continue;
+            }
+            if (options.require_quiescence and entry.index.stats().active_count > vector_block_immediate_bootstrap_max_vectors) {
+                const now = platform_time.monotonicNs();
+                if (self.vector_block_candidate_sequence.load(.acquire) != sequence) {
+                    self.vector_block_candidate_sequence.store(sequence, .release);
+                    self.vector_block_candidate_since_ns.store(now, .release);
+                    deferred = true;
+                    continue;
+                }
+                const since = self.vector_block_candidate_since_ns.load(.acquire);
+                if (since == 0 or now -| since < vector_block_quiescence_ns) {
+                    deferred = true;
+                    continue;
+                }
+            }
+            if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+                return .{ .published = published, .deferred = true };
+            self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
+            self.vector_block_stable_tip_sequence.store(sequence, .release);
+            defer {
+                self.vector_block_stable_tip_sequence.store(0, .release);
+                self.vector_block_stable_tip_index.store(0, .release);
+                self.vector_block_stable_tip_finalizing.store(false, .release);
+            }
+            self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, sequence) catch |err| switch (err) {
+                error.PostingCheckpointSequenceMismatch,
+                error.VectorBlockSnapshotAdvancedWithoutWal,
+                error.VectorBlockGenerationReservationLost,
+                => {
+                    deferred = true;
+                    continue;
+                },
+                else => return err,
+            };
+            // Vector files alone do not establish the posting-local scan
+            // plane. Schedule its first full base without joining the builder
+            // under any apply fence. Later WAL/delta consolidation is optional
+            // and must not make readiness flap on every source mutation.
+            if (entry.native_physical_v2 and
+                (!entry.index.nativePostingBaseHasVectors() or entry.index.nativePostingAccelerationPending()))
+            {
+                if (!entry.apply_mutex.tryLock()) {
+                    deferred = true;
+                    continue;
+                }
+                defer entry.apply_mutex.unlock();
+                if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) published += 1;
+                if (try entry.index.requestNativePostingAcceleration()) published += 1;
+                // Backoff means waiting for projection inputs, not ready.
+                // Keep the scheduler/lifecycle obligation alive even when
+                // there is intentionally no worker or publication in flight.
+                if (entry.index.experimental_posting_checkpoint_build != null or
+                    entry.index.nativePostingAccelerationPending()) deferred = true;
+                continue;
+            }
+            if (entry.index.experimentalPostingDurableAppliedSequence() == sequence and
+                self.vectorBlockReadyAtSequenceAndCount(sequence, entry, entry.index.stats().active_count))
+                published += 1;
+        }
+        return .{ .published = published, .deferred = deferred };
+    }
+
     /// Publish the exact-vector projection at a caller-proven idle boundary.
     /// Startup catch-up and DB.runUntilIdle own a stable writer generation, so
     /// making them wait for a second observation would retire the only writer
@@ -7759,7 +8280,9 @@ pub const IndexManager = struct {
                 source_sequence,
                 entry,
                 entry.index.stats().active_count,
-            )) {
+            ) or (entry.native_physical_v2 and entry.index.stats().active_count != 0 and
+                !entry.index.nativePostingBaseHasVectors()))
+            {
                 try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
                 changed = self.vectorBlockReadyAtSequenceAndCount(
                     source_sequence,
@@ -7878,7 +8401,7 @@ pub const IndexManager = struct {
     }
 
     pub fn loadCatalogOnly(self: *IndexManager, store: anytype) !void {
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStoreForStatus(store);
         self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
         try self.loadResolverCatalog(store);
@@ -8784,7 +9307,10 @@ pub const IndexManager = struct {
             .graph => .graph_artifacts,
             else => .generated_artifacts,
         };
-        plan.value = try self.encodeGeneratedArtifactCleanupRecord(initial_phase, owned_chunk_name, owned_embedding_name, owned_embedding_names, null);
+        plan.value = if (self.table_owns_embedding_artifacts and (kind == .dense_vector or kind == .sparse_vector))
+            try self.encodeGeneratedArtifactCleanupRecord(initial_phase, null, null, &.{}, null)
+        else
+            try self.encodeGeneratedArtifactCleanupRecord(initial_phase, owned_chunk_name, owned_embedding_name, owned_embedding_names, null);
         return plan;
     }
 
@@ -9711,6 +10237,28 @@ pub const IndexManager = struct {
         const selected = try self.readPublishedIndexRootPointer(target_path, name);
         defer if (selected) |value| self.alloc.free(value);
         return selected != null and std.mem.eql(u8, selected.?, candidate_relative_path);
+    }
+
+    /// A pinned reader may still own the healthy predecessor after the
+    /// durable pointer moves. Inspect its resident storage identity, not that
+    /// pointer; never extend predecessor admission to the new candidate.
+    pub fn denseResidentIsRepairPredecessor(
+        self: *IndexManager,
+        name: []const u8,
+        previous_relative_path: ?[]const u8,
+        candidate_relative_path: []const u8,
+    ) !bool {
+        if (previous_relative_path) |previous| {
+            if (std.mem.eql(u8, previous, candidate_relative_path)) return false;
+        }
+        const dense = self.denseIndex(name) orelse return false;
+        const resident_path = dense.index.storageRootPath() orelse return false;
+        const expected = if (previous_relative_path) |previous|
+            try std.fs.path.join(self.alloc, &.{ self.base_path, previous })
+        else
+            try self.indexPath(name);
+        defer self.alloc.free(expected);
+        return std.mem.eql(u8, resident_path, expected);
     }
 
     /// Advance at most one bounded algebraic key-deletion batch while also
@@ -11972,6 +12520,56 @@ pub const IndexManager = struct {
             .float16
         else
             .float32;
+    }
+
+    const default_posting_local_projections = false;
+
+    fn configureDensePostingProjectionBuild(index: *hbc_mod.HBCIndex, ctx: *DenseVectorLoadContext) void {
+        // New posting builds omit the optional duplicate float16 plane by
+        // default. Centralized candidate reads and authoritative completion
+        // remain enabled. Existing immutable planes stay readable; changing
+        // this policy does not request an eager rewrite or reclamation.
+        const enabled = environmentFlag("ANTFLY_EXPERIMENT_POSTING_LOCAL_PROJECTIONS", default_posting_local_projections);
+        const subgroups = environmentFlag("ANTFLY_EXPERIMENT_SUBGROUPS_4", false) or
+            environmentFlag("ANTFLY_EXPERIMENT_SUBGROUPS_8", false) or
+            environmentFlag("ANTFLY_EXPERIMENT_SUBGROUPS_16", false);
+        configureDensePostingProjectionLayout(index, ctx, enabled, subgroups, denseVectorBlockPreferredEncoding());
+    }
+
+    fn configureDensePostingProjectionLayout(
+        index: *hbc_mod.HBCIndex,
+        ctx: *DenseVectorLoadContext,
+        locality_override: ?bool,
+        subgroups: bool,
+        encoding: vector_block_store_mod.Encoding,
+    ) void {
+        const retain = locality_override orelse default_posting_local_projections;
+        // Subgroup training can borrow projections without persisting a
+        // duplicate plane or making that optional plane a readiness dependency.
+        configureDensePostingProjectionBuildWithPolicy(index, ctx, retain or subgroups, encoding);
+        index.external_vector_projection_build_retain = retain;
+        index.external_vector_projection_build_required = retain and encoding == .float16;
+    }
+
+    fn configureDensePostingProjectionBuildWithPolicy(
+        index: *hbc_mod.HBCIndex,
+        ctx: *DenseVectorLoadContext,
+        enabled: bool,
+        encoding: vector_block_store_mod.Encoding,
+    ) void {
+        // These fields describe one optional acceleration dependency.
+        // Clear both its producer and readiness requirement when disabled so
+        // maintenance cannot endlessly retry a deliberately absent plane.
+        index.external_vector_projection_build_loader = null;
+        index.external_vector_projection_build_begin = null;
+        index.external_vector_projection_build_end = null;
+        index.external_vector_projection_build_revision = null;
+        index.external_vector_projection_build_required = false;
+        index.native_acceleration_retry = .{};
+        if (!enabled) return;
+        index.setExternalVectorProjectionBuildLoader(ctx, loadDenseVectorProjectionsForPostingBuild, encoding == .float16);
+        index.setExternalVectorProjectionBuildRevision(ctx, denseVectorProjectionBuildRevision);
+        index.setExternalVectorProjectionBuildLifecycle(ctx, beginDenseVectorProjectionBuild, endDenseVectorProjectionBuild);
     }
 
     pub const DensePostingCaptureOptions = struct {
@@ -16450,12 +17048,7 @@ pub const IndexManager = struct {
                 index.setExternalVectorBatchBoundedDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatchBounded);
                 index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
                 index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
-                index.setExternalVectorProjectionBuildLoader(vector_loader_context, loadDenseVectorProjectionsForPostingBuild);
-                index.setExternalVectorProjectionBuildLifecycle(
-                    vector_loader_context,
-                    beginDenseVectorProjectionBuild,
-                    endDenseVectorProjectionBuild,
-                );
+                configureDensePostingProjectionBuild(index, vector_loader_context);
                 self.attachVectorBlockResidencyPolicy(index);
                 if (index.experimentalPostingWalAuthoritative() or
                     (densePostingSidecarEnabled() and
@@ -22473,6 +23066,9 @@ pub const IndexManager = struct {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const generation = loader.manager.acquireVectorBlockGeneration() orelse return error.Unsupported;
         errdefer generation.release();
+        if (generation.source_snapshot) |*snapshot| {
+            if (snapshot.store.wal_has_mutations) return error.Unsupported;
+        }
         if (!vectorBlockGenerationExactAtSequence(generation, source_sequence) or
             generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16)
             return error.Unsupported;
@@ -22483,7 +23079,7 @@ pub const IndexManager = struct {
         // ordinary positional reader. Other open/read failures remain visible
         // so publication never papers over a corrupt or missing block.
         const cold_reader = generation.opened.beginColdProjectionSession() catch |err| switch (err) {
-            error.DescriptorAdmissionCapacityTooSmall => null,
+            error.DescriptorAdmissionCapacityTooSmall, error.DescriptorAdmissionUnavailable => null,
             else => return err,
         };
         active_dense_projection_build_session = .{
@@ -22491,6 +23087,7 @@ pub const IndexManager = struct {
             .source_sequence = source_sequence,
             .generation = generation,
             .cold_reader = cold_reader,
+            .started_ns = platform_time.monotonicNs(),
         };
     }
 
@@ -22506,11 +23103,31 @@ pub const IndexManager = struct {
                 loader.index_name,
             });
         }
+        std.log.info("dense projection staging sequence={} batches={} vectors={} elapsed_ns={} lookup_ns={} read_ns={} physical_reads={} physical_bytes={} cold={}", .{
+            session.source_sequence,                           session.batches,        session.vectors,
+            platform_time.monotonicNs() -| session.started_ns, session.lookup_ns,      session.read_ns,
+            session.physical_reads,                            session.physical_bytes, session.cold_reader != null,
+        });
         session.deinit();
         active_dense_projection_build_session = null;
     }
 
     fn loadDenseVectorProjectionsForPostingBuild(
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        metadata: []const ?[]const u8,
+        values: []hbc_mod.NativeProjectionBuildValue,
+        payload_scratch: []u8,
+        dims: usize,
+        source_sequence: u64,
+    ) !void {
+        loadDenseVectorProjectionsForPostingBuildImpl(ctx, vector_ids, metadata, values, payload_scratch, dims, source_sequence) catch |err| {
+            if (active_dense_projection_build_session) |*session| return session.scratch.allocationError(err);
+            return err;
+        };
+    }
+
+    fn loadDenseVectorProjectionsForPostingBuildImpl(
         ctx: *anyopaque,
         vector_ids: []const u64,
         metadata: []const ?[]const u8,
@@ -22546,22 +23163,25 @@ pub const IndexManager = struct {
             generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16)
             return error.Unsupported;
 
-        const reads = try manager.alloc.alloc(DenseArtifactReadKey, vector_ids.len);
+        const lookup_started = platform_time.monotonicNs();
+        const read_alloc = if (build_session) |session| session.scratch.allocator(manager.alloc, manager.resource_manager) else manager.alloc;
+        defer if (build_session) |session| session.scratch.reset();
+        const reads = try read_alloc.alloc(DenseArtifactReadKey, vector_ids.len);
         var key_count: usize = 0;
         defer {
-            for (reads[0..key_count]) |read| manager.alloc.free(read.key);
-            manager.alloc.free(reads);
+            for (reads[0..key_count]) |read| read_alloc.free(read.key);
+            read_alloc.free(reads);
         }
         for (metadata, 0..) |maybe_doc_key, i| {
             const doc_key = maybe_doc_key orelse return error.NotFound;
-            const artifact_key = try denseVectorArtifactKeyForMetadataAlloc(manager.alloc, entry, doc_key);
+            const artifact_key = try denseVectorArtifactKeyForMetadataAlloc(read_alloc, entry, doc_key);
             reads[i] = DenseArtifactReadKey.init(artifact_key, i);
             key_count += 1;
         }
         const shard_count = generation.opened.store.manifest.?.shard_count;
         std.mem.sort(DenseArtifactReadKey, reads, shard_count, DenseArtifactReadKey.blockLessThan);
-        const requests = try manager.alloc.alloc(vector_block_store_mod.ProjectionReadRequest, reads.len);
-        defer manager.alloc.free(requests);
+        const requests = try read_alloc.alloc(vector_block_store_mod.ProjectionReadRequest, reads.len);
+        defer read_alloc.free(requests);
         for (reads, 0..) |read, i| {
             const found = try generation.opened.locateHashed(read.key, read.block_hash, source_sequence, null);
             const located = switch (found) {
@@ -22572,14 +23192,26 @@ pub const IndexManager = struct {
             requests[i] = .{ .located = located, .scratch = destination };
         }
         const used_cold_reader = if (build_session) |session| session.cold_reader != null else false;
+        const read_started = platform_time.monotonicNs();
+        if (build_session) |session| {
+            session.lookup_ns +|= read_started -| lookup_started;
+            session.batches +|= 1;
+            session.vectors +|= vector_ids.len;
+        }
+        var read_stats: vector_block_store_mod.ReadBatchStats = .{};
         if (build_session) |session| {
             if (session.cold_reader) |*reader| {
-                _ = try reader.readProjectionsIntoBatch(manager.io, requests);
+                read_stats = try reader.readProjectionsIntoBatch(manager.io, requests);
             } else {
-                _ = try generation.opened.readProjectionsIntoBatch(manager.io, requests);
+                read_stats = try generation.opened.readProjectionsIntoBatch(manager.io, requests);
             }
         } else {
             _ = try generation.opened.readProjectionsIntoBatch(manager.io, requests);
+        }
+        if (build_session) |session| {
+            session.read_ns +|= platform_time.monotonicNs() -| read_started;
+            session.physical_reads +|= read_stats.physical_reads;
+            session.physical_bytes +|= read_stats.physical_bytes;
         }
         defer {
             if (!used_cold_reader) {
@@ -22591,8 +23223,25 @@ pub const IndexManager = struct {
                 }
             }
         }
+        // WAL extents retain authoritative float32 values. A single such row
+        // must not defer the entire leaf until shared-vector compaction. Build
+        // its bounded plane from the same pinned generation, with one reusable
+        // vector-sized decode buffer (not a leaf-sized float32 matrix).
+        var decode_scratch: []f32 = &.{};
+        defer read_alloc.free(decode_scratch);
         for (reads, requests) |read, request| {
+            if (request.err) |err| return err;
             const value = request.value orelse return error.NotFound;
+            if (request.located == .wal and value.encoding == .float32) {
+                if (decode_scratch.len == 0) decode_scratch = try read_alloc.alloc(f32, dims);
+                values[read.position] = try nativePostingProjectionFromWal(
+                    value,
+                    payload_scratch[read.position * row_bytes ..][0..row_bytes],
+                    decode_scratch,
+                    dims,
+                );
+                continue;
+            }
             if (value.encoding != .float16 or value.dims != dims or value.bytes.len != row_bytes) return error.Unsupported;
             values[read.position] = .{
                 .bytes = value.bytes,
@@ -22612,14 +23261,32 @@ pub const IndexManager = struct {
                         .residual_len = std.math.cast(u32, block.location.residual_len) orelse return error.Unsupported,
                         .residual_checksum = block.location.residual_checksum,
                     },
-                    // Stable-tip posting publication normally consumes a
-                    // compacted base. A WAL-backed vector remains correct but
-                    // cannot publish a durable physical hint; V5 then falls
-                    // back to authoritative key lookup for the whole leaf.
+                    // WAL rows have no durable block locator. The leaf can
+                    // still serve its bounded plane; exact completion resolves
+                    // authoritative values by key under the query generation.
                     .wal => null,
                 },
             };
         }
+    }
+
+    fn nativePostingProjectionFromWal(
+        value: vector_block_mod.Value,
+        destination: []u8,
+        decode_scratch: []f32,
+        dims: usize,
+    ) !hbc_mod.NativeProjectionBuildValue {
+        if (value.encoding != .float32 or value.dims != dims) return error.Unsupported;
+        const source = try value.decodeExactInto(decode_scratch);
+        const encoded = try vector_block_mod.encodeVectorIntoWithStats(.float16, source, destination);
+        return .{
+            .bytes = destination,
+            .scale = encoded.scale,
+            .error_norm = encoded.quantization.error_norm,
+            .decoded_norm_lower_bound = encoded.quantization.decoded_norm_lower_bound,
+            .checksum = @import("antfly_hash").Crc32.hash(destination),
+            .residual_location = null,
+        };
     }
 
     fn scoreDenseVectorsFromNativeLocations(
@@ -22664,10 +23331,14 @@ pub const IndexManager = struct {
         if (generation.opened.store.covered_source_sequence != sequence or
             generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16) return;
 
-        var read_arena = std.heap.ArenaAllocator.init(loader.manager.alloc);
-        defer read_arena.deinit();
-        const read_alloc = read_arena.allocator();
-        const located_projections = try read_alloc.alloc(?vector_block_store_mod.LoadedProjection, vector_ids.len);
+        const pooled = if (session.working_slice == .dense_search_working_set)
+            try loader.manager.native_read_scratch.acquire()
+        else
+            null;
+        defer if (pooled) |slot| loader.manager.native_read_scratch.release(slot) else session.endResidualScratch();
+        const read_alloc = if (pooled) |slot| slot.allocator() else session.beginResidualScratch();
+        const located_projections = read_alloc.alloc(?vector_block_store_mod.LoadedProjection, vector_ids.len) catch |err|
+            return if (pooled) |slot| slot.allocationError(err) else session.residualAllocationError(err);
         @memset(located_projections, null);
 
         var residual_bytes: usize = 0;
@@ -22692,14 +23363,12 @@ pub const IndexManager = struct {
         }
         if (residual_count == 0) return;
 
-        const request_bytes = @as(u64, @intCast(residual_count)) *|
-            (@sizeOf(vector_block_store_mod.ResidualReadRequest) + @sizeOf(usize));
-        session.setNativeVectorIoBytes(@as(u64, @intCast(residual_bytes)) +| request_bytes);
-        defer session.setNativeVectorIoBytes(0);
-
-        const residual_scratch = try read_alloc.alloc(u8, residual_bytes);
-        const requests = try read_alloc.alloc(vector_block_store_mod.ResidualReadRequest, residual_count);
-        const request_slots = try read_alloc.alloc(usize, residual_count);
+        const residual_scratch = read_alloc.alloc(u8, residual_bytes) catch |err|
+            return if (pooled) |slot| slot.allocationError(err) else session.residualAllocationError(err);
+        const requests = read_alloc.alloc(vector_block_store_mod.ResidualReadRequest, residual_count) catch |err|
+            return if (pooled) |slot| slot.allocationError(err) else session.residualAllocationError(err);
+        const request_slots = read_alloc.alloc(usize, residual_count) catch |err|
+            return if (pooled) |slot| slot.allocationError(err) else session.residualAllocationError(err);
         var request_count: usize = 0;
         var residual_offset: usize = 0;
         for (located_projections, 0..) |maybe_projection, slot| {
@@ -22715,7 +23384,13 @@ pub const IndexManager = struct {
         }
 
         const read_start = platform_time.monotonicNs();
-        const read_stats = try generation.opened.readExactResidualsIntoBatch(loader.manager.io, requests);
+        // Qualification-only A/B: retain identical location resolution,
+        // coalescing, checksums and exact scoring; vary only task scheduling.
+        const inline_residual_reads = if (getenv("ANTFLY_EXPERIMENT_INLINE_NATIVE_RESIDUAL_READS")) |value|
+            std.mem.eql(u8, std.mem.span(value), "1")
+        else
+            false;
+        const read_stats = try generation.opened.readExactResidualsIntoBatch(if (inline_residual_reads) null else loader.manager.io, requests);
         if (profile) |p| {
             p.rerank_vector_physical_reads +|= read_stats.physical_reads;
             p.rerank_vector_physical_bytes +|= read_stats.physical_bytes;
@@ -22818,6 +23493,34 @@ pub const IndexManager = struct {
         profile: ?*hbc_mod.SearchProfile,
     ) !void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const pooled = if (active_dense_vector_load_session) |session|
+            if (session.context == loader and session.working_slice == .dense_search_working_set)
+                try loader.manager.native_read_scratch.acquire()
+            else
+                null
+        else
+            null;
+        defer if (pooled) |slot| loader.manager.native_read_scratch.release(slot);
+        scoreDenseVectorsForHbcBatchImpl(ctx, vector_ids, metadata, query, query_measure, metric, distances, error_bounds, batch_scratch, dims, scratch, profile, pooled) catch |err|
+            return if (pooled) |slot| slot.allocationError(err) else err;
+    }
+
+    fn scoreDenseVectorsForHbcBatchImpl(
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        metadata: []const ?[]const u8,
+        query: []const f32,
+        query_measure: f32,
+        metric: vector_mod.DistanceMetric,
+        distances: []f32,
+        error_bounds: ?[]f32,
+        batch_scratch: []f32,
+        dims: usize,
+        scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch,
+        profile: ?*hbc_mod.SearchProfile,
+        pooled: ?*native_read_scratch_pool.Pool.Slot,
+    ) !void {
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const manager = loader.manager;
         const store = manager.primary_store orelse return error.NotFound;
         const entry = manager.denseIndex(loader.index_name) orelse return error.IndexNotFound;
@@ -22896,13 +23599,17 @@ pub const IndexManager = struct {
         defer if (release_vector_block_generation) vector_block_generation.?.release();
 
         const key_start = platform_time.monotonicNs();
-        var key_arena = std.heap.ArenaAllocator.init(manager.alloc);
+        // Queries reuse an admitted, reclaimable arena across batches and
+        // requests. Non-query native callers keep lifetime-scoped OS backing;
+        // primary-only key lookups retain their ordinary small-object allocator.
+        var key_arena = std.heap.ArenaAllocator.init(if (vector_block_generation != null) std.heap.page_allocator else manager.alloc);
         defer key_arena.deinit();
-        const key_alloc = key_arena.allocator();
+        const use_pool = pooled != null and vector_block_generation != null;
+        const key_alloc = if (use_pool) pooled.?.allocator() else key_arena.allocator();
         var vector_block_payload_scratch: []u8 = &.{};
         var vector_block_payload_stride: usize = 0;
         if (vector_block_generation) |generation| {
-            const encoding = generation.opened.baseEncoding() orelse return error.InconsistentVectorBlockEncoding;
+            const encoding = generation.opened.payloadEncoding() orelse return error.InconsistentVectorBlockEncoding;
             const vector_bytes = try vector_block_mod.encodedVectorBytesLen(encoding, dims);
             const residual_bytes = if (error_bounds == null and encoding == .float16)
                 try vector_block_mod.exactResidualMaxBytes(dims)
@@ -22910,7 +23617,7 @@ pub const IndexManager = struct {
                 0;
             vector_block_payload_stride = std.math.add(usize, vector_bytes, residual_bytes) catch return error.BufferTooSmall;
             const payload_bytes = std.math.mul(usize, vector_block_payload_stride, vector_ids.len) catch return error.BufferTooSmall;
-            if (load_session) |session| {
+            if (!use_pool) if (load_session) |session| {
                 const io_request_bytes: usize = if (error_bounds != null)
                     @sizeOf(vector_block_store_mod.ProjectionReadRequest)
                 else
@@ -22923,7 +23630,7 @@ pub const IndexManager = struct {
                 const request_bytes = @as(u64, @intCast(vector_ids.len)) *| per_request_bytes;
                 session.setNativeVectorIoBytes(@as(u64, @intCast(payload_bytes)) +| request_bytes);
                 native_vector_io_accounted = true;
-            }
+            };
             vector_block_payload_scratch = try key_alloc.alloc(
                 u8,
                 payload_bytes,
@@ -23128,15 +23835,22 @@ pub const IndexManager = struct {
                 request_count += 1;
             }
             if (error_bounds != null) {
-                const read_stats = try generation.opened.readProjectionsIntoBatch(manager.io, projection_requests[0..request_count]);
+                const borrow_enabled = if (manager.resource_manager) |resources| resources.dense_projection_borrow_enabled else false;
+                const read_stats = if (if (borrow_enabled) load_session else null) |session|
+                    try generation.opened.readProjectionsIntoBatchBorrowed(manager.io, projection_requests[0..request_count], &session.native_projection_borrows, session.projectionBorrowAllocator())
+                else
+                    try generation.opened.readProjectionsIntoBatch(manager.io, projection_requests[0..request_count]);
                 if (profile) |p| {
                     p.rerank_vector_physical_reads +|= read_stats.physical_reads;
                     p.rerank_vector_physical_bytes +|= read_stats.physical_bytes;
                 }
                 for (projection_requests[0..request_count], request_positions[0..request_count]) |request, artifact_pos| {
                     const value = request.value orelse continue;
+                    if (request.borrowed) if (profile) |p| {
+                        p.rerank_vector_projection_borrows += 1;
+                    };
                     values[artifact_pos] = value;
-                    projections[artifact_pos] = .{ .located = request.located, .value = value };
+                    projections[artifact_pos] = .{ .located = request.located, .value = value, .borrowed = request.borrowed };
                 }
             } else {
                 const residual_stats = try generation.opened.readExactResidualsIntoBatch(manager.io, residual_requests[0..residual_request_count]);
@@ -37091,6 +37805,119 @@ test "dense artifact rerank cosine distance includes candidate norm" {
     );
 }
 
+test "posting locality policy only disables optional projection publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/posting-locality", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var index = try hbc_mod.HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
+    defer index.close();
+    // Configuration stores this pointer but must not dereference its manager
+    // until a real read/build begins. No callback is invoked in this test.
+    var context: IndexManager.DenseVectorLoadContext = undefined;
+    index.setExternalVectorLoader(&context, IndexManager.loadDenseVectorForHbc);
+    index.setExternalVectorBatchBoundedDistanceLoader(&context, IndexManager.scoreDenseVectorsForHbcBatchBounded);
+    index.setExternalVectorBatchLocatedDistanceLoader(&context, IndexManager.scoreDenseVectorsFromNativeLocations);
+    IndexManager.configureDensePostingProjectionBuildWithPolicy(&index, &context, true, .float16);
+    try std.testing.expect(index.external_vector_projection_build_loader != null);
+    try std.testing.expect(index.external_vector_projection_build_begin != null);
+    try std.testing.expect(index.external_vector_projection_build_end != null);
+    try std.testing.expect(index.external_vector_projection_build_revision != null);
+    try std.testing.expect(index.external_vector_projection_build_required);
+
+    IndexManager.configureDensePostingProjectionBuildWithPolicy(&index, &context, false, .float16);
+    try std.testing.expect(index.external_vector_projection_build_loader == null);
+    try std.testing.expect(index.external_vector_projection_build_begin == null);
+    try std.testing.expect(index.external_vector_projection_build_end == null);
+    try std.testing.expect(index.external_vector_projection_build_revision == null);
+    try std.testing.expect(!index.external_vector_projection_build_required);
+    try std.testing.expect(index.hasExternalVectorLoader());
+    try std.testing.expect(index.external_vector_batch_bounded_distance_loader != null);
+    try std.testing.expect(index.external_vector_batch_located_distance_loader != null);
+
+    IndexManager.configureDensePostingProjectionBuildWithPolicy(&index, &context, true, .float32);
+    try std.testing.expect(index.external_vector_projection_build_loader != null);
+    try std.testing.expect(!index.external_vector_projection_build_required);
+}
+
+test "posting locality defaults to no copy and preserves explicit opt in and training" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/posting-default", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var index = try hbc_mod.HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
+    defer index.close();
+    // As in the policy test, configuration stores but never dereferences ctx.
+    var context: IndexManager.DenseVectorLoadContext = undefined;
+    index.setExternalVectorLoader(&context, IndexManager.loadDenseVectorForHbc);
+    index.setExternalVectorBatchBoundedDistanceLoader(&context, IndexManager.scoreDenseVectorsForHbcBatchBounded);
+    index.setExternalVectorBatchLocatedDistanceLoader(&context, IndexManager.scoreDenseVectorsFromNativeLocations);
+    for ([_]vector_block_store_mod.Encoding{ .float16, .float32 }) |encoding| {
+        IndexManager.configureDensePostingProjectionLayout(&index, &context, true, false, encoding);
+        try std.testing.expect(index.external_vector_projection_build_loader != null);
+        try std.testing.expect(index.external_vector_projection_build_retain);
+        try std.testing.expectEqual(encoding == .float16, index.external_vector_projection_build_required);
+        // Reconfiguration must also clear a prior locality readiness requirement.
+        IndexManager.configureDensePostingProjectionLayout(&index, &context, null, false, encoding);
+        try std.testing.expect(index.external_vector_projection_build_loader == null);
+        try std.testing.expect(!index.external_vector_projection_build_retain);
+        try std.testing.expect(!index.external_vector_projection_build_required);
+        IndexManager.configureDensePostingProjectionLayout(&index, &context, null, true, encoding);
+        try std.testing.expect(index.external_vector_projection_build_loader != null);
+        try std.testing.expect(!index.external_vector_projection_build_retain);
+        try std.testing.expect(!index.external_vector_projection_build_required);
+        IndexManager.configureDensePostingProjectionLayout(&index, &context, false, false, encoding);
+        try std.testing.expect(index.external_vector_projection_build_loader == null);
+        try std.testing.expect(index.hasExternalVectorLoader());
+        try std.testing.expect(index.external_vector_batch_bounded_distance_loader != null);
+        try std.testing.expect(index.external_vector_batch_located_distance_loader != null);
+    }
+}
+
+test "native posting projection builds bounded planes from float32 WAL rows" {
+    const source = [_]f32{ 0.10003, -0.20007, 0, -0.0, 0.00000003, 100_000.125 };
+    var wal_bytes: [source.len * 4 + 1]u8 align(4) = undefined;
+    _ = try vector_block_mod.encodeVectorInto(.float32, &source, wal_bytes[1..]);
+    const value: vector_block_mod.Value = .{
+        .source_sequence = 91,
+        .revision = 7,
+        .dims = source.len,
+        .bytes = wal_bytes[1..],
+    };
+    var destination: [source.len * 2]u8 = undefined;
+    var scratch: [source.len]f32 = undefined;
+    const projection = try IndexManager.nativePostingProjectionFromWal(value, &destination, &scratch, source.len);
+    // Use the very same encoder/metadata as immutable float16 blocks, not an
+    // unchecked cast or a new approximation contract for the WAL path.
+    var expected: [source.len * 2]u8 = undefined;
+    const stats = try vector_block_mod.encodeVectorIntoWithStats(.float16, &source, &expected);
+    try std.testing.expectEqualSlices(u8, &expected, projection.bytes);
+    try std.testing.expectEqual(stats.scale, projection.scale);
+    try std.testing.expectEqual(stats.quantization.error_norm, projection.error_norm);
+    try std.testing.expectEqual(stats.quantization.decoded_norm_lower_bound, projection.decoded_norm_lower_bound);
+    try std.testing.expectEqual(std.hash.Crc32.hash(&expected), projection.checksum);
+    try std.testing.expect(projection.residual_location == null);
+    try std.testing.expectEqual(@intFromPtr(&destination), @intFromPtr(projection.bytes.ptr));
+    // Exact completion remains byte-for-byte authoritative, including signed
+    // zero; generating the candidate plane must never mutate the leased WAL.
+    const exact = try value.decodeExactInto(&scratch);
+    for (source, exact) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+    try std.testing.expectError(error.Unsupported, IndexManager.nativePostingProjectionFromWal(value, &destination, &scratch, source.len - 1));
+    try std.testing.expectError(error.BufferTooSmall, IndexManager.nativePostingProjectionFromWal(value, &destination, scratch[0..1], source.len));
+}
+
+test "native posting projection rejects nonfinite WAL rows" {
+    var source = [_]f32{ 1, std.math.nan(f32) };
+    var encoded: [8]u8 = undefined;
+    for (&source, 0..) |v, i| std.mem.writeInt(u32, encoded[i * 4 ..][0..4], @bitCast(v), .little);
+    const value: vector_block_mod.Value = .{ .source_sequence = 1, .revision = 1, .dims = 2, .bytes = &encoded };
+    var destination: [4]u8 = undefined;
+    var scratch: [2]f32 = undefined;
+    try std.testing.expectError(error.InvalidVectorComponent, IndexManager.nativePostingProjectionFromWal(value, &destination, &scratch, 2));
+}
+
 test "native float16 residual rerank returns authoritative float32 score" {
     const alloc = std.testing.allocator;
     const source = [_]f32{ 0.10003, -0.20007, 0.30011, 12_345.678 };
@@ -37109,13 +37936,28 @@ test "native float16 residual rerank returns authoritative float32 score" {
 }
 
 test "native rerank exact completion reuses location and reads one residual" {
+    try testNativeRerankLocationReuse(false, false);
+}
+
+test "native rerank pooled exact completion reuses location and reads one residual" {
+    try testNativeRerankLocationReuse(true, false);
+}
+
+test "native rerank borrowed pages remain pinned through authoritative residual completion" {
+    try testNativeRerankLocationReuse(true, true);
+}
+
+fn testNativeRerankLocationReuse(pooled_query: bool, borrow_pages: bool) !void {
     const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var manager_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const manager_path = try std.fmt.bufPrint(&manager_path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var manager = try IndexManager.init(alloc, manager_path);
     defer manager.deinit();
+    if (borrow_pages) manager.resource_manager = &resources;
 
     var memory = lsm_backend_mod.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -37139,7 +37981,10 @@ test "native rerank exact completion reuses location and reads one residual" {
         .manager = &manager,
         .index_name = @constCast("native-location-rerank"),
     };
-    var session: IndexManager.DenseVectorLoadSession = .{ .context = &context };
+    var session: IndexManager.DenseVectorLoadSession = .{
+        .context = &context,
+        .working_slice = if (pooled_query) .dense_search_working_set else .dense_apply_working_set,
+    };
     defer session.deinit();
     session.pinNativeVectorGeneration(generation, 9);
     const location = (try generation.opened.locateHashed(
@@ -37148,10 +37993,24 @@ test "native rerank exact completion reuses location and reads one residual" {
         9,
         1,
     )).vector;
-    const projection = try generation.opened.viewProjection(location);
+    var projection = try generation.opened.viewProjection(location);
+    if (borrow_pages) {
+        resources.dense_projection_pages_enabled = true;
+        resources.dense_projection_borrow_enabled = true;
+        generation.opened.resource_manager = &resources;
+        var read_bytes: [64]u8 = undefined;
+        var requests = [_]vector_block_store_mod.ProjectionReadRequest{.{ .located = location, .scratch = &read_bytes }};
+        _ = try generation.opened.readProjectionsIntoBatch(null, &requests);
+        _ = try generation.opened.readProjectionsIntoBatch(null, &requests);
+        _ = try generation.opened.readProjectionsIntoBatchBorrowed(null, &requests, &session.native_projection_borrows, session.projectionBorrowAllocator());
+        try std.testing.expect(requests[0].borrowed);
+        projection = .{ .located = location, .value = requests[0].value.?, .borrowed = true };
+        try std.testing.expectEqual(@as(u64, 0), resource_manager_mod.ProjectionPageCache.Cache.reclaim(resources.projectionPageCache().?, std.math.maxInt(u64)));
+    }
     session.cacheNativeVectorLocation(17, projection);
     const cached_projection = session.nativeVectorLocation(17, 9) orelse return error.TestExpectedCachedProjection;
-    try std.testing.expect(@intFromPtr(cached_projection.value.bytes.ptr) != @intFromPtr(projection.value.bytes.ptr));
+    try std.testing.expectEqual(borrow_pages, cached_projection.value.bytes.ptr == projection.value.bytes.ptr);
+    if (borrow_pages) try std.testing.expectEqual(@as(usize, 0), session.native_vector_projection_bytes.items.len);
     try std.testing.expect(session.working_bytes_current >= session.native_vector_projection_bytes.capacity);
 
     const previous_session = IndexManager.active_dense_vector_load_session;
@@ -37184,9 +38043,12 @@ test "native rerank exact completion reuses location and reads one residual" {
     try std.testing.expectEqual(@as(u64, 0), profile.rerank_vector_projection_bytes);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_vector_residual_reads);
     try std.testing.expectEqual(@as(u64, @intCast(location.residualBytes())), profile.rerank_vector_residual_bytes);
+    const retained_residual_capacity = if (pooled_query) manager.native_read_scratch.idle_bytes else session.residual_arena.?.queryCapacity();
+    try std.testing.expect(retained_residual_capacity > 0);
 
     const block_location = location.block;
-    const aligned_projection_bytes: []align(@alignOf(f16)) const u8 = @alignCast(projection.value.bytes);
+    const persisted_view = try generation.opened.viewProjection(location);
+    const aligned_projection_bytes: []align(@alignOf(f16)) const u8 = @alignCast(persisted_view.value.bytes);
     const persisted_projection: hbc_mod.BoundedProjection = .{
         .values = std.mem.bytesAsSlice(f16, aligned_projection_bytes),
         .scale = projection.value.scale,
@@ -37205,6 +38067,10 @@ test "native rerank exact completion reuses location and reads one residual" {
     // Posting-local projections do not call the external bounded loader, so
     // exact completion must be able to lease CURRENT on demand.
     session.clearNativeVectorLocations();
+    if (borrow_pages) {
+        try std.testing.expectEqual(@as(usize, 0), session.native_projection_borrows.leases.items.len);
+        try std.testing.expect(resource_manager_mod.ProjectionPageCache.Cache.reclaim(resources.projectionPageCache().?, std.math.maxInt(u64)) > 0);
+    }
     profile = .{};
     try IndexManager.scoreDenseVectorsFromNativeLocations(
         &context,
@@ -37223,6 +38089,233 @@ test "native rerank exact completion reuses location and reads one residual" {
     try std.testing.expectEqual(std.math.inf(f32), distances[1]);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_vector_location_reuses);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_vector_residual_reads);
+    try std.testing.expectEqual(retained_residual_capacity, if (pooled_query) manager.native_read_scratch.idle_bytes else session.residual_arena.?.queryCapacity());
+}
+
+test "vector mutation revision certification batches sorted keys without reordering mutations" {
+    const Txn = struct {
+        calls: usize = 0,
+        missing: bool = false,
+        fail: bool = false,
+
+        fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            self.calls += 1;
+            try std.testing.expect(keys.len <= 256);
+            if (self.fail) return error.Corrupted;
+            for (keys, values, 0..) |key, *value, i| {
+                if (i > 0) try std.testing.expect(std.mem.order(u8, keys[i - 1], key) != .gt);
+                value.* = if (self.missing) null else key;
+            }
+        }
+    };
+    var keys: [513][24]u8 = undefined;
+    var records: [514]vector_block_store_mod.BatchRecord = undefined;
+    for (records[0..513], 0..) |*record, i| {
+        record.* = .{
+            .kind = .upsert,
+            .key = try std.fmt.bufPrint(&keys[i], "artifact-{d:0>4}", .{512 - i}),
+            .source_sequence = 42,
+            .revision = 0,
+        };
+    }
+    // Duplicate keys still refer to their original mutation slots.
+    records[17].key = records[3].key;
+    records[513] = .{ .kind = .tombstone, .key = "deleted", .source_sequence = 42, .revision = 777 };
+    var txn: Txn = .{};
+    try IndexManager.certifyVectorMutationRevisions(std.testing.allocator, &txn, false, &records);
+    try std.testing.expectEqual(@as(usize, 3), txn.calls);
+    for (records[0..513], 0..) |record, i| {
+        try std.testing.expectEqual(std.hash.XxHash64.hash(0, record.key), record.revision);
+        if (i != 17) try std.testing.expectEqual(@intFromPtr(&keys[i]), @intFromPtr(record.key.ptr));
+    }
+    try std.testing.expectEqual(@as(u64, 777), records[513].revision);
+    txn = .{};
+    try IndexManager.certifyVectorMutationRevisions(std.testing.allocator, &txn, false, records[513..]);
+    try std.testing.expectEqual(@as(usize, 0), txn.calls);
+    txn = .{ .missing = true };
+    try std.testing.expectError(error.NotFound, IndexManager.certifyVectorMutationRevisions(std.testing.allocator, &txn, false, records[0..1]));
+    txn = .{ .fail = true };
+    try std.testing.expectError(error.Corrupted, IndexManager.certifyVectorMutationRevisions(std.testing.allocator, &txn, false, records[0..1]));
+}
+
+test "native projection build scratch reuses bounded memory and releases on failure" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = .{
+        .soft_limit_bytes = 4096,
+        .hard_limit_bytes = 4096,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    {
+        var scratch: IndexManager.DenseProjectionBuildScratch = .{};
+        defer scratch.deinit();
+        const first = try scratch.allocator(alloc, &manager).alloc(u8, 256);
+        scratch.reset();
+        const charged = manager.sliceStats(.dense_vector_block_build_working_set).used_bytes;
+        try std.testing.expect(charged >= 256 and charged <= 4096);
+        const second = try scratch.allocator(alloc, &manager).alloc(u8, 256);
+        try std.testing.expectEqual(first.ptr, second.ptr);
+        try std.testing.expectEqual(charged, manager.sliceStats(.dense_vector_block_build_working_set).used_bytes);
+        try std.testing.expectError(error.OutOfMemory, scratch.allocator(alloc, &manager).alloc(u8, 8192));
+        try std.testing.expectEqual(error.ResourceBudgetExceeded, scratch.allocationError(error.OutOfMemory));
+        try std.testing.expectEqual(error.Corrupted, scratch.allocationError(error.Corrupted));
+        scratch.reset();
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_vector_block_build_working_set).used_bytes);
+    // Embedders without a governor still get the same bounded-lifetime reuse.
+    var ungoverned: IndexManager.DenseProjectionBuildScratch = .{};
+    defer ungoverned.deinit();
+    _ = try ungoverned.allocator(alloc, null).alloc(u8, 32);
+    ungoverned.reset();
+    _ = try ungoverned.allocator(alloc, null).alloc(u8, 64);
+}
+
+test "native read scratch pool reuses pages and reclaims only idle leases" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
+    const pool = try native_read_scratch_pool.Pool.create(alloc, &resources);
+    defer pool.destroy();
+    const first = try pool.acquire();
+    const bytes = try first.allocator().alloc(u8, 1024);
+    @memset(bytes, 73);
+    pool.release(first);
+    try std.testing.expect(resources.sliceStats(.dense_search_working_set).used_bytes > 0);
+    const second = try pool.acquire();
+    try std.testing.expectEqual(first, second);
+    const reused = try second.allocator().alloc(u8, 1024);
+    try std.testing.expectEqual(bytes.ptr, reused.ptr);
+    @memset(reused, 41);
+    try std.testing.expectEqual(@as(u64, 0), pool.reclaim(std.math.maxInt(u64)));
+    for (reused) |byte| try std.testing.expectEqual(@as(u8, 41), byte);
+    pool.release(second);
+    try std.testing.expect(pool.reclaim(1) > 0);
+    try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.dense_search_working_set).used_bytes);
+}
+
+test "native read scratch pool bounds idle slots and rejects oversized retention" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
+    const pool = try native_read_scratch_pool.Pool.create(alloc, &resources);
+    defer pool.destroy();
+    var slots: [34]*native_read_scratch_pool.Pool.Slot = undefined;
+    for (&slots) |*slot| {
+        slot.* = try pool.acquire();
+        _ = try slot.*.allocator().alloc(u8, 128);
+    }
+    for (slots) |slot| pool.release(slot);
+    try std.testing.expectEqual(@as(usize, 32), pool.idle_count);
+    try std.testing.expect(pool.idle_bytes <= 64 * 1024 * 1024);
+    const large = try pool.acquire();
+    _ = try large.allocator().alloc(u8, 5 * 1024 * 1024);
+    pool.release(large);
+    try std.testing.expectEqual(@as(usize, 31), pool.idle_count);
+}
+
+test "native read scratch pool participates in hard-budget reclamation" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+        .soft_limit_bytes = 8192,
+        .hard_limit_bytes = 8192,
+    };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resources.deinit(alloc);
+    const pool = try native_read_scratch_pool.Pool.create(alloc, &resources);
+    defer pool.destroy();
+    const active = try pool.acquire();
+    defer pool.release(active);
+    const original = try active.allocator().alloc(u8, 1024);
+    @memset(original, 91);
+    const idle = try pool.acquire();
+    _ = try idle.allocator().alloc(u8, 4096);
+    pool.release(idle);
+    _ = try active.allocator().alloc(u8, 2048);
+    try std.testing.expectEqual(@as(usize, 0), pool.idle_count);
+    for (original) |byte| try std.testing.expectEqual(@as(u8, 91), byte);
+    try std.testing.expectError(error.OutOfMemory, active.allocator().alloc(u8, 16384));
+    try std.testing.expectEqual(error.ResourceBudgetExceeded, active.allocationError(error.OutOfMemory));
+    try std.testing.expectEqual(error.Corrupted, active.allocationError(error.Corrupted));
+}
+
+test "native read scratch pool keeps concurrent leases isolated" {
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(8) });
+    defer runtime.deinit();
+    var resources = resource_manager_mod.ResourceManager.init(.{});
+    defer resources.deinit(alloc);
+    const pool = try native_read_scratch_pool.Pool.create(alloc, &resources);
+    defer pool.destroy();
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(p: *native_read_scratch_pool.Pool, failure: *std.atomic.Value(bool), tag: u8) std.Io.Cancelable!void {
+            for (0..64) |_| {
+                const slot = p.acquire() catch {
+                    failure.store(true, .release);
+                    return;
+                };
+                defer p.release(slot);
+                const bytes = slot.allocator().alloc(u8, 8192) catch {
+                    failure.store(true, .release);
+                    return;
+                };
+                @memset(bytes, tag);
+                _ = p.reclaim(1);
+                for (bytes) |byte| if (byte != tag) {
+                    failure.store(true, .release);
+                    return;
+                };
+            }
+        }
+    };
+    var group: std.Io.Group = .init;
+    defer group.cancel(runtime.io());
+    for (0..8) |i| try group.concurrent(runtime.io(), Worker.run, .{ pool, &failed, @as(u8, @intCast(i)) });
+    try group.await(runtime.io());
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.active.load(.acquire));
+}
+
+test "native residual scratch reuses capacity and releases its bounded reservation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+        .soft_limit_bytes = 4096,
+        .hard_limit_bytes = 4096,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{ .resource_manager = &resource_manager });
+    defer manager.deinit();
+    var context: IndexManager.DenseVectorLoadContext = .{
+        .manager = &manager,
+        .index_name = @constCast("residual-scratch"),
+    };
+    {
+        var session: IndexManager.DenseVectorLoadSession = .{
+            .context = &context,
+            .working_slice = .dense_search_working_set,
+        };
+        defer session.deinit();
+        const first = try session.beginResidualScratch().alloc(u8, 128);
+        session.endResidualScratch();
+        const charged = resource_manager.sliceStats(.dense_search_working_set).used_bytes;
+        try std.testing.expect(charged >= 128 and charged <= 4096);
+        const second = try session.beginResidualScratch().alloc(u8, 128);
+        try std.testing.expectEqual(first.ptr, second.ptr);
+        try std.testing.expectEqual(charged, resource_manager.sliceStats(.dense_search_working_set).used_bytes);
+        try std.testing.expectError(error.OutOfMemory, session.residual_arena.?.allocator().alloc(u8, 8192));
+        try std.testing.expect(session.residual_budget.?.denied());
+        try std.testing.expectEqual(error.ResourceBudgetExceeded, session.residualAllocationError(error.OutOfMemory));
+        session.endResidualScratch();
+    }
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.dense_search_working_set).used_bytes);
 }
 
 test "force text compaction supersedes in-flight scheduled merge" {

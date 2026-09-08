@@ -22,6 +22,8 @@ const vectorindex = @import("antfly_vectorindex");
 const vector_block = vectorindex.vector_block;
 const vector_wal = vectorindex.vector_block_wal;
 const vector_manifest = vectorindex.vector_block_manifest;
+const wal_view = @import("vector_wal_view.zig");
+const resource_manager_mod = @import("resource_manager.zig");
 const internal_keys = @import("internal_keys.zig");
 const artifact_codec = @import("db/enrichment/artifact_codec.zig");
 
@@ -34,6 +36,7 @@ const EmptyBaseLayout = struct {
 
 fn scorePrecisionForEncoding(encoding: Encoding) vector_manifest.ScorePrecision {
     return switch (encoding) {
+        .artifact_reference => .artifact_reference,
         .float32 => .authoritative_float32,
         .float16 => .authoritative_float32_with_bounded_float16,
     };
@@ -48,6 +51,7 @@ const max_wal_bytes: usize = 512 * 1024 * 1024;
 const wal_checkpoint_bytes: usize = 64 * 1024 * 1024;
 const max_block_bytes: usize = if (@sizeOf(usize) >= 8) 8 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
 var positional_read_test_nonce: std.atomic.Value(u64) = .init(0);
+var retained_block_identity: std.atomic.Value(u64) = .init(1);
 
 pub fn checkpointBlockPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64, shard_id: u32) ![]u8 {
     const name = try std.fmt.allocPrint(alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
@@ -77,12 +81,15 @@ pub const RetainedBlock = struct {
     const Shared = struct {
         alloc: Allocator,
         refs: std.atomic.Value(u64) = .init(1),
+        identity: u64,
         payload: Payload,
     };
 
     fn init(alloc: Allocator, payload: Payload) !RetainedBlock {
         const shared = try alloc.create(Shared);
-        shared.* = .{ .alloc = alloc, .payload = payload };
+        const identity = retained_block_identity.fetchAdd(1, .monotonic);
+        std.debug.assert(identity != 0);
+        shared.* = .{ .alloc = alloc, .payload = payload, .identity = identity };
         return .{ .shared = shared };
     }
 
@@ -150,6 +157,7 @@ pub const RetainedBlock = struct {
 
 pub const BatchRecord = struct {
     kind: enum { upsert, tombstone },
+    reference: ?struct { digest: [32]u8, dims: u32 } = null,
     key: []const u8,
     source_sequence: u64,
     revision: u64,
@@ -192,8 +200,8 @@ pub const BaseBuildOptions = struct {
     spool_buffer_bytes: usize = 64 * 1024,
     // Float16 is the compact candidate plane. Fresh writers co-publish a
     // lossless residual for native authoritative float32 completion; callers
-    // still inspect score precision because legacy float16 bases remain
-    // readable as bounded-only generations until rebuilt.
+    // still inspect score precision to distinguish authoritative completion
+    // from deliberately bounded-only projections.
     encoding: vector_block.Encoding = .float16,
     /// Sorted, unique hashes of configured embedding artifact names. The
     /// shared base stores each payload once while publishing an independent
@@ -308,10 +316,31 @@ pub const Store = struct {
     wal_committed_bytes: u64 = 0,
     wal_has_mutations: bool = false,
     wal_latest_mutation_sequence: u64 = 0,
+    active_wal_min_mutation_sequence: ?u64 = null,
     last_committed_batch: ?u64 = null,
     covered_source_sequence: u64 = 0,
     segment_covered_source_sequence: u64 = 0,
     poisoned: bool = false,
+
+    /// Clone the already validated writer state without invoking recovery.
+    /// Callers serialize append/publication against the original generation.
+    pub fn clone(self: *const Store, alloc: Allocator) !Store {
+        const root = try alloc.dupe(u8, self.root_dir);
+        errdefer alloc.free(root);
+        const segments = try alloc.dupe(vector_manifest.Segment, self.manifest_segments);
+        errdefer alloc.free(segments);
+        const coverages = try alloc.dupe(vector_manifest.Coverage, self.manifest_coverages);
+        var result = self.*;
+        result.alloc = alloc;
+        result.root_dir = root;
+        result.manifest_segments = segments;
+        result.manifest_coverages = coverages;
+        if (result.manifest) |*manifest| {
+            manifest.segments = segments;
+            manifest.coverages = coverages;
+        }
+        return result;
+    }
 
     pub fn open(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
         var opened = try openInternal(alloc, storage, root_dir, false, null);
@@ -333,6 +362,11 @@ pub const Store = struct {
 
     pub fn openWithBlocks(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Opened {
         return try openInternal(alloc, storage, root_dir, true, null);
+    }
+
+    /// Reader opens never create missing authority or repair a writer's tail.
+    pub fn openReadOnlyWithBlocks(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Opened {
+        return openInternalWithState(alloc, storage, root_dir, true, null, null, null, true);
     }
 
     /// Opens the latest CURRENT/WAL while sharing unchanged immutable mmap
@@ -393,16 +427,25 @@ pub const Store = struct {
         covered_source_sequence: u64,
         options: AppendOptions,
     ) !void {
+        var writer = try self.encodeBatch(batch_id, records, covered_source_sequence);
+        defer writer.deinit();
+        try self.appendEncodedBatch(&writer, records, options);
+    }
+
+    pub fn encodeBatch(self: *Store, batch_id: u64, records: []const BatchRecord, covered_source_sequence: u64) !vector_wal.Writer {
         if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
         if (self.manifest == null) return error.MissingVectorBlockManifest;
         if (records.len == 0) return error.EmptyVectorWalBatch;
         var writer = vector_wal.Writer.initAfterCommitted(self.alloc, self.last_committed_batch, self.covered_source_sequence);
-        defer writer.deinit();
+        errdefer writer.deinit();
         for (records) |record| {
             if (record.source_sequence < self.segment_covered_source_sequence) return error.VectorWalOverlapsCheckpoint;
             if (record.source_sequence > covered_source_sequence) return error.InvalidVectorWalCommit;
             switch (record.kind) {
-                .upsert => try writer.appendUpsert(batch_id, record.source_sequence, record.revision, record.key, record.vector),
+                .upsert => if (record.reference) |ref|
+                    try writer.appendReference(batch_id, record.source_sequence, record.revision, record.key, ref.dims, &ref.digest)
+                else
+                    try writer.appendUpsert(batch_id, record.source_sequence, record.revision, record.key, record.vector),
                 .tombstone => {
                     if (record.vector.len != 0) return error.InvalidVectorWalRecord;
                     try writer.appendTombstone(batch_id, record.source_sequence, record.revision, record.key);
@@ -410,21 +453,77 @@ pub const Store = struct {
             }
         }
         try writer.commit(batch_id, covered_source_sequence);
-        try self.appendWriter(batch_id, covered_source_sequence, writer.bytes(), options);
-        self.wal_has_mutations = true;
+        return writer;
+    }
+
+    pub fn appendEncodedBatch(self: *Store, writer: *const vector_wal.Writer, records: []const BatchRecord, options: AppendOptions) !void {
+        if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
+        try self.appendWriter(writer.last_committed_batch.?, writer.covered_source_sequence, writer.bytes(), options);
+        self.wal_has_mutations = self.wal_has_mutations or records.len != 0;
         for (records) |record| {
             self.wal_latest_mutation_sequence = @max(self.wal_latest_mutation_sequence, record.source_sequence);
+            self.active_wal_min_mutation_sequence = @min(self.active_wal_min_mutation_sequence orelse record.source_sequence, record.source_sequence);
         }
     }
 
     pub fn appendCoverage(self: *Store, batch_id: u64, covered_source_sequence: u64, options: AppendOptions) !void {
+        var writer = try self.encodeCoverage(batch_id, covered_source_sequence);
+        defer writer.deinit();
+        try self.appendEncodedBatch(&writer, &.{}, options);
+    }
+
+    pub fn encodeCoverage(self: *Store, batch_id: u64, covered_source_sequence: u64) !vector_wal.Writer {
         if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
         if (self.manifest == null) return error.MissingVectorBlockManifest;
         var writer = vector_wal.Writer.initAfterCommitted(self.alloc, self.last_committed_batch, self.covered_source_sequence);
-        defer writer.deinit();
+        errdefer writer.deinit();
         try writer.appendCoverage(batch_id, covered_source_sequence);
         try writer.commit(batch_id, covered_source_sequence);
-        try self.appendWriter(batch_id, covered_source_sequence, writer.bytes(), options);
+        return writer;
+    }
+
+    /// Called on a preallocated successor under writer exclusion. The old
+    /// append target becomes immutable at a complete transaction boundary;
+    /// CURRENT names both it and the new empty append target. No WAL is read
+    /// or copied. The caller must invalidate its writer on ambiguous failure.
+    pub fn sealWal(self: *Store) !bool {
+        if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
+        var manifest = self.manifest orelse return false;
+        const sealed_bytes = try manifest.sealed_wals.bytes();
+        if (self.wal_committed_bytes == sealed_bytes or manifest.sealed_wals.count == vector_manifest.wal_extents.max_extents) return false;
+        const next_generation = try std.math.add(u64, self.wal_generation, 1);
+        const active_path = try self.walPathAlloc(self.wal_generation);
+        defer self.alloc.free(active_path);
+        const next_path = try self.walPathAlloc(next_generation);
+        defer self.alloc.free(next_path);
+        const current_path = try self.currentPathAlloc();
+        defer self.alloc.free(current_path);
+        manifest.sealed_wals.items[manifest.sealed_wals.count] = .{
+            .generation = self.wal_generation,
+            .committed_bytes = self.wal_committed_bytes - sealed_bytes,
+            .covered_source_sequence = self.covered_source_sequence,
+            .last_batch = self.last_committed_batch orelse return error.InvalidVectorBlockPublicationBoundary,
+            .min_mutation_sequence = self.active_wal_min_mutation_sequence,
+        };
+        manifest.sealed_wals.count += 1;
+        manifest.wal_generation = next_generation;
+        manifest.wal_committed_bytes = self.wal_committed_bytes;
+        // Preserve the base source floor, especially for an omitted physical
+        // base. The sealed WAL itself proves the newer applied watermark.
+        const encoded = try manifest.encodeAlloc(self.alloc);
+        defer self.alloc.free(encoded);
+        if (try self.storage.fileSize(active_path) != self.wal_committed_bytes - sealed_bytes)
+            return error.InvalidVectorBlockPublicationBoundary;
+        try self.storage.syncFileContentsAbsolute(active_path);
+        try atomicReplace(self.alloc, self.storage, next_path, &.{});
+        generation_publication.publishControlFile(self.alloc, self.storage, current_path, encoded) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
+        self.manifest = manifest;
+        self.wal_generation = next_generation;
+        self.active_wal_min_mutation_sequence = null;
+        return true;
     }
 
     /// Publishes the real, O(1) authority for a logical projection which has no
@@ -612,6 +711,7 @@ pub const Store = struct {
             .admission_checksum = reader.admissionChecksum(),
             .encoding = reader.encoding,
             .score_precision = switch (reader.encoding) {
+                .artifact_reference => .artifact_reference,
                 .float32 => .authoritative_float32,
                 .float16 => if (reader.hasExactResiduals())
                     .authoritative_float32_with_bounded_float16
@@ -626,6 +726,48 @@ pub const Store = struct {
     /// readers retain the preceding generation.
     pub fn discardStagedBlocks(self: *const Store, staged: []const StagedBlock) void {
         discardStagedBlocksAt(self.storage, self.root_dir, staged);
+    }
+
+    pub const StreamingBlock = struct {
+        sink: lsm_backend.storage_io.AtomicWriteSink,
+        writer: vector_block.StreamingWriter,
+        active: bool = true,
+
+        pub fn deinit(self: *StreamingBlock) void {
+            if (self.active) self.sink.abort();
+            self.writer.deinit();
+        }
+        pub fn flushIfNeeded(self: *StreamingBlock) !void {
+            try self.writer.flushIfNeeded(&self.sink);
+        }
+        pub fn finish(self: *StreamingBlock) !StagedBlock {
+            const result = try self.writer.finish(&self.sink);
+            self.active = false; // finish consumes the sink on failure as well
+            try self.sink.finish();
+            const page = &self.writer.page;
+            return .{
+                .generation = page.generation,
+                .covered_source_sequence = page.covered_source_sequence,
+                .shard_id = page.shard_id,
+                .shard_count = page.shard_count,
+                .bytes = result.bytes,
+                .admission_checksum = result.admission_checksum,
+                .encoding = page.encoding,
+                .score_precision = if (page.encoding == .artifact_reference) .artifact_reference else if (page.encoding == .float32) .authoritative_float32 else if (result.exact_residuals) .authoritative_float32_with_bounded_float16 else .bounded_float16,
+            };
+        }
+    };
+
+    pub fn beginStreamingBlock(self: *Store, generation: u64, sequence: u64, shard: u32, shards: u32, encoding: Encoding) !StreamingBlock {
+        if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
+        const path = try self.blockPathAlloc(generation, shard);
+        defer self.alloc.free(path);
+        var sink = try self.storage.beginAtomicWrite(self.alloc, path);
+        errdefer sink.abort();
+        sink.setCacheIntent(.cold_sequential);
+        var writer = try vector_block.StreamingWriter.init(self.alloc, &sink, generation, shard, shards, sequence, encoding);
+        writer.cluster_projections = @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_PROJECTION_CLUSTERING");
+        return .{ .sink = sink, .writer = writer };
     }
 
     pub fn publishStagedGeneration(
@@ -723,7 +865,100 @@ pub const Store = struct {
         build.disarmCleanup();
     }
 
-    const PublicationMode = enum { replace_base, append_delta, replace_deltas };
+    const PublicationMode = union(enum) {
+        replace_base,
+        append_delta,
+        replace_deltas,
+        replace_selected: []const vector_manifest.Segment,
+
+        fn retains(self: @This(), segment: vector_manifest.Segment, base: u64) bool {
+            return switch (self) {
+                .replace_base => false,
+                .append_delta => true,
+                .replace_deltas => segment.generation == base,
+                .replace_selected => |selected| blk: {
+                    for (selected) |removed| if (removed.generation == segment.generation and removed.shard_id == segment.shard_id) break :blk false;
+                    break :blk true;
+                },
+            };
+        }
+    };
+
+    pub fn publishSelectedSourceSegments(self: *Store, generation: u64, staged: []const StagedBlock, selected: []const vector_manifest.Segment, boundary: WalPrefixBoundary) !void {
+        const manifest = self.manifest orelse return error.MissingVectorBlockManifest;
+        // Partial physical-base replacement would violate base completeness.
+        for (selected) |segment| if (segment.generation == manifest.base_generation) return error.InvalidVectorBlockPublicationBoundary;
+        return self.publishStagedGenerationMode(generation, boundary.covered_source_sequence, staged, .{ .replace_selected = selected }, null, boundary, false, null);
+    }
+
+    pub const PreparedPublication = struct {
+        next: Store,
+        encoded: []u8,
+        current_path: []u8,
+        obsolete_paths: std.ArrayListUnmanaged([]u8),
+        boundary: WalPrefixBoundary,
+        previous_generation: u64,
+        wal_after_batch: ?u64 = null,
+        committed: bool = false,
+
+        pub fn deinit(self: *PreparedPublication) void {
+            const alloc = self.next.alloc;
+            for (self.obsolete_paths.items) |path| alloc.free(path);
+            self.obsolete_paths.deinit(alloc);
+            alloc.free(self.encoded);
+            alloc.free(self.current_path);
+            self.next.deinit();
+        }
+        pub fn openReaders(self: *const PreparedPublication, alloc: Allocator, previous: ?*const Opened) !Opened {
+            if (self.committed) return error.VectorBlockPublicationAlreadyCommitted;
+            const reuse_after = if (previous) |old|
+                if (old.wal_tree_initialized and old.store.storage.ptr == self.next.storage.ptr and
+                    old.store.storage.vtable == self.next.storage.vtable and std.mem.eql(u8, old.store.root_dir, self.next.root_dir) and
+                    std.meta.eql(old.store.walPrefixBoundary(), self.boundary)) self.wal_after_batch else null
+            else
+                null;
+            return openInternalWithState(alloc, self.next.storage, self.next.root_dir, true, previous, &self.next, reuse_after, false);
+        }
+        /// Only immutable names known obsolete at preparation time are
+        /// reclaimed here. A directory sweep would race another staged build.
+        pub fn reclaimObsolete(self: *const PreparedPublication) void {
+            if (!self.committed) return;
+            for (self.obsolete_paths.items) |path| self.next.storage.deleteFileAbsolute(path) catch {};
+        }
+    };
+
+    pub fn prepareStagedBaseBuild(self: *Store, build: *const StagedBaseBuild, disposition: BaseWalDisposition) !PreparedPublication {
+        return self.prepareStagedGenerationMode(
+            build.generation,
+            build.covered_source_sequence,
+            build.staged,
+            .replace_base,
+            build.coverages,
+            switch (disposition) {
+                .flatten_prefix => |prefix| prefix,
+                else => null,
+            },
+            disposition == .reset_source_epoch,
+            if (build.staged.len == 0) .{ .shard_count = build.logical_shard_count, .encoding = build.encoding } else null,
+        );
+    }
+
+    /// No WAL scan, reader construction, or cleanup occurs at the durable
+    /// commit boundary. The caller validates its live generation and writer
+    /// token under publication exclusion before entering this method.
+    pub fn commitPrepared(self: *Store, prepared: *PreparedPublication) !void {
+        if (prepared.committed) return error.VectorBlockPublicationAlreadyCommitted;
+        if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
+        if (!std.meta.eql(self.walPrefixBoundary(), prepared.boundary) or
+            (if (self.manifest) |manifest| manifest.latest_generation else 0) != prepared.previous_generation)
+            return error.InvalidVectorBlockPublicationBoundary;
+        generation_publication.publishControlFile(self.alloc, self.storage, prepared.current_path, prepared.encoded) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
+        std.mem.swap(Store, self, &prepared.next);
+        prepared.committed = true;
+    }
 
     /// Replaces every existing sparse delta with one merged delta while
     /// retaining the immutable base. Old mmap leases remain valid after their
@@ -758,6 +993,24 @@ pub const Store = struct {
         reset_source_epoch: bool,
         empty_base_layout: ?EmptyBaseLayout,
     ) !void {
+        var prepared = try self.prepareStagedGenerationMode(generation, covered_source_sequence, staged, mode, replacement_coverages, flattened_wal, reset_source_epoch, empty_base_layout);
+        defer prepared.deinit();
+        try self.commitPrepared(&prepared);
+        prepared.reclaimObsolete();
+        self.reclaimUnreferencedFilesBestEffort();
+    }
+
+    fn prepareStagedGenerationMode(
+        self: *Store,
+        generation: u64,
+        covered_source_sequence: u64,
+        staged: []const StagedBlock,
+        mode: PublicationMode,
+        replacement_coverages: ?[]const vector_manifest.Coverage,
+        flattened_wal: ?WalPrefixBoundary,
+        reset_source_epoch: bool,
+        empty_base_layout: ?EmptyBaseLayout,
+    ) !PreparedPublication {
         if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
         if (staged.len == 0 and empty_base_layout == null) return error.EmptyVectorBlockGeneration;
         // A complete authoritative snapshot can replace an older base at a
@@ -768,8 +1021,8 @@ pub const Store = struct {
         if (empty_base_layout != null and !replace_base) return error.InvalidVectorBlockGeneration;
         if (reset_source_epoch and (!replace_base or flattened_wal != null))
             return error.InvalidVectorBlockPublicationBoundary;
-        if (flattened_wal != null and !replace_base) return error.InvalidVectorBlockPublicationBoundary;
-        const authoritative_replacement = replace_base and
+        if (flattened_wal != null and !replace_base and mode != .replace_selected) return error.InvalidVectorBlockPublicationBoundary;
+        const authoritative_replacement = (replace_base or mode == .replace_selected) and
             (!self.wal_has_mutations or flattened_wal != null or reset_source_epoch);
         if (!authoritative_replacement and covered_source_sequence != self.covered_source_sequence) return error.InvalidVectorBlockPublicationBoundary;
         if (flattened_wal) |boundary| {
@@ -798,7 +1051,7 @@ pub const Store = struct {
             // physical shard layout atomically. Deltas and WAL-backed
             // generations must preserve shard identity or lookups could route
             // around an older committed record.
-            if (manifest.shard_count != shard_count and !authoritative_replacement) return error.InvalidVectorBlockGeneration;
+            if (manifest.shard_count != shard_count and (!authoritative_replacement or mode == .replace_selected)) return error.InvalidVectorBlockGeneration;
         }
         var previous_shard: ?u32 = null;
         for (staged, 0..) |receipt, i| {
@@ -816,16 +1069,20 @@ pub const Store = struct {
             previous_shard = receipt.shard_id;
         }
 
-        const base_segment_count: usize = if (self.manifest) |manifest| baseSegmentCount(manifest) else 0;
-        const retained_count = switch (mode) {
-            .replace_base => 0,
-            .append_delta => self.manifest_segments.len,
-            .replace_deltas => base_segment_count,
-        };
+        var retained_count: usize = 0;
+        const old_base = if (self.manifest) |manifest| manifest.base_generation else 0;
+        for (self.manifest_segments) |segment| {
+            if (mode.retains(segment, old_base)) retained_count += 1;
+        }
         const next_count = retained_count + staged.len;
         const next_segments = try self.alloc.alloc(vector_manifest.Segment, next_count);
         errdefer self.alloc.free(next_segments);
-        if (retained_count != 0) @memcpy(next_segments[0..retained_count], self.manifest_segments[0..retained_count]);
+        var retained_pos: usize = 0;
+        for (self.manifest_segments) |segment| {
+            if (!mode.retains(segment, old_base)) continue;
+            next_segments[retained_pos] = segment;
+            retained_pos += 1;
+        }
         for (staged, next_segments[retained_count..]) |receipt, *descriptor| descriptor.* = stagedDescriptor(receipt);
         const coverage_source = if (replace_base)
             replacement_coverages orelse &.{}
@@ -839,8 +1096,32 @@ pub const Store = struct {
         var next_wal_last_batch: ?u64 = null;
         var next_wal_has_mutations = false;
         var next_wal_latest_mutation_sequence: u64 = 0;
+        var next_active_min_sequence: ?u64 = null;
+        var retained_wals: ?vector_manifest.wal_extents.Set = null;
         var next_covered_source_sequence = covered_source_sequence;
-        if (flattened_wal) |boundary| {
+        if (flattened_wal) |boundary| if (self.manifest) |manifest| {
+            if (boundary.covered_source_sequence == covered_source_sequence) {
+                if (manifest.sealed_wals.afterPrefix(boundary.committed_bytes, boundary.covered_source_sequence)) |tail| {
+                    var nonoverlapping = true;
+                    for (tail.slice()) |extent| if (extent.min_mutation_sequence) |minimum| {
+                        if (minimum <= covered_source_sequence) nonoverlapping = false;
+                    };
+                    if (self.active_wal_min_mutation_sequence) |minimum|
+                        if (minimum <= covered_source_sequence) {
+                            nonoverlapping = false;
+                        };
+                    if (nonoverlapping) retained_wals = tail;
+                }
+            }
+        };
+        if (retained_wals) |tail| {
+            next_active_min_sequence = self.active_wal_min_mutation_sequence;
+            next_wal_has_mutations = next_active_min_sequence != null;
+            for (tail.slice()) |extent| next_wal_has_mutations = next_wal_has_mutations or extent.min_mutation_sequence != null;
+            if (next_wal_has_mutations) next_wal_latest_mutation_sequence = self.wal_latest_mutation_sequence;
+            next_covered_source_sequence = self.covered_source_sequence;
+            if (self.wal_committed_bytes > flattened_wal.?.committed_bytes) next_wal_last_batch = self.last_committed_batch;
+        } else if (flattened_wal) |boundary| {
             recovered_wal = try self.recoverWal();
             const recovered = &recovered_wal.?;
             if (@as(u64, @intCast(recovered.replay.committed_bytes)) != self.wal_committed_bytes) {
@@ -862,22 +1143,25 @@ pub const Store = struct {
                 for (tail.records.items) |record| {
                     if (record.kind != .coverage and record.source_sequence <= covered_source_sequence)
                         return error.VectorWalOverlapsCheckpoint;
-                    if (record.kind == .upsert or record.kind == .tombstone) {
+                    if (record.kind == .upsert or record.kind == .reference or record.kind == .tombstone) {
                         next_wal_has_mutations = true;
                         next_wal_latest_mutation_sequence = @max(next_wal_latest_mutation_sequence, record.source_sequence);
+                        next_active_min_sequence = @min(next_active_min_sequence orelse record.source_sequence, record.source_sequence);
                     }
                 }
                 next_wal_last_batch = tail.last_committed_batch;
                 next_covered_source_sequence = @max(covered_source_sequence, tail.covered_source_sequence);
             }
         }
-        const next_wal_generation = std.math.add(u64, self.wal_generation, 1) catch return error.VectorWalGenerationOverflow;
+        const next_wal_generation = if (retained_wals != null) self.wal_generation else std.math.add(u64, self.wal_generation, 1) catch return error.VectorWalGenerationOverflow;
+        const next_wal_committed_bytes: u64 = if (retained_wals != null) self.wal_committed_bytes - flattened_wal.?.committed_bytes else @intCast(next_wal_bytes.len);
         const next_manifest: vector_manifest.Manifest = .{
             .base_generation = if (replace_base) generation else self.manifest.?.base_generation,
             .latest_generation = generation,
             .wal_generation = next_wal_generation,
-            .wal_committed_bytes = @intCast(next_wal_bytes.len),
-            .covered_source_sequence = next_covered_source_sequence,
+            .wal_committed_bytes = next_wal_committed_bytes,
+            .sealed_wals = retained_wals orelse .{},
+            .covered_source_sequence = if (next_segments.len == 0) covered_source_sequence else next_covered_source_sequence,
             .shard_count = shard_count,
             .segments = next_segments,
             .coverages = next_coverages,
@@ -890,48 +1174,63 @@ pub const Store = struct {
         };
         try next_manifest.validate();
         const encoded = try next_manifest.encodeAlloc(self.alloc);
-        defer self.alloc.free(encoded);
+        errdefer self.alloc.free(encoded);
         const next_wal_path = try self.walPathAlloc(next_wal_generation);
         defer self.alloc.free(next_wal_path);
         // Allocate post-publication cleanup state before the CURRENT commit
         // point so no allocator failure can make a committed generation look
         // retryable to the caller.
-        const previous_wal_path = try self.walPathAlloc(self.wal_generation);
-        defer self.alloc.free(previous_wal_path);
-        try atomicReplace(self.alloc, self.storage, next_wal_path, next_wal_bytes);
+        if (retained_wals == null) try atomicReplace(self.alloc, self.storage, next_wal_path, next_wal_bytes);
         const current_path = try self.currentPathAlloc();
-        defer self.alloc.free(current_path);
-        generation_publication.publishControlFile(self.alloc, self.storage, current_path, encoded) catch |err| {
-            self.poisoned = true;
-            return err;
-        };
-
-        const obsolete_start: usize = switch (mode) {
-            .replace_base => 0,
-            .append_delta => self.manifest_segments.len,
-            .replace_deltas => base_segment_count,
-        };
-        for (self.manifest_segments[obsolete_start..]) |descriptor| {
-            const obsolete_path = self.blockPathAlloc(descriptor.generation, descriptor.shard_id) catch continue;
-            defer self.alloc.free(obsolete_path);
-            self.storage.deleteFileAbsolute(obsolete_path) catch {};
+        errdefer self.alloc.free(current_path);
+        const owned_root = try self.alloc.dupe(u8, self.root_dir);
+        errdefer self.alloc.free(owned_root);
+        var obsolete_paths = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (obsolete_paths.items) |path| self.alloc.free(path);
+            obsolete_paths.deinit(self.alloc);
         }
-        self.storage.deleteFileAbsolute(previous_wal_path) catch {};
-        if (self.manifest_segments.len != 0) self.alloc.free(self.manifest_segments);
-        if (self.manifest_coverages.len != 0) self.alloc.free(self.manifest_coverages);
-        self.manifest_segments = next_segments;
-        self.manifest_coverages = next_coverages;
-        self.manifest = next_manifest;
-        self.manifest.?.segments = self.manifest_segments;
-        self.manifest.?.coverages = self.manifest_coverages;
-        self.wal_generation = next_wal_generation;
-        self.wal_committed_bytes = @intCast(next_wal_bytes.len);
-        self.wal_has_mutations = next_wal_has_mutations;
-        self.wal_latest_mutation_sequence = next_wal_latest_mutation_sequence;
-        self.last_committed_batch = next_wal_last_batch;
-        self.covered_source_sequence = next_covered_source_sequence;
-        self.segment_covered_source_sequence = covered_source_sequence;
-        self.reclaimUnreferencedFilesBestEffort();
+
+        try obsolete_paths.ensureTotalCapacity(self.alloc, self.manifest_segments.len - retained_count + 1 + vector_manifest.wal_extents.max_extents);
+        for (self.manifest_segments) |descriptor| {
+            if (mode.retains(descriptor, old_base)) continue;
+            obsolete_paths.appendAssumeCapacity(try self.blockPathAlloc(descriptor.generation, descriptor.shard_id));
+        }
+        if (retained_wals == null) obsolete_paths.appendAssumeCapacity(try self.walPathAlloc(self.wal_generation));
+        if (self.manifest) |manifest| for (manifest.sealed_wals.slice()) |extent| {
+            var retained = false;
+            if (retained_wals) |tail| for (tail.slice()) |live| {
+                if (live.generation == extent.generation) retained = true;
+            };
+            if (!retained) obsolete_paths.appendAssumeCapacity(try self.walPathAlloc(extent.generation));
+        };
+        return .{
+            .next = .{
+                .alloc = self.alloc,
+                .storage = self.storage,
+                .root_dir = owned_root,
+                .manifest = next_manifest,
+                .manifest_segments = next_segments,
+                .manifest_coverages = next_coverages,
+                .wal_generation = next_wal_generation,
+                .wal_committed_bytes = next_wal_committed_bytes,
+                .wal_has_mutations = next_wal_has_mutations,
+                .wal_latest_mutation_sequence = next_wal_latest_mutation_sequence,
+                .active_wal_min_mutation_sequence = next_active_min_sequence,
+                .last_committed_batch = next_wal_last_batch,
+                .covered_source_sequence = next_covered_source_sequence,
+                .segment_covered_source_sequence = covered_source_sequence,
+            },
+            .encoded = encoded,
+            .current_path = current_path,
+            .obsolete_paths = obsolete_paths,
+            .boundary = self.walPrefixBoundary(),
+            .previous_generation = if (self.manifest) |manifest| manifest.latest_generation else 0,
+            .wal_after_batch = if (retained_wals) |tail|
+                self.manifest.?.sealed_wals.items[self.manifest.?.sealed_wals.count - tail.count - 1].last_batch
+            else
+                null,
+        };
     }
 
     /// Reconciles immutable blocks and WAL generations against CURRENT. This
@@ -976,7 +1275,13 @@ pub const Store = struct {
     }
 
     fn artifactNameIsLive(self: *const Store, name: []const u8) bool {
-        if (parseWalGeneration(name)) |generation| return generation == self.wal_generation;
+        if (parseWalGeneration(name)) |generation| {
+            if (generation == self.wal_generation) return true;
+            if (self.manifest) |manifest| for (manifest.sealed_wals.slice()) |extent| {
+                if (generation == extent.generation) return true;
+            };
+            return false;
+        }
         const identity = parseBlockIdentity(name) orelse return false;
         for (self.manifest_segments) |descriptor| {
             if (descriptor.generation == identity.generation and descriptor.shard_id == identity.shard_id)
@@ -1128,9 +1433,10 @@ pub const Store = struct {
                 vector: []const f32,
                 coverage_index: usize,
             ) !void {
-                const dims = std.math.cast(u32, vector.len) orelse return error.VectorBlockTooLarge;
+                const ref = if (ctx.encoding == .artifact_reference) try @import("artifact_payload.zig").Reference.decode(artifact) else null;
+                const dims = if (ref) |reference| reference.dims else std.math.cast(u32, vector.len) orelse return error.VectorBlockTooLarge;
                 const source_vector_bytes = std.math.mul(usize, vector.len, @sizeOf(f32)) catch return error.VectorBlockTooLarge;
-                const encoded_bytes = try vector_block.encodedVectorBytesLen(ctx.encoding, vector.len);
+                const encoded_bytes = try vector_block.encodedVectorBytesLen(ctx.encoding, dims);
                 const residual_max = if (ctx.encoding == .float16)
                     try vector_block.exactResidualMaxBytes(vector.len)
                 else
@@ -1146,7 +1452,10 @@ pub const Store = struct {
                 std.mem.writeInt(u64, record[16..24], std.hash.XxHash64.hash(0, artifact), .big);
                 @memcpy(record[40..][0..key.len], key);
                 const vector_out = record[40 + key.len ..][0..encoded_bytes];
-                const encoded = try vector_block.encodeVectorIntoWithStats(ctx.encoding, vector, vector_out);
+                const encoded: vector_block.EncodedVectorStats = if (ctx.encoding == .artifact_reference) blk: {
+                    @memcpy(vector_out, &ref.?.digest);
+                    break :blk .{ .scale = 1, .quantization = .{ .error_norm = 0, .decoded_norm_lower_bound = 0 } };
+                } else try vector_block.encodeVectorIntoWithStats(ctx.encoding, vector, vector_out);
                 std.mem.writeInt(u32, record[24..28], @bitCast(encoded.scale), .little);
                 std.mem.writeInt(u32, record[28..32], @bitCast(encoded.quantization.error_norm), .little);
                 std.mem.writeInt(u32, record[32..36], @bitCast(encoded.quantization.decoded_norm_lower_bound), .little);
@@ -1183,6 +1492,10 @@ pub const Store = struct {
                 // multiple indexes sharing one scope still store it once.
                 const scope_hash = internal_keys.embeddingArtifactScopeHash(key) orelse return .@"continue";
                 const coverage_index = ctx.coverageIndex(scope_hash) orelse return .@"continue";
+                if (ctx.encoding == .artifact_reference) {
+                    try ctx.appendVectorRecord(key, value, &.{}, coverage_index);
+                    return .@"continue";
+                }
                 const header = try artifact_codec.decodeHeader(value);
                 if (header.kind != .dense_embedding) return .@"continue";
                 const dims = try artifact_codec.decodeDenseEmbeddingDims(value);
@@ -1210,7 +1523,7 @@ pub const Store = struct {
             .stats = &stats,
             .coverages = coverages,
         };
-        try doc_store.scanReadTxnWithContext(txn, "", "", .{}, &scan_context, ScanContext.scan);
+        try doc_store.scanReadTxnWithContext(txn, "", "", .{ .physical_payloads = options.encoding == .artifact_reference }, &scan_context, ScanContext.scan);
         for (0..options.shard_count) |shard| {
             try scan_context.flush(shard);
             if (spool_initialized[shard]) try self.storage.syncFileContentsAbsolute(spool_paths[shard]);
@@ -1239,15 +1552,15 @@ pub const Store = struct {
             var entries = try parseSpoolEntries(self.alloc, spool, options.encoding);
             defer entries.deinit(self.alloc);
             std.mem.sortUnstable(SpoolEntry, entries.items, {}, SpoolEntry.lessThan);
-            var writer = try vector_block.Writer.initWithEncoding(
-                self.alloc,
+            var output = try self.beginStreamingBlock(
                 generation,
+                covered_source_sequence,
                 @intCast(shard),
                 physical_shard_count,
-                covered_source_sequence,
                 options.encoding,
             );
-            defer writer.deinit();
+            defer output.deinit();
+            const writer = &output.writer.page;
             for (entries.items) |entry| {
                 if (entry.exact_residual) |residual| {
                     try writer.appendEncodedVectorWithStatsAndResidual(
@@ -1271,11 +1584,10 @@ pub const Store = struct {
                         entry.quantization,
                     );
                 }
+                try output.flushIfNeeded();
             }
-            const block = try writer.build();
-            defer self.alloc.free(block);
-            stats.block_bytes += block.len;
-            staged[shard] = try self.stageBlock(generation, covered_source_sequence, @intCast(shard), block);
+            staged[shard] = try output.finish();
+            stats.block_bytes += staged[shard].bytes;
             staged_count += 1;
         }
         const build_root = try self.alloc.dupe(u8, self.root_dir);
@@ -1307,14 +1619,57 @@ pub const Store = struct {
     }
 
     fn recoverWal(self: *const Store) !RecoveredWal {
-        const path = try self.walPathAlloc(self.wal_generation);
-        defer self.alloc.free(path);
-        const bytes = try self.storage.readFileAlloc(self.alloc, path, max_wal_bytes + 1);
+        const bytes = try self.readWalBytes(false);
         errdefer self.alloc.free(bytes);
         var replay = try vector_wal.Replay.parse(self.alloc, bytes);
         errdefer replay.deinit();
         if (replay.committed_bytes != bytes.len) return error.InvalidVectorBlockPublicationBoundary;
         return .{ .alloc = self.alloc, .bytes = bytes, .replay = replay };
+    }
+
+    /// Recovery assembles immutable committed extents plus the active file.
+    /// Only startup reads beyond CURRENT's committed byte count; checkpoint
+    /// preparation reads the exact captured prefix. Sealed files must match
+    /// their transaction receipts, including coverage-only commits.
+    fn readWalBytes(self: *const Store, recover_active: bool) ![]u8 {
+        const extents = if (self.manifest) |manifest| manifest.sealed_wals else vector_manifest.wal_extents.Set{};
+        const sealed_bytes = try extents.bytes();
+        if (sealed_bytes > self.wal_committed_bytes or self.wal_committed_bytes > max_wal_bytes) return error.VectorWalTooLarge;
+        const active_path = try self.walPathAlloc(self.wal_generation);
+        defer self.alloc.free(active_path);
+        const active = if (recover_active)
+            self.storage.readFileAlloc(self.alloc, active_path, max_wal_bytes - @as(usize, @intCast(sealed_bytes)) + 1) catch |err| switch (err) {
+                error.FileNotFound => if (self.wal_committed_bytes == sealed_bytes) try self.alloc.alloc(u8, 0) else return error.MissingVectorWal,
+                else => return err,
+            }
+        else
+            try self.storage.readFileRangeAlloc(self.alloc, active_path, 0, @intCast(self.wal_committed_bytes - sealed_bytes));
+        if (extents.count == 0) return active;
+        defer self.alloc.free(active);
+        const bytes = try self.alloc.alloc(u8, try std.math.add(usize, @intCast(sealed_bytes), active.len));
+        errdefer self.alloc.free(bytes);
+        var pos: usize = 0;
+        for (extents.slice()) |extent| {
+            const path = try self.walPathAlloc(extent.generation);
+            defer self.alloc.free(path);
+            if (try self.storage.fileSize(path) != extent.committed_bytes) return error.InvalidVectorWalExtent;
+            const chunk = try self.storage.readFileRangeAlloc(self.alloc, path, 0, @intCast(extent.committed_bytes));
+            defer self.alloc.free(chunk);
+            var replay = try vector_wal.Replay.parse(self.alloc, chunk);
+            defer replay.deinit();
+            if (replay.committed_bytes != extent.committed_bytes or
+                replay.covered_source_sequence != extent.covered_source_sequence or
+                replay.last_committed_batch != extent.last_batch) return error.InvalidVectorWalExtent;
+            var min_sequence: ?u64 = null;
+            for (replay.records.items) |record| if (record.kind == .upsert or record.kind == .reference or record.kind == .tombstone) {
+                min_sequence = @min(min_sequence orelse record.source_sequence, record.source_sequence);
+            };
+            if (min_sequence != extent.min_mutation_sequence) return error.InvalidVectorWalExtent;
+            @memcpy(bytes[pos..][0..chunk.len], chunk);
+            pos += chunk.len;
+        }
+        @memcpy(bytes[pos..], active);
+        return bytes;
     }
 };
 
@@ -1324,6 +1679,7 @@ pub const Store = struct {
 pub const LocatedValue = union(enum) {
     wal: vector_block.Value,
     block: struct {
+        owner: ?*const Opened = null,
         reader_index: usize,
         reader_generation: u64,
         reader_shard_id: u32,
@@ -1358,6 +1714,154 @@ pub const LocatedLookup = union(enum) {
     vector: LocatedValue,
 };
 
+/// Bounded, optional physical hints shared by immutable source snapshots.
+/// Entries never borrow payloads or reader pointers. Each hit must bind its
+/// generation/shard to the requesting snapshot before it can be used.
+pub const ReferenceLocationCache = struct {
+    const Entry = struct {
+        occupied: bool = false,
+        digest: [32]u8 = undefined,
+        generation: u64 = undefined,
+        shard: u32 = undefined,
+        location: vector_block.ValueLocation = undefined,
+    };
+    const resources = @import("resource_manager.zig");
+    const Stripe = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        entries: ?[]Entry = null,
+        reservation: ?resources.Reservation = null,
+        // Admission on the second observation avoids retaining one-pass scans.
+        probation: [64]u64 = @splat(0),
+    };
+    alloc: Allocator,
+    entry_alloc: Allocator,
+    count: usize,
+    adaptive: bool = false,
+    stripes: [16]Stripe = @splat(.{}),
+    manager: ?*resources.ResourceManager = null,
+    reclaimer: u64 = 0,
+    resident_bytes: std.atomic.Value(u64) = .init(0),
+    reclaimed_bytes: std.atomic.Value(u64) = .init(0),
+    hits: std.atomic.Value(u64) = .init(0),
+    misses: std.atomic.Value(u64) = .init(0),
+
+    pub fn create(alloc: Allocator, count: usize) !*ReferenceLocationCache {
+        return createWithPolicy(alloc, count, false);
+    }
+
+    pub fn createWithPolicy(alloc: Allocator, count: usize, adaptive: bool) !*ReferenceLocationCache {
+        if (count == 0 or !std.math.isPowerOfTwo(count) or count > 65536) return error.InvalidArgument;
+        const self = try alloc.create(ReferenceLocationCache);
+        self.* = .{ .alloc = alloc, .entry_alloc = alloc, .count = count, .adaptive = adaptive };
+        errdefer self.deinit();
+        if (!adaptive) {
+            for (self.stripes[0..@min(count, 16)]) |*stripe| {
+                stripe.entries = try alloc.alloc(Entry, @max(1, count / 16));
+                @memset(stripe.entries.?, .{});
+                _ = self.resident_bytes.fetchAdd(stripe.entries.?.len * @sizeOf(Entry), .monotonic);
+            }
+        }
+        return self;
+    }
+
+    /// Lazy arrays use thread-safe backing allocation and their own reservations,
+    /// never the source writer's serialized BudgetedAllocator.
+    pub fn attachManager(self: *ReferenceLocationCache, backing: Allocator, manager: *resources.ResourceManager) !void {
+        if (!self.adaptive) return;
+        self.entry_alloc = backing;
+        self.manager = manager;
+        self.reclaimer = try manager.registerReclaimer(.dense_source_payload_state, self, reclaim);
+    }
+
+    pub fn reclaim(ptr: *anyopaque, target: u64) u64 {
+        const self: *ReferenceLocationCache = @ptrCast(@alignCast(ptr));
+        var released: u64 = 0;
+        for (&self.stripes) |*stripe| {
+            if (released >= target) break;
+            if (!stripe.mutex.tryLock()) continue;
+            if (stripe.entries) |entries| {
+                const bytes = entries.len * @sizeOf(Entry);
+                self.entry_alloc.free(entries);
+                stripe.entries = null;
+                if (stripe.reservation) |*reservation| reservation.release();
+                stripe.reservation = null;
+                @memset(&stripe.probation, 0);
+                _ = self.resident_bytes.fetchSub(bytes, .monotonic);
+                released += bytes;
+            }
+            stripe.mutex.unlock();
+        }
+        _ = self.reclaimed_bytes.fetchAdd(released, .monotonic);
+        return released;
+    }
+
+    pub fn deinit(self: *ReferenceLocationCache) void {
+        if (self.manager) |manager| manager.unregisterReclaimer(self.reclaimer);
+        _ = reclaim(self, std.math.maxInt(u64));
+        self.alloc.destroy(self);
+    }
+
+    fn get(self: *ReferenceLocationCache, source: *const Opened, digest: []const u8, hash: u64) ?LocatedValue {
+        const slot: usize = @intCast(hash & (self.count - 1));
+        const stripe = &self.stripes[slot % 16];
+        if (stripe.mutex.tryLock()) {
+            const entry: Entry = if (stripe.entries) |entries| entries[slot / 16] else .{};
+            stripe.mutex.unlock();
+            if (entry.occupied and std.mem.eql(u8, &entry.digest, digest)) {
+                if (source.readerIndexForGenerationShard(entry.generation, entry.shard)) |reader_index| {
+                    _ = self.hits.fetchAdd(1, .monotonic);
+                    return .{ .block = .{
+                        .reader_index = reader_index,
+                        .reader_generation = entry.generation,
+                        .reader_shard_id = entry.shard,
+                        .location = entry.location,
+                    } };
+                }
+            }
+        }
+        _ = self.misses.fetchAdd(1, .monotonic);
+        return null;
+    }
+
+    fn put(self: *ReferenceLocationCache, digest: []const u8, hash: u64, located: LocatedValue) void {
+        if (located != .block) return;
+        const slot: usize = @intCast(hash & (self.count - 1));
+        const stripe = &self.stripes[slot % 16];
+        if (!stripe.mutex.tryLock()) return;
+        defer stripe.mutex.unlock();
+        if (self.adaptive) {
+            const probe = &stripe.probation[(hash >> 16) % stripe.probation.len];
+            const fingerprint = hash | 1;
+            if (probe.* != fingerprint) {
+                probe.* = fingerprint;
+                return;
+            }
+        }
+        if (stripe.entries == null) {
+            const count = @max(1, self.count / 16);
+            var reservation: ?resources.Reservation = if (self.manager) |manager|
+                manager.reserve(.dense_source_payload_state, count * @sizeOf(Entry)) catch return
+            else
+                null;
+            const entries = self.entry_alloc.alloc(Entry, count) catch {
+                if (reservation) |*owned| owned.release();
+                return;
+            };
+            @memset(entries, .{});
+            stripe.entries = entries;
+            stripe.reservation = reservation;
+            _ = self.resident_bytes.fetchAdd(entries.len * @sizeOf(Entry), .monotonic);
+        }
+        stripe.entries.?[slot / 16] = .{
+            .occupied = true,
+            .digest = digest[0..32].*,
+            .generation = located.block.reader_generation,
+            .shard = located.block.reader_shard_id,
+            .location = located.block.location,
+        };
+    }
+};
+
 /// A compact vector plane whose payload checksum has already been validated,
 /// tied to the immutable location and generation lease that owns its bytes.
 /// Keeping this view for one query avoids both a second lookup and a second
@@ -1365,6 +1869,22 @@ pub const LocatedLookup = union(enum) {
 pub const LoadedProjection = struct {
     located: LocatedValue,
     value: vector_block.Value,
+    /// Only true when a query-owned ProjectionBorrowScope pins these bytes.
+    borrowed: bool = false,
+};
+
+pub const ProjectionBorrowScope = struct {
+    leases: std.ArrayList(resource_manager_mod.ProjectionPageCache.Cache.Lease) = .empty,
+
+    pub fn clear(self: *@This()) void {
+        for (self.leases.items) |*lease| lease.deinit();
+        self.leases.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.clear();
+        self.leases.deinit(alloc);
+    }
 };
 
 /// One independently owned destination in a bounded positional-read batch.
@@ -1377,6 +1897,7 @@ pub const ProjectionReadRequest = struct {
     scratch: []u8,
     value: ?vector_block.Value = null,
     err: ?anyerror = null,
+    borrowed: bool = false,
 };
 
 pub const ExactReadRequest = struct {
@@ -1396,6 +1917,7 @@ pub const ResidualReadRequest = struct {
 pub const ReadBatchStats = struct {
     physical_reads: u64 = 0,
     physical_bytes: u64 = 0,
+    cache_hits: u64 = 0,
 };
 
 pub const Opened = struct {
@@ -1404,6 +1926,8 @@ pub const Opened = struct {
     /// prevents one query from monopolizing its workers or multiplying the
     /// query's transient payload residency.
     const positional_read_wave: usize = 8;
+
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     store: Store,
     blocks: []RetainedBlock,
@@ -1415,6 +1939,62 @@ pub const Opened = struct {
     wal_bytes: []u8,
     wal: vector_wal.Replay,
     wal_order: std.ArrayListUnmanaged(usize),
+    wal_tree: ?*wal_view.Node = null,
+    wal_tree_initialized: bool = false,
+    /// Borrowed immutable source generation, owned by the serving generation lease.
+    external_payloads: ?*const Opened = null,
+    /// Borrowed from the table source owner; clones do not inherit it.
+    reference_location_cache: ?*ReferenceLocationCache = null,
+    /// Only immutable digest-keyed source stores may attach this hint index.
+    source_directory: ?*@import("source_location_directory.zig").Directory = null,
+
+    pub fn clone(self: *const Opened, alloc: Allocator) !Opened {
+        var unchanged = vector_wal.Writer.initAfterCommitted(alloc, self.store.last_committed_batch, self.store.covered_source_sequence);
+        defer unchanged.deinit();
+        return self.prepareWalSuccessor(alloc, &unchanged, false);
+    }
+
+    /// Allocate a successor before committing its WAL bytes. Immutable block
+    /// handles and prior transaction payloads are shared; only the appended
+    /// transaction and its AVL paths are new. No filesystem operation occurs.
+    pub fn prepareWalSuccessor(self: *const Opened, alloc: Allocator, writer: *const vector_wal.Writer, has_mutations: bool) !Opened {
+        var base = if (self.wal_tree) |tree| tree.retain() else null;
+        defer if (base) |tree| tree.release();
+        if (!self.wal_tree_initialized and self.wal_bytes.len != 0)
+            base = try wal_view.extend(alloc, null, self.wal_bytes);
+        const tree = try wal_view.extend(alloc, base, writer.bytes());
+        errdefer if (tree) |node| node.release();
+        var store = try self.store.clone(alloc);
+        errdefer store.deinit();
+        store.wal_committed_bytes = try std.math.add(u64, store.wal_committed_bytes, writer.bytes().len);
+        store.last_committed_batch = writer.last_committed_batch;
+        store.covered_source_sequence = writer.covered_source_sequence;
+        store.wal_has_mutations = store.wal_has_mutations or has_mutations;
+        if (writer.min_mutation_sequence) |sequence|
+            store.active_wal_min_mutation_sequence = @min(store.active_wal_min_mutation_sequence orelse sequence, sequence);
+        if (has_mutations) store.wal_latest_mutation_sequence = writer.covered_source_sequence;
+        const blocks = try alloc.alloc(RetainedBlock, self.blocks.len);
+        errdefer alloc.free(blocks);
+        const readers = try alloc.dupe(vector_block.Reader, self.readers);
+        errdefer alloc.free(readers);
+        const reader_order = try alloc.dupe(usize, self.reader_order);
+        errdefer alloc.free(reader_order);
+        const shard_offsets = try alloc.dupe(usize, self.shard_offsets);
+        for (blocks, self.blocks) |*out, block| out.* = block.retain();
+        return .{
+            .store = store,
+            .blocks = blocks,
+            .readers = readers,
+            .reader_order = reader_order,
+            .shard_offsets = shard_offsets,
+            .wal_bytes = &.{},
+            .wal = .{ .alloc = alloc },
+            .wal_order = .empty,
+            .wal_tree = tree,
+            .wal_tree_initialized = true,
+            .source_directory = self.source_directory,
+        };
+    }
 
     /// Maintenance-only view of one immutable generation. Every block uses a
     /// private cold-random descriptor, so sparse projection copying neither
@@ -1440,6 +2020,10 @@ pub const Opened = struct {
             ranges: []const lsm_backend.storage_io.ColdReadRange,
             stats: lsm_backend.storage_io.ColdReadStats = .{},
 
+            fn runQueued(_: void, self: *ProjectionReadGroup) std.Io.Cancelable!void {
+                try self.run();
+            }
+
             fn run(self: *ProjectionReadGroup) std.Io.Cancelable!void {
                 std.debug.assert(self.ordered.len > 0 and self.ordered.len == self.ranges.len);
                 const reader_index = self.ordered[0].reader_index;
@@ -1463,25 +2047,30 @@ pub const Opened = struct {
         };
 
         opened: *const Opened,
+        resource_manager: ?*resource_manager_mod.ResourceManager = null,
         readers: []lsm_backend.storage_io.ColdSequentialReader,
         opened_readers: usize = 0,
         ordered: std.ArrayListUnmanaged(OrderedProjection) = .empty,
         ranges: std.ArrayListUnmanaged(lsm_backend.storage_io.ColdReadRange) = .empty,
         groups: std.ArrayListUnmanaged(ProjectionReadGroup) = .empty,
 
-        fn init(opened: *const Opened) !ColdProjectionSession {
+        fn init(logical: *const Opened) !ColdProjectionSession {
+            // Locations in a reference map address the pinned source blocks.
+            // Open those files while retaining the caller's I/O admission.
+            const opened = logical.external_payloads orelse logical;
             if (opened.blocks.len > opened.store.storage.coldSequentialReaderCapacity())
                 return error.DescriptorAdmissionCapacityTooSmall;
-            const readers = try opened.store.alloc.alloc(lsm_backend.storage_io.ColdSequentialReader, opened.blocks.len);
-            var session: ColdProjectionSession = .{ .opened = opened, .readers = readers };
-            errdefer session.deinit();
-            for (opened.readers) |reader| {
-                const path = try opened.store.blockPathAlloc(reader.generation, reader.shard_id);
-                defer opened.store.alloc.free(path);
-                session.readers[session.opened_readers] = try opened.store.storage.beginColdRandomRead(opened.store.alloc, path);
-                session.opened_readers += 1;
+            const paths = try opened.store.alloc.alloc([]const u8, opened.readers.len);
+            defer opened.store.alloc.free(paths);
+            var initialized: usize = 0;
+            defer for (paths[0..initialized]) |path| opened.store.alloc.free(path);
+            for (opened.readers, paths) |reader, *path| {
+                path.* = try opened.store.blockPathAlloc(reader.generation, reader.shard_id);
+                initialized += 1;
             }
-            return session;
+            const readers = (try opened.store.storage.tryBeginColdRandomReads(opened.store.alloc, paths)) orelse
+                return error.DescriptorAdmissionUnavailable;
+            return .{ .opened = opened, .resource_manager = logical.resource_manager, .readers = readers, .opened_readers = readers.len };
         }
 
         pub fn deinit(self: *ColdProjectionSession) void {
@@ -1547,28 +2136,20 @@ pub const Opened = struct {
                 start = end;
             }
 
-            const io = maybe_io;
-            start = 0;
-            var concurrency_available = io != null;
-            while (start < self.groups.items.len) {
-                const end = @min(self.groups.items.len, start + Opened.positional_read_wave);
-                if (!concurrency_available) {
-                    for (self.groups.items[start..end]) |*group| try group.run();
-                    start = end;
-                    continue;
-                }
-                var io_group = std.Io.Group.init;
-                var scheduled_end = start;
-                while (scheduled_end < end) : (scheduled_end += 1) {
-                    io_group.concurrent(io.?, ProjectionReadGroup.run, .{&self.groups.items[scheduled_end]}) catch {
-                        concurrency_available = false;
-                        break;
-                    };
-                }
-                try io_group.await(io.?);
-                for (self.groups.items[scheduled_end..end]) |*group| try group.run();
-                start = end;
-            }
+            // Each descriptor belongs to exactly one group. Reuse bounded
+            // workers across those groups instead of imposing a barrier after
+            // every eight shards. No two workers can mutate a reader's scratch,
+            // and cancellation joins every worker before these arrays reset.
+            // Maintenance borrows the same node-wide extra-read permits as
+            // foreground reads, rather than launching ungoverned helper waves.
+            try runPositionalReadBatch(
+                ProjectionReadGroup,
+                {},
+                maybe_io,
+                self.groups.items,
+                ProjectionReadGroup.runQueued,
+                self.resource_manager,
+            );
 
             var stats: ReadBatchStats = .{};
             for (self.groups.items) |group| {
@@ -1594,12 +2175,14 @@ pub const Opened = struct {
         self.wal.deinit();
         alloc.free(self.wal_bytes);
         self.wal_order.deinit(alloc);
+        if (self.wal_tree) |tree| tree.release();
         self.* = undefined;
     }
 
     pub fn baseEncoding(self: *const Opened) ?vector_block.Encoding {
         const manifest = self.store.manifest orelse return null;
         if (!manifest.hasPhysicalBase()) return switch (manifest.score_precision) {
+            .artifact_reference => .artifact_reference,
             .authoritative_float32 => .float32,
             .bounded_float16, .authoritative_float32_with_bounded_float16 => .float16,
             .unspecified => null,
@@ -1617,15 +2200,22 @@ pub const Opened = struct {
         return self.baseEncoding() == encoding;
     }
 
+    /// Query buffers hold the resolved payload, not the reference-map entry.
+    pub fn payloadEncoding(self: *const Opened) ?vector_block.Encoding {
+        const encoding = self.baseEncoding() orelse return null;
+        if (encoding == .artifact_reference) {
+            const source = self.external_payloads orelse return null;
+            return source.baseEncoding();
+        }
+        return encoding;
+    }
+
     pub fn scorePrecision(self: *const Opened) vector_manifest.ScorePrecision {
         const manifest = self.store.manifest orelse return .unspecified;
-        if (manifest.score_precision != .unspecified) return manifest.score_precision;
-        // V1/V2 manifests predate the declaration. Their immutable block
-        // encoding is nevertheless explicit and fully admission-validated.
-        return switch (self.baseEncoding() orelse return .unspecified) {
-            .float32 => .authoritative_float32,
-            .float16 => .bounded_float16,
-        };
+        if (manifest.score_precision == .artifact_reference) {
+            if (self.external_payloads) |source| return source.scorePrecision();
+        }
+        return manifest.score_precision;
     }
 
     /// Returns an exact O(shards) cardinality certificate when CURRENT is a
@@ -1692,6 +2282,20 @@ pub const Opened = struct {
         target_shard_count: u32,
         spool_buffer_bytes: usize,
     ) !bool {
+        var build = (try self.stageDeltasToBaseWithShardCount(target_shard_count, spool_buffer_bytes)) orelse return false;
+        defer build.deinit();
+        try self.store.publishStagedBaseBuild(&build, .{ .flatten_prefix = self.store.walPrefixBoundary() });
+        return true;
+    }
+
+    /// Stage immutable output only. The caller reserves the generation and
+    /// retains this source view; CURRENT and its live WAL are untouched until
+    /// a separately fenced publisher validates and installs the receipt.
+    pub fn stageDeltasToBaseWithShardCount(
+        self: *Opened,
+        target_shard_count: u32,
+        spool_buffer_bytes: usize,
+    ) !?StagedBaseBuild {
         const manifest = self.store.manifest orelse return error.MissingVectorBlockManifest;
         if (target_shard_count == 0 or target_shard_count > vector_manifest.max_shards or
             !std.math.isPowerOfTwo(target_shard_count) or spool_buffer_bytes == 0)
@@ -1699,10 +2303,10 @@ pub const Opened = struct {
             return error.InvalidVectorBlockBuildOptions;
         }
         if (target_shard_count != manifest.shard_count) {
-            return self.compactDeltasToReshardedBase(target_shard_count, spool_buffer_bytes);
+            return try self.stageDeltasToReshardedBase(target_shard_count, spool_buffer_bytes);
         }
         const shard_count: usize = @intCast(manifest.shard_count);
-        if (!self.store.wal_has_mutations and manifest.segments.len == baseSegmentCount(manifest)) return false;
+        if (!self.store.wal_has_mutations and manifest.segments.len == baseSegmentCount(manifest)) return null;
         const flattened_wal = if (self.store.wal_has_mutations)
             self.store.walPrefixBoundary()
         else
@@ -1712,9 +2316,9 @@ pub const Opened = struct {
             return error.VectorBlockGenerationOverflow;
         const encoding = self.baseEncoding() orelse return error.InconsistentVectorBlockEncoding;
         const staged = try self.store.alloc.alloc(StagedBlock, shard_count);
-        defer self.store.alloc.free(staged);
+        errdefer self.store.alloc.free(staged);
         const coverages = try self.store.alloc.alloc(vector_manifest.Coverage, manifest.coverages.len);
-        defer self.store.alloc.free(coverages);
+        errdefer self.store.alloc.free(coverages);
         for (coverages, manifest.coverages) |*coverage, existing| coverage.* = .{
             .scope_hash = existing.scope_hash,
             .vector_count = 0,
@@ -1722,91 +2326,61 @@ pub const Opened = struct {
             .key_hash_sum = 0,
         };
         var staged_count: usize = 0;
-        var records = std.ArrayListUnmanaged(CompactionRecord).empty;
-        defer records.deinit(self.store.alloc);
+        errdefer self.store.discardStagedBlocks(staged[0..staged_count]);
         var scratch = std.ArrayListUnmanaged(f32).empty;
         defer scratch.deinit(self.store.alloc);
-        const wal_by_shard = try self.store.alloc.alloc(std.ArrayListUnmanaged(usize), shard_count);
+        const wal_by_shard = try self.store.alloc.alloc(std.ArrayListUnmanaged(vector_wal.Record), shard_count);
         defer self.store.alloc.free(wal_by_shard);
         for (wal_by_shard) |*items| items.* = .empty;
         defer for (wal_by_shard) |*items| items.deinit(self.store.alloc);
         if (flattened_wal != null) try self.collectLatestWalByShard(wal_by_shard);
 
         for (0..shard_count) |shard| {
-            records.clearRetainingCapacity();
-            const start = self.shard_offsets[shard];
-            const end = self.shard_offsets[shard + 1];
-            for (self.reader_order[start..end]) |reader_index| {
-                const reader = self.readers[reader_index];
-                for (0..reader.count) |entry_index| {
-                    const entry = try reader.entryAt(entry_index);
-                    try records.append(self.store.alloc, CompactionRecord.fromBlock(entry, reader.generation));
-                }
-            }
-            for (wal_by_shard[shard].items) |record_index| {
-                try records.append(self.store.alloc, CompactionRecord.fromWal(self.wal.records.items[record_index], generation));
-            }
-            std.mem.sortUnstable(CompactionRecord, records.items, {}, CompactionRecord.lessThan);
+            var merge = try CompactionMerge.init(self, shard, wal_by_shard[shard].items, generation);
+            defer merge.deinit();
 
-            var writer = try vector_block.Writer.initWithEncoding(
-                self.store.alloc,
+            var output = try self.store.beginStreamingBlock(
                 generation,
+                self.store.covered_source_sequence,
                 @intCast(shard),
                 manifest.shard_count,
-                self.store.covered_source_sequence,
                 encoding,
             );
-            defer writer.deinit();
-            var pos: usize = 0;
-            while (pos < records.items.len) {
-                var record_end = pos + 1;
-                while (record_end < records.items.len and records.items[pos].sameKey(records.items[record_end])) : (record_end += 1) {}
-                const latest = records.items[record_end - 1];
+            defer output.deinit();
+            while (try merge.next()) |latest| {
                 if (latest.isLive()) noteCoverage(coverages, latest.key);
                 switch (latest.payload) {
-                    .wal_vector => try latest.appendTo(&writer, self.store.alloc, &scratch),
-                    .block_vector, .tombstone => try latest.appendLiveBlockVectorTo(&writer, encoding),
+                    .wal_vector => try latest.appendTo(&output.writer.page, self.store.alloc, &scratch),
+                    .block_vector, .tombstone => try latest.appendLiveBlockVectorTo(&output.writer.page, encoding),
                 }
-                pos = record_end;
+                try output.flushIfNeeded();
             }
-            const bytes = try writer.build();
-            defer self.store.alloc.free(bytes);
-            staged[staged_count] = try self.store.stageBlock(
-                generation,
-                self.store.covered_source_sequence,
-                @intCast(shard),
-                bytes,
-            );
+            staged[staged_count] = try output.finish();
             staged_count += 1;
             // The next shard cannot reference these immutable input pages.
             // Drop only residency, not the mmap lease, so compaction does not
             // accumulate a corpus-sized RSS high-water.
             self.discardShardResidentPages(shard, true);
         }
-        if (flattened_wal) |boundary| {
-            try self.store.publishStagedBasePreservingWalTail(
-                generation,
-                self.store.covered_source_sequence,
-                staged[0..staged_count],
-                coverages,
-                boundary,
-            );
-        } else {
-            try self.store.publishStagedBaseWithCoverage(
-                generation,
-                self.store.covered_source_sequence,
-                staged[0..staged_count],
-                coverages,
-            );
-        }
-        return true;
+        return .{
+            .alloc = self.store.alloc,
+            .storage = self.store.storage,
+            .root_dir = try self.store.alloc.dupe(u8, self.store.root_dir),
+            .generation = generation,
+            .covered_source_sequence = self.store.covered_source_sequence,
+            .logical_shard_count = target_shard_count,
+            .encoding = encoding,
+            .staged = staged,
+            .coverages = coverages,
+            .stats = .{},
+        };
     }
 
-    fn compactDeltasToReshardedBase(
+    fn stageDeltasToReshardedBase(
         self: *Opened,
         target_shard_count: u32,
         spool_buffer_bytes: usize,
-    ) !bool {
+    ) !StagedBaseBuild {
         const manifest = self.store.manifest orelse return error.MissingVectorBlockManifest;
         const flattened_wal = if (self.store.wal_has_mutations)
             self.store.walPrefixBoundary()
@@ -1841,15 +2415,13 @@ pub const Opened = struct {
         }
 
         const coverages = try self.store.alloc.alloc(vector_manifest.Coverage, manifest.coverages.len);
-        defer self.store.alloc.free(coverages);
+        errdefer self.store.alloc.free(coverages);
         for (coverages, manifest.coverages) |*coverage, existing| coverage.* = .{
             .scope_hash = existing.scope_hash,
             .vector_count = 0,
             .key_hash_xor = 0,
             .key_hash_sum = 0,
         };
-        var records = std.ArrayListUnmanaged(CompactionRecord).empty;
-        defer records.deinit(self.store.alloc);
         var decode_scratch = std.ArrayListUnmanaged(f32).empty;
         defer decode_scratch.deinit(self.store.alloc);
 
@@ -1924,18 +2496,24 @@ pub const Opened = struct {
                         }
                     },
                     .wal_vector => |value| {
-                        try ctx.decode_scratch.resize(ctx.alloc, value.dims);
-                        const decoded = try value.decodeVectorInto(ctx.decode_scratch.items);
-                        const encoded = try vector_block.encodeVectorIntoWithStats(ctx.encoding, decoded, vector_out);
-                        scale = encoded.scale;
-                        quantization = encoded.quantization;
-                        if (ctx.encoding == .float16) {
-                            residual_len = try vector_block.encodeExactResidualInto(
-                                decoded,
-                                vector_out,
-                                scale,
-                                bytes[40 + record.key.len + encoded_len ..][0..residual_max],
-                            );
+                        if (value.kind == .reference) {
+                            if (ctx.encoding != .artifact_reference) return error.InconsistentVectorBlockEncoding;
+                            @memcpy(vector_out, value.vector_bytes);
+                            quantization = .{ .error_norm = 0, .decoded_norm_lower_bound = 0 };
+                        } else {
+                            try ctx.decode_scratch.resize(ctx.alloc, value.dims);
+                            const decoded = try value.decodeVectorInto(ctx.decode_scratch.items);
+                            const encoded = try vector_block.encodeVectorIntoWithStats(ctx.encoding, decoded, vector_out);
+                            scale = encoded.scale;
+                            quantization = encoded.quantization;
+                            if (ctx.encoding == .float16) {
+                                residual_len = try vector_block.encodeExactResidualInto(
+                                    decoded,
+                                    vector_out,
+                                    scale,
+                                    bytes[40 + record.key.len + encoded_len ..][0..residual_max],
+                                );
+                            }
                         }
                     },
                 }
@@ -1961,36 +2539,19 @@ pub const Opened = struct {
         };
 
         const source_shard_count: usize = @intCast(manifest.shard_count);
-        const wal_by_shard = try self.store.alloc.alloc(std.ArrayListUnmanaged(usize), source_shard_count);
+        const wal_by_shard = try self.store.alloc.alloc(std.ArrayListUnmanaged(vector_wal.Record), source_shard_count);
         defer self.store.alloc.free(wal_by_shard);
         for (wal_by_shard) |*items| items.* = .empty;
         defer for (wal_by_shard) |*items| items.deinit(self.store.alloc);
         if (flattened_wal != null) try self.collectLatestWalByShard(wal_by_shard);
         for (0..source_shard_count) |source_shard| {
-            records.clearRetainingCapacity();
-            const start = self.shard_offsets[source_shard];
-            const end = self.shard_offsets[source_shard + 1];
-            for (self.reader_order[start..end]) |reader_index| {
-                const reader = self.readers[reader_index];
-                for (0..reader.count) |entry_index| {
-                    const entry = try reader.entryAt(entry_index);
-                    try records.append(self.store.alloc, CompactionRecord.fromBlock(entry, reader.generation));
-                }
-            }
-            for (wal_by_shard[source_shard].items) |record_index| {
-                try records.append(self.store.alloc, CompactionRecord.fromWal(self.wal.records.items[record_index], generation));
-            }
-            std.mem.sortUnstable(CompactionRecord, records.items, {}, CompactionRecord.lessThan);
-            var pos: usize = 0;
-            while (pos < records.items.len) {
-                var record_end = pos + 1;
-                while (record_end < records.items.len and records.items[pos].sameKey(records.items[record_end])) : (record_end += 1) {}
-                const latest = records.items[record_end - 1];
+            var merge = try CompactionMerge.init(self, source_shard, wal_by_shard[source_shard].items, generation);
+            defer merge.deinit();
+            while (try merge.next()) |latest| {
                 if (latest.isLive()) {
                     noteCoverage(coverages, latest.key);
                     try spool.append(latest);
                 }
-                pos = record_end;
             }
             self.discardShardResidentPages(source_shard, true);
         }
@@ -2002,7 +2563,7 @@ pub const Opened = struct {
         }
 
         const staged = try self.store.alloc.alloc(StagedBlock, destination_count);
-        defer self.store.alloc.free(staged);
+        errdefer self.store.alloc.free(staged);
         var staged_count: usize = 0;
         errdefer self.store.discardStagedBlocks(staged[0..staged_count]);
         for (0..destination_count) |shard| {
@@ -2014,15 +2575,15 @@ pub const Opened = struct {
             var entries = try parseSpoolEntries(self.store.alloc, spool_bytes, encoding);
             defer entries.deinit(self.store.alloc);
             std.mem.sortUnstable(SpoolEntry, entries.items, {}, SpoolEntry.lessThan);
-            var writer = try vector_block.Writer.initWithEncoding(
-                self.store.alloc,
+            var output = try self.store.beginStreamingBlock(
                 generation,
+                self.store.covered_source_sequence,
                 @intCast(shard),
                 target_shard_count,
-                self.store.covered_source_sequence,
                 encoding,
             );
-            defer writer.deinit();
+            defer output.deinit();
+            const writer = &output.writer.page;
             for (entries.items) |entry| {
                 if (entry.exact_residual) |residual| {
                     try writer.appendEncodedVectorWithStatsAndResidual(
@@ -2046,34 +2607,23 @@ pub const Opened = struct {
                         entry.quantization,
                     );
                 }
+                try output.flushIfNeeded();
             }
-            const block = try writer.build();
-            defer self.store.alloc.free(block);
-            staged[staged_count] = try self.store.stageBlock(
-                generation,
-                self.store.covered_source_sequence,
-                @intCast(shard),
-                block,
-            );
+            staged[staged_count] = try output.finish();
             staged_count += 1;
         }
-        if (flattened_wal) |boundary| {
-            try self.store.publishStagedBasePreservingWalTail(
-                generation,
-                self.store.covered_source_sequence,
-                staged[0..staged_count],
-                coverages,
-                boundary,
-            );
-        } else {
-            try self.store.publishStagedBaseWithCoverage(
-                generation,
-                self.store.covered_source_sequence,
-                staged[0..staged_count],
-                coverages,
-            );
-        }
-        return true;
+        return .{
+            .alloc = self.store.alloc,
+            .storage = self.store.storage,
+            .root_dir = try self.store.alloc.dupe(u8, self.store.root_dir),
+            .generation = generation,
+            .covered_source_sequence = self.store.covered_source_sequence,
+            .logical_shard_count = target_shard_count,
+            .encoding = encoding,
+            .staged = staged,
+            .coverages = coverages,
+            .stats = .{},
+        };
     }
 
     /// Checkpoints the committed mutation WAL into mmap-friendly sparse
@@ -2082,6 +2632,10 @@ pub const Opened = struct {
     /// into one sparse generation, preserving tombstones against the base and
     /// keeping both write amplification and query fan-out bounded.
     pub fn checkpointWalToDelta(self: *Opened, force: bool) !bool {
+        return self.checkpointWalToDeltaWithPolicy(force, false);
+    }
+
+    pub fn checkpointWalToDeltaWithPolicy(self: *Opened, force: bool, append_only: bool) !bool {
         if (!self.store.wal_has_mutations) return false;
         if (!force and !self.store.shouldCheckpointWal()) return false;
         const manifest = self.store.manifest orelse return error.MissingVectorBlockManifest;
@@ -2095,12 +2649,12 @@ pub const Opened = struct {
             vector_manifest.max_bootstrap_delta_generations
         else
             vector_manifest.max_online_delta_generations;
-        const compact_existing = deltaGenerationCount(manifest) >= delta_limit;
+        const compact_existing = deltaGenerationCount(manifest) >= (if (append_only) vector_manifest.max_supported_delta_generations else delta_limit);
         const generation = std.math.add(u64, manifest.latest_generation, 1) catch return error.VectorBlockGenerationOverflow;
         const encoding = self.baseEncoding() orelse return error.InconsistentVectorBlockEncoding;
         const shard_count: usize = @intCast(manifest.shard_count);
 
-        const wal_by_shard = try self.store.alloc.alloc(std.ArrayListUnmanaged(usize), shard_count);
+        const wal_by_shard = try self.store.alloc.alloc(std.ArrayListUnmanaged(vector_wal.Record), shard_count);
         defer self.store.alloc.free(wal_by_shard);
         for (wal_by_shard) |*items| items.* = .empty;
         defer for (wal_by_shard) |*items| items.deinit(self.store.alloc);
@@ -2127,36 +2681,29 @@ pub const Opened = struct {
                     }
                 }
             }
-            for (wal_by_shard[shard].items) |record_index| {
-                try records.append(self.store.alloc, CompactionRecord.fromWal(self.wal.records.items[record_index], generation));
+            for (wal_by_shard[shard].items) |record| {
+                try records.append(self.store.alloc, CompactionRecord.fromWal(record, generation));
             }
             if (records.items.len == 0) continue;
             std.mem.sortUnstable(CompactionRecord, records.items, {}, CompactionRecord.lessThan);
 
-            var writer = try vector_block.Writer.initWithEncoding(
-                self.store.alloc,
+            var output = try self.store.beginStreamingBlock(
                 generation,
+                self.store.covered_source_sequence,
                 @intCast(shard),
                 manifest.shard_count,
-                self.store.covered_source_sequence,
                 encoding,
             );
-            defer writer.deinit();
+            defer output.deinit();
             var pos: usize = 0;
             while (pos < records.items.len) {
                 var end = pos + 1;
                 while (end < records.items.len and records.items[pos].sameKey(records.items[end])) : (end += 1) {}
-                try records.items[end - 1].appendTo(&writer, self.store.alloc, &scratch);
+                try records.items[end - 1].appendTo(&output.writer.page, self.store.alloc, &scratch);
+                try output.flushIfNeeded();
                 pos = end;
             }
-            const bytes = try writer.build();
-            defer self.store.alloc.free(bytes);
-            try staged.append(self.store.alloc, try self.store.stageBlock(
-                generation,
-                self.store.covered_source_sequence,
-                @intCast(shard),
-                bytes,
-            ));
+            try staged.append(self.store.alloc, try output.finish());
             if (compact_existing) self.discardShardResidentPages(shard, false);
         }
         if (staged.items.len == 0) return error.EmptyVectorBlockGeneration;
@@ -2178,7 +2725,8 @@ pub const Opened = struct {
         }
     }
 
-    fn collectLatestWalByShard(self: *const Opened, by_shard: []std.ArrayListUnmanaged(usize)) !void {
+    fn collectLatestWalByShard(self: *const Opened, by_shard: []std.ArrayListUnmanaged(vector_wal.Record)) !void {
+        if (self.wal_tree_initialized) return wal_view.Node.collectByShard(self.wal_tree, self.store.alloc, by_shard);
         var pos: usize = 0;
         while (pos < self.wal_order.items.len) {
             const first = self.wal.records.items[self.wal_order.items[pos]];
@@ -2190,7 +2738,7 @@ pub const Opened = struct {
             const latest_index = self.wal_order.items[end - 1];
             const latest = self.wal.records.items[latest_index];
             const shard: usize = @intCast(latest.key_hash & (@as(u64, by_shard.len) - 1));
-            try by_shard[shard].append(self.store.alloc, latest_index);
+            try by_shard[shard].append(self.store.alloc, latest);
             pos = end;
         }
     }
@@ -2200,15 +2748,33 @@ pub const Opened = struct {
     }
 
     pub fn getHashed(self: *const Opened, key: []const u8, hash: u64, max_source_sequence: u64, expected_revision: ?u64) !vector_block.Lookup {
+        const found = try self.getRawHashed(key, hash, max_source_sequence, expected_revision);
+        if (found != .vector or found.vector.encoding != .artifact_reference or self.external_payloads == null) return found;
+        return .{ .vector = try self.resolveReference(found.vector) };
+    }
+
+    pub fn resolveReference(self: *const Opened, ref: vector_block.Value) !vector_block.Value {
+        const source = self.external_payloads orelse return error.MissingVectorPayloadGeneration;
+        if (ref.bytes.len != 32) return error.InvalidVectorReference;
+        const found = try source.getRawHashed(ref.bytes, vector_block.keyHash(ref.bytes), std.math.maxInt(u64), 1);
+        if (found != .vector or found.vector.dims != ref.dims or found.vector.encoding == .artifact_reference) return error.MissingCommittedVectorPayload;
+        var value = found.vector;
+        value.source_sequence = ref.source_sequence;
+        value.revision = ref.revision;
+        return value;
+    }
+
+    pub fn getRawHashed(self: *const Opened, key: []const u8, hash: u64, max_source_sequence: u64, expected_revision: ?u64) !vector_block.Lookup {
         var saw_revision_mismatch = false;
         if (try self.getWalHashed(key, hash, max_source_sequence)) |record| {
             if (expected_revision == null or expected_revision.? == record.revision) {
                 return switch (record.kind) {
-                    .upsert => .{ .vector = .{
+                    .upsert, .reference => .{ .vector = .{
                         .source_sequence = record.source_sequence,
                         .revision = record.revision,
                         .dims = record.dims,
                         .bytes = record.vector_bytes,
+                        .encoding = if (record.kind == .reference) .artifact_reference else .float32,
                     } },
                     .tombstone => .{ .tombstone = .{ .source_sequence = record.source_sequence, .revision = record.revision } },
                     else => unreachable,
@@ -2216,6 +2782,12 @@ pub const Opened = struct {
             }
             saw_revision_mismatch = true;
         }
+        if (self.source_directory) |directory| if (directory.get(key)) |hint| {
+            if (self.readerIndexForGenerationShard(hint.generation, hint.shard)) |reader_index| {
+                const found = try self.readers[reader_index].getHashed(key, hash, max_source_sequence, expected_revision);
+                if (found == .vector) return found;
+            }
+        };
         const manifest = self.store.manifest orelse return .missing;
         const target_shard: u32 = @intCast(hash & (@as(u64, manifest.shard_count) - 1));
         const shard_start = self.shard_offsets[target_shard];
@@ -2251,61 +2823,58 @@ pub const Opened = struct {
         expected_revision: ?u64,
         scratch: []u8,
     ) !vector_block.Lookup {
-        var saw_revision_mismatch = false;
-        if (try self.getWalHashed(key, hash, max_source_sequence)) |record| {
-            if (expected_revision == null or expected_revision.? == record.revision) {
-                return switch (record.kind) {
-                    .upsert => .{ .vector = .{
-                        .source_sequence = record.source_sequence,
-                        .revision = record.revision,
-                        .dims = record.dims,
-                        .bytes = record.vector_bytes,
-                    } },
-                    .tombstone => .{ .tombstone = .{ .source_sequence = record.source_sequence, .revision = record.revision } },
-                    else => unreachable,
-                };
-            }
-            saw_revision_mismatch = true;
-        }
-        const manifest = self.store.manifest orelse return .missing;
-        const target_shard: u32 = @intCast(hash & (@as(u64, manifest.shard_count) - 1));
-        const shard_start = self.shard_offsets[target_shard];
-        var order_pos = self.shard_offsets[target_shard + 1];
-        while (order_pos > shard_start) {
-            order_pos -= 1;
-            const reader_index = self.reader_order[order_pos];
-            const found = try self.readers[reader_index].locateHashed(key, hash, max_source_sequence, null);
-            switch (found) {
-                .missing => {},
-                .tombstone => |value| {
-                    if (expected_revision == null or expected_revision.? == value.revision)
-                        return .{ .tombstone = value };
-                    saw_revision_mismatch = true;
-                },
-                .vector => |location| {
-                    if (expected_revision != null and expected_revision.? != location.revision) {
-                        saw_revision_mismatch = true;
-                        continue;
-                    }
-                    const required = try location.scratchBytes();
-                    if (scratch.len < required) return error.BufferTooSmall;
-                    const vector_bytes = scratch[0..location.vector_len];
-                    const residual_bytes = scratch[location.vector_len..required];
-                    try self.blocks[reader_index].readAllAt(vector_bytes, location.vector_offset);
-                    if (residual_bytes.len != 0)
-                        try self.blocks[reader_index].readAllAt(residual_bytes, location.residual_offset);
-                    return .{ .vector = try location.valueFromPayload(vector_bytes, residual_bytes) };
-                },
-            }
-        }
-        if (saw_revision_mismatch) return error.VectorBlockRevisionMismatch;
-        return .missing;
+        const found = try self.locateHashed(key, hash, max_source_sequence, expected_revision);
+        return switch (found) {
+            .missing => .missing,
+            .tombstone => |value| .{ .tombstone = value },
+            .vector => |value| .{ .vector = try self.readExactInto(value, scratch) },
+        };
     }
 
     /// Resolves a key once without touching either immutable payload plane.
     /// The returned location is valid only while this Opened generation is
     /// retained; read methods reject accidental use with a different reader.
-    pub fn locateHashed(
+    pub fn locateHashed(self: *const Opened, key: []const u8, hash: u64, max_source_sequence: u64, expected_revision: ?u64) !LocatedLookup {
+        const found = try self.locateRawHashed(key, hash, max_source_sequence, expected_revision);
+        if (found != .vector or self.external_payloads == null) return found;
+        const encoding = switch (found.vector) {
+            .wal => |v| v.encoding,
+            .block => |b| b.location.encoding,
+        };
+        if (encoding != .artifact_reference) return found;
+        // Only the small authenticated identity touches the reference map's mmap.
+        const ref = try self.viewExact(found.vector);
+        const source = self.external_payloads.?;
+        if (ref.bytes.len != 32) return error.InvalidVectorReference;
+        const digest_hash = vector_block.keyHash(ref.bytes);
+        var target: LocatedLookup = lookup: {
+            if (source.reference_location_cache) |cache| {
+                if (cache.get(source, ref.bytes, digest_hash)) |located| break :lookup .{ .vector = located };
+            }
+            const resolved = try source.locateRawHashed(ref.bytes, digest_hash, std.math.maxInt(u64), 1);
+            if (resolved == .vector) {
+                if (source.reference_location_cache) |cache| cache.put(ref.bytes, digest_hash, resolved.vector);
+            }
+            break :lookup resolved;
+        };
+        if (target != .vector) return error.MissingCommittedVectorPayload;
+        switch (target.vector) {
+            .wal => |*value| {
+                if (value.dims != ref.dims or value.encoding == .artifact_reference) return error.InvalidVectorReference;
+                value.source_sequence = ref.source_sequence;
+                value.revision = ref.revision;
+            },
+            .block => |*block| {
+                if (block.location.dims != ref.dims or block.location.encoding == .artifact_reference) return error.InvalidVectorReference;
+                block.owner = source;
+                block.location.source_sequence = ref.source_sequence;
+                block.location.revision = ref.revision;
+            },
+        }
+        return target;
+    }
+
+    fn locateRawHashed(
         self: *const Opened,
         key: []const u8,
         hash: u64,
@@ -2316,11 +2885,12 @@ pub const Opened = struct {
         if (try self.getWalHashed(key, hash, max_source_sequence)) |record| {
             if (expected_revision == null or expected_revision.? == record.revision) {
                 return switch (record.kind) {
-                    .upsert => .{ .vector = .{ .wal = .{
+                    .upsert, .reference => .{ .vector = .{ .wal = .{
                         .source_sequence = record.source_sequence,
                         .revision = record.revision,
                         .dims = record.dims,
                         .bytes = record.vector_bytes,
+                        .encoding = if (record.kind == .reference) .artifact_reference else .float32,
                     } } },
                     .tombstone => .{ .tombstone = .{
                         .source_sequence = record.source_sequence,
@@ -2331,6 +2901,17 @@ pub const Opened = struct {
             }
             saw_revision_mismatch = true;
         }
+        if (self.source_directory) |directory| if (directory.get(key)) |hint| {
+            if (self.readerIndexForGenerationShard(hint.generation, hint.shard)) |reader_index| {
+                const found = try self.readers[reader_index].locateHashed(key, hash, max_source_sequence, expected_revision);
+                if (found == .vector) return .{ .vector = .{ .block = .{
+                    .reader_index = reader_index,
+                    .reader_generation = hint.generation,
+                    .reader_shard_id = hint.shard,
+                    .location = found.vector,
+                } } };
+            }
+        };
         const manifest = self.store.manifest orelse return .missing;
         const target_shard: u32 = @intCast(hash & (@as(u64, manifest.shard_count) - 1));
         const shard_start = self.shard_offsets[target_shard];
@@ -2370,7 +2951,12 @@ pub const Opened = struct {
         self: *const Opened,
         located: LocatedValue,
         scratch: []u8,
-    ) !vector_block.Value {
+    ) anyerror!vector_block.Value {
+        if (located == .block) {
+            if (located.block.owner) |owner| {
+                if (owner != self) return owner.readProjectionInto(located, scratch);
+            }
+        }
         return switch (located) {
             .wal => |value| value,
             .block => |block| blk: {
@@ -2385,6 +2971,7 @@ pub const Opened = struct {
     }
 
     fn runProjectionRead(self: *const Opened, request: *ProjectionReadRequest) std.Io.Cancelable!void {
+        if (request.borrowed) return;
         request.value = self.readProjectionInto(request.located, request.scratch) catch |err| {
             request.err = err;
             return;
@@ -2400,16 +2987,206 @@ pub const Opened = struct {
         io: ?std.Io,
         requests: []ProjectionReadRequest,
     ) !ReadBatchStats {
-        try runPositionalReadBatch(ProjectionReadRequest, self, io, requests, runProjectionRead);
-        var stats: ReadBatchStats = .{};
-        for (requests) |request| switch (request.located) {
-            .wal => {},
-            .block => |block| {
-                stats.physical_reads += 1;
-                stats.physical_bytes +|= block.location.vector_len;
-            },
+        // Ordinary callers may reuse request descriptors between batches.
+        for (requests) |*request| request.borrowed = false;
+        return self.readProjectionBatchImpl(io, requests);
+    }
+
+    pub fn readProjectionsIntoBatchBorrowed(
+        self: *const Opened,
+        io: ?std.Io,
+        requests: []ProjectionReadRequest,
+        scope: *ProjectionBorrowScope,
+        alloc: Allocator,
+    ) !ReadBatchStats {
+        for (requests) |*request| {
+            request.borrowed = false;
+            request.value = null;
+            request.err = null;
+        }
+        if (self.resource_manager) |manager| if (manager.dense_projection_borrow_enabled) {
+            if (manager.projectionPageCache()) |cache| for (requests) |*request| {
+                const item = (self.projectionPageItem(request) catch continue) orelse continue;
+                var lease = cache.borrow(item.block.shared.identity, item.page, item.location.vector_offset - item.page, item.location.vector_len) orelse continue;
+                const value = item.location.projectionValueFromPayload(lease.bytes) catch {
+                    lease.deinit();
+                    continue;
+                };
+                scope.leases.append(alloc, lease) catch {
+                    lease.deinit();
+                    continue;
+                };
+                request.value = value;
+                request.borrowed = true;
+            };
         };
+        return self.readProjectionBatchImpl(io, requests);
+    }
+
+    fn readProjectionBatchImpl(self: *const Opened, io: ?std.Io, requests: []ProjectionReadRequest) !ReadBatchStats {
+        if (self.resource_manager) |manager| if (manager.dense_projection_trace_enabled)
+            @import("projection_read_trace.zig").record(self, requests);
+        if (self.resource_manager) |manager| if (manager.dense_projection_pages_enabled) {
+            // Charge bounded grouping metadata and every possible worker page
+            // before entering that stack frame. Budget rejection preserves
+            // the established scalar/vector-read path instead of failing queries.
+            const scratch_bytes = 256 * (@sizeOf(ProjectionPageItem) + @sizeOf(ProjectionPageGroup)) + positional_read_wave * resource_manager_mod.ProjectionPageCache.page_size;
+            if (manager.reserveImmediate(.dense_search_working_set, scratch_bytes)) |reservation| {
+                var owned = reservation;
+                defer owned.release();
+                return self.readProjectionPages(io, requests, manager);
+            } else |_| {}
+        };
+        try runPositionalReadBatch(ProjectionReadRequest, self, io, requests, runProjectionRead, self.resource_manager);
+        var stats: ReadBatchStats = .{};
+        for (requests) |request| {
+            if (request.borrowed) {
+                stats.cache_hits += 1;
+                continue;
+            }
+            switch (request.located) {
+                .wal => {},
+                .block => |block| {
+                    stats.physical_reads += 1;
+                    stats.physical_bytes +|= block.location.vector_len;
+                },
+            }
+        }
         return stats;
+    }
+
+    const ProjectionPageItem = struct {
+        request: *ProjectionReadRequest,
+        block: RetainedBlock,
+        location: vector_block.ValueLocation,
+        page: usize,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            if (a.block.shared.identity != b.block.shared.identity) return a.block.shared.identity < b.block.shared.identity;
+            return a.location.vector_offset < b.location.vector_offset;
+        }
+    };
+
+    const ProjectionPageGroup = struct {
+        items: []ProjectionPageItem = &.{},
+        cache: ?*resource_manager_mod.ProjectionPageCache.Cache = null,
+        fallback: ?*ProjectionReadRequest = null,
+        stats: ReadBatchStats = .{},
+    };
+
+    fn runProjectionPage(self: *const Opened, group: *ProjectionPageGroup) std.Io.Cancelable!void {
+        if (group.fallback) |request| {
+            try self.runProjectionRead(request);
+            if (request.located == .block) {
+                group.stats.physical_reads = 1;
+                group.stats.physical_bytes = request.located.block.location.vector_len;
+            }
+            return;
+        }
+        const first = group.items[0];
+        const last = group.items[group.items.len - 1];
+        const start = first.location.vector_offset;
+        var end = last.location.vector_offset + last.location.vector_len;
+        // Duplicate offsets can have differently sized destinations in invalid
+        // input. Never let one malformed sibling shorten another's range.
+        for (group.items) |item| end = @max(end, item.location.vector_offset + item.location.vector_len);
+        var page: [resource_manager_mod.ProjectionPageCache.page_size]u8 = undefined;
+        const result = if (group.cache) |cache| cache.copy(first.block.shared.identity, first.page, start - first.page, page[0 .. end - start]) else .miss;
+        var origin = start;
+        if (result != .hit) {
+            const fill = result == .admit or group.items.len > 1;
+            origin = if (fill) first.page else start;
+            const read_end = if (fill) @min(first.block.bytes().len, first.page + page.len) else end;
+            first.block.readAllAt(page[0 .. read_end - origin], origin) catch |err| {
+                for (group.items) |item| item.request.err = err;
+                return;
+            };
+            group.stats.physical_reads = 1;
+            group.stats.physical_bytes = read_end - origin;
+            if (fill) if (group.cache) |cache| cache.put(first.block.shared.identity, first.page, page[0 .. read_end - origin]);
+        } else group.stats.cache_hits = group.items.len;
+        for (group.items) |item| {
+            const bytes = item.request.scratch[0..item.location.vector_len];
+            @memcpy(bytes, page[item.location.vector_offset - origin ..][0..bytes.len]);
+            item.request.value = item.location.projectionValueFromPayload(bytes) catch |err| {
+                item.request.err = err;
+                continue;
+            };
+        }
+    }
+
+    fn projectionPageItem(self: *const Opened, request: *ProjectionReadRequest) !?ProjectionPageItem {
+        const located = switch (request.located) {
+            .wal => return null,
+            .block => |block| block,
+        };
+        if (located.owner) |owner| if (owner != self) return owner.projectionPageItem(request);
+        _ = try self.readerForLocated(located.reader_index, located.reader_generation, located.reader_shard_id);
+        const location = located.location;
+        if (request.scratch.len < location.vector_len) return error.BufferTooSmall;
+        const block = self.blocks[located.reader_index];
+        if (location.vector_offset > block.bytes().len or location.vector_len > block.bytes().len - location.vector_offset) return error.EndOfStream;
+        const page = location.vector_offset / resource_manager_mod.ProjectionPageCache.page_size * resource_manager_mod.ProjectionPageCache.page_size;
+        if (location.vector_len > resource_manager_mod.ProjectionPageCache.page_size - (location.vector_offset - page)) return null;
+        return .{ .request = request, .block = block, .location = location, .page = page };
+    }
+
+    fn readProjectionPages(self: *const Opened, io: ?std.Io, requests: []ProjectionReadRequest, manager: *resource_manager_mod.ResourceManager) !ReadBatchStats {
+        const cache = manager.projectionPageCache();
+        var total: ReadBatchStats = .{};
+        var begin: usize = 0;
+        // Bounded metadata, independent of the configured rerank window. No
+        // arena growth or per-vector task allocation is added to the hot path.
+        while (begin < requests.len) {
+            const end = @min(requests.len, begin + 256);
+            var items: [256]ProjectionPageItem = undefined;
+            var count: usize = 0;
+            var groups: [256]ProjectionPageGroup = undefined;
+            var group_count: usize = 0;
+            for (requests[begin..end]) |*request| {
+                if (request.borrowed) {
+                    total.cache_hits += 1;
+                    continue;
+                }
+                request.value = null;
+                request.err = null;
+                const item = self.projectionPageItem(request) catch |err| {
+                    request.err = err;
+                    continue;
+                };
+                if (item) |resolved| {
+                    items[count] = resolved;
+                    count += 1;
+                } else {
+                    if (manager.dense_grouped_fallbacks) {
+                        groups[group_count] = .{ .fallback = request };
+                        group_count += 1;
+                        continue;
+                    }
+                    try self.runProjectionRead(request);
+                    if (request.located == .block) {
+                        total.physical_reads += 1;
+                        total.physical_bytes += request.located.block.location.vector_len;
+                    }
+                }
+            }
+            std.mem.sortUnstable(ProjectionPageItem, items[0..count], {}, ProjectionPageItem.less);
+            var start: usize = 0;
+            while (start < count) {
+                var stop = start + 1;
+                while (stop < count and items[stop].block.shared == items[start].block.shared and items[stop].page == items[start].page) : (stop += 1) {}
+                groups[group_count] = .{ .items = items[start..stop], .cache = cache };
+                group_count += 1;
+                start = stop;
+            }
+            try runPositionalReadBatch(ProjectionPageGroup, self, io, groups[0..group_count], runProjectionPage, manager);
+            for (groups[0..group_count]) |group| {
+                total.physical_reads += group.stats.physical_reads;
+                total.physical_bytes += group.stats.physical_bytes;
+                total.cache_hits += group.stats.cache_hits;
+            }
+            begin = end;
+        }
+        return total;
     }
 
     /// Releases clean immutable pages accumulated by a one-pass projection
@@ -2424,7 +3201,12 @@ pub const Opened = struct {
     /// query scoring. Mapped blocks were admitted with MADV_RANDOM, so this
     /// faults only the vector pages selected by the ANN candidate shell and
     /// leaves ordinary host page pressure free to reclaim them.
-    pub fn viewProjection(self: *const Opened, located: LocatedValue) !LoadedProjection {
+    pub fn viewProjection(self: *const Opened, located: LocatedValue) anyerror!LoadedProjection {
+        if (located == .block) {
+            if (located.block.owner) |owner| {
+                if (owner != self) return owner.viewProjection(located);
+            }
+        }
         return switch (located) {
             .wal => |value| .{ .located = located, .value = value },
             .block => |block| blk: {
@@ -2457,7 +3239,12 @@ pub const Opened = struct {
         error_norm: f32,
         decoded_norm_lower_bound: f32,
         checksum: u32,
-    ) !LoadedProjection {
+    ) anyerror!LoadedProjection {
+        if (located == .block) {
+            if (located.block.owner) |owner| {
+                if (owner != self) return owner.bindBorrowedProjection(located, bytes, scale, error_norm, decoded_norm_lower_bound, checksum);
+            }
+        }
         return switch (located) {
             .wal => error.UnsupportedBorrowedVectorProjection,
             .block => |block| blk: {
@@ -2494,7 +3281,12 @@ pub const Opened = struct {
         projection_checksum: u32,
         source_sequence: u64,
         hint: vectorindex.types.NativeResidualLocation,
-    ) !LoadedProjection {
+    ) anyerror!LoadedProjection {
+        if (self.external_payloads) |source| {
+            var projection = try source.bindPersistedResidualLocation(projection_bytes, scale, error_norm, decoded_norm_lower_bound, projection_checksum, source_sequence, hint);
+            if (projection.located == .block) projection.located.block.owner = source;
+            return projection;
+        }
         if (hint.residual_len == 0) return error.VectorBlockProjectionLocationMismatch;
         const index = self.readerIndexForGenerationShard(
             hint.reader_generation,
@@ -2544,7 +3336,12 @@ pub const Opened = struct {
 
     /// Completes a previously validated compact view by touching only its
     /// lossless residual plane. The caller must hold the same Opened lease.
-    pub fn viewExactFromProjection(self: *const Opened, projection: LoadedProjection) !vector_block.Value {
+    pub fn viewExactFromProjection(self: *const Opened, projection: LoadedProjection) anyerror!vector_block.Value {
+        if (projection.located == .block) {
+            if (projection.located.block.owner) |owner| {
+                if (owner != self) return owner.viewExactFromProjection(projection);
+            }
+        }
         return switch (projection.located) {
             .wal => projection.value,
             .block => |block| blk: {
@@ -2571,7 +3368,12 @@ pub const Opened = struct {
         self: *const Opened,
         located: LocatedValue,
         scratch: []u8,
-    ) !vector_block.Value {
+    ) anyerror!vector_block.Value {
+        if (located == .block) {
+            if (located.block.owner) |owner| {
+                if (owner != self) return owner.readExactInto(located, scratch);
+            }
+        }
         return switch (located) {
             .wal => |value| value,
             .block => |block| blk: {
@@ -2601,7 +3403,7 @@ pub const Opened = struct {
         io: ?std.Io,
         requests: []ExactReadRequest,
     ) !ReadBatchStats {
-        try runPositionalReadBatch(ExactReadRequest, self, io, requests, runExactRead);
+        try runPositionalReadBatch(ExactReadRequest, self, io, requests, runExactRead, self.resource_manager);
         var stats: ReadBatchStats = .{};
         for (requests) |request| switch (request.located) {
             .wal => {},
@@ -2620,7 +3422,12 @@ pub const Opened = struct {
         self: *const Opened,
         projection: LoadedProjection,
         residual_scratch: []u8,
-    ) !vector_block.Value {
+    ) anyerror!vector_block.Value {
+        if (projection.located == .block) {
+            if (projection.located.block.owner) |owner| {
+                if (owner != self) return owner.readExactResidualInto(projection, residual_scratch);
+            }
+        }
         return switch (projection.located) {
             .wal => projection.value,
             .block => |block| blk: {
@@ -2646,7 +3453,7 @@ pub const Opened = struct {
         io: ?std.Io,
         requests: []ResidualReadRequest,
     ) !ReadBatchStats {
-        try runPositionalReadBatch(ResidualReadRequest, self, io, requests, runResidualRead);
+        try runPositionalReadBatch(ResidualReadRequest, self, io, requests, runResidualRead, self.resource_manager);
         var stats: ReadBatchStats = .{};
         for (requests) |request| switch (request.projection.located) {
             .wal => {},
@@ -2672,9 +3479,8 @@ pub const Opened = struct {
         return reader;
     }
 
-    /// Resolves an immutable physical location without scanning unrelated
-    /// shards. Generations may temporarily retain more than one reader per
-    /// shard, so search that shard newest-first just like point lookup.
+    /// Manifest order is generation-ascending within each shard. Directory
+    /// hints stay logarithmic even with long append-only source chains.
     fn readerIndexForGenerationShard(
         self: *const Opened,
         reader_generation: u64,
@@ -2683,18 +3489,20 @@ pub const Opened = struct {
         const manifest = self.store.manifest orelse return null;
         if (reader_shard_id >= manifest.shard_count) return null;
         const shard: usize = @intCast(reader_shard_id);
-        const shard_start = self.shard_offsets[shard];
-        var order_pos = self.shard_offsets[shard + 1];
-        while (order_pos > shard_start) {
-            order_pos -= 1;
-            const reader_index = self.reader_order[order_pos];
-            const reader = self.readers[reader_index];
-            if (reader.generation == reader_generation) return reader_index;
+        var lo = self.shard_offsets[shard];
+        var hi = self.shard_offsets[shard + 1];
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const index = self.reader_order[mid];
+            const generation = self.readers[index].generation;
+            if (generation == reader_generation) return index;
+            if (generation < reader_generation) lo = mid + 1 else hi = mid;
         }
         return null;
     }
 
     fn getWalHashed(self: *const Opened, key: []const u8, hash: u64, max_source_sequence: u64) !?vector_wal.Record {
+        if (self.wal_tree_initialized) return wal_view.Node.lookup(self.wal_tree, key, hash, max_source_sequence);
         var lo: usize = 0;
         var hi = self.wal_order.items.len;
         while (lo < hi) {
@@ -2720,6 +3528,7 @@ fn runPositionalReadBatch(
     maybe_io: ?std.Io,
     requests: []Request,
     comptime run: anytype,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
 ) !void {
     const io = maybe_io orelse {
         for (requests) |*request| try run(context, request);
@@ -2730,30 +3539,158 @@ fn runPositionalReadBatch(
         return;
     }
 
-    var start: usize = 0;
-    var concurrency_available = true;
-    while (start < requests.len) {
-        if (!concurrency_available) {
-            for (requests[start..]) |*request| try run(context, request);
-            return;
+    // Keep the same bounded physical concurrency without allocating a task
+    // per vector or putting a barrier behind every short wave. The caller is
+    // one worker, so an unavailable concurrent lane still makes progress.
+    const Work = struct {
+        context: @TypeOf(context),
+        requests: []Request,
+        next: std.atomic.Value(usize) = .init(0),
+        manager: ?*resource_manager_mod.ResourceManager,
+
+        fn worker(work: *@This()) std.Io.Cancelable!void {
+            defer if (work.manager) |manager| manager.releaseDenseReadTask();
+            try work.drain();
         }
 
-        const end = @min(requests.len, start + Opened.positional_read_wave);
-        var group = std.Io.Group.init;
-        var scheduled_end = start;
-        while (scheduled_end < end) : (scheduled_end += 1) {
-            group.concurrent(io, run, .{ context, &requests[scheduled_end] }) catch {
-                concurrency_available = false;
-                break;
-            };
+        fn drain(work: *@This()) std.Io.Cancelable!void {
+            while (true) {
+                const index = work.next.fetchAdd(1, .monotonic);
+                if (index >= work.requests.len) return;
+                try run(work.context, &work.requests[index]);
+            }
         }
-        // Await is a cancellation propagation boundary and guarantees all
-        // issued reads have stopped touching request memory before returning.
-        try group.await(io);
-        for (requests[scheduled_end..end]) |*request| try run(context, request);
-        start = end;
+    };
+    var work: Work = .{ .context = context, .requests = requests, .manager = resource_manager };
+    var group = std.Io.Group.init;
+    // Drain all tasks even if the caller is cancelled while doing its share:
+    // request buffers and the stack-owned queue must never escape this call.
+    defer group.cancel(io);
+    const workers = @min(requests.len, Opened.positional_read_wave);
+    for (1..workers) |_| {
+        if (resource_manager) |manager| if (!manager.tryAcquireDenseReadTask()) break;
+        group.concurrent(io, Work.worker, .{&work}) catch {
+            if (resource_manager) |manager| manager.releaseDenseReadTask();
+            break;
+        };
+    }
+    try work.drain();
+    try group.await(io);
+}
+
+test "storage.vector_block_store bounded read workers process every request once with unavailable lanes" {
+    const Request = struct { visits: usize = 0 };
+    const Runner = struct {
+        fn run(_: void, request: *Request) std.Io.Cancelable!void {
+            request.visits += 1;
+        }
+    };
+    for ([_]usize{ 0, 1, 8 }) |limit| {
+        var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(limit) });
+        defer runtime.deinit();
+        var requests: [257]Request = @splat(.{});
+        try runPositionalReadBatch(Request, {}, runtime.io(), &requests, Runner.run, null);
+        for (requests) |request| try std.testing.expectEqual(@as(usize, 1), request.visits);
+    }
+    var serial: [17]Request = @splat(.{});
+    try runPositionalReadBatch(Request, {}, null, &serial, Runner.run, null);
+    for (serial) |request| try std.testing.expectEqual(@as(usize, 1), request.visits);
+}
+
+test "storage.vector_block_store governed read workers release permits on completion and cancellation" {
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer runtime.deinit();
+    const Request = struct { visits: u32 = 0, cancel: bool = false };
+    const Runner = struct {
+        fn run(_: void, request: *Request) std.Io.Cancelable!void {
+            request.visits += 1;
+            if (request.cancel) return error.Canceled;
+        }
+    };
+    for ([_]u32{ 0, 1, 2 }) |limit| {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .dense_read_extra_task_limit = limit });
+        defer manager.deinit(std.testing.allocator);
+        var requests: [257]Request = @splat(.{});
+        try runPositionalReadBatch(Request, {}, runtime.io(), &requests, Runner.run, &manager);
+        for (requests) |request| try std.testing.expectEqual(@as(u32, 1), request.visits);
+        try std.testing.expectEqual(@as(u32, 0), manager.denseReadTaskStats().active);
+        try std.testing.expect(manager.denseReadTaskStats().peak_active <= limit);
+        requests = @splat(.{ .cancel = true });
+        try std.testing.expectError(error.Canceled, runPositionalReadBatch(Request, {}, runtime.io(), &requests, Runner.run, &manager));
+        try std.testing.expectEqual(@as(u32, 0), manager.denseReadTaskStats().active);
     }
 }
+
+/// One cursor per already-sorted immutable run plus the sorted, deduplicated
+/// WAL stream. Payloads remain borrowed from the source generation. Scratch is
+/// O(number of runs), independent of the number of vectors in a shard.
+const CompactionMerge = struct {
+    const Head = struct {
+        reader: ?usize,
+        position: usize,
+        record: CompactionRecord,
+        fn order(_: void, lhs: @This(), rhs: @This()) std.math.Order {
+            if (CompactionRecord.lessThan({}, lhs.record, rhs.record)) return .lt;
+            if (CompactionRecord.lessThan({}, rhs.record, lhs.record)) return .gt;
+            return .eq;
+        }
+    };
+    source: *const Opened,
+    wal_indices: []const vector_wal.Record,
+    generation: u64,
+    heap: std.PriorityQueue(Head, void, Head.order) = .empty,
+
+    fn init(source: *const Opened, shard: usize, wal_indices: []const vector_wal.Record, generation: u64) !CompactionMerge {
+        var self = CompactionMerge{ .source = source, .wal_indices = wal_indices, .generation = generation };
+        errdefer self.deinit();
+        const readers = source.reader_order[source.shard_offsets[shard]..source.shard_offsets[shard + 1]];
+        try self.heap.ensureUnusedCapacity(source.store.alloc, readers.len + 1);
+        for (readers) |reader_index| {
+            const reader = source.readers[reader_index];
+            if (reader.count == 0) continue;
+            try self.heap.push(source.store.alloc, .{
+                .reader = reader_index,
+                .position = 0,
+                .record = CompactionRecord.fromBlock(try reader.entryAt(0), reader.generation),
+            });
+        }
+        if (wal_indices.len != 0) try self.heap.push(source.store.alloc, .{
+            .reader = null,
+            .position = 0,
+            .record = CompactionRecord.fromWal(wal_indices[0], generation),
+        });
+        return self;
+    }
+
+    fn deinit(self: *CompactionMerge) void {
+        self.heap.deinit(self.source.store.alloc);
+    }
+
+    fn pop(self: *CompactionMerge) !?CompactionRecord {
+        var head = self.heap.pop() orelse return null;
+        const value = head.record;
+        head.position += 1;
+        if (head.reader) |index| {
+            const reader = self.source.readers[index];
+            if (head.position >= reader.count) return value;
+            head.record = CompactionRecord.fromBlock(try reader.entryAt(head.position), reader.generation);
+        } else {
+            if (head.position >= self.wal_indices.len) return value;
+            head.record = CompactionRecord.fromWal(self.wal_indices[head.position], self.generation);
+        }
+        try self.heap.push(self.source.store.alloc, head);
+        return value;
+    }
+
+    fn next(self: *CompactionMerge) !?CompactionRecord {
+        var latest = (try self.pop()) orelse return null;
+        while (self.heap.peek()) |head| {
+            if (!latest.sameKey(head.record)) break;
+            latest = (try self.pop()).?;
+        }
+        return latest;
+    }
+};
 
 const CompactionRecord = struct {
     hash: u64,
@@ -2797,7 +3734,7 @@ const CompactionRecord = struct {
             .revision = record.revision,
             .generation = generation,
             .payload = switch (record.kind) {
-                .upsert => .{ .wal_vector = record },
+                .upsert, .reference => .{ .wal_vector = record },
                 .tombstone => .tombstone,
                 else => unreachable,
             },
@@ -2833,11 +3770,19 @@ const CompactionRecord = struct {
         switch (self.payload) {
             .tombstone => try writer.appendTombstone(self.key, self.source_sequence, self.revision),
             .block_vector => |value| {
+                if (value.encoding == .artifact_reference) {
+                    if (writer.encoding != .artifact_reference) return error.InconsistentVectorBlockEncoding;
+                    return writer.appendEncodedVector(self.key, self.source_sequence, self.revision, value.dims, value.bytes, 1);
+                }
                 try scratch.resize(alloc, value.dims);
                 const vector = try value.decodeExactInto(scratch.items);
                 try writer.appendVector(self.key, self.source_sequence, self.revision, vector);
             },
             .wal_vector => |record| {
+                if (record.kind == .reference) {
+                    if (writer.encoding != .artifact_reference) return error.InconsistentVectorBlockEncoding;
+                    return writer.appendEncodedVector(self.key, self.source_sequence, self.revision, record.dims, record.vector_bytes, 1);
+                }
                 try scratch.resize(alloc, record.dims);
                 const vector = try record.decodeVectorInto(scratch.items);
                 try writer.appendVector(self.key, self.source_sequence, self.revision, vector);
@@ -2886,17 +3831,7 @@ const CompactionRecord = struct {
                         );
                     }
                 } else {
-                    // A v1-v3 block has no persisted quantization metadata.
-                    // Compute conservative metadata once while upgrading it;
-                    // subsequent queries and compactions remain single-pass.
-                    try writer.appendEncodedVector(
-                        self.key,
-                        self.source_sequence,
-                        self.revision,
-                        value.dims,
-                        value.bytes,
-                        value.scale,
-                    );
+                    return error.CorruptedVectorBlock;
                 }
             },
             .wal_vector => return error.VectorWalCheckpointRequired,
@@ -2927,40 +3862,58 @@ fn openInternal(
     retain_blocks: bool,
     previous: ?*const Opened,
 ) !Opened {
-    const owned_root = try alloc.dupe(u8, root_dir);
-    errdefer alloc.free(owned_root);
-    try storage.createDirPath(owned_root);
-    var store: Store = .{ .alloc = alloc, .storage = storage, .root_dir = owned_root };
+    return openInternalWithState(alloc, storage, root_dir, retain_blocks, previous, null, null, false);
+}
+
+fn openInternalWithState(
+    alloc: Allocator,
+    storage: lsm_backend.Storage,
+    root_dir: []const u8,
+    retain_blocks: bool,
+    previous: ?*const Opened,
+    prepared: ?*const Store,
+    reuse_wal_after_batch: ?u64,
+    read_only: bool,
+) !Opened {
+    var store: Store = if (prepared) |state| try state.clone(alloc) else blk: {
+        const owned_root = try alloc.dupe(u8, root_dir);
+        errdefer alloc.free(owned_root);
+        if (!read_only) try storage.createDirPath(owned_root);
+        break :blk .{ .alloc = alloc, .storage = storage, .root_dir = owned_root };
+    };
     errdefer store.deinit();
 
-    const current_path = try store.currentPathAlloc();
-    defer alloc.free(current_path);
-    const current = storage.readFileAlloc(alloc, current_path, max_manifest_bytes) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            const wal_path = try store.walPathAlloc(1);
-            defer alloc.free(wal_path);
-            try atomicReplace(alloc, storage, wal_path, &.{});
-            break :blk try alloc.alloc(u8, 0);
-        },
-        else => return err,
-    };
-    defer alloc.free(current);
-    if (current.len != 0) {
-        var decoded = try vector_manifest.decodeAlloc(alloc, current);
-        store.manifest_segments = decoded.owned_segments;
-        decoded.owned_segments = &.{};
-        store.manifest_coverages = decoded.owned_coverages;
-        decoded.owned_coverages = &.{};
-        store.manifest = decoded.manifest;
-        store.manifest.?.segments = store.manifest_segments;
-        store.manifest.?.coverages = store.manifest_coverages;
-        store.wal_generation = store.manifest.?.wal_generation;
-        store.wal_committed_bytes = store.manifest.?.wal_committed_bytes;
-        store.covered_source_sequence = store.manifest.?.covered_source_sequence;
-        store.segment_covered_source_sequence = if (store.manifest_segments.len != 0)
-            store.manifest_segments[store.manifest_segments.len - 1].covered_source_sequence
-        else
-            store.manifest.?.covered_source_sequence;
+    if (prepared == null) {
+        const current_path = try store.currentPathAlloc();
+        defer alloc.free(current_path);
+        const current = storage.readFileAlloc(alloc, current_path, max_manifest_bytes) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                if (read_only) return error.MissingVectorBlockManifest;
+                const wal_path = try store.walPathAlloc(1);
+                defer alloc.free(wal_path);
+                try atomicReplace(alloc, storage, wal_path, &.{});
+                break :blk try alloc.alloc(u8, 0);
+            },
+            else => return err,
+        };
+        defer alloc.free(current);
+        if (current.len != 0) {
+            var decoded = try vector_manifest.decodeAlloc(alloc, current);
+            store.manifest_segments = decoded.owned_segments;
+            decoded.owned_segments = &.{};
+            store.manifest_coverages = decoded.owned_coverages;
+            decoded.owned_coverages = &.{};
+            store.manifest = decoded.manifest;
+            store.manifest.?.segments = store.manifest_segments;
+            store.manifest.?.coverages = store.manifest_coverages;
+            store.wal_generation = store.manifest.?.wal_generation;
+            store.wal_committed_bytes = store.manifest.?.wal_committed_bytes;
+            store.covered_source_sequence = store.manifest.?.covered_source_sequence;
+            store.segment_covered_source_sequence = if (store.manifest_segments.len != 0)
+                store.manifest_segments[store.manifest_segments.len - 1].covered_source_sequence
+            else
+                store.manifest.?.covered_source_sequence;
+        }
     }
 
     const blocks = if (retain_blocks and store.manifest != null)
@@ -3004,19 +3957,38 @@ fn openInternal(
         shard_cursors[shard] += 1;
     }
 
+    if (reuse_wal_after_batch) |batch| {
+        const tree = try wal_view.Node.afterBatch(alloc, previous.?.wal_tree, batch);
+        return .{
+            .store = store,
+            .blocks = blocks,
+            .readers = readers,
+            .reader_order = reader_order,
+            .shard_offsets = shard_offsets,
+            .wal_bytes = &.{},
+            .wal = .{ .alloc = alloc },
+            .wal_order = .empty,
+            .wal_tree = tree,
+            .wal_tree_initialized = true,
+        };
+    }
     const wal_path = try store.walPathAlloc(store.wal_generation);
     defer alloc.free(wal_path);
-    var wal_bytes = storage.readFileAlloc(alloc, wal_path, max_wal_bytes + 1) catch |err| switch (err) {
-        error.FileNotFound => if (store.wal_committed_bytes == 0) try alloc.alloc(u8, 0) else return error.MissingVectorWal,
-        else => return err,
-    };
+    var wal_bytes = try store.readWalBytes(true);
     errdefer alloc.free(wal_bytes);
     var wal = try vector_wal.Replay.parse(alloc, wal_bytes);
     errdefer wal.deinit();
     if (wal.committed_bytes < store.wal_committed_bytes) return error.VectorWalShorterThanManifest;
+    const sealed_bytes: usize = @intCast(if (store.manifest) |manifest| try manifest.sealed_wals.bytes() else 0);
+    var active_replay = try vector_wal.Replay.parse(alloc, wal_bytes[sealed_bytes..]);
+    defer active_replay.deinit();
+    store.active_wal_min_mutation_sequence = null;
+    for (active_replay.records.items) |record| if (record.kind == .upsert or record.kind == .reference or record.kind == .tombstone) {
+        store.active_wal_min_mutation_sequence = @min(store.active_wal_min_mutation_sequence orelse record.source_sequence, record.source_sequence);
+    };
     for (wal.records.items) |record| {
         if (record.kind != .coverage and record.source_sequence < store.segment_covered_source_sequence) return error.VectorWalOverlapsCheckpoint;
-        if (record.kind == .upsert or record.kind == .tombstone) {
+        if (record.kind == .upsert or record.kind == .reference or record.kind == .tombstone) {
             store.wal_has_mutations = true;
             store.wal_latest_mutation_sequence = @max(store.wal_latest_mutation_sequence, record.source_sequence);
         }
@@ -3025,7 +3997,7 @@ fn openInternal(
         const committed = try alloc.dupe(u8, wal_bytes[0..wal.committed_bytes]);
         alloc.free(wal_bytes);
         wal_bytes = committed;
-        try atomicReplace(alloc, storage, wal_path, wal_bytes);
+        if (!read_only) try atomicReplace(alloc, storage, wal_path, wal_bytes[sealed_bytes..]);
         wal.deinit();
         wal = try vector_wal.Replay.parse(alloc, wal_bytes);
     }
@@ -3034,7 +4006,7 @@ fn openInternal(
     store.covered_source_sequence = @max(store.covered_source_sequence, wal.covered_source_sequence);
     var wal_order = std.ArrayListUnmanaged(usize).empty;
     errdefer wal_order.deinit(alloc);
-    for (wal.records.items, 0..) |record, index| if (record.kind == .upsert or record.kind == .tombstone) try wal_order.append(alloc, index);
+    for (wal.records.items, 0..) |record, index| if (record.kind == .upsert or record.kind == .reference or record.kind == .tombstone) try wal_order.append(alloc, index);
     std.mem.sortUnstable(usize, wal_order.items, &wal, walRecordLessThan);
     return .{
         .store = store,
@@ -3055,6 +4027,18 @@ const BlockIdentity = struct {
 
 fn isManagedArtifactName(name: []const u8) bool {
     return parseWalGeneration(name) != null or parseBlockIdentity(name) != null;
+}
+
+/// Only a startup owner with no active builders may remove these names.
+/// Ordinary publication reclamation deliberately excludes temporary outputs.
+pub fn isTemporaryArtifactName(name: []const u8) bool {
+    const separator = std.mem.lastIndexOf(u8, name, ".tmp-") orelse return false;
+    const nonce = name[separator + 5 ..];
+    if (nonce.len == 0) return false;
+    _ = std.fmt.parseInt(u64, nonce, 10) catch return false;
+    const base = name[0..separator];
+    return std.mem.eql(u8, base, current_name) or
+        std.mem.eql(u8, base, "SOURCE_CHECKPOINT") or isManagedArtifactName(base);
 }
 
 fn parseWalGeneration(name: []const u8) ?u64 {
@@ -3370,6 +4354,155 @@ test "vector block store publishes base and replays committed WAL" {
     }
 }
 
+test "cold projection workers drain multiple shards under admission and reuse the session" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi)
+        return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var native = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer native.deinit();
+    var root_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/antfly-vector-cold-workers-{d}-{d}", .{
+        std.posix.system.getpid(), positional_read_test_nonce.fetchAdd(1, .monotonic),
+    });
+    defer native.storage().deleteTree(root) catch {};
+    var store = try Store.open(alloc, native.storage(), root);
+    defer store.deinit();
+    const shard_count = 16;
+    var keys: [shard_count][32]u8 = undefined;
+    var key_views: [shard_count][]const u8 = undefined;
+    var blocks: [shard_count]ShardBlock = undefined;
+    var initialized: usize = 0;
+    defer for (blocks[0..initialized]) |block| alloc.free(block.bytes);
+    for (&blocks, 0..) |*block, shard| {
+        var nonce: u64 = 0;
+        while (true) : (nonce += 1) {
+            const key = try std.fmt.bufPrint(&keys[shard], "cold-worker-{d}-{d}", .{ shard, nonce });
+            if (try vector_block.shardForKey(key, shard_count) != shard) continue;
+            key_views[shard] = key;
+            break;
+        }
+        var writer = try vector_block.Writer.initWithEncoding(alloc, 1, @intCast(shard), shard_count, 1, .float16);
+        defer writer.deinit();
+        try writer.appendVector(key_views[shard], 1, 1, &.{ 1.25, -2.5, 3.75 });
+        block.* = .{ .shard_id = @intCast(shard), .bytes = try writer.build() };
+        initialized += 1;
+    }
+    store.covered_source_sequence = 1;
+    try store.publishGeneration(1, 1, &blocks, true);
+    var opened = try Store.openWithBlocks(alloc, native.storage(), root);
+    defer opened.deinit();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .dense_read_extra_task_limit = 2 });
+    defer manager.deinit(alloc);
+    opened.resource_manager = &manager;
+    var session = try opened.beginColdProjectionSession();
+    defer session.deinit();
+    var payloads: [shard_count][64]u8 = undefined;
+    var requests: [shard_count]ProjectionReadRequest = undefined;
+    for (&requests, 0..) |*request, i| {
+        request.* = .{
+            .located = (try opened.locateHashed(key_views[i], vector_block.keyHash(key_views[i]), 1, 1)).vector,
+            .scratch = &payloads[i],
+        };
+    }
+    for ([_]usize{ 0, 2, 8 }) |limit| {
+        var runtime = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(limit) });
+        defer runtime.deinit();
+        for (0..2) |_| {
+            const stats = try session.readProjectionsIntoBatch(runtime.io(), &requests);
+            try std.testing.expectEqual(@as(u64, shard_count), stats.physical_reads);
+            try std.testing.expectEqual(@as(u32, 0), manager.denseReadTaskStats().active);
+            try std.testing.expect(manager.denseReadTaskStats().peak_active <= 2);
+            for (requests) |request| {
+                try std.testing.expect(request.err == null);
+                var decoded: [3]f32 = undefined;
+                try std.testing.expectEqualSlices(f32, &.{ 1.25, -2.5, 3.75 }, try request.value.?.decodeInto(&decoded));
+            }
+        }
+    }
+    // A logical ANN reference map has different (here, no) physical blocks.
+    // Its cold session must consume the already resolved source locations and
+    // still use the logical owner's resource admission, not the source's.
+    const map_root = try std.fmt.allocPrint(alloc, "{s}/reference-map", .{root});
+    defer alloc.free(map_root);
+    var map_store = try Store.open(alloc, native.storage(), map_root);
+    defer map_store.deinit();
+    try map_store.publishEmptyBase(1, 1, .{ .shard_count = 16, .encoding = .artifact_reference });
+    var map = try Store.openWithBlocks(alloc, native.storage(), map_root);
+    defer map.deinit();
+    opened.resource_manager = null;
+    map.external_payloads = &opened;
+    map.resource_manager = &manager;
+    var referenced_session = try map.beginColdProjectionSession();
+    defer referenced_session.deinit();
+    try std.testing.expect(referenced_session.opened == &opened);
+    try std.testing.expect(referenced_session.resource_manager == &manager);
+    const referenced_stats = try referenced_session.readProjectionsIntoBatch(null, &requests);
+    try std.testing.expectEqual(@as(u64, shard_count), referenced_stats.physical_reads);
+    for (requests) |request| {
+        try std.testing.expect(request.err == null);
+        var decoded: [3]f32 = undefined;
+        try std.testing.expectEqualSlices(f32, &.{ 1.25, -2.5, 3.75 }, try request.value.?.decodeInto(&decoded));
+    }
+    // One invalid destination must not prevent the other shards completing.
+    requests[0].scratch = &.{};
+    _ = try session.readProjectionsIntoBatch(null, &requests);
+    try std.testing.expectEqual(error.BufferTooSmall, requests[0].err.?);
+    for (requests[1..]) |request| try std.testing.expect(request.err == null and request.value != null);
+}
+
+test "grouped projection queue includes oversized fallbacks and unavailable helpers" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    var native = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer native.deinit();
+    var root_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/antfly-vector-grouped-{d}-{d}", .{ std.posix.system.getpid(), positional_read_test_nonce.fetchAdd(1, .monotonic) });
+    defer native.storage().deleteTree(root) catch {};
+    var store = try Store.open(alloc, native.storage(), root);
+    defer store.deinit();
+    var writer = try vector_block.Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float32);
+    defer writer.deinit();
+    const large = [_]f32{1.25} ** 4097;
+    const Entry = struct {
+        key: []const u8,
+        vector: []const f32,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            const ah = vector_block.keyHash(a.key);
+            const bh = vector_block.keyHash(b.key);
+            return if (ah == bh) std.mem.order(u8, a.key, b.key) == .lt else ah < bh;
+        }
+    };
+    var entries = [_]Entry{ .{ .key = "large", .vector = &large }, .{ .key = "small-a", .vector = &.{ 2, 3, 4 } }, .{ .key = "small-b", .vector = &.{ 5, 6, 7 } } };
+    std.mem.sort(Entry, &entries, {}, Entry.less);
+    for (entries) |entry| try writer.appendVector(entry.key, 1, 1, entry.vector);
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    store.covered_source_sequence = 1;
+    try store.publishGeneration(1, 1, &.{.{ .shard_id = 0, .bytes = bytes }}, true);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    manager.dense_projection_pages_enabled = true;
+    manager.dense_grouped_fallbacks = true;
+    var opened = try Store.openWithBlocks(alloc, native.storage(), root);
+    defer opened.deinit();
+    opened.resource_manager = &manager;
+    var buffers: [3][large.len * 4]u8 = undefined;
+    var requests: [3]ProjectionReadRequest = undefined;
+    for (entries, 0..) |entry, i| requests[i] = .{ .located = (try opened.locateHashed(entry.key, vector_block.keyHash(entry.key), 1, 1)).vector, .scratch = &buffers[i] };
+    for ([_]u32{ 0, 4 }) |helpers| {
+        manager.dense_read_extra_task_limit = helpers;
+        const stats = try opened.readProjectionsIntoBatch(runtime.io(), &requests);
+        try std.testing.expect(stats.physical_reads >= 1 and stats.physical_reads <= 3);
+        for (requests, entries) |request, entry| {
+            try std.testing.expect(request.err == null);
+            var decoded: [large.len]f32 = undefined;
+            try std.testing.expectEqualSlices(f32, entry.vector, try request.value.?.decodeInto(&decoded));
+        }
+    }
+}
+
 test "vector block positional lookup reads mmap payload through retained descriptor" {
     if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi)
         return error.SkipZigTest;
@@ -3461,6 +4594,54 @@ test "vector block positional lookup reads mmap payload through retained descrip
     var expected_projection_bytes: u64 = 0;
     for (projection_requests) |request| expected_projection_bytes += @intCast(request.located.block.location.vector_len);
     try std.testing.expectEqual(expected_projection_bytes, projection_read_stats.physical_bytes);
+
+    {
+        var manager = resource_manager_mod.ResourceManager.init(.{});
+        defer manager.deinit(alloc);
+        manager.dense_projection_pages_enabled = true;
+        opened.resource_manager = &manager;
+        defer opened.resource_manager = null;
+        const grouped = try opened.readProjectionsIntoBatch(io_impl.io(), &projection_requests);
+        try std.testing.expectEqual(@as(u64, 1), grouped.physical_reads);
+        const cached = try opened.readProjectionsIntoBatch(io_impl.io(), &projection_requests);
+        try std.testing.expectEqual(@as(u64, 0), cached.physical_reads);
+        try std.testing.expectEqual(@as(u64, keys.len), cached.cache_hits);
+        manager.dense_projection_borrow_enabled = true;
+        var borrow_scope: ProjectionBorrowScope = .{};
+        defer borrow_scope.deinit(alloc);
+        const borrowed_stats = try opened.readProjectionsIntoBatchBorrowed(io_impl.io(), &projection_requests, &borrow_scope, alloc);
+        try std.testing.expectEqual(@as(u64, 0), borrowed_stats.physical_reads);
+        try std.testing.expectEqual(@as(usize, keys.len), borrow_scope.leases.items.len);
+        for (projection_requests) |request| {
+            try std.testing.expect(request.borrowed);
+            try std.testing.expect(request.value.?.bytes.ptr != request.scratch.ptr);
+        }
+        try std.testing.expectEqual(@as(u64, 0), resource_manager_mod.ProjectionPageCache.Cache.reclaim(manager.projectionPageCache().?, std.math.maxInt(u64)));
+        for (projection_requests, expected_vectors) |request, expected| {
+            try std.testing.expect(request.err == null);
+            var decoded: [3]f32 = undefined;
+            try std.testing.expectEqualSlices(f32, &expected, try request.value.?.decodeInto(&decoded));
+        }
+        borrow_scope.clear();
+        var denied_scope: ProjectionBorrowScope = .{};
+        var denied_allocator = std.heap.FixedBufferAllocator.init(&.{});
+        defer denied_scope.deinit(denied_allocator.allocator());
+        _ = try opened.readProjectionsIntoBatchBorrowed(io_impl.io(), &projection_requests, &denied_scope, denied_allocator.allocator());
+        try std.testing.expectEqual(@as(usize, 0), denied_scope.leases.items.len);
+        for (projection_requests) |request| {
+            try std.testing.expect(!request.borrowed);
+            try std.testing.expect(request.value != null);
+        }
+        // Reclamation must be a transparent miss. A bad sibling destination
+        // cannot poison successful requests or the shared immutable cache.
+        _ = resource_manager_mod.ProjectionPageCache.Cache.reclaim(manager.projectionPageCache().?, std.math.maxInt(u64));
+        projection_requests[0].scratch = &.{};
+        _ = try opened.readProjectionsIntoBatch(io_impl.io(), &projection_requests);
+        try std.testing.expectEqual(error.BufferTooSmall, projection_requests[0].err.?);
+        for (projection_requests[1..]) |request| try std.testing.expect(request.err == null);
+        projection_requests[0].scratch = &batch_scratch[0];
+        _ = try opened.readProjectionsIntoBatch(io_impl.io(), &projection_requests);
+    }
 
     var cold_session = try opened.beginColdProjectionSession();
     defer cold_session.deinit();
@@ -3671,6 +4852,180 @@ test "vector block store publishes snapshot base with committed WAL suffix" {
     try std.testing.expect(current.store.wal_has_mutations);
     try std.testing.expectEqualSlices(f32, &.{2.0}, (try current.get("artifact-a", 0, 2)).vector.vectorView().?);
     try std.testing.expectEqualSlices(f32, &.{3.0}, (try current.get("artifact-a", 1, 3)).vector.vectorView().?);
+}
+
+test "incremental vector WAL successor agrees with recovery and checkpoint" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/incremental-vector-wal";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    try store.publishEmptyBase(1, 0, .{ .shard_count = 1, .encoding = .float16 });
+    var empty = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer empty.deinit();
+    const rows = [_]BatchRecord{.{ .kind = .upsert, .key = "a", .source_sequence = 1, .revision = 1, .vector = &.{ 1, 2 } }};
+    var encoded = try store.encodeBatch(try store.nextBatchId(), &rows, 1);
+    defer encoded.deinit();
+    var first = try empty.prepareWalSuccessor(alloc, &encoded, true);
+    defer first.deinit();
+    try store.appendEncodedBatch(&encoded, &rows, .{});
+    const updates = [_]BatchRecord{.{ .kind = .upsert, .key = "a", .source_sequence = 2, .revision = 2, .vector = &.{ 3, 4 } }};
+    var second_bytes = try store.encodeBatch(try store.nextBatchId(), &updates, 2);
+    defer second_bytes.deinit();
+    var second = try first.prepareWalSuccessor(alloc, &second_bytes, true);
+    defer second.deinit();
+    try store.appendEncodedBatch(&second_bytes, &updates, .{});
+    try std.testing.expectEqual(@as(usize, 0), second.wal_bytes.len);
+    var scratch: [2]f32 = undefined;
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, try (try first.get("a", 2, 1)).vector.decodeInto(&scratch));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, try (try second.get("a", 1, 1)).vector.decodeInto(&scratch));
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, try (try second.get("a", 2, 2)).vector.decodeInto(&scratch));
+    try std.testing.expect(try second.checkpointWalToDelta(true));
+    var recovered = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u64, 2), recovered.store.covered_source_sequence);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, try (try recovered.get("a", 2, 2)).vector.decodeExactInto(&scratch));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, try (try first.get("a", 2, 1)).vector.decodeInto(&scratch));
+}
+
+test "native compaction staging preserves concurrent WAL suffix and old query leases" {
+    try testNativeCompactionSuffix(false);
+}
+
+test "sealed vector WAL compaction retains active file without copying suffix" {
+    try testNativeCompactionSuffix(true);
+}
+
+fn testNativeCompactionSuffix(sealed: bool) !void {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/native-compaction-staging-suffix";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    var writer = try vector_block.Writer.initWithEncoding(alloc, 1, 0, 1, 0, .float16);
+    defer writer.deinit();
+    try writer.appendVector("b", 0, 1, &.{2.0});
+    try writer.appendVector("a", 0, 1, &.{1.0});
+    const base = try writer.build();
+    defer alloc.free(base);
+    try store.publishGeneration(1, 0, &.{.{ .shard_id = 0, .bytes = base }}, true);
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .upsert,
+        .key = "a",
+        .source_sequence = 1,
+        .revision = 2,
+        .vector = &.{3.0},
+    }}, 1, .{});
+    if (sealed) try std.testing.expect(try store.sealWal());
+    var old_query = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer old_query.deinit();
+    const prefix = old_query.store.walPrefixBoundary();
+    var staged = (try old_query.stageDeltasToBaseWithShardCount(1, 4096)).?;
+    defer staged.deinit();
+    try std.testing.expectEqual(@as(u64, 1), store.manifest.?.latest_generation);
+    // These source effects commit after the encoder selected its immutable
+    // source. Their byte suffix, including tombstones, must survive flattening.
+    try store.appendBatch(try store.nextBatchId(), &.{
+        .{ .kind = .upsert, .key = "a", .source_sequence = 2, .revision = 3, .vector = &.{4.0} },
+        .{ .kind = .tombstone, .key = "b", .source_sequence = 2, .revision = 3 },
+    }, 2, .{});
+    // Reader allocation and suffix copying happen before the durable fence.
+    // A source append in that interval must reject this prepared publication.
+    var raced = try store.prepareStagedBaseBuild(&staged, .{ .flatten_prefix = prefix });
+    defer raced.deinit();
+    var prepared_readers = try raced.openReaders(alloc, &old_query);
+    defer prepared_readers.deinit();
+    try store.appendCoverage(try store.nextBatchId(), 3, .{});
+    try std.testing.expectError(error.InvalidVectorBlockPublicationBoundary, store.commitPrepared(&raced));
+    try std.testing.expect(!store.poisoned);
+    var prepared = try store.prepareStagedBaseBuild(&staged, .{ .flatten_prefix = prefix });
+    defer prepared.deinit();
+    if (sealed) {
+        try std.testing.expectEqual(store.wal_generation, prepared.next.wal_generation);
+        try std.testing.expectEqual(store.wal_committed_bytes - prefix.committed_bytes, prepared.next.wal_committed_bytes);
+        try std.testing.expectEqual(@as(u8, 0), prepared.next.manifest.?.sealed_wals.count);
+    }
+    var live_disk = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer live_disk.deinit();
+    var live_view = try live_disk.clone(alloc);
+    defer live_view.deinit();
+    var published_readers = try prepared.openReaders(alloc, &live_view);
+    defer published_readers.deinit();
+    if (sealed) {
+        try std.testing.expectEqual(@as(usize, 0), published_readers.wal_bytes.len);
+        const old_value = (try live_view.get("a", 3, 3)).vector;
+        const new_value = (try published_readers.get("a", 3, 3)).vector;
+        try std.testing.expectEqual(old_value.vectorView().?.ptr, new_value.vectorView().?.ptr);
+    }
+    try store.commitPrepared(&prepared);
+    staged.disarmCleanup();
+    prepared.reclaimObsolete();
+    var restarted = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer restarted.deinit();
+    try std.testing.expectEqual(@as(u64, 3), restarted.store.covered_source_sequence);
+    try std.testing.expectEqual(@as(u64, 3), published_readers.store.covered_source_sequence);
+    var scratch: [1]f32 = undefined;
+    try std.testing.expectEqualSlices(f32, &.{3.0}, try (try old_query.get("a", 1, 2)).vector.decodeInto(&scratch));
+    try std.testing.expectEqualSlices(f32, &.{2.0}, try (try old_query.get("b", 1, 1)).vector.decodeInto(&scratch));
+    try std.testing.expectEqualSlices(f32, &.{4.0}, try (try restarted.get("a", 2, 3)).vector.decodeInto(&scratch));
+    try std.testing.expect((try restarted.get("b", 2, null)) == .tombstone);
+}
+
+test "sealed vector WAL recovers multiple extents and trims only active torn suffix" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/sealed-vector-recovery";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    try store.publishEmptyBase(1, 0, .{ .shard_count = 1 });
+    try store.appendBatch(0, &.{.{ .kind = .upsert, .key = "a", .source_sequence = 0, .revision = 1, .vector = &.{1.0} }}, 0, .{});
+    try std.testing.expect(try store.sealWal());
+    try store.appendCoverage(try store.nextBatchId(), 5, .{});
+    try std.testing.expect(try store.sealWal());
+    try std.testing.expect(!try store.sealWal());
+    try store.appendBatch(try store.nextBatchId(), &.{.{ .kind = .upsert, .key = "b", .source_sequence = 6, .revision = 1, .vector = &.{2.0} }}, 6, .{});
+    const active_bytes = store.wal_committed_bytes - try store.manifest.?.sealed_wals.bytes();
+    const path = try store.walPathAlloc(store.wal_generation);
+    defer alloc.free(path);
+    try memory.storage().appendFileAbsolute(alloc, path, "torn", false);
+    var recovered = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u64, 0), recovered.store.segment_covered_source_sequence);
+    try std.testing.expectEqual(@as(u64, 6), recovered.store.covered_source_sequence);
+    try std.testing.expectEqual(active_bytes, try memory.storage().fileSize(path));
+    try std.testing.expectEqual(@as(u8, 2), recovered.store.manifest.?.sealed_wals.count);
+    try std.testing.expectEqual(@as(?u64, 6), recovered.store.active_wal_min_mutation_sequence);
+    try std.testing.expectEqualSlices(f32, &.{1.0}, (try recovered.get("a", 6, 1)).vector.vectorView().?);
+    try std.testing.expectEqualSlices(f32, &.{2.0}, (try recovered.get("b", 6, 1)).vector.vectorView().?);
+    _ = try recovered.store.reclaimUnreferencedFiles();
+    const sealed_path = try store.walPathAlloc(store.manifest.?.sealed_wals.items[0].generation);
+    defer alloc.free(sealed_path);
+    try std.testing.expectEqual(store.manifest.?.sealed_wals.items[0].committed_bytes, try memory.storage().fileSize(sealed_path));
+    try memory.storage().appendFileAbsolute(alloc, sealed_path, "torn", false);
+    try std.testing.expectError(error.InvalidVectorWalExtent, Store.openWithBlocks(alloc, memory.storage(), root));
+}
+
+test "sealed vector WAL poisons ambiguous append-target publication" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/sealed-vector-ambiguous";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    try store.publishEmptyBase(1, 0, .{ .shard_count = 1 });
+    try store.appendCoverage(1, 1, .{});
+    generation_publication.injectPostPublishFailuresForTest(2);
+    try std.testing.expectError(error.GenerationPublicationDurabilityUncertain, store.sealWal());
+    try std.testing.expect(store.poisoned);
+    try std.testing.expectError(error.VectorBlockStoreRequiresReopen, store.appendCoverage(2, 2, .{}));
+    var recovered = try Store.open(alloc, memory.storage(), root);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u64, 1), recovered.covered_source_sequence);
+    try std.testing.expectEqual(@as(u8, 1), recovered.manifest.?.sealed_wals.count);
+    try recovered.appendCoverage(2, 2, .{});
 }
 
 test "empty vector authority declares a new scope without rewriting WAL or blocks" {
@@ -4371,4 +5726,26 @@ test "vector block store bulk builder stages bounded shared shards" {
     try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 100_000.0))), @as(u32, @bitCast(decoded[0])));
     try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -250_000.0))), @as(u32, @bitCast(decoded[1])));
     try std.testing.expect((try opened.get("ordinary-document", 9, null)) == .missing);
+}
+
+test "source vector payloads adaptive location cache admits repeats and releases reservations" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    const cache = try ReferenceLocationCache.createWithPolicy(alloc, 65536, true);
+    defer cache.deinit();
+    try cache.attachManager(alloc, &manager);
+    try std.testing.expectEqual(@as(u64, 0), cache.resident_bytes.load(.monotonic));
+    const digest = [_]u8{7} ** 32;
+    const located: LocatedValue = .{ .block = .{ .reader_index = 0, .reader_generation = 1, .reader_shard_id = 0, .location = undefined } };
+    cache.put(&digest, 42, located);
+    try std.testing.expectEqual(@as(u64, 0), cache.resident_bytes.load(.monotonic));
+    cache.put(&digest, 42, located);
+    const resident = cache.resident_bytes.load(.monotonic);
+    try std.testing.expect(resident > 0);
+    try std.testing.expectEqual(resident, ReferenceLocationCache.reclaim(cache, resident));
+    try std.testing.expectEqual(@as(u64, 0), cache.resident_bytes.load(.monotonic));
+    // Reclamation also resets admission history; a fresh scan stays unallocated.
+    cache.put(&digest, 42, located);
+    try std.testing.expectEqual(@as(u64, 0), cache.resident_bytes.load(.monotonic));
 }

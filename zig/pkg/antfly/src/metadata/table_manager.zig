@@ -44,7 +44,8 @@ pub const TableRecord = topology_records.TableRecord;
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return lhs.table_id == rhs.table_id and
+    return lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+        lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
         std.mem.eql(u8, lhs.description, rhs.description) and
         std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
@@ -70,6 +71,9 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    // Preserve fingerprints of existing default-mode tables.
+    if (table.storage.dense_embeddings != .primary_lsm)
+        hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
     var encoded: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &encoded, table.table_id, .little);
     hasher.update(&encoded);
@@ -2085,6 +2089,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     const restore_location = try alloc.dupe(u8, record.restore_location);
     errdefer alloc.free(restore_location);
     return .{
+        .storage = record.storage,
         .table_id = record.table_id,
         .name = name,
         .description = description,

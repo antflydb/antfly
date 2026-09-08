@@ -5,6 +5,7 @@ usage() {
   echo "usage: $0 RUN_ROOT PORT HEALTH_PORT [OPTIONS]" >&2
   echo "" >&2
   echo "Options:" >&2
+  echo "  --dense-embeddings MODE  Table source payload storage (primary_lsm or vector_store)" >&2
   echo "  --case NAME              VectorDBBench case" >&2
   echo "  --vdbbench-root PATH     VectorDBBench checkout" >&2
   echo "  --vdbbench-python PATH   Python from a prepared VectorDBBench virtualenv" >&2
@@ -87,6 +88,7 @@ resume_after_live=${VDBBENCH_RESUME_AFTER_LIVE:-0}
 resume_concurrent=${VDBBENCH_RESUME_CONCURRENT:-0}
 resume_concurrent_only=0
 label_suffix=${VDBBENCH_LABEL_SUFFIX:-}
+dense_embeddings=${ANTFLY_VDBBENCH_DENSE_EMBEDDINGS:-}
 native_hbc=0
 vector_blocks=${VDBBENCH_VECTOR_BLOCKS:-0}
 vector_block_encoding=${VDBBENCH_VECTOR_BLOCK_ENCODING:-float16}
@@ -97,6 +99,7 @@ posting_idle_max_postings=${ANTFLY_DENSE_POSTING_IDLE_MAX_POSTINGS_PER_INDEX:-}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --dense-embeddings) [[ $# -ge 2 ]] || usage; dense_embeddings=$2; shift 2 ;;
     --case) [[ $# -ge 2 ]] || usage; vdbbench_case=$2; shift 2 ;;
     --vdbbench-root) [[ $# -ge 2 ]] || usage; vdbbench_root=$2; shift 2 ;;
     --vdbbench-python) [[ $# -ge 2 ]] || usage; vdbbench_python=$2; shift 2 ;;
@@ -266,8 +269,22 @@ if [[ "$vdbbench_help" == *"--serial-cooldown"* ]]; then
 fi
 
 mkdir -p "$run_root/results"
+# Client commands change directory. Keep their result/log paths anchored to
+# the caller's run root, including when that root was supplied relatively.
+run_root=$(cd "$run_root" && pwd -P)
+vdbbench_client_root=$vdbbench_root
+if [[ -n "$dense_embeddings" ]]; then
+  if [[ "$dense_embeddings" != primary_lsm && "$dense_embeddings" != vector_store ]]; then
+    echo "dense embeddings must be primary_lsm or vector_store" >&2
+    exit 2
+  fi
+  export ANTFLY_VDBBENCH_DENSE_EMBEDDINGS=$dense_embeddings
+  vdbbench_client_root="$run_root/vector-source-client${label_suffix}"
+  python3 "$script_dir/prepare_vdbbench_vector_source.py" "$vdbbench_root" "$vdbbench_client_root"
+fi
 if [[ "$resume_after_live" != "1" ]]; then
-  python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$centroid_directory_mode" "$flat_probe_count" <<'PY'
+  python3 - "$run_root/run-config.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$centroid_directory_mode" "$flat_probe_count" <<'PY'
+import hashlib
 import json
 import os
 import subprocess
@@ -275,11 +292,15 @@ import sys
 
 experiment_environment_names = (
     "ANTFLY_DENSE_POSTING_IDLE_MAX_POSTINGS_PER_INDEX",
+    "ANTFLY_VDBBENCH_DENSE_EMBEDDINGS",
+    "ANTFLY_VDBBENCH_SYNC_LEVEL",
+    "ANTFLY_EXPERIMENT_INLINE_NATIVE_RESIDUAL_READS",
 )
 
 (
     out_path,
     repo_root,
+    antfly_bin,
     vdbbench_root,
     case_name,
     batch_size,
@@ -302,10 +323,19 @@ antfly_git_head = subprocess.check_output(
 vdbbench_git_head = subprocess.check_output(
     ["git", "-C", vdbbench_root, "rev-parse", "HEAD"], text=True
 ).strip()
+binary_hash = hashlib.sha256()
+with open(antfly_bin, "rb") as executable:
+    for chunk in iter(lambda: executable.read(1024 * 1024), b""):
+        binary_hash.update(chunk)
+tracked_diff = subprocess.check_output(["git", "-C", repo_root, "diff", "HEAD", "--binary"])
 with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(
         {
             "antfly_git_head": antfly_git_head,
+            "antfly_bin": antfly_bin,
+            "antfly_binary_sha256": binary_hash.hexdigest(),
+            "antfly_tracked_changes": bool(tracked_diff),
+            "antfly_tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
             "vdbbench_git_head": vdbbench_git_head,
             "vdbbench_root": vdbbench_root,
             "case": case_name,
@@ -339,6 +369,7 @@ PY
   python3 "$sampler" --capture-wired-baseline "$run_root/wired-baseline.json"
 else
   python3 - "$run_root/resume-config${label_suffix}.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$cold_label" "$warm_label" "$concurrent_label" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$diagnostic_profile_only" "$resume_concurrent" "$resume_concurrent_only" <<'PY'
+import hashlib
 import json
 import os
 import subprocess
@@ -346,6 +377,9 @@ import sys
 
 experiment_environment_names = (
     "ANTFLY_DENSE_POSTING_IDLE_MAX_POSTINGS_PER_INDEX",
+    "ANTFLY_VDBBENCH_DENSE_EMBEDDINGS",
+    "ANTFLY_VDBBENCH_SYNC_LEVEL",
+    "ANTFLY_EXPERIMENT_INLINE_NATIVE_RESIDUAL_READS",
 )
 
 (
@@ -367,6 +401,11 @@ experiment_environment_names = (
     resume_concurrent,
     resume_concurrent_only,
 ) = sys.argv[1:]
+binary_hash = hashlib.sha256()
+with open(antfly_bin, "rb") as executable:
+    for chunk in iter(lambda: executable.read(1024 * 1024), b""):
+        binary_hash.update(chunk)
+tracked_diff = subprocess.check_output(["git", "-C", repo_root, "diff", "HEAD", "--binary"])
 with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -374,6 +413,9 @@ with open(out_path, "w", encoding="utf-8") as handle:
                 ["git", "-C", repo_root, "rev-parse", "HEAD"], text=True
             ).strip(),
             "antfly_bin": antfly_bin,
+            "antfly_binary_sha256": binary_hash.hexdigest(),
+            "antfly_tracked_changes": bool(tracked_diff),
+            "antfly_tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
             "vdbbench_root": vdbbench_root,
             "process_memory_budget_mb": (
                 int(memory_budget_mb) if memory_budget_mb else None
@@ -451,6 +493,7 @@ PY
 
 start_server() {
   local log_name=$1
+  qualification_server_log="$run_root/$log_name"
   local memory_args=()
   if [[ -n "$process_memory_budget_mb" ]]; then
     # Use the standalone contract rather than leaking the canonical process
@@ -486,6 +529,10 @@ wait_public_index_ready() {
   local status_path="$run_root/index-readiness${suffix}.json"
   local attempts=0
   while [[ "$attempts" -lt 1800 ]]; do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      echo "server exited while waiting for index readiness; inspect server log" >&2
+      return 1
+    fi
     attempts=$((attempts + 1))
     if curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$status_path" 2>/dev/null &&
       python3 - "$status_path" <<'PY'
@@ -715,7 +762,7 @@ run_vdbbench() {
     cli_args+=(--search-effort "$search_effort")
   fi
   (
-    cd "$vdbbench_root"
+    cd "$vdbbench_client_root"
     ANTFLY_VDBBENCH_KEEP_DEFAULT_FULL_TEXT=0 \
     ANTFLY_VDBBENCH_READ_ONLY_REUSE=${ANTFLY_VDBBENCH_READ_ONLY_REUSE:-0} \
     ANTFLY_BENCH_STATUS=1 \
@@ -735,44 +782,21 @@ validate_vdbbench_result() {
   local db_label=$1
   local expected_load_count=$2
   local require_query_metrics=$3
-  python3 - "$run_root/results" "$db_label" "$expected_load_count" "$require_query_metrics" <<'PY'
-import json
-import pathlib
+  local expected_curve=${4:-}
+  python3 "$script_dir/validate_vdbbench_result.py" \
+    "$run_root/results" "$db_label" "$expected_load_count" "$require_query_metrics" "$expected_curve" \
+    --server-log "$qualification_server_log"
+}
+
+validate_native_lifecycle() {
+  python3 - "$script_dir" "$qualification_server_log" <<'PY'
 import sys
+from pathlib import Path
 
-results_root = pathlib.Path(sys.argv[1])
-db_label = sys.argv[2]
-expected_load_count = int(sys.argv[3])
-require_query_metrics = sys.argv[4] == "1"
-matches = []
-for path in results_root.rglob("*.json"):
-    with path.open(encoding="utf-8") as handle:
-        payload = json.load(handle)
-    for result in payload.get("results", []):
-        configured_label = result.get("task_config", {}).get("db_config", {}).get("db_label")
-        if configured_label == db_label:
-            matches.append((path, result))
+sys.path.insert(0, sys.argv[1])
+from validate_vdbbench_result import validate_lifecycle_log
 
-if len(matches) != 1:
-    raise SystemExit(
-        f"expected exactly one VectorDBBench result for {db_label!r}, found {len(matches)}"
-    )
-path, result = matches[0]
-if result.get("label") == "x":
-    raise SystemExit(f"VectorDBBench stage {db_label!r} failed; see {path}")
-metrics = result.get("metrics", {})
-loaded = int(metrics.get("inserted_count", 0) or metrics.get("max_load_count", 0) or 0)
-if loaded < expected_load_count:
-    raise SystemExit(
-        f"VectorDBBench stage {db_label!r} loaded {loaded}, expected at least {expected_load_count}; see {path}"
-    )
-if require_query_metrics:
-    recall = float(metrics.get("recall", 0) or 0)
-    latency = float(metrics.get("serial_latency_p95", 0) or 0)
-    if recall <= 0 or latency <= 0:
-        raise SystemExit(
-            f"VectorDBBench stage {db_label!r} has no valid query metrics (recall={recall}, p95={latency}); see {path}"
-        )
+validate_lifecycle_log(Path(sys.argv[2]))
 PY
 }
 
@@ -798,12 +822,13 @@ if [[ "$resume_after_live" == "1" ]]; then
     if [[ "$resume_concurrent" == "1" ]]; then
       ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$concurrent_label" --skip-drop-old --skip-load --search-concurrent --skip-search-serial \
         >"$run_root/vdbbench-reopened-concurrent${label_suffix}.log" 2>&1
-      validate_vdbbench_result "$concurrent_label" 0 0
+      validate_vdbbench_result "$concurrent_label" 0 0 "$query_concurrency"
       mark_phase reopened_concurrent_query_end
     fi
   fi
   run_mixed_profile "$label_suffix"
   run_public_profile "$label_suffix"
+  validate_native_lifecycle
   curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-after-restart${label_suffix}.txt"
   curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-after-restart${label_suffix}.json"
   capture_footprint_once \
@@ -828,9 +853,34 @@ start_metrics_sampler "$run_root/metrics-live.prom"
 mark_phase live_load_and_query_start
 run_vdbbench "$live_label" --drop-old --load --search-concurrent --search-serial \
   >"$run_root/vdbbench-live.log" 2>&1
-validate_vdbbench_result "$live_label" "$expected_docs" 1
+validate_vdbbench_result "$live_label" "$expected_docs" 1 "$query_concurrency"
 mark_phase live_load_and_query_end
 run_mixed_profile ""
+if [[ -n "$dense_embeddings" ]]; then
+  mark_phase source_churn_begin
+  churn_profile_args=()
+  if [[ "${ANTFLY_BENCH_METRICS:-0}" == "1" ]]; then
+    churn_profile_args=(--server-log "$run_root/antfly-initial.log")
+  fi
+  "$vdbbench_python" "$script_dir/profile_vector_store_churn.py" \
+    --dataset "$profile_dataset" --port "$port" --batch "$batch_size" \
+    --output "$run_root/source-churn.json" \
+    "${churn_profile_args[@]}"
+  wait_public_index_ready ""
+  mark_phase source_churn_end
+  mark_phase source_enrichment_begin
+  "$vdbbench_python" "$script_dir/profile_vector_store_enrichment.py" \
+    --port "$port" --mode "$dense_embeddings" --batch "$batch_size" \
+    --output "$run_root/source-enrichment.json"
+  python3 - "$run_root/source-enrichment.json" <<'PY'
+import json, sys
+result = json.load(open(sys.argv[1]))
+if not result.get("qualified", False):
+    raise SystemExit("enrichment query failures disqualify this run; inspect source-enrichment.json")
+PY
+  mark_phase source_enrichment_end
+fi
+validate_vdbbench_result "$live_label" "$expected_docs" 1 "$query_concurrency"
 curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-before-restart.txt"
 curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench" >"$run_root/table-before-restart.json"
 curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-before-restart.json"
@@ -845,6 +895,7 @@ stop_metrics_sampler
 mark_phase restart_begin
 stop_server
 mark_phase shutdown_complete
+python3 "$script_dir/vector_store_disk_accounting.py" "$run_root/data" "$run_root/disk-before-restart.json"
 start_server antfly-reopened.log
 start_rss_sampler "$run_root/rss-restart.tsv"
 mark_phase restart_ready
@@ -860,6 +911,7 @@ ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$warm_label" --skip-drop-old --s
 validate_vdbbench_result "$warm_label" 0 1
 mark_phase reopened_warm_query_end
 run_public_profile ""
+validate_native_lifecycle
 curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-after-restart.txt"
 curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$run_root/index-after-restart.json"
 capture_footprint_once \
@@ -869,4 +921,7 @@ capture_footprint_once \
   "$run_root/wired-baseline.json"
 stop_rss_sampler "$run_root/rss-restart.tsv" "$run_root/rss-restart.json"
 
+curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench" >"$run_root/table-after-restart.json"
+stop_server
+python3 "$script_dir/vector_store_disk_accounting.py" "$run_root/data" "$run_root/disk-after-restart.json"
 python3 "$script_dir/summarize_vdbbench_qualification.py" "$run_root"

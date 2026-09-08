@@ -36,6 +36,7 @@ pub const CoverageMember = struct {
 };
 
 pub const SearchScratch = struct {
+    global_subgroups: @import("global_subgroup_plan.zig").Plan = .{},
     dims: usize,
     estimate: quantizer.RaBitQuantizer.EstimateScratch,
     transformed_query: []f32,
@@ -174,7 +175,16 @@ pub const SearchScratch = struct {
     }
 
     pub fn ensureVectorFetchCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        const vector_value_count = std.math.mul(usize, self.dims, needed) catch return error.OutOfMemory;
+        // Preserve the preflight contract: impossible dimensions must not
+        // grow any of the metadata arrays before reporting overflow.
+        _ = std.math.mul(usize, self.dims, needed) catch return error.OutOfMemory;
+        try self.ensureVectorFetchMetadataCapacity(alloc, needed);
+        try self.ensureVectorDecodeCapacity(alloc, needed);
+    }
+
+    /// Selection may span the complete candidate shell without decoding it.
+    /// Keep its scalar/identity storage independent of the wide float32 plane.
+    fn ensureVectorFetchMetadataCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.positions.len < needed) self.positions = try alloc.realloc(self.positions, needed);
         if (self.vector_ids.len < needed) self.vector_ids = try alloc.realloc(self.vector_ids, needed);
         if (self.metadata.len < needed) self.metadata = try alloc.realloc(self.metadata, needed);
@@ -185,6 +195,10 @@ pub const SearchScratch = struct {
         if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
         const score_scratch_needed = std.math.mul(usize, needed, 2) catch return error.OutOfMemory;
         if (self.score_bounds.len < score_scratch_needed) self.score_bounds = try alloc.realloc(self.score_bounds, score_scratch_needed);
+    }
+
+    pub fn ensureVectorDecodeCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        const vector_value_count = std.math.mul(usize, self.dims, needed) catch return error.OutOfMemory;
         if (self.vector_batch.len < vector_value_count) self.vector_batch = try alloc.realloc(self.vector_batch, vector_value_count);
     }
 
@@ -194,13 +208,19 @@ pub const SearchScratch = struct {
     /// though no source vectors are decoded. At 768d/1M that accidental
     /// coupling added roughly 2.8 MiB to every concurrent query.
     pub fn ensureFlatCentroidScoreCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        try self.ensureScoreCapacity(alloc, needed);
+    }
+
+    /// Scanning a native candidate plane needs scalar outputs, not a decoded
+    /// float32 matrix or metadata fetch workspace proportional to leaf size.
+    pub fn ensureScoreCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
         if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
     }
 
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.flags.len < needed) self.flags = try alloc.realloc(self.flags, needed);
-        try self.ensureVectorFetchCapacity(alloc, needed);
+        try self.ensureVectorFetchMetadataCapacity(alloc, needed);
     }
 
     pub fn ensureMemberIdCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -249,6 +269,10 @@ pub const SearchScratch = struct {
     ) u64 {
         if (target_bytes == 0) return 0;
         var reclaimed: u64 = 0;
+        std.debug.assert(!self.global_subgroups.active);
+        reclaimed += self.global_subgroups.bytes();
+        self.global_subgroups.deinit(alloc);
+        if (reclaimed >= target_bytes) return reclaimed;
         reclaimed +|= freeSliceAboveRetainedCapacity(search_types.FlatCentroidProbe, alloc, &self.flat_probes, 0);
         if (reclaimed >= target_bytes) return reclaimed;
         reclaimed +|= freeSliceAboveRetainedCapacity(search_types.FlatCentroidProbe, alloc, &self.flat_probe_merge, 0);
@@ -345,7 +369,7 @@ pub const SearchScratch = struct {
     }
 
     pub fn bytes(self: *const SearchScratch) u64 {
-        return estimateScratchBytes(&self.estimate) +
+        return self.global_subgroups.bytes() + estimateScratchBytes(&self.estimate) +
             byteLen(self.transformed_query) +
             byteLen(self.centroid) +
             byteLen(self.vector) +
@@ -370,6 +394,7 @@ pub const SearchScratch = struct {
     }
 
     pub fn deinit(self: *SearchScratch, alloc: Allocator) void {
+        self.global_subgroups.deinit(alloc);
         self.estimate.deinit(alloc);
         alloc.free(self.transformed_query);
         alloc.free(self.centroid);
@@ -430,6 +455,31 @@ test "SearchScratch grows error bounds with vector fetch capacity" {
     try std.testing.expect(scratch.distances.len >= 5);
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expect(scratch.vector_batch.len >= 4 * 5);
+}
+
+test "SearchScratch rerank shell does not allocate a full decode matrix" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 1536, 0, 0);
+    defer scratch.deinit(alloc);
+    try scratch.ensureRerankCapacity(alloc, 900);
+    try std.testing.expectEqual(@as(usize, 0), scratch.vector_batch.len);
+    try std.testing.expect(scratch.flags.len >= 900);
+    try std.testing.expect(scratch.vector_views.len >= 900);
+    try std.testing.expect(scratch.score_bounds.len >= 1800);
+    const positions = scratch.positions.ptr;
+    const distances = scratch.distances.ptr;
+    try scratch.ensureVectorDecodeCapacity(alloc, 128);
+    try std.testing.expectEqual(@as(usize, 128 * 1536), scratch.vector_batch.len);
+    // Growing a decode batch cannot invalidate the already sliced selection
+    // and scalar-result planes, including during authoritative fallback.
+    try std.testing.expectEqual(positions, scratch.positions.ptr);
+    try std.testing.expectEqual(distances, scratch.distances.ptr);
+    try scratch.ensureVectorDecodeCapacity(alloc, 0);
+    try std.testing.expectEqual(@as(usize, 128 * 1536), scratch.vector_batch.len);
+    try scratch.ensureVectorDecodeCapacity(alloc, 900);
+    try std.testing.expectEqual(@as(usize, 900 * 1536), scratch.vector_batch.len);
+    try std.testing.expectEqual(positions, scratch.positions.ptr);
+    try std.testing.expectEqual(distances, scratch.distances.ptr);
 }
 
 test "SearchScratch initial byte projection matches its initialized payload" {

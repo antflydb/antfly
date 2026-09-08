@@ -16,18 +16,14 @@
 //! signal to fall back to that store.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const checked_region = @import("checked_region.zig");
 
 const magic: [8]u8 = .{ 'A', 'F', 'V', 'B', 'L', 'K', 0, 0 };
-const legacy_version: u16 = 1;
-const unscaled_encoding_version: u16 = 2;
-const scaled_encoding_version: u16 = 3;
 const version: u16 = 4;
 const header_size: usize = 40;
-const legacy_index_entry_size: usize = 60;
-const scaled_index_entry_size: usize = 64;
 const index_entry_size: usize = 88;
 const footer_size: usize = 60;
 const tombstone_flag: u32 = 1;
@@ -35,9 +31,12 @@ const tombstone_flag: u32 = 1;
 pub const Encoding = enum(u16) {
     float32 = 0,
     float16 = 1,
+    /// Immutable source-payload SHA-256 identity; dimensions describe its target.
+    artifact_reference = 2,
 
     pub fn componentBytes(self: Encoding) usize {
         return switch (self) {
+            .artifact_reference => 0, // Not a component encoding; use encodedVectorBytesLen.
             .float32 => @sizeOf(f32),
             .float16 => @sizeOf(f16),
         };
@@ -45,6 +44,7 @@ pub const Encoding = enum(u16) {
 
     fn alignment(self: Encoding) usize {
         return switch (self) {
+            .artifact_reference => 1,
             .float32 => @alignOf(f32),
             .float16 => @alignOf(f16),
         };
@@ -53,6 +53,7 @@ pub const Encoding = enum(u16) {
 
 pub fn encodedVectorBytesLen(encoding: Encoding, dims: usize) !usize {
     if (dims == 0) return error.InvalidVectorDimensions;
+    if (encoding == .artifact_reference) return 32;
     return std.math.mul(usize, dims, encoding.componentBytes()) catch error.VectorBlockTooLarge;
 }
 
@@ -288,10 +289,12 @@ pub fn encodedQuantizationStats(
     scale: f32,
 ) !QuantizationStats {
     try validateEncodedVector(encoding, dims, bytes, scale);
+    if (encoding == .artifact_reference) return .{ .error_norm = 0, .decoded_norm_lower_bound = 0 };
     var error_norm_squared: f64 = 0;
     var decoded_norm_squared: f64 = 0;
     var pos: usize = 0;
     for (0..dims) |_| switch (encoding) {
+        .artifact_reference => return error.UnresolvedVectorReference,
         .float32 => {
             const decoded: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
             decoded_norm_squared += @as(f64, decoded) * decoded;
@@ -302,7 +305,7 @@ pub fn encodedQuantizationStats(
             const component: f32 = @floatCast(component_f16);
             const decoded = component * scale;
             // A full f16 ULP also covers the f32 divide/multiply round trips
-            // used by the encoder. This path is used for legacy/compacted
+            // used by the encoder. This path is used for pre-encoded
             // encoded input whose original f32 values are unavailable.
             const component_error = scale *
                 (@abs(component) * (1.0 / 1024.0) + 1.0 / 8_388_608.0);
@@ -336,6 +339,7 @@ pub fn encodeVectorIntoWithStats(encoding: Encoding, vector: []const f32, out: [
     }
     var pos: usize = 0;
     for (vector) |value| switch (encoding) {
+        .artifact_reference => return error.UnresolvedVectorReference,
         .float32 => {
             // float32 needs only this single validation/encoding traversal.
             if (!std.math.isFinite(value)) return error.InvalidVectorComponent;
@@ -350,6 +354,7 @@ pub fn encodeVectorIntoWithStats(encoding: Encoding, vector: []const f32, out: [
     };
     const source_norm_squared = sourceNormSquaredF32(vector);
     const quantization: QuantizationStats = switch (encoding) {
+        .artifact_reference => return error.UnresolvedVectorReference,
         .float32 => QuantizationStats{
             .error_norm = 0,
             .decoded_norm_lower_bound = if (std.math.isFinite(source_norm_squared))
@@ -388,8 +393,10 @@ pub fn encodeVectorInto(encoding: Encoding, vector: []const f32, out: []u8) !f32
 fn validateEncodedVector(encoding: Encoding, dims: usize, bytes: []const u8, scale: f32) !void {
     if (bytes.len != try encodedVectorBytesLen(encoding, dims)) return error.InvalidEncodedVectorLength;
     if (!std.math.isFinite(scale) or scale <= 0) return error.InvalidVectorScale;
+    if (encoding == .artifact_reference) return;
     var pos: usize = 0;
     for (0..dims) |_| switch (encoding) {
+        .artifact_reference => return error.UnresolvedVectorReference,
         .float32 => {
             const value: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
             if (!std.math.isFinite(value)) return error.InvalidVectorComponent;
@@ -420,7 +427,30 @@ pub fn shardForKey(key: []const u8, shard_count: u32) !u32 {
     return @intCast(keyHash(key) & (@as(u64, shard_count) - 1));
 }
 
+/// Query-independent sparse random-hyperplane signature. This is a bounded
+/// semantic co-access proxy, not training on benchmark queries or changing
+/// ANN routing. Physical clustering across hash shards is a separate design.
+fn projectionLocalityKey(encoding: Encoding, bytes: []const u8, dims: u32) u16 {
+    var code: u16 = 0;
+    for (0..16) |bit| {
+        var projected: f64 = 0;
+        for (0..8) |tap| {
+            const axis = (bit * 131 + tap * 37 + 17) % @as(usize, dims);
+            const value: f32 = if (encoding == .float16)
+                @floatCast(@as(f16, @bitCast(readU16(bytes[axis * 2 ..][0..2]))))
+            else
+                @bitCast(readU32(bytes[axis * 4 ..][0..4]));
+            projected += @as(f64, value) * (if (((bit * 13 + tap * 7) % 5) < 2) @as(f64, -1) else 1);
+        }
+        if (projected >= 0) code |= @as(u16, 1) << @intCast(bit);
+    }
+    return code;
+}
+
 pub const Writer = struct {
+    /// Experimental physical layout only. Logical index order and identity
+    /// stay unchanged; no vector payload or residual is duplicated on disk.
+    cluster_projections: bool = false,
     alloc: Allocator,
     // Keep keys and vector payloads in separate physical regions. Reader
     // admission validates every key to prove hash-shard membership and total
@@ -428,7 +458,7 @@ pub const Writer = struct {
     // multi-KiB vector made that compact validation fault nearly the entire
     // mmap into RSS. New blocks retain keys in `data` and stage vectors here;
     // build() fixes their relative offsets after publishing the aligned vector
-    // arena. The on-disk reader contract remains compatible with older blocks.
+    // arena. Readers locate each region through the index offsets.
     vector_data: std.ArrayListUnmanaged(u8) = .empty,
     residual_data: std.ArrayListUnmanaged(u8) = .empty,
     data: std.ArrayListUnmanaged(u8) = .empty,
@@ -496,7 +526,7 @@ pub const Writer = struct {
         writeU32(self.data.items[20..24], shard_id);
         writeU32(self.data.items[24..28], shard_count);
         writeU64(self.data.items[28..36], covered_source_sequence);
-        writeU32(self.data.items[36..40], std.hash.Crc32.hash(self.data.items[0..36]));
+        writeU32(self.data.items[36..40], Crc32.hash(self.data.items[0..36]));
         return self;
     }
 
@@ -657,7 +687,7 @@ pub const Writer = struct {
                             self.residual_data.items[residual_offset..][0..max_len],
                         );
                         self.residual_data.shrinkRetainingCapacity(residual_offset + residual_len);
-                        residual_checksum = std.hash.Crc32.hash(self.residual_data.items[residual_offset..][0..residual_len]);
+                        residual_checksum = Crc32.hash(self.residual_data.items[residual_offset..][0..residual_len]);
                     }
                 },
                 .encoded => |encoded| {
@@ -676,17 +706,17 @@ pub const Writer = struct {
                         residual_offset = self.residual_data.items.len;
                         try self.residual_data.appendSlice(self.alloc, residual);
                         residual_len = residual.len;
-                        residual_checksum = std.hash.Crc32.hash(residual);
+                        residual_checksum = Crc32.hash(residual);
                     }
                 },
             }
-            vector_checksum = std.hash.Crc32.hash(destination);
+            vector_checksum = Crc32.hash(destination);
         }
 
         try appendU64(self.alloc, &self.index, hash);
         try appendU64(self.alloc, &self.index, @intCast(key_offset));
         try appendU32(self.alloc, &self.index, key_len);
-        try appendU32(self.alloc, &self.index, std.hash.Crc32.hash(key));
+        try appendU32(self.alloc, &self.index, Crc32.hash(key));
         try appendU64(self.alloc, &self.index, source_sequence);
         try appendU64(self.alloc, &self.index, revision);
         try appendU64(self.alloc, &self.index, @intCast(vector_offset));
@@ -709,7 +739,34 @@ pub const Writer = struct {
 
         const vector_arena_offset = std.mem.alignForward(usize, self.data.items.len, self.encoding.alignment());
         try self.data.appendNTimes(self.alloc, 0, vector_arena_offset - self.data.items.len);
-        try self.data.appendSlice(self.alloc, self.vector_data.items);
+        if (self.cluster_projections and (self.encoding == .float16 or self.encoding == .float32) and self.count > 1 and self.count <= 8192) {
+            // StreamingWriter bounds this permutation to its 1-MiB page;
+            // the separate row cap bounds extra metadata to 64 KiB even for
+            // tiny vectors or pages dominated by tombstones.
+            // Write directly into the existing output arena: there is no
+            // second temporary payload copy in addition to ordinary build().
+            const order = try self.alloc.alloc(u64, @intCast(self.count));
+            defer self.alloc.free(order);
+            if (self.count >= (@as(u64, 1) << 48)) return error.VectorBlockTooLarge;
+            for (order, 0..) |*key, row| {
+                const entry = self.index.items[row * index_entry_size ..][0..index_entry_size];
+                const dims = readU32(entry[48..52]);
+                const offset: usize = @intCast(readU64(entry[40..48]));
+                const signature: u16 = if (readU32(entry[52..56]) & tombstone_flag != 0) 0xffff else projectionLocalityKey(self.encoding, self.vector_data.items[offset..][0..try encodedVectorBytesLen(self.encoding, dims)], dims);
+                key.* = (@as(u64, signature) << 48) | @as(u64, @intCast(row));
+            }
+            std.mem.sortUnstable(u64, order, {}, std.sort.asc(u64));
+            for (order) |key| {
+                const row: usize = @intCast(key & ((@as(u64, 1) << 48) - 1));
+                const entry = self.index.items[row * index_entry_size ..][0..index_entry_size];
+                if (readU32(entry[52..56]) & tombstone_flag != 0) continue;
+                const offset: usize = @intCast(readU64(entry[40..48]));
+                const length = try encodedVectorBytesLen(self.encoding, readU32(entry[48..52]));
+                const relative = self.data.items.len - vector_arena_offset;
+                try self.data.appendSlice(self.alloc, self.vector_data.items[offset..][0..length]);
+                writeU64(entry[40..48], @intCast(relative));
+            }
+        } else try self.data.appendSlice(self.alloc, self.vector_data.items);
 
         const residual_arena_offset = self.data.items.len;
         try self.data.appendSlice(self.alloc, self.residual_data.items);
@@ -739,12 +796,12 @@ pub const Writer = struct {
         try appendU64(self.alloc, &self.data, self.count);
         try appendU64(self.alloc, &self.data, self.covered_source_sequence);
         try appendU64(self.alloc, &self.data, self.generation);
-        try appendU32(self.alloc, &self.data, std.hash.Crc32.hash(self.index.items));
+        try appendU32(self.alloc, &self.data, Crc32.hash(self.index.items));
         try appendU16(self.alloc, &self.data, version);
         try appendU16(self.alloc, &self.data, @intFromEnum(self.encoding));
         try appendU32(self.alloc, &self.data, self.shard_id);
         try appendU32(self.alloc, &self.data, self.shard_count);
-        try appendU32(self.alloc, &self.data, std.hash.Crc32.hash(self.data.items[footer_start..][0..48]));
+        try appendU32(self.alloc, &self.data, Crc32.hash(self.data.items[footer_start..][0..48]));
         try self.data.appendSlice(self.alloc, &magic);
         self.vector_data.clearAndFree(self.alloc);
         self.residual_data.clearAndFree(self.alloc);
@@ -752,6 +809,138 @@ pub const Writer = struct {
         return try self.data.toOwnedSlice(self.alloc);
     }
 };
+
+/// Bounded payload pages with a final compact directory. The existing format
+/// uses absolute locations, so pages can be streamed without a second whole-
+/// shard payload allocation or a corpus-sized temporary file. Each page keeps
+/// its projection and residual arenas contiguous for sequential maintenance.
+pub const StreamingWriter = struct {
+    cluster_projections: bool = false,
+    alloc: Allocator,
+    page: Writer,
+    index: std.ArrayListUnmanaged(u8) = .empty,
+    last_key: []u8 = &.{},
+    count: u64 = 0,
+    header_checksum: u32,
+    exact_residuals: bool = true,
+    finished: bool = false,
+    pub const page_bytes: usize = 1024 * 1024;
+    pub const Finish = struct { bytes: usize, admission_checksum: u32, exact_residuals: bool };
+
+    pub fn init(alloc: Allocator, sink: anytype, generation: u64, shard_id: u32, shard_count: u32, sequence: u64, encoding: Encoding) !StreamingWriter {
+        if (sink.len() != 0) return error.InvalidVectorBlockBuildOutput;
+        var page = try Writer.initWithEncoding(alloc, generation, shard_id, shard_count, sequence, encoding);
+        errdefer page.deinit();
+        try sink.appendSlice(page.data.items);
+        return .{ .alloc = alloc, .page = page, .header_checksum = readU32(page.data.items[36..40]) };
+    }
+    pub fn deinit(self: *StreamingWriter) void {
+        self.page.deinit();
+        self.index.deinit(self.alloc);
+        self.alloc.free(self.last_key);
+    }
+    pub fn flushIfNeeded(self: *StreamingWriter, sink: anytype) !void {
+        if (self.page.data.items.len + self.page.vector_data.items.len + self.page.residual_data.items.len >= page_bytes)
+            try self.flush(sink);
+    }
+    fn flush(self: *StreamingWriter, sink: anytype) !void {
+        if (self.finished) return error.VectorBlockWriterFinished;
+        if (self.page.count == 0) return;
+        const previous = self.page.previous.?;
+        const last_key = try self.alloc.dupe(u8, previous.key);
+        errdefer self.alloc.free(last_key);
+        self.page.cluster_projections = self.cluster_projections;
+        const bytes = try self.page.build();
+        defer self.alloc.free(bytes);
+        const reader = try Reader.init(bytes);
+        const aligned = std.mem.alignForward(usize, sink.len(), @alignOf(u64));
+        var zeros: [@alignOf(u64)]u8 = @splat(0);
+        try sink.appendSlice(zeros[0 .. aligned - sink.len()]);
+        const bias = sink.len() - header_size;
+        try self.index.ensureUnusedCapacity(self.alloc, @intCast(reader.count * index_entry_size));
+        for (0..@intCast(reader.count)) |i| {
+            var entry: [index_entry_size]u8 = bytes[reader.index_offset + i * index_entry_size ..][0..index_entry_size].*;
+            writeU64(entry[8..16], try std.math.add(u64, readU64(entry[8..16]), bias));
+            if (readU32(entry[52..56]) & tombstone_flag == 0) {
+                writeU64(entry[40..48], try std.math.add(u64, readU64(entry[40..48]), bias));
+                if (readU32(entry[80..84]) != 0)
+                    writeU64(entry[72..80], try std.math.add(u64, readU64(entry[72..80]), bias));
+            }
+            self.index.appendSliceAssumeCapacity(&entry);
+        }
+        try sink.appendSlice(bytes[header_size..reader.index_offset]);
+        self.count += reader.count;
+        self.exact_residuals = self.exact_residuals and reader.hasExactResiduals();
+        var next = try Writer.initWithEncoding(self.alloc, self.page.generation, self.page.shard_id, self.page.shard_count, self.page.covered_source_sequence, self.page.encoding);
+        next.previous = .{ .hash = previous.hash, .key = last_key, .source_sequence = previous.source_sequence, .revision = previous.revision };
+        self.page.deinit();
+        self.page = next;
+        self.alloc.free(self.last_key);
+        self.last_key = last_key;
+    }
+    pub fn finish(self: *StreamingWriter, sink: anytype) !Finish {
+        try self.flush(sink);
+        self.finished = true;
+        const index_offset = sink.len();
+        try sink.appendSlice(self.index.items);
+        var footer: [footer_size]u8 = @splat(0);
+        writeU64(footer[0..8], @intCast(index_offset));
+        writeU64(footer[8..16], self.count);
+        writeU64(footer[16..24], self.page.covered_source_sequence);
+        writeU64(footer[24..32], self.page.generation);
+        const index_checksum = Crc32.hash(self.index.items);
+        writeU32(footer[32..36], index_checksum);
+        writeU16(footer[36..38], version);
+        writeU16(footer[38..40], @intFromEnum(self.page.encoding));
+        writeU32(footer[40..44], self.page.shard_id);
+        writeU32(footer[44..48], self.page.shard_count);
+        const footer_checksum = Crc32.hash(footer[0..48]);
+        writeU32(footer[48..52], footer_checksum);
+        @memcpy(footer[52..], &magic);
+        try sink.appendSlice(&footer);
+        var identity: [12]u8 = undefined;
+        writeU32(identity[0..4], self.header_checksum);
+        writeU32(identity[4..8], index_checksum);
+        writeU32(identity[8..12], footer_checksum);
+        return .{ .bytes = sink.len(), .admission_checksum = Crc32.hash(&identity), .exact_residuals = self.exact_residuals };
+    }
+};
+
+test "vector block streaming pages preserve exact values and global ordering" {
+    const alloc = std.testing.allocator;
+    const Sink = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        fn len(self: *@This()) usize {
+            return self.bytes.items.len;
+        }
+        fn appendSlice(self: *@This(), bytes: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    var sink: Sink = .{};
+    defer sink.bytes.deinit(alloc);
+    var writer = try StreamingWriter.init(alloc, &sink, 1, 0, 1, 2048, .float16);
+    defer writer.deinit();
+    var source: [512]f32 = undefined;
+    for (0..2048) |i| {
+        for (&source, 0..) |*v, d| v.* = @as(f32, @floatFromInt(i + d)) / 19.0;
+        try writer.page.appendVector("same-key", i + 1, i + 1, &source);
+        try writer.flushIfNeeded(&sink);
+    }
+    try std.testing.expect(writer.count > 0); // Multiple physical payload pages.
+    try std.testing.expectError(error.OutOfOrderVectorBlockEntry, writer.page.appendVector("same-key", 1, 1, &source));
+    const finished = try writer.finish(&sink);
+    const reader = try Reader.init(sink.bytes.items);
+    try std.testing.expectEqual(@as(u64, 2048), reader.count);
+    try std.testing.expectEqual(finished.admission_checksum, reader.admissionChecksum());
+    try std.testing.expect(finished.exact_residuals);
+    var scratch: [512]f32 = undefined;
+    for ([_]u64{ 1, 512, 1024, 2048 }) |sequence| {
+        const value = (try reader.get("same-key", sequence, sequence)).vector;
+        const exact = try value.decodeExactInto(&scratch);
+        for (exact, 0..) |v, d| try std.testing.expectEqual(@as(f32, @floatFromInt(sequence - 1 + d)) / 19.0, v);
+    }
+}
 
 pub const Value = struct {
     source_sequence: u64,
@@ -781,6 +970,7 @@ pub const Value = struct {
         var pos: usize = 0;
         for (out[0..self.dims]) |*value| {
             switch (self.encoding) {
+                .artifact_reference => return error.UnresolvedVectorReference,
                 .float32 => {
                     value.* = @bitCast(std.mem.readInt(u32, self.bytes[pos..][0..4], .little));
                     pos += 4;
@@ -832,7 +1022,7 @@ pub const ValueLocation = struct {
     /// every RaBitQ boundary candidate into an exact-vector I/O operation.
     pub fn projectionValueFromPayload(self: ValueLocation, vector_bytes: []const u8) !Value {
         if (vector_bytes.len != self.vector_len) return error.CorruptedVectorBlock;
-        if (std.hash.Crc32.hash(vector_bytes) != self.vector_checksum)
+        if (Crc32.hash(vector_bytes) != self.vector_checksum)
             return error.VectorBlockPayloadChecksumMismatch;
         return self.projectionValueFromVerifiedPayload(vector_bytes, self.vector_checksum);
     }
@@ -884,7 +1074,7 @@ pub const ValueLocation = struct {
             return error.VectorBlockProjectionLocationMismatch;
         }
         if (residual_bytes.len != self.residual_len) return error.CorruptedVectorBlock;
-        if (self.residual_len != 0 and std.hash.Crc32.hash(residual_bytes) != self.residual_checksum)
+        if (self.residual_len != 0 and Crc32.hash(residual_bytes) != self.residual_checksum)
             return error.VectorBlockResidualChecksumMismatch;
         var value = projection;
         value.exact_residual = if (residual_bytes.len == 0) null else residual_bytes;
@@ -925,7 +1115,6 @@ pub const Reader = struct {
     shard_count: u32,
     covered_source_sequence: u64,
     encoding: Encoding,
-    index_entry_size: usize,
 
     const Entry = struct {
         hash: u64,
@@ -950,22 +1139,9 @@ pub const Reader = struct {
         if (data.len < header_size + footer_size) return error.CorruptedVectorBlock;
         if (!std.mem.eql(u8, data[0..8], &magic)) return error.CorruptedVectorBlock;
         const block_version = readU16(data[8..10]);
-        const encoding: Encoding = switch (block_version) {
-            legacy_version => if (readU16(data[10..12]) == 0) .float32 else return error.UnsupportedVectorBlockVersion,
-            unscaled_encoding_version, scaled_encoding_version, version => switch (readU16(data[10..12])) {
-                @intFromEnum(Encoding.float32) => .float32,
-                @intFromEnum(Encoding.float16) => .float16,
-                else => return error.UnsupportedVectorBlockEncoding,
-            },
-            else => return error.UnsupportedVectorBlockVersion,
-        };
-        const entry_size = switch (block_version) {
-            version => index_entry_size,
-            scaled_encoding_version => scaled_index_entry_size,
-            legacy_version, unscaled_encoding_version => legacy_index_entry_size,
-            else => unreachable,
-        };
-        if (readU32(data[36..40]) != std.hash.Crc32.hash(data[0..36])) return error.VectorBlockHeaderChecksumMismatch;
+        if (block_version != version) return error.UnsupportedVectorBlockVersion;
+        const encoding = std.enums.fromInt(Encoding, readU16(data[10..12])) orelse return error.UnsupportedVectorBlockEncoding;
+        if (readU32(data[36..40]) != Crc32.hash(data[0..36])) return error.VectorBlockHeaderChecksumMismatch;
 
         const generation = readU64(data[12..20]);
         const shard_id = readU32(data[20..24]);
@@ -975,7 +1151,7 @@ pub const Reader = struct {
         const footer = data[data.len - footer_size ..];
         if (!std.mem.eql(u8, footer[52..60], &magic)) return error.CorruptedVectorBlock;
         if (readU16(footer[36..38]) != block_version or readU16(footer[38..40]) != @intFromEnum(encoding)) return error.UnsupportedVectorBlockVersion;
-        if (readU32(footer[48..52]) != std.hash.Crc32.hash(footer[0..48])) return error.VectorBlockFooterChecksumMismatch;
+        if (readU32(footer[48..52]) != Crc32.hash(footer[0..48])) return error.VectorBlockFooterChecksumMismatch;
         if (readU64(footer[24..32]) != generation) return error.CorruptedVectorBlock;
         if (readU32(footer[40..44]) != shard_id or readU32(footer[44..48]) != shard_count) return error.CorruptedVectorBlock;
         if (readU64(footer[16..24]) != covered_source_sequence) return error.CorruptedVectorBlock;
@@ -986,10 +1162,10 @@ pub const Reader = struct {
             header_size,
             readU64(footer[0..8]),
             count_raw,
-            entry_size,
+            index_entry_size,
         ) catch return error.CorruptedVectorBlock;
         const count = std.math.cast(usize, count_raw) orelse return error.CorruptedVectorBlock;
-        if (readU32(footer[32..36]) != std.hash.Crc32.hash(index_region.slice(data))) return error.VectorBlockIndexChecksumMismatch;
+        if (readU32(footer[32..36]) != Crc32.hash(index_region.slice(data))) return error.VectorBlockIndexChecksumMismatch;
         const reader: Reader = .{
             .data = data,
             .index_offset = index_region.offset,
@@ -999,7 +1175,6 @@ pub const Reader = struct {
             .shard_count = shard_count,
             .covered_source_sequence = covered_source_sequence,
             .encoding = encoding,
-            .index_entry_size = entry_size,
         };
         try reader.validate();
         return reader;
@@ -1013,7 +1188,7 @@ pub const Reader = struct {
         writeU32(identity[0..4], readU32(self.data[36..40]));
         writeU32(identity[4..8], readU32(self.data[self.data.len - footer_size + 32 ..][0..4]));
         writeU32(identity[8..12], readU32(self.data[self.data.len - footer_size + 48 ..][0..4]));
-        return std.hash.Crc32.hash(&identity);
+        return Crc32.hash(&identity);
     }
 
     pub fn get(self: Reader, key: []const u8, max_source_sequence: u64, expected_revision: ?u64) !Lookup {
@@ -1067,7 +1242,7 @@ pub const Reader = struct {
             .source_sequence = found.source_sequence,
             .revision = found.revision,
         } };
-        const vector_len = std.math.mul(usize, found.dims, self.encoding.componentBytes()) catch
+        const vector_len = encodedVectorBytesLen(self.encoding, found.dims) catch
             return error.CorruptedVectorBlock;
         return .{ .vector = .{
             .source_sequence = found.source_sequence,
@@ -1103,9 +1278,9 @@ pub const Reader = struct {
             .source_sequence = found.source_sequence,
             .revision = found.revision,
         } };
-        const byte_len = std.math.mul(usize, found.dims, self.encoding.componentBytes()) catch return error.CorruptedVectorBlock;
+        const byte_len = encodedVectorBytesLen(self.encoding, found.dims) catch return error.CorruptedVectorBlock;
         const bytes = self.data[found.vector_offset..][0..byte_len];
-        if (std.hash.Crc32.hash(bytes) != found.vector_checksum) return error.VectorBlockPayloadChecksumMismatch;
+        if (Crc32.hash(bytes) != found.vector_checksum) return error.VectorBlockPayloadChecksumMismatch;
         return .{ .vector = .{
             .source_sequence = found.source_sequence,
             .revision = found.revision,
@@ -1119,7 +1294,7 @@ pub const Reader = struct {
                 null
             else blk: {
                 const residual = self.data[found.residual_offset..][0..found.residual_len];
-                if (std.hash.Crc32.hash(residual) != found.residual_checksum)
+                if (Crc32.hash(residual) != found.residual_checksum)
                     return error.VectorBlockResidualChecksumMismatch;
                 break :blk residual;
             },
@@ -1128,7 +1303,7 @@ pub const Reader = struct {
 
     fn entry(self: Reader, index: usize) !Entry {
         if (index >= self.count) return error.CorruptedVectorBlock;
-        const raw = self.data[self.index_offset + index * self.index_entry_size ..][0..self.index_entry_size];
+        const raw = self.data[self.index_offset + index * index_entry_size ..][0..index_entry_size];
         const entry_value: Entry = .{
             .hash = readU64(raw[0..8]),
             .key_offset = std.math.cast(usize, readU64(raw[8..16])) orelse return error.CorruptedVectorBlock,
@@ -1140,26 +1315,12 @@ pub const Reader = struct {
             .dims = readU32(raw[48..52]),
             .flags = readU32(raw[52..56]),
             .vector_checksum = readU32(raw[56..60]),
-            .vector_scale = if (self.index_entry_size >= scaled_index_entry_size)
-                @bitCast(readU32(raw[60..64]))
-            else if ((readU32(raw[52..56]) & tombstone_flag) != 0)
-                0
-            else
-                1,
-            .quantization_error_norm = if (self.index_entry_size == index_entry_size)
-                @bitCast(readU32(raw[64..68]))
-            else
-                null,
-            .decoded_norm_lower_bound = if (self.index_entry_size == index_entry_size)
-                @bitCast(readU32(raw[68..72]))
-            else
-                null,
-            .residual_offset = if (self.index_entry_size == index_entry_size)
-                std.math.cast(usize, readU64(raw[72..80])) orelse return error.CorruptedVectorBlock
-            else
-                0,
-            .residual_len = if (self.index_entry_size == index_entry_size) readU32(raw[80..84]) else 0,
-            .residual_checksum = if (self.index_entry_size == index_entry_size) readU32(raw[84..88]) else 0,
+            .vector_scale = @bitCast(readU32(raw[60..64])),
+            .quantization_error_norm = @bitCast(readU32(raw[64..68])),
+            .decoded_norm_lower_bound = @bitCast(readU32(raw[68..72])),
+            .residual_offset = std.math.cast(usize, readU64(raw[72..80])) orelse return error.CorruptedVectorBlock,
+            .residual_len = readU32(raw[80..84]),
+            .residual_checksum = readU32(raw[84..88]),
         };
         if (entry_value.key_offset < header_size or entry_value.key_offset > self.index_offset or entry_value.key_len > self.index_offset - entry_value.key_offset) return error.CorruptedVectorBlock;
         if (entry_value.source_sequence > self.covered_source_sequence) return error.CorruptedVectorBlock;
@@ -1181,7 +1342,7 @@ pub const Reader = struct {
                 }) catch return error.CorruptedVectorBlock;
             } else if (entry_value.decoded_norm_lower_bound != null) return error.CorruptedVectorBlock;
             if (entry_value.dims == 0 or entry_value.vector_offset < header_size or entry_value.vector_offset % self.encoding.alignment() != 0) return error.CorruptedVectorBlock;
-            const byte_len = std.math.mul(usize, entry_value.dims, self.encoding.componentBytes()) catch return error.CorruptedVectorBlock;
+            const byte_len = encodedVectorBytesLen(self.encoding, entry_value.dims) catch return error.CorruptedVectorBlock;
             if (entry_value.vector_offset > self.index_offset or byte_len > self.index_offset - entry_value.vector_offset) return error.CorruptedVectorBlock;
             if (entry_value.residual_len == 0) {
                 if (entry_value.residual_offset != 0 or entry_value.residual_checksum != 0) return error.CorruptedVectorBlock;
@@ -1196,7 +1357,7 @@ pub const Reader = struct {
 
     fn entryAssumeValidated(self: Reader, index: usize) Entry {
         std.debug.assert(index < self.count);
-        const raw = self.data[self.index_offset + index * self.index_entry_size ..][0..self.index_entry_size];
+        const raw = self.data[self.index_offset + index * index_entry_size ..][0..index_entry_size];
         return .{
             .hash = readU64(raw[0..8]),
             .key_offset = @intCast(readU64(raw[8..16])),
@@ -1208,29 +1369,18 @@ pub const Reader = struct {
             .dims = readU32(raw[48..52]),
             .flags = readU32(raw[52..56]),
             .vector_checksum = readU32(raw[56..60]),
-            .vector_scale = if (self.index_entry_size >= scaled_index_entry_size)
-                @bitCast(readU32(raw[60..64]))
-            else if ((readU32(raw[52..56]) & tombstone_flag) != 0)
-                0
-            else
-                1,
-            .quantization_error_norm = if (self.index_entry_size == index_entry_size)
-                @bitCast(readU32(raw[64..68]))
-            else
-                null,
-            .decoded_norm_lower_bound = if (self.index_entry_size == index_entry_size)
-                @bitCast(readU32(raw[68..72]))
-            else
-                null,
-            .residual_offset = if (self.index_entry_size == index_entry_size) @intCast(readU64(raw[72..80])) else 0,
-            .residual_len = if (self.index_entry_size == index_entry_size) readU32(raw[80..84]) else 0,
-            .residual_checksum = if (self.index_entry_size == index_entry_size) readU32(raw[84..88]) else 0,
+            .vector_scale = @bitCast(readU32(raw[60..64])),
+            .quantization_error_norm = @bitCast(readU32(raw[64..68])),
+            .decoded_norm_lower_bound = @bitCast(readU32(raw[68..72])),
+            .residual_offset = @intCast(readU64(raw[72..80])),
+            .residual_len = readU32(raw[80..84]),
+            .residual_checksum = readU32(raw[84..88]),
         };
     }
 
     fn entryKey(self: Reader, entry_value: Entry) ![]const u8 {
         const bytes = self.data[entry_value.key_offset..][0..entry_value.key_len];
-        if (std.hash.Crc32.hash(bytes) != entry_value.key_checksum) return error.VectorBlockKeyChecksumMismatch;
+        if (Crc32.hash(bytes) != entry_value.key_checksum) return error.VectorBlockKeyChecksumMismatch;
         return bytes;
     }
 
@@ -1269,6 +1419,59 @@ pub const Reader = struct {
         return true;
     }
 };
+
+test "clustered projection arena preserves lookup exact residuals and single-copy size" {
+    const alloc = std.testing.allocator;
+    const Row = struct {
+        key: [8]u8,
+        vector: [65]f32,
+        ordinal: u64,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            const ah = keyHash(&a.key);
+            const bh = keyHash(&b.key);
+            return if (ah == bh) std.mem.order(u8, &a.key, &b.key) == .lt else ah < bh;
+        }
+    };
+    var rows: [37]Row = undefined;
+    for (&rows, 0..) |*row, i| {
+        row.ordinal = i;
+        std.mem.writeInt(u64, &row.key, i, .little);
+        for (&row.vector, 0..) |*value, d| value.* = (@as(f32, @floatFromInt((i * 11 + d * 7) % 31)) - 15) / 13;
+    }
+    std.mem.sort(Row, &rows, {}, Row.less);
+    for ([_]Encoding{ .float16, .float32 }) |encoding| {
+        var normal = try Writer.initWithEncoding(alloc, 1, 0, 1, 10, encoding);
+        defer normal.deinit();
+        var clustered = try Writer.initWithEncoding(alloc, 1, 0, 1, 10, encoding);
+        defer clustered.deinit();
+        clustered.cluster_projections = true;
+        for (&rows) |*row| {
+            if (row.ordinal % 7 == 0) {
+                try normal.appendTombstone(&row.key, 10, row.ordinal);
+                try clustered.appendTombstone(&row.key, 10, row.ordinal);
+            } else {
+                try normal.appendVector(&row.key, 10, row.ordinal, &row.vector);
+                try clustered.appendVector(&row.key, 10, row.ordinal, &row.vector);
+            }
+        }
+        const a = try normal.build();
+        defer alloc.free(a);
+        const b = try clustered.build();
+        defer alloc.free(b);
+        try std.testing.expectEqual(a.len, b.len);
+        try std.testing.expect(!std.mem.eql(u8, a, b));
+        const reader = try Reader.init(b);
+        for (&rows) |*row| {
+            const found = try reader.get(&row.key, 10, row.ordinal);
+            if (row.ordinal % 7 == 0) {
+                try std.testing.expect(found == .tombstone);
+            } else {
+                var decoded: [65]f32 = undefined;
+                try std.testing.expectEqualSlices(f32, &row.vector, try found.vector.decodeExactInto(&decoded));
+            }
+        }
+    }
+}
 
 fn validShardCount(shard_count: u32) bool {
     return shard_count != 0 and std.math.isPowerOfTwo(shard_count);
@@ -1366,7 +1569,7 @@ test "vector block rejects wrapped index regions before slicing" {
     const footer = encoded[encoded.len - footer_size ..];
     writeU64(footer[0..8], std.math.maxInt(u64) - 31);
     writeU64(footer[8..16], 1);
-    writeU32(footer[48..52], std.hash.Crc32.hash(footer[0..48]));
+    writeU32(footer[48..52], Crc32.hash(footer[0..48]));
     try std.testing.expectError(error.CorruptedVectorBlock, Reader.init(encoded));
 }
 
@@ -1456,35 +1659,17 @@ test "vector block keeps pre-encoded float16 bounded until residual is supplied"
     );
 }
 
-test "vector block reader keeps v3 scaled blocks compatible without projection metadata" {
+test "vector block reader rejects superseded and future formats" {
     const alloc = std.testing.allocator;
     var writer = try Writer.initWithEncoding(alloc, 9, 0, 1, 1, .float16);
     defer writer.deinit();
     try writer.appendVector("artifact-a", 1, 7, &.{ 0.125, -0.33325, 4.5 });
-    const current = try writer.build();
-    defer alloc.free(current);
-    const current_reader = try Reader.init(current);
-
-    // A v3 entry ends after vector_scale. Reframe the committed current block
-    // as the exact bytes an older writer emitted, including both checksums.
-    const old = try alloc.alloc(u8, current.len - (index_entry_size - scaled_index_entry_size));
-    defer alloc.free(old);
-    const old_footer_start = old.len - footer_size;
-    @memcpy(old[0 .. current_reader.index_offset + scaled_index_entry_size], current[0 .. current_reader.index_offset + scaled_index_entry_size]);
-    @memcpy(old[old_footer_start..], current[current.len - footer_size ..]);
-    writeU16(old[8..10], scaled_encoding_version);
-    writeU32(old[36..40], std.hash.Crc32.hash(old[0..36]));
-    const footer = old[old_footer_start..];
-    writeU32(footer[32..36], std.hash.Crc32.hash(old[current_reader.index_offset..old_footer_start]));
-    writeU16(footer[36..38], scaled_encoding_version);
-    writeU32(footer[48..52], std.hash.Crc32.hash(footer[0..48]));
-
-    const reader = try Reader.init(old);
-    const value = (try reader.get("artifact-a", 1, 7)).vector;
-    try std.testing.expect(value.quantization_error_norm == null);
-    try std.testing.expect(value.decoded_norm_lower_bound == null);
-    var decoded: [3]f32 = undefined;
-    try std.testing.expectApproxEqAbs(@as(f32, -0.33325), (try value.decodeInto(&decoded))[1], 0.0005);
+    const encoded = try writer.build();
+    defer alloc.free(encoded);
+    for ([_]u16{ 0, 1, 2, 3, version + 1 }) |unsupported| {
+        writeU16(encoded[8..10], unsupported);
+        try std.testing.expectError(error.UnsupportedVectorBlockVersion, Reader.init(encoded));
+    }
 }
 
 test "vector block admission rejects invalid projection metadata" {
@@ -1497,8 +1682,8 @@ test "vector block admission rejects invalid projection metadata" {
     const reader = try Reader.init(encoded);
     writeU32(encoded[reader.index_offset + 64 ..][0..4], @bitCast(std.math.nan(f32)));
     const footer = encoded[encoded.len - footer_size ..];
-    writeU32(footer[32..36], std.hash.Crc32.hash(encoded[reader.index_offset .. encoded.len - footer_size]));
-    writeU32(footer[48..52], std.hash.Crc32.hash(footer[0..48]));
+    writeU32(footer[32..36], Crc32.hash(encoded[reader.index_offset .. encoded.len - footer_size]));
+    writeU32(footer[48..52], Crc32.hash(footer[0..48]));
     try std.testing.expectError(error.CorruptedVectorBlock, Reader.init(encoded));
 }
 

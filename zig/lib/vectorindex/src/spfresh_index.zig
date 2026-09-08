@@ -358,6 +358,9 @@ pub fn layeredExactFlatCentroidDirectoryFromDirectory(
     const blocks = try alloc.alloc(FlatCentroidBlock, parent.blocks.len + overlay_blocks);
     errdefer alloc.free(blocks);
     var block_index: usize = 0;
+    // Overlay ownership has moved into initialized blocks before retaining
+    // the parent allocates its backing lease. Clean it up if that fails.
+    errdefer for (blocks[0..block_index]) |*block| block.deinit(alloc);
     if (overlay.posting_ids.len != 0) {
         blocks[0] = .{
             .posting_ids = overlay.posting_ids,
@@ -550,6 +553,9 @@ pub fn projectedFlatCentroidDirectoryBuildBytes(
     try checkedAddMul(&transient, @intCast(block_size), @as(u64, @intCast(dims)) *| @sizeOf(f32));
     try checkedAddMul(&transient, @min(node_count, @as(u64, @intCast(block_size))), @as(u64, @intCast(dims)) *| @sizeOf(f32));
     try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    // Optional native routing centering accumulates one D-sized f64 mean,
+    // never another posting-sized/vector-sized payload matrix.
+    try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f64));
     // One decoded node is live at a time while traversing the directory.
     try checkedAddMul(&transient, 1, @sizeOf(types.Node));
     try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f32));
@@ -669,17 +675,19 @@ fn siftFlatProbeDown(probes: []FlatCentroidProbe, start_index: usize) void {
 /// Maintain a fixed-capacity max heap whose root is the least desirable
 /// retained probe. Insertion remains O(log k) without allocating a separate
 /// PriorityQueue backing buffer outside the resource governor.
-fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCentroidProbe) void {
-    if (probes.len == 0) return;
+fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCentroidProbe) ?FlatCentroidProbe {
+    if (probes.len == 0) return candidate;
     if (count.* < probes.len) {
         probes[count.*] = candidate;
         siftFlatProbeUp(probes[0 .. count.* + 1], count.*);
         count.* += 1;
-        return;
+        return null;
     }
-    if (!flatProbeLess({}, candidate, probes[0])) return;
+    if (!flatProbeLess({}, candidate, probes[0])) return candidate;
+    const omitted = probes[0];
     probes[0] = candidate;
     siftFlatProbeDown(probes, 0);
+    return omitted;
 }
 
 fn flatAnnScore(probe: FlatCentroidProbe) f32 {
@@ -699,8 +707,12 @@ fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
 }
 
 fn populateFlatProbeSuffixBounds(probes: []FlatCentroidProbe) void {
-    var suffix_lower_bound = std.math.inf(f32);
-    var suffix_resolved = true;
+    populateFlatProbeSuffixBoundsWithOmitted(probes, std.math.inf(f32), true);
+}
+
+fn populateFlatProbeSuffixBoundsWithOmitted(probes: []FlatCentroidProbe, omitted_lower_bound: f32, omitted_resolved: bool) void {
+    var suffix_lower_bound = omitted_lower_bound;
+    var suffix_resolved = omitted_resolved;
     var reverse_index = probes.len;
     while (reverse_index > 0) {
         reverse_index -= 1;
@@ -749,12 +761,57 @@ test "bounded flat probe heap retains the best stable frontier" {
         // A non-finite routing score is always worse than a finite candidate.
         .{ .posting_id = 0, .distance = std.math.nan(f32), .error_bound = 0 },
     };
-    for (candidates) |candidate| insertFlatProbe(&retained, &retained_count, candidate);
+    for (candidates) |candidate| _ = insertFlatProbe(&retained, &retained_count, candidate);
     try std.testing.expectEqual(retained.len, retained_count);
     std.mem.sort(FlatCentroidProbe, &retained, {}, flatProbeLess);
     try std.testing.expectEqual(@as(u64, 1), retained[0].posting_id);
     try std.testing.expectEqual(@as(u64, 2), retained[1].posting_id);
     try std.testing.expectEqual(@as(u64, 3), retained[2].posting_id);
+}
+
+test "bounded flat suffix proofs include evicted rejected and unresolved postings" {
+    try testBoundedFlatSuffixProofs();
+}
+
+pub fn testBoundedFlatSuffixProofs() !void {
+    for ([_]bool{ false, true }) |dirty| {
+        var candidates: [73]FlatCentroidProbe = undefined;
+        var retained: [11]FlatCentroidProbe = undefined;
+        var count: usize = 0;
+        var omitted_lower = std.math.inf(f32);
+        var omitted_resolved = true;
+        for (&candidates, 0..) |*candidate, i| {
+            const distance: f32 = @floatFromInt((i * 31) % candidates.len);
+            candidate.* = .{
+                .posting_id = i + 1,
+                .distance = distance,
+                .error_bound = 0,
+                .member_lower_bound = distance / @as(f32, @floatFromInt(1 + i % 7)),
+                .bound_resolved = !(dirty and i == 5),
+            };
+            if (insertFlatProbe(&retained, &count, candidate.*)) |omitted| {
+                omitted_resolved = omitted_resolved and omitted.bound_resolved;
+                if (omitted_resolved) omitted_lower = @min(omitted_lower, omitted.member_lower_bound);
+            }
+        }
+        std.mem.sort(FlatCentroidProbe, &retained, {}, flatProbeLess);
+        populateFlatProbeSuffixBoundsWithOmitted(&retained, omitted_lower, omitted_resolved);
+        for (retained, 0..) |probe, visited_count| {
+            var expected = std.math.inf(f32);
+            var resolved = true;
+            for (candidates) |candidate| {
+                var visited = false;
+                for (retained[0..visited_count]) |prior| {
+                    if (prior.posting_id == candidate.posting_id) visited = true;
+                }
+                if (visited) continue;
+                resolved = resolved and candidate.bound_resolved;
+                expected = @min(expected, candidate.member_lower_bound);
+            }
+            try std.testing.expectEqual(resolved, probe.suffix_bounds_resolved);
+            try std.testing.expectEqual(if (resolved) expected else -std.math.inf(f32), probe.suffix_member_lower_bound);
+        }
+    }
 }
 
 fn flatMemberLowerBound(
@@ -1129,22 +1186,28 @@ fn appendFlatCentroidBlock(
 /// The exact directory wins once topology traversal becomes pointer-heavy;
 /// small indexes keep the tree and avoid paying for a complete centroid scan.
 pub fn usesFlatCentroidDirectory(self: anytype) bool {
-    if (!self.config.use_quantization) return false;
-    return switch (self.config.centroid_directory_mode) {
+    const Index = comptime @TypeOf(self.*);
+    const active_count = if (comptime @hasDecl(Index, "publishedActiveCount"))
+        self.publishedActiveCount()
+    else
+        self.metadata.active_count;
+    return usesFlatCentroidDirectoryAtCount(&self.config, active_count);
+}
+
+/// A query must choose from its captured generation, not a live counter that
+/// can cross the routing threshold between admission and candidate scoring.
+pub fn usesFlatCentroidDirectoryAtCount(config: *const types.HBCConfig, active_count: u64) bool {
+    if (!config.use_quantization) return false;
+    return switch (config.centroid_directory_mode) {
         .hbc => false,
         .flat_rabitq, .flat_exact => true,
         .auto => blk: {
-            const Index = comptime @TypeOf(self.*);
-            const active_count = if (comptime @hasDecl(Index, "publishedActiveCount"))
-                self.publishedActiveCount()
-            else
-                self.metadata.active_count;
-            const leaf_size = @max(@as(u64, self.config.leaf_size), 1);
+            const leaf_size = @max(@as(u64, config.leaf_size), 1);
             // Use the completed-leaf scale here. A partially filled final
             // leaf should not switch the whole index to a flat directory one
             // batch before the configured posting boundary.
             const estimated_postings = active_count / leaf_size;
-            break :blk estimated_postings >= self.config.flat_exact_min_postings;
+            break :blk estimated_postings >= config.flat_exact_min_postings;
         },
     };
 }
@@ -1171,6 +1234,9 @@ test "automatic centroid routing switches only at the posting scale boundary" {
     try std.testing.expect(!usesFlatCentroidDirectory(&index));
     index.active_count = 102_400;
     try std.testing.expect(usesFlatCentroidDirectory(&index));
+    try std.testing.expect(!usesFlatCentroidDirectoryAtCount(&index.config, 102_399));
+    index.active_count = 1;
+    try std.testing.expect(usesFlatCentroidDirectoryAtCount(&index.config, 102_400));
     index.config.centroid_directory_mode = .hbc;
     try std.testing.expect(!usesFlatCentroidDirectory(&index));
     index.config.centroid_directory_mode = .flat_exact;
@@ -1295,14 +1361,184 @@ fn buildFlatCentroidDirectory(
     };
 }
 
-fn loadOrBuildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_count: u64, publish_generation: u64) !FlatCentroidDirectory {
+/// Convert only new exact blocks. Already-quantized parent blocks remain
+/// borrowed under the existing directory/generation lease; a new delta does
+/// not requantize its ancestors. No source vectors or primary reads are used.
+/// The elected builder owns `directory` exclusively under its existing peak
+/// reservation. On error the caller can deinitialize the partially converted
+/// directory normally. Nothing is installed into a shared cache before success.
+fn quantizeExactFlatCentroidBlocks(
+    self: anytype,
+    directory: *FlatCentroidDirectory,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    const dims: usize = @intCast(self.config.dims);
+    const center = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(center);
+    const Index = comptime @TypeOf(self.*);
+    const centered = if (comptime @hasDecl(Index, "nativeCenteredRoutingEnabled")) self.nativeCenteredRoutingEnabled() else false;
+    const sums: []f64 = if (centered) try self.alloc.alloc(f64, dims) else &.{};
+    defer self.alloc.free(sums);
+    for (directory.blocks) |*block| {
+        try checkCancellation(cancellation);
+        const exact = switch (block.encoding) {
+            .rabitq => continue,
+            .exact => |value| value,
+        };
+        // Persisted blocks/large live overlays need not use today's runtime
+        // block size. Keep those exact instead of allocating a normalized
+        // matrix larger than this builder's reserved conversion workspace.
+        if (block.posting_ids.len == 0 or block.posting_ids.len > @max(self.config.flat_centroid_block_size, 1)) continue;
+        if (exact.vectors.len != std.math.mul(usize, block.posting_ids.len, dims) catch return error.InvalidCentroidDirectory)
+            return error.InvalidCentroidDirectory;
+        @memset(center, 0);
+        if (centered) {
+            // Stream contiguous source centroids once into bounded f64 sums;
+            // this avoids overflow/rounding drift in a long f32 reduction. The
+            // arithmetic mean is deliberately NOT normalized: RaBitQ stores
+            // its norm/dot corrections and quantizes residuals about it.
+            @memset(sums, 0);
+            for (0..block.posting_ids.len) |row| {
+                if ((row & 0xff) == 0) try checkCancellation(cancellation);
+                for (sums, exact.vectors[row * dims ..][0..dims]) |*sum, value| sum.* += @as(f64, value);
+            }
+            for (center, sums) |*value, sum| value.* = @floatCast(sum / @as(f64, @floatFromInt(block.posting_ids.len)));
+        }
+        var quantized = try self.quantizer.quantize(center, exact.vectors, block.posting_ids.len);
+        errdefer quantized.deinit(self.alloc);
+        try checkCancellation(cancellation);
+        const ids = if (block.owned) block.posting_ids else try self.alloc.dupe(u64, block.posting_ids);
+        errdefer if (!block.owned) self.alloc.free(@constCast(ids));
+        const radii = if (block.owned) block.covering_radii else try self.alloc.dupe(f32, block.covering_radii);
+        if (block.owned) {
+            self.alloc.free(@constCast(exact.vectors));
+            self.alloc.free(@constCast(exact.measures));
+        }
+        block.posting_ids = ids;
+        block.covering_radii = radii;
+        block.encoding = .{ .rabitq = quantized };
+        block.owned = true;
+    }
+}
+
+fn loadOrBuildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_count: u64, publish_generation: u64, cancellation: ?search_types.CancellationToken) !FlatCentroidDirectory {
     const Index = comptime @TypeOf(self.*);
     if (comptime @hasDecl(Index, "loadPersistedFlatCentroidDirectory")) {
         if (try self.loadPersistedFlatCentroidDirectory(txn, root_node, node_count, publish_generation)) |persisted| {
-            return persisted;
+            var directory = persisted;
+            errdefer directory.deinit(self.alloc);
+            if (comptime @hasDecl(Index, "nativeQuantizedRoutingEnabled")) {
+                if (self.config.use_quantization and self.nativeQuantizedRoutingEnabled()) try quantizeExactFlatCentroidBlocks(self, &directory, cancellation);
+            }
+            return directory;
         }
     }
-    return try buildFlatCentroidDirectory(self, txn, root_node, node_count, publish_generation, null);
+    return try buildFlatCentroidDirectory(self, txn, root_node, node_count, publish_generation, cancellation);
+}
+
+const QuantizedRoutingTest = struct {
+    fn overlay(alloc: std.mem.Allocator) !OwnedExactCentroidOverlay {
+        const ids = try alloc.dupe(u64, &.{1});
+        errdefer alloc.free(ids);
+        const radii = try alloc.dupe(f32, &.{0.3});
+        errdefer alloc.free(radii);
+        const measures = try alloc.dupe(f32, &.{1});
+        errdefer alloc.free(measures);
+        const vectors = try alloc.dupe(f32, &.{ 0, 0, 1 });
+        return .{ .posting_ids = ids, .covering_radii = radii, .measures = measures, .vectors = vectors };
+    }
+
+    fn run(alloc: std.mem.Allocator, centered: bool) !void {
+        const Quantizer = @import("antfly_vector").quantizer.RaBitQuantizer;
+        const Index = struct {
+            alloc: std.mem.Allocator,
+            config: types.HBCConfig,
+            quantizer: Quantizer,
+            centered: bool,
+            pub fn nativeCenteredRoutingEnabled(self: *const @This()) bool {
+                return self.centered;
+            }
+        };
+        var index: Index = .{
+            .alloc = alloc,
+            .config = types.HBCConfig{ .dims = 3, .metric = .cosine },
+            .quantizer = try Quantizer.init(alloc, 3, 42, .cosine),
+            .centered = centered,
+        };
+        defer index.quantizer.deinit();
+        const parent = try alloc.create(FlatCentroidDirectory);
+        parent.* = .{ .posting_count = 2, .root_node_snapshot = 3, .node_count_snapshot = 3, .publish_generation_snapshot = 7 };
+        defer parent.release(alloc);
+        parent.blocks = try alloc.alloc(FlatCentroidBlock, 1);
+        parent.blocks[0] = .{
+            .posting_ids = &.{ 1, 2 },
+            .covering_radii = &.{ 0.1, 0.2 },
+            .encoding = .{ .exact = .{ .vectors = &.{ 1, 0, 0, 0, 1, 0 }, .measures = &.{ 1, 1 } } },
+            .owned = false,
+        };
+        index.config.flat_centroid_block_size = 1;
+        try quantizeExactFlatCentroidBlocks(&index, parent, null);
+        try std.testing.expect(parent.blocks[0].encoding == .exact);
+        try std.testing.expect(!parent.blocks[0].owned);
+        index.config.flat_centroid_block_size = 2;
+        try quantizeExactFlatCentroidBlocks(&index, parent, null);
+        try std.testing.expect(parent.blocks[0].owned);
+        try std.testing.expectEqualSlices(f32, if (centered) &.{ 0.5, 0.5, 0 } else &.{ 0, 0, 0 }, parent.blocks[0].encoding.rabitq.centroid);
+        try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, parent.blocks[0].posting_ids);
+        const parent_codes = parent.blocks[0].encoding.rabitq.codes.data.ptr;
+        // Repeated conversion must be a no-op for already-quantized parents.
+        try quantizeExactFlatCentroidBlocks(&index, parent, null);
+        try std.testing.expectEqual(parent_codes, parent.blocks[0].encoding.rabitq.codes.data.ptr);
+
+        const shadowed = try alloc.dupe(u64, &.{1});
+        var shadowed_owned = true;
+        errdefer if (shadowed_owned) alloc.free(shadowed);
+        const new_centroids = try overlay(alloc);
+        shadowed_owned = false;
+        var layered = try layeredExactFlatCentroidDirectoryFromDirectory(alloc, parent, new_centroids, shadowed, 3, 3, 8);
+        defer layered.deinit(alloc);
+        try quantizeExactFlatCentroidBlocks(&index, &layered, null);
+        try std.testing.expectEqual(@as(u64, 8), layered.publish_generation_snapshot);
+        try std.testing.expectEqual(@as(usize, 2), layered.posting_count);
+        try std.testing.expectEqual(@as(u32, 2), parent.ref_count.load(.acquire));
+        try std.testing.expectEqualSlices(u64, &.{1}, layered.blocks[0].posting_ids);
+        try std.testing.expectEqualSlices(f32, &.{0.3}, layered.blocks[0].covering_radii);
+        try std.testing.expect(layered.blocks[0].owned);
+        try std.testing.expectEqualSlices(f32, if (centered) &.{ 0, 0, 1 } else &.{ 0, 0, 0 }, layered.blocks[0].encoding.rabitq.centroid);
+        try std.testing.expect(!layered.blocks[1].owned);
+        try std.testing.expect(postingBitIsSet(layered.blocks[1].shadowed_posting_bits, 1));
+        try std.testing.expect(!postingBitIsSet(layered.blocks[1].shadowed_posting_bits, 2));
+        try std.testing.expectEqual(parent_codes, layered.blocks[1].encoding.rabitq.codes.data.ptr);
+    }
+};
+
+test "quantized native routing retains delta masks and parent leases under allocation failure" {
+    for ([_]bool{ false, true }) |centered| {
+        try QuantizedRoutingTest.run(std.testing.allocator, centered);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, QuantizedRoutingTest.run, .{centered});
+    }
+}
+
+test "quantized native routing cancellation leaves borrowed data unchanged" {
+    const alloc = std.testing.allocator;
+    const Quantizer = @import("antfly_vector").quantizer.RaBitQuantizer;
+    var index = .{
+        .alloc = alloc,
+        .config = types.HBCConfig{ .dims = 3 },
+        .quantizer = try Quantizer.init(alloc, 3, 42, .l2_squared),
+    };
+    defer index.quantizer.deinit();
+    var block: FlatCentroidBlock = .{
+        .posting_ids = &.{1},
+        .covering_radii = &.{0},
+        .encoding = .{ .exact = .{ .vectors = &.{ 1, 0, 0 }, .measures = &.{1} } },
+        .owned = false,
+    };
+    var directory: FlatCentroidDirectory = .{ .blocks = @as(*[1]FlatCentroidBlock, &block)[0..] };
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, quantizeExactFlatCentroidBlocks(&index, &directory, search_types.CancellationToken.fromAtomic(&cancelled)));
+    try std.testing.expect(!block.owned);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, block.encoding.exact.vectors);
 }
 
 pub fn clearFlatCentroidDirectory(self: anytype) void {
@@ -1397,13 +1633,13 @@ fn acquireFlatCentroidDirectory(
         const built = try self.alloc.create(FlatCentroidDirectory);
         errdefer self.alloc.destroy(built);
         if (expected_snapshot != null) {
-            built.* = try loadOrBuildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
+            built.* = try loadOrBuildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
         } else if (comptime @hasDecl(Index, "beginRuntimeSearchTxn")) {
             var build_txn = try self.beginRuntimeSearchTxn();
             defer build_txn.abort();
-            built.* = try loadOrBuildFlatCentroidDirectory(self, &build_txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
+            built.* = try loadOrBuildFlatCentroidDirectory(self, &build_txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
         } else {
-            built.* = try loadOrBuildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
+            built.* = try loadOrBuildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
         }
         errdefer built.deinit(self.alloc);
         if (comptime @hasDecl(Index, "accountFlatCentroidDirectory")) {
@@ -1527,6 +1763,11 @@ pub fn selectFlatPostingsAlloc(
     try scratch.ensureFlatProbeCapacity(self.alloc, selection_limit, needs_merge);
     const selected = scratch.flat_probes[0..selection_limit];
     var selected_count: usize = 0;
+    // Retain only an O(1) proof summary for every rejected/evicted probe.
+    // This certifies the omitted frontier without allocating all postings.
+    var omitted_lower_bound = std.math.inf(f32);
+    var omitted_resolved = directory.complete();
+    profile.traversal_incomplete_routing_directory += @intFromBool(!omitted_resolved);
     const query_measure: f32 = switch (self.config.metric) {
         .l2_squared => vec.dot(query, query),
         .cosine => vec.norm(query),
@@ -1561,12 +1802,16 @@ pub fn selectFlatPostingsAlloc(
         for (block.posting_ids, 0..) |posting_id, i| {
             if ((i & 0xff) == 0) try checkCancellation(cancellation);
             if (postingBitIsSet(block.shadowed_posting_bits, posting_id)) continue;
-            const member_lower_bound = flatMemberLowerBound(
-                self.config.metric,
-                distances[i],
-                error_bounds[i],
-                block.covering_radii[i],
-            );
+            const angular_bounds = if (comptime @hasDecl(Index, "nativeAngularBoundsEnabled")) self.nativeAngularBoundsEnabled() else false;
+            const member_lower_bound = if (angular_bounds and self.config.metric == .cosine)
+                posting.cosineAngularLowerBound(distances[i] - error_bounds[i], block.covering_radii[i])
+            else
+                flatMemberLowerBound(
+                    self.config.metric,
+                    distances[i],
+                    error_bounds[i],
+                    block.covering_radii[i],
+                );
             const candidate: FlatCentroidProbe = .{
                 .posting_id = posting_id,
                 .distance = distances[i],
@@ -1574,16 +1819,19 @@ pub fn selectFlatPostingsAlloc(
                 .member_lower_bound = member_lower_bound orelse -std.math.inf(f32),
                 .bound_resolved = member_lower_bound != null,
             };
-            insertFlatProbe(selected, &selected_count, candidate);
+            profile.traversal_unresolved_posting_bounds += @intFromBool(member_lower_bound == null);
+            if (insertFlatProbe(selected, &selected_count, candidate)) |omitted| {
+                omitted_resolved = omitted_resolved and omitted.bound_resolved and std.math.isFinite(omitted.member_lower_bound);
+                if (omitted_resolved) omitted_lower_bound = @min(omitted_lower_bound, omitted.member_lower_bound);
+            }
         }
     }
 
     const probes = selected[0..selected_count];
     try sortFlatProbesCancellable(probes, scratch.flat_probe_merge, cancellation);
-    // A suffix bound proves stopping only when the selection contains the
-    // complete directory. A bounded top frontier deliberately leaves omitted
-    // postings unresolved, preserving approximate-search correctness.
-    if (selection_limit == posting_count) populateFlatProbeSuffixBounds(probes);
+    // The suffix includes all omitted probes as well as unvisited retained
+    // probes. One unresolved/dirty omitted radius disables the proof.
+    populateFlatProbeSuffixBoundsWithOmitted(probes, omitted_lower_bound, omitted_resolved);
     profile.approx_nodes_expanded += @intCast(directory.blocks.len);
     return .{ .probes = probes, .total_postings = posting_count };
 }

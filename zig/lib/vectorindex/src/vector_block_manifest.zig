@@ -14,17 +14,13 @@
 //! f32 base for every source batch while retaining atomic CURRENT publication.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
+pub const wal_extents = @import("vector_wal_extents.zig");
 
 const magic: [8]u8 = .{ 'A', 'F', 'V', 'B', 'M', 'A', 'N', 0 };
-const legacy_version: u16 = 1;
-const coverage_version: u16 = 2;
-const score_precision_version: u16 = 3;
-/// V4 permits an explicitly empty physical base with a non-zero logical shard
-/// count. Older readers reject the version instead of mistaking sparse deltas
-/// for a complete base during a rolling downgrade.
-const version: u16 = 4;
-const legacy_header_size: usize = 68;
+// All native vector formats in this PR are unreleased: write and read one layout.
+const version: u16 = 6;
 const header_size: usize = 72;
 const segment_size: usize = 40;
 const coverage_size: usize = 32;
@@ -37,11 +33,9 @@ pub const max_shards: u32 = 1024;
 /// the stable-tip base publication.
 pub const max_online_delta_generations: usize = 8;
 pub const max_bootstrap_delta_generations: usize = 24;
-/// Keep the format admission bound separate from checkpoint policy. This lets
-/// a newer binary tighten residency without making a previously published,
-/// valid 25--64-run bootstrap manifest unreadable during rolling upgrade or
-/// crash recovery.
-pub const max_supported_delta_generations: usize = 64;
+/// Keep format admission separate from checkpoint policy: append-only stores
+/// may retain many valid segments while individual checkpoint batches stay small.
+pub const max_supported_delta_generations: usize = 4096;
 pub const max_delta_generations: usize = max_supported_delta_generations;
 pub const max_segments: usize = @as(usize, max_shards) * (max_delta_generations + 1);
 pub const max_coverages: usize = 4096;
@@ -68,6 +62,7 @@ pub const Coverage = struct {
 };
 
 pub const ScorePrecision = enum(u32) {
+    artifact_reference = 4,
     /// Older manifests did not declare whether their blocks could certify an
     /// exact public score. Readers may inspect block encoding for migration,
     /// but must not infer exact readiness from this value.
@@ -90,6 +85,7 @@ pub const Manifest = struct {
     segments: []const Segment,
     coverages: []const Coverage = &.{},
     score_precision: ScorePrecision = .authoritative_float32,
+    sealed_wals: wal_extents.Set = .{},
 
     pub fn hasPhysicalBase(self: Manifest) bool {
         return self.segments.len >= @as(usize, @intCast(self.shard_count)) and
@@ -101,16 +97,13 @@ pub const Manifest = struct {
         try self.validate();
         const entries_len = std.math.mul(usize, self.segments.len, segment_size) catch return error.VectorBlockManifestTooLarge;
         const coverage_len = std.math.mul(usize, self.coverages.len, coverage_size) catch return error.VectorBlockManifestTooLarge;
-        const body_len = std.math.add(usize, entries_len, coverage_len) catch return error.VectorBlockManifestTooLarge;
+        const body_len = std.math.add(usize, entries_len, coverage_len + @as(usize, self.sealed_wals.count) * wal_extents.encoded_extent_size) catch return error.VectorBlockManifestTooLarge;
         const total_len = std.math.add(usize, header_size + footer_size, body_len) catch return error.VectorBlockManifestTooLarge;
         const out = try alloc.alloc(u8, total_len);
         errdefer alloc.free(out);
         @memcpy(out[0..8], &magic);
-        // Keep complete physical bases on V3 so mixed-version readers can
-        // continue across ordinary checkpoints. V4 is emitted only while its
-        // omitted-base semantic is actually required.
-        writeU16(out[8..10], if (self.hasPhysicalBase()) score_precision_version else version);
-        writeU16(out[10..12], 0);
+        writeU16(out[8..10], version);
+        writeU16(out[10..12], self.sealed_wals.count);
         writeU64(out[12..20], self.base_generation);
         writeU64(out[20..28], self.latest_generation);
         writeU64(out[28..36], self.wal_generation);
@@ -119,10 +112,13 @@ pub const Manifest = struct {
         writeU32(out[52..56], self.shard_count);
         writeU32(out[56..60], @intCast(self.segments.len));
         writeU32(out[60..64], @intCast(self.coverages.len));
-        if (self.score_precision == .unspecified) return error.InvalidVectorBlockManifest;
         writeU32(out[64..68], @intFromEnum(self.score_precision));
-        writeU32(out[68..72], std.hash.Crc32.hash(out[0..68]));
+        writeU32(out[68..72], Crc32.hash(out[0..68]));
         var pos = header_size;
+        for (self.sealed_wals.slice()) |extent| {
+            extent.encode(out[pos..][0..wal_extents.encoded_extent_size]);
+            pos += wal_extents.encoded_extent_size;
+        }
         for (self.segments) |segment| {
             writeU64(out[pos..][0..8], segment.generation);
             writeU64(out[pos + 8 ..][0..8], segment.covered_source_sequence);
@@ -140,12 +136,14 @@ pub const Manifest = struct {
             writeU64(out[pos + 24 ..][0..8], coverage.key_hash_sum);
             pos += coverage_size;
         }
-        writeU32(out[pos..][0..4], std.hash.Crc32.hash(out[0..pos]));
+        writeU32(out[pos..][0..4], Crc32.hash(out[0..pos]));
         @memcpy(out[pos + 4 ..][0..8], &magic);
         return out;
     }
 
     pub fn validate(self: Manifest) !void {
+        if (self.score_precision == .unspecified) return error.InvalidVectorBlockManifest;
+        try self.sealed_wals.validate(self.wal_generation, self.wal_committed_bytes);
         if (self.base_generation == 0 or self.latest_generation < self.base_generation or self.wal_generation == 0) return error.InvalidVectorBlockManifest;
         if (self.shard_count == 0 or self.shard_count > max_shards or !std.math.isPowerOfTwo(self.shard_count)) return error.InvalidVectorBlockManifest;
         if (self.segments.len > max_segments) return error.InvalidVectorBlockManifest;
@@ -210,41 +208,33 @@ pub const Decoded = struct {
 };
 
 pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !Decoded {
-    if (bytes.len < legacy_header_size + footer_size or !std.mem.eql(u8, bytes[0..8], &magic)) return error.InvalidVectorBlockManifest;
-    const decoded_version = readU16(bytes[8..10]);
-    if (decoded_version != legacy_version and decoded_version != coverage_version and
-        decoded_version != score_precision_version and decoded_version != version)
-        return error.UnsupportedVectorBlockManifestVersion;
-    if (readU16(bytes[10..12]) != 0) return error.UnsupportedVectorBlockManifestFlags;
-    const decoded_header_size = if (decoded_version == legacy_version) legacy_header_size else header_size;
-    if (bytes.len < decoded_header_size + footer_size) return error.InvalidVectorBlockManifest;
-    if (decoded_version == legacy_version) {
-        if (readU32(bytes[60..64]) != 0) return error.UnsupportedVectorBlockManifestFlags;
-        if (readU32(bytes[64..68]) != std.hash.Crc32.hash(bytes[0..64])) return error.VectorBlockManifestChecksumMismatch;
-    } else {
-        if (decoded_version == coverage_version and readU32(bytes[64..68]) != 0)
-            return error.UnsupportedVectorBlockManifestFlags;
-        if (readU32(bytes[68..72]) != std.hash.Crc32.hash(bytes[0..68])) return error.VectorBlockManifestChecksumMismatch;
-    }
+    if (bytes.len < header_size + footer_size or !std.mem.eql(u8, bytes[0..8], &magic)) return error.InvalidVectorBlockManifest;
+    if (readU16(bytes[8..10]) != version) return error.UnsupportedVectorBlockManifestVersion;
+    const extent_count = readU16(bytes[10..12]);
+    if (extent_count > wal_extents.max_extents) return error.InvalidVectorWalExtent;
+    if (readU32(bytes[68..72]) != Crc32.hash(bytes[0..68])) return error.VectorBlockManifestChecksumMismatch;
     const segment_count: usize = @intCast(readU32(bytes[56..60]));
     const shard_count = readU32(bytes[52..56]);
-    if (decoded_version < version and segment_count < shard_count)
-        return error.InvalidVectorBlockManifest;
-    const coverage_count: usize = if (decoded_version == legacy_version) 0 else @intCast(readU32(bytes[60..64]));
+    const coverage_count: usize = @intCast(readU32(bytes[60..64]));
     if (segment_count > max_segments) return error.VectorBlockManifestTooLarge;
     if (coverage_count > max_coverages) return error.VectorBlockManifestTooLarge;
     const entries_len = std.math.mul(usize, segment_count, segment_size) catch return error.InvalidVectorBlockManifest;
     const coverage_len = std.math.mul(usize, coverage_count, coverage_size) catch return error.InvalidVectorBlockManifest;
-    const body_len = std.math.add(usize, entries_len, coverage_len) catch return error.InvalidVectorBlockManifest;
-    const expected_len = std.math.add(usize, decoded_header_size + footer_size, body_len) catch return error.InvalidVectorBlockManifest;
+    const body_len = std.math.add(usize, entries_len, coverage_len + @as(usize, extent_count) * wal_extents.encoded_extent_size) catch return error.InvalidVectorBlockManifest;
+    const expected_len = std.math.add(usize, header_size + footer_size, body_len) catch return error.InvalidVectorBlockManifest;
     if (bytes.len != expected_len) return error.InvalidVectorBlockManifest;
     const footer = bytes[bytes.len - footer_size ..];
     if (!std.mem.eql(u8, footer[4..12], &magic)) return error.InvalidVectorBlockManifest;
-    if (readU32(footer[0..4]) != std.hash.Crc32.hash(bytes[0 .. bytes.len - footer_size])) return error.VectorBlockManifestChecksumMismatch;
+    if (readU32(footer[0..4]) != Crc32.hash(bytes[0 .. bytes.len - footer_size])) return error.VectorBlockManifestChecksumMismatch;
 
     const segments = try alloc.alloc(Segment, segment_count);
     errdefer alloc.free(segments);
-    var pos = decoded_header_size;
+    var pos = header_size;
+    var sealed_wals: wal_extents.Set = .{ .count = @intCast(extent_count) };
+    for (sealed_wals.items[0..extent_count]) |*extent| {
+        extent.* = try wal_extents.Extent.decode(bytes[pos..][0..wal_extents.encoded_extent_size]);
+        pos += wal_extents.encoded_extent_size;
+    }
     for (segments) |*segment| {
         if (readU32(bytes[pos + 20 ..][0..4]) != 0 or readU32(bytes[pos + 36 ..][0..4]) != 0) return error.UnsupportedVectorBlockManifestFlags;
         segment.* = .{
@@ -276,14 +266,35 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !Decoded {
         .shard_count = shard_count,
         .segments = segments,
         .coverages = coverages,
-        .score_precision = if (decoded_version >= score_precision_version)
-            std.enums.fromInt(ScorePrecision, readU32(bytes[64..68])) orelse
-                return error.UnsupportedVectorBlockScorePrecision
-        else
-            .unspecified,
+        .sealed_wals = sealed_wals,
+        .score_precision = std.enums.fromInt(ScorePrecision, readU32(bytes[64..68])) orelse
+            return error.UnsupportedVectorBlockScorePrecision,
     };
     try manifest.validate();
     return .{ .manifest = manifest, .owned_segments = segments, .owned_coverages = coverages };
+}
+
+test "vector block manifest sealed WAL receipts preserve an omitted base floor" {
+    const alloc = std.testing.allocator;
+    var manifest: Manifest = .{
+        .base_generation = 1,
+        .latest_generation = 1,
+        .wal_generation = 3,
+        .wal_committed_bytes = 100,
+        .covered_source_sequence = 0,
+        .shard_count = 128,
+        .segments = &.{},
+    };
+    manifest.sealed_wals.count = 1;
+    manifest.sealed_wals.items[0] = .{ .generation = 2, .committed_bytes = 80, .covered_source_sequence = 5, .last_batch = 0, .min_mutation_sequence = 0 };
+    const encoded = try manifest.encodeAlloc(alloc);
+    defer alloc.free(encoded);
+    try std.testing.expectEqual(version, readU16(encoded[8..10]));
+    var decoded = try decodeAlloc(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualDeep(manifest, decoded.manifest);
+    encoded[header_size] ^= 1;
+    try std.testing.expectError(error.VectorBlockManifestChecksumMismatch, decodeAlloc(alloc, encoded));
 }
 
 fn writeU16(out: []u8, value: u16) void {
@@ -331,7 +342,7 @@ test "vector block manifest round trips a sparse delta chain" {
     };
     const encoded = try source.encodeAlloc(alloc);
     defer alloc.free(encoded);
-    try std.testing.expectEqual(score_precision_version, readU16(encoded[8..10]));
+    try std.testing.expectEqual(version, readU16(encoded[8..10]));
     var decoded = try decodeAlloc(alloc, encoded);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), decoded.manifest.latest_generation);
@@ -357,7 +368,7 @@ test "vector block manifest requires every base shard" {
     try std.testing.expectError(error.InvalidVectorBlockManifest, invalid.validate());
 }
 
-test "vector block manifest v4 represents empty logical base without shard files" {
+test "vector block manifest represents empty logical base without shard files" {
     const alloc = std.testing.allocator;
     const coverages = [_]Coverage{.{
         .scope_hash = 17,
@@ -399,37 +410,13 @@ test "vector block manifest v4 represents empty logical base without shard files
     try sparse.validate();
 }
 
-test "vector block manifest keeps version one generations readable" {
+test "vector block manifest rejects superseded and future formats" {
     const alloc = std.testing.allocator;
-    const total_len = legacy_header_size + segment_size + footer_size;
-    const encoded = try alloc.alloc(u8, total_len);
+    const manifest: Manifest = .{ .base_generation = 1, .latest_generation = 1, .wal_generation = 2, .wal_committed_bytes = 0, .covered_source_sequence = 0, .shard_count = 1, .segments = &.{}, .score_precision = .authoritative_float32 };
+    const encoded = try manifest.encodeAlloc(alloc);
     defer alloc.free(encoded);
-    @memcpy(encoded[0..8], &magic);
-    writeU16(encoded[8..10], legacy_version);
-    writeU16(encoded[10..12], 0);
-    writeU64(encoded[12..20], 1);
-    writeU64(encoded[20..28], 1);
-    writeU64(encoded[28..36], 2);
-    writeU64(encoded[36..44], 0);
-    writeU64(encoded[44..52], 9);
-    writeU32(encoded[52..56], 1);
-    writeU32(encoded[56..60], 1);
-    writeU32(encoded[60..64], 0);
-    writeU32(encoded[64..68], std.hash.Crc32.hash(encoded[0..64]));
-    var pos: usize = legacy_header_size;
-    writeU64(encoded[pos..][0..8], 1);
-    writeU64(encoded[pos + 8 ..][0..8], 9);
-    writeU32(encoded[pos + 16 ..][0..4], 0);
-    writeU32(encoded[pos + 20 ..][0..4], 0);
-    writeU64(encoded[pos + 24 ..][0..8], 128);
-    writeU32(encoded[pos + 32 ..][0..4], 77);
-    writeU32(encoded[pos + 36 ..][0..4], 0);
-    pos += segment_size;
-    writeU32(encoded[pos..][0..4], std.hash.Crc32.hash(encoded[0..pos]));
-    @memcpy(encoded[pos + 4 ..][0..8], &magic);
-
-    var decoded = try decodeAlloc(alloc, encoded);
-    defer decoded.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), decoded.manifest.segments.len);
-    try std.testing.expectEqual(@as(usize, 0), decoded.manifest.coverages.len);
+    for ([_]u16{ 0, 1, 2, 3, 4, 5, version + 1 }) |unsupported| {
+        writeU16(encoded[8..10], unsupported);
+        try std.testing.expectError(error.UnsupportedVectorBlockManifestVersion, decodeAlloc(alloc, encoded));
+    }
 }

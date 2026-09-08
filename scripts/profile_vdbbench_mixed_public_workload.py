@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -31,6 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-workers", type=int, default=10)
     parser.add_argument("--write-workers", type=int, default=4)
     parser.add_argument("--write-batch", type=int, default=100)
+    parser.add_argument(
+        "--write-rows-per-second",
+        type=float,
+        default=float(os.environ.get("VDBBENCH_MIXED_WRITE_ROWS_PER_SECOND", "0")),
+        help="Node-total offered rate; zero retains saturation mode",
+    )
     parser.add_argument("--update-vectors", type=int, default=2000)
     parser.add_argument("--query-vectors", type=int, default=1000)
     parser.add_argument("--limit", type=int, default=100)
@@ -66,21 +74,30 @@ def load_inputs(
     neighbors = pq.ParquetFile(args.dataset / "neighbors.parquet").read(
         columns=["neighbors_id"]
     )["neighbors_id"]
-    train = pq.ParquetFile(args.dataset / "shuffle_train.parquet").read(
-        columns=["id", "emb"]
-    )
+    train = pq.ParquetFile(args.dataset / "shuffle_train.parquet")
     query_count = min(args.query_vectors, len(tests), len(neighbors))
-    update_count = min(args.update_vectors, len(train))
+    update_count = min(args.update_vectors, train.metadata.num_rows)
     if query_count <= 0 or update_count < args.write_batch:
         raise ValueError("dataset does not contain enough query/update vectors")
     query_vectors = [tests[i].as_py() for i in range(query_count)]
     query_neighbors = [neighbors[i].as_py()[: args.limit] for i in range(query_count)]
-    train_ids = train["id"]
-    train_vectors = train["emb"]
-    updates = [
-        (int(train_ids[i].as_py()), train_vectors[i].as_py())
-        for i in range(update_count)
-    ]
+    # Same deterministic prefix, without materializing 1M embeddings merely to
+    # update 2K rows. Generator heap/page pressure must not perturb server RSS.
+    updates = []
+    for batch in train.iter_batches(
+        batch_size=min(1024, update_count), columns=["id", "emb"]
+    ):
+        needed = update_count - len(updates)
+        updates.extend(
+            (int(doc_id), vector)
+            for doc_id, vector in zip(
+                batch.column(0).to_pylist()[:needed],
+                batch.column(1).to_pylist()[:needed],
+                strict=True,
+            )
+        )
+        if len(updates) == update_count:
+            break
     return query_vectors, query_neighbors, updates
 
 
@@ -98,6 +115,8 @@ def index_ready(payload: dict[str, Any]) -> bool:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if not math.isfinite(args.write_rows_per_second) or args.write_rows_per_second < 0:
+        raise ValueError("offered write rate must be finite and non-negative")
     if args.seconds <= 0 or args.query_workers <= 0 or args.write_workers <= 0:
         raise ValueError("seconds and worker counts must be positive")
     if args.write_batch <= 0 or args.update_vectors <= 0 or args.query_vectors <= 0:
@@ -108,7 +127,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     query_url = f"{base}/query"
     batch_url = f"{base}/batch"
     index_url = f"{base}/indexes/{args.index}"
-    barrier = threading.Barrier(args.query_workers + args.write_workers + 1)
+    pacing_start = [0.0]
+
+    def start_clock():
+        pacing_start[0] = time.perf_counter()
+
+    barrier = threading.Barrier(
+        args.query_workers + args.write_workers + 1, action=start_clock
+    )
     stop = threading.Event()
     errors: list[str] = []
     query_latencies: list[float] = []
@@ -116,6 +142,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     hbc_latencies: list[float] = []
     recalls: list[float] = []
     write_latencies: list[float] = []
+    write_schedule_delays: list[float] = []
+    write_scheduled_latencies: list[float] = []
     written_rows = 0
     write_lock = threading.Lock()
     update_cursor = itertools.count()
@@ -174,6 +202,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 barrier.wait(args.timeout)
                 while not stop.is_set():
                     batch_number = next(update_cursor)
+                    if args.write_rows_per_second:
+                        due = (
+                            pacing_start[0]
+                            + batch_number
+                            * args.write_batch
+                            / args.write_rows_per_second
+                        )
+                        if stop.wait(max(0.0, due - time.perf_counter())):
+                            break
                     start = (batch_number * args.write_batch) % len(updates)
                     selected = [
                         updates[(start + i) % len(updates)]
@@ -196,6 +233,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     elapsed_ms = (time.perf_counter() - started) * 1000
                     response.raise_for_status()
                     write_latencies.append(elapsed_ms)
+                    if args.write_rows_per_second:
+                        delay = max(0.0, started - due) * 1000
+                        write_schedule_delays.append(delay)
+                        write_scheduled_latencies.append(delay + elapsed_ms)
                     with write_lock:
                         written_rows += len(selected)
         except (httpx.HTTPError, threading.BrokenBarrierError) as exc:
@@ -251,12 +292,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "query_workers": args.query_workers,
         "write_workers": args.write_workers,
         "write_batch": args.write_batch,
+        "offered_write_rows_per_second": args.write_rows_per_second or None,
+        "write_schedule_delay": (
+            latency_summary(write_schedule_delays) if write_schedule_delays else None
+        ),
+        "write_scheduled_latency": (
+            latency_summary(write_scheduled_latencies)
+            if write_scheduled_latencies
+            else None
+        ),
         "query_count": len(query_latencies),
         "query_qps": len(query_latencies) / elapsed,
         "query_latency": latency_summary(query_latencies) if query_latencies else None,
-        "server_latency": latency_summary(server_latencies)
-        if server_latencies
-        else None,
+        "server_latency": (
+            latency_summary(server_latencies) if server_latencies else None
+        ),
         "hbc_latency": latency_summary(hbc_latencies) if hbc_latencies else None,
         "recall": sum(recalls) / len(recalls) if recalls else None,
         "write_batches": len(write_latencies),

@@ -2840,6 +2840,7 @@ pub const MetadataHttpServer = struct {
         self.tableOperations().create(ctx.allocator, request_context, table_name, request) catch |err| switch (err) {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => return ctx.status(400).text("vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
             error.CreateTableRequestTooLarge => {

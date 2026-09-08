@@ -2465,14 +2465,12 @@ fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
         for (cursors[0..initialized_cursors]) |*cursor| cursor.deinit();
         allocator.free(cursors);
     }
-    const cold_reader_capacity = backend.storage.?.coldSequentialReaderCapacity();
     for (window_runs, 0..) |run, i| {
         const path = run.path orelse return error.RunStateUnavailable;
         cursors[i] = try PersistedRunCursor.init(
             allocator,
             backend.storage.?,
             path,
-            i < cold_reader_capacity,
         );
         initialized_cursors += 1;
         if (cursors[i].index.entry_count != run.entry_count) return error.InvalidTableFile;
@@ -2797,14 +2795,14 @@ const PersistedRunCursor = struct {
         allocator: std.mem.Allocator,
         storage: @import("storage_io.zig").Storage,
         path: []const u8,
-        cold: bool,
     ) !PersistedRunCursor {
         var index = try repository_mod.loadRunSequentialTableIndexAllocWithStorage(storage, allocator, path);
         errdefer index.deinit(allocator);
-        const reader = if (cold)
-            try storage.beginColdSequentialRead(allocator, path)
-        else
-            try storage.beginSequentialRead(allocator, path);
+        // Run snapshots pin immutable paths through output publication. Keep
+        // input descriptors window-scoped: per-compaction capacity estimates
+        // cannot prevent two jobs from collectively exhausting the node pool
+        // while both still need to open another input or output.
+        const reader = try storage.beginWindowedColdRead(allocator, path);
         return .{
             .allocator = allocator,
             .reader = reader,

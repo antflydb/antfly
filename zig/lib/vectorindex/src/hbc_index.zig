@@ -545,6 +545,47 @@ fn loadNativeQuantizedReadView(
     };
 }
 
+fn loadNativeLeafScanForProbe(self: anytype, txn: anytype, probe: search_types.FlatCentroidProbe) !?hbc_runtime.NativeLeafScanView {
+    if (comptime @hasDecl(childType(@TypeOf(self)), "loadNativeLeafScanViewFromHandle")) {
+        if (probe.native_scan_resolved) {
+            const handle = probe.native_scan_handle orelse return null;
+            return self.loadNativeLeafScanViewFromHandle(txn, probe.posting_id, handle) catch |err| {
+                if (err == error.Corrupted) return null;
+                return err;
+            };
+        }
+    }
+    return try loadNativeLeafScanReadView(self, txn, probe.posting_id);
+}
+
+fn admitAndLoadTreeLeafScan(
+    self: anytype,
+    txn: anytype,
+    admission: anytype,
+    posting_id: u64,
+    req: search_types.SearchRequest,
+    profile: *search_types.SearchProfile,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+) !?hbc_runtime.NativeLeafScanView {
+    var probe = search_types.FlatCentroidProbe{ .posting_id = posting_id, .distance = 0, .error_bound = 0 };
+    if (comptime @hasDecl(childType(@TypeOf(self)), "admitTreeLeafScan")) {
+        const start = now_fn_u64();
+        try self.admitTreeLeafScan(admission, txn, &probe, req);
+        profile.scan_admission_wait_ns += elapsed_fn_u64(start);
+        self.noteSearchAdmissionProfile(admission, profile);
+    }
+    return loadNativeLeafScanForProbe(self, txn, probe);
+}
+
+fn finishCandidateScan(self: anytype, admission: anytype, req: search_types.SearchRequest, profile: *search_types.SearchProfile, now: fn () u64, elapsed: fn (u64) u64) !void {
+    if (comptime @hasDecl(childType(@TypeOf(self)), "finishCandidateScan")) {
+        const start = now();
+        try self.finishCandidateScan(admission, req);
+        profile.rerank_admission_wait_ns += elapsed(start);
+    }
+}
+
 fn loadNativeLeafScanReadView(
     self: anytype,
     txn: anytype,
@@ -2526,14 +2567,19 @@ fn searchProfiledRequestAttempt(
             .profile = profile,
         };
     }
-    // Legacy/tree admission obtains its conservative scan permit here before
-    // retaining a transaction or request workspace. Native flat admission
-    // instead pins one immutable SearchView now and defers its scan permit
-    // until routing has identified the exact posting set.
+    // Legacy admission obtains a conservative permit before retaining a txn.
+    // Native routing pins one immutable SearchView first: flat routing admits
+    // its selected frontier once, while tree routing admits cumulative selected
+    // leaf work progressively without changing score-dependent traversal.
     try search_types.checkCancelled(req);
+    const admission_start = now_fn_u64();
     var search_admission = if (comptime @hasDecl(Index, "acquireSearchAdmission"))
         try self.acquireSearchAdmission(published_snapshot.active_count, published_snapshot.node_count, req)
     else {};
+    profile.admission_wait_ns += elapsed_fn_u64(admission_start);
+    if (comptime @hasDecl(Index, "noteSearchAdmissionProfile")) {
+        self.noteSearchAdmissionProfile(&search_admission, &profile);
+    }
     defer if (comptime @hasDecl(Index, "releaseSearchAdmission")) {
         self.releaseSearchAdmission(&search_admission);
     };
@@ -2592,8 +2638,8 @@ fn searchProfiledRequestAttempt(
             published_snapshot.active_count,
         );
     }
-    // The admission lease either already owns bandwidth (legacy/tree) or owns
-    // the native generation whose exact flat-route cost will be admitted below.
+    // The admission lease either owns legacy bandwidth or the native generation
+    // whose selected scan work will be admitted below.
     try search_types.checkCancelled(req);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
@@ -2632,7 +2678,9 @@ fn searchProfiledRequestAttempt(
     var scratch_handle = try self.acquireSearchScratch();
     profile.scratch_acquire_ns += elapsed_fn_u64(scratch_start);
     const scratch = &scratch_handle.scratch;
+    scratch.global_subgroups.reset();
     defer {
+        scratch.global_subgroups.reset();
         if (exhaustive_coverage) scratch.clearExhaustiveWorkspace(self.alloc);
         if (comptime @hasDecl(Index, "refreshSearchScratchAccounting")) {
             self.refreshSearchScratchAccounting(&scratch_handle);
@@ -2689,7 +2737,8 @@ fn searchProfiledRequestAttempt(
     // frontier is known, the adapter sums its authenticated per-posting costs
     // and obtains scan bandwidth before any candidate payload is touched.
     var prepared_flat_selection: ?spfresh_index.FlatCentroidSelection = null;
-    if (spfresh_index.usesFlatCentroidDirectory(self)) {
+    const use_flat_routing = spfresh_index.usesFlatCentroidDirectoryAtCount(&self.config, published_snapshot.active_count);
+    if (use_flat_routing) {
         const search_width_usize: usize = @intCast(search_width);
         const missing_posting_slack = @max(@as(usize, 16), search_width_usize / 100);
         prepared_flat_selection = try spfresh_index.selectFlatPostingsAlloc(
@@ -2710,12 +2759,17 @@ fn searchProfiledRequestAttempt(
             elapsed_fn_u64,
         );
         if (comptime @hasDecl(Index, "finalizeFlatSearchAdmission")) {
+            const scan_admission_start = now_fn_u64();
             try self.finalizeFlatSearchAdmission(
                 &search_admission,
                 &txn,
                 prepared_flat_selection.?.probes,
                 req,
             );
+            profile.scan_admission_wait_ns += elapsed_fn_u64(scan_admission_start);
+            if (comptime @hasDecl(Index, "noteSearchAdmissionProfile")) {
+                self.noteSearchAdmissionProfile(&search_admission, &profile);
+            }
         }
     }
 
@@ -2726,12 +2780,13 @@ fn searchProfiledRequestAttempt(
     }
     var filter_state = try search_types.RequestFilterState.init(self.alloc, req);
     defer filter_state.deinit(self.alloc);
+    const global_plan_prepared = try prepareGlobalSubgroupPlan(self, &txn, &scratch_handle, req, &filter_state, coverage_policy, @intCast(@min(@as(u64, search_width) + 1, published_snapshot.node_count)));
 
     var approx_results = try search_results.ApproxSearchResults.initCapacity(self.alloc, req.k, candidate_limit, candidate_limit);
     errdefer approx_results.deinit();
     profile.setup_ns += elapsed_fn_u64(setup_start);
 
-    if (spfresh_index.usesFlatCentroidDirectory(self)) {
+    if (use_flat_routing) {
         const configured_probe_count = if (self.config.flat_centroid_probe_count != 0)
             self.config.flat_centroid_probe_count
         else
@@ -2782,12 +2837,11 @@ fn searchProfiledRequestAttempt(
                 profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
                 break;
             }
-            if (i == next_wave_end and next_wave_end < probe_count) {
-                profile.traversal_waves += 1;
-                profile.traversal_max_wave_leaves = @max(
-                    profile.traversal_max_wave_leaves,
-                    @as(u64, @intCast(next_wave_end - previous_wave_end)),
-                );
+            const wave_boundary = i == next_wave_end and next_wave_end < probe_count;
+            // Default initial effort can be the entire wave. Evaluate proof
+            // bounds within it too; waiting until the next wave otherwise
+            // reaches the ANN effort limit without checking a single bound.
+            if (!exhaustive_coverage and i != 0 and (wave_boundary or i % 256 == 0)) {
                 // The complete immutable directory carries a suffix minimum
                 // over conservative posting-ball bounds. Compare it with the
                 // kth-smallest upper endpoint already retained by the
@@ -2795,9 +2849,9 @@ fn searchProfiledRequestAttempt(
                 // larger, no unseen vector can enter the public top-k. Dirty
                 // or unresolved radii leave suffix_bounds_resolved false and
                 // retain the established effort/fill behavior.
-                if (!exhaustive_coverage and probe.suffix_bounds_resolved) {
+                if (!exhaustive_coverage and !global_plan_prepared and profile.subgroup_vectors_skipped == 0 and probe.suffix_bounds_resolved) {
                     profile.traversal_bound_resolutions += 1;
-                    try scratch.ensureVectorFetchCapacity(self.alloc, approx_results.items.items.len);
+                    try scratch.ensureScoreCapacity(self.alloc, approx_results.items.items.len);
                     if (approxTopKUpperBound(
                         approx_results.items.items,
                         req.k,
@@ -2810,13 +2864,23 @@ fn searchProfiledRequestAttempt(
                             profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
                             break;
                         }
+                        profile.traversal_bound_overlap += 1;
                     } else {
                         profile.traversal_bound_fallbacks += 1;
+                        profile.traversal_bound_incomplete_topk += 1;
                     }
                 } else if (!exhaustive_coverage) {
                     profile.traversal_bound_resolutions += 1;
                     profile.traversal_bound_fallbacks += 1;
+                    profile.traversal_bound_unresolved_frontier += 1;
                 }
+            }
+            if (wave_boundary) {
+                profile.traversal_waves += 1;
+                profile.traversal_max_wave_leaves = @max(
+                    profile.traversal_max_wave_leaves,
+                    @as(u64, @intCast(next_wave_end - previous_wave_end)),
+                );
                 // A full candidate heap is not evidence that the selected
                 // leaves contain the nearest neighbors. It only bounds the
                 // retained shell. Continue honoring the caller's leaf-effort
@@ -2837,7 +2901,10 @@ fn searchProfiledRequestAttempt(
             }
             if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
-            if (try loadNativeLeafScanReadView(self, &txn, probe.posting_id)) |native_scan| {
+            const native_lookup_start = now_fn_u64();
+            const native_leaf = try loadNativeLeafScanForProbe(self, &txn, probe);
+            profile.native_leaf_lookup_ns += elapsed_fn_u64(native_lookup_start);
+            if (native_leaf) |native_scan| {
                 profile.native_leaf_scan_hits += 1;
                 try coverage_tracker.observe(self, &txn, scratch, probe.posting_id, native_scan.member_ids);
                 try @This().scoreLeafMemberIds(
@@ -2849,6 +2916,7 @@ fn searchProfiledRequestAttempt(
                     native_scan.member_ids,
                     &native_scan.quantized,
                     native_scan.projections,
+                    native_scan.subgroup_plan,
                     transformed_query,
                     transformed_query_measure,
                     req.query,
@@ -2888,7 +2956,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             leaf_handle.deinit(self.alloc);
             leaf_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             profile.leaves_explored += 1;
             flat_leaves_scored += 1;
         }
@@ -2910,17 +2978,19 @@ fn searchProfiledRequestAttempt(
 
         if (flat_leaves_scored > 0) {
             try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
+            try drainGlobalSubgroups(self, &txn, scratch, req, transformed_query, &approx_results, &profile, true, now_fn_u64, elapsed_fn_u64);
+            try finishCandidateScan(self, &search_admission, req, &profile, now_fn_u64, elapsed_fn_u64);
             if (should_rerank) {
                 var reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
-                reranked.candidate_coverage = if (profile.traversal_frontier_remaining == 0) .exhausted else .more;
+                reranked.candidate_coverage = if (profile.traversal_frontier_remaining == 0 and profile.subgroup_vectors_skipped == 0) .exhausted else .more;
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
             }
 
             var results = try approx_results.toFinalResults();
             approx_results.deinit();
-            results.candidate_coverage = if (profile.traversal_frontier_remaining == 0) .exhausted else .more;
+            results.candidate_coverage = if (profile.traversal_frontier_remaining == 0 and profile.subgroup_vectors_skipped == 0) .exhausted else .more;
             results.sort();
             if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
             profile.total_ns = elapsed_fn_u64(total_start);
@@ -2961,7 +3031,7 @@ fn searchProfiledRequestAttempt(
     {
         const root = root_handle.ptr();
         if (root.is_leaf) {
-            if (try loadNativeLeafScanReadView(self, &txn, root.id)) |native_scan| {
+            if (try admitAndLoadTreeLeafScan(self, &txn, &search_admission, root.id, req, &profile, now_fn_u64, elapsed_fn_u64)) |native_scan| {
                 profile.native_leaf_scan_hits += 1;
                 try coverage_tracker.observe(self, &txn, scratch, root.id, native_scan.member_ids);
                 const leaf_id = root.id;
@@ -2976,6 +3046,7 @@ fn searchProfiledRequestAttempt(
                     native_scan.member_ids,
                     &native_scan.quantized,
                     native_scan.projections,
+                    native_scan.subgroup_plan,
                     transformed_query,
                     transformed_query_measure,
                     req.query,
@@ -2990,14 +3061,18 @@ fn searchProfiledRequestAttempt(
                     elapsed_fn_u64,
                 );
                 try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
+                try drainGlobalSubgroups(self, &txn, scratch, req, transformed_query, &approx_results, &profile, true, now_fn_u64, elapsed_fn_u64);
+                try finishCandidateScan(self, &search_admission, req, &profile, now_fn_u64, elapsed_fn_u64);
                 if (should_rerank) {
-                    const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+                    var reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                     approx_results.deinit();
+                    if (profile.subgroup_vectors_skipped != 0) reranked.candidate_coverage = .more;
                     profile.total_ns = elapsed_fn_u64(total_start);
                     return .{ .results = reranked, .profile = profile };
                 }
                 var results = try approx_results.toFinalResults();
                 approx_results.deinit();
+                if (profile.subgroup_vectors_skipped != 0) results.candidate_coverage = .more;
                 results.sort();
                 if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
                 profile.total_ns = elapsed_fn_u64(total_start);
@@ -3012,7 +3087,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = root_posting.hasFreshStoredPayload();
             root_handle.deinit(self.alloc);
             root_handle_active = false;
-            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
+            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
                 error.NotFound => {
                     if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     approx_results.deinit();
@@ -3027,6 +3102,8 @@ fn searchProfiledRequestAttempt(
                 else => |unhandled| return @as(anyerror!search_types.ProfiledSearchResults, unhandled),
             };
             try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
+            try drainGlobalSubgroups(self, &txn, scratch, req, transformed_query, &approx_results, &profile, true, now_fn_u64, elapsed_fn_u64);
+            try finishCandidateScan(self, &search_admission, req, &profile, now_fn_u64, elapsed_fn_u64);
             if (should_rerank) {
                 var reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
@@ -3110,14 +3187,20 @@ fn searchProfiledRequestAttempt(
             // foreground appends update a posting without rewriting its whole
             // ancestor chain. Resolve/expand those internal nodes first, then
             // order the resulting leaf frontier by durable posting radii.
-            if (node.is_leaf and self.config.metric == .l2_squared) {
-                if (subtreeLowerBound(
+            const angular_bounds = if (comptime @hasDecl(Index, "nativeAngularBoundsEnabled")) self.nativeAngularBoundsEnabled() else false;
+            if (node.is_leaf and (self.config.metric == .l2_squared or (angular_bounds and self.config.metric == .cosine))) {
+                const chord_lower = subtreeLowerBound(
                     self.config.metric,
                     transformed_query_measure,
                     candidate,
                     node.centroid,
                     node.covering_radius,
-                )) |lower_bound| {
+                );
+                const lower = if (chord_lower != null and angular_bounds and self.config.metric == .cosine)
+                    posting.cosineAngularLowerBound(candidate.distance - candidate.error_bound, node.covering_radius)
+                else
+                    chord_lower;
+                if (lower) |lower_bound| {
                     candidate.lower_bound = lower_bound;
                     candidate.bound_resolved = true;
                     candidate.is_leaf = node.is_leaf;
@@ -3130,7 +3213,7 @@ fn searchProfiledRequestAttempt(
                 candidate.bound_resolved = true;
             }
         }
-        const allow_dynamic_pruning = !exhaustive_coverage and self.config.metric != .inner_product;
+        const allow_dynamic_pruning = !exhaustive_coverage and !global_plan_prepared and self.config.metric != .inner_product;
         if (allow_dynamic_pruning and !node.is_leaf and search_mod.shouldBreakOnInternalCandidate(candidate, &approx_results)) {
             node_handle.deinit(self.alloc);
             node_handle_active = false;
@@ -3149,7 +3232,7 @@ fn searchProfiledRequestAttempt(
                 node_handle_active = false;
                 continue;
             }
-            if (try loadNativeLeafScanReadView(self, &txn, node.id)) |native_scan| {
+            if (try admitAndLoadTreeLeafScan(self, &txn, &search_admission, node.id, req, &profile, now_fn_u64, elapsed_fn_u64)) |native_scan| {
                 profile.native_leaf_scan_hits += 1;
                 const leaf_id = node.id;
                 node_handle.deinit(self.alloc);
@@ -3164,6 +3247,7 @@ fn searchProfiledRequestAttempt(
                     native_scan.member_ids,
                     &native_scan.quantized,
                     native_scan.projections,
+                    native_scan.subgroup_plan,
                     transformed_query,
                     transformed_query_measure,
                     req.query,
@@ -3190,7 +3274,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, null, null, null, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             search_mod.noteLeafExplored(&beam_state);
             profile.leaves_explored += 1;
         } else {
@@ -3208,18 +3292,20 @@ fn searchProfiledRequestAttempt(
     profile.traversal_frontier_remaining = @intCast(candidates.count() + @intFromBool(traversal_stopped_early));
 
     try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
+    try drainGlobalSubgroups(self, &txn, scratch, req, transformed_query, &approx_results, &profile, true, now_fn_u64, elapsed_fn_u64);
+    try finishCandidateScan(self, &search_admission, req, &profile, now_fn_u64, elapsed_fn_u64);
 
     if (should_rerank) {
         var reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
         approx_results.deinit();
-        reranked.candidate_coverage = if (profile.traversal_frontier_remaining == 0) .exhausted else .more;
+        reranked.candidate_coverage = if (profile.traversal_frontier_remaining == 0 and profile.subgroup_vectors_skipped == 0) .exhausted else .more;
         profile.total_ns = elapsed_fn_u64(total_start);
         return .{ .results = reranked, .profile = profile };
     }
 
     var results = try approx_results.toFinalResults();
     approx_results.deinit();
-    results.candidate_coverage = if (profile.traversal_frontier_remaining == 0) .exhausted else .more;
+    results.candidate_coverage = if (profile.traversal_frontier_remaining == 0 and profile.subgroup_vectors_skipped == 0) .exhausted else .more;
     results.sort();
     if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
     profile.total_ns = elapsed_fn_u64(total_start);
@@ -3580,6 +3666,11 @@ fn addChildCandidatesFromIds(
             profile.approx_nodes_expanded += 1;
 
             const count = child_count;
+            // Pressure reclamation can free oversized scalar outputs between
+            // requests. Tree scoring owns its score-plane capacity separately
+            // from member IDs and cannot rely on a previous flat/leaf scorer.
+            // Only grow these two scalar planes, not the vector-fetch matrix.
+            try scratch.ensureScoreCapacity(self.alloc, count);
             const distances = scratch.distances[0..count];
             const error_bounds = scratch.error_bounds[0..count];
 
@@ -3638,7 +3729,7 @@ pub fn scoreLeafMembers(
 ) !void {
     const leaf_posting = try posting.PostingStore.view(leaf);
     const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
-    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, null, null, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
+    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, null, null, null, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
 }
 
 fn noteLeafScanBytes(
@@ -3648,6 +3739,314 @@ fn noteLeafScanBytes(
 ) void {
     const bytes = @as(u64, @intCast(vector_count)) *| bytes_per_vector;
     profile.max_leaf_scan_bytes = @max(profile.max_leaf_scan_bytes, bytes);
+    profile.leaf_scan_bytes +|= bytes;
+}
+
+/// Eight scores feed the existing SIMD heap-admission gate immediately.
+/// Neither leaf-sized output arrays nor identity-position arrays are written.
+const NativeCandidateScoreSink = CandidateScoreSink(true);
+const NoCopyCandidateScoreSink = CandidateScoreSink(false);
+
+fn prepareGlobalSubgroupPlan(self: anytype, txn: anytype, handle: anytype, req: search_types.SearchRequest, filter: *const search_types.RequestFilterState, coverage: search_types.CoveragePolicy, max_leaves: usize) !bool {
+    const Index = childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "nativeGlobalSubgroupRoutingEnabled")) return false;
+    if (!self.nativeGlobalSubgroupRoutingEnabled() or max_leaves == 0 or coverage == .complete_snapshot or self.config.metric != .cosine or
+        !self.config.use_quantization or !filter.isTrivial() or req.filter_prefix.len != 0 or req.distance_over != null or req.distance_under != null) return false;
+    const identity = self.nativeGlobalSubgroupLeaseIdentity(txn) orelse return false;
+    const plan = &handle.scratch.global_subgroups;
+    const target = try std.math.add(u64, handle.scratch.bytes() - plan.bytes(), try plan.projectedBytes(max_leaves));
+    try search_types.checkCancelled(req);
+    self.reserveSearchScratchBytes(handle, target) catch |err| switch (err) {
+        error.ResourceBudgetExceeded => return false,
+        else => return err,
+    };
+    try plan.ensureCapacity(self.alloc, max_leaves);
+    plan.generation = identity;
+    plan.active = true;
+    return true;
+}
+
+fn drainGlobalSubgroups(self: anytype, txn: anytype, scratch: anytype, req: search_types.SearchRequest, approx_query: []const f32, results: *search_results.ApproxSearchResults, profile: *search_types.SearchProfile, prune: bool, now: fn () u64, elapsed: fn (u64) u64) !void {
+    const planner = @import("global_subgroup_plan.zig");
+    const plan = &scratch.global_subgroups;
+    if (!plan.active) return;
+    if (comptime @hasDecl(childType(@TypeOf(self)), "nativeGlobalSubgroupLeaseIdentity")) {
+        if (plan.generation != self.nativeGlobalSubgroupLeaseIdentity(txn)) return error.StalePublishedSnapshot;
+    } else return error.StalePublishedSnapshot;
+    const route_start = now();
+    var total: u64 = 0;
+    var can_prune = prune;
+    var compact_query: [@import("posting_subgroups.zig").max_dims]i8 = undefined;
+    var compact_query_scale: ?f32 = null;
+    if (prune and req.query.len <= compact_query.len) {
+        for (plan.leaves[0..plan.leaf_count]) |leaf| if (leaf.plan.compact != null) {
+            compact_query_scale = @import("compact_subgroups.zig").quantize(req.query, compact_query[0..req.query.len]) catch null;
+            break;
+        };
+    }
+    for (plan.leaves[0..plan.leaf_count]) |leaf| {
+        try search_types.checkCancelled(req);
+        for (0..leaf.plan.ends.len) |group| {
+            const range = leaf.plan.range(group);
+            const count = range.end - range.start;
+            total += count;
+            const id = leaf.first_group + group;
+            const score = if (!prune) 0 else if (compact_query_scale != null and leaf.plan.compact != null) compact: {
+                profile.subgroup_compact_groups_scored += 1;
+                break :compact leaf.plan.compact.?.score(group, compact_query[0..req.query.len], compact_query_scale.?);
+            } else planner.dot(req.query, leaf.plan.centers[group * self.config.dims ..][0..self.config.dims]);
+            plan.entries[id] = .{ .id = @intCast(id), .weight = @intCast(count), .score = score };
+            if (!std.math.isFinite(plan.entries[id].score)) can_prune = false;
+        }
+    }
+    const cancellation: ?quantizer_mod.CancellationToken = if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null;
+    if (can_prune) {
+        _ = try planner.weighted.select(plan.entries[0..plan.group_count], plan.selected[0..plan.group_count], (total * 3 + 3) / 4, if (req.cancellation) |token| .{ .ptr = token.ptr, .cancelled = token.is_cancelled_fn } else null);
+    }
+    profile.subgroup_routing_ns += elapsed(route_start);
+    const scan_start = now();
+    for (plan.leaves[0..plan.leaf_count]) |*leaf| {
+        try search_types.checkCancelled(req);
+        var ranges: [16]quantizer_mod.ScoreRange = undefined;
+        var count: usize = 0;
+        var selected_rows: usize = 0;
+        for (0..leaf.plan.ends.len) |g| if (!can_prune or plan.selected[leaf.first_group + g]) {
+            const range = leaf.plan.range(g);
+            selected_rows += range.end - range.start;
+            if (count != 0 and ranges[count - 1].end == range.start) {
+                ranges[count - 1].end = range.end;
+            } else {
+                ranges[count] = .{ .start = range.start, .end = range.end };
+                count += 1;
+            }
+        };
+        var sink = RangeCandidateScoreSink{ .base = .{ .results = results, .ids = leaf.ids } };
+        try self.quantizer.estimateDistancesInRangesTo(&leaf.set, approx_query, &scratch.estimate, cancellation, ranges[0..count], &sink);
+        sink.base.flush();
+        profile.subgroup_leaves_scored += @intFromBool(can_prune);
+        profile.subgroup_vectors_skipped += leaf.ids.len - selected_rows;
+        profile.approx_leaves_scored += 1;
+        profile.approx_vectors_scored += selected_rows;
+        profile.traversal_eligible_vectors += selected_rows;
+        noteLeafScanBytes(profile, selected_rows, @as(u64, @intCast(rabitq.codeWidth(self.config.dims))) * @sizeOf(u64));
+    }
+    profile.leaf_score_ns += elapsed(scan_start);
+    plan.reset();
+}
+
+/// A prevalidated ascending range plan needs no per-row membership predicate.
+/// Gaps flush partial batches before advancing the physical ID cursor.
+const RangeCandidateScoreSink = struct {
+    base: NoCopyCandidateScoreSink,
+    pub fn write(self: *@This(), index: usize, distance: f32, bound: f32) void {
+        if (index != self.base.first_row + self.base.count) {
+            self.base.flush();
+            self.base.first_row = index;
+        }
+        self.base.write(index, distance, bound);
+    }
+};
+
+/// One query quantization per leaf; rejected contiguous ranges never load or
+/// score their code payload. Flush on gaps to preserve ID/score alignment.
+const SubgroupScoreSink = struct {
+    base: NoCopyCandidateScoreSink,
+    ends: []const u32,
+    selected: [@import("posting_subgroups.zig").max_groups]bool = @splat(false),
+    group: usize = 0,
+
+    pub fn accepts(self: *@This(), index: usize) bool {
+        while (index >= self.ends[self.group]) self.group += 1;
+        return self.selected[self.group];
+    }
+    pub fn write(self: *@This(), index: usize, distance: f32, bound: f32) void {
+        if (index != self.base.first_row + self.base.count) {
+            self.base.flush();
+            self.base.first_row = index;
+        }
+        self.base.write(index, distance, bound);
+    }
+};
+
+fn CandidateScoreSink(comptime with_projection: bool) type {
+    return struct {
+        results: *search_results.ApproxSearchResults,
+        ids: []const u64,
+        plane: if (with_projection) hbc_runtime.NativeProjectionPlane else void = undefined,
+        dims: usize = 0,
+        first_row: usize = 0,
+        count: usize = 0,
+        distances: [8]f32 = undefined,
+        errors: [8]f32 = undefined,
+
+        pub fn write(self: *@This(), index: usize, distance: f32, bound: f32) void {
+            std.debug.assert(index == self.first_row + self.count);
+            self.distances[self.count] = distance;
+            self.errors[self.count] = bound;
+            self.count += 1;
+            if (self.count == self.distances.len) self.flush();
+        }
+
+        fn flush(self: *@This()) void {
+            if (self.count == 0) return;
+            if (with_projection) {
+                self.results.addDeferredProjectionRange(self.ids[self.first_row..][0..self.count], self.distances[0..self.count], self.errors[0..self.count], self.plane, self.first_row, self.dims);
+            } else {
+                self.results.addApproxResults(self.ids[self.first_row..][0..self.count], self.distances[0..self.count], self.errors[0..self.count]);
+            }
+            self.first_row += self.count;
+            self.count = 0;
+        }
+    };
+}
+
+pub fn benchmarkFusedNativeCandidates() !void {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const dims = 768;
+    const count = 512;
+    const iterations = 2048;
+    const data = try alloc.alloc(f32, dims * count);
+    defer alloc.free(data);
+    const projected = try alloc.alloc(f16, dims * count);
+    defer alloc.free(projected);
+    var centroid = [_]f32{0.1} ** dims;
+    var query: [dims]f32 = undefined;
+    var ids: [count]u64 = undefined;
+    var checksums = [_]u32{0} ** count;
+    var scales = [_]f32{1} ** count;
+    var bounds = [_]f32{0.01} ** count;
+    var norms = [_]f32{0.1} ** count;
+    for (&query, 0..) |*value, d| value.* = @as(f32, @floatFromInt(d % 5)) / 9;
+    for (0..count) |row| {
+        ids[row] = row + 1;
+        for (0..dims) |d| {
+            const value = @as(f32, @floatFromInt((row * 11 + d * 7) % 31)) / 31;
+            data[row * dims + d] = value;
+            projected[row * dims + d] = @floatCast(value);
+        }
+    }
+    const plane = hbc_runtime.NativeProjectionPlane{ .dims = dims, .values = projected, .scales = &scales, .error_norms = &bounds, .decoded_norm_lower_bounds = &norms, .checksums = &checksums };
+    var quantizer = try quantizer_mod.RaBitQuantizer.init(alloc, dims, 42, .cosine);
+    defer quantizer.deinit();
+    var quantized = try quantizer.quantize(&centroid, data, count);
+    defer quantized.deinit(alloc);
+    var estimate = try quantizer_mod.RaBitQuantizer.EstimateScratch.init(alloc, dims);
+    defer estimate.deinit(alloc);
+    var distances: [count]f32 = undefined;
+    var errors: [count]f32 = undefined;
+    var results = try search_results.ApproxSearchResults.initCapacity(alloc, 100, 900, 1800);
+    defer results.deinit();
+    for (0..4) |round| {
+        // Alternate order within one process; warm immutable inputs and the
+        // same candidate gate isolate sink overhead from HTTP/I/O/admission.
+        for (0..2) |mode| {
+            const fused = (round + mode) % 2 == 1;
+            results.items.clearRetainingCapacity();
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..iterations) |_| {
+                if (fused) {
+                    var sink = NativeCandidateScoreSink{ .results = &results, .ids = &ids, .plane = plane, .dims = dims };
+                    try quantizer.estimateDistancesTo(&quantized, &query, &estimate, null, &sink);
+                    sink.flush();
+                } else {
+                    try quantizer.estimateDistancesWithScratch(&quantized, &query, &distances, &errors, &estimate);
+                    results.addDeferredProjectionRange(&ids, &distances, &errors, plane, 0, dims);
+                }
+            }
+            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
+            std.debug.print("native-score round={} fused={} ns_per_vector={d:.3} retained={}\n", .{ round, fused, @as(f64, @floatFromInt(elapsed)) / (iterations * count), results.items.items.len });
+        }
+    }
+}
+
+pub fn testFusedNativeCandidateParity() !void {
+    const alloc = std.testing.allocator;
+    const count = 37; // Four complete batches and a partial final batch.
+    for ([_]usize{ 3, 64, 65 }) |dims| {
+        var data: [65 * count]f32 = undefined;
+        var projected: [65 * count]f16 = undefined;
+        var centroid: [65]f32 = undefined;
+        var query: [65]f32 = undefined;
+        var ids: [count]u64 = undefined;
+        var checksums: [count]u32 = undefined;
+        var scales = [_]f32{1} ** count;
+        var bounds = [_]f32{0.01} ** count;
+        var norms = [_]f32{0.1} ** count;
+        for (0..dims) |d| {
+            centroid[d] = @as(f32, @floatFromInt(d % 7)) / 10;
+            query[d] = @as(f32, @floatFromInt(d % 5)) / 9;
+        }
+        for (0..count) |row| {
+            ids[row] = row + 1;
+            checksums[row] = @intCast(row);
+            for (0..dims) |d| {
+                const value = @as(f32, @floatFromInt((row * 11 + d * 7) % 31)) / 31;
+                data[row * dims + d] = value;
+                projected[row * dims + d] = @floatCast(value);
+            }
+        }
+        const plane = hbc_runtime.NativeProjectionPlane{ .dims = dims, .values = projected[0 .. count * dims], .scales = &scales, .error_norms = &bounds, .decoded_norm_lower_bounds = &norms, .checksums = &checksums };
+        for ([_]vec.DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
+            var quantizer = try quantizer_mod.RaBitQuantizer.init(alloc, dims, 42, metric);
+            defer quantizer.deinit();
+            var quantized = try quantizer.quantize(centroid[0..dims], data[0 .. count * dims], count);
+            defer quantized.deinit(alloc);
+            var estimate = try quantizer_mod.RaBitQuantizer.EstimateScratch.init(alloc, dims);
+            defer estimate.deinit(alloc);
+            for ([_][]const f32{ query[0..dims], centroid[0..dims] }) |q| {
+                var distances: [count]f32 = undefined;
+                var errors: [count]f32 = undefined;
+                try quantizer.estimateDistancesWithScratch(&quantized, q, &distances, &errors, &estimate);
+                var array = try search_results.ApproxSearchResults.initCapacity(alloc, 4, 8, 8);
+                defer array.deinit();
+                array.addDeferredProjectionRange(&ids, &distances, &errors, plane, 0, dims);
+                var fused = try search_results.ApproxSearchResults.initCapacity(alloc, 4, 8, 8);
+                defer fused.deinit();
+                var sink = NativeCandidateScoreSink{ .results = &fused, .ids = &ids, .plane = plane, .dims = dims };
+                try quantizer.estimateDistancesTo(&quantized, q, &estimate, null, &sink);
+                sink.flush();
+                array.sort();
+                fused.sort();
+                try std.testing.expectEqualDeep(array.items.items, fused.items.items);
+                var plain_array = try search_results.ApproxSearchResults.initCapacity(alloc, 4, 8, 8);
+                defer plain_array.deinit();
+                plain_array.addApproxResults(&ids, &distances, &errors);
+                var plain_fused = try search_results.ApproxSearchResults.initCapacity(alloc, 4, 8, 8);
+                defer plain_fused.deinit();
+                var plain_sink = NoCopyCandidateScoreSink{ .results = &plain_fused, .ids = &ids };
+                try quantizer.estimateDistancesTo(&quantized, q, &estimate, null, &plain_sink);
+                plain_sink.flush();
+                plain_array.sort();
+                plain_fused.sort();
+                try std.testing.expectEqualDeep(plain_array.items.items, plain_fused.items.items);
+                // Non-contiguous physical ranges retain the array scorer's
+                // exact arithmetic/order, including query == centroid and
+                // partial SIMD batches on either side of a skipped range.
+                var selected_array = try search_results.ApproxSearchResults.initCapacity(alloc, 4, 8, 8);
+                defer selected_array.deinit();
+                selected_array.addApproxResults(ids[2..7], distances[2..7], errors[2..7]);
+                selected_array.addApproxResults(ids[11..], distances[11..], errors[11..]);
+                var selected_fused = try search_results.ApproxSearchResults.initCapacity(alloc, 4, 8, 8);
+                defer selected_fused.deinit();
+                var selected_sink: SubgroupScoreSink = .{ .base = .{ .results = &selected_fused, .ids = &ids }, .ends = &.{ 2, 7, 11, count } };
+                selected_sink.selected[1] = true;
+                selected_sink.selected[3] = true;
+                try quantizer.estimateDistancesTo(&quantized, q, &estimate, null, &selected_sink);
+                selected_sink.base.flush();
+                selected_array.sort();
+                selected_fused.sort();
+                try std.testing.expectEqualDeep(selected_array.items.items, selected_fused.items.items);
+                var range_fused = try search_results.ApproxSearchResults.initCapacity(alloc, 4, 8, 8);
+                defer range_fused.deinit();
+                var range_sink = RangeCandidateScoreSink{ .base = .{ .results = &range_fused, .ids = &ids } };
+                try quantizer.estimateDistancesInRangesTo(&quantized, q, &estimate, null, &.{ .{ .start = 2, .end = 7 }, .{ .start = 11, .end = count } }, &range_sink);
+                range_sink.base.flush();
+                range_fused.sort();
+                try std.testing.expectEqualDeep(selected_array.items.items, range_fused.items.items);
+            }
+        }
+    }
 }
 
 fn scoreLeafMemberIds(
@@ -3659,6 +4058,7 @@ fn scoreLeafMemberIds(
     member_ids: []const u64,
     native_quantized: ?*const hbc_runtime.QuantizedSet,
     native_projections: ?hbc_runtime.NativeProjectionPlane,
+    native_subgroups: ?@import("posting_subgroups.zig").View,
     approx_query: []const f32,
     approx_query_measure: f32,
     exact_query: []const f32,
@@ -3672,21 +4072,102 @@ fn scoreLeafMemberIds(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
-    const start = now_fn_u64();
-    defer profile.leaf_score_ns += elapsed_fn_u64(start);
+    var start = now_fn_u64();
+    if (scratch.global_subgroups.active) {
+        if (native_quantized != null and native_subgroups != null and native_projections == null and leaf_has_fresh_stored_payload and std.meta.activeTag(native_quantized.?.*) == .rabit) {
+            try validateQuantizedSet(self, native_quantized.?, member_ids.len);
+            var groups = native_subgroups.?;
+            if (comptime @hasDecl(childType(@TypeOf(self)), "nativeCompactSubgroups"))
+                groups.compact = self.nativeCompactSubgroups(txn, groups);
+            if (scratch.global_subgroups.append(member_ids, native_quantized.?.rabit, groups)) {
+                profile.max_leaf_vectors_considered = @max(profile.max_leaf_vectors_considered, member_ids.len);
+                profile.subgroup_routing_ns += elapsed_fn_u64(start);
+                return;
+            }
+        }
+        // A dirty/unsupported leaf invalidates pruning for this work plan, not
+        // the query. Drain in original order before entering ordinary fallback.
+        try drainGlobalSubgroups(self, txn, scratch, req, approx_query, results, profile, false, now_fn_u64, elapsed_fn_u64);
+        start = now_fn_u64();
+    }
+    var subgroup_routing_ns: u64 = 0;
+    defer profile.leaf_score_ns += elapsed_fn_u64(start) -| subgroup_routing_ns;
     profile.max_leaf_vectors_considered = @max(
         profile.max_leaf_vectors_considered,
         @as(u64, @intCast(member_ids.len)),
     );
     const coverage_policy = search_types.coveragePolicy(req);
-    try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
 
     // Resolve selective ID and metadata-prefix predicates once per leaf. The
     // sorted metadata batch reuses LSM blocks and replaces the former scalar
     // point lookup (plus cache lock) for every quantized candidate.
     const filters_active = !filter_state.isTrivial() or req.filter_prefix.len > 0;
-    var filtered_count: usize = 0;
-    for (member_ids, 0..) |member_id, original_index| {
+    const NativeIndex = childType(@TypeOf(self));
+    const subgroup_enabled = if (comptime @hasDecl(NativeIndex, "nativeSubgroupRoutingEnabled")) self.nativeSubgroupRoutingEnabled() else false;
+    if (subgroup_enabled and coverage_policy != .complete_snapshot and self.config.metric == .cosine and
+        !filters_active and req.distance_over == null and req.distance_under == null and
+        self.config.use_quantization and leaf_has_fresh_stored_payload and native_quantized != null and
+        native_projections == null and native_subgroups != null and std.meta.activeTag(native_quantized.?.*) == .rabit)
+    {
+        try validateQuantizedSet(self, native_quantized.?, member_ids.len);
+        const grouping = @import("posting_subgroups.zig");
+        const plan = native_subgroups.?;
+        const route_start = now_fn_u64();
+        var order: [grouping.max_groups]u8 = undefined;
+        var scores: [grouping.max_groups]f64 = undefined;
+        try plan.rank(exact_query, &order, &scores);
+        var sink: RangeCandidateScoreSink = .{ .base = .{ .results = results, .ids = member_ids } };
+        var selected = [_]bool{false} ** grouping.max_groups;
+        const keep = @max(@as(usize, 1), plan.ends.len * 3 / 4);
+        var selected_rows: usize = 0;
+        for (order[0..keep]) |group| {
+            selected[group] = true;
+            const range = plan.range(group);
+            selected_rows += range.end - range.start;
+        }
+        var ranges: [grouping.max_groups]quantizer_mod.ScoreRange = undefined;
+        var range_count: usize = 0;
+        for (selected[0..plan.ends.len], 0..) |keep_group, group| if (keep_group) {
+            const range = plan.range(group);
+            if (range_count != 0 and ranges[range_count - 1].end == range.start) {
+                ranges[range_count - 1].end = range.end;
+            } else {
+                ranges[range_count] = .{ .start = range.start, .end = range.end };
+                range_count += 1;
+            }
+        };
+        subgroup_routing_ns = elapsed_fn_u64(route_start);
+        profile.subgroup_routing_ns += subgroup_routing_ns;
+        try self.quantizer.estimateDistancesInRangesTo(&native_quantized.?.rabit, approx_query, &scratch.estimate, if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null, ranges[0..range_count], &sink);
+        sink.base.flush();
+        profile.subgroup_leaves_scored += 1;
+        profile.subgroup_vectors_skipped += member_ids.len - selected_rows;
+        profile.approx_leaves_scored += 1;
+        profile.approx_vectors_scored += selected_rows;
+        profile.traversal_eligible_vectors += selected_rows;
+        noteLeafScanBytes(profile, selected_rows, @as(u64, @intCast(rabitq.codeWidth(self.config.dims))) * @sizeOf(u64));
+        return;
+    }
+    const fuse_no_copy = if (comptime @hasDecl(NativeIndex, "nativeFusedNoCopyEnabled")) self.nativeFusedNoCopyEnabled() else false;
+    const direct_no_copy = fuse_no_copy and native_projections == null and
+        !filters_active and req.distance_over == null and req.distance_under == null and
+        self.config.use_quantization and leaf_has_fresh_stored_payload and native_quantized != null and
+        std.meta.activeTag(native_quantized.?.*) == .rabit;
+    const direct_native_scoring = direct_no_copy or if (native_projections) |plane|
+        !filters_active and req.distance_over == null and req.distance_under == null and
+            self.config.use_quantization and leaf_has_fresh_stored_payload and native_quantized != null and
+            std.meta.activeTag(native_quantized.?.*) == .rabit and
+            plane.validFor(member_ids.len, @intCast(self.config.dims)) and plane.checksums.len == member_ids.len
+    else
+        false;
+    if (!direct_native_scoring) {
+        try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
+    }
+    // Native unfiltered scoring consumes the leased IDs and identity row
+    // order directly. Do not write two scratch arrays for every routed vector
+    // only to read them back in the following scoring pass.
+    var filtered_count: usize = if (direct_native_scoring) member_ids.len else 0;
+    if (!direct_native_scoring) for (member_ids, 0..) |member_id, original_index| {
         if (filters_active) profile.filter_candidates += 1;
         if (filter_state.rejects(member_id)) {
             profile.filter_rejected += 1;
@@ -3695,7 +4176,7 @@ fn scoreLeafMemberIds(
         scratch.member_ids[filtered_count] = member_id;
         scratch.positions[filtered_count] = original_index;
         filtered_count += 1;
-    }
+    };
     if (req.filter_prefix.len > 0 and filtered_count > 0) {
         const filter_start = now_fn_u64();
         profile.filter_metadata_batches += 1;
@@ -3735,8 +4216,24 @@ fn scoreLeafMemberIds(
     }
     if (filtered_count == 0) return;
     profile.traversal_eligible_vectors += @intCast(filtered_count);
-    const scoring_member_ids = scratch.member_ids[0..filtered_count];
-    const original_positions = scratch.positions[0..filtered_count];
+    const scoring_member_ids = if (direct_native_scoring) member_ids else scratch.member_ids[0..filtered_count];
+    const original_positions: []const usize = if (direct_native_scoring) &.{} else scratch.positions[0..filtered_count];
+    if (direct_no_copy) {
+        try validateQuantizedSet(self, native_quantized.?, member_ids.len);
+        var sink = NoCopyCandidateScoreSink{ .results = results, .ids = member_ids };
+        try self.quantizer.estimateDistancesTo(
+            &native_quantized.?.rabit,
+            approx_query,
+            &scratch.estimate,
+            if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null,
+            &sink,
+        );
+        sink.flush();
+        profile.approx_leaves_scored += 1;
+        profile.approx_vectors_scored += member_ids.len;
+        noteLeafScanBytes(profile, member_ids.len, @as(u64, @intCast(rabitq.codeWidth(self.config.dims))) *| @sizeOf(u64));
+        return;
+    }
     const has_extra_filters = req.distance_over != null or req.distance_under != null;
     var scoring_req = req;
     scoring_req.filter_prefix = "";
@@ -3752,43 +4249,24 @@ fn scoreLeafMemberIds(
             // complete those candidates from float16 before rerank. This
             // avoids decoding every wide projection in the routed shell while
             // preserving the established RaBitQ recall/error-bound contract.
-            if (!filters_active and
-                !has_extra_filters and
-                self.config.use_quantization and
-                leaf_has_fresh_stored_payload and
-                native_quantized != null and
-                projection_plane.checksums.len == member_ids.len)
-            {
+            if (direct_native_scoring) {
                 const count = member_ids.len;
-                const distances = scratch.distances[0..count];
-                const error_bounds = scratch.error_bounds[0..count];
-                try self.estimateQuantizedDistances(
-                    native_quantized.?,
+                try validateQuantizedSet(self, native_quantized.?, count);
+                var sink = NativeCandidateScoreSink{ .results = results, .ids = member_ids, .plane = projection_plane, .dims = dims };
+                try self.quantizer.estimateDistancesTo(
+                    &native_quantized.?.rabit,
                     approx_query,
-                    approx_query_measure,
-                    distances,
-                    error_bounds,
                     &scratch.estimate,
+                    if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null,
+                    &sink,
                 );
-                results.addApproxResultsWithDeferredProjectionPlane(
-                    member_ids,
-                    distances,
-                    error_bounds,
-                    projection_plane.values,
-                    projection_plane.scales,
-                    projection_plane.error_norms,
-                    projection_plane.decoded_norm_lower_bounds,
-                    projection_plane.checksums,
-                    projection_plane.residual_locations,
-                    original_positions,
-                    dims,
-                );
+                sink.flush();
                 profile.approx_leaves_scored += 1;
                 profile.approx_vectors_scored += count;
                 noteLeafScanBytes(
                     profile,
                     count,
-                    std.math.divCeil(u64, @intCast(self.config.dims), 8) catch unreachable,
+                    @as(u64, @intCast(rabitq.codeWidth(self.config.dims))) *| @sizeOf(u64),
                 );
                 return;
             }
@@ -3802,6 +4280,7 @@ fn scoreLeafMemberIds(
             for (original_positions, 0..) |original_position, i| {
                 if (i % 256 == 0) try search_types.checkCancelled(req);
                 const row = projection_plane.values[original_position * dims ..][0..dims];
+                try projection_plane.validateRow(original_position);
                 const distance = vec.distanceToQueryF16(
                     exact_query,
                     exact_query_measure,
@@ -3830,6 +4309,7 @@ fn scoreLeafMemberIds(
                         projection_plane.error_norms,
                         projection_plane.decoded_norm_lower_bounds,
                         projection_plane.checksums,
+                        projection_plane.verification,
                         projection_plane.residual_locations,
                         original_positions,
                         dims,
@@ -3907,7 +4387,7 @@ fn scoreLeafMemberIds(
             noteLeafScanBytes(
                 profile,
                 count,
-                std.math.divCeil(u64, @intCast(self.config.dims), 8) catch unreachable,
+                @as(u64, @intCast(rabitq.codeWidth(self.config.dims))) *| @sizeOf(u64),
             );
             return;
         }
@@ -4078,6 +4558,8 @@ fn completeDeferredProjectionScores(
         }
         if (item.bounded_projection) continue;
         const projection = item.projection orelse continue;
+        if (projection.verify_payload)
+            try hbc_runtime.validateProjectionPayload(projection.values, projection.checksum, projection.verification);
         const distance = vec.distanceToQueryF16(
             query,
             query_measure,
@@ -4154,7 +4636,9 @@ fn rerankResultsWithCachePolicy(
     // float16 projection. Complete only that bounded heap before ordering;
     // authoritative residual completion below remains limited to intervals
     // that can cross the public top-k boundary.
+    const projection_start = now_fn_u64();
     try completeDeferredProjectionScores(self.config, query, query_measure, ranked_items, req.cancellation);
+    profile.projection_completion_ns += elapsed_fn_u64(projection_start);
     search_mod.sortApproxResultsByDistance(ranked_items);
 
     const rerank_selection = selectRerankCandidatesInto(scratch.flags[0..ranked_items.len], ranked_items, rerankBoundaryK(req), req, self.config.rerank_policy);
@@ -4219,6 +4703,7 @@ fn rerankResultsWithCachePolicy(
             }
             rerank_positions = rerank_positions[0..unresolved_count];
             const max_external_rerank_batch = rerank_positions.len;
+            try scratch.ensureVectorDecodeCapacity(self.alloc, max_external_rerank_batch);
             var offset: usize = 0;
             while (offset < rerank_positions.len) {
                 const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
@@ -4351,6 +4836,7 @@ fn rerankResultsWithCachePolicy(
             // lease, arena, and sort. Large sets retain 128-entry checkpoints
             // so the boundary proof can still stop before loading a long tail.
             const max_external_rerank_batch = externalRerankBatchSize(self.config.dims, rerank_positions.len);
+            try scratch.ensureVectorDecodeCapacity(self.alloc, max_external_rerank_batch);
             var offset: usize = 0;
             while (offset < rerank_positions.len) {
                 const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
@@ -4450,6 +4936,10 @@ fn rerankResultsWithCachePolicy(
 
         if (!external_scored) {
             const preload_start = now_fn_u64();
+            // The generic authoritative loader keeps all returned views alive
+            // until distance evaluation. Unlike native completion batches it
+            // therefore still needs the entire selected fallback matrix.
+            try scratch.ensureVectorDecodeCapacity(self.alloc, rerank_positions.len);
             try loadRerankVectorsSortedWithScratch(
                 self,
                 txn,
@@ -6086,35 +6576,8 @@ fn normalizeCentroidForMetric(self: anytype, centroid: []f32) void {
     }
 }
 
-fn coveringRadiusForMatrix(
-    metric: vec.DistanceMetric,
-    centroid: []const f32,
-    vectors: []const f32,
-    count: usize,
-) f32 {
-    if (metric == .inner_product) return std.math.nan(f32);
-    if (count == 0) return 0;
-    if (centroid.len == 0 or vectors.len < count * centroid.len) return std.math.nan(f32);
-    var max_squared: f32 = 0;
-    for (0..count) |row| {
-        const candidate = vectors[row * centroid.len ..][0..centroid.len];
-        var squared: f32 = 0;
-        for (centroid, candidate) |center, value| {
-            const delta = value - center;
-            squared += delta * delta;
-        }
-        max_squared = @max(max_squared, squared);
-    }
-    const radius = @sqrt(max_squared);
-    return if (metric == .cosine) conservativeCosineRadius(radius) else radius;
-}
-
-fn conservativeCosineRadius(radius: f32) f32 {
-    if (!std.math.isFinite(radius) or radius < 0) return std.math.nan(f32);
-    // Radius values become proof objects. Expand them slightly so f32 dot,
-    // norm, and sqrt rounding can only make pruning more conservative.
-    return std.math.nextAfter(f32, radius * 1.000001 + 0.000001, std.math.inf(f32));
-}
+const coveringRadiusForMatrix = posting.coveringRadiusForMatrix;
+const conservativeCosineRadius = posting.conservativeCosineRadius;
 
 fn updateWeightedCentroidAndMeasureCosineShift(
     self: anytype,

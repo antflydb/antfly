@@ -13,6 +13,7 @@
 //! fails closed. Artifact keys and f32 payloads are covered by the frame CRC.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const vector_block = @import("vector_block.zig");
@@ -26,6 +27,7 @@ pub const Kind = enum(u8) {
     upsert = 1,
     tombstone = 2,
     coverage = 3,
+    reference = 4,
     commit = 255,
 };
 
@@ -71,6 +73,7 @@ pub const Writer = struct {
     open_batch_max_sequence: u64 = 0,
     last_committed_batch: ?u64 = null,
     covered_source_sequence: u64 = 0,
+    min_mutation_sequence: ?u64 = null,
 
     pub fn init(alloc: Allocator) Writer {
         return .{ .alloc = alloc };
@@ -126,6 +129,10 @@ pub const Writer = struct {
         });
     }
 
+    pub fn appendReference(self: *Writer, batch_id: u64, source_sequence: u64, revision: u64, key: []const u8, dims: u32, digest: *const [32]u8) !void {
+        try self.append(.{ .kind = .reference, .batch_id = batch_id, .source_sequence = source_sequence, .revision = revision, .key_hash = vector_block.keyHash(key), .key = key, .dims = dims, .vector_bytes = digest });
+    }
+
     pub fn appendTombstone(self: *Writer, batch_id: u64, source_sequence: u64, revision: u64, key: []const u8) !void {
         if (key.len == 0) return error.InvalidVectorWalKey;
         try self.append(.{
@@ -163,6 +170,8 @@ pub const Writer = struct {
             if (record.source_sequence < self.covered_source_sequence) return error.OutOfOrderVectorWalSequence;
         }
         try appendFrame(self.alloc, &self.out, record);
+        if (record.kind == .upsert or record.kind == .reference or record.kind == .tombstone)
+            self.min_mutation_sequence = @min(self.min_mutation_sequence orelse record.source_sequence, record.source_sequence);
         if (starts_batch) self.open_batch = record.batch_id;
         self.open_batch_records += 1;
         self.open_batch_max_sequence = @max(self.open_batch_max_sequence, record.source_sequence);
@@ -275,7 +284,7 @@ fn appendFrame(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), record: Recor
     @memcpy(frame[64..][0..record.key.len], record.key);
     @memset(frame[64 + record.key.len ..][0 .. padded_key_len - record.key.len], 0);
     @memcpy(frame[64 + padded_key_len ..], record.vector_bytes);
-    std.mem.writeInt(u32, frame[12..16], std.hash.Crc32.hash(frame[16..]), .big);
+    std.mem.writeInt(u32, frame[12..16], Crc32.hash(frame[16..]), .big);
 }
 
 fn decodeFrame(bytes: []const u8) !?DecodedFrame {
@@ -287,10 +296,11 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
     if (total_len < frame_header_len or total_len > max_frame_len) return error.CorruptedVectorWal;
     if (bytes.len < total_len) return null;
     const frame = bytes[0..total_len];
-    if (std.mem.readInt(u32, frame[12..16], .big) != std.hash.Crc32.hash(frame[16..])) return error.VectorWalChecksumMismatch;
+    if (std.mem.readInt(u32, frame[12..16], .big) != Crc32.hash(frame[16..])) return error.VectorWalChecksumMismatch;
     for (frame[17..24]) |reserved| if (reserved != 0) return error.UnsupportedVectorWalFlags;
     const kind: Kind = switch (frame[16]) {
         @intFromEnum(Kind.upsert) => .upsert,
+        @intFromEnum(Kind.reference) => .reference,
         @intFromEnum(Kind.tombstone) => .tombstone,
         @intFromEnum(Kind.coverage) => .coverage,
         @intFromEnum(Kind.commit) => .commit,
@@ -298,7 +308,7 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
     };
     const key_len: usize = @intCast(std.mem.readInt(u32, frame[56..60], .big));
     const dims = std.mem.readInt(u32, frame[60..64], .big);
-    const vector_len = std.math.mul(usize, dims, @sizeOf(f32)) catch return error.CorruptedVectorWal;
+    const vector_len = if (kind == .reference) 32 else std.math.mul(usize, dims, @sizeOf(f32)) catch return error.CorruptedVectorWal;
     const padded_key_len = std.mem.alignForward(usize, key_len, @alignOf(f32));
     if (padded_key_len > total_len - frame_header_len or vector_len != total_len - frame_header_len - padded_key_len) return error.CorruptedVectorWal;
     if (!std.mem.allEqual(u8, frame[64 + key_len ..][0 .. padded_key_len - key_len], 0)) return error.CorruptedVectorWal;
@@ -318,6 +328,9 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
 
 fn validateRecord(record: Record) !void {
     switch (record.kind) {
+        .reference => {
+            if (record.key.len == 0 or record.dims == 0 or record.vector_bytes.len != 32 or record.key_hash != vector_block.keyHash(record.key)) return error.InvalidVectorWalRecord;
+        },
         .upsert => {
             if (record.key.len == 0 or record.dims == 0) return error.InvalidVectorWalRecord;
             if (record.key_hash != vector_block.keyHash(record.key)) return error.InvalidVectorWalRecord;

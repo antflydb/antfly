@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
@@ -228,7 +229,7 @@ pub fn appendStateWithOptionsResult(
     std.mem.writeInt(u16, record[4..6], record_version, .little);
     std.mem.writeInt(u16, record[6..8], record_header_len, .little);
     std.mem.writeInt(u32, record[8..12], @intCast(payload.len), .little);
-    std.mem.writeInt(u32, record[12..16], std.hash.Crc32.hash(payload), .little);
+    std.mem.writeInt(u32, record[12..16], Crc32.hash(payload), .little);
 
     const wal_dir = try walDirPathAlloc(allocator, root_dir);
     defer allocator.free(wal_dir);
@@ -551,7 +552,7 @@ pub fn appendReplay(
     std.mem.writeInt(u16, record[6..8], replay_record_header_len, .little);
     std.mem.writeInt(u64, record[8..16], sequence, .little);
     std.mem.writeInt(u32, record[16..20], @intCast(payload.len), .little);
-    std.mem.writeInt(u32, record[20..24], std.hash.Crc32.hash(payload), .little);
+    std.mem.writeInt(u32, record[20..24], Crc32.hash(payload), .little);
     @memcpy(record[replay_record_header_len..], payload);
 
     const wal_dir = try walDirPathAlloc(allocator, root_dir);
@@ -1013,7 +1014,7 @@ fn consumeCompleteReplayRecords(
 
         if (sequence >= from_sequence) {
             const payload = pending.items[pos + replay_record_header_len .. pos + total_len];
-            if (std.hash.Crc32.hash(payload) != expected_crc) {
+            if (Crc32.hash(payload) != expected_crc) {
                 logCorruptWalDetail("replay_crc", 0, pos, pending.items.len, "replay CRC mismatch");
                 return error.CorruptLsmWal;
             }
@@ -1075,7 +1076,7 @@ fn consumeReplayRecordsFromMixedWal(
             if (pending.items.len - pos < total_len) break;
             if (sequence >= from_sequence) {
                 const payload = pending.items[pos + replay_record_header_len .. pos + total_len];
-                if (std.hash.Crc32.hash(payload) != expected_crc) {
+                if (Crc32.hash(payload) != expected_crc) {
                     logCorruptWalDetail("mixed_replay_crc", 0, pos, pending.items.len, "mixed WAL replay CRC mismatch");
                     return error.CorruptLsmWal;
                 }
@@ -1206,7 +1207,7 @@ fn consumeCompleteRecords(
             if (pending.items.len - pos < total_len) break;
 
             const payload = pending.items[pos + record_header_len .. pos + total_len];
-            if (std.hash.Crc32.hash(payload) != expected_crc) {
+            if (Crc32.hash(payload) != expected_crc) {
                 logCorruptWalDetail("record_crc", segment, pos, pending.items.len, "state record CRC mismatch");
                 return error.CorruptLsmWal;
             }
@@ -1244,7 +1245,7 @@ fn consumeCompleteRecords(
             const total_len = replay_record_header_len + payload_len;
             if (pending.items.len - pos < total_len) break;
             const payload = pending.items[pos + replay_record_header_len .. pos + total_len];
-            if (std.hash.Crc32.hash(payload) != expected_crc) {
+            if (Crc32.hash(payload) != expected_crc) {
                 logCorruptWalDetail("replay_record_crc", segment, pos, pending.items.len, "replay record CRC mismatch");
                 return error.CorruptLsmWal;
             }
@@ -1360,7 +1361,7 @@ fn encodeControl(out: []u8, kind: ControlKind, payload: []const u8) void {
     std.mem.writeInt(
         u32,
         out[out.len - control_checksum_len ..][0..control_checksum_len],
-        std.hash.Crc32.hash(out[0 .. out.len - control_checksum_len]),
+        Crc32.hash(out[0 .. out.len - control_checksum_len]),
         .little,
     );
 }
@@ -1376,7 +1377,7 @@ fn decodeControl(raw: []const u8, kind: ControlKind, payload_len: usize) ![]cons
         raw[raw.len - control_checksum_len ..][0..control_checksum_len],
         .little,
     );
-    if (std.hash.Crc32.hash(raw[0 .. raw.len - control_checksum_len]) != expected_checksum)
+    if (Crc32.hash(raw[0 .. raw.len - control_checksum_len]) != expected_checksum)
         return error.CorruptLsmWalIndex;
     return raw[control_header_len .. control_header_len + payload_len];
 }

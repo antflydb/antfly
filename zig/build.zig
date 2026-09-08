@@ -756,6 +756,7 @@ const AntflyRootImports = struct {
     bloom: *std.Build.Module,
     vector: *std.Build.Module,
     vectorindex: *std.Build.Module,
+    hash: *std.Build.Module,
     matcher: *std.Build.Module,
     resolver: *std.Build.Module,
     casbin: *std.Build.Module,
@@ -827,6 +828,7 @@ const AntflyRootImports = struct {
         .{ .name = "bloom", .field = "bloom" },
         .{ .name = "antfly_vector", .field = "vector" },
         .{ .name = "antfly_vectorindex", .field = "vectorindex" },
+        .{ .name = "antfly_hash", .field = "hash" },
         .{ .name = "antfly_matcher", .field = "matcher" },
         .{ .name = "antfly_resolver", .field = "resolver" },
         .{ .name = "antfly_casbin", .field = "casbin" },
@@ -1705,6 +1707,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm_vector_mod.addImport("protobuf", protobuf_mod);
+    const hash_mod = b.createModule(.{
+        .root_source_file = b.path("lib/hash/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wasm_hash_mod = b.createModule(.{
+        .root_source_file = b.path("lib/hash/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    // Standalone benchmark roots force ReleaseFast even when the root build
+    // defaults to Debug. Keep their checksum dependency equally optimized.
+    const hash_bench_mod = if (optimize == .ReleaseFast) hash_mod else b.createModule(.{
+        .root_source_file = b.path("lib/hash/src/mod.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     const vectorindex_mod = b.createModule(.{
         .root_source_file = b.path("lib/vectorindex/src/mod.zig"),
         .target = target,
@@ -1712,6 +1731,7 @@ pub fn build(b: *std.Build) void {
     });
     vectorindex_mod.addImport("antfly_vector", vector_mod);
     vectorindex_mod.addImport("antfly_platform", platform_mod);
+    vectorindex_mod.addImport("antfly_hash", hash_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, vectorindex_mod, target);
         vectorindex_mod.linkFramework("Foundation", .{});
@@ -1725,6 +1745,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm_vectorindex_mod.addImport("antfly_vector", wasm_vector_mod);
     wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
     const casbin_mod = b.createModule(.{
         .root_source_file = b.path("lib/casbin/src/mod.zig"),
         .target = target,
@@ -1737,6 +1758,7 @@ pub fn build(b: *std.Build) void {
     });
     storage_mod.addImport("bloom", bloom_mod);
     storage_mod.addImport("antfly_platform", platform_mod);
+    storage_mod.addImport("antfly_hash", hash_mod);
     const usermgr_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/mod.zig"),
         .target = target,
@@ -2106,6 +2128,7 @@ pub fn build(b: *std.Build) void {
         .bloom = bloom_mod,
         .vector = vector_mod,
         .vectorindex = vectorindex_mod,
+        .hash = hash_mod,
         .matcher = matcher_mod,
         .resolver = resolver_mod,
         .casbin = casbin_mod,
@@ -2287,6 +2310,7 @@ pub fn build(b: *std.Build) void {
         bloom_mod,
         vector_mod,
         vectorindex_mod,
+        hash_mod,
         vellum_mod,
         regex_mod,
         image_mod,
@@ -2372,6 +2396,7 @@ pub fn build(b: *std.Build) void {
         wasm_bloom_mod,
         wasm_vector_mod,
         wasm_vectorindex_mod,
+        wasm_hash_mod,
         vellum_mod,
         regex_mod,
         wasm_image_mod,
@@ -3113,12 +3138,34 @@ pub fn build(b: *std.Build) void {
     const lib_embeddings_test_step = b.step("lib-embeddings-test", "Run standalone lib/embeddings tests");
     lib_embeddings_test_step.dependOn(&run_lib_embeddings_tests.step);
 
+    const lib_hash_tests = b.addTest(.{
+        .root_module = hash_mod,
+        .filters = b.args orelse &.{},
+    });
+    const run_lib_hash_tests = b.addRunArtifact(lib_hash_tests);
+    const lib_hash_test_step = b.step("lib-hash-test", "Run standalone lib/hash tests");
+    lib_hash_test_step.dependOn(&run_lib_hash_tests.step);
+
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
+        .filters = b.args orelse &.{},
     });
     const run_lib_vectorindex_tests = b.addRunArtifact(lib_vectorindex_tests);
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
     lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
+
+    const vector_kernel_mod = b.createModule(.{ .root_source_file = b.path("lib/vector/src/quantizer.zig"), .target = target, .optimize = optimize });
+    vector_kernel_mod.addImport("protobuf", protobuf_mod);
+    const vector_kernel_tests = b.addTest(.{ .root_module = vector_kernel_mod, .filters = b.args orelse &.{} });
+    const run_vector_kernel_tests = b.addRunArtifact(vector_kernel_tests);
+    b.step("lib-vector-kernel-test", "Run standalone quantizer kernel tests (no external recall fixtures)").dependOn(&run_vector_kernel_tests.step);
+
+    const subgroup_scan_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_subgroup_scan.zig"), .target = target, .optimize = optimize });
+    subgroup_scan_mod.addImport("antfly_vector", vector_mod);
+    subgroup_scan_mod.addImport("antfly_vector_index", vectorindex_mod);
+    const subgroup_scan_bench = b.addExecutable(.{ .name = "bench-subgroup-scan", .root_module = subgroup_scan_mod });
+    const install_subgroup_scan_bench = b.addInstallArtifact(subgroup_scan_bench, .{});
+    b.step("bench-subgroup-scan", "Build offline weighted selection and native range scan benchmark").dependOn(&install_subgroup_scan_bench.step);
 
     const vector_cancellation_tests = b.addTest(.{
         .root_module = vector_mod,
@@ -4164,7 +4211,7 @@ pub fn build(b: *std.Build) void {
         "ambiguous mutation response is explicitly non-retryable",
         "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
-        "writer native vector finalization projects through cached shard status",
+        "table-wide native vector work does not block an independently ready index",
         "status source reports an absent linearizable read capability without failing",
         "status source rejects every partial routing capability",
         "table read source distinguishes unavailable physical capability observation",
@@ -7383,6 +7430,10 @@ pub fn build(b: *std.Build) void {
     const dense_index_lifecycle_regression_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
+            "posting WAL capacity",
+            "native posting initial acceleration",
+            "db online vector publication",
+            "db multi-source dense target",
             "index repair state root-generation reset atomically rebinds replacement debt",
             "index repair state persists through backend storage",
             "index repair state persists intent and provisional replay pin atomically",
@@ -7775,6 +7826,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_generating_tests.step);
     unit_test_step.dependOn(&run_lib_embeddings_tests.step);
     unit_test_step.dependOn(&run_lib_vectorindex_tests.step);
+    unit_test_step.dependOn(&run_lib_hash_tests.step);
     unit_test_step.dependOn(&run_vector_cancellation_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
@@ -7869,7 +7921,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_test_step = b.step("lmdb-test", "Run Zig LMDB port unit tests");
     lmdb_test_step.dependOn(&run_lmdb_unit_tests.step);
 
-    const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_unit_tests = b.addTest(.{
         .root_module = storage_lmdb_test_mod,
     });
@@ -7900,7 +7952,7 @@ pub fn build(b: *std.Build) void {
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
-    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod);
+    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_soak_tests = b.addTest(.{
         .root_module = storage_lmdb_soak_test_mod,
         .filters = &.{"LMDB sim soak stays green"},
@@ -7909,17 +7961,47 @@ pub fn build(b: *std.Build) void {
     const storage_lmdb_soak_step = b.step("lmdb-sim-soak", "Run only the LMDB simulation soak test");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
 
-    const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
 
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
-    const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_test_mod.addImport("bloom", bloom_mod);
+    vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    vector_payload_test_mod.addImport("antfly-json", json_mod);
+    vector_payload_test_mod.addImport("structlog", structlog_mod);
+    const vector_payload_tests = b.addTest(.{
+        .root_module = vector_payload_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "source vector payloads", "vector references", "table storage settings" },
+    });
+    const run_vector_payload_tests = b.addRunArtifact(vector_payload_tests);
+    const vector_payload_test_step = b.step("vector-payload-test", "Run source vector payload ownership and recovery tests");
+    vector_payload_test_step.dependOn(&run_vector_payload_tests.step);
+    unit_test_step.dependOn(&run_vector_payload_tests.step);
+
+    const native_vector_store_test_mod = makeLmdbModule(b, "pkg/antfly/src/native_vector_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    native_vector_store_test_mod.addImport("bloom", bloom_mod);
+    native_vector_store_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    native_vector_store_test_mod.addImport("antfly-json", json_mod);
+    native_vector_store_test_mod.addImport("structlog", structlog_mod);
+    const native_vector_store_tests = b.addTest(.{
+        .root_module = native_vector_store_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "storage.vector_block_store", "vector block", "vector WAL", "native compaction", "sealed vector", "empty vector authority", "owned staged base", "cold projection workers", "source vector payloads adaptive" },
+    });
+    const run_native_vector_store_tests = b.addRunArtifact(native_vector_store_tests);
+    const native_vector_store_test_step = b.step("vector-block-store-test", "Run native vector segment publication and recovery tests");
+    native_vector_store_test_step.dependOn(&run_native_vector_store_tests.step);
+
+    const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
     const shard_unit_tests = b.addTest(.{
         .root_module = shard_test_mod,
@@ -7929,7 +8011,7 @@ pub fn build(b: *std.Build) void {
     const shard_test_step = b.step("shard-test", "Run storage/shard unit tests");
     shard_test_step.dependOn(&run_shard_unit_tests.step);
 
-    const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
     const wal_unit_tests = b.addTest(.{
@@ -7981,7 +8063,7 @@ pub fn build(b: *std.Build) void {
 
     const wal_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options);
-    const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod);
+    const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod, hash_mod);
     wal_soak_test_mod.addImport("bloom", bloom_mod);
     const wal_soak_tests = b.addTest(.{
         .root_module = wal_soak_test_mod,
@@ -7996,7 +8078,7 @@ pub fn build(b: *std.Build) void {
     storage_sim_soak_step.dependOn(&run_wal_soak_tests.step);
     soak_test_step.dependOn(storage_sim_soak_step);
 
-    const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
     persistent_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
@@ -8058,7 +8140,7 @@ pub fn build(b: *std.Build) void {
 
     const persistent_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
-    const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod);
+    const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod, hash_mod);
     persistent_soak_test_mod.addImport("bloom", bloom_mod);
     persistent_soak_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_soak_test_mod.addImport("antfly_regex", regex_mod);
@@ -8075,7 +8157,7 @@ pub fn build(b: *std.Build) void {
 
     storage_sim_soak_step.dependOn(&run_persistent_soak_tests.step);
 
-    const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     addSnowballModule(b, index_manager_test_mod);
     index_manager_test_mod.addImport("bloom", bloom_mod);
     index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
@@ -8136,7 +8218,7 @@ pub fn build(b: *std.Build) void {
     const index_manager_vopr_step = b.step("index-manager-vopr-test", "Run index manager modeled-storage VOPR smoke tests");
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
-    const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
@@ -8396,7 +8478,7 @@ pub fn build(b: *std.Build) void {
     const db_split_replay_step = b.step("db-split-replay-fixtures", "Run only the DB split replay fixture tests");
     db_split_replay_step.dependOn(&run_db_split_replay_tests.step);
 
-    const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
@@ -8409,7 +8491,7 @@ pub fn build(b: *std.Build) void {
     const sparse_test_step = b.step("sparse-test", "Run sparse index unit tests");
     sparse_test_step.dependOn(&run_sparse_unit_tests.step);
 
-    const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     derived_log_test_mod.addImport("bloom", bloom_mod);
     const derived_log_unit_tests = b.addTest(.{
         .root_module = derived_log_test_mod,
@@ -9088,7 +9170,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
     const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_c);
-    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod);
+    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod, hash_bench_mod);
     const lmdb_bench_mod_c = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
@@ -9105,7 +9187,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
     const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_zig);
-    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod);
+    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod, hash_bench_mod);
     const lmdb_bench_mod_zig = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
@@ -9163,7 +9245,7 @@ pub fn build(b: *std.Build) void {
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const split_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, split_bench_engine_options);
-    const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod);
+    const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod, hash_bench_mod);
     const split_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/split_bench.zig"),
         .target = target,
@@ -9360,6 +9442,7 @@ pub fn build(b: *std.Build) void {
     });
     lsm_write_bench_root_mod.addImport("bloom", bloom_mod);
     lsm_write_bench_root_mod.addImport("antfly_platform", platform_mod);
+    lsm_write_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     lsm_write_bench_mod.addImport("antfly_zig", lsm_write_bench_root_mod);
     const lsm_write_bench = b.addExecutable(.{
         .name = "lsm_write_bench",
@@ -9421,6 +9504,7 @@ pub fn build(b: *std.Build) void {
     text_segment_bench_root_mod.addImport("bloom", bloom_mod);
     text_segment_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     text_segment_bench_root_mod.addImport("antfly_platform", platform_mod);
+    text_segment_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     text_segment_write_bench_mod.addImport("antfly_text_bench", text_segment_bench_root_mod);
     const text_segment_write_bench = b.addExecutable(.{
         .name = "text_segment_write_bench",
@@ -9489,7 +9573,7 @@ pub fn build(b: *std.Build) void {
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const wal_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, wal_bench_engine_options);
-    const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod);
+    const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod, hash_bench_mod);
     const wal_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/wal_bench.zig"),
         .target = target,
@@ -9589,6 +9673,7 @@ pub fn build(b: *std.Build) void {
     derived_log_bench_root_mod.addImport("lmdb_engine", derived_log_bench_engine_mod);
     derived_log_bench_root_mod.addImport("bloom", bloom_mod);
     derived_log_bench_root_mod.addImport("antfly_platform", platform_mod);
+    derived_log_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     derived_log_bench_root_mod.link_libc = true;
     const derived_log_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/derived_log_bench.zig"),
@@ -10180,6 +10265,7 @@ pub fn build(b: *std.Build) void {
     hbc_isolate_root_mod.addImport("antfly_vector", vector_mod);
     hbc_isolate_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
     hbc_isolate_root_mod.addImport("antfly_platform", platform_mod);
+    hbc_isolate_root_mod.addImport("antfly_hash", hash_bench_mod);
     hbc_isolate_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
 
     const hbc_isolate = b.addExecutable(.{
@@ -10255,6 +10341,7 @@ pub fn build(b: *std.Build) void {
     replay_bench_root_mod.addImport("antfly_reranking", reranking_mod);
     replay_bench_root_mod.addImport("antfly_scraping", scraping_mod);
     replay_bench_root_mod.addImport("antfly_platform", platform_mod);
+    replay_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     addSnowballModule(b, replay_bench_root_mod);
     replay_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
 
@@ -10394,6 +10481,7 @@ pub fn build(b: *std.Build) void {
     algebraic_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     algebraic_bench_root_mod.addImport("antfly_regex", regex_mod);
     algebraic_bench_root_mod.addImport("antfly_platform", platform_mod);
+    algebraic_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     algebraic_bench_root_mod.addImport("antfly_reranking", reranking_mod);
     algebraic_bench_root_mod.addImport("antfly_resolver", resolver_mod);
     algebraic_bench_root_mod.addImport("antfly_reader_config", reader_config_mod);
@@ -10652,6 +10740,7 @@ pub fn build(b: *std.Build) void {
     });
     provisioned_dense_ingest_guardrail_mod.addImport("antfly-zig", lib_mod);
     provisioned_dense_ingest_guardrail_mod.addImport("antfly_platform", platform_mod);
+    provisioned_dense_ingest_guardrail_mod.addImport("antfly_hash", hash_mod);
 
     const provisioned_dense_ingest_guardrail = b.addExecutable(.{
         .name = "provisioned_dense_ingest_guardrail",
@@ -11020,17 +11109,15 @@ pub fn build(b: *std.Build) void {
                 // roots instead of discarding a successful production build.
                 .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast storage codegen reached
-                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
+                // 19.38 GB (18.05 GiB) with shared source/reference storage and
+                // the platform frameworks enabled. Reserve 20 GiB.
                 // A clean native aarch64-linux-musl production container build
                 // reached 19.89 GB (18.52 GiB) for the current production
                 // graph. Reserve 20 GiB on Linux so Zig's scheduler does
                 // not discard a successfully compiled production artifact.
                 // Use the same Linux-target claim for native and cross builds;
                 // the target artifact determines the dominant codegen shape.
-                .distributed => @as(usize, if (target.result.os.tag == .macos)
-                    18
-                else
-                    20) * 1024 * 1024 * 1024,
+                .distributed => 20 * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
                 // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS

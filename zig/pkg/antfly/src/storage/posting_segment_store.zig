@@ -46,27 +46,89 @@ pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation
 pub const RetainedSegment = union(enum) {
     heap: []u8,
     mapped: []align(std.heap.page_size_min) u8,
+    shared: *Shared,
+
+    const Shared = struct {
+        alloc: Allocator,
+        refs: std.atomic.Value(usize) = .init(1),
+        namespace: []u8,
+        descriptor: posting_wal.Checkpoint.Segment,
+        payload: RetainedSegment,
+        retirement_storage: ?lsm_backend.Storage.Lease = null,
+        retired: std.atomic.Value(bool) = .init(false),
+    };
+
+    /// Ownership of payload transfers only on success. Namespace and complete
+    /// immutable descriptor identity are required before a mapping is reused.
+    fn share(alloc: Allocator, payload: RetainedSegment, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment) !RetainedSegment {
+        const shared = try alloc.create(Shared);
+        errdefer alloc.destroy(shared);
+        shared.* = .{ .alloc = alloc, .payload = payload, .namespace = try alloc.dupe(u8, namespace), .descriptor = descriptor };
+        return .{ .shared = shared };
+    }
+
+    fn retainMatching(self: RetainedSegment, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment) ?RetainedSegment {
+        if (self != .shared or !std.mem.eql(u8, self.shared.namespace, namespace) or
+            !std.meta.eql(self.shared.descriptor, descriptor)) return null;
+        const previous = self.shared.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
+        return self;
+    }
+
+    /// Called by the serialized publication owner only after CURRENT is
+    /// durable and no longer references this immutable identity. The caller
+    /// holds a reference throughout; release of the last query lease performs
+    /// deletion after unmapping, including on platforms that forbid unlinking
+    /// a mapped file. Allocation/I/O failure leaves recoverable startup debt.
+    fn retireMatching(self: RetainedSegment, storage: lsm_backend.Storage, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment) bool {
+        if (self != .shared or !std.mem.eql(u8, self.shared.namespace, namespace) or
+            !std.meta.eql(self.shared.descriptor, descriptor)) return false;
+        if (!self.shared.retired.load(.acquire)) {
+            // Failure leaves an orphan for owner-only startup reclamation;
+            // it must not fall through to immediate deletion of a leased file.
+            self.shared.retirement_storage = storage.acquireLease() catch null;
+            self.shared.retired.store(true, .release);
+        }
+        return true;
+    }
 
     pub fn bytes(self: RetainedSegment) []const u8 {
         return switch (self) {
             .heap => |data| data,
             .mapped => |data| data,
+            .shared => |value| value.payload.bytes(),
         };
     }
 
     pub fn isMapped(self: RetainedSegment) bool {
-        return self == .mapped;
+        return if (self == .shared) self.shared.payload.isMapped() else self == .mapped;
     }
 
     pub fn mappedBytes(self: RetainedSegment) ?[]align(std.heap.page_size_min) u8 {
         return switch (self) {
             .mapped => |data| data,
             .heap => null,
+            .shared => |value| value.payload.mappedBytes(),
         };
     }
 
     pub fn deinit(self: *RetainedSegment, alloc: Allocator) void {
         switch (self.*) {
+            .shared => |value| {
+                if (value.refs.fetchSub(1, .acq_rel) == 1) {
+                    const owner = value.alloc;
+                    value.payload.deinit(owner);
+                    if (value.retired.load(.acquire)) if (value.retirement_storage) |*lease| {
+                        defer lease.deinit();
+                        if (checkpointSegmentPathAlloc(owner, value.namespace, value.descriptor.generation)) |path| {
+                            defer owner.free(path);
+                            lease.view.deleteFileAbsolute(path) catch {};
+                        } else |_| {}
+                    };
+                    owner.free(value.namespace);
+                    owner.destroy(value);
+                }
+            },
             .heap => |data| alloc.free(data),
             .mapped => |data| if (builtin.os.tag != .freestanding and builtin.os.tag != .windows and builtin.os.tag != .wasi)
                 std.posix.munmap(data)
@@ -83,6 +145,67 @@ pub const BatchRecord = struct {
     source_sequence: u64,
     payload: []const u8,
 };
+
+fn testSharedSegmentOwnership(alloc: Allocator) !void {
+    var payload = RetainedSegment{ .heap = try alloc.dupe(u8, "immutable segment") };
+    var payload_owned = true;
+    defer if (payload_owned) payload.deinit(alloc);
+    const descriptor = posting_wal.Checkpoint.Segment{ .generation = 3, .checksum = 17, .admission_checksum = 23 };
+    var original = try RetainedSegment.share(alloc, payload, "/index-a", descriptor);
+    payload_owned = false;
+    var original_owned = true;
+    defer if (original_owned) original.deinit(alloc);
+    try std.testing.expect(original.retainMatching("/index-b", descriptor) == null);
+    var changed = descriptor;
+    changed.admission_checksum += 1;
+    try std.testing.expect(original.retainMatching("/index-a", changed) == null);
+    var retained = original.retainMatching("/index-a", descriptor) orelse return error.TestUnexpectedResult;
+    defer retained.deinit(alloc);
+    try std.testing.expectEqual(original.bytes().ptr, retained.bytes().ptr);
+    original.deinit(alloc);
+    original_owned = false;
+    try std.testing.expectEqualStrings("immutable segment", retained.bytes());
+    try std.testing.expect(!retained.isMapped());
+    try std.testing.expect(retained.mappedBytes() == null);
+}
+
+test "storage.posting shared immutable segments retain namespace-bound payload ownership" {
+    try testSharedSegmentOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testSharedSegmentOwnership, .{});
+}
+
+test "storage.posting retired segment owns deletion storage past provider shutdown" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try checkpointSegmentPathAlloc(alloc, root, 1);
+    defer alloc.free(path);
+    var native = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    var native_owned = true;
+    defer if (native_owned) native.deinit();
+    try native.storage().writeFileAbsolute(path, "leased payload");
+    var payload = RetainedSegment{ .heap = try alloc.dupe(u8, "leased payload") };
+    var payload_owned = true;
+    defer if (payload_owned) payload.deinit(alloc);
+    const descriptor = posting_wal.Checkpoint.Segment{ .generation = 1 };
+    var segment = try RetainedSegment.share(alloc, payload, root, descriptor);
+    payload_owned = false;
+    var segment_owned = true;
+    defer if (segment_owned) segment.deinit(alloc);
+    try std.testing.expect(segment.retireMatching(native.storage(), root, descriptor));
+    _ = try native.storage().fileSize(path);
+    native.deinit();
+    native_owned = false;
+    try std.testing.expectEqualStrings("leased payload", segment.bytes());
+    segment.deinit(alloc);
+    segment_owned = false;
+    var verifier = try lsm_backend.NativeStorage.init(alloc, .threaded);
+    defer verifier.deinit();
+    try std.testing.expectError(error.FileNotFound, verifier.storage().fileSize(path));
+}
 
 pub const AppendOptions = struct {
     sync: bool = true,
@@ -319,6 +442,44 @@ pub const Store = struct {
         return if (self.checkpoint) |checkpoint| checkpoint.delta_segment_count else 0;
     }
 
+    /// Rotate only at a committed batch boundary. CURRENT first makes the
+    /// immutable extent recoverable together with the new append target;
+    /// checkpoint preparation can subsequently drop covered extents by name.
+    /// The caller owns the writer lane. An ambiguous CURRENT write poisons it.
+    pub fn sealWalForCheckpoint(self: *Store) !bool {
+        if (self.poisoned) return error.PostingStoreRequiresReopen;
+        var checkpoint = self.checkpoint orelse return error.MissingPostingCheckpoint;
+        const sealed_bytes = checkpoint.sealedWalBytes();
+        if (self.wal_committed_bytes == sealed_bytes) return false;
+        if (checkpoint.sealed_wal_count == posting_wal.Checkpoint.max_sealed_wals) return false;
+        const next_generation = std.math.add(u64, self.wal_generation, 1) catch return error.PostingWalGenerationOverflow;
+        const old_path = try self.walPathAlloc(self.wal_generation);
+        defer self.alloc.free(old_path);
+        const next_path = try self.walPathAlloc(next_generation);
+        defer self.alloc.free(next_path);
+        const current_path = try self.currentPathAlloc();
+        defer self.alloc.free(current_path);
+        try self.storage.syncFileContentsAbsolute(old_path);
+        try atomicReplace(self.alloc, self.storage, next_path, &.{});
+        checkpoint.sealed_wals[checkpoint.sealed_wal_count] = .{
+            .generation = self.wal_generation,
+            .committed_bytes = self.wal_committed_bytes - sealed_bytes,
+            .covered_source_sequence = self.covered_source_sequence,
+            .last_batch = self.last_committed_batch orelse return error.InvalidPostingWalBoundary,
+        };
+        checkpoint.sealed_wal_count += 1;
+        checkpoint.wal_generation = next_generation;
+        checkpoint.wal_committed_bytes = self.wal_committed_bytes;
+        const encoded = checkpoint.encode();
+        generation_publication.publishControlFile(self.alloc, self.storage, current_path, &encoded) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
+        self.checkpoint = checkpoint;
+        self.wal_generation = next_generation;
+        return true;
+    }
+
     pub fn markAuthoritative(self: *Store) !void {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, authority_name });
@@ -349,6 +510,8 @@ pub const Store = struct {
         covered_source_sequence: u64,
         options: AppendOptions,
     ) !void {
+        const trace = @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES");
+        const started = if (trace) @import("antfly_platform").time.monotonicNs() else 0;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint == null) return error.MissingPostingCheckpoint;
         if (records.len == 0) return error.EmptyPostingWalBatch;
@@ -372,6 +535,7 @@ pub const Store = struct {
 
         const wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(wal_path);
+        const encoded_at = if (trace) @import("antfly_platform").time.monotonicNs() else 0;
         self.storage.appendFileAbsolute(self.alloc, wal_path, writer.bytes(), options.sync) catch |err| {
             // The storage error may be ambiguous (for example fsync failed
             // after the append reached the page cache). Refuse retries on this
@@ -391,6 +555,10 @@ pub const Store = struct {
         }
         self.last_committed_batch = batch_id;
         self.covered_source_sequence = covered_source_sequence;
+        if (trace) std.log.info("dense WAL stages batch={} sequence={} records={} bytes={} encode_ns={} append_sync_ns={} sync={}", .{
+            batch_id,              covered_source_sequence,                                     records.len,  writer.bytes().len,
+            encoded_at -| started, @import("antfly_platform").time.monotonicNs() -| encoded_at, options.sync,
+        });
     }
 
     pub fn appendCoverage(self: *Store, batch_id: u64, covered_source_sequence: u64, options: AppendOptions) !void {
@@ -586,6 +754,25 @@ pub const Store = struct {
         );
     }
 
+    /// Streaming deltas carry the same durable receipt as full checkpoints;
+    /// publication must not require a second, corpus-sized heap copy.
+    pub fn publishStagedDeltaReceiptPreservingWalTail(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        flattened_wal_bytes: u64,
+        staged: StagedCheckpointSegment,
+    ) !void {
+        return try self.publishCheckpointInternalMode(
+            segment_generation,
+            covered_source_sequence,
+            null,
+            flattened_wal_bytes,
+            staged,
+            .delta,
+        );
+    }
+
     fn publishCheckpointInternal(
         self: *Store,
         segment_generation: u64,
@@ -604,7 +791,136 @@ pub const Store = struct {
         );
     }
 
-    const PublicationMode = enum { full, delta };
+    pub const PublicationMode = enum { full, delta, compact_deltas };
+
+    /// A durable candidate which is not authoritative until commitPrepared.
+    /// Reader construction/admission must happen before CURRENT changes. On
+    /// failure the old WAL and generation remain writable and recoverable.
+    pub const PreparedPublication = struct {
+        next: Store,
+        encoded: [posting_wal.Checkpoint.encoded_len]u8,
+        current_path: []u8,
+        previous_checkpoint: ?posting_wal.Checkpoint,
+        previous_wal_generation: u64,
+        previous_wal_bytes: u64,
+        previous_sequence: u64,
+        previous_batch: ?u64,
+        mode: PublicationMode,
+        committed: bool = false,
+        published_checkpoint: posting_wal.Checkpoint,
+
+        pub fn deinit(self: *PreparedPublication) void {
+            self.next.alloc.free(self.current_path);
+            self.next.deinit();
+        }
+
+        pub fn openReaders(self: *const PreparedPublication) !OpenedWithSegment {
+            return self.openReadersReusing(&.{});
+        }
+
+        pub fn openReadersReusing(self: *const PreparedPublication, previous: []const RetainedSegment) !OpenedWithSegment {
+            if (self.committed) return error.PostingPublicationAlreadyCommitted;
+            var next = self.next;
+            next.root_dir = try next.alloc.dupe(u8, next.root_dir);
+            errdefer next.deinit();
+            const checkpoint = next.checkpoint.?;
+            const segments = try next.alloc.alloc(RetainedSegment, checkpoint.segmentCount());
+            var count: usize = 0;
+            errdefer {
+                for (segments[0..count]) |*segment| segment.deinit(next.alloc);
+                next.alloc.free(segments);
+            }
+            for (segments, 0..) |*segment, index| {
+                const descriptor = checkpoint.segment(index);
+                segment.* = reuse: {
+                    for (previous) |retained| if (retained.retainMatching(next.root_dir, descriptor)) |shared|
+                        break :reuse shared;
+                    break :reuse try next.readSegmentRetainedFor(descriptor);
+                };
+                count += 1;
+            }
+            return .{ .store = next, .segments = segments };
+        }
+
+        /// Reclaim only names made obsolete by this transaction, never a
+        /// directory sweep which could race the next unpublished build.
+        pub fn reclaimObsolete(self: *const PreparedPublication) void {
+            self.reclaimObsoleteWithLeases(&.{});
+        }
+
+        pub fn reclaimObsoleteWithLeases(self: *const PreparedPublication, previous: []const RetainedSegment) void {
+            if (!self.committed) return;
+            const old = &self.next; // commit swaps the old store into next.
+            if (old.checkpoint) |checkpoint| {
+                for (0..checkpoint.segmentCount()) |index| {
+                    const descriptor = checkpoint.segment(index);
+                    var retained = false;
+                    for (0..self.published_checkpoint.segmentCount()) |next_index| {
+                        if (std.meta.eql(descriptor, self.published_checkpoint.segment(next_index))) {
+                            retained = true;
+                            break;
+                        }
+                    }
+                    if (retained) continue;
+                    for (previous) |segment| {
+                        if (segment.retireMatching(old.storage, old.root_dir, descriptor)) {
+                            retained = true;
+                            break;
+                        }
+                    }
+                    if (retained) continue;
+                    const path = old.segmentPathAlloc(descriptor.generation) catch continue;
+                    defer old.alloc.free(path);
+                    old.storage.deleteFileAbsolute(path) catch {};
+                }
+            }
+            if (old.checkpoint) |checkpoint| {
+                for (checkpoint.sealed_wals[0..checkpoint.sealed_wal_count]) |extent| {
+                    if (self.published_checkpoint.retainsWal(extent.generation)) continue;
+                    const path = old.walPathAlloc(extent.generation) catch continue;
+                    defer old.alloc.free(path);
+                    old.storage.deleteFileAbsolute(path) catch {};
+                }
+            }
+            if (!self.published_checkpoint.retainsWal(old.wal_generation)) {
+                const path = old.walPathAlloc(old.wal_generation) catch return;
+                defer old.alloc.free(path);
+                old.storage.deleteFileAbsolute(path) catch {};
+            }
+        }
+    };
+
+    pub fn prepareStagedReceiptPreservingWalTail(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        flattened_wal_bytes: u64,
+        staged: StagedCheckpointSegment,
+        mode: PublicationMode,
+    ) !PreparedPublication {
+        return self.prepareCheckpointInternalMode(segment_generation, covered_source_sequence, null, flattened_wal_bytes, staged, mode);
+    }
+
+    pub fn prepareCheckpoint(self: *Store, segment_generation: u64, covered_source_sequence: u64, segment_bytes: []const u8) !PreparedPublication {
+        return self.prepareCheckpointInternalMode(segment_generation, covered_source_sequence, segment_bytes, null, null, .full);
+    }
+
+    pub fn commitPrepared(self: *Store, prepared: *PreparedPublication) !void {
+        if (self.poisoned) return error.PostingStoreRequiresReopen;
+        if (prepared.committed) return error.PostingPublicationAlreadyCommitted;
+        if (!std.meta.eql(self.checkpoint, prepared.previous_checkpoint) or
+            self.wal_generation != prepared.previous_wal_generation or
+            self.wal_committed_bytes != prepared.previous_wal_bytes or
+            self.covered_source_sequence != prepared.previous_sequence or
+            self.last_committed_batch != prepared.previous_batch)
+            return error.InvalidPostingWalBoundary;
+        generation_publication.publishControlFile(self.alloc, self.storage, prepared.current_path, &prepared.encoded) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
+        std.mem.swap(Store, self, &prepared.next);
+        prepared.committed = true;
+    }
 
     fn publishCheckpointInternalMode(
         self: *Store,
@@ -615,6 +931,21 @@ pub const Store = struct {
         staged: ?StagedCheckpointSegment,
         mode: PublicationMode,
     ) !void {
+        var prepared = try self.prepareCheckpointInternalMode(segment_generation, covered_source_sequence, segment_bytes, flattened_wal_bytes, staged, mode);
+        defer prepared.deinit();
+        try self.commitPrepared(&prepared);
+        prepared.reclaimObsolete();
+    }
+
+    fn prepareCheckpointInternalMode(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        segment_bytes: ?[]const u8,
+        flattened_wal_bytes: ?u64,
+        staged: ?StagedCheckpointSegment,
+        mode: PublicationMode,
+    ) !PreparedPublication {
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint) |current| {
             if (segment_generation <= current.latestSegmentGeneration()) return error.OutOfOrderPostingSegmentGeneration;
@@ -625,6 +956,10 @@ pub const Store = struct {
                 return error.TooManyPostingDeltaSegments;
             }
         }
+        if (mode == .compact_deltas) {
+            const current = self.checkpoint orelse return error.MissingPostingCheckpoint;
+            if (current.delta_segment_count == 0) return error.MissingPostingDeltaSegments;
+        }
         if (staged == null) _ = try posting_segment.Reader.init(segment_bytes orelse return error.MissingPostingCheckpoint);
 
         var retained_wal: ?RecoveredWal = null;
@@ -633,7 +968,28 @@ pub const Store = struct {
         var tail_last_committed_batch: ?u64 = null;
         var tail_covered_source_sequence = covered_source_sequence;
         var tail_has_state_records = false;
-        if (flattened_wal_bytes) |prefix_bytes_u64| {
+        // A sealed-prefix receipt is an exact byte/sequence boundary, even
+        // when later maintenance batches have the same source sequence.
+        var reused_wals: ?posting_wal.Checkpoint = null;
+        if (flattened_wal_bytes) |prefix_bytes| if (self.checkpoint) |current| {
+            var bytes: u64 = 0;
+            for (current.sealed_wals[0..current.sealed_wal_count], 0..) |extent, i| {
+                bytes += extent.committed_bytes;
+                if (bytes != prefix_bytes or extent.covered_source_sequence != covered_source_sequence) continue;
+                var remaining = current;
+                remaining.sealed_wals = [_]posting_wal.Checkpoint.SealedWal{.{}} ** posting_wal.Checkpoint.max_sealed_wals;
+                remaining.sealed_wal_count = @intCast(current.sealed_wal_count - i - 1);
+                @memcpy(remaining.sealed_wals[0..remaining.sealed_wal_count], current.sealed_wals[i + 1 .. current.sealed_wal_count]);
+                reused_wals = remaining;
+                tail_last_committed_batch = if (self.wal_committed_bytes > prefix_bytes) self.last_committed_batch else null;
+                tail_covered_source_sequence = self.covered_source_sequence;
+                // Conservative debt accounting avoids reading payloads here.
+                tail_has_state_records = self.wal_has_state_records and self.wal_committed_bytes > prefix_bytes;
+                break;
+            }
+        };
+        if (flattened_wal_bytes != null and reused_wals == null) {
+            const prefix_bytes_u64 = flattened_wal_bytes.?;
             const prefix_bytes = std.math.cast(usize, prefix_bytes_u64) orelse return error.InvalidPostingWalBoundary;
             retained_wal = try self.recoverWal();
             const wal = &retained_wal.?;
@@ -672,12 +1028,12 @@ pub const Store = struct {
             {
                 return error.InvalidPostingWalBoundary;
             }
-        } else if (covered_source_sequence < self.covered_source_sequence) {
+        } else if (flattened_wal_bytes == null and covered_source_sequence < self.covered_source_sequence) {
             return error.OutOfOrderPostingCheckpointSequence;
         }
 
-        const next_wal_generation = std.math.add(u64, self.wal_generation, 1) catch
-            return error.PostingWalGenerationOverflow;
+        const next_wal_generation = if (reused_wals != null) self.wal_generation else std.math.add(u64, self.wal_generation, 1) catch return error.PostingWalGenerationOverflow;
+        const next_wal_bytes = if (reused_wals != null) self.wal_committed_bytes - flattened_wal_bytes.? else tail.len;
         const segment_path = try self.segmentPathAlloc(segment_generation);
         defer self.alloc.free(segment_path);
         const segment_checksum: u32 = if (staged) |receipt| blk: {
@@ -705,84 +1061,117 @@ pub const Store = struct {
             try generation_publication.replaceColdImmutable(self.alloc, self.storage, segment_path, segment_bytes.?);
         }
 
-        const next_wal_path = try self.walPathAlloc(next_wal_generation);
-        defer self.alloc.free(next_wal_path);
-        try atomicReplace(self.alloc, self.storage, next_wal_path, tail);
+        if (reused_wals == null) {
+            const next_wal_path = try self.walPathAlloc(next_wal_generation);
+            defer self.alloc.free(next_wal_path);
+            try atomicReplace(self.alloc, self.storage, next_wal_path, tail);
+        }
 
         var next_checkpoint: posting_wal.Checkpoint = .{
             .segment_generation = segment_generation,
             .segment_checksum = effective_segment_checksum,
             .segment_admission_checksum = segment_admission_checksum,
             .wal_generation = next_wal_generation,
-            .wal_committed_bytes = @intCast(tail.len),
+            .wal_committed_bytes = next_wal_bytes,
             .covered_source_sequence = covered_source_sequence,
         };
-        if (mode == .delta) {
+        if (reused_wals) |remaining| {
+            next_checkpoint.sealed_wal_count = remaining.sealed_wal_count;
+            next_checkpoint.sealed_wals = remaining.sealed_wals;
+        }
+        if (mode == .delta or mode == .compact_deltas) {
             const current = self.checkpoint.?;
             next_checkpoint.segment_generation = current.segment_generation;
             next_checkpoint.segment_checksum = current.segment_checksum;
             next_checkpoint.segment_admission_checksum = current.segment_admission_checksum;
-            next_checkpoint.delta_segment_count = current.delta_segment_count + 1;
-            next_checkpoint.delta_segments = current.delta_segments;
-            next_checkpoint.delta_segments[current.delta_segment_count] = .{
+            const retained_deltas: u8 = if (mode == .delta) current.delta_segment_count else 0;
+            next_checkpoint.delta_segment_count = retained_deltas + 1;
+            @memcpy(next_checkpoint.delta_segments[0..retained_deltas], current.delta_segments[0..retained_deltas]);
+            next_checkpoint.delta_segments[retained_deltas] = .{
                 .generation = segment_generation,
                 .checksum = effective_segment_checksum,
                 .admission_checksum = segment_admission_checksum,
             };
         }
         const published_segment_bytes: u64 = if (staged) |receipt| receipt.bytes else @intCast(segment_bytes.?.len);
-        const next_segment_bytes: u64 = if (mode == .delta)
-            std.math.add(u64, self.segment_bytes, published_segment_bytes) catch
-                return error.PostingSegmentTooLarge
-        else
-            published_segment_bytes;
+        const retained_segment_bytes: u64 = switch (mode) {
+            .full => 0,
+            .delta => self.segment_bytes,
+            .compact_deltas => blk: {
+                const base_path = try self.segmentPathAlloc(self.checkpoint.?.segment_generation);
+                defer self.alloc.free(base_path);
+                break :blk try self.storage.fileSize(base_path);
+            },
+        };
+        const next_segment_bytes: u64 =
+            std.math.add(u64, retained_segment_bytes, published_segment_bytes) catch
+                return error.PostingSegmentTooLarge;
         const encoded = next_checkpoint.encode();
         const current_path = try self.currentPathAlloc();
-        defer self.alloc.free(current_path);
-        generation_publication.publishControlFile(self.alloc, self.storage, current_path, &encoded) catch |err| {
-            self.poisoned = true;
-            return err;
+        errdefer self.alloc.free(current_path);
+        var next = self.*;
+        next.root_dir = try self.alloc.dupe(u8, self.root_dir);
+        next.checkpoint = next_checkpoint;
+        next.wal_generation = next_wal_generation;
+        next.wal_committed_bytes = next_wal_bytes;
+        next.wal_has_state_records = tail_has_state_records;
+        next.last_committed_batch = tail_last_committed_batch;
+        next.covered_source_sequence = tail_covered_source_sequence;
+        next.segment_bytes = next_segment_bytes;
+        return .{
+            .next = next,
+            .encoded = encoded,
+            .current_path = current_path,
+            .previous_checkpoint = self.checkpoint,
+            .previous_wal_generation = self.wal_generation,
+            .previous_wal_bytes = self.wal_committed_bytes,
+            .previous_sequence = self.covered_source_sequence,
+            .previous_batch = self.last_committed_batch,
+            .mode = mode,
+            .published_checkpoint = next_checkpoint,
         };
-
-        const previous = self.checkpoint;
-        const previous_wal_generation = self.wal_generation;
-        self.checkpoint = next_checkpoint;
-        self.wal_generation = next_wal_generation;
-        self.wal_committed_bytes = @intCast(tail.len);
-        self.wal_has_state_records = tail_has_state_records;
-        self.last_committed_batch = tail_last_committed_batch;
-        self.covered_source_sequence = tail_covered_source_sequence;
-        self.segment_bytes = next_segment_bytes;
-
-        // Preserve deterministic retirement for providers which do not yet
-        // support directory inventory; the reconciliation sweep additionally
-        // catches crash orphans and retries failed unlinks.
-        if (mode == .full) {
-            if (previous) |old| {
-                for (0..old.segmentCount()) |index| {
-                    const old_segment_path = self.segmentPathAlloc(old.segment(index).generation) catch continue;
-                    defer self.alloc.free(old_segment_path);
-                    self.storage.deleteFileAbsolute(old_segment_path) catch {};
-                }
-            }
-        }
-        if (self.walPathAlloc(previous_wal_generation)) |old_wal_path| {
-            defer self.alloc.free(old_wal_path);
-            self.storage.deleteFileAbsolute(old_wal_path) catch {};
-        } else |_| {}
-        self.reclaimUnreferencedFilesBestEffort();
     }
 
     pub fn recoverWal(self: *Store) !RecoveredWal {
         const wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(wal_path);
-        const bytes = self.storage.readFileAlloc(self.alloc, wal_path, max_wal_bytes + 1) catch |err| switch (err) {
+        const active = self.storage.readFileAlloc(self.alloc, wal_path, max_wal_bytes + 1) catch |err| switch (err) {
             error.FileNotFound => if (self.wal_committed_bytes == 0)
                 try self.alloc.alloc(u8, 0)
             else
                 return error.MissingPostingWal,
             else => return err,
         };
+        if (self.checkpoint == null or self.checkpoint.?.sealed_wal_count == 0) {
+            errdefer self.alloc.free(active);
+            if (active.len > max_wal_bytes) return error.PostingWalTooLarge;
+            return .{ .alloc = self.alloc, .bytes = active, .replay = try posting_wal.Replay.parse(self.alloc, active) };
+        }
+        defer self.alloc.free(active);
+        var combined = std.ArrayListUnmanaged(u8).empty;
+        defer combined.deinit(self.alloc);
+        if (self.checkpoint) |checkpoint| {
+            const sealed_bytes = checkpoint.sealedWalBytes();
+            if (sealed_bytes > max_wal_bytes or active.len > max_wal_bytes - sealed_bytes) return error.PostingWalTooLarge;
+            try combined.ensureTotalCapacity(self.alloc, @intCast(sealed_bytes + active.len));
+            for (checkpoint.sealed_wals[0..checkpoint.sealed_wal_count]) |extent| {
+                const path = try self.walPathAlloc(extent.generation);
+                defer self.alloc.free(path);
+                const bytes = self.storage.readFileAlloc(self.alloc, path, @intCast(extent.committed_bytes + 1)) catch |err| switch (err) {
+                    error.FileNotFound => return error.MissingPostingWal,
+                    else => return err,
+                };
+                defer self.alloc.free(bytes);
+                if (bytes.len != extent.committed_bytes) return error.InvalidPostingWalBoundary;
+                var replay = try posting_wal.Replay.parse(self.alloc, bytes);
+                defer replay.deinit();
+                if (replay.committed_bytes != bytes.len or replay.covered_source_sequence != extent.covered_source_sequence or
+                    replay.last_committed_batch != extent.last_batch) return error.InvalidPostingWalBoundary;
+                combined.appendSliceAssumeCapacity(bytes);
+            }
+        }
+        try combined.appendSlice(self.alloc, active);
+        const bytes = try combined.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(bytes);
         return .{
             .alloc = self.alloc,
@@ -836,7 +1225,7 @@ pub const Store = struct {
 
     fn artifactNameIsLive(self: *const Store, name: []const u8) bool {
         if (parseManagedGeneration(name, "wal-", ".afpw")) |generation|
-            return generation == self.wal_generation;
+            return if (self.checkpoint) |checkpoint| checkpoint.retainsWal(generation) else generation == self.wal_generation;
         if (parseManagedGeneration(name, "segment-", ".afps")) |generation| {
             const checkpoint = self.checkpoint orelse return false;
             for (0..checkpoint.segmentCount()) |index| {
@@ -881,18 +1270,24 @@ pub const Store = struct {
             if (published_checksum_matches) {
                 if (posting_segment.Reader.init(mapped)) |_| {
                     std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
-                    return .{ .mapped = mapped };
+                    var payload = RetainedSegment{ .mapped = mapped };
+                    errdefer payload.deinit(self.alloc);
+                    return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
                 } else |_| {}
             }
             std.posix.munmap(mapped);
         } else |_| {}
-        return .{ .heap = try self.readSegmentAllocFor(descriptor) };
+        var payload = RetainedSegment{ .heap = try self.readSegmentAllocFor(descriptor) };
+        errdefer payload.deinit(self.alloc);
+        return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
     }
 
     fn replaceWal(self: *Store, contents: []const u8) !void {
         const path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(path);
-        try atomicReplace(self.alloc, self.storage, path, contents);
+        const sealed_bytes: usize = @intCast(if (self.checkpoint) |checkpoint| checkpoint.sealedWalBytes() else 0);
+        if (contents.len < sealed_bytes) return error.InvalidPostingWalBoundary;
+        try atomicReplace(self.alloc, self.storage, path, contents[sealed_bytes..]);
         self.wal_committed_bytes = @intCast(contents.len);
     }
 
@@ -1266,6 +1661,203 @@ test "storage.posting segment publication preserves the exact committed WAL tail
     try std.testing.expectEqualStrings("same-sequence-tail", replay.replay.latest(3, .base).?.payload);
 }
 
+test "storage.posting sealed WAL handoff reuses the active file and recovers same-sequence tails" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-sealed");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(3, 10, "base");
+    const initial = try writer.build();
+    defer alloc.free(initial);
+    try store.publishCheckpoint(1, 10, initial);
+    try store.appendBatch(try store.nextBatchId(), &.{.{ .kind = .base, .posting_id = 3, .source_sequence = 11, .payload = "sealed" }}, 11);
+    const prefix_bytes = store.wal_committed_bytes;
+    const sealed_generation = store.wal_generation;
+    try std.testing.expect(try store.sealWalForCheckpoint());
+    const active_generation = store.wal_generation;
+    try std.testing.expectEqual(@as(u8, 1), store.checkpoint.?.sealed_wal_count);
+    // Crash/reopen before checkpoint publication must retain the old base and
+    // its entire sealed prefix, even though the append target is now empty.
+    var before = try Store.open(alloc, memory.storage(), "/posting-sealed");
+    defer before.deinit();
+    try std.testing.expectEqual(@as(u64, 11), before.covered_source_sequence);
+    try std.testing.expectEqual(prefix_bytes, before.wal_committed_bytes);
+    try store.appendBatch(try store.nextBatchId(), &.{.{ .kind = .base, .posting_id = 3, .source_sequence = 11, .payload = "same-sequence-tail" }}, 11);
+    const active_bytes = store.wal_committed_bytes - prefix_bytes;
+    var next_writer = posting_segment.Writer.init(alloc);
+    defer next_writer.deinit();
+    try next_writer.appendBaseAt(3, 11, "sealed");
+    const next = try next_writer.build();
+    defer alloc.free(next);
+    const staged = try store.stageCheckpointSegment(2, next);
+    var prepared = try store.prepareStagedReceiptPreservingWalTail(2, 11, prefix_bytes, staged, .full);
+    defer prepared.deinit();
+    try std.testing.expectEqual(active_generation, prepared.next.wal_generation);
+    try std.testing.expectEqual(active_bytes, prepared.next.wal_committed_bytes);
+    try store.commitPrepared(&prepared);
+    prepared.reclaimObsolete();
+    try std.testing.expectEqual(active_generation, store.wal_generation);
+    const sealed_path = try store.walPathAlloc(sealed_generation);
+    defer alloc.free(sealed_path);
+    try std.testing.expectError(error.FileNotFound, memory.storage().fileSize(sealed_path));
+    var reopened = try Store.open(alloc, memory.storage(), "/posting-sealed");
+    defer reopened.deinit();
+    var replay = try reopened.recoverWal();
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("same-sequence-tail", replay.replay.latest(3, .base).?.payload);
+    try std.testing.expectEqual(@as(?u64, 2), reopened.last_committed_batch);
+    try reopened.appendCoverage(try reopened.nextBatchId(), 12, .{ .sync = true });
+}
+
+test "storage.posting ambiguous WAL seal requires reopen and preserves the committed extent" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-seal-ambiguous");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(1, 0, "base");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    try store.publishCheckpoint(1, 0, bytes);
+    try store.appendBatch(1, &.{.{ .kind = .base, .posting_id = 1, .source_sequence = 1, .payload = "committed" }}, 1);
+    generation_publication.injectPostPublishFailuresForTest(2);
+    defer generation_publication.injectPostPublishFailuresForTest(0);
+    try std.testing.expectError(error.GenerationPublicationDurabilityUncertain, store.sealWalForCheckpoint());
+    try std.testing.expectError(error.PostingStoreRequiresReopen, store.appendCoverage(2, 2, .{}));
+    try std.testing.expectError(error.PostingStoreRequiresReopen, store.sealWalForCheckpoint());
+    var recovered = try Store.open(alloc, memory.storage(), "/posting-seal-ambiguous");
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u8, 1), recovered.checkpoint.?.sealed_wal_count);
+    try std.testing.expectEqual(@as(u64, 1), recovered.covered_source_sequence);
+    try recovered.appendCoverage(2, 2, .{});
+    var replay = try recovered.recoverWal();
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("committed", replay.replay.latest(1, .base).?.payload);
+    try std.testing.expectEqual(@as(u64, 2), replay.replay.covered_source_sequence);
+}
+
+test "storage.posting sealed extents survive active-tail truncation and reject missing extents" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-sealed-tail");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    const initial = try writer.build();
+    defer alloc.free(initial);
+    try store.publishCheckpoint(1, 0, initial);
+    try store.appendCoverage(try store.nextBatchId(), 1, .{ .sync = true });
+    try std.testing.expect(try store.sealWalForCheckpoint());
+    const sealed_generation = store.checkpoint.?.sealed_wals[0].generation;
+    try store.appendCoverage(try store.nextBatchId(), 2, .{ .sync = true });
+    const active_path = try store.walPathAlloc(store.wal_generation);
+    defer alloc.free(active_path);
+    const active_bytes = try memory.storage().fileSize(active_path);
+    try memory.storage().appendFileAbsolute(alloc, active_path, "partial", false);
+    var reopened = try Store.open(alloc, memory.storage(), "/posting-sealed-tail");
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 2), reopened.covered_source_sequence);
+    try std.testing.expectEqual(active_bytes, try memory.storage().fileSize(active_path));
+    const sealed_path = try store.walPathAlloc(sealed_generation);
+    defer alloc.free(sealed_path);
+    try memory.storage().deleteFileAbsolute(sealed_path);
+    try std.testing.expectError(error.MissingPostingWal, Store.open(alloc, memory.storage(), "/posting-sealed-tail"));
+}
+
+test "storage.posting checkpoint retains newer sealed extents across prefix reclamation" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-multiple-extents");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    const segment = try writer.build();
+    defer alloc.free(segment);
+    try store.publishCheckpoint(1, 0, segment);
+    var prefix: u64 = 0;
+    for (1..4) |sequence| {
+        try store.appendCoverage(try store.nextBatchId(), sequence, .{ .sync = true });
+        if (sequence == 1) prefix = store.wal_committed_bytes;
+        try std.testing.expect(try store.sealWalForCheckpoint());
+    }
+    const before = store.checkpoint.?;
+    const staged = try store.stageCheckpointSegment(2, segment);
+    var prepared = try store.prepareStagedReceiptPreservingWalTail(2, 1, prefix, staged, .full);
+    defer prepared.deinit();
+    try store.commitPrepared(&prepared);
+    prepared.reclaimObsolete();
+    try std.testing.expectEqual(@as(u8, 2), store.checkpoint.?.sealed_wal_count);
+    try std.testing.expectEqual(before.wal_generation, store.wal_generation);
+    _ = try store.reclaimUnreferencedFiles();
+    for (before.sealed_wals[1..3]) |extent| {
+        const path = try store.walPathAlloc(extent.generation);
+        defer alloc.free(path);
+        try std.testing.expectEqual(extent.committed_bytes, try memory.storage().fileSize(path));
+    }
+    var reopened = try Store.open(alloc, memory.storage(), "/posting-multiple-extents");
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 3), reopened.covered_source_sequence);
+    try std.testing.expectEqual(@as(?u64, 3), reopened.last_committed_batch);
+    try std.testing.expectEqual(store.wal_committed_bytes, reopened.wal_committed_bytes);
+    try reopened.appendCoverage(try reopened.nextBatchId(), 4, .{ .sync = true });
+}
+
+test "storage.posting prepared checkpoint leaves CURRENT writable on reader failure and rejects stale tails" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-prepared");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(7, 10, "base");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    try store.publishCheckpoint(1, 10, bytes);
+    const staged = try store.stageCheckpointSegment(2, bytes);
+    var prepared = try store.prepareStagedReceiptPreservingWalTail(2, 10, 0, staged, .full);
+    defer prepared.deinit();
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    prepared.next.alloc = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, prepared.openReaders());
+    prepared.next.alloc = alloc;
+    var observed = try Store.open(alloc, memory.storage(), "/posting-prepared");
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), observed.latestSegmentGeneration());
+    try std.testing.expect(!store.poisoned);
+
+    // Same-sequence maintenance must invalidate the prepared byte boundary.
+    try store.appendBatch(try store.nextBatchId(), &.{.{ .kind = .base, .posting_id = 7, .source_sequence = 10, .payload = "tail" }}, 10);
+    try std.testing.expectError(error.InvalidPostingWalBoundary, store.commitPrepared(&prepared));
+    var refreshed = try store.prepareStagedReceiptPreservingWalTail(2, 10, 0, staged, .full);
+    defer refreshed.deinit();
+    var readers = try refreshed.openReaders();
+    defer {
+        for (readers.segments) |*segment| segment.deinit(alloc);
+        alloc.free(readers.segments);
+        readers.store.deinit();
+    }
+    var replay = try readers.store.recoverWal();
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("tail", replay.replay.latest(7, .base).?.payload);
+    try store.commitPrepared(&refreshed);
+    try std.testing.expectEqual(@as(?u64, 2), store.latestSegmentGeneration());
+    try std.testing.expectError(error.PostingPublicationAlreadyCommitted, store.commitPrepared(&refreshed));
+    refreshed.reclaimObsolete();
+    var reopened = try Store.open(alloc, memory.storage(), "/posting-prepared");
+    defer reopened.deinit();
+    try std.testing.expectEqual(store.wal_committed_bytes, reopened.wal_committed_bytes);
+    try std.testing.expectEqual(store.checkpoint, reopened.checkpoint);
+}
+
 test "storage.posting delta publication survives restart and full compaction" {
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
@@ -1323,6 +1915,62 @@ test "storage.posting delta publication survives restart and full compaction" {
     try std.testing.expectError(error.FileNotFound, memory.storage().fileSize("/posting-delta-chain/segment-1.afps"));
     try std.testing.expectError(error.FileNotFound, memory.storage().fileSize("/posting-delta-chain/segment-2.afps"));
     _ = try memory.storage().fileSize("/posting-delta-chain/segment-3.afps");
+}
+
+test "storage.posting suffix compaction retains base and delays retired files until leases release" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-fold");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(7, 1, "base");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    try store.publishCheckpoint(1, 1, bytes);
+    for (2..10) |generation| {
+        const staged = try store.stageCheckpointSegment(generation, bytes);
+        try store.publishStagedDeltaPreservingWalTail(generation, 1, bytes, 0, staged);
+    }
+    var old = try Store.openWithSegmentAlloc(alloc, memory.storage(), "/posting-fold");
+    defer old.store.deinit();
+    var old_owned = true;
+    defer if (old_owned) {
+        for (old.segments) |*segment| segment.deinit(alloc);
+        alloc.free(old.segments);
+    };
+    const staged = try store.stageCheckpointSegment(10, bytes);
+    var prepared = try store.prepareStagedReceiptPreservingWalTail(10, 1, 0, staged, .compact_deltas);
+    defer prepared.deinit();
+    var next = try prepared.openReadersReusing(old.segments);
+    defer {
+        for (next.segments) |*segment| segment.deinit(alloc);
+        alloc.free(next.segments);
+        next.store.deinit();
+    }
+    try std.testing.expectEqual(old.segments[0].bytes().ptr, next.segments[0].bytes().ptr);
+    // Before CURRENT commits, neither live nor staged identities are removed.
+    prepared.reclaimObsoleteWithLeases(old.segments);
+    _ = try memory.storage().fileSize("/posting-fold/segment-2.afps");
+    try store.commitPrepared(&prepared);
+    prepared.reclaimObsoleteWithLeases(old.segments);
+    try std.testing.expectEqual(@as(u8, 1), store.checkpoint.?.delta_segment_count);
+    try std.testing.expectEqual(@as(u64, bytes.len * 2), store.segment_bytes);
+    _ = try memory.storage().fileSize("/posting-fold/segment-2.afps");
+    for (old.segments) |*segment| segment.deinit(alloc);
+    alloc.free(old.segments);
+    old_owned = false;
+    // MemoryStorage has no owned lifetime lease. Unsupported retirement is
+    // deliberately left as startup debt, never a borrowed callback.
+    _ = try memory.storage().fileSize("/posting-fold/segment-2.afps");
+    _ = try store.reclaimUnreferencedFiles();
+    try std.testing.expectError(error.FileNotFound, memory.storage().fileSize("/posting-fold/segment-2.afps"));
+    _ = try memory.storage().fileSize("/posting-fold/segment-1.afps");
+    var reopened = try Store.open(alloc, memory.storage(), "/posting-fold");
+    defer reopened.deinit();
+    try std.testing.expectEqual(store.checkpoint, reopened.checkpoint);
+    try std.testing.expectEqual(@as(u64, bytes.len * 2), reopened.segment_bytes);
 }
 
 test "storage.posting segment publication rejects a non-commit WAL boundary" {

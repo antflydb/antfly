@@ -119,6 +119,9 @@ pub const NamespaceReadTxn = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     read_lease: ?ReadLease = null,
+    /// Optional adapter-owned value pins. Release these before the generation
+    /// lease: cached decoded values may borrow its accounting/allocator owner.
+    value_lease: ?ReadLease = null,
     /// Optional owner-defined epoch captured immediately before this snapshot
     /// opened. HBC uses it to reject cache fills when publication advanced
     /// after the transaction was created; storage backends remain unaware of
@@ -134,8 +137,10 @@ pub const NamespaceReadTxn = struct {
 
     pub fn abort(self: *NamespaceReadTxn) void {
         const read_lease = self.read_lease;
+        const value_lease = self.value_lease;
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
+        if (value_lease) |lease| lease.release(lease.ptr);
         if (read_lease) |lease| lease.release(lease.ptr);
     }
 

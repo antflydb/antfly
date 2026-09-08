@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
@@ -520,10 +521,21 @@ pub const FileTrailer = struct {
 pub const Storage = struct {
     pub const Trailer = FileTrailer;
 
+    pub const Lease = struct {
+        view: Storage,
+        release: *const fn (*anyopaque) void,
+
+        pub fn deinit(self: *Lease) void {
+            self.release(self.view.ptr);
+            self.* = undefined;
+        }
+    };
+
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         read_file_alloc: *const fn (*anyopaque, Allocator, []const u8, usize) anyerror![]u8,
         read_file_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
@@ -540,6 +552,7 @@ pub const Storage = struct {
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
         begin_cold_sequential_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
         begin_cold_random_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
+        try_begin_cold_random_reads: ?*const fn (*anyopaque, Allocator, []const []const u8) anyerror!?[]ColdSequentialReader = null,
         cold_sequential_reader_capacity: ?*const fn (*anyopaque) usize = null,
         /// Persists file contents without implying namespace durability.
         sync_contents_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
@@ -565,6 +578,13 @@ pub const Storage = struct {
 
     pub fn createDirPath(self: Storage, path: []const u8) !void {
         return self.vtable.create_dir_path(self.ptr, path);
+    }
+
+    /// Providers must explicitly support ownership. A borrowed fallback would
+    /// turn delayed maintenance into a use-after-free during index shutdown.
+    pub fn acquireLease(self: Storage) !Lease {
+        const acquire = self.vtable.acquire_lease orelse return error.UnsupportedStorageLease;
+        return acquire(self.ptr);
     }
 
     pub fn readFileAlloc(self: Storage, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -691,6 +711,15 @@ pub const Storage = struct {
         return try GenericColdSequentialReader.create(allocator, self, path);
     }
 
+    /// All-or-nothing private-reader admission. Never waits for descriptors:
+    /// callers may already own a checkpoint output and must not hold that
+    /// resource while waiting for another builder's partial input set.
+    /// Null means use the existing generation's positional read path.
+    pub fn tryBeginColdRandomReads(self: Storage, allocator: Allocator, paths: []const []const u8) !?[]ColdSequentialReader {
+        const begin = self.vtable.try_begin_cold_random_reads orelse return null;
+        return try begin(self.ptr, allocator, paths);
+    }
+
     /// Acquires a descriptor/handle bound to the currently opened file, not a
     /// path which may later be atomically replaced. Generation capture uses
     /// this stronger contract so materialization can safely outlive mutation
@@ -703,6 +732,14 @@ pub const Storage = struct {
 
     pub fn beginSequentialRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
         return try GenericColdSequentialReader.create(allocator, self, path);
+    }
+
+    /// A cursor over an immutable path pinned by the caller's run snapshot.
+    /// Private cold descriptors live only for one read window, never across
+    /// admission for another input or the output writer. Unlike a stable file
+    /// lease, this must not be used for replaceable WAL or CURRENT paths.
+    pub fn beginWindowedColdRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
+        return try GenericColdSequentialReader.createWithPolicy(allocator, self, path, self.coldSequentialReaderCapacity() != 0);
     }
 
     /// Maximum private maintenance descriptors that can coexist while
@@ -781,6 +818,7 @@ const GenericColdSequentialReader = struct {
     allocator: Allocator,
     storage: Storage,
     path: []u8,
+    cold_windows: bool = false,
 
     const vtable: ColdSequentialReader.VTable = .{
         .read_range_alloc = readRangeAlloc,
@@ -791,30 +829,48 @@ const GenericColdSequentialReader = struct {
     };
 
     fn create(allocator: Allocator, storage: Storage, path: []const u8) !ColdSequentialReader {
+        return createWithPolicy(allocator, storage, path, false);
+    }
+
+    fn createWithPolicy(allocator: Allocator, storage: Storage, path: []const u8, cold_windows: bool) !ColdSequentialReader {
         const self = try allocator.create(GenericColdSequentialReader);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .storage = storage,
             .path = try allocator.dupe(u8, path),
+            .cold_windows = cold_windows,
         };
         return .{ .ptr = self, .vtable = &vtable };
     }
 
     fn readRangeAlloc(ptr: *anyopaque, allocator: Allocator, offset: u64, len: usize) ![]u8 {
         const self: *GenericColdSequentialReader = @ptrCast(@alignCast(ptr));
+        if (self.cold_windows) {
+            var window = try self.storage.beginColdSequentialRead(self.allocator, self.path);
+            defer window.deinit();
+            return try window.readRangeAlloc(allocator, offset, len);
+        }
         return try self.storage.readFileRangeAlloc(allocator, self.path, offset, len);
     }
 
     fn readRangeInto(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *GenericColdSequentialReader = @ptrCast(@alignCast(ptr));
-        const bytes = try self.storage.readFileRangeAlloc(self.allocator, self.path, offset, out.len);
-        defer self.allocator.free(bytes);
-        if (bytes.len != out.len) return error.EndOfStream;
-        @memcpy(out, bytes);
+        if (self.cold_windows) {
+            var window = try self.storage.beginColdSequentialRead(self.allocator, self.path);
+            defer window.deinit();
+            return try window.readRangeInto(offset, out);
+        }
+        return try self.storage.readFileRangeInto(self.allocator, self.path, offset, out);
     }
 
     fn readRangesInto(ptr: *anyopaque, ranges: []const ColdReadRange) !ColdReadStats {
+        const self: *GenericColdSequentialReader = @ptrCast(@alignCast(ptr));
+        if (self.cold_windows and ranges.len != 0) {
+            var window = try self.storage.beginColdSequentialRead(self.allocator, self.path);
+            defer window.deinit();
+            return try window.readRangesInto(ranges);
+        }
         var stats: ColdReadStats = .{};
         for (ranges) |range| {
             try readRangeInto(ptr, range.offset, range.destination);
@@ -919,13 +975,13 @@ const BufferedAtomicWriteSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -995,6 +1051,9 @@ const FdCache = if (!supports_posix_fd_cache)
         pub fn invalidateRename(_: *FdCache, _: u64, _: []const u8, _: []const u8) void {}
         pub fn invalidateNamespace(_: *FdCache, _: u64) void {}
         pub fn reserveDescriptors(_: *FdCache, _: std.Io, _: usize) !void {}
+        pub fn tryReserveDescriptors(_: *FdCache, _: std.Io, _: usize) bool {
+            return false;
+        }
         pub fn releaseDescriptors(_: *FdCache, _: std.Io, _: usize) void {}
         pub fn reservePersistentDescriptors(_: *FdCache, _: std.Io, _: usize) !void {}
         pub fn releasePersistentDescriptors(_: *FdCache, _: std.Io, _: usize) void {}
@@ -1339,6 +1398,17 @@ else
             }
             if (locked) shard.mutex.unlock();
             if (removed) self.signalAdmissionChanged(io);
+        }
+
+        fn tryReserveDescriptors(self: *FdCache, io: std.Io, count: usize) bool {
+            if (count == 0) return true;
+            if (count > self.capacity - self.persistent_reserve) return false;
+            self.admission_mutex.lockUncancelable(io);
+            defer self.admission_mutex.unlock(io);
+            // Do not bypass a queued operation or retain a partial reservation.
+            if (self.admission_head != null or !self.makeCapacityAvailable(count)) return false;
+            _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
+            return true;
         }
 
         fn reserveDescriptors(self: *FdCache, io: std.Io, count: usize) !void {
@@ -1738,6 +1808,17 @@ const NativeStorageState = struct {
         };
     }
 
+    fn tryAcquireFdPermits(self: *NativeStorageState, count: usize) !?NativeFdPermit {
+        const retained = try self.retain();
+        const io = retained.threaded.io();
+        const cache = retained.fdCache();
+        if (!cache.tryReserveDescriptors(io, count)) {
+            retained.release();
+            return null;
+        }
+        return .{ .state = retained, .cache = cache, .io = io, .count = count };
+    }
+
     fn retain(self: *NativeStorageState) !*NativeStorageState {
         while (true) {
             const current = self.refs.load(.acquire);
@@ -1989,6 +2070,7 @@ else blk: {
                 .begin_atomic_write = beginAtomicWrite,
                 .begin_cold_sequential_read = beginColdSequentialRead,
                 .begin_cold_random_read = beginColdRandomRead,
+                .try_begin_cold_random_reads = tryBeginNativeColdRandomReads,
                 .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
                 .sync_contents_absolute = syncFileContentsAbsolute,
                 .sync_parent_absolute = syncParentAbsolute,
@@ -2275,6 +2357,7 @@ else blk: {
         };
 
         const threaded_only_vtable: Storage.VTable = .{
+            .acquire_lease = acquireErasedLease,
             .create_dir_path = createDirPath,
             .read_file_alloc = readFileAlloc,
             .read_file_range_alloc = readFileRangeAlloc,
@@ -2288,6 +2371,7 @@ else blk: {
             .begin_atomic_write = beginAtomicWrite,
             .begin_cold_sequential_read = beginColdSequentialRead,
             .begin_cold_random_read = beginColdRandomRead,
+            .try_begin_cold_random_reads = tryBeginNativeColdRandomReads,
             .cold_sequential_reader_capacity = coldSequentialReaderCapacity,
             .sync_contents_absolute = syncFileContentsAbsolute,
             .sync_parent_absolute = syncParentAbsolute,
@@ -2333,6 +2417,20 @@ else blk: {
         /// once shutdown has started.
         pub fn acquireLease(self: *NativeStorage) !Lease {
             return .{ .state = try self.state.acquireLease() };
+        }
+
+        fn acquireErasedLease(ptr: *anyopaque) !Storage.Lease {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.acquireLease();
+            return .{
+                .view = .{ .ptr = retained, .vtable = &threaded_only_vtable },
+                .release = releaseErasedLease,
+            };
+        }
+
+        fn releaseErasedLease(ptr: *anyopaque) void {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            state.release();
         }
 
         pub fn beginAtomicWriteWithPermit(
@@ -3064,13 +3162,13 @@ const NativeBufferedAtomicWriteSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -3116,6 +3214,24 @@ const native_buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
     .finish = NativeBufferedAtomicWriteSink.finish,
     .abort = NativeBufferedAtomicWriteSink.abort,
 };
+
+fn tryBeginNativeColdRandomReads(ptr: *anyopaque, allocator: Allocator, paths: []const []const u8) !?[]ColdSequentialReader {
+    if (paths.len == 0) return try allocator.alloc(ColdSequentialReader, 0);
+    const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+    var reservation = (try state.tryAcquireFdPermits(paths.len)) orelse return null;
+    defer reservation.release();
+    const readers = try allocator.alloc(ColdSequentialReader, paths.len);
+    errdefer allocator.free(readers);
+    var initialized: usize = 0;
+    errdefer for (readers[0..initialized]) |*reader| reader.deinit();
+    for (paths, readers) |path, *reader| {
+        var permit = if (reservation.count == 1) reservation.take() else try reservation.splitOne();
+        defer permit.release();
+        reader.* = try NativeColdSequentialReader.createWithPermit(allocator, path, &permit, .random);
+        initialized += 1;
+    }
+    return readers;
+}
 
 fn nativeColdSequentialReaderCapacity(state: *const NativeStorageState) usize {
     if (comptime !supports_posix_fd_cache) return 0;
@@ -3177,7 +3293,12 @@ const NativeColdSequentialReader = struct {
         if (comptime !supports_posix_fd_cache) return error.UnsupportedNativeStorageRuntime;
 
         var permit = try state.acquireFdPermit();
-        errdefer permit.release();
+        defer permit.release();
+        return try createWithPermit(allocator, path, &permit, intent);
+    }
+
+    fn createWithPermit(allocator: Allocator, path: []const u8, permit: *NativeFdPermit, intent: Intent) !ColdSequentialReader {
+        if (comptime !supports_posix_fd_cache) return error.UnsupportedNativeStorageRuntime;
         const opened = try openCold(path);
         errdefer closeFd(opened.fd);
 
@@ -3514,7 +3635,7 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (range_offset > self.bytes_written or range_len > self.bytes_written - range_offset) return error.InvalidAtomicWriteOffset;
 
-        var crc = std.hash.Crc32.init();
+        var crc = Crc32.init();
         var offset: usize = 0;
         var buf: [64 * 1024]u8 = undefined;
         while (offset < range_len) {
@@ -4144,6 +4265,90 @@ test "cold sequential reader is isolated from foreground descriptor cache" {
     try std.testing.expectEqual(before, native.snapshotStats().fd_admitted_descriptors);
 }
 
+test "windowed cold cursors release input admission before output work" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 4);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/window-input", .{tmp.sub_path});
+    defer alloc.free(input);
+    const output = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/window-output", .{tmp.sub_path});
+    defer alloc.free(output);
+    try native.storage().writeFileAbsolute(input, "abcdefgh");
+    const baseline = native.snapshotStats().fd_admitted_descriptors;
+    var cursors: [32]ColdSequentialReader = undefined;
+    var initialized: usize = 0;
+    defer for (cursors[0..initialized]) |*cursor| cursor.deinit();
+    for (&cursors) |*cursor| {
+        cursor.* = try native.storage().beginWindowedColdRead(alloc, input);
+        initialized += 1;
+    }
+    // A merge wider than the descriptor pool owns no input permits between
+    // windows. Opening output cannot wait behind its own retained inputs.
+    try std.testing.expectEqual(baseline, native.snapshotStats().fd_admitted_descriptors);
+    // Directory creation itself needs two transient permits even when the
+    // path exists. The old one-output-slot estimate deadlocked at this edge.
+    try native.storage().createDirPath(std.fs.path.dirname(output).?);
+    var sink = try native.storage().beginAtomicWrite(alloc, output);
+    var sink_active = true;
+    defer if (sink_active) sink.abort();
+    const with_output = native.snapshotStats().fd_admitted_descriptors;
+    for (&cursors) |*cursor| {
+        var bytes: [4]u8 = undefined;
+        try cursor.readRangeInto(2, &bytes);
+        try std.testing.expectEqualStrings("cdef", &bytes);
+        try std.testing.expectEqual(with_output, native.snapshotStats().fd_admitted_descriptors);
+        try sink.appendSlice(&bytes);
+    }
+    var first: [2]u8 = undefined;
+    var last: [2]u8 = undefined;
+    const stats = try cursors[0].readRangesInto(&.{
+        .{ .offset = 0, .destination = &first },
+        .{ .offset = 6, .destination = &last },
+    });
+    try std.testing.expectEqualStrings("ab", &first);
+    try std.testing.expectEqualStrings("gh", &last);
+    try std.testing.expectEqual(@as(u64, 4), stats.logical_bytes);
+    const owned = try cursors[0].readRangeAlloc(alloc, 1, 3);
+    defer alloc.free(owned);
+    try std.testing.expectEqualStrings("bcd", owned);
+    try std.testing.expectError(error.EndOfStream, cursors[0].readRangeInto(8, &first));
+    try std.testing.expectEqual(with_output, native.snapshotStats().fd_admitted_descriptors);
+    sink_active = false;
+    try sink.finish();
+    try std.testing.expectEqual(baseline, native.snapshotStats().fd_admitted_descriptors);
+}
+
+test "cold reader group admission is atomic and releases failed opens" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 8);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/group-read", .{tmp.sub_path});
+    defer alloc.free(path);
+    try native.storage().writeFileAbsolute(path, "payload");
+    const baseline = native.snapshotStats().fd_admitted_descriptors;
+    const first = (try native.storage().tryBeginColdRandomReads(alloc, &.{ path, path, path })).?;
+    defer alloc.free(first);
+    // A second complete set cannot fit. It must return immediately without
+    // reserving any partial set, even while the first set remains retained.
+    const held = native.snapshotStats().fd_admitted_descriptors;
+    try std.testing.expect((try native.storage().tryBeginColdRandomReads(alloc, &.{ path, path, path, path })) == null);
+    try std.testing.expectEqual(held, native.snapshotStats().fd_admitted_descriptors);
+    for (first) |*reader| reader.deinit();
+    try std.testing.expectEqual(baseline, native.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expectError(error.FileNotFound, native.storage().tryBeginColdRandomReads(alloc, &.{ path, "/missing-antfly-cold-group-file" }));
+    try std.testing.expectEqual(baseline, native.snapshotStats().fd_admitted_descriptors);
+}
+
 test "cold sequential reader capacity preserves output and persistent admission" {
     if (!supports_posix_fd_cache) return error.SkipZigTest;
 
@@ -4179,7 +4384,7 @@ test "native atomic write sink supports patching and crc before finish" {
 
     try writer.appendSlice("hello _____");
     try writer.writeAt(6, "world");
-    try std.testing.expectEqual(std.hash.Crc32.hash("hello world"), try writer.crc32Prefix(writer.len()));
+    try std.testing.expectEqual(Crc32.hash("hello world"), try writer.crc32Prefix(writer.len()));
 
     active = false;
     try writer.finish();
@@ -4977,7 +5182,7 @@ test "native buffered atomic write sink retains invalidation state past storage 
 
     try writer.appendSlice("buffered _____");
     try writer.writeAt(9, "lease");
-    try std.testing.expectEqual(std.hash.Crc32.hash("buffered lease"), try writer.crc32Prefix(writer.len()));
+    try std.testing.expectEqual(Crc32.hash("buffered lease"), try writer.crc32Prefix(writer.len()));
     native.deinit();
 
     active = false;

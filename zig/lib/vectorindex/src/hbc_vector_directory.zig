@@ -15,6 +15,7 @@
 //! validated at open while block indexes and values are validated on demand.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const checked_region = @import("checked_region.zig");
 
@@ -198,9 +199,9 @@ pub const StreamingWriter = struct {
         writeU64(&footer, 0, @intCast(root_offset));
         writeU64(&footer, 8, @intCast(self.descriptors.items.len));
         writeU64(&footer, 16, self.entry_count);
-        writeU32(&footer, 24, std.hash.Crc32.hash(self.index_scratch.items));
+        writeU32(&footer, 24, Crc32.hash(self.index_scratch.items));
         writeU16(&footer, 28, version);
-        writeU32(&footer, 32, std.hash.Crc32.hash(footer[0..32]));
+        writeU32(&footer, 32, Crc32.hash(footer[0..32]));
         @memcpy(footer[36..40], &magic);
         try sink.appendSlice(&footer);
         var value_bytes: u64 = 0;
@@ -235,8 +236,8 @@ pub const StreamingWriter = struct {
         try self.index_scratch.appendSlice(self.alloc, self.leaf_data_scratch.items);
         try self.index_scratch.appendSlice(self.alloc, self.metadata_data_scratch.items);
         try sink.appendSlice(self.index_scratch.items);
-        const leaf_data_checksum = std.hash.Crc32.hash(self.leaf_data_scratch.items);
-        const metadata_data_checksum = std.hash.Crc32.hash(self.metadata_data_scratch.items);
+        const leaf_data_checksum = Crc32.hash(self.leaf_data_scratch.items);
+        const metadata_data_checksum = Crc32.hash(self.metadata_data_scratch.items);
 
         self.index_scratch.clearRetainingCapacity();
         const raw_len = std.math.mul(usize, self.ids.items.len, @sizeOf(u64)) catch return error.VectorDirectoryTooLarge;
@@ -293,7 +294,7 @@ pub const StreamingWriter = struct {
             .index_offset = index_offset,
             .index_len = self.index_scratch.items.len,
             .data_checksum = leaf_data_checksum,
-            .index_checksum = std.hash.Crc32.hash(self.index_scratch.items),
+            .index_checksum = Crc32.hash(self.index_scratch.items),
             .metadata_count = self.metadata_ends.items.len,
             .metadata_data_checksum = metadata_data_checksum,
         });
@@ -323,10 +324,10 @@ pub const Reader = struct {
         const footer = data[data.len - footer_size ..];
         if (!std.mem.eql(u8, footer[36..40], &magic)) return error.CorruptedVectorDirectory;
         if (readU16(footer, 28) != version or readU16(footer, 30) != 0) return error.UnsupportedVectorDirectoryVersion;
-        if (readU32(footer, 32) != std.hash.Crc32.hash(footer[0..32])) return error.VectorDirectoryChecksumMismatch;
+        if (readU32(footer, 32) != Crc32.hash(footer[0..32])) return error.VectorDirectoryChecksumMismatch;
         const root = checked_region.exactTail(data.len, footer_size, header_size, readU64(footer, 0), readU64(footer, 8), descriptor_size) catch
             return error.CorruptedVectorDirectory;
-        if (readU32(footer, 24) != std.hash.Crc32.hash(root.slice(data))) return error.VectorDirectoryChecksumMismatch;
+        if (readU32(footer, 24) != Crc32.hash(root.slice(data))) return error.VectorDirectoryChecksumMismatch;
         const block_count = std.math.cast(usize, readU64(footer, 8)) orelse return error.CorruptedVectorDirectory;
         const verification_words = std.math.divCeil(usize, block_count, @bitSizeOf(u64)) catch
             return error.CorruptedVectorDirectory;
@@ -495,7 +496,7 @@ pub const Reader = struct {
     fn validateBlock(self: Reader, block_index: usize, descriptor_value: Descriptor, verify_data: ?Kind) !void {
         if (!isVerified(self.verified_indexes, block_index)) {
             const index = self.indexBytes(descriptor_value);
-            if (std.hash.Crc32.hash(index) != descriptor_value.index_checksum) return error.VectorDirectoryChecksumMismatch;
+            if (Crc32.hash(index) != descriptor_value.index_checksum) return error.VectorDirectoryChecksumMismatch;
             switch (descriptor_value.encoding) {
                 .raw => if (readU64(index, 0) != descriptor_value.first_id or
                     readU64(index, (descriptor_value.count - 1) * @sizeOf(u64)) != descriptor_value.last_id) return error.CorruptedVectorDirectory,
@@ -559,12 +560,12 @@ pub const Reader = struct {
         if (verify_data) |kind| {
             switch (kind) {
                 .leaf => if (!isVerified(self.verified_leaf_data, block_index)) {
-                    if (std.hash.Crc32.hash(self.leafDataBytes(descriptor_value)) != descriptor_value.data_checksum)
+                    if (Crc32.hash(self.leafDataBytes(descriptor_value)) != descriptor_value.data_checksum)
                         return error.VectorDirectoryChecksumMismatch;
                     markVerified(self.verified_leaf_data, block_index);
                 },
                 .metadata => if (!isVerified(self.verified_metadata_data, block_index)) {
-                    if (std.hash.Crc32.hash(self.metadataDataBytes(descriptor_value)) != descriptor_value.metadata_data_checksum)
+                    if (Crc32.hash(self.metadataDataBytes(descriptor_value)) != descriptor_value.metadata_data_checksum)
                         return error.VectorDirectoryChecksumMismatch;
                     markVerified(self.verified_metadata_data, block_index);
                 },
@@ -1037,7 +1038,7 @@ test "HBC vector directory rejects wrapped root regions before slicing" {
     const footer = bytes[bytes.len - footer_size ..];
     writeU64(footer, 0, std.math.maxInt(u64) - 7);
     writeU64(footer, 8, 1);
-    writeU32(footer, 32, std.hash.Crc32.hash(footer[0..32]));
+    writeU32(footer, 32, Crc32.hash(footer[0..32]));
     try std.testing.expectError(error.CorruptedVectorDirectory, Reader.init(alloc, bytes));
 }
 
@@ -1056,8 +1057,8 @@ test "HBC vector directory rejects unchecksummed bytes before root" {
     const old_index_len = readU32(root, 48);
     try std.testing.expect(old_index_len > 0);
     writeU32(root, 48, old_index_len - 1);
-    writeU32(footer, 24, std.hash.Crc32.hash(root));
-    writeU32(footer, 32, std.hash.Crc32.hash(footer[0..32]));
+    writeU32(footer, 24, Crc32.hash(root));
+    writeU32(footer, 32, Crc32.hash(footer[0..32]));
 
     try std.testing.expectError(error.CorruptedVectorDirectory, Reader.init(alloc, bytes));
 }

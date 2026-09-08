@@ -20,6 +20,7 @@
 //! a damaged posting id, sequence, or commit marker cannot be accepted.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const posting_segment = @import("posting_segment.zig");
 
@@ -27,7 +28,6 @@ pub const PostingId = posting_segment.PostingId;
 
 const magic: u32 = 0x41465057; // AFPW
 const version: u16 = 5;
-const min_supported_version: u16 = 1;
 const frame_header_len: usize = 48;
 const checksum_offset: usize = 12;
 const checksum_body_offset: usize = 16;
@@ -121,10 +121,19 @@ pub fn encodeReplacementPatchAlloc(
             const anchor = std.mem.readInt(u64, replacement[replacement_offset..][0..replacement_patch_anchor_len], .little);
             if (anchors.get(anchor)) |candidate_u32| {
                 const candidate: usize = @intCast(candidate_u32);
-                var matched = replacement_patch_anchor_len;
-                while (candidate + matched < base.len and replacement_offset + matched < replacement.len and
-                    base[candidate + matched] == replacement[replacement_offset + matched]) : (matched += 1)
-                {}
+                // The anchor already proves the first bytes equal. Use the
+                // standard SIMD-aware comparison for the remaining run rather
+                // than a dependent byte-at-a-time loop. The first differing
+                // byte (and therefore every encoded patch operation) is
+                // identical to the scalar matcher.
+                const available = @min(base.len - candidate, replacement.len - replacement_offset);
+                const tail_len = available - replacement_patch_anchor_len;
+                const tail_match = std.mem.indexOfDiff(
+                    u8,
+                    base[candidate + replacement_patch_anchor_len ..][0..tail_len],
+                    replacement[replacement_offset + replacement_patch_anchor_len ..][0..tail_len],
+                ) orelse tail_len;
+                const matched = replacement_patch_anchor_len + tail_match;
                 if (matched >= replacement_patch_min_copy_len) {
                     copy_offset = candidate;
                     copy_len = matched;
@@ -244,8 +253,8 @@ fn finishReplacementPatchHeader(
     std.mem.writeInt(u32, header[12..16], @intCast(replacement.len), .big);
     std.mem.writeInt(u32, header[16..20], op_count, .big);
     @memset(header[20..24], 0);
-    std.mem.writeInt(u32, header[24..28], std.hash.Crc32.hash(base), .big);
-    std.mem.writeInt(u32, header[28..32], std.hash.Crc32.hash(replacement), .big);
+    std.mem.writeInt(u32, header[24..28], Crc32.hash(base), .big);
+    std.mem.writeInt(u32, header[28..32], Crc32.hash(replacement), .big);
 }
 
 fn appendReplacementPatchLiteral(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
@@ -285,7 +294,7 @@ pub fn applyReplacementPatchAlloc(
     const replacement_len: usize = @intCast(std.mem.readInt(u32, payload[12..16], .big));
     const op_count: usize = @intCast(std.mem.readInt(u32, payload[16..20], .big));
     if (payload[20] != 0 or payload[21] != 0 or payload[22] != 0 or payload[23] != 0) return error.UnsupportedPostingPatchFlags;
-    if (base.len != base_len or std.hash.Crc32.hash(base) != std.mem.readInt(u32, payload[24..28], .big)) {
+    if (base.len != base_len or Crc32.hash(base) != std.mem.readInt(u32, payload[24..28], .big)) {
         return error.PostingPatchBaseMismatch;
     }
     const replacement = try alloc.alloc(u8, replacement_len);
@@ -327,7 +336,7 @@ pub fn applyReplacementPatchAlloc(
         }
     }
     if (payload_offset != payload.len or replacement_offset != replacement.len) return error.CorruptedPostingPatch;
-    if (std.hash.Crc32.hash(replacement) != std.mem.readInt(u32, payload[28..32], .big)) {
+    if (Crc32.hash(replacement) != std.mem.readInt(u32, payload[28..32], .big)) {
         return error.PostingPatchResultMismatch;
     }
     return .{ .target = target, .replacement = replacement };
@@ -659,21 +668,21 @@ fn appendFrame(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), record: Recor
     std.mem.writeInt(u64, frame[32..40], record.posting_id, .big);
     std.mem.writeInt(u64, frame[40..48], record.source_sequence, .big);
     @memcpy(frame[frame_header_len..], record.payload);
-    std.mem.writeInt(u32, frame[checksum_offset..checksum_body_offset], std.hash.Crc32.hash(frame[checksum_body_offset..]), .big);
+    std.mem.writeInt(u32, frame[checksum_offset..checksum_body_offset], Crc32.hash(frame[checksum_body_offset..]), .big);
 }
 
 fn decodeFrame(bytes: []const u8) !?DecodedFrame {
     if (bytes.len < checksum_body_offset) return null;
     if (std.mem.readInt(u32, bytes[0..4], .big) != magic) return error.BadPostingWalMagic;
     const frame_version = std.mem.readInt(u16, bytes[4..6], .big);
-    if (frame_version < min_supported_version or frame_version > version) return error.UnsupportedPostingWalVersion;
+    if (frame_version != version) return error.UnsupportedPostingWalVersion;
     if (std.mem.readInt(u16, bytes[6..8], .big) != frame_header_len) return error.UnsupportedPostingWalHeader;
     const total_len: usize = @intCast(std.mem.readInt(u32, bytes[8..12], .big));
     if (total_len < frame_header_len) return error.CorruptedPostingWal;
     if (total_len > max_frame_len) return error.PostingWalRecordTooLarge;
     if (bytes.len < total_len) return null;
     const frame = bytes[0..total_len];
-    if (std.mem.readInt(u32, frame[checksum_offset..checksum_body_offset], .big) != std.hash.Crc32.hash(frame[checksum_body_offset..])) {
+    if (std.mem.readInt(u32, frame[checksum_offset..checksum_body_offset], .big) != Crc32.hash(frame[checksum_body_offset..])) {
         return error.PostingWalChecksumMismatch;
     }
     for (frame[17..24]) |reserved| if (reserved != 0) return error.UnsupportedPostingWalFlags;
@@ -713,16 +722,23 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
 
 pub const Checkpoint = struct {
     pub const max_delta_segments: usize = 8;
-    const legacy_encoded_len: usize = 52;
-    pub const encoded_len: usize = 48 + 4 + max_delta_segments * 16 + 4;
+    pub const max_sealed_wals: usize = 8;
+    const sealed_wals_offset: usize = 52 + max_delta_segments * 16;
+    pub const encoded_len: usize = sealed_wals_offset + 4 + max_sealed_wals * 32 + 4;
     const checkpoint_magic: [4]u8 = "AFPC".*;
-    const checkpoint_version: u16 = 3;
-    const min_checkpoint_version: u16 = 1;
+    const checkpoint_version: u16 = 4;
 
     pub const Segment = struct {
         generation: u64 = 0,
         checksum: u32 = 0,
         admission_checksum: u32 = 0,
+    };
+
+    pub const SealedWal = struct {
+        generation: u64 = 0,
+        committed_bytes: u64 = 0,
+        covered_source_sequence: u64 = 0,
+        last_batch: u64 = 0,
     };
 
     segment_generation: u64,
@@ -733,6 +749,22 @@ pub const Checkpoint = struct {
     covered_source_sequence: u64,
     delta_segment_count: u8 = 0,
     delta_segments: [max_delta_segments]Segment = [_]Segment{.{}} ** max_delta_segments,
+    sealed_wal_count: u8 = 0,
+    sealed_wals: [max_sealed_wals]SealedWal = [_]SealedWal{.{}} ** max_sealed_wals,
+
+    pub fn sealedWalBytes(self: Checkpoint) u64 {
+        var bytes: u64 = 0;
+        for (self.sealed_wals[0..self.sealed_wal_count]) |extent| bytes += extent.committed_bytes;
+        return bytes;
+    }
+
+    pub fn retainsWal(self: Checkpoint, generation: u64) bool {
+        if (self.wal_generation == generation) return true;
+        for (self.sealed_wals[0..self.sealed_wal_count]) |extent| {
+            if (extent.generation == generation) return true;
+        }
+        return false;
+    }
 
     pub fn latestSegmentGeneration(self: Checkpoint) u64 {
         if (self.delta_segment_count == 0) return self.segment_generation;
@@ -773,35 +805,38 @@ pub const Checkpoint = struct {
             std.mem.writeInt(u32, out[offset + 12 ..][0..4], segment_descriptor.admission_checksum, .big);
             offset += 16;
         }
-        std.mem.writeInt(u32, out[offset..][0..4], std.hash.Crc32.hash(out[0..offset]), .big);
+        out[offset] = self.sealed_wal_count;
+        @memset(out[offset + 1 ..][0..3], 0);
+        offset += 4;
+        for (self.sealed_wals) |extent| {
+            std.mem.writeInt(u64, out[offset..][0..8], extent.generation, .big);
+            std.mem.writeInt(u64, out[offset + 8 ..][0..8], extent.committed_bytes, .big);
+            std.mem.writeInt(u64, out[offset + 16 ..][0..8], extent.covered_source_sequence, .big);
+            std.mem.writeInt(u64, out[offset + 24 ..][0..8], extent.last_batch, .big);
+            offset += 32;
+        }
+        std.mem.writeInt(u32, out[offset..][0..4], Crc32.hash(out[0..offset]), .big);
         return out;
     }
 
     pub fn decode(bytes: []const u8) !Checkpoint {
-        if (bytes.len != legacy_encoded_len and bytes.len != encoded_len) return error.InvalidPostingCheckpoint;
+        if (bytes.len != encoded_len) return error.InvalidPostingCheckpoint;
         if (!std.mem.eql(u8, bytes[0..4], &checkpoint_magic)) return error.BadPostingCheckpointMagic;
-        const encoded_version = std.mem.readInt(u16, bytes[4..6], .big);
-        if (encoded_version < min_checkpoint_version or encoded_version > checkpoint_version) return error.UnsupportedPostingCheckpointVersion;
-        if ((encoded_version < 3 and bytes.len != legacy_encoded_len) or
-            (encoded_version >= 3 and bytes.len != encoded_len)) return error.InvalidPostingCheckpoint;
-        if (std.mem.readInt(u16, bytes[6..8], .big) != 0 or
-            (encoded_version == 1 and std.mem.readInt(u32, bytes[20..24], .big) != 0))
-        {
-            return error.UnsupportedPostingCheckpointFlags;
-        }
-        const checkpoint_checksum_offset: usize = if (encoded_version >= 3) encoded_len - 4 else 48;
-        if (std.mem.readInt(u32, bytes[checkpoint_checksum_offset..][0..4], .big) != std.hash.Crc32.hash(bytes[0..checkpoint_checksum_offset])) {
+        if (std.mem.readInt(u16, bytes[4..6], .big) != checkpoint_version) return error.UnsupportedPostingCheckpointVersion;
+        if (std.mem.readInt(u16, bytes[6..8], .big) != 0) return error.UnsupportedPostingCheckpointFlags;
+        const checkpoint_checksum_offset: usize = bytes.len - 4;
+        if (std.mem.readInt(u32, bytes[checkpoint_checksum_offset..][0..4], .big) != Crc32.hash(bytes[0..checkpoint_checksum_offset])) {
             return error.PostingCheckpointChecksumMismatch;
         }
         var checkpoint: Checkpoint = .{
             .segment_generation = std.mem.readInt(u64, bytes[8..16], .big),
             .segment_checksum = std.mem.readInt(u32, bytes[16..20], .big),
-            .segment_admission_checksum = if (encoded_version >= 2) std.mem.readInt(u32, bytes[20..24], .big) else 0,
+            .segment_admission_checksum = std.mem.readInt(u32, bytes[20..24], .big),
             .wal_generation = std.mem.readInt(u64, bytes[24..32], .big),
             .wal_committed_bytes = std.mem.readInt(u64, bytes[32..40], .big),
             .covered_source_sequence = std.mem.readInt(u64, bytes[40..48], .big),
         };
-        if (encoded_version >= 3) {
+        {
             checkpoint.delta_segment_count = bytes[48];
             if (checkpoint.delta_segment_count > max_delta_segments or
                 !std.mem.allEqual(u8, bytes[49..52], 0)) return error.UnsupportedPostingCheckpointFlags;
@@ -823,6 +858,38 @@ pub const Checkpoint = struct {
                 if (segment_descriptor.generation != 0 or segment_descriptor.checksum != 0 or
                     segment_descriptor.admission_checksum != 0) return error.InvalidPostingCheckpoint;
             }
+        }
+        {
+            var offset: usize = sealed_wals_offset;
+            checkpoint.sealed_wal_count = bytes[offset];
+            if (checkpoint.sealed_wal_count > max_sealed_wals or !std.mem.allEqual(u8, bytes[offset + 1 ..][0..3], 0))
+                return error.InvalidPostingCheckpoint;
+            offset += 4;
+            var previous_generation: u64 = 0;
+            var previous_sequence = checkpoint.covered_source_sequence;
+            var previous_batch: u64 = 0;
+            var total: u64 = 0;
+            for (&checkpoint.sealed_wals, 0..) |*extent, i| {
+                extent.* = .{
+                    .generation = std.mem.readInt(u64, bytes[offset..][0..8], .big),
+                    .committed_bytes = std.mem.readInt(u64, bytes[offset + 8 ..][0..8], .big),
+                    .covered_source_sequence = std.mem.readInt(u64, bytes[offset + 16 ..][0..8], .big),
+                    .last_batch = std.mem.readInt(u64, bytes[offset + 24 ..][0..8], .big),
+                };
+                offset += 32;
+                if (i >= checkpoint.sealed_wal_count) {
+                    if (!std.meta.eql(extent.*, SealedWal{})) return error.InvalidPostingCheckpoint;
+                    continue;
+                }
+                if (extent.generation <= previous_generation or extent.generation >= checkpoint.wal_generation or
+                    extent.committed_bytes == 0 or extent.covered_source_sequence < previous_sequence or
+                    (i != 0 and extent.last_batch <= previous_batch)) return error.InvalidPostingCheckpoint;
+                total = std.math.add(u64, total, extent.committed_bytes) catch return error.InvalidPostingCheckpoint;
+                previous_generation = extent.generation;
+                previous_sequence = extent.covered_source_sequence;
+                previous_batch = extent.last_batch;
+            }
+            if (total > checkpoint.wal_committed_bytes) return error.InvalidPostingCheckpoint;
         }
         return checkpoint;
     }
@@ -898,6 +965,13 @@ pub fn testRejectsChecksumAndOrderingErrors() !void {
     try writer.append(.base, 1, 3, 10, "base-v1");
     try writer.commit(1, 10);
 
+    const unsupported_frame = try alloc.dupe(u8, writer.bytes());
+    defer alloc.free(unsupported_frame);
+    for ([_]u16{ 0, 1, 2, 3, 4, version + 1 }) |unsupported| {
+        std.mem.writeInt(u16, unsupported_frame[4..6], unsupported, .big);
+        try std.testing.expectError(error.UnsupportedPostingWalVersion, Replay.parse(alloc, unsupported_frame));
+    }
+
     var corrupt = try alloc.dupe(u8, writer.bytes());
     defer alloc.free(corrupt);
     corrupt[frame_header_len] ^= 1;
@@ -933,23 +1007,32 @@ pub fn testCheckpointRoundTripAndChecksum() !void {
     const decoded = try Checkpoint.decode(&encoded);
     try std.testing.expectEqualDeep(expected, decoded);
 
-    // V1 used the same fixed layout but reserved bytes 20..24. It remains
-    // readable and deliberately requests the legacy whole-file checksum.
-    var legacy: [Checkpoint.legacy_encoded_len]u8 = undefined;
-    @memcpy(legacy[0..48], encoded[0..48]);
-    std.mem.writeInt(u16, legacy[4..6], 1, .big);
-    @memset(legacy[20..24], 0);
-    std.mem.writeInt(u32, legacy[48..52], std.hash.Crc32.hash(legacy[0..48]), .big);
-    try std.testing.expectEqual(@as(u32, 0), (try Checkpoint.decode(&legacy)).segment_admission_checksum);
+    var sealed = expected;
+    sealed.sealed_wal_count = 2;
+    sealed.sealed_wals[0] = .{ .generation = 6, .committed_bytes = 1024, .covered_source_sequence = 1234, .last_batch = 10 };
+    sealed.sealed_wals[1] = .{ .generation = 7, .committed_bytes = 2048, .covered_source_sequence = 1235, .last_batch = 11 };
+    try std.testing.expectEqualDeep(sealed, try Checkpoint.decode(&sealed.encode()));
+    try std.testing.expectEqual(@as(u64, 3072), sealed.sealedWalBytes());
+    sealed.sealed_wals[1].generation = 6;
+    try std.testing.expectError(error.InvalidPostingCheckpoint, Checkpoint.decode(&sealed.encode()));
+    sealed.sealed_wals[1].generation = 7;
+    sealed.wal_committed_bytes = 1024;
+    try std.testing.expectError(error.InvalidPostingCheckpoint, Checkpoint.decode(&sealed.encode()));
+
+    for ([_]u16{ 0, 1, 2, 3, Checkpoint.checkpoint_version + 1 }) |unsupported| {
+        var obsolete = expected.encode();
+        std.mem.writeInt(u16, obsolete[4..6], unsupported, .big);
+        try std.testing.expectError(error.UnsupportedPostingCheckpointVersion, Checkpoint.decode(&obsolete));
+    }
 
     var unordered_delta = expected.encode();
     std.mem.writeInt(u64, unordered_delta[68..76], 8, .big);
-    std.mem.writeInt(u32, unordered_delta[Checkpoint.encoded_len - 4 ..][0..4], std.hash.Crc32.hash(unordered_delta[0 .. Checkpoint.encoded_len - 4]), .big);
+    std.mem.writeInt(u32, unordered_delta[Checkpoint.encoded_len - 4 ..][0..4], Crc32.hash(unordered_delta[0 .. Checkpoint.encoded_len - 4]), .big);
     try std.testing.expectError(error.InvalidPostingCheckpoint, Checkpoint.decode(&unordered_delta));
 
     var dirty_unused_delta = expected.encode();
     std.mem.writeInt(u64, dirty_unused_delta[84..92], 12, .big);
-    std.mem.writeInt(u32, dirty_unused_delta[Checkpoint.encoded_len - 4 ..][0..4], std.hash.Crc32.hash(dirty_unused_delta[0 .. Checkpoint.encoded_len - 4]), .big);
+    std.mem.writeInt(u32, dirty_unused_delta[Checkpoint.encoded_len - 4 ..][0..4], Crc32.hash(dirty_unused_delta[0 .. Checkpoint.encoded_len - 4]), .big);
     try std.testing.expectError(error.InvalidPostingCheckpoint, Checkpoint.decode(&dirty_unused_delta));
 
     encoded[10] ^= 1;
@@ -1075,6 +1158,26 @@ test "posting WAL replacement patches preserve shifted binary runs" {
     const decoded = try applyReplacementPatchAlloc(alloc, patch, &base);
     defer alloc.free(decoded.replacement);
     try std.testing.expectEqualSlices(u8, &replacement, decoded.replacement);
+}
+
+test "posting WAL replacement patches preserve fragmented unaligned long runs" {
+    const alloc = std.testing.allocator;
+    var base: [32768]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(593);
+    random.random().bytes(&base);
+    for ([_]usize{ 0, 1, 7, 8, 15, 17 }) |shift| {
+        var replacement: [32768]u8 = undefined;
+        @memset(replacement[0..shift], 0xa5);
+        @memcpy(replacement[shift..], base[0 .. base.len - shift]);
+        var offset: usize = 517;
+        while (offset < replacement.len) : (offset += 1021) replacement[offset] ^= 0xff;
+        const patch = try encodeReplacementPatchAlloc(alloc, .quantized_checkpoint, &base, &replacement);
+        defer alloc.free(patch);
+        try std.testing.expect(patch.len < replacement.len / 8);
+        const decoded = try applyReplacementPatchAlloc(alloc, patch, &base);
+        defer alloc.free(decoded.replacement);
+        try std.testing.expectEqualSlices(u8, &replacement, decoded.replacement);
+    }
 }
 
 test "posting WAL replacement patches fast path a point insertion" {

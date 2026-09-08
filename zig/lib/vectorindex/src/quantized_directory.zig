@@ -20,25 +20,100 @@
 //! for every immutable posting visited by a query.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const proto = @import("antfly_vector").proto;
 const hbc_runtime = @import("hbc_runtime.zig");
+const subgroups = @import("posting_subgroups.zig");
 
 const Allocator = std.mem.Allocator;
 const magic: [4]u8 = "AFQD".*;
-// First released schema for the native-v2 index. Earlier numeric revisions
-// existed only on this development branch and are intentionally unsupported.
-const version: u16 = 1;
+// V3 preserves omission of the unused L2 centroid-dot protobuf column. Search
+// still borrows a zero-filled plane, but mutation patches require byte-exact
+// reconstruction. Only the current, unreleased format is supported.
+const version: u16 = 3;
 const header_size: usize = 64;
 const entry_header_size: usize = 32;
 // The compact index is authenticated eagerly and remains resident. Keep the
 // two serving costs here so routing can charge exactly the selected postings
 // without touching one large payload page per leaf.
-const index_entry_size: usize = 36;
+const index_entry_size: usize = 52;
 const entry_alignment: usize = 64;
 const entry_flag_member_ids: u32 = 1 << 0;
 const entry_flag_projection_plane: u32 = 1 << 1;
 const entry_flag_residual_locations: u32 = 1 << 2;
-const known_entry_flags: u32 = entry_flag_member_ids | entry_flag_projection_plane | entry_flag_residual_locations;
+const entry_flag_omitted_l2_centroid_dots: u32 = 1 << 3;
+const entry_flag_subgroups: u32 = 1 << 4;
+const known_entry_flags: u32 = entry_flag_member_ids | entry_flag_projection_plane | entry_flag_residual_locations | entry_flag_omitted_l2_centroid_dots | entry_flag_subgroups;
+
+/// One bounded leaf's permuted build columns. Authoritative float32 vectors
+/// and residuals are not copied or moved by this serving-layout operation.
+const ReorderedLeaf = struct {
+    set: proto.RaBitQuantizedVectorSet,
+    members: []u8,
+    projections: []hbc_runtime.NativeProjectionBuildValue,
+    plan_bytes: []u8,
+
+    fn init(alloc: Allocator, set: *const proto.RaBitQuantizedVectorSet, members: []const u8, projections: []const hbc_runtime.NativeProjectionBuildValue, plan: subgroups.View) !ReorderedLeaf {
+        try plan.validate();
+        if (set.getCount() != plan.rows.len or set.centroid.len != plan.dims or members.len != plan.rows.len * 8 or
+            (projections.len != 0 and projections.len != plan.rows.len)) return error.InvalidSubgroupPlan;
+        var reordered = try reorderSet(alloc, set, plan.rows, false);
+        errdefer reordered.deinit(alloc);
+        const ids = try alloc.alloc(u8, members.len);
+        errdefer alloc.free(ids);
+        for (plan.rows, 0..) |original, serving| @memcpy(ids[serving * 8 ..][0..8], members[original * 8 ..][0..8]);
+        const values = try alloc.alloc(hbc_runtime.NativeProjectionBuildValue, projections.len);
+        errdefer alloc.free(values);
+        if (projections.len != 0) for (plan.rows, 0..) |original, serving| {
+            values[serving] = projections[original];
+        };
+        const encoded = try plan.encode(alloc);
+        return .{ .set = reordered, .members = ids, .projections = values, .plan_bytes = encoded };
+    }
+
+    fn deinit(self: *ReorderedLeaf, alloc: Allocator) void {
+        self.set.deinit(alloc);
+        alloc.free(self.members);
+        alloc.free(self.projections);
+        alloc.free(self.plan_bytes);
+    }
+};
+
+fn reorderSet(alloc: Allocator, source: *const proto.RaBitQuantizedVectorSet, rows: []const u32, inverse: bool) !proto.RaBitQuantizedVectorSet {
+    const count = source.getCount();
+    if (rows.len != count or source.codes.width <= 0 or source.codes.data.len != count * @as(usize, @intCast(source.codes.width)) or
+        source.code_counts.len != count or source.centroid_distances.len != count or source.quantized_dot_products.len != count or
+        (source.centroid_dot_products.len != 0 and source.centroid_dot_products.len != count)) return error.InvalidSubgroupPlan;
+    var result = try source.clone(alloc);
+    const width: usize = @intCast(source.codes.width);
+    for (rows, 0..) |canonical, serving| {
+        const src = if (inverse) serving else canonical;
+        const dst = if (inverse) canonical else serving;
+        @memcpy(result.codes.data[dst * width ..][0..width], source.codes.data[src * width ..][0..width]);
+        result.code_counts[dst] = source.code_counts[src];
+        result.centroid_distances[dst] = source.centroid_distances[src];
+        result.quantized_dot_products[dst] = source.quantized_dot_products[src];
+        if (source.centroid_dot_products.len != 0) result.centroid_dot_products[dst] = source.centroid_dot_products[src];
+    }
+    return result;
+}
+
+/// The candidate CRC covers every byte except the wide projection matrix.
+/// Each projection row has its own authenticated CRC in the metadata columns.
+/// This avoids faulting the matrix merely to begin a compact RaBitQ scan.
+const ProjectionRange = struct {
+    start: u64 = 0,
+    len: u64 = 0,
+    fn checksum(self: @This(), bytes: []const u8) !u32 {
+        const start = std.math.cast(usize, self.start) orelse return error.InvalidQuantizedDirectory;
+        const len = std.math.cast(usize, self.len) orelse return error.InvalidQuantizedDirectory;
+        if (start > bytes.len or len > bytes.len - start) return error.InvalidQuantizedDirectory;
+        var crc = Crc32.init();
+        crc.update(bytes[0..start]);
+        crc.update(bytes[start + len ..]);
+        return crc.final();
+    }
+};
 
 /// Conservative per-generation serving costs. These are authenticated in the
 /// compact directory header, so restart can restore admission without touching
@@ -96,13 +171,13 @@ fn encodeAdmissionStats(header: *[header_size]u8, stats: AdmissionStats) void {
     writeU64(header, 32, stats.max_leaf_vectors);
     writeU64(header, 40, stats.max_unfiltered_scan_bytes);
     writeU64(header, 48, stats.max_filtered_scan_bytes);
-    writeU32(header, 56, std.hash.Crc32.hash(header[0..56]));
+    writeU32(header, 56, Crc32.hash(header[0..56]));
     writeU32(header, 60, 0);
 }
 
 fn decodeAdmissionStats(data: []const u8) !AdmissionStats {
     if (data.len < header_size or readU32(data, 60) != 0 or
-        readU32(data, 56) != std.hash.Crc32.hash(data[0..56]))
+        readU32(data, 56) != Crc32.hash(data[0..56]))
     {
         return error.QuantizedDirectoryAdmissionChecksumMismatch;
     }
@@ -173,6 +248,7 @@ pub const Writer = struct {
     out: std.ArrayListUnmanaged(u8) = .empty,
     posting_ids: std.ArrayListUnmanaged(u64) = .empty,
     offsets: std.ArrayListUnmanaged(u64) = .empty,
+    projection_ranges: std.ArrayListUnmanaged(ProjectionRange) = .empty,
     scan_bytes: std.ArrayListUnmanaged(ScanBytes) = .empty,
     admission_stats: AdmissionStats = .{},
     finished: bool = false,
@@ -189,6 +265,7 @@ pub const Writer = struct {
         self.out.deinit(self.alloc);
         self.posting_ids.deinit(self.alloc);
         self.offsets.deinit(self.alloc);
+        self.projection_ranges.deinit(self.alloc);
         self.scan_bytes.deinit(self.alloc);
         self.* = undefined;
     }
@@ -217,6 +294,16 @@ pub const Writer = struct {
         member_id_bytes: []const u8,
         projections: []const hbc_runtime.NativeProjectionBuildValue,
     ) !void {
+        return self.appendLeaf(posting_id, set, member_id_bytes, projections, &.{});
+    }
+
+    pub fn appendWithSubgroups(self: *Writer, posting_id: u64, set: *const proto.RaBitQuantizedVectorSet, member_id_bytes: []const u8, projections: []const hbc_runtime.NativeProjectionBuildValue, plan: subgroups.View) !void {
+        var leaf = try ReorderedLeaf.init(self.alloc, set, member_id_bytes, projections, plan);
+        defer leaf.deinit(self.alloc);
+        try self.appendLeaf(posting_id, &leaf.set, leaf.members, leaf.projections, leaf.plan_bytes);
+    }
+
+    fn appendLeaf(self: *Writer, posting_id: u64, set: *const proto.RaBitQuantizedVectorSet, member_id_bytes: []const u8, projections: []const hbc_runtime.NativeProjectionBuildValue, subgroup_bytes: []const u8) !void {
         if (self.finished) return error.QuantizedDirectoryWriterFinished;
         if (posting_id == 0 or set.centroid.len != self.dims) return error.InvalidQuantizedDirectoryEntry;
         const count = set.getCount();
@@ -265,13 +352,15 @@ pub const Writer = struct {
             if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
         }
 
-        const serving_bytes = leafScanBytes(
+        var serving_bytes = leafScanBytes(
             count,
             width,
             self.dims,
             member_id_bytes.len != 0,
             projections.len != 0,
         );
+        serving_bytes.unfiltered +|= subgroup_bytes.len;
+        serving_bytes.filtered +|= subgroup_bytes.len;
         if (member_id_bytes.len != 0) {
             const vectors: u64 = @intCast(count);
             self.admission_stats.merge(.{
@@ -289,12 +378,16 @@ pub const Writer = struct {
         errdefer _ = self.offsets.pop();
         try self.scan_bytes.append(self.alloc, serving_bytes);
         errdefer _ = self.scan_bytes.pop();
+        try self.projection_ranges.append(self.alloc, .{});
+        errdefer _ = self.projection_ranges.pop();
         try appendZeros(self.alloc, &self.out, entry_header_size);
         writeU64(self.out.items, entry_offset, posting_id);
         writeU32(self.out.items, entry_offset + 8, @intCast(count));
         writeU32(self.out.items, entry_offset + 12, @intCast(width));
         writeF32(self.out.items, entry_offset + 16, set.centroid_norm);
         var flags: u32 = 0;
+        if (subgroup_bytes.len != 0) flags |= entry_flag_subgroups;
+        if (omitted_l2_centroid_dots) flags |= entry_flag_omitted_l2_centroid_dots;
         if (member_id_bytes.len != 0) {
             flags |= entry_flag_member_ids;
             try self.out.appendSlice(self.alloc, member_id_bytes);
@@ -318,6 +411,10 @@ pub const Writer = struct {
             // Keep each column contiguous: a leaf scan streams the f16 matrix,
             // while boundary math reads the much smaller metadata columns.
             try alignOutput(self.alloc, &self.out, @alignOf(f16));
+            self.projection_ranges.items[self.projection_ranges.items.len - 1] = .{
+                .start = @intCast(self.out.items.len - entry_offset),
+                .len = @intCast(projections.len * self.dims * @sizeOf(f16)),
+            };
             for (projections) |projection| try self.out.appendSlice(self.alloc, projection.bytes);
             try alignOutput(self.alloc, &self.out, @alignOf(f32));
             for (projections) |projection| try self.out.appendSlice(self.alloc, std.mem.asBytes(&projection.scale));
@@ -339,6 +436,10 @@ pub const Writer = struct {
                 for (projections) |projection| try appendU32(self.alloc, &self.out, projection.residual_location.?.residual_checksum);
             }
         }
+        if (subgroup_bytes.len != 0) {
+            try alignOutput(self.alloc, &self.out, 4);
+            try self.out.appendSlice(self.alloc, subgroup_bytes);
+        }
     }
 
     pub fn observeFallbackLeaf(self: *Writer, count: usize) void {
@@ -358,15 +459,18 @@ pub const Writer = struct {
             try appendZeros(self.alloc, &self.out, index_entry_size);
             writeU64(self.out.items, start, posting_id);
             writeU64(self.out.items, start + 8, offset);
-            writeU32(self.out.items, start + 16, std.hash.Crc32.hash(self.out.items[start_usize..end_usize]));
+            const range = self.projection_ranges.items[index];
+            writeU32(self.out.items, start + 16, try range.checksum(self.out.items[start_usize..end_usize]));
             writeU64(self.out.items, start + 20, serving_bytes.unfiltered);
             writeU64(self.out.items, start + 28, serving_bytes.filtered);
+            writeU64(self.out.items, start + 36, range.start);
+            writeU64(self.out.items, start + 44, range.len);
         }
         @memcpy(self.out.items[0..4], &magic);
         writeU16(self.out.items, 4, version);
         self.out.items[6] = self.metric;
         writeU32(self.out.items, 8, @intCast(self.dims));
-        writeU32(self.out.items, 12, std.hash.Crc32.hash(self.out.items[index_offset..]));
+        writeU32(self.out.items, 12, Crc32.hash(self.out.items[index_offset..]));
         writeU64(self.out.items, 16, @intCast(self.posting_ids.items.len));
         writeU64(self.out.items, 24, @intCast(index_offset));
         encodeAdmissionStats(self.out.items[0..header_size], self.admission_stats);
@@ -387,10 +491,11 @@ pub const StreamingWriter = struct {
     base_offset: usize,
     posting_ids: std.ArrayListUnmanaged(u64) = .empty,
     offsets: std.ArrayListUnmanaged(u64) = .empty,
+    projection_ranges: std.ArrayListUnmanaged(ProjectionRange) = .empty,
     checksums: std.ArrayListUnmanaged(u32) = .empty,
     scan_bytes: std.ArrayListUnmanaged(ScanBytes) = .empty,
     admission_stats: AdmissionStats = .{},
-    active_crc: ?std.hash.Crc32 = null,
+    active_crc: ?Crc32 = null,
     finished: bool = false,
 
     pub const Finish = struct {
@@ -418,6 +523,7 @@ pub const StreamingWriter = struct {
     pub fn deinit(self: *StreamingWriter) void {
         self.posting_ids.deinit(self.alloc);
         self.offsets.deinit(self.alloc);
+        self.projection_ranges.deinit(self.alloc);
         self.checksums.deinit(self.alloc);
         self.scan_bytes.deinit(self.alloc);
         self.* = undefined;
@@ -431,6 +537,16 @@ pub const StreamingWriter = struct {
         member_id_bytes: []const u8,
         projections: []const hbc_runtime.NativeProjectionBuildValue,
     ) !void {
+        return self.appendLeaf(sink, posting_id, set, member_id_bytes, projections, &.{});
+    }
+
+    pub fn appendWithSubgroups(self: *StreamingWriter, sink: anytype, posting_id: u64, set: *const proto.RaBitQuantizedVectorSet, member_id_bytes: []const u8, projections: []const hbc_runtime.NativeProjectionBuildValue, plan: subgroups.View) !void {
+        var leaf = try ReorderedLeaf.init(self.alloc, set, member_id_bytes, projections, plan);
+        defer leaf.deinit(self.alloc);
+        try self.appendLeaf(sink, posting_id, &leaf.set, leaf.members, leaf.projections, leaf.plan_bytes);
+    }
+
+    fn appendLeaf(self: *StreamingWriter, sink: anytype, posting_id: u64, set: *const proto.RaBitQuantizedVectorSet, member_id_bytes: []const u8, projections: []const hbc_runtime.NativeProjectionBuildValue, subgroup_bytes: []const u8) !void {
         if (self.finished) return error.QuantizedDirectoryWriterFinished;
         if (posting_id == 0 or set.centroid.len != self.dims) return error.InvalidQuantizedDirectoryEntry;
         const count = set.getCount();
@@ -479,13 +595,15 @@ pub const StreamingWriter = struct {
             if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
         }
 
-        const serving_bytes = leafScanBytes(
+        var serving_bytes = leafScanBytes(
             count,
             width,
             self.dims,
             member_id_bytes.len != 0,
             projections.len != 0,
         );
+        serving_bytes.unfiltered +|= subgroup_bytes.len;
+        serving_bytes.filtered +|= subgroup_bytes.len;
         if (member_id_bytes.len != 0) {
             const vectors: u64 = @intCast(count);
             self.admission_stats.merge(.{
@@ -504,6 +622,8 @@ pub const StreamingWriter = struct {
         writeU32(&header, 12, @intCast(width));
         writeF32(&header, 16, set.centroid_norm);
         var flags: u32 = 0;
+        if (subgroup_bytes.len != 0) flags |= entry_flag_subgroups;
+        if (omitted_l2_centroid_dots) flags |= entry_flag_omitted_l2_centroid_dots;
         if (member_id_bytes.len != 0) flags |= entry_flag_member_ids;
         if (projections.len != 0) {
             flags |= entry_flag_projection_plane;
@@ -524,7 +644,13 @@ pub const StreamingWriter = struct {
             try self.appendEntryBytes(sink, std.mem.sliceAsBytes(set.centroid_dot_products));
         if (projections.len != 0) {
             try self.alignEntry(sink, @alignOf(f16));
-            for (projections) |projection| try self.appendEntryBytes(sink, projection.bytes);
+            try self.projection_ranges.append(self.alloc, .{
+                .start = @intCast(sink.len() - self.base_offset - self.offsets.items[self.offsets.items.len - 1]),
+                .len = @intCast(projections.len * self.dims * @sizeOf(f16)),
+            });
+            // The compact checksum excludes only these independently checked
+            // rows. Projection metadata and locations remain covered below.
+            for (projections) |projection| try sink.appendSlice(projection.bytes);
             try self.alignEntry(sink, @alignOf(f32));
             for (projections) |projection| try self.appendEntryBytes(sink, std.mem.asBytes(&projection.scale));
             for (projections) |projection| try self.appendEntryBytes(sink, std.mem.asBytes(&projection.error_norm));
@@ -542,6 +668,10 @@ pub const StreamingWriter = struct {
                 for (projections) |projection| try self.appendEntryU32(sink, projection.residual_location.?.residual_len);
                 for (projections) |projection| try self.appendEntryU32(sink, projection.residual_location.?.residual_checksum);
             }
+        } else try self.projection_ranges.append(self.alloc, .{});
+        if (subgroup_bytes.len != 0) {
+            try self.alignEntry(sink, 4);
+            try self.appendEntryBytes(sink, subgroup_bytes);
         }
     }
 
@@ -554,14 +684,16 @@ pub const StreamingWriter = struct {
         self.finished = true;
         try self.finishActiveEntry(sink);
         const index_offset = sink.len() - self.base_offset;
-        var index_crc = std.hash.Crc32.init();
-        for (self.posting_ids.items, self.offsets.items, self.checksums.items, self.scan_bytes.items) |posting_id, offset, checksum, serving_bytes| {
+        var index_crc = Crc32.init();
+        for (self.posting_ids.items, self.offsets.items, self.checksums.items, self.scan_bytes.items, self.projection_ranges.items) |posting_id, offset, checksum, serving_bytes, range| {
             var encoded: [index_entry_size]u8 = undefined;
             writeU64(&encoded, 0, posting_id);
             writeU64(&encoded, 8, offset);
             writeU32(&encoded, 16, checksum);
             writeU64(&encoded, 20, serving_bytes.unfiltered);
             writeU64(&encoded, 28, serving_bytes.filtered);
+            writeU64(&encoded, 36, range.start);
+            writeU64(&encoded, 44, range.len);
             try sink.appendSlice(&encoded);
             index_crc.update(&encoded);
         }
@@ -594,7 +726,7 @@ pub const StreamingWriter = struct {
         errdefer _ = self.posting_ids.pop();
         try self.offsets.append(self.alloc, @intCast(sink.len() - self.base_offset));
         errdefer _ = self.offsets.pop();
-        self.active_crc = std.hash.Crc32.init();
+        self.active_crc = Crc32.init();
     }
 
     fn finishActiveEntry(self: *StreamingWriter, sink: anytype) !void {
@@ -647,12 +779,40 @@ pub const View = struct {
     quantized_dot_products: []const f32,
     centroid_dot_products: []const f32,
     centroid_norm: f32,
-    /// Present only in V2 leaf entries. Internal postings and V1 generations
+    omitted_l2_centroid_dots: bool = false,
+    /// Present only in leaf entries. Internal postings
     /// retain an empty slice and continue through the packed-node path.
     member_ids: []const u64,
     projections: ?hbc_runtime.NativeProjectionPlane,
     count: usize,
     width: usize,
+    subgroup_plan: ?subgroups.View = null,
+
+    pub const CanonicalRead = struct {
+        value: proto.RaBitQuantizedVectorSet,
+        owned: bool,
+        pub fn deinit(self: *CanonicalRead, alloc: Allocator) void {
+            if (self.owned) self.value.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    /// Serving order is independent of the mutation protocol's canonical row
+    /// order. Only mutation/rewrite paths pay this bounded inverse mapping.
+    pub fn canonical(self: View, alloc: Allocator) !CanonicalRead {
+        const serving = self.asProto();
+        return if (self.subgroup_plan) |plan|
+            .{ .value = try reorderSet(alloc, &serving, plan.rows, true), .owned = true }
+        else
+            .{ .value = serving, .owned = false };
+    }
+
+    pub fn canonicalScratchBytes(self: View) u64 {
+        return if (self.subgroup_plan != null)
+            @as(u64, @intCast(self.centroid.len * 4 + self.codes.len * 8 + self.count * 16))
+        else
+            0;
+    }
 
     pub fn asProto(self: View) proto.RaBitQuantizedVectorSet {
         return .{
@@ -666,7 +826,7 @@ pub const View = struct {
             .code_counts = @constCast(self.code_counts),
             .centroid_distances = @constCast(self.centroid_distances),
             .quantized_dot_products = @constCast(self.quantized_dot_products),
-            .centroid_dot_products = @constCast(self.centroid_dot_products),
+            .centroid_dot_products = if (self.omitted_l2_centroid_dots) &.{} else @constCast(self.centroid_dot_products),
             .centroid_norm = self.centroid_norm,
         };
     }
@@ -693,7 +853,7 @@ pub const Reader = struct {
         if (dims == 0 or index_offset < header_size or index_offset > data.len or index_bytes != data.len - index_offset) {
             return error.InvalidQuantizedDirectory;
         }
-        if (std.hash.Crc32.hash(data[index_offset..]) != readU32(data, 12)) {
+        if (Crc32.hash(data[index_offset..]) != readU32(data, 12)) {
             return error.QuantizedDirectoryIndexChecksumMismatch;
         }
         var previous_id: u64 = 0;
@@ -737,6 +897,11 @@ pub const Reader = struct {
         return readU32(self.data, self.index_offset + index * index_entry_size + 16);
     }
 
+    fn projectionRange(self: Reader, index: usize) ProjectionRange {
+        const cursor = self.index_offset + index * index_entry_size;
+        return .{ .start = readU64(self.data, cursor + 36), .len = readU64(self.data, cursor + 44) };
+    }
+
     fn indexScanBytes(self: Reader, index: usize) ScanBytes {
         const cursor = self.index_offset + index * index_entry_size;
         return .{
@@ -767,7 +932,7 @@ pub const Reader = struct {
 
     pub fn get(self: Reader, posting_id: u64) !?View {
         const index = self.findIndex(posting_id) orelse return null;
-        return try self.viewAt(index);
+        return try self.viewAt(index, true);
     }
 
     /// Exact authenticated bandwidth charge for one immutable leaf. This
@@ -779,7 +944,7 @@ pub const Reader = struct {
         return if (filtered) bytes.filtered else bytes.unfiltered;
     }
 
-    fn viewAt(self: Reader, index: usize) !View {
+    fn viewAt(self: Reader, index: usize, validate_subgroups: bool) !View {
         const entry = try self.entryBytes(index);
         const start = @intFromPtr(entry.ptr) - @intFromPtr(self.data.ptr);
         const end = start + entry.len;
@@ -791,6 +956,9 @@ pub const Reader = struct {
         const width: usize = readU32(self.data, start + 12);
         if (count == 0 or width == 0) return error.InvalidQuantizedDirectory;
         const flags = readU32(self.data, start + 20);
+        const omitted_l2_centroid_dots = flags & entry_flag_omitted_l2_centroid_dots != 0;
+        if (omitted_l2_centroid_dots and self.metric != 0)
+            return error.InvalidQuantizedDirectory;
         if (flags & ~known_entry_flags != 0 or
             (flags & entry_flag_residual_locations != 0 and flags & entry_flag_projection_plane == 0))
         {
@@ -837,6 +1005,8 @@ pub const Reader = struct {
             const projection_end = std.math.add(usize, cursor, projection_bytes) catch return error.InvalidQuantizedDirectory;
             if (projection_end > end) return error.InvalidQuantizedDirectory;
             const projection_raw: []align(@alignOf(f16)) const u8 = @alignCast(self.data[cursor..projection_end]);
+            const range = self.projectionRange(index);
+            if (range.start != cursor - start or range.len != projection_bytes) return error.InvalidQuantizedDirectory;
             cursor = std.mem.alignForward(usize, projection_end, @alignOf(f32));
             const metadata_columns: usize = 4;
             const metadata_bytes = std.math.mul(usize, scalar_bytes, metadata_columns) catch return error.InvalidQuantizedDirectory;
@@ -895,8 +1065,25 @@ pub const Reader = struct {
                 .checksums = checksums,
                 .residual_locations = residual_locations,
             };
+        } else blk: {
+            const range = self.projectionRange(index);
+            if (range.start != 0 or range.len != 0) return error.InvalidQuantizedDirectory;
+            break :blk null;
+        };
+        const subgroup_plan: ?subgroups.View = if (flags & entry_flag_subgroups != 0) blk: {
+            cursor = std.mem.alignForward(usize, cursor, 4);
+            if (cursor > end or end - cursor < 24 or member_ids.len != count) return error.InvalidQuantizedDirectory;
+            const length: usize = readU32(self.data, cursor + 8);
+            if (length > end - cursor) return error.InvalidQuantizedDirectory;
+            const plan = try subgroups.decodeBorrowedLayout(self.data[cursor..][0..length]);
+            if (validate_subgroups) try plan.validate();
+            if (plan.dims != self.dims or plan.rows.len != count) return error.InvalidQuantizedDirectory;
+            cursor += length;
+            break :blk plan;
         } else null;
         if (!std.mem.allEqual(u8, self.data[cursor..end], 0)) return error.InvalidQuantizedDirectory;
+        if (omitted_l2_centroid_dots and !std.mem.allEqual(u8, centroid_dots_raw, 0))
+            return error.InvalidQuantizedDirectory;
         return View{
             .metric = self.metric,
             .centroid = centroid,
@@ -906,10 +1093,12 @@ pub const Reader = struct {
             .quantized_dot_products = std.mem.bytesAsSlice(f32, dots_raw),
             .centroid_dot_products = std.mem.bytesAsSlice(f32, centroid_dots_raw),
             .centroid_norm = readF32(self.data, start + 16),
+            .omitted_l2_centroid_dots = omitted_l2_centroid_dots,
             .member_ids = member_ids,
             .projections = projections,
             .count = count,
             .width = width,
+            .subgroup_plan = subgroup_plan,
         };
     }
 };
@@ -925,16 +1114,33 @@ pub const VerifiedReader = struct {
     alloc: Allocator,
     reader: Reader,
     verification: []std.atomic.Value(u8),
+    projection_offsets: []usize,
+    projection_verification: []std.atomic.Value(u8),
 
     pub fn init(alloc: Allocator, data: []const u8) !VerifiedReader {
         const reader = try Reader.init(data);
         const verification = try alloc.alloc(std.atomic.Value(u8), reader.posting_count);
+        errdefer alloc.free(verification);
         for (verification) |*state| state.* = .init(unknown);
-        return .{ .alloc = alloc, .reader = reader, .verification = verification };
+        const offsets = try alloc.alloc(usize, reader.posting_count + 1);
+        errdefer alloc.free(offsets);
+        offsets[0] = 0;
+        for (0..reader.posting_count) |index| {
+            const range = reader.projectionRange(index);
+            const entry = try reader.entryBytes(index);
+            if (range.len > entry.len) return error.InvalidQuantizedDirectory;
+            const rows = if (reader.dims == 0) 0 else range.len / (@as(u64, reader.dims) * 2);
+            offsets[index + 1] = try std.math.add(usize, offsets[index], std.math.cast(usize, rows) orelse return error.InvalidQuantizedDirectory);
+        }
+        const rows = try alloc.alloc(std.atomic.Value(u8), offsets[reader.posting_count]);
+        for (rows) |*state| state.* = .init(unknown);
+        return .{ .alloc = alloc, .reader = reader, .verification = verification, .projection_offsets = offsets, .projection_verification = rows };
     }
 
     pub fn deinit(self: *VerifiedReader) void {
         self.alloc.free(self.verification);
+        self.alloc.free(self.projection_offsets);
+        self.alloc.free(self.projection_verification);
         self.* = undefined;
     }
 
@@ -956,6 +1162,24 @@ pub const VerifiedReader = struct {
 
     pub fn scanBytes(self: *const VerifiedReader, posting_id: u64, filtered: bool) ?u64 {
         return self.reader.scanBytes(posting_id, filtered);
+    }
+
+    pub fn resolveIndex(self: *const VerifiedReader, posting_id: u64) ?usize {
+        return self.reader.findIndex(posting_id);
+    }
+
+    pub fn scanBytesAt(self: *const VerifiedReader, index: usize, filtered: bool) u64 {
+        std.debug.assert(index < self.reader.posting_count);
+        const bytes = self.reader.indexScanBytes(index);
+        return if (filtered) bytes.filtered else bytes.unfiltered;
+    }
+
+    /// Only authenticated compact-index bytes are consulted; no payload pages
+    /// are faulted while reconstructing optional acceleration debt on restart.
+    pub fn missingProjectionLeafAt(self: *const VerifiedReader, index: usize) ?u64 {
+        if (index >= self.reader.posting_count or self.reader.indexScanBytes(index).unfiltered == 0 or
+            self.reader.projectionRange(index).len != 0) return null;
+        return self.reader.indexId(index);
     }
 
     /// Returns the exact independently checksummed entry range. Maintenance
@@ -1001,7 +1225,7 @@ pub const VerifiedReader = struct {
         const state = self.verification[index].load(.acquire);
         if (state == corrupt) return error.QuantizedDirectoryChecksumMismatch;
         if (state == unknown) {
-            if (std.hash.Crc32.hash(entry) != self.reader.indexChecksum(index)) {
+            if (try self.reader.projectionRange(index).checksum(entry) != self.reader.indexChecksum(index)) {
                 self.verification[index].store(corrupt, .release);
                 return error.QuantizedDirectoryChecksumMismatch;
             }
@@ -1030,27 +1254,42 @@ pub const VerifiedReader = struct {
         const serving_bytes = self.reader.indexScanBytes(index);
         writeU64(encoded, index_offset + 20, serving_bytes.unfiltered);
         writeU64(encoded, index_offset + 28, serving_bytes.filtered);
-        writeU32(encoded, 12, std.hash.Crc32.hash(encoded[index_offset..]));
+        const range = self.reader.projectionRange(index);
+        writeU64(encoded, index_offset + 36, range.start);
+        writeU64(encoded, index_offset + 44, range.len);
+        writeU32(encoded, 12, Crc32.hash(encoded[index_offset..]));
         encodeAdmissionStats(encoded[0..header_size], self.reader.admission_stats);
 
         const standalone = try Reader.init(encoded);
         const view = (try standalone.get(posting_id)) orelse return error.InvalidQuantizedDirectory;
+        if (view.projections) |plane| for (0..view.count) |row| try plane.validateRow(row);
         return .{ .alloc = alloc, .encoded = encoded, .view = view };
     }
 
     pub fn get(self: *VerifiedReader, posting_id: u64) !?View {
         const index = self.reader.findIndex(posting_id) orelse return null;
+        return try self.getAt(index, posting_id);
+    }
+
+    pub fn getAt(self: *VerifiedReader, index: usize, posting_id: u64) !View {
+        if (index >= self.reader.posting_count or self.reader.indexId(index) != posting_id) return error.InvalidQuantizedDirectory;
         const state = self.verification[index].load(.acquire);
         if (state == corrupt) return error.QuantizedDirectoryChecksumMismatch;
         if (state == unknown) {
             const entry = try self.reader.entryBytes(index);
-            if (std.hash.Crc32.hash(entry) != self.reader.indexChecksum(index)) {
+            if (try self.reader.projectionRange(index).checksum(entry) != self.reader.indexChecksum(index)) {
                 self.verification[index].store(corrupt, .release);
                 return error.QuantizedDirectoryChecksumMismatch;
             }
-            self.verification[index].store(valid, .release);
         }
-        return try self.reader.viewAt(index);
+        var view = try self.reader.viewAt(index, state != valid);
+        if (view.projections) |*plane| {
+            const states = self.projection_verification[self.projection_offsets[index]..self.projection_offsets[index + 1]];
+            if (states.len != view.count) return error.InvalidQuantizedDirectory;
+            plane.verification = states;
+        }
+        if (state != valid) self.verification[index].store(valid, .release);
+        return view;
     }
 };
 
@@ -1075,6 +1314,51 @@ const TestingSink = struct {
         @memcpy(self.out.items[offset..][0..bytes.len], bytes);
     }
 };
+
+fn exerciseSubgroupColumns(alloc: Allocator) !void {
+    const set = proto.RaBitQuantizedVectorSet{
+        .metric = .cosine,
+        .centroid = @constCast(&[_]f32{ 1, 2, 3 }),
+        .codes = .{ .count = 4, .width = 1, .data = @constCast(&[_]u64{ 7, 9, 11, 13 }) },
+        .code_counts = @constCast(&[_]u32{ 2, 3, 4, 5 }),
+        .centroid_distances = @constCast(&[_]f32{ 0.25, 0.5, 0.75, 1 }),
+        .quantized_dot_products = @constCast(&[_]f32{ 1.25, 1.5, 1.75, 2 }),
+        .centroid_dot_products = @constCast(&[_]f32{ 2.25, 2.5, 2.75, 3 }),
+        .centroid_norm = 3.5,
+    };
+    const ids = [_]u64{ 101, 202, 303, 404 };
+    const plan: subgroups.View = .{ .dims = 3, .rows = &.{ 2, 0, 3, 1 }, .ends = &.{ 2, 4 }, .centers = &.{ 1, 0, 0, 0, 1, 0 } };
+    const expected = try set.encode(alloc);
+    defer alloc.free(expected);
+    var writer = try Writer.init(alloc, 3, 2);
+    defer writer.deinit();
+    try writer.appendWithSubgroups(7, &set, std.mem.sliceAsBytes(&ids), &.{}, plan);
+    const encoded = try writer.build();
+    defer alloc.free(encoded);
+    var reader = try VerifiedReader.init(alloc, encoded);
+    defer reader.deinit();
+    const view = (try reader.get(7)).?;
+    try std.testing.expectEqualSlices(u64, &.{ 303, 101, 404, 202 }, view.member_ids);
+    try std.testing.expectEqualSlices(u64, &.{ 11, 7, 13, 9 }, view.codes);
+    try std.testing.expectEqualSlices(u32, plan.rows, view.subgroup_plan.?.rows);
+    var canonical = try view.canonical(alloc);
+    defer canonical.deinit(alloc);
+    const restored = try canonical.value.encode(alloc);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, expected, restored);
+    var sink: TestingSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var streaming = try StreamingWriter.init(alloc, &sink, 3, 2);
+    defer streaming.deinit();
+    try streaming.appendWithSubgroups(&sink, 7, &set, std.mem.sliceAsBytes(&ids), &.{}, plan);
+    _ = try streaming.finish(&sink);
+    try std.testing.expectEqualSlices(u8, encoded, sink.out.items);
+}
+
+test "subgroup serving layout reconstructs canonical mutation bytes and streams identically" {
+    try exerciseSubgroupColumns(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSubgroupColumns, .{});
+}
 
 test "streaming quantized directory is byte-compatible with buffered writer" {
     const alloc = std.testing.allocator;
@@ -1108,8 +1392,8 @@ test "streaming quantized directory is byte-compatible with buffered writer" {
         .residual_checksum = 43,
     };
     const projections = [_]hbc_runtime.NativeProjectionBuildValue{
-        .{ .bytes = std.mem.sliceAsBytes(&first), .scale = 1, .error_norm = 0.01, .decoded_norm_lower_bound = 3.7, .checksum = 17, .residual_location = first_location },
-        .{ .bytes = std.mem.sliceAsBytes(&second), .scale = 2, .error_norm = 0.02, .decoded_norm_lower_bound = 8.7, .checksum = 29, .residual_location = second_location },
+        .{ .bytes = std.mem.sliceAsBytes(&first), .scale = 1, .error_norm = 0.01, .decoded_norm_lower_bound = 3.7, .checksum = Crc32.hash(std.mem.sliceAsBytes(&first)), .residual_location = first_location },
+        .{ .bytes = std.mem.sliceAsBytes(&second), .scale = 2, .error_norm = 0.02, .decoded_norm_lower_bound = 8.7, .checksum = Crc32.hash(std.mem.sliceAsBytes(&second)), .residual_location = second_location },
     };
 
     var buffered = try Writer.init(alloc, 3, 2);
@@ -1181,7 +1465,11 @@ test "quantized directory persists conservative fallback admission" {
 
     const unreleased_prototype = try alloc.dupe(u8, encoded);
     defer alloc.free(unreleased_prototype);
+    writeU16(unreleased_prototype, 4, 1);
+    try std.testing.expectError(error.UnsupportedQuantizedDirectoryVersion, Reader.init(unreleased_prototype));
     writeU16(unreleased_prototype, 4, 2);
+    try std.testing.expectError(error.UnsupportedQuantizedDirectoryVersion, Reader.init(unreleased_prototype));
+    writeU16(unreleased_prototype, 4, version + 1);
     try std.testing.expectError(error.UnsupportedQuantizedDirectoryVersion, Reader.init(unreleased_prototype));
 }
 
@@ -1252,8 +1540,8 @@ test "quantized directory co-locates bounded float16 leaf projections" {
         .residual_checksum = 43,
     };
     const projections = [_]hbc_runtime.NativeProjectionBuildValue{
-        .{ .bytes = std.mem.sliceAsBytes(&first), .scale = 1, .error_norm = 0.01, .decoded_norm_lower_bound = 3.7, .checksum = 17, .residual_location = first_location },
-        .{ .bytes = std.mem.sliceAsBytes(&second), .scale = 2, .error_norm = 0.02, .decoded_norm_lower_bound = 8.7, .checksum = 29, .residual_location = second_location },
+        .{ .bytes = std.mem.sliceAsBytes(&first), .scale = 1, .error_norm = 0.01, .decoded_norm_lower_bound = 3.7, .checksum = Crc32.hash(std.mem.sliceAsBytes(&first)), .residual_location = first_location },
+        .{ .bytes = std.mem.sliceAsBytes(&second), .scale = 2, .error_norm = 0.02, .decoded_norm_lower_bound = 8.7, .checksum = Crc32.hash(std.mem.sliceAsBytes(&second)), .residual_location = second_location },
     };
     try writer.appendWithLeafPlanes(7, &set, std.mem.sliceAsBytes(&member_ids), &projections);
     const encoded = try writer.build();
@@ -1269,13 +1557,28 @@ test "quantized directory co-locates bounded float16 leaf projections" {
     try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, plane.scales);
     try std.testing.expectEqualSlices(f32, &.{ 0.01, 0.02 }, plane.error_norms);
     try std.testing.expectEqualSlices(f32, &.{ 3.7, 8.7 }, plane.decoded_norm_lower_bounds);
-    try std.testing.expectEqualSlices(u32, &.{ 17, 29 }, plane.checksums);
+    try plane.validateRow(0);
+    try plane.validateRow(1);
+    try std.testing.expectEqual(@as(u8, 1), plane.verification.?[0].load(.acquire));
+    try std.testing.expect(reader.missingProjectionLeafAt(0) == null);
     const locations = plane.residual_locations orelse return error.TestExpectedResidualLocations;
     try std.testing.expectEqual(first_location, locations.at(0).?);
     try std.testing.expectEqual(second_location, locations.at(1).?);
+
+    // A cold compact scan validates no wide matrix bytes. Corruption in a
+    // deferred row must still fail before that row can influence its score.
+    const payload_offset = @intFromPtr(plane.values.ptr) - @intFromPtr(encoded.ptr);
+    encoded[payload_offset] ^= 1;
+    defer encoded[payload_offset] ^= 1;
+    var cold = try VerifiedReader.init(alloc, encoded);
+    defer cold.deinit();
+    const cold_view = (try cold.get(7)).?;
+    try std.testing.expectError(error.QuantizedDirectoryChecksumMismatch, cold_view.projections.?.validateRow(0));
+    try std.testing.expectEqual(@as(u8, 2), cold_view.projections.?.verification.?[0].load(.acquire));
+    try cold_view.projections.?.validateRow(1);
 }
 
-test "quantized directory canonicalizes omitted l2 centroid dots" {
+test "quantized directory preserves omitted l2 protobuf bytes for WAL patches" {
     const alloc = std.testing.allocator;
     var writer = try Writer.init(alloc, 2, 0);
     defer writer.deinit();
@@ -1295,6 +1598,45 @@ test "quantized directory canonicalizes omitted l2 centroid dots" {
     const reader = try Reader.init(encoded);
     const view = (try reader.get(7)).?;
     try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, view.centroid_dot_products);
+    const original = try set.encode(alloc);
+    defer alloc.free(original);
+    const restored = try view.asProto().encode(alloc);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, original, restored);
+    var sink: TestingSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var streaming = try StreamingWriter.init(alloc, &sink, 2, 0);
+    defer streaming.deinit();
+    try streaming.appendWithLeafPlanes(&sink, 7, &set, &.{}, &.{});
+    _ = try streaming.finish(&sink);
+    try std.testing.expectEqualSlices(u8, encoded, sink.out.items);
+    var verified = try VerifiedReader.init(alloc, sink.out.items);
+    defer verified.deinit();
+    const location = verified.entryLocation(7).?;
+    var owned = try verified.decodeOwnedEntry(alloc, 7, sink.out.items[location.offset..][0..location.len]);
+    defer owned.deinit();
+    const cold_restored = try owned.view.asProto().encode(alloc);
+    defer alloc.free(cold_restored);
+    try std.testing.expectEqualSlices(u8, original, cold_restored);
+    const wal = @import("posting_wal.zig");
+    var next = set;
+    next.centroid_norm = 4.5;
+    const replacement = try next.encode(alloc);
+    defer alloc.free(replacement);
+    const patch = try wal.encodeReplacementPatchAlloc(alloc, .quantized_checkpoint, original, replacement);
+    defer alloc.free(patch);
+    for ([_][]const u8{ restored, cold_restored }) |base| {
+        const applied = try wal.applyReplacementPatchAlloc(alloc, patch, base);
+        defer alloc.free(applied.replacement);
+        try std.testing.expectEqualSlices(u8, replacement, applied.replacement);
+    }
+    // The representation change that caused the original restart mismatch
+    // remains invalid. Current directories must reproduce the original bytes.
+    var expanded = set;
+    expanded.centroid_dot_products = @constCast(&[_]f32{ 0, 0 });
+    const changed_base = try expanded.encode(alloc);
+    defer alloc.free(changed_base);
+    try std.testing.expectError(error.PostingPatchBaseMismatch, wal.applyReplacementPatchAlloc(alloc, patch, changed_base));
 }
 
 test "quantized directory rejects truncation" {
@@ -1354,4 +1696,27 @@ test "quantized directory verifies posting payload lazily" {
     defer reader.deinit();
     try std.testing.expectError(error.QuantizedDirectoryChecksumMismatch, reader.get(1));
     try std.testing.expectError(error.QuantizedDirectoryChecksumMismatch, reader.get(1));
+}
+
+test "L2 append after directory materialization publishes a valid larger checkpoint" {
+    const alloc = std.testing.allocator;
+    var q = try @import("antfly_vector").quantizer.RaBitQuantizer.init(alloc, 2, 42, .l2_squared);
+    defer q.deinit();
+    var set = try q.quantize(&.{ 1, 2 }, &.{ 2, 3, 4, 5 }, 2);
+    defer set.deinit(alloc);
+    // An explicit all-zero L2 centroid-dot plane is also a valid input.
+    // Appending must normalize it without leaving a stale count-sized plane.
+    set.centroid_dot_products = try alloc.alloc(f32, 2);
+    @memset(set.centroid_dot_products, 0);
+    try q.quantizeWithSet(&set, &.{ 6, 7 }, 1);
+    try std.testing.expectEqual(@as(usize, 3), set.getCount());
+    try std.testing.expectEqual(@as(usize, 0), set.centroid_dot_products.len);
+    var writer = try Writer.init(alloc, 2, 0);
+    defer writer.deinit();
+    try writer.append(7, &set);
+    const encoded = try writer.build();
+    defer alloc.free(encoded);
+    const reader = try Reader.init(encoded);
+    const view = (try reader.get(7)).?;
+    try std.testing.expectEqual(@as(usize, 3), view.centroid_distances.len);
 }

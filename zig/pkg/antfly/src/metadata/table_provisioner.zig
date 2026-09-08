@@ -180,6 +180,7 @@ pub fn provisioningFingerprint(
         hasher.update(&range.completed_restore_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
+        if (table.storage.dense_embeddings != .primary_lsm) hashBytes(&hasher, @tagName(table.storage.dense_embeddings));
         hashBytes(&hasher, table.schema_json);
         hashBytes(&hasher, table.read_schema_json);
         hashBytes(&hasher, table.indexes_json);
@@ -249,6 +250,7 @@ pub fn reconcileReplicaRootWithOptions(
         var open_options = provisioningDbOpenOptions();
         open_options.backend_runtime = options.backend_runtime;
         open_options.schema_before_index_load = runtime_schema;
+        open_options.table_storage = table.storage;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;

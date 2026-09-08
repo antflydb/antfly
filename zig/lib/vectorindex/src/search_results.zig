@@ -41,6 +41,8 @@ pub const BoundedProjection = struct {
     error_norm: f32,
     decoded_norm_lower_bound: f32,
     checksum: u32,
+    verify_payload: bool = false,
+    verification: ?*std.atomic.Value(u8) = null,
     residual_location: ?types.NativeResidualLocation = null,
 };
 
@@ -382,6 +384,7 @@ pub const ApproxSearchResults = struct {
         projection_error_norms: []const f32,
         decoded_norm_lower_bounds: []const f32,
         checksums: []const u32,
+        verification: ?[]std.atomic.Value(u8),
         residual_locations: ?types.NativeResidualLocationPlane,
         original_positions: []const usize,
         dims: usize,
@@ -395,10 +398,12 @@ pub const ApproxSearchResults = struct {
             projection_error_norms,
             decoded_norm_lower_bounds,
             checksums,
+            verification,
             residual_locations,
             original_positions,
             dims,
             true,
+            0,
         );
     }
 
@@ -416,8 +421,9 @@ pub const ApproxSearchResults = struct {
         projection_error_norms: []const f32,
         decoded_norm_lower_bounds: []const f32,
         checksums: []const u32,
+        verification: ?[]std.atomic.Value(u8),
         residual_locations: ?types.NativeResidualLocationPlane,
-        original_positions: []const usize,
+        original_positions: ?[]const usize,
         dims: usize,
     ) void {
         self.addApproxResultsWithProjectionPlaneMode(
@@ -429,11 +435,27 @@ pub const ApproxSearchResults = struct {
             projection_error_norms,
             decoded_norm_lower_bounds,
             checksums,
+            verification,
             residual_locations,
             original_positions,
             dims,
             false,
+            0,
         );
+    }
+
+    /// Contiguous subrange of one leased leaf; physical plane indexes remain
+    /// absolute. Fused scorers need no temporary identity-position array.
+    pub fn addDeferredProjectionRange(
+        self: *ApproxSearchResults,
+        vector_ids: []const u64,
+        distances: []const f32,
+        error_bounds: []const f32,
+        plane: anytype,
+        first_row: usize,
+        dims: usize,
+    ) void {
+        self.addApproxResultsWithProjectionPlaneMode(vector_ids, distances, error_bounds, plane.values, plane.scales, plane.error_norms, plane.decoded_norm_lower_bounds, plane.checksums, plane.verification, plane.residual_locations, null, dims, false, first_row);
     }
 
     fn addApproxResultsWithProjectionPlaneMode(
@@ -446,14 +468,18 @@ pub const ApproxSearchResults = struct {
         projection_error_norms: []const f32,
         decoded_norm_lower_bounds: []const f32,
         checksums: []const u32,
+        verification: ?[]std.atomic.Value(u8),
         residual_locations: ?types.NativeResidualLocationPlane,
-        original_positions: []const usize,
+        original_positions: ?[]const usize,
         dims: usize,
         bounded_projection: bool,
+        first_row: usize,
     ) void {
         std.debug.assert(vector_ids.len == distances.len);
         std.debug.assert(vector_ids.len == error_bounds.len);
-        std.debug.assert(vector_ids.len == original_positions.len);
+        // Null denotes the complete contiguous leaf in its natural row order.
+        // Filtered callers supply an explicit mapping into the original plane.
+        if (original_positions) |positions| std.debug.assert(vector_ids.len == positions.len);
 
         const F32x8 = @Vector(8, f32);
         var i: usize = 0;
@@ -469,7 +495,7 @@ pub const ApproxSearchResults = struct {
                 }
             }
 
-            const original_position = original_positions[i];
+            const original_position = if (original_positions) |positions| positions[i] else first_row + i;
             const value_offset = std.math.mul(usize, original_position, dims) catch return;
             if (original_position >= scales.len or
                 original_position >= projection_error_norms.len or
@@ -490,6 +516,8 @@ pub const ApproxSearchResults = struct {
                     .error_norm = projection_error_norms[original_position],
                     .decoded_norm_lower_bound = decoded_norm_lower_bounds[original_position],
                     .checksum = checksums[original_position],
+                    .verify_payload = true,
+                    .verification = if (verification) |states| &states[original_position] else null,
                     .residual_location = if (residual_locations) |locations| locations.at(original_position) else null,
                 },
             );
@@ -595,6 +623,7 @@ test "deferred projection admission retains the plane without claiming it scored
         &norm_lowers,
         &checksums,
         null,
+        null,
         &positions,
         2,
     );
@@ -605,6 +634,11 @@ test "deferred projection admission retains the plane without claiming it scored
     const first = results.items.items[0].projection orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u32, 0x1111), first.checksum);
     try std.testing.expectEqualSlices(f16, values[0..2], first.values);
+    var contiguous = try ApproxSearchResults.initCapacity(std.testing.allocator, 2, 2, 2);
+    defer contiguous.deinit();
+    contiguous.addApproxResultsWithDeferredProjectionPlane(&ids, &distances, &error_bounds, &values, &scales, &projection_errors, &norm_lowers, &checksums, null, null, null, 2);
+    contiguous.sort();
+    try std.testing.expectEqualDeep(results.items.items, contiguous.items.items);
 }
 
 test "batched approximate admission preserves scalar thresholds across random blocks" {

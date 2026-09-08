@@ -59,6 +59,16 @@ pub const FlatCentroidProbe = struct {
     bound_resolved: bool = false,
     suffix_member_lower_bound: f32 = -std.math.inf(f32),
     suffix_bounds_resolved: bool = false,
+    /// Resolved using authenticated metadata before scan admission. The
+    /// transaction's immutable generation lease owns these opaque pointers.
+    native_scan_resolved: bool = false,
+    native_scan_handle: ?NativeLeafScanHandle = null,
+};
+
+pub const NativeLeafScanHandle = struct {
+    generation: *const anyopaque,
+    directory: *anyopaque,
+    entry_index: usize,
 };
 
 pub const SearchResult = search_results.SearchResult;
@@ -123,6 +133,17 @@ pub const SearchProfile = struct {
     total_ns: u64 = 0,
     setup_ns: u64 = 0,
     runtime_txn_ns: u64 = 0,
+    admission_wait_ns: u64 = 0,
+    scan_admission_wait_ns: u64 = 0,
+    rerank_admission_wait_ns: u64 = 0,
+    admission_estimated_scan_bytes: u64 = 0,
+    admission_selected_scan_bytes: u64 = 0,
+    admission_peak_reserved_bytes: u64 = 0,
+    admission_reservations: u64 = 0,
+    admission_fallback_leaves: u64 = 0,
+    leaf_scan_bytes: u64 = 0,
+    native_leaf_lookup_ns: u64 = 0,
+    projection_completion_ns: u64 = 0,
     scratch_acquire_ns: u64 = 0,
     root_load_ns: u64 = 0,
     node_cache_lookup_ns: u64 = 0,
@@ -154,6 +175,7 @@ pub const SearchProfile = struct {
     /// Physical compact-plane reads. The bounded pass retains the validated
     /// generation-leased view so exact completion does not read it twice.
     rerank_vector_projection_reads: u64 = 0,
+    rerank_vector_projection_borrows: u64 = 0,
     rerank_vector_projection_bytes: u64 = 0,
     /// Physical lossless-residual reads, which must track authoritative
     /// completions rather than the wider bounded candidate shell.
@@ -203,6 +225,11 @@ pub const SearchProfile = struct {
     traversal_bound_resolutions: u64 = 0,
     traversal_bound_fallbacks: u64 = 0,
     traversal_bound_stops: u64 = 0,
+    traversal_bound_unresolved_frontier: u64 = 0,
+    traversal_bound_incomplete_topk: u64 = 0,
+    traversal_bound_overlap: u64 = 0,
+    traversal_unresolved_posting_bounds: u64 = 0,
+    traversal_incomplete_routing_directory: u64 = 0,
     traversal_yield_stops: u64 = 0,
     traversal_frontier_remaining: u64 = 0,
     traversal_eligible_vectors: u64 = 0,
@@ -227,6 +254,10 @@ pub const SearchProfile = struct {
     leaf_payload_missing: u64 = 0,
     native_leaf_scan_hits: u64 = 0,
     native_leaf_scan_fallbacks: u64 = 0,
+    subgroup_leaves_scored: u64 = 0,
+    subgroup_vectors_skipped: u64 = 0,
+    subgroup_compact_groups_scored: u64 = 0,
+    subgroup_routing_ns: u64 = 0,
     reranked_vectors: u64 = 0,
     approx_candidate_count: u64 = 0,
     rerank_candidate_count: u64 = 0,

@@ -728,6 +728,7 @@ const LocalStandaloneMetadata = struct {
     catalog_store: ?*antfly.storage_backend_erased.Store,
     backend_runtime: *antfly.db.background_runtime.BackendRuntime,
     storage_engine: antfly.common.config.StorageEngine = .local,
+    vector_source_storage_allowed: bool = true,
     epoch: u64 = 1,
     last_schema_migration_finalize_at_ms: u64 = 0,
     local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
@@ -1113,6 +1114,9 @@ const LocalStandaloneMetadata = struct {
 
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        const replicated = !self.vector_source_storage_allowed or
+            (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+        try req.storage.validateStandalone(req.num_shards orelse 1, replicated, self.storage_engine != .local);
         const table = try deriveStandaloneTableRecord(self.storage_engine, table_name, req);
         const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
         defer {
@@ -1767,6 +1771,7 @@ fn deriveStandaloneTableRecord(
     table_name: []const u8,
     req: antfly.public_api.tables.CreateTableRequest,
 ) !antfly.metadata.TableRecord {
+    try req.storage.validateStandalone(req.num_shards orelse 1, false, storage_engine != .local);
     if (storage_engine == .lite and (req.num_shards orelse 1) != 1) {
         return error.InvalidCreateTableRequest;
     }
@@ -2224,6 +2229,16 @@ pub fn runFromIterator(
         return err;
     };
     defer local_metadata.deinit();
+    local_metadata.vector_source_storage_allowed = !ha_role_requested;
+    // Reject persisted experimental tables before HA can snapshot or mirror
+    // primary roots whose references need a separate source-store lifecycle.
+    if (ha_role_requested) {
+        var tables = local_metadata.manager.tables.valueIterator();
+        while (tables.next()) |table| {
+            if (table.storage.dense_embeddings == .vector_store)
+                return error.VectorStoreRequiresLocalSingleShardTable;
+        }
+    }
     if (lite_backend) |*backend| {
         try local_metadata.adoptEmbeddedLiteRootIfNeeded(backend);
         // Mark only after embedded adoption and metadata publication succeed.

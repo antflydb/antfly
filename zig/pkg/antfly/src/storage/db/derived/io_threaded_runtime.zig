@@ -1376,6 +1376,8 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
         .{
             .resource_manager = runtime.backlog.resource_manager,
             .max_windows_per_call = max_windows_per_call,
+            .max_call_ns = policy.max_call_ns,
+            .max_call_bytes = policy.max_call_bytes,
             .max_items_per_window = policy.max_items_per_window,
             .max_chunk_bytes = policy.max_chunk_bytes,
             .estimated_dense_vector_bytes = policy.estimated_dense_vector_bytes,

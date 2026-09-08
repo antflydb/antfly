@@ -14,6 +14,14 @@
 
 const std = @import("std");
 
+test "fused native candidate scoring preserves array score and projection parity" {
+    try @import("hbc_index.zig").testFusedNativeCandidateParity();
+}
+
+test "fused native candidate scoring microbenchmark" {
+    try @import("hbc_index.zig").benchmarkFusedNativeCandidates();
+}
+
 pub const types = @import("types.zig");
 pub const bulk_build = @import("bulk_build.zig");
 pub const kmeans = @import("kmeans.zig");
@@ -27,6 +35,33 @@ pub const checked_region = @import("checked_region.zig");
 pub const posting_segment = @import("posting_segment.zig");
 pub const centroid_directory = @import("centroid_directory.zig");
 pub const quantized_directory = @import("quantized_directory.zig");
+pub const posting_subgroups = @import("posting_subgroups.zig");
+pub const compact_subgroups = @import("compact_subgroups.zig");
+pub const weighted_subgroup_selection = @import("weighted_subgroup_selection.zig");
+
+// Discover format tests even when a filtered run excludes the root's query
+// tests (and therefore never otherwise analyzes these lazy imports).
+comptime {
+    if (@import("builtin").is_test) {
+        _ = @import("quantized_directory.zig");
+        _ = @import("vector_block.zig");
+        _ = @import("antfly_hash");
+        _ = @import("posting_wal.zig");
+        _ = @import("posting_segment.zig");
+        _ = @import("vector_block_wal.zig");
+        _ = @import("vector_block_manifest.zig");
+        _ = @import("hbc_vector_directory.zig");
+        _ = @import("hbc_index.zig");
+        _ = @import("posting.zig");
+        _ = @import("spfresh_index.zig");
+        _ = @import("posting_subgroups.zig");
+        _ = @import("weighted_subgroup_selection.zig");
+        _ = @import("global_subgroup_plan.zig");
+        _ = @import("compact_subgroups.zig");
+        _ = @import("search_results.zig");
+        _ = @import("search_runtime.zig");
+    }
+}
 pub const posting_wal = @import("posting_wal.zig");
 pub const hbc_vector_directory = @import("hbc_vector_directory.zig");
 pub const vector_block = @import("vector_block.zig");
@@ -163,6 +198,24 @@ test "posting wal rejects checksum and ordering errors" {
 
 test "posting checkpoint round trips with checksum" {
     try posting_wal.testCheckpointRoundTripAndChecksum();
+}
+
+test "bounded flat proof includes all omitted postings without full-directory scratch" {
+    try @import("spfresh_index.zig").testBoundedFlatSuffixProofs();
+}
+
+test "native candidate score growth does not grow the vector fetch workspace" {
+    var scratch = try @import("search_runtime.zig").SearchScratch.init(std.testing.allocator, 768, 4, 16);
+    defer scratch.deinit(std.testing.allocator);
+    const vector_values = scratch.vector_batch.len;
+    const metadata_slots = scratch.metadata.len;
+    const positions = scratch.positions.len;
+    try scratch.ensureScoreCapacity(std.testing.allocator, 4096);
+    try std.testing.expectEqual(vector_values, scratch.vector_batch.len);
+    try std.testing.expectEqual(metadata_slots, scratch.metadata.len);
+    try std.testing.expectEqual(positions, scratch.positions.len);
+    try std.testing.expect(scratch.distances.len >= 4096);
+    try std.testing.expect(scratch.error_bounds.len >= 4096);
 }
 
 test "posting segment checkpoint and wal tail compose" {

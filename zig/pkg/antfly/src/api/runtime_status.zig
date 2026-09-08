@@ -86,6 +86,7 @@ pub const LocalTableRuntimeStatus = struct {
     created_at_millis: u64 = 0,
     stats: db_mod.types.DBStats,
     lsm_storage_stats: ?LsmStorageStats = null,
+    source_vectors: ?@import("../storage/artifact_payload.zig").Stats = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         db_mod.types.freeDBStats(alloc, self.stats);
@@ -103,6 +104,7 @@ pub const LocalTableRuntimeStatus = struct {
             .created_at_millis = self.created_at_millis,
             .stats = try cloneDBStats(alloc, self.stats),
             .lsm_storage_stats = self.lsm_storage_stats,
+            .source_vectors = self.source_vectors,
         };
     }
 
@@ -1733,6 +1735,10 @@ fn mergeCachedStatusWithNonAuthoritativePlaceholder(
     // immediately erase the owner acknowledgement we are trying to retain.
     merged.replaceMetadata(cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns));
 
+    // Each snapshot owns its index strings and nested arrays. Moving a deep
+    // clone preserves that ownership when the previous cache entry retires.
+    var retained = try previous.clone(alloc);
+    defer retained.deinit(alloc);
     for (merged.stats.indexes) |*dst| {
         const target_fence = if (targeted_index_fences) |fences| fences.get(dst.name) else null;
         const targeted = if (target_fence) |fence| !fence.target_authority_handed_off else false;
@@ -1746,10 +1752,10 @@ fn mergeCachedStatusWithNonAuthoritativePlaceholder(
         else
             false;
         if (targeted and !target_facts_current) continue;
-        const cached = findMatchingIndexStatus(previous.stats.indexes, dst.name, dst.kind) orelse continue;
-        const owned_name = dst.name;
-        dst.* = cached;
-        dst.name = owned_name;
+        const cached = for (retained.stats.indexes) |*candidate| {
+            if (candidate.kind == dst.kind and std.mem.eql(u8, candidate.name, dst.name)) break candidate;
+        } else continue;
+        std.mem.swap(db_mod.types.DBIndexStats, dst, cached);
         if (targeted) {
             dst.runtime_observation_stale = false;
             dst.runtime_observation_serviceable = false;
@@ -2824,6 +2830,41 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
     try std.testing.expectEqualStrings("kw", logs.items[0].stats.indexes[0].name);
 }
 
+test "synthetic status merge owns retained index errors after previous snapshot retires" {
+    const alloc = std.testing.allocator;
+    var merged: ?LocalTableRuntimeStatus = null;
+    defer if (merged) |*value| value.deinit(alloc);
+    {
+        var previous = LocalTableRuntimeStatus{
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1) },
+        };
+        previous.stats.indexes[0] = .{
+            .name = try alloc.dupe(u8, "semantic"),
+            .kind = .dense_vector,
+            .load_error = try alloc.dupe(u8, "retained load error"),
+            .index_repair_last_error = try alloc.dupe(u8, "retained repair error"),
+        };
+        defer previous.deinit(alloc);
+        var placeholder = LocalTableRuntimeStatus{
+            .metadata = .{ .source = .synthetic_config, .freshness = .stale },
+            .stats = .{ .index_count = 1, .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1) },
+        };
+        placeholder.stats.indexes[0] = .{
+            .name = try alloc.dupe(u8, "semantic"),
+            .kind = .dense_vector,
+            .load_error = try alloc.dupe(u8, "placeholder load error"),
+            .index_repair_last_error = try alloc.dupe(u8, "placeholder repair error"),
+        };
+        defer placeholder.deinit(alloc);
+        merged = try mergeCachedStatusWithNonAuthoritativePlaceholder(alloc, previous, placeholder, 1, null);
+        try std.testing.expect(merged.?.stats.indexes[0].load_error.?.ptr != previous.stats.indexes[0].load_error.?.ptr);
+        try std.testing.expect(merged.?.stats.indexes[0].index_repair_last_error.?.ptr != previous.stats.indexes[0].index_repair_last_error.?.ptr);
+    }
+    try std.testing.expectEqualStrings("retained load error", merged.?.stats.indexes[0].load_error.?);
+    try std.testing.expectEqualStrings("retained repair error", merged.?.stats.indexes[0].index_repair_last_error.?);
+}
+
 test "table runtime snapshot cache does not replace published live status with synthetic zero" {
     var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
     defer cache.deinit();
@@ -3039,7 +3080,10 @@ test "table runtime snapshot cache preserving replacement does not replace live 
 
     try std.testing.expectEqual(@as(usize, 1), docs.items.len);
     try std.testing.expectEqual(RuntimeStatusSource.cached_snapshot, docs.items[0].metadata.source);
-    try std.testing.expectEqual(RuntimeStatusFreshness.fresh, docs.items[0].metadata.freshness);
+    // Retained counts survive the missed refresh; its freshness and current
+    // target observation still remain conservative.
+    try std.testing.expectEqual(RuntimeStatusFreshness.stale, docs.items[0].metadata.freshness);
+    try std.testing.expect(!docs.items[0].metadata.target_observation_complete);
     try std.testing.expectEqual(@as(u64, 250_000), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(@as(u64, 250_000), docs.items[0].stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 2048), docs.items[0].stats.indexes[0].node_count);

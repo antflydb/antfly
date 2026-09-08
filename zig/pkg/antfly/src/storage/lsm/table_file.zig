@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const bloom = @import("bloom");
 const byte_copy = @import("../../common/byte_copy.zig");
 const snappy = @import("../../encoding/snappy.zig");
@@ -802,7 +803,7 @@ const memory_table_sink_vtable = TableSink.VTable{
 
 const ChecksummedTableSink = struct {
     parent: *TableSink,
-    crc: std.hash.Crc32 = .init(),
+    crc: Crc32 = .init(),
 
     fn sink(self: *ChecksummedTableSink) TableSink {
         return .{
@@ -1537,7 +1538,7 @@ pub const StreamingEncoder = struct {
             .physical_relative_offset = physical_relative_offset,
             .physical_len = try checkedU32(encoded_payload.payload.len),
             .compression = encoded_payload.compression,
-            .checksum = std.hash.Crc32.hash(encoded_payload.payload),
+            .checksum = Crc32.hash(encoded_payload.payload),
             .first_entry_index = try checkedU32(self.block_first_entry_index),
             .entry_count = try checkedU32(self.block_entry_count),
             .smallest_namespace_name = smallest_namespace_name,
@@ -1694,7 +1695,7 @@ fn flushEncodedBlock(
         .physical_relative_offset = physical_relative_offset,
         .physical_len = try checkedU32(encoded_payload.payload.len),
         .compression = encoded_payload.compression,
-        .checksum = std.hash.Crc32.hash(encoded_payload.payload),
+        .checksum = Crc32.hash(encoded_payload.payload),
         .first_entry_index = try checkedU32(block_first_entry_index),
         .entry_count = try checkedU32(block_entry_count),
         .smallest_namespace_name = block_smallest_namespace_name,
@@ -2251,7 +2252,7 @@ pub fn decodeWindowFromRawAlloc(
 }
 
 pub fn validateBlockPayload(payload: []const u8, expected_checksum: u32) !void {
-    if (std.hash.Crc32.hash(payload) != expected_checksum) return error.TableBlockChecksumMismatch;
+    if (Crc32.hash(payload) != expected_checksum) return error.TableBlockChecksumMismatch;
 }
 
 fn validateRawBlockChecksums(raw: []const u8, index: *const TableIndex) !void {
@@ -2330,7 +2331,7 @@ pub fn decodeFooterBytes(raw: []const u8) !Footer {
     if (raw.len != footer_len) return error.InvalidTableFile;
     if (!hasFooterMagic(raw)) return error.InvalidTableFile;
     const stored_footer_checksum = std.mem.readInt(u32, raw[44..48], .little);
-    if (std.hash.Crc32.hash(raw[0..44]) != stored_footer_checksum) return error.InvalidTableFile;
+    if (Crc32.hash(raw[0..44]) != stored_footer_checksum) return error.InvalidTableFile;
 
     var cursor: usize = footer_magic.len;
     if (try readU32(raw, &cursor) != version) return error.UnsupportedVersion;
@@ -2359,7 +2360,7 @@ pub fn decodeIndexFromFooterAlloc(
     metadata: []const u8,
 ) !TableIndex {
     if (metadata.len != footer.metadata_len) return error.InvalidTableFile;
-    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    if (Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
     return try decodeFooterMetadataAlloc(
         allocator,
         metadata,
@@ -2377,7 +2378,7 @@ pub fn decodeSequentialIndexFromFooterAlloc(
     metadata: []const u8,
 ) !SequentialTableIndex {
     if (metadata.len != footer.metadata_len) return error.InvalidTableFile;
-    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    if (Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
     var cursor: usize = 0;
 
     // Entry offsets and all lookup accelerators are deliberately skipped.
@@ -2650,7 +2651,7 @@ fn appendFooter(
     std.mem.writeInt(u32, raw[32..36], try checkedU32(entry_count), .little);
     std.mem.writeInt(u32, raw[36..40], try checkedU32(entry_data_len), .little);
     std.mem.writeInt(u32, raw[40..44], metadata_checksum, .little);
-    std.mem.writeInt(u32, raw[44..48], std.hash.Crc32.hash(raw[0..44]), .little);
+    std.mem.writeInt(u32, raw[44..48], Crc32.hash(raw[0..44]), .little);
     try sink.appendSlice(&raw);
 }
 
@@ -2702,7 +2703,7 @@ fn decodeVersionedIndexAlloc(
     if (footer.metadata_offset > footer_offset or footer.metadata_len != footer_offset - footer.metadata_offset)
         return error.InvalidTableFile;
     const metadata = raw[footer.metadata_offset..footer_offset];
-    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    if (Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
     var index = try decodeFooterMetadataAlloc(
         allocator,
         metadata,
@@ -3192,7 +3193,7 @@ test "table file rejects forged footer entry count before allocating offsets" {
 
     const footer_bytes = encoded[encoded.len - footer_len ..];
     std.mem.writeInt(u32, footer_bytes[32..36], std.math.maxInt(u32), .little);
-    std.mem.writeInt(u32, footer_bytes[44..48], std.hash.Crc32.hash(footer_bytes[0..44]), .little);
+    std.mem.writeInt(u32, footer_bytes[44..48], Crc32.hash(footer_bytes[0..44]), .little);
     const footer = try decodeFooterBytes(footer_bytes);
     const metadata = encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len];
 

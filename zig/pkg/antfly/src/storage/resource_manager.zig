@@ -17,6 +17,9 @@ const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
 const cache_budget = @import("../common/cache_budget.zig");
+pub const DenseWorkAdmission = @import("dense_work_admission.zig");
+const dense_perf = @import("dense_perf_experiments.zig");
+pub const ProjectionPageCache = @import("projection_page_cache.zig");
 
 const MiB: u64 = 1024 * 1024;
 const dense_replay_window_min_bytes: u64 = 16 * MiB;
@@ -125,6 +128,7 @@ pub const Slice = enum(u8) {
     /// admission, and every builder allocation remains inside the aggregate
     /// host-memory envelope.
     dense_vector_block_build_working_set,
+    dense_source_payload_state,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -159,6 +163,7 @@ pub const Slice = enum(u8) {
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
             .dense_vector_block_build_working_set => "dense.vector_block_build_working_set",
+            .dense_source_payload_state => "dense.source_payload_state",
         };
     }
 };
@@ -350,6 +355,9 @@ pub const Options = struct {
     /// retained-memory accounting: permits model bytes simultaneously streamed
     /// through shared caches and memory channels.
     dense_search_bandwidth_capacity_bytes: ?u64 = null,
+    /// Additional std.Io read workers, beyond already-admitted query callers.
+    /// Null derives from logical CPUs; zero keeps caller-only execution.
+    dense_read_extra_task_limit: ?u32 = null,
     /// Allocates identity tables and the reclaimer registry only as concurrent
     /// owners exceed their previous high-water mark. Production owners should
     /// pass their lifetime allocator; the page allocator keeps lightweight
@@ -392,6 +400,7 @@ pub const Options = struct {
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 },
         };
     }
 
@@ -428,6 +437,7 @@ pub const Options = struct {
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .report, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .throttle_writes },
         };
     }
 };
@@ -452,6 +462,14 @@ pub const Stats = struct {
     reclaim_requests: u64 = 0,
     reclaimed_bytes: u64 = 0,
     dense_search_admission: DenseSearchAdmissionStats = .{},
+    dense_read_tasks: DenseReadTaskStats = .{},
+};
+
+pub const DenseReadTaskStats = struct {
+    limit: u32 = 0,
+    active: u32 = 0,
+    peak_active: u32 = 0,
+    denied: u64 = 0,
 };
 
 pub const DenseSearchAdmissionStats = struct {
@@ -721,6 +739,23 @@ pub const ReclaimerOptions = struct {
     weight: u32 = 1,
 };
 
+test "dense aggregate resource manager bounds callers and helpers together" {
+    var manager = ResourceManager.init(.{ .dense_read_extra_task_limit = 4 });
+    defer manager.deinit(std.testing.allocator);
+    manager.dense_aggregate_admission = true;
+    manager.dense_driver_admission.capacity = 2;
+    var caller = try manager.dense_driver_admission.acquire(null, null);
+    defer caller.release();
+    try std.testing.expect(manager.tryAcquireDenseReadTask());
+    try std.testing.expect(!manager.tryAcquireDenseReadTask());
+    try std.testing.expectEqual(@as(u32, 1), manager.denseReadTaskStats().active);
+    manager.releaseDenseReadTask();
+    try std.testing.expect(manager.tryAcquireDenseReadTask());
+    manager.releaseDenseReadTask();
+    caller.release();
+    manager.dense_driver_admission.assertIdle();
+}
+
 pub const ResourceManager = struct {
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
@@ -757,6 +792,29 @@ pub const ResourceManager = struct {
     dense_search_waits: u64 = 0,
     dense_search_cancellations: u64 = 0,
     dense_search_wait_ns: u64 = 0,
+    dense_read_extra_task_limit: u32 = 0,
+    dense_rerank_admission: DenseWorkAdmission.Queue = .{},
+    dense_driver_admission: DenseWorkAdmission.Queue = .{},
+    dense_aggregate_admission: bool = false,
+    dense_phase_admission: bool = false,
+    dense_scan_prediction: bool = false,
+    dense_fused_no_copy: bool = false,
+    dense_angular_bounds: bool = false,
+    dense_quantized_routing: bool = false,
+    dense_centered_routing: bool = false,
+    dense_subgroup_count: u8 = 0,
+    dense_subgroup_routing: bool = false,
+    dense_global_subgroup_routing: bool = false,
+    dense_compact_subgroup_routing: bool = false,
+    dense_projection_pages_enabled: bool = false,
+    dense_projection_borrow_enabled: bool = false,
+    dense_projection_trace_enabled: bool = false,
+    dense_grouped_fallbacks: bool = false,
+    dense_projection_pages: std.atomic.Value(?*ProjectionPageCache.Cache) = .init(null),
+    dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
+    dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
+    dense_read_peak_extra_tasks: std.atomic.Value(u32) = .init(0),
+    dense_read_denied_tasks: std.atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -807,12 +865,86 @@ pub const ResourceManager = struct {
             .query_embedding_max_inflight = @max(@as(usize, 1), options.query_embedding_max_inflight),
             .dense_search_bandwidth_capacity_bytes = options.dense_search_bandwidth_capacity_bytes orelse
                 options.budgets[@intFromEnum(Slice.dense_search_working_set)].soft_limit_bytes,
+            .dense_read_extra_task_limit = options.dense_read_extra_task_limit orelse
+                @intCast(@min(std.math.maxInt(u32), (std.Thread.getCpuCount() catch 1) *| 2)),
+            .dense_rerank_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
+            .dense_driver_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
+            .dense_aggregate_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_AGGREGATE_ADMISSION"),
+            .dense_phase_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_PHASE_ADMISSION"),
+            .dense_scan_prediction = dense_perf.enabled("ANTFLY_EXPERIMENT_SCAN_PREDICTION"),
+            .dense_fused_no_copy = dense_perf.enabled("ANTFLY_EXPERIMENT_FUSED_NO_COPY"),
+            .dense_angular_bounds = dense_perf.enabled("ANTFLY_EXPERIMENT_ANGULAR_BOUNDS"),
+            .dense_quantized_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_QUANTIZED_ROUTING"),
+            .dense_centered_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_CENTERED_ROUTING"),
+            .dense_subgroup_count = if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_16")) 16 else if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_8")) 8 else if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_4")) 4 else 0,
+            .dense_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUP_ROUTING"),
+            .dense_global_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING"),
+            .dense_compact_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_COMPACT_SUBGROUP_ROUTING"),
+            .dense_projection_pages_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_PAGES"),
+            .dense_projection_borrow_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_BORROW"),
+            .dense_projection_trace_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_TRACE"),
+            .dense_grouped_fallbacks = dense_perf.enabled("ANTFLY_EXPERIMENT_GROUPED_FALLBACKS"),
             .identity_allocator = options.identity_allocator,
         };
     }
 
     pub fn queryEmbeddingCacheBudget(self: *ResourceManager) *cache_budget.CacheBudget {
         return &self.query_embedding_cache_budget;
+    }
+
+    pub fn projectionPageCache(self: *ResourceManager) ?*ProjectionPageCache.Cache {
+        if (!self.dense_projection_pages_enabled) return null;
+        if (self.dense_projection_pages.load(.acquire)) |cache| return cache;
+        if (!self.dense_projection_pages_mutex.tryLock()) return null;
+        defer self.dense_projection_pages_mutex.unlock();
+        if (self.dense_projection_pages.load(.acquire)) |cache| return cache;
+        const cache = ProjectionPageCache.Cache.create(self) catch return null;
+        self.dense_projection_pages.store(cache, .release);
+        return cache;
+    }
+
+    /// Optional parallelism is nonblocking. The admitted query caller always
+    /// drains its queue, so no generation/scratch lease waits for more workers.
+    pub fn tryAcquireDenseReadTask(self: *ResourceManager) bool {
+        var driver: DenseWorkAdmission.Queue.Lease = .{};
+        if (self.dense_aggregate_admission) {
+            driver = self.dense_driver_admission.tryAcquire() orelse {
+                _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
+                return false;
+            };
+        }
+        var granted = false;
+        defer if (!granted) driver.release();
+        var active = self.dense_read_extra_tasks.load(.monotonic);
+        while (active < self.dense_read_extra_task_limit) {
+            if (self.dense_read_extra_tasks.cmpxchgWeak(active, active + 1, .acquire, .monotonic)) |updated| {
+                active = updated;
+            } else {
+                _ = self.dense_read_peak_extra_tasks.fetchMax(active + 1, .monotonic);
+                granted = true;
+                return true;
+            }
+        }
+        _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
+        return false;
+    }
+
+    pub fn releaseDenseReadTask(self: *ResourceManager) void {
+        const previous = self.dense_read_extra_tasks.fetchSub(1, .release);
+        std.debug.assert(previous != 0);
+        if (self.dense_aggregate_admission) {
+            var driver: DenseWorkAdmission.Queue.Lease = .{ .queue = &self.dense_driver_admission };
+            driver.release();
+        }
+    }
+
+    pub fn denseReadTaskStats(self: *const ResourceManager) DenseReadTaskStats {
+        return .{
+            .limit = self.dense_read_extra_task_limit,
+            .active = self.dense_read_extra_tasks.load(.monotonic),
+            .peak_active = self.dense_read_peak_extra_tasks.load(.monotonic),
+            .denied = self.dense_read_denied_tasks.load(.monotonic),
+        };
     }
 
     pub fn registerReclaimer(
@@ -1129,8 +1261,9 @@ pub const ResourceManager = struct {
     }
 
     /// Acquire a fair node-wide permit for the estimated candidate bytes one
-    /// dense search will scan. Waiters do not hold an index transaction,
-    /// generation fence, or request workspace. Oversized searches consume the
+    /// dense search will scan. Waiters must not hold mutable index/cache locks
+    /// or a publication fence. Native two-phase searches may retain immutable
+    /// generation leases and separately budgeted request scratch. Oversized searches consume the
     /// whole budget and therefore retain correctness progress without letting
     /// smaller requests starve them indefinitely.
     pub fn acquireDenseSearchBandwidth(
@@ -1320,6 +1453,11 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        self.dense_rerank_admission.assertIdle();
+        self.dense_driver_admission.assertIdle();
+        if (self.dense_projection_pages.load(.acquire)) |cache| cache.deinit();
+        if (self.dense_read_extra_tasks.load(.acquire) != 0)
+            @panic("resource manager deinitialized with active dense read workers");
         lockAtomic(&self.dense_search_admission_mutex);
         if (self.dense_search_active_queries != 0 or self.dense_search_wait_head != null)
             @panic("resource manager deinitialized with active dense search admission");
@@ -2496,6 +2634,7 @@ pub const ResourceManager = struct {
             .reclaim_requests = self.reclaim_requests.load(.monotonic),
             .reclaimed_bytes = self.reclaimed_bytes.load(.monotonic),
             .dense_search_admission = self.denseSearchAdmissionStats(),
+            .dense_read_tasks = self.denseReadTaskStats(),
         };
     }
 
@@ -2886,6 +3025,7 @@ pub const Reservation = struct {
 /// backing allocator. One operation may make bounded progress above the normal
 /// hard limit only while it is the slice's sole user.
 pub const BudgetedAllocator = struct {
+    allocator_mutex: std.atomic.Mutex = .unlocked,
     backing: std.mem.Allocator,
     reservation: Reservation,
     max_hard_limit_multiple: u64,
@@ -2932,6 +3072,45 @@ pub const BudgetedAllocator = struct {
                 .free = free,
             },
         };
+    }
+
+    /// Shared immutable generations may release their final allocation on a
+    /// query thread while the source writer allocates a successor. Owners that
+    /// publish such leases must use this interface for every allocation.
+    /// Reclaimers for this allocator must not recursively free through it.
+    pub fn threadSafeAllocator(self: *BudgetedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = lockedAlloc, .resize = lockedResize, .remap = lockedRemap, .free = lockedFree } };
+    }
+
+    pub fn liveBytesThreadSafe(self: *BudgetedAllocator) u64 {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.live_bytes;
+    }
+
+    fn lockedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return alloc(ctx, len, alignment, ret_addr);
+    }
+    fn lockedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return resize(ctx, memory, alignment, new_len, ret_addr);
+    }
+    fn lockedRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return remap(ctx, memory, alignment, new_len, ret_addr);
+    }
+    fn lockedFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        free(ctx, memory, alignment, ret_addr);
     }
 
     pub fn denied(self: *const BudgetedAllocator) bool {

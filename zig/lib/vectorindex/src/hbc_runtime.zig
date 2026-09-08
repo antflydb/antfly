@@ -60,6 +60,7 @@ pub const NativeLeafScanView = struct {
     /// resulting score interval conservative enough to defer authoritative
     /// residual reads until the public top-k boundary is known.
     projections: ?NativeProjectionPlane = null,
+    subgroup_plan: ?@import("posting_subgroups.zig").View = null,
 };
 
 pub const NativeProjectionPlane = struct {
@@ -72,6 +73,7 @@ pub const NativeProjectionPlane = struct {
     /// this column and remain scoreable, but cannot use residual-only exact
     /// completion without revalidating the projection payload.
     checksums: []const u32 = &.{},
+    verification: ?[]std.atomic.Value(u8) = null,
     /// Optional generation-bound locations of the lossless residuals in the
     /// shared exact-vector store. Older posting generations omit this plane;
     /// callers must then resolve the artifact key through the authoritative
@@ -79,6 +81,13 @@ pub const NativeProjectionPlane = struct {
     /// validates its generation, shard, sequence, projection checksum, and
     /// residual checksum.
     residual_locations: ?NativeResidualLocationPlane = null,
+
+    pub fn validateRow(self: @This(), row: usize) !void {
+        if (row >= self.scales.len or row >= self.checksums.len or self.dims == 0 or
+            row >= self.values.len / self.dims) return error.InvalidQuantizedDirectory;
+        const values = self.values[row * self.dims ..][0..self.dims];
+        try validateProjectionPayload(values, self.checksums[row], if (self.verification) |states| &states[row] else null);
+    }
 
     pub fn validFor(self: @This(), count: usize, dims: usize) bool {
         const expected_values = std.math.mul(usize, count, dims) catch return false;
@@ -88,9 +97,24 @@ pub const NativeProjectionPlane = struct {
             self.error_norms.len == count and
             self.decoded_norm_lower_bounds.len == count and
             (self.checksums.len == 0 or self.checksums.len == count) and
+            (self.verification == null or self.verification.?.len == count) and
             (self.residual_locations == null or self.residual_locations.?.validFor(count));
     }
 };
+
+/// Memoization belongs to the immutable generation, never to an artifact ID
+/// that can be reused by a later mutation. Concurrent first readers may both
+/// hash a row; neither waits or holds a lock across mmap faults.
+pub fn validateProjectionPayload(values: []const f16, checksum: u32, verification: ?*std.atomic.Value(u8)) !void {
+    if (verification) |state| switch (state.load(.acquire)) {
+        1 => return,
+        2 => return error.QuantizedDirectoryChecksumMismatch,
+        else => {},
+    };
+    const valid = std.hash.Crc32.hash(std.mem.sliceAsBytes(values)) == checksum;
+    if (verification) |state| state.store(if (valid) 1 else 2, .release);
+    if (!valid) return error.QuantizedDirectoryChecksumMismatch;
+}
 
 pub const NativeResidualLocation = types.NativeResidualLocation;
 pub const NativeResidualLocationPlane = types.NativeResidualLocationPlane;
@@ -121,10 +145,17 @@ pub const NativeProjectionBuildBegin = *const fn (ctx: *anyopaque, source_sequen
 pub const NativeProjectionBuildEnd = *const fn (ctx: *anyopaque) void;
 
 pub const NativeProjectionBuildSource = struct {
+    /// Training reads the shared projection, but need not duplicate that
+    /// matrix in the posting generation.
+    retain_projection_plane: bool = true,
+    subgroup_count: u8 = 0,
     ctx: *anyopaque,
     loader: NativeProjectionBuildLoader,
     begin: ?NativeProjectionBuildBegin = null,
     end: ?NativeProjectionBuildEnd = null,
+    /// Layout policy, independent of whether the source is available at this
+    /// instant. Missing optional acceleration remains retryable serving debt.
+    required: bool = false,
 };
 
 pub const WriteProfile = struct {

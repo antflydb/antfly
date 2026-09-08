@@ -5407,7 +5407,18 @@ pub const ApiHttpServer = struct {
             // backfill and turns a supposedly best-effort field into an
             // unbounded GET /tables stall.
             .lsm = liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
+            .source_vectors = liveSourceVectorStatus(local_statuses.items),
         };
+    }
+
+    fn liveSourceVectorStatus(statuses: []const runtime_status.LocalTableRuntimeStatus) ?@import("../storage/artifact_payload.zig").Stats {
+        // Source mode is admitted only for one shard. Read its resident-owner
+        // observation; do not open files or trigger maintenance from status.
+        for (statuses) |status| {
+            if (!runtime_status.statusRuntimeFresh(status)) continue;
+            if (status.source_vectors) |source| return source;
+        }
+        return null;
     }
 
     fn liveLsmStorageStatusFromRuntimeStatuses(
@@ -14392,6 +14403,7 @@ pub const ApiHttpServer = struct {
         self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
             error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => try contextual_operations.textAlloc(self.alloc, 400, "vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
