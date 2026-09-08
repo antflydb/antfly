@@ -60,6 +60,28 @@ pub const DecoderCrossCache = struct {
     keys: []CT,
     values: []CT,
 
+    /// Views may borrow their source (CUDA) or retain it (Metal). In either
+    /// case the owning cache must outlive this descriptor set.
+    fn prefix(self: DecoderCrossCache, cb: *const ComputeBackend, allocator: std.mem.Allocator, rows: usize, cols: usize) !DecoderCrossCache {
+        const keys = try allocator.alloc(CT, self.keys.len);
+        errdefer allocator.free(keys);
+        const values = try allocator.alloc(CT, self.values.len);
+        errdefer allocator.free(values);
+        var key_count: usize = 0;
+        var value_count: usize = 0;
+        errdefer {
+            for (keys[0..key_count]) |tensor| cb.free(tensor);
+            for (values[0..value_count]) |tensor| cb.free(tensor);
+        }
+        for (self.keys, self.values, 0..) |key, value, layer| {
+            keys[layer] = try cb.sliceRows2D(allocator, key, 0, rows, cols);
+            key_count += 1;
+            values[layer] = try cb.sliceRows2D(allocator, value, 0, rows, cols);
+            value_count += 1;
+        }
+        return .{ .keys = keys, .values = values };
+    }
+
     pub fn deinit(self: *DecoderCrossCache, cb: *const ComputeBackend, allocator: std.mem.Allocator) void {
         for (self.keys) |key| cb.free(key);
         for (self.values) |value| cb.free(value);
@@ -170,14 +192,21 @@ test "Florence cache preparation cancels between layers and releases partial ten
 }
 
 pub const DecoderIncrementalCache = struct {
+    /// Full backing allocations remain owned even when logical rows shrink.
     cross: DecoderCrossCache,
+    cross_active: ?DecoderCrossCache = null,
     self: DecoderSelfCache,
     encoder_mask: []i64,
     self_mask: []i64,
     batch: usize,
     enc_seq: usize,
 
+    fn attentionCross(self: *const DecoderIncrementalCache) DecoderCrossCache {
+        return self.cross_active orelse self.cross;
+    }
+
     pub fn deinit(self: *DecoderIncrementalCache, cb: *const ComputeBackend, allocator: std.mem.Allocator) void {
+        if (self.cross_active) |*active| active.deinit(cb, allocator);
         self.cross.deinit(cb, allocator);
         self.self.deinit(cb, allocator);
         allocator.free(self.encoder_mask);
@@ -346,6 +375,7 @@ pub fn compactDecoderIncrementalCache(
 
     var old_cross = cache.cross;
     var old_self = cache.self;
+    var old_cross_active = cache.cross_active;
     const old_encoder_mask = cache.encoder_mask;
     const old_self_mask = cache.self_mask;
     cache.* = .{
@@ -365,6 +395,7 @@ pub fn compactDecoderIncrementalCache(
     next_cross_keys_len = 0;
     next_cross_values_len = 0;
     next_cache_owned = false;
+    if (old_cross_active) |*active| active.deinit(cb, allocator);
     old_cross.deinit(cb, allocator);
     old_self.deinit(cb, allocator);
     allocator.free(old_encoder_mask);
@@ -465,12 +496,140 @@ fn compactPreallocatedDecoderIncrementalCacheInPlace(
         }
     }
 
+    // In-place row copies do not change tensor metadata. Publish exact active
+    // shapes for attention, keeping the original allocations alive underneath
+    // borrowed CUDA views as well as retained Metal views. Device slicing is
+    // descriptor-only; it does not allocate another KV payload. As with a
+    // failed row copy, a view failure aborts this invocation and its cache.
+    const active = try cache.cross.prefix(cb, allocator, encoder_mask_len, config.d_model);
+    if (cache.cross_active) |*previous| previous.deinit(cb, allocator);
+    cache.cross_active = active;
+
     allocator.free(cache.encoder_mask);
     allocator.free(cache.self_mask);
     cache.encoder_mask = encoder_mask;
     cache.self_mask = self_mask;
     cache.batch = next_batch;
     return true;
+}
+
+test "Florence compaction publishes active shapes and preserves borrowed backing through repeated EOS" {
+    try testCompactedCrossViews(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompactedCrossViews, .{});
+}
+
+fn testCompactedCrossViews(allocator: std.mem.Allocator) !void {
+    const Probe = struct {
+        allocator: std.mem.Allocator,
+        roots: usize = 0,
+        views: usize = 0,
+        payload_bytes: usize = 0,
+        const Tensor = struct { data: []f32, rows: usize, cols: usize, owned: bool };
+        fn tensor(raw: CT) *Tensor {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn alloc(raw: *anyopaque, shape: []const i32) !?CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const rows: usize = @intCast(shape[0]);
+            const cols: usize = @intCast(shape[1]);
+            const data = try self.allocator.alloc(f32, rows * cols);
+            errdefer self.allocator.free(data);
+            const output = try self.allocator.create(Tensor);
+            output.* = .{ .data = data, .rows = rows, .cols = cols, .owned = true };
+            for (data, 0..) |*value, index| value.* = @floatFromInt(index);
+            self.roots += 1;
+            self.payload_bytes += data.len * @sizeOf(f32);
+            return output;
+        }
+        fn free(raw: *anyopaque, ct: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const value = tensor(ct);
+            if (value.owned) {
+                // Emulate CUDA's borrowed views: releasing their owner first
+                // is invalid even if Metal would retain its buffer for us.
+                std.debug.assert(self.views == 0);
+                self.roots -= 1;
+                self.payload_bytes -= value.data.len * @sizeOf(f32);
+                self.allocator.free(value.data);
+            } else self.views -= 1;
+            self.allocator.destroy(value);
+        }
+        fn copy(_: *anyopaque, dst: CT, dst_row: usize, src: CT, src_row: usize, rows: usize, cols: usize) !bool {
+            const target = tensor(dst);
+            const source = tensor(src);
+            if (target.cols != cols or source.cols != cols or dst_row + rows > target.rows or src_row + rows > source.rows) return error.InvalidShape;
+            std.mem.copyForwards(f32, target.data[dst_row * cols ..][0 .. rows * cols], source.data[src_row * cols ..][0 .. rows * cols]);
+            return true;
+        }
+        fn slice(raw: *anyopaque, input: CT, start: usize, rows: usize, cols: usize) !CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const source = tensor(input);
+            if (source.cols != cols or start + rows > source.rows) return error.InvalidShape;
+            const output = try self.allocator.create(Tensor);
+            output.* = .{ .data = source.data[start * cols ..][0 .. rows * cols], .rows = rows, .cols = cols, .owned = false };
+            self.views += 1;
+            return output;
+        }
+        fn cross(self: *@This(), layers: usize) !DecoderCrossCache {
+            const keys = try self.allocator.alloc(CT, layers);
+            errdefer self.allocator.free(keys);
+            const values = try self.allocator.alloc(CT, layers);
+            errdefer self.allocator.free(values);
+            var initialized: usize = 0;
+            errdefer for (0..initialized) |i| {
+                free(self, keys[i]);
+                free(self, values[i]);
+            };
+            for (keys, values) |*key, *value| {
+                key.* = (try alloc(self, &.{ 14, 2 })).?;
+                errdefer free(self, key.*);
+                value.* = (try alloc(self, &.{ 14, 2 })).?;
+                initialized += 1;
+            }
+            return .{ .keys = keys, .values = values };
+        }
+    };
+    var probe = Probe{ .allocator = allocator };
+    defer std.debug.assert(probe.roots == 0 and probe.views == 0 and probe.payload_bytes == 0);
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.allocUninitF32Shape = Probe.alloc;
+    vtable.freeTensor = Probe.free;
+    vtable.copyRows2D = Probe.copy;
+    vtable.sliceRows2D = Probe.slice;
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &vtable };
+    var cache: DecoderIncrementalCache = init: {
+        var cross = try probe.cross(2);
+        errdefer cross.deinit(&cb, allocator);
+        var self = (try DecoderSelfCache.tryInitPreallocated(&cb, allocator, 2, 7, 4, 2)).?;
+        errdefer self.deinit(&cb, allocator);
+        self.len = 2;
+        const encoder_mask = try allocator.alloc(i64, 14);
+        errdefer allocator.free(encoder_mask);
+        const self_mask = try allocator.alloc(i64, 28);
+        @memset(encoder_mask, 1);
+        @memset(self_mask, 1);
+        break :init .{ .cross = cross, .self = self, .encoder_mask = encoder_mask, .self_mask = self_mask, .batch = 7, .enc_seq = 2 };
+    };
+    defer cache.deinit(&cb, allocator);
+    const payload_bytes = probe.payload_bytes;
+    const backing = cache.cross.keys[0];
+    const config = Config{ .decoder_layers = 2, .d_model = 2 };
+    try std.testing.expectError(error.InvalidInputShape, compactDecoderIncrementalCache(&cb, allocator, config, &cache, &.{ 3, 1 }));
+    try std.testing.expect(try compactDecoderIncrementalCache(&cb, allocator, config, &cache, &.{ 1, 3, 5 }));
+    try std.testing.expectEqual(@as(usize, 3), cache.batch);
+    try std.testing.expectEqual(@as(usize, 6), Probe.tensor(cache.attentionCross().keys[0]).rows);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23 }, Probe.tensor(cache.attentionCross().keys[0]).data);
+    try std.testing.expect(try compactDecoderIncrementalCache(&cb, allocator, config, &cache, &.{1}));
+    try std.testing.expectEqual(@as(usize, 1), cache.batch);
+    for (cache.attentionCross().keys, cache.attentionCross().values) |key, value| {
+        try std.testing.expectEqual(@as(usize, 2), Probe.tensor(key).rows);
+        try std.testing.expectEqualSlices(f32, &.{ 12, 13, 14, 15 }, Probe.tensor(key).data);
+        try std.testing.expectEqualSlices(f32, &.{ 12, 13, 14, 15 }, Probe.tensor(value).data);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 24, 25, 26, 27 }, Probe.tensor(cache.self.keys[0].?).data[0..4]);
+    try std.testing.expectEqual(backing, cache.cross.keys[0]);
+    try std.testing.expectEqual(payload_bytes, probe.payload_bytes);
+    try std.testing.expectEqual(@as(usize, 4), probe.views);
 }
 
 const VisionForwardResult = struct {
@@ -2974,7 +3133,8 @@ fn decoderBlockIncrementalCached(
 
     const q_cross = try decoderLinearProj(cb, self_normed, layer, "encoder_attn.q_proj", batch, d_model, d_model, buf);
     defer cb.free(q_cross);
-    const cross_attn = try cb.crossAttention(q_cross, cache.cross.keys[layer], cache.cross.values[layer], cache.encoder_mask, batch, 1, cache.enc_seq, num_heads, head_dim);
+    const cross = cache.attentionCross();
+    const cross_attn = try cb.crossAttention(q_cross, cross.keys[layer], cross.values[layer], cache.encoder_mask, batch, 1, cache.enc_seq, num_heads, head_dim);
     defer cb.free(cross_attn);
     const cross_proj = try decoderLinearProj(cb, cross_attn, layer, "encoder_attn.out_proj", batch, d_model, d_model, buf);
     defer cb.free(cross_proj);

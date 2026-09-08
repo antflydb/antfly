@@ -561,6 +561,7 @@ const TestSubmit = struct {
     task: micro.Task = .rerank,
     control: ?Control = null,
     output: ?[]Tensor = null,
+    output_allocator: std.mem.Allocator = std.testing.allocator,
     err: ?anyerror = null,
     permit: ?*session_mod.RunPermit = null,
 
@@ -571,12 +572,12 @@ const TestSubmit = struct {
         };
     }
     fn deinit(self: *@This()) void {
-        if (self.output) |output| destroy(std.testing.allocator, output);
+        if (self.output) |output| destroy(self.output_allocator, output);
         self.output = null;
     }
 };
 
-test "tensor microbatch fuses forwards and retains zero-copy outputs through last consumer" {
+test "tensor microbatch executor deterministically fuses a complete window and retains outputs" {
     const memory = @import("../runtime/tier/memory.zig");
     var controller = memory.AdmissionController{};
     var fake = TestSession{};
@@ -593,12 +594,31 @@ test "tensor microbatch fuses forwards and retains zero-copy outputs through las
     var input = try Tensor.initFloat32(std.testing.allocator, "values", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
     defer input.deinit();
     var callers: [8]TestSubmit = undefined;
-    for (&callers) |*caller| caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &.{input} };
+    for (&callers) |*caller| caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &.{input}, .output_allocator = std.heap.smp_allocator };
     defer for (&callers) |*caller| caller.deinit();
-    var group = std.Io.Group.init;
-    defer group.cancel(std.testing.io);
-    for (&callers) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-    try group.await(std.testing.io);
+    // Supply a known complete window at the executor boundary. Whether eight
+    // independent callers arrive before a coalescing timer expires is not a
+    // correctness contract (nor a reliable assertion on a loaded CI host).
+    var tickets: [8]Ticket = undefined;
+    var outputs: [8][]Tensor = @splat(&.{});
+    var slots: [8]micro.ResultSlot = undefined;
+    var items: [8]micro.ExecuteItem = undefined;
+    for (&tickets, &outputs, &slots, &items) |*ticket, *output, *slot, *item| {
+        ticket.* = .{ .session = session, .permit = null, .gate = &gate, .inputs = &.{input}, .control = null, .rows = 2 };
+        try std.testing.expect(eligible(session, ticket.inputs));
+        slot.* = .{ .output = @ptrCast(output) };
+        item.* = .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = ticket, .slot = slot };
+    }
+    execute(&broker, &items);
+    for (&callers, outputs, slots) |*caller, output, slot| {
+        if (slot.completed and slot.err == null) caller.output = output;
+        caller.err = slot.err;
+    }
+    for (slots) |slot| {
+        try std.testing.expect(slot.completed);
+        if (slot.err) |err| return err;
+        try std.testing.expectEqual(micro.Execution.native_batch, slot.execution);
+    }
     try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.monotonic));
     for (&callers) |*caller| {
         if (caller.err) |err| return err;
@@ -611,7 +631,6 @@ test "tensor microbatch fuses forwards and retains zero-copy outputs through las
     try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, callers[7].output.?[0].asFloat32());
     callers[7].deinit();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
-    try std.testing.expectEqual(@as(u64, 8), broker.snapshot(std.testing.io).native_items);
 }
 
 test "tensor microbatch broadcasts scalar controls and separates unequal values" {

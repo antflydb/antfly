@@ -59,11 +59,14 @@ terminated. The fixed default ports are 29680/29681; use `--port` to change them
 - `--ocr-model` and `--embed-model`: explicit model identities; defaults pin the
   Florence and BGE safetensors variants. Embedding dimension remains BGE's 384.
 - `--batch`: submit all source rows together; omit for one request per PDF.
+- `--read-profile`: enable per-stage reader diagnostics and record the override
+  in provenance. Use for failure diagnosis, not timing comparisons.
 - `--trials`: fresh tables within one server process. Model/runtime caches can
   be warm after the first trial. The first trial is **not** a cold-filesystem run.
 
 Both subjects receive identical configuration, including a 16,000 MiB process
-budget. Ambient `ANTFLY_*` variables are removed and their names recorded.
+budget. Ambient `ANTFLY_*` variables are removed and their names recorded;
+`--read-profile` explicitly reinstates only `ANTFLY_INFERENCE_READ_PROFILE=1`.
 The only remote-content exception is the local byte origin. GPU acceleration
 must be checked in runtime logs; compiling Metal support alone is not proof.
 

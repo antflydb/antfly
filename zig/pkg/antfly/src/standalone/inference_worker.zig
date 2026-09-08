@@ -455,6 +455,12 @@ const Child = struct {
     configured: bool = false,
     startup_mutex: std.Io.Mutex = .init,
 
+    const ProviderDiagnostic = struct {
+        operation: c_int = 0,
+        request_json: []const u8 = "",
+        has_deadline: bool = false,
+    };
+
     fn closed(_: *anyopaque) void {
         // Loss of the owning database is a hard lifetime boundary, even if a
         // concurrent driver call is wedged and cannot join cooperatively.
@@ -466,11 +472,19 @@ const Child = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const envelope = try requestEnvelope(arena.allocator(), request);
-        return self.execute(arena.allocator(), request, envelope) catch |err|
-            reply(&self.endpoint, bridge.statusFromError(err), "", "");
+        var diagnostic: ProviderDiagnostic = .{};
+        return self.execute(arena.allocator(), request, envelope, &diagnostic) catch |err| {
+            // Diagnose at the error owner, including envelope decoding and
+            // response serialization, before the first lossy RPC status hop.
+            const status = if (envelope.operation == .provider)
+                @import("provider_failure.zig").status(diagnostic.operation, diagnostic.request_json, diagnostic.has_deadline, err)
+            else
+                bridge.statusFromError(err);
+            return reply(&self.endpoint, status, "", "");
+        };
     }
 
-    fn execute(self: *Child, arena: std.mem.Allocator, request: *rpc.Request, envelope: wire.Envelope) !rpc.OwnedPayload {
+    fn execute(self: *Child, arena: std.mem.Allocator, request: *rpc.Request, envelope: wire.Envelope, diagnostic: *ProviderDiagnostic) !rpc.OwnedPayload {
         if (envelope.operation == .initialize) {
             try self.startup_mutex.lock(self.io);
             defer self.startup_mutex.unlock(self.io);
@@ -504,11 +518,16 @@ const Child = struct {
         switch (envelope.operation) {
             .provider => {
                 const provider = try std.json.parseFromSliceLeaky(wire.Provider, arena, envelope.options, .{});
+                diagnostic.operation = provider.operation;
+                diagnostic.has_deadline = provider.deadline_ns != null;
                 var limits = wire.provider_attachment_limits;
                 // Text-only calls keep the existing logical JSON body ceiling.
                 limits.max_metadata_bytes = rpc.max_body_bytes;
                 var media = try wire.attachments.parseAlloc(arena, envelope.data, limits);
                 defer media.deinit();
+                // Metadata borrows the request payload, not the attachment
+                // descriptor allocation freed by media.deinit().
+                diagnostic.request_json = media.metadata;
                 if (media.attachments.len > 0 and media.metadata.len > wire.provider_attachment_limits.max_metadata_bytes) return error.BodyTooLarge;
                 const payloads = try arena.alloc(bridge.ProviderBinaryPayload, media.attachments.len);
                 for (payloads, media.attachments) |*payload, attachment| payload.* = .{

@@ -7982,6 +7982,8 @@ pub fn build(b: *std.Build) void {
             "standalone runtime local generator accepts media url data uris",
             "local generate message conversion preserves tool history and admission",
             "inference worker",
+            "provider failure logging",
+            "provider owner logs private cause",
             "standalone runtime local dense embed preserves borrowed binary media",
             "standalone numeric result ABI",
             "standalone raster embedding control",

@@ -4990,10 +4990,44 @@ capacity failure retains the original valid cache. Failure-injection and shared
 row tests cover rollback, live-peer refusal, values and byte-credit cleanup.
 This is last-survivor host compaction, not device-side multi-survivor gather/scatter.
 
-For sixteen alternating short/long rewrites, the hermetic dispatcher regression
-now uses six physical forwards instead of twelve from adjacent eight-item sorting,
-while preserving original result order. This is a scheduling/forward-count win,
-not a measured accelerator throughput claim.
+For sixteen alternating short/long rewrites, global width grouping allows six
+physical forwards instead of twelve from adjacent eight-item sorting, while
+preserving original result order. This is an achievable scheduling improvement,
+not a guaranteed count or a measured accelerator throughput claim. Stage fusion
+is opportunistic: worker saturation, inline `Group.async` execution, and expired
+coalescing windows may produce smaller valid batches. Rewriting regressions
+therefore assert bounded calls, exactly-once stage rows, padding work and ordered
+results, including with no spare workers. Complete-window tensor fusion and
+shared-output lifetimes are tested deterministically at the executor boundary.
+
+Private provider errors must be diagnosed at their owning runtime before the
+first ABI or worker-RPC hop normalizes them. Both linked and isolated inference
+use one bounded operation/error/model diagnostic policy, retain stable errors,
+and normalize private causes to `InferenceProviderFailure`. The receiving bridge
+must not re-log normalized errors or expose backend-specific error names in its
+wire ABI. Provider-envelope decoding and serialization failures obey the same
+rule; logs never include request bodies or media bytes.
+
+Resident PDF OCR additionally separates cross-attention cache backing ownership
+from active tensor shape. In-place EOS compaction moves surviving rows but does
+not resize the backing allocation. The decoder publishes exact active-prefix
+views after each compaction and uses those views for attention. Original buffers
+outlive all views, including CUDA's non-retaining row views; Metal keeps retained
+device views. Repeated compaction replaces only view descriptors, not KV payloads.
+Teardown releases views before backing storage, and allocation failures unwind
+both. Hermetic regressions exercise 7-to-3-to-1 rows, ordered values, stable
+payload allocation, borrowed ownership and every allocation failure.
+
+Verification of this fix includes the real seven-page remote-PDF forced-OCR
+case on Metal: all seven OCR attempts finish without the previous `InvalidShape`
+failure. This is not full benchmark qualification: the separate newspaper page
+still reports `RenderWorkerMemoryLimitExceeded`. Keep scratch and retained-output
+allocation lifetimes distinct when resolving that admission failure; do not
+silently raise caps or treat retained embedded text as successful forced OCR.
+Companion multi-table E2E tests also reproduce `ConcurrencyUnavailable` when
+per-shard parked maintenance loops exhaust the bounded background lane. The
+long-term remedy is shared bounded runnable scheduling with owner registration,
+in-flight draining and shutdown safety, not a larger fixed thread limit or timeout.
 
 ### Remaining resident-decoder execution contract
 

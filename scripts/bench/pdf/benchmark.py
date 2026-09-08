@@ -185,6 +185,8 @@ def run_created(args, out):
     overrides = {k: v for k, v in environment.items() if k.startswith("ANTFLY_")}
     for key in overrides:
         environment.pop(key)
+    if args.read_profile:
+        environment["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
     provenance = {
         "binary": str(binary),
         "binary_sha256": sha256(binary),
@@ -196,6 +198,7 @@ def run_created(args, out):
         "model_loading": "fresh process first trial; reused process later trials; table setup reported separately",
         "filesystem_cache": "uncontrolled/warm; no system cache flush",
         "removed_environment_keys": sorted(overrides),
+        "read_profile": args.read_profile,
         "platform": (
             os.uname()._asdict() if hasattr(os.uname(), "_asdict") else list(os.uname())
         ),
@@ -412,6 +415,11 @@ if __name__ == "__main__":
     parser.add_argument("--embed-model", default="BAAI/bge-small-en-v1.5:safetensors")
     parser.add_argument("--mode", choices=["auto", "always"], default="auto")
     parser.add_argument("--batch", action="store_true")
+    parser.add_argument(
+        "--read-profile",
+        action="store_true",
+        help="Enable reader diagnostics (not a timing run)",
+    )
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
