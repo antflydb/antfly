@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Crc32 = std.hash.Crc32;
+const Crc32 = @import("antfly_hash").Crc32;
 const ArrayList = std.ArrayList;
 
 /// AFB file magic bytes: "ANTFLYB\n"

@@ -9,6 +9,7 @@
 //! fsync+rename manifest exists. A directory alone is never publication proof.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const fs_paths = @import("../../../common/fs_paths.zig");
 
 const Allocator = std.mem.Allocator;
@@ -150,7 +151,7 @@ fn encode(alloc: Allocator, generation_id: u128, index_name: []const u8, config_
     try appendInt(alloc, &out, u64, sequence);
     try appendInt(alloc, &out, u32, @intCast(index_name.len));
     try out.appendSlice(alloc, index_name);
-    try appendInt(alloc, &out, u32, std.hash.Crc32.hash(out.items));
+    try appendInt(alloc, &out, u32, Crc32.hash(out.items));
     return try out.toOwnedSlice(alloc);
 }
 
@@ -159,7 +160,7 @@ fn decode(alloc: Allocator, raw: []const u8) !Manifest {
         return error.InvalidIndexGenerationManifest;
     }
     const payload_end = raw.len - 4;
-    if (std.hash.Crc32.hash(raw[0..payload_end]) != std.mem.readInt(u32, raw[payload_end..][0..4], .little)) {
+    if (Crc32.hash(raw[0..payload_end]) != std.mem.readInt(u32, raw[payload_end..][0..4], .little)) {
         return error.InvalidIndexGenerationManifest;
     }
     var pos: usize = magic.len;

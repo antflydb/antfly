@@ -21,6 +21,7 @@
 //! manifest files without inventing a JSON-only test format.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const snappy = @import("../../encoding/snappy.zig");
 
@@ -439,7 +440,7 @@ fn decodeBlockAlloc(
             const expected_crc = std.mem.readInt(u32, encoded_block[checksum_start..][0..4], .big);
             const decoded = try snappy.decode(alloc, compressed);
             errdefer alloc.free(decoded);
-            if (std.hash.Crc32.hash(decoded) != expected_crc) return error.AvroBlockChecksumMismatch;
+            if (Crc32.hash(decoded) != expected_crc) return error.AvroBlockChecksumMismatch;
             break :blk .{ .bytes = decoded, .owned = decoded };
         },
         .zstandard => blk: {
@@ -1484,7 +1485,7 @@ fn encodeFixtureBlockAlloc(
         const encoded = try alloc.alloc(u8, compressed.len + 4);
         errdefer alloc.free(encoded);
         @memcpy(encoded[0..compressed.len], compressed);
-        std.mem.writeInt(u32, encoded[compressed.len..][0..4], std.hash.Crc32.hash(block), .big);
+        std.mem.writeInt(u32, encoded[compressed.len..][0..4], Crc32.hash(block), .big);
         return .{ .bytes = encoded, .owned = encoded };
     }
     if (std.mem.eql(u8, codec, "zstandard")) {
