@@ -8,6 +8,24 @@ The compact-query comparison below uses 21 measured samples instead of five.
 
 ## Durable cross-job topology reuse
 
+After increasing default scheduling spans to 4,096 records, the same fixture
+and command measured the following on 2026-09-08:
+
+| Complete numerical job | Physical edge records read | Checkpoints | Median time (range) |
+| --- | ---: | ---: | ---: |
+| Independent topology | 32,768 | 36 | 1.612 s (1.415–1.887 s) |
+| Shared topology | 0 | 22 | 0.834 s (0.811–0.892 s) |
+
+The current shared case is 1.93× faster on this fixture. Against the earlier
+small-page run below, independent/shared checkpoint counts fall 638 → 36 and
+110 → 22. Those work counts are directly checked. The historical wall times
+were not collected in a controlled same-run comparison: storage compaction and
+other activity on this shared host can materially change elapsed time. This
+benchmark calls the low-level numerical runner; it does not measure concurrent
+task admission or HTTP latency.
+
+### Historical small-page baseline
+
 Measured 2026-09-08 with:
 
 ```sh
@@ -40,6 +58,24 @@ Lifecycle tests additionally cover HITS-to-PageRank/eigenvector adoption,
 producer cleanup and reopen, filter-set canonicalization, independent concurrent
 producers, generation pins, deleted filters/metrics, bounded crash-resumable
 reclamation, and rejection of retirement tasks targeting winning packed tiles.
+
+## Adaptive decoded-score joins
+
+Measured 2026-09-08 with
+`zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --score-join-only`.
+The fixture borrows one decoded 1,024-row block and verifies exact results for
+each candidate count. Six samples, first discarded, 4,096 repetitions per sample:
+
+| Candidate rows | Binary reference | Adaptive join | Improvement |
+| --- | ---: | ---: | ---: |
+| 1 | 75 ns | 75 ns | unchanged |
+| 16 | 431 ns | 434 ns | within 1% |
+| 256 | 16.425 µs | 10.959 µs | 1.50× |
+| 1,024 | 84.884 µs | 21.394 µs | 3.97× |
+
+Sparse requests retain binary search; dense candidates merge against sorted
+scores. These timings exclude decoding, allocation, authentication and I/O.
+Separate parity tests include duplicate, missing and invalid row ordinals.
 
 ## Shared admission, sparse work, and publication checkpoints
 

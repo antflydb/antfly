@@ -3175,10 +3175,10 @@ pub const HttpHandler = struct {
     }
 
     const PublicGraphMetricColumns = struct {
-        columns: [][]?f64,
+        columns: []query_mod.graph_metric_reader.ScoreColumn,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
-            for (self.columns) |column| if (column.len > 0) alloc.free(column);
+            for (self.columns) |*column| column.deinit(alloc);
             if (self.columns.len > 0) alloc.free(self.columns);
             self.* = undefined;
         }
@@ -3186,6 +3186,7 @@ pub const HttpHandler = struct {
 
     const CachedPublicGraphMetricColumn = struct {
         scores: []?f64,
+        memory: query_mod.runtime.GraphMetricReadBudget.Reservation = .{},
         /// Stable indexes into the original graph result. This slice is owned
         /// by the request workspace and shared by columns loaded together.
         source_rows: []const usize,
@@ -3210,8 +3211,9 @@ pub const HttpHandler = struct {
             {
                 continue;
             }
-            const column = maybe_column.* orelse continue;
+            var column = maybe_column.* orelse continue;
             if (column.scores.len > 0) self.alloc.free(column.scores);
+            column.memory.deinit();
             maybe_column.* = null;
         }
     }
@@ -3229,10 +3231,10 @@ pub const HttpHandler = struct {
     ) !PublicGraphMetricColumns {
         if (statuses.len != dependency_names.len or status_initialized.len != dependency_names.len)
             return error.InvalidQueryRequest;
-        const columns = try self.alloc.alloc([]?f64, metric_names.len);
+        const columns = try self.alloc.alloc(query_mod.graph_metric_reader.ScoreColumn, metric_names.len);
         var initialized_columns: usize = 0;
         errdefer {
-            for (columns[0..initialized_columns]) |column| self.alloc.free(column);
+            for (columns[0..initialized_columns]) |*column| column.deinit(self.alloc);
             if (columns.len > 0) self.alloc.free(columns);
         }
 
@@ -3244,8 +3246,9 @@ pub const HttpHandler = struct {
             if (source_row >= nodes.len) return error.InvalidQueryRequest;
             local_node_count += @intFromBool(graphMetricLocalNodeId(nodes[source_row]) != null);
         }
-        try session.chargeGraphMetricRetained(std.math.mul(usize, local_node_count, @sizeOf([]const u8) + @sizeOf(usize)) catch
+        var adapter_memory = try session.reserveGraphMetricMemory(std.math.mul(usize, local_node_count, @sizeOf([]const u8) + @sizeOf(usize)) catch
             return error.GraphMetricQueryBudgetExceeded);
+        defer adapter_memory.deinit();
         const node_ids = try self.alloc.alloc([]const u8, local_node_count);
         defer self.alloc.free(node_ids);
         const local_node_indexes = try self.alloc.alloc(usize, local_node_count);
@@ -3259,7 +3262,7 @@ pub const HttpHandler = struct {
             local_node_index += 1;
         }
 
-        var point_score_columns = try query_mod.graphMetricScoreColumnsAlloc(
+        var point_score_columns = try query_mod.graph_metric_reader.scoreColumnsScopedAlloc(
             self.alloc,
             session,
             graph_index_name,
@@ -3274,24 +3277,29 @@ pub const HttpHandler = struct {
                 statuses[dependency_index] = try self.graphMetricStatusAlloc(metric_name, point_scores.config_fingerprint, point_scores.edge_filter, point_scores.converged, point_scores.iterations_completed, point_scores.delta, point_scores.metadata_version, point_scores.published_generation, point_scores.edge_generation, point_scores.computed_at_ms);
                 status_initialized[dependency_index] = true;
             }
-            const local_scores = try point_scores.takeScores();
-            var local_scores_owned = true;
-            errdefer if (local_scores_owned) self.alloc.free(local_scores);
+            var local_column = try point_scores.takeColumn();
+            errdefer local_column.deinit(self.alloc);
+            var aligned_memory: query_mod.runtime.GraphMetricReadBudget.Reservation = .{};
+            errdefer aligned_memory.deinit();
             if (local_node_count != source_rows.len) {
                 const aligned_bytes = std.math.mul(usize, source_rows.len, @sizeOf(?f64)) catch
                     return error.GraphMetricQueryBudgetExceeded;
                 // The local result remains live while the aligned column is
                 // allocated, so charge the peak expansion rather than only
                 // the eventual delta.
-                try session.chargeGraphMetricRetained(aligned_bytes);
+                aligned_memory = try session.reserveGraphMetricMemory(aligned_bytes);
             }
-            columns[i] = try scatterLocalGraphMetricScoresAlloc(
+            const aligned = try scatterLocalGraphMetricScoresAlloc(
                 self.alloc,
                 source_rows.len,
                 local_node_indexes,
-                local_scores,
+                local_column.scores,
             );
-            local_scores_owned = false;
+            if (local_node_count != source_rows.len) {
+                // Scatter consumed/freed the local allocation.
+                local_column.memory.deinit();
+                columns[i] = .{ .scores = aligned, .memory = aligned_memory };
+            } else columns[i] = .{ .scores = aligned, .memory = local_column.memory };
             initialized_columns += 1;
         }
         return .{ .columns = columns };
@@ -3332,8 +3340,8 @@ pub const HttpHandler = struct {
         defer loaded.deinit(self.alloc);
         for (missing_names[0..missing_count], loaded.columns) |name, *column| {
             const dependency_index = metricDependencyIndex(dependency_names, name).?;
-            cached_columns[dependency_index] = .{ .scores = column.*, .source_rows = source_rows };
-            column.* = @constCast((&[_]?f64{})[0..]);
+            cached_columns[dependency_index] = .{ .scores = column.scores, .memory = column.memory, .source_rows = source_rows };
+            column.* = .{ .scores = &.{} };
         }
     }
 
@@ -3377,6 +3385,8 @@ pub const HttpHandler = struct {
         // entries would retain source_rows pointing at a selection the caller
         // is about to free while later entries still describe current_rows.
         var replacements: [graph_query_mod.graph_metric_dependency_limit]?[]?f64 = @splat(null);
+        var reservations: [graph_query_mod.graph_metric_dependency_limit]query_mod.runtime.GraphMetricReadBudget.Reservation = @splat(.{});
+        defer for (&reservations) |*reservation| reservation.deinit();
         errdefer for (replacements[0..cached_columns.len]) |maybe_scores| if (maybe_scores) |scores| self.alloc.free(scores);
         for (cached_columns, 0..) |maybe_column, column_index| {
             const cached = maybe_column orelse continue;
@@ -3384,7 +3394,7 @@ pub const HttpHandler = struct {
                 return error.InvalidQueryRequest;
             const retained_bytes = std.math.mul(usize, next_rows.len, @sizeOf(?f64)) catch
                 return error.GraphMetricQueryBudgetExceeded;
-            try session.chargeGraphMetricRetained(retained_bytes);
+            reservations[column_index] = try session.reserveGraphMetricMemory(retained_bytes);
             const rebased = try self.alloc.alloc(?f64, next_rows.len);
             // Register ownership before validating/copying the selector. The
             // transaction rollback must also cover malformed parent ordinals.
@@ -3394,11 +3404,14 @@ pub const HttpHandler = struct {
                 score.* = cached.scores[parent_index];
             }
         }
-        for (cached_columns, replacements[0..cached_columns.len]) |*maybe_column, *maybe_replacement| {
+        for (cached_columns, replacements[0..cached_columns.len], reservations[0..cached_columns.len]) |*maybe_column, *maybe_replacement, *reservation| {
             const cached = if (maybe_column.*) |*value| value else continue;
             const rebased = maybe_replacement.*.?;
             if (cached.scores.len > 0) self.alloc.free(cached.scores);
+            cached.memory.deinit();
             cached.scores = rebased;
+            cached.memory = reservation.*;
+            reservation.* = .{};
             cached.source_rows = next_rows;
             maybe_replacement.* = null;
         }
@@ -3433,15 +3446,17 @@ pub const HttpHandler = struct {
 
         const initial_row_bytes = std.math.mul(usize, result.nodes.len, @sizeOf(usize)) catch
             return error.GraphMetricQueryBudgetExceeded;
-        try session.chargeGraphMetricRetained(initial_row_bytes);
+        var active_row_memory = try session.reserveGraphMetricMemory(initial_row_bytes);
+        defer active_row_memory.deinit();
         const initial_rows = try self.alloc.alloc(usize, result.nodes.len);
         for (initial_rows, 0..) |*row, i| row.* = i;
         var active_rows: []usize = initial_rows;
         defer if (active_rows.len > 0) self.alloc.free(active_rows);
 
         var cached_columns: [graph_query_mod.graph_metric_dependency_limit]?CachedPublicGraphMetricColumn = @splat(null);
-        defer for (cached_columns[0..dependency_count]) |maybe_column| if (maybe_column) |column| {
+        defer for (cached_columns[0..dependency_count]) |*maybe_column| if (maybe_column.*) |*column| {
             if (column.scores.len > 0) self.alloc.free(column.scores);
+            column.memory.deinit();
         };
         var stage_column_buffer: [graph_query_mod.graph_metric_dependency_limit][]?f64 = undefined;
 
@@ -3473,8 +3488,9 @@ pub const HttpHandler = struct {
             filter_query.order_by = &.{};
             // The selector retains its candidate permutation while copying
             // the selected prefix; reserve both arrays before entering it.
-            try session.chargeGraphMetricRetained(std.math.mul(usize, active_rows.len, 2 * @sizeOf(usize)) catch
+            var selection_memory = try session.reserveGraphMetricMemory(std.math.mul(usize, active_rows.len, 2 * @sizeOf(usize)) catch
                 return error.GraphMetricQueryBudgetExceeded);
+            defer selection_memory.deinit();
             const selected = try graph_query_mod.GraphQueryEngine.selectLoadedMetricCandidateIndexesAlloc(
                 self.alloc,
                 filter_names_buffer[0..filter_name_count],
@@ -3491,14 +3507,14 @@ pub const HttpHandler = struct {
                 projection_names_buffer[0..projection_name_count],
             );
             const filtered_rows = blk: {
+                var memory = try session.reserveGraphMetricMemory(std.math.mul(usize, selected.len, @sizeOf(usize)) catch return error.GraphMetricQueryBudgetExceeded);
+                errdefer memory.deinit();
                 const rows = try self.alloc.alloc(usize, selected.len);
                 errdefer self.alloc.free(rows);
                 for (selected, rows) |source_index, *row| {
                     if (source_index >= active_rows.len) return error.InvalidQueryRequest;
                     row.* = active_rows[source_index];
                 }
-                try session.chargeGraphMetricRetained(std.math.mul(usize, rows.len, @sizeOf(usize)) catch
-                    return error.GraphMetricQueryBudgetExceeded);
                 try self.rebasePublicGraphMetricColumns(
                     session,
                     cached_columns[0..dependency_count],
@@ -3506,10 +3522,12 @@ pub const HttpHandler = struct {
                     rows,
                     selected,
                 );
-                break :blk rows;
+                break :blk .{ .rows = rows, .memory = memory };
             };
             if (active_rows.len > 0) self.alloc.free(active_rows);
-            active_rows = filtered_rows;
+            active_row_memory.deinit();
+            active_rows = filtered_rows.rows;
+            active_row_memory = filtered_rows.memory;
         }
 
         if (order_name_count > 0) {
@@ -3535,8 +3553,9 @@ pub const HttpHandler = struct {
             var order_query = query;
             order_query.metrics = &.{};
             order_query.where_metric = &.{};
-            try session.chargeGraphMetricRetained(std.math.mul(usize, active_rows.len, 2 * @sizeOf(usize)) catch
+            var selection_memory = try session.reserveGraphMetricMemory(std.math.mul(usize, active_rows.len, 2 * @sizeOf(usize)) catch
                 return error.GraphMetricQueryBudgetExceeded);
+            defer selection_memory.deinit();
             const selected = try graph_query_mod.GraphQueryEngine.selectLoadedMetricCandidateIndexesAlloc(
                 self.alloc,
                 order_names_buffer[0..order_name_count],
@@ -3553,14 +3572,14 @@ pub const HttpHandler = struct {
                 &.{},
             );
             const ordered_rows = blk: {
+                var memory = try session.reserveGraphMetricMemory(std.math.mul(usize, selected.len, @sizeOf(usize)) catch return error.GraphMetricQueryBudgetExceeded);
+                errdefer memory.deinit();
                 const rows = try self.alloc.alloc(usize, selected.len);
                 errdefer self.alloc.free(rows);
                 for (selected, rows) |source_index, *row| {
                     if (source_index >= active_rows.len) return error.InvalidQueryRequest;
                     row.* = active_rows[source_index];
                 }
-                try session.chargeGraphMetricRetained(std.math.mul(usize, rows.len, @sizeOf(usize)) catch
-                    return error.GraphMetricQueryBudgetExceeded);
                 try self.rebasePublicGraphMetricColumns(
                     session,
                     cached_columns[0..dependency_count],
@@ -3568,10 +3587,12 @@ pub const HttpHandler = struct {
                     rows,
                     selected,
                 );
-                break :blk rows;
+                break :blk .{ .rows = rows, .memory = memory };
             };
             if (active_rows.len > 0) self.alloc.free(active_rows);
-            active_rows = ordered_rows;
+            active_row_memory.deinit();
+            active_rows = ordered_rows.rows;
+            active_row_memory = ordered_rows.memory;
         }
 
         try self.ensurePublicGraphMetricColumns(
@@ -7786,6 +7807,27 @@ fn scatterLocalGraphMetricScoresAlloc(
     }
     alloc.free(local_scores);
     return scores;
+}
+
+test "serverless graph metric column rebasing releases retired memory and rolls back failures" {
+    const alloc = std.testing.allocator;
+    var handler = HttpHandler{ .alloc = alloc, .api = undefined, .catalog = undefined, .manifests = undefined, .progress = undefined, .query = undefined, .runtime_status = undefined };
+    var session = query_mod.QuerySession{ .alloc = alloc, .artifacts = undefined, .manifest = undefined };
+    const bytes = 4 * @sizeOf(?f64);
+    session.graph_metric_read_budget.limits.max_retained_bytes = 2 * bytes;
+    const scores = try alloc.dupe(?f64, &.{ 0, 1, 2, 3 });
+    var columns = [_]?HttpHandler.CachedPublicGraphMetricColumn{.{ .scores = scores, .source_rows = &.{ 0, 1, 2, 3 }, .memory = try session.reserveGraphMetricMemory(bytes) }};
+    defer {
+        alloc.free(columns[0].?.scores);
+        columns[0].?.memory.deinit();
+    }
+    for (0..100) |_| {
+        try handler.rebasePublicGraphMetricColumns(&session, &columns, &.{ 0, 1, 2, 3 }, &.{ 0, 1, 2, 3 }, &.{ 0, 1, 2, 3 });
+        try std.testing.expectEqual(@as(u64, bytes), session.graph_metric_read_budget.retained_bytes);
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, handler.rebasePublicGraphMetricColumns(&session, &columns, &.{ 0, 1, 2, 3 }, &.{ 0, 1, 2, 3 }, &.{ 0, 1, 2, 4 }));
+    try std.testing.expectEqual(@as(u64, bytes), session.graph_metric_read_budget.retained_bytes);
+    try std.testing.expectEqualSlices(?f64, &.{ 0, 1, 2, 3 }, columns[0].?.scores);
 }
 
 test "serverless graph metric lookup preserves qualified node identity" {

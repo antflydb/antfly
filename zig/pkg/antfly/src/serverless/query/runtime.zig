@@ -74,6 +74,54 @@ pub const GraphMetricReadBudget = struct {
     work_items: u64 = 0,
     retained_bytes: u64 = 0,
 
+    /// Move-only live-memory ownership. Unlike cumulative I/O/work admission,
+    /// scratch and replaced outputs release their capacity when destroyed.
+    /// The shared request budget must outlive every reservation.
+    pub const Reservation = struct {
+        budget: ?*GraphMetricReadBudget = null,
+        bytes: usize = 0,
+
+        /// A read scope can collect conservative scratch/cache-lease charges
+        /// from concurrent children. Only its owner may split or destroy it,
+        /// after those children have joined.
+        pub fn grow(self: *@This(), bytes: usize) !void {
+            const budget = self.budget orelse return error.GraphMetricQueryBudgetExceeded;
+            lockAtomic(&budget.mutex);
+            defer budget.mutex.unlock();
+            const owned = std.math.add(usize, self.bytes, bytes) catch return error.GraphMetricQueryBudgetExceeded;
+            const retained = try checkedCharge(budget.retained_bytes, bytes, budget.limits.max_retained_bytes);
+            self.bytes = owned;
+            budget.retained_bytes = retained;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.budget) |budget| {
+                lockAtomic(&budget.mutex);
+                std.debug.assert(budget.retained_bytes >= self.bytes);
+                budget.retained_bytes -= self.bytes;
+                budget.mutex.unlock();
+            }
+            self.* = .{};
+        }
+
+        pub fn split(self: *@This(), bytes: usize) @This() {
+            std.debug.assert(bytes <= self.bytes);
+            self.bytes -= bytes;
+            return .{ .budget = self.budget, .bytes = bytes };
+        }
+
+        /// Escaping public output keeps its request charge, but must not keep
+        /// a pointer to a query session that can already have been destroyed.
+        pub fn detach(self: *@This()) void {
+            self.* = .{};
+        }
+    };
+
+    pub fn reserveRetained(self: *@This(), bytes: usize) !Reservation {
+        try self.chargeRetained(bytes);
+        return .{ .budget = self, .bytes = bytes };
+    }
+
     fn checkedCharge(current: u64, amount: u64, limit: u64) !u64 {
         const next = std.math.add(u64, current, amount) catch return error.GraphMetricQueryBudgetExceeded;
         if (next > limit) return error.GraphMetricQueryBudgetExceeded;
@@ -145,6 +193,27 @@ test "serverless graph metric request budget composes reads and rejects charges 
     try budget.chargeRetained(10);
     try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRetained(1));
     try std.testing.expectEqual(@as(u64, 10), budget.retained_bytes);
+}
+
+test "serverless graph metric memory reservations transfer release and preserve work charges" {
+    var budget = GraphMetricReadBudget{ .limits = .{ .max_retained_bytes = 64 } };
+    try budget.chargeDecode(1, 10);
+    var scratch = try budget.reserveRetained(48);
+    var output = scratch.split(16);
+    scratch.deinit();
+    try std.testing.expectEqual(@as(u64, 16), budget.retained_bytes);
+    for (0..100) |_| {
+        var replacement = try budget.reserveRetained(48);
+        try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.reserveRetained(1));
+        replacement.deinit();
+    }
+    output.deinit();
+    try std.testing.expectEqual(@as(u64, 0), budget.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 10), budget.work_items);
+    var escaping = try budget.reserveRetained(8);
+    escaping.detach();
+    escaping.deinit();
+    try std.testing.expectEqual(@as(u64, 8), budget.retained_bytes);
 }
 
 test "serverless graph metric score-plan reservation is atomic across ranges and bytes" {
@@ -285,6 +354,9 @@ pub const QuerySession = struct {
     owns_graph_metric_specs: bool = true,
     graph_metric_read_budget: GraphMetricReadBudget = .{},
     graph_metric_read_budget_shared: ?*GraphMetricReadBudget = null,
+    // Borrowed read-lifetime scratch reservation, propagated to joined child
+    // reads. Output reservations are independent and may outlive this scope.
+    graph_metric_retained_scope: ?*GraphMetricReadBudget.Reservation = null,
 
     pub fn deinit(self: *QuerySession) void {
         if (self.owns_graph_metric_specs) self.clearGraphMetricSpecs();
@@ -359,6 +431,7 @@ pub const QuerySession = struct {
             .graph_metric_specs = self.graph_metric_specs,
             .owns_graph_metric_specs = false,
             .graph_metric_read_budget_shared = self.effectiveGraphMetricReadBudget(),
+            .graph_metric_retained_scope = self.graph_metric_retained_scope,
         };
     }
 
@@ -398,7 +471,12 @@ pub const QuerySession = struct {
     }
 
     pub fn chargeGraphMetricRetained(self: *QuerySession, bytes: usize) !void {
+        if (self.graph_metric_retained_scope) |scope| return scope.grow(bytes);
         return self.effectiveGraphMetricReadBudget().chargeRetained(bytes);
+    }
+
+    pub fn reserveGraphMetricMemory(self: *QuerySession, bytes: usize) !GraphMetricReadBudget.Reservation {
+        return self.effectiveGraphMetricReadBudget().reserveRetained(bytes);
     }
 
     pub fn findArtifactIndex(self: *const QuerySession, kind: manifest_mod.ArtifactKind) ?usize {

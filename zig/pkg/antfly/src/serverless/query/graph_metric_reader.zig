@@ -121,6 +121,7 @@ pub const Result = struct {
 pub const PointScoresResult = struct {
     scores: []?f64,
     owns_scores: bool = true,
+    memory: runtime_mod.GraphMetricReadBudget.Reservation = .{},
     config_fingerprint: u64,
     converged: bool,
     iterations_completed: u32,
@@ -133,6 +134,7 @@ pub const PointScoresResult = struct {
 
     pub fn deinit(self: *PointScoresResult, alloc: Allocator) void {
         if (self.owns_scores) alloc.free(self.scores);
+        self.memory.deinit();
         self.edge_filter.deinit(alloc);
         self.* = undefined;
     }
@@ -143,7 +145,27 @@ pub const PointScoresResult = struct {
     pub fn takeScores(self: *PointScoresResult) ![]?f64 {
         if (!self.owns_scores) return error.GraphMetricScoresAlreadyTaken;
         self.owns_scores = false;
+        self.memory.detach();
         return self.scores;
+    }
+
+    pub fn takeColumn(self: *PointScoresResult) !ScoreColumn {
+        if (!self.owns_scores) return error.GraphMetricScoresAlreadyTaken;
+        self.owns_scores = false;
+        const column = ScoreColumn{ .scores = self.scores, .memory = self.memory };
+        self.memory = .{};
+        return column;
+    }
+};
+
+pub const ScoreColumn = struct {
+    scores: []?f64,
+    memory: runtime_mod.GraphMetricReadBudget.Reservation = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.scores);
+        self.memory.deinit();
+        self.* = .{ .scores = &.{} };
     }
 };
 
@@ -313,11 +335,48 @@ pub fn scoreColumnsAlloc(
     metric_names: []const []const u8,
     node_ids: []const []const u8,
 ) !PointScoreColumnsResult {
+    const result = try scoreColumnsScopedAlloc(alloc, session, graph_index_name, metric_names, node_ids);
+    for (result.columns) |*column| column.memory.detach();
+    return result;
+}
+
+/// Request-scoped columns release admission on destruction or replacement.
+/// These columns must be destroyed before the owning query session; callers
+/// exporting results beyond that lifetime use scoreColumnsAlloc instead.
+pub fn scoreColumnsScopedAlloc(
+    alloc: Allocator,
+    session: *runtime_mod.QuerySession,
+    graph_index_name: []const u8,
+    metric_names: []const []const u8,
+    node_ids: []const []const u8,
+) !PointScoreColumnsResult {
     if (metric_names.len > max_point_score_columns or node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
     if (metric_names.len == 0) return .{ .columns = try alloc.alloc(PointScoresResult, 0) };
-    try admitPointOutputs(session, node_ids.len, metric_names.len);
-    const candidate_order = try candidateOrderAlloc(alloc, session, node_ids);
-    defer alloc.free(candidate_order);
+    var output_memory = try admitPointOutputs(session, node_ids.len, metric_names.len);
+    defer output_memory.deinit();
+    _ = try session.graphMetricSpecs();
+    var scratch = try session.reserveGraphMetricMemory(0);
+    defer scratch.deinit();
+    var scoped = session.forkGraphMetricRead(session.alloc);
+    defer scoped.deinit();
+    scoped.diagnostics = session.diagnostics;
+    scoped.graph_metric_retained_scope = &scratch;
+    return scoreColumnsWithScopeAlloc(alloc, &scoped, graph_index_name, metric_names, node_ids, &output_memory);
+}
+
+fn scoreColumnsWithScopeAlloc(
+    alloc: Allocator,
+    session: *runtime_mod.QuerySession,
+    graph_index_name: []const u8,
+    metric_names: []const []const u8,
+    node_ids: []const []const u8,
+    output_memory: *runtime_mod.GraphMetricReadBudget.Reservation,
+) !PointScoreColumnsResult {
+    if (metric_names.len > max_point_score_columns or node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
+    if (metric_names.len == 0) return .{ .columns = try alloc.alloc(PointScoresResult, 0) };
+    var owned_order = try candidateOrderScopedAlloc(alloc, session, node_ids);
+    defer owned_order.deinit(alloc);
+    const candidate_order = owned_order.rows;
     const specs = try session.graphMetricSpecs();
     // Plan immutable computations, then fan out logical names/provenance.
     // Aliases must not multiply transport admission, routing or block decode.
@@ -410,6 +469,7 @@ pub fn scoreColumnsAlloc(
         const scores = if (owns_physical) buffers[p].? else try alloc.dupe(?f64, columns[owners[p]].scores);
         errdefer if (!owns_physical) alloc.free(scores);
         columns[i] = try pointScoresResultAlloc(alloc, session, graph_index_name, name, scores, metadata);
+        columns[i].memory = output_memory.split(node_ids.len * @sizeOf(?f64) + @sizeOf(PointScoresResult));
         initialized_columns += 1;
         if (owns_physical) buffers[p] = null;
     }
@@ -425,9 +485,30 @@ pub fn scoresAlloc(
     metric_name: []const u8,
     node_ids: []const []const u8,
 ) !PointScoresResult {
-    try admitPointOutputs(session, node_ids.len, 1);
-    const candidate_order = try candidateOrderAlloc(alloc, session, node_ids);
-    defer alloc.free(candidate_order);
+    if (node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
+    var output_memory = try admitPointOutputs(session, node_ids.len, 1);
+    defer output_memory.deinit();
+    _ = try session.graphMetricSpecs();
+    var scratch = try session.reserveGraphMetricMemory(0);
+    defer scratch.deinit();
+    var scoped = session.forkGraphMetricRead(session.alloc);
+    defer scoped.deinit();
+    scoped.diagnostics = session.diagnostics;
+    scoped.graph_metric_retained_scope = &scratch;
+    return scoresWithScopeAlloc(alloc, &scoped, graph_index_name, metric_name, node_ids, &output_memory);
+}
+
+fn scoresWithScopeAlloc(
+    alloc: Allocator,
+    session: *runtime_mod.QuerySession,
+    graph_index_name: []const u8,
+    metric_name: []const u8,
+    node_ids: []const []const u8,
+    output_memory: *runtime_mod.GraphMetricReadBudget.Reservation,
+) !PointScoresResult {
+    var owned_order = try candidateOrderScopedAlloc(alloc, session, node_ids);
+    defer owned_order.deinit(alloc);
+    const candidate_order = owned_order.rows;
     const values = try alloc.alloc(?f64, node_ids.len);
     errdefer alloc.free(values);
     var plans = [_]?PointScorePlan{try preparePointScoresAlloc(alloc, session, graph_index_name, metric_name, node_ids, candidate_order, values)};
@@ -435,21 +516,39 @@ pub fn scoresAlloc(
     try admitPointPlans(alloc, session, &plans);
     try executePointScores(session, &plans[0].?, node_ids, values);
     const metadata = plans[0].?.metadata;
-    return try pointScoresResultAlloc(alloc, session, graph_index_name, metric_name, values, metadata);
+    const result = try pointScoresResultAlloc(alloc, session, graph_index_name, metric_name, values, metadata);
+    output_memory.detach();
+    return result;
 }
 
-fn admitPointOutputs(session: *runtime_mod.QuerySession, count: usize, columns: usize) !void {
+fn admitPointOutputs(session: *runtime_mod.QuerySession, count: usize, columns: usize) !runtime_mod.GraphMetricReadBudget.Reservation {
     try session.checkCancellation();
     if (count > (Limits{}).max_point_scores or columns > max_point_score_columns) return error.GraphMetricQueryBudgetExceeded;
     const items = std.math.mul(usize, count, columns) catch return error.GraphMetricQueryBudgetExceeded;
     const payload = std.math.mul(usize, items, @sizeOf(?f64)) catch return error.GraphMetricQueryBudgetExceeded;
     const descriptors = std.math.mul(usize, columns, @sizeOf(PointScoresResult)) catch return error.GraphMetricQueryBudgetExceeded;
-    try session.chargeGraphMetricRetained(std.math.add(usize, payload, descriptors) catch return error.GraphMetricQueryBudgetExceeded);
+    return session.reserveGraphMetricMemory(std.math.add(usize, payload, descriptors) catch return error.GraphMetricQueryBudgetExceeded);
 }
 
 /// One admitted permutation shared by every metric's routing and score plan.
 /// Original row indexes preserve duplicate IDs and caller-visible ordering.
 pub fn candidateOrderAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, node_ids: []const []const u8) ![]u32 {
+    var result = try candidateOrderScopedAlloc(alloc, session, node_ids);
+    result.memory.detach();
+    return result.rows;
+}
+
+const CandidateOrder = struct {
+    rows: []u32,
+    memory: runtime_mod.GraphMetricReadBudget.Reservation,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.rows);
+        self.memory.deinit();
+    }
+};
+
+fn candidateOrderScopedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, node_ids: []const []const u8) !CandidateOrder {
     try session.checkCancellation();
     if (node_ids.len > (Limits{}).max_point_scores) return error.GraphMetricQueryBudgetExceeded;
     for (node_ids, 0..) |id, i| {
@@ -458,7 +557,8 @@ pub fn candidateOrderAlloc(alloc: Allocator, session: *runtime_mod.QuerySession,
     }
     const sort_work = std.math.mul(usize, node_ids.len, 2 + std.math.log2_int(usize, @max(node_ids.len, 1))) catch return error.GraphMetricQueryBudgetExceeded;
     try session.chargeGraphMetricDecode(0, sort_work);
-    try session.chargeGraphMetricRetained(node_ids.len * (@sizeOf(u32) + @sizeOf(u64)));
+    var memory = try session.reserveGraphMetricMemory(node_ids.len * (@sizeOf(u32) + @sizeOf(u64)));
+    defer memory.deinit();
     const order = try alloc.alloc(u32, node_ids.len);
     errdefer alloc.free(order);
     for (order, 0..) |*row, i| row.* = @intCast(i);
@@ -499,7 +599,7 @@ pub fn candidateOrderAlloc(alloc: Allocator, session: *runtime_mod.QuerySession,
     };
     std.mem.sort(u32, order, Order{ .ids = node_ids, .heads = heads, .prefix = prefix_len }, Order.less);
     try session.checkCancellation();
-    return order;
+    return .{ .rows = order, .memory = memory.split(node_ids.len * @sizeOf(u32)) };
 }
 
 const TouchedBlock = struct {
@@ -696,7 +796,7 @@ fn decodePointScoreBlock(session: *runtime_mod.QuerySession, entry: metric_segme
     try session.chargeGraphMetricDecode(1, expected);
     const decoded = try metric_segment.decodeScoreBlockWithCancellation(payload, session.cancellation);
     if (decoded.len != expected or !decoded.scores[0].eqlNode(decoded.node_prefix, entry.first_node_id)) return error.InvalidGraphMetricSegment;
-    for (candidate_rows) |row| values[row] = decoded.score(node_ids[row]);
+    try decoded.populateSorted(node_ids, candidate_rows, values, session.cancellation);
 }
 
 fn executePointScores(session: *runtime_mod.QuerySession, plan: *const PointScorePlan, node_ids: []const []const u8, values: []?f64) !void {
@@ -3033,6 +3133,17 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
     try std.testing.expectEqual(@as(?f64, last_value), second_cached.scores[0]);
     try std.testing.expectEqual(@as(u64, if (paged) 3 else 1), cache.graph_metric_routing.hits);
     try std.testing.expectEqual(@as(u64, 1), session.graph_metric_read_budget.decoded_blocks);
+    // Scoped stage reads release routing, planner, and output reservations.
+    // Repeated warm stages must not accumulate a fictitious retained heap.
+    session.graph_metric_read_budget = .{};
+    for (0..8) |_| {
+        var scoped_columns = try scoreColumnsScopedAlloc(alloc, &session, "graph_idx", &.{"rank"}, &node_ids);
+        try std.testing.expectEqual(@as(?f64, last_value), scoped_columns.columns[0].scores[0]);
+        try std.testing.expectEqual(@as(u64, node_ids.len * @sizeOf(?f64) + @sizeOf(PointScoresResult)), session.graph_metric_read_budget.retained_bytes);
+        scoped_columns.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 0), session.graph_metric_read_budget.retained_bytes);
+    }
+    try std.testing.expect(session.graph_metric_read_budget.work_items > 0);
     if (score_count == metric_segment.score_block_entries + 1) {
         var ranked = try metric_segment.codec.decodeRoutingRootAlloc(alloc, payload[state.root_offset..], payload.len, metric_segment.wire_version, .none);
         defer ranked.deinit(alloc);

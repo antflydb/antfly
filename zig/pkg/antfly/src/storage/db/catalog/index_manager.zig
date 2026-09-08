@@ -6078,12 +6078,15 @@ pub const IndexManager = struct {
                     stats.active_builds += 1;
                     continue;
                 }
-                if (cfg.refresh != .background) continue;
+                const requested = try entry.index.graphMetricBuildRequested(cfg.name);
+                if (cfg.refresh != .background and !requested) continue;
                 if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                 switch (status.state) {
                     .not_ready, .stale => stats.queued_builds += 1,
-                    .disabled, .fresh, .building => {},
-                    .failed => {},
+                    .disabled, .building => {},
+                    .fresh, .failed => if (requested) {
+                        stats.queued_builds += 1;
+                    },
                 }
             }
         }
@@ -6167,10 +6170,12 @@ pub const IndexManager = struct {
                     continue;
                 }
 
-                if (cfg.refresh != .background) continue;
+                const requested = try entry.index.graphMetricBuildRequested(cfg.name);
+                if (cfg.refresh != .background and !requested) continue;
                 if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                 switch (status.state) {
-                    .not_ready, .stale => {
+                    .not_ready, .stale, .fresh, .failed => {
+                        if ((status.state == .fresh or status.state == .failed) and !requested) continue;
                         if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, options)) {
                             decision.ineligible_queued += 1;
                         } else if (graphMetricPlannedAutoCanStart(
@@ -6186,7 +6191,7 @@ pub const IndexManager = struct {
                             decision.deferred_queued += 1;
                         }
                     },
-                    .disabled, .fresh, .building, .failed => {},
+                    .disabled, .building => {},
                 }
             }
         }
@@ -6309,10 +6314,12 @@ pub const IndexManager = struct {
             if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
 
             var active = status.state == .building;
-            if (!active and options.start_background_builds and cfg.refresh == .background) {
+            const requested = try entry.index.graphMetricBuildRequested(cfg.name);
+            if (!active and (requested or (options.start_background_builds and cfg.refresh == .background))) {
                 switch (status.state) {
-                    .not_ready, .stale, .failed => {
-                        if (status.state == .failed) {
+                    .not_ready, .stale, .failed, .fresh => {
+                        if (status.state == .fresh and !requested) continue;
+                        if (status.state == .failed and !requested) {
                             // Preserve terminal failures for the same
                             // generation, but do not let a superseded
                             // snapshot permanently block newer graph
@@ -6336,6 +6343,18 @@ pub const IndexManager = struct {
                             result.planning_steps += 1;
                             continue;
                         }
+                        const preparation = entry.index.prepareGraphMetricTopologyDetailed(cfg, status.target_edge_generation) catch |err| switch (err) {
+                            error.GraphMetricBuildSnapshotChanged => continue,
+                            else => return err,
+                        };
+                        switch (preparation) {
+                            .ready => {},
+                            .queued => {
+                                result.planning_steps += 1;
+                                continue;
+                            },
+                            .waiting => continue,
+                        }
                         var started = entry.index.ensureGraphMetricPlannedBuildFromCachedPlan(cfg.name, status.target_edge_generation) catch |err| switch (err) {
                             error.GraphMetricDisabled => continue,
                             error.GraphMetricBuildSnapshotChanged => continue,
@@ -6347,7 +6366,7 @@ pub const IndexManager = struct {
                         index_scheduled_builds += 1;
                         active = true;
                     },
-                    .disabled, .fresh, .building => {},
+                    .disabled, .building => {},
                 }
             }
             if (!active) continue;
@@ -6400,6 +6419,7 @@ pub const IndexManager = struct {
 
         const entry_count = scheduled_entries.len;
         if (entry_count == 0) return result;
+        var topology_census_steps: usize = 0;
         for (scheduled_entries) |scheduled| {
             const entry = scheduled.entry;
             const metric_name = scheduled.metric_name;
@@ -6409,6 +6429,21 @@ pub const IndexManager = struct {
             }
 
             if (metric_name.len == 0) {
+                // Idle reads are bounded too, but do not report eligible work
+                // and keep runUntilIdle spinning through a retained catalog.
+                if (topology_census_steps >= options.max_pages) continue;
+                topology_census_steps += 1;
+                const prepared = entry.index.runGraphMetricTopologyPreparationStep(options.worker_id) catch |err| switch (err) {
+                    error.GraphMetricBuildSuperseded, error.GraphMetricBuildSnapshotChanged => continue,
+                    else => return err,
+                };
+                if (prepared) {
+                    result.worker_steps += 1;
+                    // This may be only a packing checkpoint or retirement
+                    // slice, not a completed numerical page.
+                    result.planning_steps += 1;
+                    continue;
+                }
                 const topology = try entry.index.cleanupGraphMetricTopologyPageDetailed();
                 if (topology.removed != 0) {
                     result.worker_steps += 1;

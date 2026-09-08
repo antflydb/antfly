@@ -187,7 +187,62 @@ pub const DecodedScoreBlock = struct {
         }
         return null;
     }
+
+    /// Candidates are in canonical ID order, with original row ordinals for
+    /// scattering. Sparse probes retain binary search; dense spans merge once
+    /// through the borrowed block. Duplicate candidates do not advance the
+    /// block cursor and therefore preserve every caller-visible row.
+    pub fn populateSorted(self: *const DecodedScoreBlock, node_ids: []const []const u8, rows: []const u32, values: []?f64, cancellation: CancellationToken) !void {
+        if (node_ids.len != values.len) return error.InvalidGraphMetricSegment;
+        const search_cost = 1 + std.math.log2_int(usize, @max(self.len, 1));
+        const merge = rows.len > (self.len + rows.len) / search_cost;
+        if (!merge) {
+            for (rows, 0..) |row, i| {
+                if (i % 256 == 0) try cancellation.check();
+                if (row >= node_ids.len) return error.InvalidGraphMetricSegment;
+                values[row] = self.score(node_ids[row]);
+            }
+            return;
+        }
+        var position: usize = 0;
+        for (rows, 0..) |row, i| {
+            if (i % 256 == 0) try cancellation.check();
+            if (row >= node_ids.len) return error.InvalidGraphMetricSegment;
+            while (position < self.len and self.scores[position].orderNode(self.node_prefix, node_ids[row]) == .lt) position += 1;
+            values[row] = if (position < self.len and self.scores[position].eqlNode(self.node_prefix, node_ids[row])) self.scores[position].value else null;
+        }
+    }
 };
+
+test "serverless graph metric adaptive score join preserves sparse dense duplicate and missing rows" {
+    var names: [1024][8]u8 = undefined;
+    var block = DecodedScoreBlock{ .node_prefix = "collection/", .len = names.len };
+    var ids: [1026][]const u8 = undefined;
+    var full: [1024][19]u8 = undefined;
+    for (&names, &full, 0..) |*name, *id, i| {
+        const suffix = try std.fmt.bufPrint(name, "{d:0>8}", .{i * 2});
+        ids[i] = try std.fmt.bufPrint(id, "collection/{s}", .{suffix});
+        block.scores[i] = .{ .node_suffix = suffix, .value = @floatFromInt(i) };
+    }
+    ids[1024] = ids[512];
+    ids[1025] = "collection/00001025";
+    var rows: [1026]u32 = undefined;
+    for (&rows, 0..) |*row, i| row.* = @intCast(i);
+    std.mem.sort(u32, &rows, &ids, struct {
+        fn less(input: *[1026][]const u8, a: u32, b: u32) bool {
+            return std.mem.lessThan(u8, input[a], input[b]);
+        }
+    }.less);
+    var values: [1026]?f64 = @splat(null);
+    for ([_]usize{ 0, 1, 7, 128, 1026 }) |count| {
+        @memset(&values, null);
+        try block.populateSorted(&ids, rows[0..count], &values, .none);
+        for (rows[0..count]) |row| try std.testing.expectEqual(block.score(ids[row]), values[row]);
+    }
+    try std.testing.expectEqual(@as(?f64, 512), values[1024]);
+    try std.testing.expectEqual(@as(?f64, null), values[1025]);
+    try std.testing.expectError(error.InvalidGraphMetricSegment, block.populateSorted(&ids, &.{1026}, &values, .none));
+}
 
 /// Exact bounded prefix needed to decode provenance from a current artifact.
 /// Logical names are manifest metadata and deliberately do not affect the

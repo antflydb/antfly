@@ -8554,6 +8554,15 @@ pub fn build(b: *std.Build) void {
     );
     const graph_metric_unit_test_step = b.step("graph-metric-unit-test", "Run cheap graph metric runtime, ownership, and query tests");
     graph_metric_unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
+    const graph_metric_topology_filters = [_][]const u8{"graph metric shared topology"};
+    const graph_metric_topology_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"db default primary backend survives reopen"}, &graph_metric_topology_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_graph_metric_topology_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_topology_tests, &graph_metric_topology_filters);
+    const graph_metric_topology_test_step = b.step("graph-metric-topology-test", "Run durable topology preparation, sharing, recovery, and reclamation tests");
+    graph_metric_topology_test_step.dependOn(&run_graph_metric_topology_tests.step);
     unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
     unit_test_step.dependOn(&run_graph_metric_command_tests.step);
 

@@ -91,6 +91,54 @@ const PhaseTrackingAllocator = struct {
     }
 };
 
+fn benchmarkScoreJoin(output: anytype) !void {
+    const codec = antfly.serverless.graph_metric_segment.codec;
+    var block = codec.DecodedScoreBlock{ .len = 1024, .node_prefix = "collection/" };
+    var suffixes: [1024][8]u8 = undefined;
+    var names: [1024][19]u8 = undefined;
+    var ids: [1024][]const u8 = undefined;
+    var rows: [1024]u32 = undefined;
+    var values: [1024]?f64 = @splat(null);
+    for (&suffixes, &names, &ids, &rows, 0..) |*suffix, *name, *id, *row, i| {
+        const text = try std.fmt.bufPrint(suffix, "{d:0>8}", .{i});
+        id.* = try std.fmt.bufPrint(name, "collection/{s}", .{text});
+        row.* = @intCast(i);
+        block.scores[i] = .{ .node_suffix = text, .value = @floatFromInt(i) };
+    }
+    for ([_]usize{ 1, 16, 256, 1024 }) |count| {
+        for (0..count) |i| rows[i] = @intCast(i * 1024 / count);
+        for ([_]bool{ true, false }) |reference| {
+            var times: [5]u64 = undefined;
+            for (0..6) |sample| {
+                const start = antfly.platform_time.monotonicNs();
+                for (0..4096) |_| {
+                    if (reference) {
+                        for (rows[0..count]) |row| values[row] = block.score(ids[row]);
+                    } else try block.populateSorted(&ids, rows[0..count], &values, .none);
+                    std.mem.doNotOptimizeAway(&values);
+                }
+                const elapsed = (antfly.platform_time.monotonicNs() - start) / 4096;
+                for (rows[0..count]) |row| if (values[row] != @as(f64, @floatFromInt(row))) return error.InvalidBenchmarkResult;
+                if (sample != 0) times[sample - 1] = elapsed;
+            }
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(std.heap.smp_allocator, .{
+                .mode = if (reference) "score_join_binary_reference" else "score_join_adaptive",
+                .rows = count,
+                .block_rows = 1024,
+                .median_ns = times[2],
+                .min_ns = times[0],
+                .max_ns = times[4],
+                .note = "borrowed decoded block; excludes decode and I/O; six samples, first discarded; 4096 repetitions",
+            }, .{});
+            defer std.heap.smp_allocator.free(json);
+            try output.interface.writeAll(json);
+            try output.interface.writeByte('\n');
+            try output.flush();
+        }
+    }
+}
+
 fn benchmarkSparseProjections(output: anytype) !void {
     const alloc = std.heap.smp_allocator;
     const ids = try alloc.alloc([]const u8, 1_000_000);
@@ -146,9 +194,11 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     var staged_only = false;
     var topology_only = false;
+    var score_join_only = false;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--staged-only")) staged_only = true else if (std.mem.eql(u8, arg, "--topology-only")) topology_only = true else return error.InvalidArgument;
+        if (std.mem.eql(u8, arg, "--staged-only")) staged_only = true else if (std.mem.eql(u8, arg, "--topology-only")) topology_only = true else if (std.mem.eql(u8, arg, "--score-join-only")) score_join_only = true else return error.InvalidArgument;
     }
+    if (score_join_only) return benchmarkScoreJoin(&output);
     if (topology_only) return benchmarkSharedTopology(init.io, &output);
     try benchmarkStagedQueries(init.io, &output);
     if (staged_only) return;
@@ -162,6 +212,7 @@ pub fn main(init: std.process.Init) !void {
     try benchmarkRoutingWorkingSet(&output);
     try benchmarkSparseProjections(&output);
     try benchmarkCandidatePlanning(&output);
+    try benchmarkScoreJoin(&output);
     try benchmarkAuthenticatedCache(init.io, &output);
     try benchmarkTopOwnership(&output);
     for ([_]usize{ 2_000, 20_000, 50_000 }) |nodes| {

@@ -560,7 +560,7 @@ pub fn validateGraphMetricEdgeFilters(
     metric_configs: []const GraphMetricConfig,
 ) GraphMetricValidationError!void {
     for (metric_configs, 0..) |metric_cfg, i| {
-        if (metric_cfg.name.len == 0) return error.InvalidGraphMetricName;
+        if (metric_cfg.name.len == 0 or std.mem.indexOfScalar(u8, metric_cfg.name, 0) != null) return error.InvalidGraphMetricName;
         if (metric_cfg.max_iterations == 0 or metric_cfg.max_iterations > graph_metric_max_iterations) {
             return error.InvalidGraphMetricIterations;
         }
@@ -655,7 +655,7 @@ test "graph index routes reverse lsm profile options" {
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
 
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{
         .reverse_backend = .lsm_memory,
         .reverse_lsm_options = .{ .flush_threshold = 91 },
     });
@@ -755,6 +755,10 @@ const graph_node_count_key = "meta:node_count";
 const graph_edge_generation_key = "meta:edge_generation";
 const graph_metric_key_prefix = "meta:metric:";
 const graph_metric_control_key_prefix = "meta:metric_control:";
+const topology_task_prefix = "meta:metric_topology:tasks/";
+const topology_task_name_prefix = "\x00topology/";
+const topology_task_control_prefix = "meta:metric_topology:control/";
+const topology_task_incarnation_key = "meta:metric_topology:task-incarnation";
 const graph_metric_recent_event_limit = 8;
 const graph_metric_status_page_limit = 8;
 const default_graph_metric_deferred_cleanup_ms: u64 = 60_000;
@@ -782,10 +786,10 @@ const graph_metric_build_adoption_page_units: usize = 512;
 const graph_metric_packed_f64_magic: u64 = 0xA17F_5046_3634_0001;
 const graph_metric_packed_f64_header_len: usize = 24;
 const graph_metric_build_adoption_cursor_prefix = "@adopt:";
-const graph_metric_partition_plan_key = "meta:metric_partition_plan:v6";
-const graph_metric_partition_census_key = "meta:metric_partition_census:v1";
-const graph_metric_partition_plan_version: u32 = 6;
-const graph_metric_partition_plan_checksum_seed: u64 = 0xA17F_504C_414E_0006;
+const graph_metric_partition_plan_key = "meta:metric_partition_plan:v7";
+const graph_metric_partition_census_key = "meta:metric_partition_census:v2";
+const graph_metric_partition_plan_version: u32 = 7;
+const graph_metric_partition_plan_checksum_seed: u64 = 0xA17F_504C_414E_0007;
 // The public API caps top-K at this value. Retaining a rank entry for every
 // score doubles write/storage amplification without improving any supported
 // query, so each immutable generation keeps only this exact ordered prefix.
@@ -799,7 +803,16 @@ pub const ReverseBackend = enum {
 };
 
 pub const GraphIndex = struct {
+    /// Explicit small-page injection for recovery fixtures; production uses
+    /// byte/work-bounded checkpoints with 4096-unit scheduling ranges.
+    test_partition_target_units: ?usize = null,
     sealed_vectors: @import("sealed_vector_cache.zig").Cache = .{},
+    topology_gc_mutex: std.atomic.Mutex = .unlocked,
+    // Census position is only a fairness hint. Deletion tombstones and removed
+    // keys are the durable recovery state; idle scans must not write a WAL.
+    topology_gc_cursor: ?topology_owner.Id = null,
+    topology_preparation_only: bool = false,
+    topology_preparation_mutex: std.atomic.Mutex = .unlocked,
     alloc: Allocator,
     index_name: []const u8,
     outgoing_store: backend_erased.Store,
@@ -1562,14 +1575,14 @@ pub const GraphIndex = struct {
     fn graphMetricKeyWithAllocator(alloc: Allocator, parts: []const []const u8) ![]u8 {
         var list = std.ArrayListUnmanaged(u8).empty;
         defer list.deinit(alloc);
-        try list.appendSlice(alloc, graph_metric_key_prefix);
+        try list.appendSlice(alloc, graphMetricNamespacePrefix(parts, graph_metric_key_prefix));
         for (parts) |part| try internal_keys.appendEncodedComponent(&list, alloc, part);
         return try list.toOwnedSlice(alloc);
     }
 
     fn writeGraphMetricKey(self: *GraphIndex, list: *std.ArrayListUnmanaged(u8), parts: []const []const u8) !void {
         list.clearRetainingCapacity();
-        try list.appendSlice(self.alloc, graph_metric_key_prefix);
+        try list.appendSlice(self.alloc, graphMetricNamespacePrefix(parts, graph_metric_key_prefix));
         for (parts) |part| try internal_keys.appendEncodedComponent(list, self.alloc, part);
     }
 
@@ -1579,16 +1592,26 @@ pub const GraphIndex = struct {
 
     fn writeGraphMetricControlKey(self: *GraphIndex, list: *std.ArrayListUnmanaged(u8), parts: []const []const u8) !void {
         list.clearRetainingCapacity();
-        try list.appendSlice(self.alloc, graph_metric_control_key_prefix);
+        try list.appendSlice(self.alloc, graphMetricControlPrefix(parts));
         for (parts) |part| try internal_keys.appendEncodedComponent(list, self.alloc, part);
     }
 
     fn graphMetricControlKeyWithAllocator(alloc: Allocator, parts: []const []const u8) ![]u8 {
         var list = std.ArrayListUnmanaged(u8).empty;
         defer list.deinit(alloc);
-        try list.appendSlice(alloc, graph_metric_control_key_prefix);
+        try list.appendSlice(alloc, graphMetricControlPrefix(parts));
         for (parts) |part| try internal_keys.appendEncodedComponent(&list, alloc, part);
         return try list.toOwnedSlice(alloc);
+    }
+
+    fn graphMetricControlPrefix(parts: []const []const u8) []const u8 {
+        return graphMetricNamespacePrefix(parts, graph_metric_control_key_prefix);
+    }
+
+    fn graphMetricNamespacePrefix(parts: []const []const u8, ordinary: []const u8) []const u8 {
+        // Task diagnostics/counters belong to the same bounded retirement
+        // namespace as its pages; none may leak into public metric metadata.
+        return if (parts.len != 0 and std.mem.startsWith(u8, parts[0], topology_task_name_prefix)) topology_task_control_prefix else ordinary;
     }
 
     fn graphMetricScoreKeyAlloc(self: *GraphIndex, metric_name: []const u8, generation: u64, node: []const u8) ![]u8 {
@@ -2653,6 +2676,20 @@ pub const GraphIndex = struct {
         // the lease. A scheduler decision made before an operator delete can
         // therefore never resurrect the metric after that delete commits.
         if (try self.metricDisabled(&batch, metric_name)) return error.GraphMetricDisabled;
+        if (self.topology_preparation_only) {
+            const task_key = try topologyTaskKeyAlloc(self.alloc, metric_name);
+            defer self.alloc.free(task_key);
+            const task_raw = batch.get(task_key) catch |err| switch (err) {
+                error.NotFound => return error.GraphMetricBuildSuperseded,
+                else => return err,
+            };
+            if (try topologyTaskIncarnation(task_raw) != try topologyTaskNameIncarnation(metric_name) or task_raw[8] & 2 != 0) return error.GraphMetricBuildSuperseded;
+            const filter = try topology_owner.filterDigest(self.alloc, cfg.edge_filter);
+            const identity = topology_owner.identity(filter, try batch.get(graph_metric_partition_plan_key));
+            const ready = try topology_owner.readyKey(self.alloc, identity, cfg.kind == .hits_authority);
+            defer self.alloc.free(ready);
+            if (batch.get(ready)) |_| return error.GraphMetricBuildSuperseded else |err| if (err != error.NotFound) return err;
+        }
 
         const key = try self.graphMetricBuildLeaseKeyAlloc(metric_name);
         defer self.alloc.free(key);
@@ -2724,6 +2761,9 @@ pub const GraphIndex = struct {
             .iteration = lease.iteration,
             .worker_id = lease.worker_id,
         }, partition_plan);
+        const requested = try self.graphMetricControlKeyAlloc(&.{ metric_name, "requested" });
+        defer self.alloc.free(requested);
+        batch.delete(requested) catch |err| if (err != error.NotFound) return err;
         try batch.commit();
     }
 
@@ -2879,8 +2919,8 @@ pub const GraphIndex = struct {
         }
         const edge_count = std.math.cast(usize, plan.edge_count) orelse return null;
         const node_count = std.math.cast(usize, plan.node_count) orelse return null;
-        if (plan.edge_page_count != graphMetricDegreeScanPageCount(edge_count) or
-            plan.node_page_count != graphMetricDegreeReducePageCount(node_count))
+        if (plan.edge_page_count != self.graphMetricDegreeScanPageCount(edge_count) or
+            plan.node_page_count != self.graphMetricDegreeReducePageCount(node_count))
         {
             return null;
         }
@@ -3064,8 +3104,8 @@ pub const GraphIndex = struct {
                 .edge_generation = state.generation,
                 .edge_count = state.edge_count,
                 .node_count = state.node_count,
-                .edge_page_count = graphMetricDegreeScanPageCount(@intCast(state.edge_count)),
-                .node_page_count = graphMetricDegreeReducePageCount(@intCast(state.node_count)),
+                .edge_page_count = self.graphMetricDegreeScanPageCount(@intCast(state.edge_count)),
+                .node_page_count = self.graphMetricDegreeReducePageCount(@intCast(state.node_count)),
                 .edge_boundaries = state.edge_boundaries,
                 .node_boundaries = state.node_boundaries,
             };
@@ -3106,7 +3146,7 @@ pub const GraphIndex = struct {
                 }
                 if (graphIndexEdgeKeyMatchesIndex(entry.key, self.index_name)) {
                     const page = state.edge_boundaries.items.len;
-                    const pages = graphMetricDegreeScanPageCount(edge_count);
+                    const pages = self.graphMetricDegreeScanPageCount(edge_count);
                     if (page < pages and state.edges_seen == graphMetricPartitionSpan(edge_count, pages, page).start) {
                         try state.edge_boundaries.ensureUnusedCapacity(self.alloc, 1);
                         state.edge_boundaries.appendAssumeCapacity(try self.alloc.dupe(u8, entry.key));
@@ -3134,7 +3174,7 @@ pub const GraphIndex = struct {
         while (item) |entry| : (item = try cur.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
             const page = state.node_boundaries.items.len;
-            const pages = graphMetricDegreeReducePageCount(node_count);
+            const pages = self.graphMetricDegreeReducePageCount(node_count);
             if (page < pages and state.nodes_seen == graphMetricPartitionSpan(node_count, pages, page).start) {
                 try state.node_boundaries.ensureUnusedCapacity(self.alloc, 1);
                 state.node_boundaries.appendAssumeCapacity(try self.alloc.dupe(u8, entry.key[prefix.len..]));
@@ -3470,7 +3510,7 @@ pub const GraphIndex = struct {
         const count = std.mem.readInt(u64, raw[0..8], .little);
         if (count == 0 or count > graph_metric_build_max_partition_pages or raw.len != 8 + count * 8) return error.InvalidGraphMetricBuildManifest;
         const manifest = try self.metricBuildManifest(txn, metric, job_id) orelse return error.InvalidGraphMetricBuildManifest;
-        if (count != graphMetricDegreeReducePageCount(@intCast(manifest.node_count))) return error.InvalidGraphMetricBuildManifest;
+        if (count != self.graphMetricDegreeReducePageCount(@intCast(manifest.node_count))) return error.InvalidGraphMetricBuildManifest;
         var plan = GraphMetricActivePlan{ .count = @intCast(count) };
         var total: u64 = 0;
         for (plan.counts[0..plan.count], 0..) |*units, i| {
@@ -3485,7 +3525,7 @@ pub const GraphIndex = struct {
 
     fn sealGraphMetricActivePlan(self: *GraphIndex, batch: anytype, metric: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob) !void {
         const manifest = try self.metricBuildManifest(batch, metric, job.job_id) orelse return error.InvalidGraphMetricBuildManifest;
-        const count = graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
+        const count = self.graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
         var encoded: [8 + 8 * graph_metric_build_max_partition_pages]u8 = undefined;
         std.mem.writeInt(u64, encoded[0..8], count, .little);
         for (0..count) |index| {
@@ -3623,19 +3663,19 @@ pub const GraphIndex = struct {
         try self.planGraphMetricIterationPagesInBatch(batch, metric_name, .pagerank, job, iteration);
     }
 
-    fn graphMetricDegreeScanPageCount(edge_key_count: usize) usize {
+    fn graphMetricDegreeScanPageCount(self: *GraphIndex, edge_key_count: usize) usize {
         if (edge_key_count == 0) return 1;
         return @min(
             graph_metric_build_max_partition_pages,
-            std.math.divCeil(usize, edge_key_count, graph_metric_build_target_scan_page_units) catch 1,
+            std.math.divCeil(usize, edge_key_count, self.test_partition_target_units orelse graph_metric_build_checkpoint_scan_units) catch 1,
         );
     }
 
-    fn graphMetricDegreeReducePageCount(node_key_count: usize) usize {
+    fn graphMetricDegreeReducePageCount(self: *GraphIndex, node_key_count: usize) usize {
         if (node_key_count == 0) return 1;
         return @min(
             graph_metric_build_max_partition_pages,
-            std.math.divCeil(usize, node_key_count, graph_metric_build_target_reduce_page_units) catch 1,
+            std.math.divCeil(usize, node_key_count, self.test_partition_target_units orelse graph_metric_build_checkpoint_reduce_units) catch 1,
         );
     }
 
@@ -3683,11 +3723,11 @@ pub const GraphIndex = struct {
         const edge_count = std.math.cast(usize, self.edge_count) orelse std.math.maxInt(usize);
         const node_count = std.math.cast(usize, self.node_count) orelse std.math.maxInt(usize);
         const reverse_edge_page_count = if (cfg.kind == .degree or graphMetricKindUsesIterativeBuild(cfg.kind))
-            graphMetricDegreeScanPageCount(edge_count)
+            self.graphMetricDegreeScanPageCount(edge_count)
         else
             0;
         const node_page_count = if (cfg.kind == .degree or graphMetricKindUsesIterativeBuild(cfg.kind))
-            graphMetricDegreeReducePageCount(node_count)
+            self.graphMetricDegreeReducePageCount(node_count)
         else
             0;
         const cleanup_page_count = graphMetricBuildCleanupPageCount(cfg.kind);
@@ -4670,7 +4710,7 @@ pub const GraphIndex = struct {
             var iteration_buf: [10]u8 = undefined;
             const retirement_prefix = try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", try std.fmt.bufPrint(&job_buf, "{d}", .{job_id}), "retirement", @tagName(phase), try std.fmt.bufPrint(&iteration_buf, "{d}", .{iteration}) });
             defer self.alloc.free(retirement_prefix);
-            const raw_prefix = try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", try std.fmt.bufPrint(&job_buf, "{d}", .{job_id}), "vector", if (phase == .hits_hub_reduce_ranks) "raw_hub" else "raw_rank", try std.fmt.bufPrint(&iteration_buf, "{d}", .{iteration}) });
+            const raw_prefix = if (self.topology_preparation_only) try self.alloc.dupe(u8, "") else try self.graphMetricControlKeyAlloc(&.{ metric_name, "job", try std.fmt.bufPrint(&job_buf, "{d}", .{job_id}), "vector", if (phase == .hits_hub_reduce_ranks) "raw_hub" else "raw_rank", try std.fmt.bufPrint(&iteration_buf, "{d}", .{iteration}) });
             defer self.alloc.free(raw_prefix);
             // Iteration zero has now packed every consumer's adjacency.
             // Retire producer fragments; later iterations use only receipts
@@ -5522,9 +5562,43 @@ pub const GraphIndex = struct {
     }
 
     fn recordGraphMetricFailureReason(self: *GraphIndex, metric_name: []const u8, failure_reason: []const u8) !void {
+        return self.recordGraphMetricFailureReasonAtGeneration(metric_name, failure_reason, null, null);
+    }
+
+    fn recordGraphMetricFailureReasonAtGeneration(self: *GraphIndex, metric_name: []const u8, failure_reason: []const u8, preparation_generation: ?u64, preparation_task: ?[]const u8) !void {
         const pair_cfg = if (self.metricConfig(metric_name)) |cfg| self.pairedHitsMetricConfig(cfg) else null;
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
+        if (preparation_task) |task_name| {
+            const task_key = try topologyTaskKeyAlloc(self.alloc, task_name);
+            defer self.alloc.free(task_key);
+            const raw = batch.get(task_key) catch |err| switch (err) {
+                error.NotFound => {
+                    batch.abort();
+                    return;
+                },
+                else => return err,
+            };
+            if (try topologyTaskIncarnation(raw) != try topologyTaskNameIncarnation(task_name) or raw[8] & 2 != 0) {
+                batch.abort();
+                return;
+            }
+            // Deliver a failure once per dependent and incarnation. A manual
+            // retry accepted after delivery must survive delayed reporters.
+            const delivered = try self.graphMetricControlKeyAlloc(&.{ task_name, "failed-dependent", metric_name });
+            defer self.alloc.free(delivered);
+            if (batch.get(delivered)) |_| {
+                batch.abort();
+                return;
+            } else |err| if (err != error.NotFound) return err;
+            try batch.put(delivered, "");
+        }
+        if (preparation_generation) |generation| {
+            if (generation != try readU64OrZero(&batch, graph_edge_generation_key) or try self.metricDisabled(&batch, metric_name) or try self.metricMaintenancePaused(&batch, metric_name)) {
+                batch.abort();
+                return;
+            }
+        }
         const retry_count = try self.nextGraphMetricFailureRetryCountInBatch(&batch, metric_name);
         try self.putGraphMetricFailureDetailInBatch(&batch, metric_name, retry_count, failure_reason);
         const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
@@ -5532,8 +5606,21 @@ pub const GraphIndex = struct {
             .at_ms = now_ms,
             .retry_count = retry_count,
             .last_error = failure_reason,
+            .target_generation = try readU64OrZero(&batch, graph_edge_generation_key),
         };
-        if (try self.metricBuildJob(&batch, metric_name)) |job| {
+        const requested = try self.graphMetricControlKeyAlloc(&.{ metric_name, "requested" });
+        defer self.alloc.free(requested);
+        batch.delete(requested) catch |err| if (err != error.NotFound) return err;
+        const failed_job = job: {
+            const candidate = try self.metricBuildJob(&batch, metric_name) orelse break :job null;
+            if (preparation_generation) |generation| {
+                // A queued dependency failure is not a failure of the old,
+                // already-published numerical job or its score namespace.
+                if (candidate.phase == .complete or candidate.target_generation != generation) break :job null;
+            }
+            break :job candidate;
+        };
+        if (failed_job) |job| {
             failure_record.job_id = job.job_id;
             self.sealed_vectors.retire(self.alloc, sealedVectorScope(metric_name));
             failure_record.target_generation = job.target_generation;
@@ -5595,7 +5682,7 @@ pub const GraphIndex = struct {
         // `self.edge_generation`; stamping that newer value here would turn a
         // normally superseded build into a terminal failure for the new work
         // and prevent background maintenance from requeuing it.
-        const failure_target_generation = if (failure_record.job_id != 0)
+        const failure_target_generation = preparation_generation orelse if (failure_record.job_id != 0)
             failure_record.target_generation
         else
             self.edge_generation;
@@ -7196,8 +7283,10 @@ pub const GraphIndex = struct {
     // plans so later iterations omit empty leaves without changing ordinals.
     // v14 removes later producer phases; reducers reuse iteration-zero adjacency.
     // v15 separates durable topology ownership from numerical job lifetimes.
+    // v16 amortizes scheduling over 4096-unit ranges and adds independent,
+    // numerical-free topology preparation in its own durable task namespace.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 15;
+    const graph_metric_build_execution_schema_version: u64 = 16;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -7545,13 +7634,14 @@ pub const GraphIndex = struct {
             @intFromEnum(GraphMetricEdgeFilterMode.types) => .types,
             else => return null,
         };
-        const count: usize = @intCast(std.mem.readInt(u64, raw[8..16], .little));
+        const count = std.math.cast(usize, std.mem.readInt(u64, raw[8..16], .little)) orelse return error.InvalidGraphMetricEdgeFilterMetadata;
         var offset: usize = graph_metric_edge_filter_header_len;
         if (mode == .all) {
             if (count != 0 or offset != raw.len) return null;
             return .{};
         }
         if (count == 0) return null;
+        if (count > (raw.len - offset) / 9) return error.InvalidGraphMetricEdgeFilterMetadata;
         const types = try alloc.alloc([]const u8, count);
         var initialized: usize = 0;
         errdefer {
@@ -7560,9 +7650,9 @@ pub const GraphIndex = struct {
         }
         for (types) |*slot| {
             if (offset + 8 > raw.len) return error.InvalidGraphMetricEdgeFilterMetadata;
-            const edge_type_len: usize = @intCast(std.mem.readInt(u64, raw[offset..][0..8], .little));
+            const edge_type_len = std.math.cast(usize, std.mem.readInt(u64, raw[offset..][0..8], .little)) orelse return error.InvalidGraphMetricEdgeFilterMetadata;
             offset += 8;
-            if (edge_type_len == 0 or offset + edge_type_len > raw.len) return error.InvalidGraphMetricEdgeFilterMetadata;
+            if (edge_type_len == 0 or edge_type_len > raw.len - offset) return error.InvalidGraphMetricEdgeFilterMetadata;
             slot.* = try alloc.dupe(u8, raw[offset..][0..edge_type_len]);
             initialized += 1;
             offset += edge_type_len;
@@ -9215,7 +9305,7 @@ pub const GraphIndex = struct {
     fn collectSealedGraphMetricMembership(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, lower: []const u8, upper: []const u8, resume_node: []const u8, limit: ?usize, max_node_bytes: ?usize, nodes: *std.ArrayListUnmanaged([]u8), slots: *std.ArrayListUnmanaged(u64)) !bool {
         var node_bytes: usize = 0;
         const manifest = try self.metricBuildManifest(txn, metric, job_id) orelse return error.GraphMetricBuildManifestNotFound;
-        const leaf_count = graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
+        const leaf_count = self.graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
         const seek = if (resume_node.len != 0) resume_node else lower;
         // Locate one immutable leaf by range, not by enumerating every leaf or
         // probing absent filtered boundary nodes in the ordinal dictionary.
@@ -10050,6 +10140,7 @@ pub const GraphIndex = struct {
     // Small chunks do not pay another maintenance tick just to consume a
     // receipt produced by this same worker; large chunks remain checkpointed.
     fn executeOrdinalReduceSummaryCheckpoint(self: *GraphIndex, metric_name: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob, claimed: GraphMetricBuildPage, max_nodes: usize, max_records: usize, may_pack: bool) !usize {
+        if (self.topology_preparation_only) return self.executeTopologyPackingSummary(metric_name, job, claimed, max_nodes, max_records);
         if (max_nodes == 0 or max_records == 0) return error.InvalidGraphMetricBuildProgress;
         // Capture before opening the snapshot/validating the lease. Retirement
         // can race a reclaimed worker, but its old ticket cannot repopulate it.
@@ -10240,6 +10331,68 @@ pub const GraphIndex = struct {
         return records;
     }
 
+    fn executeTopologyPackingSummary(self: *GraphIndex, metric: []const u8, job: GraphMetricBuildJob, claimed: GraphMetricBuildPage, max_nodes: usize, max_records: usize) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        var nodes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (nodes.items) |node| self.alloc.free(node);
+            nodes.deinit(self.alloc);
+        }
+        var slots = std.ArrayListUnmanaged(u64).empty;
+        defer slots.deinit(self.alloc);
+        const producer: GraphMetricBuildPhase = if (claimed.phase == .hits_hub_reduce_ranks) .hits_hub_contributions else .iterate_contributions;
+        var pack: ?u64 = null;
+        var prior: u64 = 0;
+        const complete = read: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            const current = try self.metricBuildPage(&txn, metric, job.job_id, claimed.phase, 0, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
+            try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
+            prior = current.completed_units;
+            const end = try self.collectGraphMetricOrdinalNodesInRange(&txn, metric, job.job_id, current.range_lower, current.range_upper, current.cursor, @min(max_nodes, vector_chunk.entries), &nodes, &slots);
+            var previous: ?u64 = null;
+            for (slots.items) |slot| {
+                const chunk = slot / vector_chunk.entries;
+                if (previous == chunk) continue;
+                previous = chunk;
+                const base = try self.topologyKey(&txn, metric, job.job_id, try self.packedAdjacencyBaseAlloc(metric, job.job_id, producer, chunk));
+                defer self.alloc.free(base);
+                const key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
+                if (txn.get(key)) |raw| {
+                    _ = try adjacency_blocks.Receipt.decode(raw);
+                } else |err| switch (err) {
+                    error.NotFound => {
+                        pack = chunk;
+                        break;
+                    },
+                    else => return err,
+                }
+            }
+            break :read end;
+        };
+        if (pack) |chunk| return self.compactOrdinalAdjacencyChunk(metric, job, claimed, producer, chunk, @min(max_records, graph_metric_build_adoption_page_units));
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        var current = try self.metricBuildPage(&batch, metric, job.job_id, claimed.phase, 0, claimed.page_id) orelse return error.GraphMetricBuildPageNotFound;
+        try self.validateGraphMetricBuildPageExecutionLease(claimed, current);
+        if (current.completed_units != prior) return error.GraphMetricBuildPageOutputMismatch;
+        current.completed_units += nodes.items.len;
+        if (current.completed_units > current.total_units) return error.InvalidGraphMetricBuildProgress;
+        if (nodes.items.len != 0) current.cursor = nodes.items[nodes.items.len - 1];
+        if (complete) {
+            current.state = .complete;
+            current.total_units = current.completed_units;
+            current.cursor = "";
+            current.lease_expires_at_ms = 0;
+            current.output_fingerprint = current.completed_units;
+        }
+        try self.putGraphMetricBuildPageInBatch(&batch, metric, current);
+        try batch.commit();
+        return nodes.items.len;
+    }
+
     fn executeGraphMetricReduceSummaryBuildPage(
         self: *GraphIndex,
         metric_name: []const u8,
@@ -10295,7 +10448,7 @@ pub const GraphIndex = struct {
                 var txn = try self.beginReadReverseTxn();
                 defer txn.abort();
                 const active = if (page.iteration != 0) try self.graphMetricActivePlan(&txn, metric_name, job.job_id) else null;
-                const count = if (active) |work| work.count else graphMetricDegreeReducePageCount(@intCast(total_units));
+                const count = if (active) |work| work.count else self.graphMetricDegreeReducePageCount(@intCast(total_units));
                 for (0..count) |index| {
                     if (active) |work| if (work.counts[index] == 0) continue;
                     const leaf = try self.metricBuildPage(&txn, metric_name, job.job_id, page.phase, page.iteration, graph_metric_build_summary_leaf_base + index) orelse return error.InvalidGraphMetricBuildManifest;
@@ -13003,6 +13156,15 @@ pub const GraphIndex = struct {
         job: GraphMetricBuildJob,
         page: GraphMetricBuildPage,
     ) !GraphMetricBuildPageExecutionResult {
+        // A topology task uses the mature page lease/checkpoint machinery, but
+        // owns no numerical vectors or publication. Only membership census and
+        // adjacency packing run before the immutable owner is sealed.
+        if (self.topology_preparation_only and page.range_kind == .nodes and
+            (page.phase == .initialize_ranks or page.phase == .reduce_ranks or page.phase == .hits_hub_reduce_ranks))
+        {
+            const completed = try self.completeGraphMetricBuildPageForAttempt(metric_name, job.job_id, page.phase, page.iteration, page.page_id, page.worker_id, page.attempt, page.total_units, 1);
+            return .{ .phase = page.phase, .page_id = page.page_id, .completed_page = true, .completed_units = completed.completed_units, .total_units = completed.total_units, .output_fingerprint = completed.output_fingerprint };
+        }
         return switch (cfg.kind) {
             .degree => try self.executeDegreeMetricBuildPage(metric_name, cfg, job, page),
             .pagerank => try self.executePageRankMetricBuildPage(metric_name, cfg, job, page),
@@ -13613,6 +13775,253 @@ pub const GraphIndex = struct {
         };
     }
 
+    pub fn queueGraphMetricBuild(self: *GraphIndex, metric: []const u8, generation: u64) !GraphMetricStatus {
+        const name = try self.graphMetricLifecycleOwnerName(metric);
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const key = try self.graphMetricControlKeyAlloc(&.{ name, "requested" });
+        defer self.alloc.free(key);
+        if (try self.metricDisabled(&batch, name)) return error.GraphMetricDisabled;
+        if (try self.metricBuildJob(&batch, name)) |job| {
+            if (job.target_generation == generation and job.phase != .complete and job.retry_count == 0 and job.last_error.len == 0) {
+                if (try self.metricBuildLease(&batch, name)) |lease| {
+                    const now_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
+                    if (lease.job_id == job.job_id and lease.target_generation == generation and lease.lease_expires_at_ms > now_ms) {
+                        batch.abort();
+                        return self.graphMetricStatus(metric);
+                    }
+                }
+            }
+        }
+        if (try readU64OrZero(&batch, key) == generation and generation != 0) {
+            batch.abort();
+            return self.graphMetricStatus(metric);
+        }
+        try putU64(&batch, key, generation);
+        try batch.commit();
+        return self.graphMetricStatus(metric);
+    }
+
+    pub fn graphMetricBuildRequested(self: *GraphIndex, metric: []const u8) !bool {
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        return self.metricBuildRequestedInTxn(&txn, try self.graphMetricLifecycleOwnerName(metric));
+    }
+
+    fn metricBuildRequestedInTxn(self: *GraphIndex, txn: anytype, metric: []const u8) !bool {
+        const key = try self.graphMetricControlKeyAlloc(&.{ metric, "requested" });
+        defer self.alloc.free(key);
+        if (txn.get(key)) |_| return true else |err| return if (err == error.NotFound) false else err;
+    }
+
+    fn propagateTopologyTaskFailure(self: *GraphIndex, cfg: GraphMetricConfig, generation: u64, reason: []const u8) !void {
+        for (self.metric_configs) |candidate| {
+            if (!graphMetricKindUsesIterativeBuild(candidate.kind) or !candidate.edge_filter.equivalent(cfg.edge_filter)) continue;
+            if (cfg.kind == .eigenvector and (candidate.kind == .hits_authority or candidate.kind == .hits_hub)) continue;
+            const status = try self.graphMetricSchedulerStatus(candidate.name, null);
+            if (status.state == .disabled or status.maintenance_paused or status.target_edge_generation != generation) continue;
+            const requested = try self.graphMetricBuildRequested(candidate.name);
+            if (!requested and (candidate.refresh != .background or status.failed_target_generation == generation or status.state == .fresh or status.state == .building)) continue;
+            try self.recordGraphMetricFailureReasonAtGeneration(candidate.name, reason, generation, cfg.name);
+        }
+    }
+
+    fn topologyTaskKeyAlloc(alloc: Allocator, name: []const u8) ![]u8 {
+        _ = try topologyTaskNameIncarnation(name);
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ topology_task_prefix, name[topology_task_name_prefix.len..][0..64] });
+    }
+
+    fn topologyTaskNameIncarnation(name: []const u8) !u64 {
+        if (!std.mem.startsWith(u8, name, topology_task_name_prefix) or name.len != topology_task_name_prefix.len + 85 or name[topology_task_name_prefix.len + 64] != '/') return error.InvalidGraphMetricBuildManifest;
+        const incarnation = std.fmt.parseInt(u64, name[name.len - 20 ..], 10) catch return error.InvalidGraphMetricBuildManifest;
+        if (incarnation == 0) return error.InvalidGraphMetricBuildManifest;
+        return incarnation;
+    }
+
+    fn topologyTaskIncarnation(raw: []const u8) !u64 {
+        if (raw.len < 49 or raw[8] > 3) return error.InvalidGraphMetricBuildManifest;
+        const incarnation = std.mem.readInt(u64, raw[9..17], .little);
+        if (incarnation == 0) return error.InvalidGraphMetricBuildManifest;
+        return incarnation;
+    }
+
+    fn topologyTaskNameAlloc(alloc: Allocator, key: []const u8, raw: []const u8) ![]u8 {
+        if (!std.mem.startsWith(u8, key, topology_task_prefix) or key.len != topology_task_prefix.len + 64) return error.InvalidGraphMetricBuildManifest;
+        return std.fmt.allocPrint(alloc, "{s}{s}/{d:0>20}", .{ topology_task_name_prefix, key[topology_task_prefix.len..], try topologyTaskIncarnation(raw) });
+    }
+
+    fn topologyTaskConfigAlloc(alloc: Allocator, name: []const u8, raw: []const u8) !GraphMetricConfig {
+        if (try topologyTaskIncarnation(raw) != try topologyTaskNameIncarnation(name)) return error.GraphMetricBuildSuperseded;
+        var checksum: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw[0 .. raw.len - 32], &checksum, .{});
+        if (!std.mem.eql(u8, &checksum, raw[raw.len - 32 ..])) return error.InvalidGraphMetricBuildManifest;
+        return .{ .name = name, .kind = if (raw[8] & 1 != 0) .hits_authority else .eigenvector, .refresh = .manual, .max_iterations = 1, .edge_filter = (try decodeGraphMetricEdgeFilterAlloc(alloc, raw[17 .. raw.len - 32])) orelse return error.InvalidGraphMetricBuildManifest };
+    }
+
+    /// Admit a generation/filter preparation independently of numerical jobs.
+    /// All requests share one task per orientation; waiting metrics retain only
+    /// their durable request, not a build lease or a numerical admission slot.
+    pub fn prepareGraphMetricTopology(self: *GraphIndex, cfg: GraphMetricConfig, generation: u64) !bool {
+        return try self.prepareGraphMetricTopologyDetailed(cfg, generation) == .ready;
+    }
+
+    pub const TopologyPreparationAdmission = enum { ready, queued, waiting };
+
+    pub fn prepareGraphMetricTopologyDetailed(self: *GraphIndex, cfg: GraphMetricConfig, generation: u64) !TopologyPreparationAdmission {
+        if (!graphMetricKindUsesIterativeBuild(cfg.kind)) return .ready;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        if (generation != try readU64OrZero(&batch, graph_edge_generation_key)) return error.GraphMetricBuildSnapshotChanged;
+        const filter = try topology_owner.filterDigest(temp, cfg.edge_filter);
+        const identity = topology_owner.identity(filter, try batch.get(graph_metric_partition_plan_key));
+        var reverse = cfg.kind == .hits_authority or cfg.kind == .hits_hub;
+        // Union cold dependencies before choosing the task identity: PageRank
+        // and HITS queued together share one bidirectional preparation.
+        for (self.metric_configs) |candidate| {
+            if (reverse) break;
+            if ((candidate.kind != .hits_authority and candidate.kind != .hits_hub) or !candidate.edge_filter.equivalent(cfg.edge_filter)) continue;
+            const owner_name = try self.graphMetricLifecycleOwnerName(candidate.name);
+            if (try self.metricDisabled(&batch, owner_name) or try self.metricMaintenancePaused(&batch, owner_name)) continue;
+            reverse = candidate.refresh == .background or try self.metricBuildRequestedInTxn(&batch, owner_name);
+        }
+        const ready = try topology_owner.readyKey(temp, identity, reverse);
+        if (batch.get(ready)) |_| {
+            batch.abort();
+            return .ready;
+        } else |err| if (err != error.NotFound) return err;
+        const id = topology_owner.ownerId(identity, "preparation", @intFromBool(reverse));
+        const key = try std.fmt.allocPrint(temp, "{s}{s}", .{ topology_task_prefix, id });
+        if (batch.get(key)) |_| {
+            batch.abort();
+            return .waiting;
+        } else |err| if (err != error.NotFound) return err;
+        const incarnation = std.math.add(u64, try readU64OrZero(&batch, topology_task_incarnation_key), 1) catch return error.GraphMetricBuildBudgetExceeded;
+        try putU64(&batch, topology_task_incarnation_key, incarnation);
+        const raw = try temp.alloc(u8, 49 + graphMetricEdgeFilterEncodedLen(cfg.edge_filter));
+        std.mem.writeInt(u64, raw[0..8], generation, .little);
+        raw[8] = @intFromBool(reverse);
+        std.mem.writeInt(u64, raw[9..17], incarnation, .little);
+        encodeGraphMetricEdgeFilter(cfg.edge_filter, raw[17 .. raw.len - 32]);
+        std.crypto.hash.sha2.Sha256.hash(raw[0 .. raw.len - 32], raw[raw.len - 32 ..][0..32], .{});
+        try batch.put(key, raw);
+        try batch.commit();
+        return .queued;
+    }
+
+    /// One bounded index-scoped task step. The borrowed execution view has its
+    /// own control namespace and no owned backend handles or numerical cache.
+    /// It reuses durable page leases/CAS/recovery without depending on a user
+    /// metric's name, lifetime, parameters, or publication state.
+    pub fn runGraphMetricTopologyPreparationStep(self: *GraphIndex, worker: []const u8) !bool {
+        // One local preparation execution slot. Durable incarnations also
+        // fence retries against delayed workers on separate reopened handles.
+        if (!self.topology_preparation_mutex.tryLock()) return false;
+        defer self.topology_preparation_mutex.unlock();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const task = read: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            var cur = try txn.openCursor();
+            defer cur.close();
+            const entry = try cur.seekAtOrAfter(topology_task_prefix) orelse return false;
+            if (!std.mem.startsWith(u8, entry.key, topology_task_prefix)) return false;
+            if (entry.key.len != topology_task_prefix.len + 64) return error.InvalidGraphMetricBuildManifest;
+            break :read .{ .key = try temp.dupe(u8, entry.key), .raw = try temp.dupe(u8, entry.value), .name = try topologyTaskNameAlloc(temp, entry.key, entry.value) };
+        };
+        const cfg = try topologyTaskConfigAlloc(temp, task.name, task.raw);
+        const generation = std.mem.readInt(u64, task.raw[0..8], .little);
+        var view = self.*;
+        view.metric_configs = &.{cfg};
+        view.sealed_vectors = .{ .capacity = 0 };
+        view.topology_preparation_only = true;
+        var failure_reason: ?[]const u8 = null;
+        const finished = check: {
+            if (task.raw[8] & 2 != 0) break :check true;
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            if (generation != try readU64OrZero(&txn, graph_edge_generation_key)) break :check true;
+            var interested = false;
+            for (self.metric_configs) |candidate| {
+                if (!graphMetricKindUsesIterativeBuild(candidate.kind) or !candidate.edge_filter.equivalent(cfg.edge_filter)) continue;
+                if (cfg.kind == .eigenvector and (candidate.kind == .hits_authority or candidate.kind == .hits_hub)) continue;
+                const status = try self.graphMetricSchedulerStatus(candidate.name, null);
+                if (status.maintenance_paused or status.state == .disabled) continue;
+                if (candidate.refresh == .background or try self.graphMetricBuildRequested(candidate.name)) {
+                    interested = true;
+                    break;
+                }
+            }
+            if (!interested) break :check true;
+            if (try view.metricBuildJob(&txn, task.name)) |job| {
+                if (job.last_error.len != 0 or job.retry_count != 0) {
+                    failure_reason = try temp.dupe(u8, if (job.last_error.len != 0) job.last_error else "GraphMetricTopologyPreparationFailed");
+                    break :check true;
+                }
+            }
+            const filter = try topology_owner.filterDigest(temp, cfg.edge_filter);
+            const identity = topology_owner.identity(filter, try txn.get(graph_metric_partition_plan_key));
+            const ready = try topology_owner.readyKey(temp, identity, cfg.kind == .hits_authority);
+            if (txn.get(ready)) |_| break :check true else |err| if (err != error.NotFound) return err;
+            break :check false;
+        };
+        if (finished) {
+            if (failure_reason) |reason| try self.propagateTopologyTaskFailure(cfg, generation, reason);
+            return self.retireTopologyTaskPage(task.key, task.name, task.raw);
+        }
+        var started = view.ensureGraphMetricPlannedBuildFromCachedPlan(task.name, generation) catch |err| switch (err) {
+            error.GraphMetricBuildSuperseded, error.GraphMetricBuildSnapshotChanged => return false,
+            else => return err,
+        };
+        started.deinit(self.alloc);
+        const coordinator = try view.runGraphMetricPlannedCoordinatorStepForMetric(task.name);
+        if (coordinator.failed_build) return true; // Persisted failure is propagated before retirement on the next step.
+        // Sealing can occur in the coordinator barrier. Never run a numerical
+        // convergence/publication page after this task has exposed its owner.
+        {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            const job = try view.metricBuildJob(&txn, task.name) orelse return true;
+            const binding = try view.topologyBinding(&txn, task.name, job.job_id) orelse return error.InvalidGraphMetricBuildManifest;
+            const owner_key = try topology_owner.catalogKey(temp, binding.id);
+            if ((try topology_owner.Record.decode(try txn.get(owner_key))).state == .sealed) return true;
+        }
+        const step = try view.runGraphMetricPlannedWorkerPageStepForMetric(task.name, worker);
+        return step.claimed_page or step.completed_page or step.failed_build or coordinator.advanced_phase or coordinator.retired_input_records != 0;
+    }
+
+    fn retireTopologyTaskPage(self: *GraphIndex, key: []const u8, name: []const u8, raw: []u8) !bool {
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const current = batch.get(key) catch |err| switch (err) {
+            error.NotFound => {
+                batch.abort();
+                return false;
+            },
+            else => return err,
+        };
+        if (try topologyTaskIncarnation(current) != try topologyTaskNameIncarnation(name)) {
+            batch.abort();
+            return false;
+        }
+        // Mark retirement before removing even the job pointer. A retry uses
+        // a fresh control namespace and cannot be erased by a stale cleanup.
+        raw[8] |= 2;
+        std.crypto.hash.sha2.Sha256.hash(raw[0 .. raw.len - 32], raw[raw.len - 32 ..][0..32], .{});
+        try batch.put(key, raw);
+        const prefix = try self.graphMetricControlKeyAlloc(&.{name});
+        defer self.alloc.free(prefix);
+        var removed = try self.deleteKeysWithPrefixPageInBatch(&batch, prefix, "", graph_metric_build_cleanup_delete_page_units);
+        defer removed.deinit(self.alloc);
+        if (removed.reached_end) try batch.delete(key);
+        try batch.commit();
+        return true;
+    }
+
     fn topologyBindingKey(self: *GraphIndex, metric: []const u8, job_id: u64) ![]u8 {
         const prefix = try self.graphMetricBuildJobNamespacePrefixAlloc(metric, job_id);
         defer self.alloc.free(prefix);
@@ -13793,66 +14202,57 @@ pub const GraphIndex = struct {
     }
 
     pub fn cleanupGraphMetricTopologyPageDetailed(self: *GraphIndex) !TopologyCleanupResult {
-        // Most graph indexes have no iterative topology. Do not acquire their
-        // writer lock merely because they participate in the worker sweep.
-        {
-            var txn = try self.beginReadReverseTxn();
-            defer txn.abort();
-            if (!try self.hasKeysWithPrefixInBatch(&txn, topology_owner.catalog_prefix)) return .{};
-        }
-        var batch = try self.beginWriteReverseBatch();
-        errdefer batch.abort();
+        if (!self.topology_gc_mutex.tryLock()) return .{};
+        defer self.topology_gc_mutex.unlock();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const temp = arena.allocator();
-        const resume_key = batch.get(topology_owner.gc_cursor_key) catch |err| switch (err) {
-            error.NotFound => "",
+        const key = inspect: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            const resume_key = if (self.topology_gc_cursor) |id| try topology_owner.catalogKey(temp, id) else topology_owner.catalog_prefix;
+            var cur = try txn.openCursor();
+            var cursor_open = true;
+            defer if (cursor_open) cur.close();
+            var entry = try cur.seekAtOrAfter(resume_key);
+            if (self.topology_gc_cursor != null) if (entry) |e| if (std.mem.eql(u8, e.key, resume_key)) {
+                entry = try cur.next();
+            };
+            if (entry == null or !std.mem.startsWith(u8, entry.?.key, topology_owner.catalog_prefix)) {
+                self.topology_gc_cursor = null;
+                return .{};
+            }
+            const selected = try temp.dupe(u8, entry.?.key);
+            if (selected.len != topology_owner.catalog_prefix.len + 64) return error.InvalidGraphMetricBuildManifest;
+            const id: topology_owner.Id = selected[topology_owner.catalog_prefix.len..][0..64].*;
+            const owner = try topology_owner.Record.decode(entry.?.value);
+            cur.close();
+            cursor_open = false;
+            if (try self.topologyOwnerRetained(&txn, temp, owner, id) and
+                !try self.hasKeysWithPrefixInBatch(&txn, try topology_owner.pinsPrefix(temp, id)) and
+                !try self.hasKeysWithPrefixInBatch(&txn, try std.fmt.allocPrint(temp, "{s}retired/", .{try topology_owner.dataPrefix(temp, id)})))
+            {
+                self.topology_gc_cursor = id;
+                return .{};
+            }
+            break :inspect selected;
+        };
+        // Revalidate all liveness under the writer transaction. A job may pin
+        // this owner between the read-only census and acquisition of the lock.
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const id: topology_owner.Id = key[topology_owner.catalog_prefix.len..][0..64].*;
+        const owner_raw = batch.get(key) catch |err| switch (err) {
+            error.NotFound => {
+                batch.abort();
+                self.topology_gc_cursor = id;
+                return .{};
+            },
             else => return err,
         };
-        var cur = try batch.openCursor();
-        var cur_open = true;
-        defer if (cur_open) cur.close();
-        var entry = try cur.seekAtOrAfter(if (resume_key.len == 0) topology_owner.catalog_prefix else resume_key);
-        if (entry) |e| if (std.mem.eql(u8, e.key, resume_key)) {
-            entry = try cur.next();
-        };
-        if (entry == null or !std.mem.startsWith(u8, entry.?.key, topology_owner.catalog_prefix)) {
-            cur.close();
-            cur_open = false;
-            if (resume_key.len != 0) try batch.delete(topology_owner.gc_cursor_key);
-            try batch.commit();
-            return .{};
-        }
-        const key = try temp.dupe(u8, entry.?.key);
-        if (key.len != topology_owner.catalog_prefix.len + 64) return error.InvalidGraphMetricBuildManifest;
-        const id: topology_owner.Id = key[topology_owner.catalog_prefix.len..][0..64].*;
-        var owner = try topology_owner.Record.decode(entry.?.value);
-        cur.close();
-        cur_open = false;
+        var owner = try topology_owner.Record.decode(owner_raw);
         if (owner.state != .deleting) {
-            var retained = false;
-            const current_plan = batch.get(graph_metric_partition_plan_key) catch |err| switch (err) {
-                error.NotFound => "",
-                else => return err,
-            };
-            const current_identity = topology_owner.identity(owner.filter, current_plan);
-            if (owner.state == .sealed and owner.format_epoch == topology_owner.epoch and
-                owner.generation == try readU64OrZero(&batch, graph_edge_generation_key) and std.mem.eql(u8, &current_identity, &owner.identity))
-            {
-                for (self.metric_configs) |cfg| {
-                    if (!graphMetricKindUsesIterativeBuild(cfg.kind)) continue;
-                    const filter = try topology_owner.filterDigest(temp, cfg.edge_filter);
-                    if (!std.mem.eql(u8, &filter, &owner.filter)) continue;
-                    const reverse = cfg.kind == .hits_authority or cfg.kind == .hits_hub;
-                    const ready = try topology_owner.readyKey(temp, owner.identity, reverse);
-                    if (batch.get(ready)) |raw| {
-                        if (std.mem.eql(u8, raw, &id)) {
-                            retained = true;
-                            break;
-                        }
-                    } else |err| if (err != error.NotFound) return err;
-                }
-            }
+            const retained = try self.topologyOwnerRetained(&batch, temp, owner, id);
             const pins = try topology_owner.pinsPrefix(temp, id);
             var pin_cur = try batch.openCursor();
             var pin_cur_open = true;
@@ -13869,7 +14269,19 @@ pub const GraphIndex = struct {
                 const fingerprint = std.mem.readInt(u64, pin.value[8..16], .little);
                 const metric = try temp.dupe(u8, pin.value[16..]);
                 var active = false;
-                if (self.metricConfig(metric)) |cfg| if (graphMetricConfigFingerprint(cfg) == fingerprint) {
+                const pin_config = self.metricConfig(metric) orelse prep: {
+                    if (!std.mem.startsWith(u8, metric, topology_task_name_prefix)) break :prep null;
+                    const task_key = try topologyTaskKeyAlloc(temp, metric);
+                    const task_raw = batch.get(task_key) catch |err| switch (err) {
+                        error.NotFound => break :prep null,
+                        else => return err,
+                    };
+                    break :prep topologyTaskConfigAlloc(temp, metric, task_raw) catch |err| switch (err) {
+                        error.GraphMetricBuildSuperseded => null,
+                        else => return err,
+                    };
+                };
+                if (pin_config) |cfg| if (graphMetricConfigFingerprint(cfg) == fingerprint) {
                     if (try self.metricBuildJob(&batch, metric)) |job| {
                         active = owner.format_epoch == topology_owner.epoch and job.job_id == job_id and job.target_generation == owner.generation and
                             job.phase != .complete and job.last_error.len == 0 and job.phase != .cleanup_old_generations;
@@ -13891,8 +14303,8 @@ pub const GraphIndex = struct {
             for (stale.items) |stale_key| try batch.delete(stale_key);
             if (live or retained) {
                 const pruned = try self.cleanupTopologyAttemptInBatch(&batch, temp, id);
-                try batch.put(topology_owner.gc_cursor_key, key);
-                try batch.commit();
+                if (stale.items.len + pruned != 0) try batch.commit() else batch.abort();
+                self.topology_gc_cursor = id;
                 // Cursor-only census progress is not eligible work: reporting
                 // it keeps multi-worker idle loops alive indefinitely as they
                 // wrap the catalog. Periodic sweeps continue the census even
@@ -13920,10 +14332,30 @@ pub const GraphIndex = struct {
         // cannot reappear, and no job can bind to or write a deleting owner.
         if (deleted.reached_end) {
             try batch.delete(key);
-            try batch.put(topology_owner.gc_cursor_key, key);
         }
         try batch.commit();
+        if (deleted.reached_end) self.topology_gc_cursor = id;
         return .{ .progressed = true, .removed = deleted.removed + @intFromBool(deleted.reached_end) };
+    }
+
+    fn topologyOwnerRetained(self: *GraphIndex, txn: anytype, temp: Allocator, owner: topology_owner.Record, id: topology_owner.Id) !bool {
+        if (owner.state != .sealed or owner.format_epoch != topology_owner.epoch or owner.generation != try readU64OrZero(txn, graph_edge_generation_key)) return false;
+        const plan = txn.get(graph_metric_partition_plan_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, &topology_owner.identity(owner.filter, plan), &owner.identity)) return false;
+        for (self.metric_configs) |cfg| {
+            if (!graphMetricKindUsesIterativeBuild(cfg.kind)) continue;
+            const filter = try topology_owner.filterDigest(temp, cfg.edge_filter);
+            if (!std.mem.eql(u8, &filter, &owner.filter)) continue;
+            const reverse = cfg.kind == .hits_authority or cfg.kind == .hits_hub;
+            const ready = try topology_owner.readyKey(temp, owner.identity, reverse);
+            if (txn.get(ready)) |value| {
+                if (std.mem.eql(u8, value, &id)) return true;
+            } else |err| if (err != error.NotFound) return err;
+        }
+        return false;
     }
 
     fn cleanupTopologyAttemptInBatch(self: *GraphIndex, batch: anytype, temp: Allocator, id: topology_owner.Id) !usize {
@@ -14368,6 +14800,7 @@ pub const GraphIndex = struct {
             try self.graphMetricMaintenancePausedKeyAlloc(metric_name),
             try self.graphMetricBuildLeaseKeyAlloc(metric_name),
             try self.graphMetricBuildJobKeyAlloc(metric_name),
+            try self.graphMetricControlKeyAlloc(&.{ metric_name, "requested" }),
             // Full materialization cleanup subsumes generation retirement.
             // Dropping these control records makes operator deletion immune to
             // a saturated two-slot retirement queue.
@@ -16284,9 +16717,10 @@ pub const GraphIndex = struct {
             "";
         errdefer if (last_error.len > 0) result_alloc.free(last_error);
         const state: GraphMetricState = if (active_build_lease) .building else base_state;
+        const explicitly_queued = try self.metricBuildRequestedInTxn(txn, lifecycle_name);
         const queued_generation: u64 = if (active_build_lease)
             if (target_edge_generation > building_generation) target_edge_generation else 0
-        else switch (base_state) {
+        else if (explicitly_queued) target_edge_generation else switch (base_state) {
             .not_ready, .stale, .failed => target_edge_generation,
             else => 0,
         };
@@ -16300,7 +16734,7 @@ pub const GraphIndex = struct {
             .metadata_version = meta.schema_version,
             .config_fingerprint = stored_config_fingerprint,
             .maintenance_paused = maintenance_paused,
-            .build_queued = queued_generation != 0,
+            .build_queued = explicitly_queued or queued_generation != 0,
             .published_generation = published_generation,
             .published_edge_generation = published_edge_generation,
             .edge_generation = self.edge_generation,
@@ -16778,6 +17212,12 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
 // Tests
 // ============================================================================
 
+fn openTestGraphIndex(alloc: Allocator, store: anytype, path: [*:0]const u8, name: []const u8, opts: GraphIndexOptions) !GraphIndex {
+    var index = try GraphIndex.open(alloc, store, path, name, opts);
+    index.test_partition_target_units = graph_metric_build_target_scan_page_units;
+    return index;
+}
+
 fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
     const ns = platform_time.monotonicNs();
     const slice = std.fmt.bufPrint(buf, "/tmp/antfly-graph-{s}-{d}\x00", .{ label, ns }) catch unreachable;
@@ -16804,7 +17244,7 @@ test "graph addEdge and getEdges out" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
 
     try graph.addEdge("doc1", "doc2", "cites", 0.9, 1000, 1001, "{}");
@@ -16836,7 +17276,7 @@ test "graph pagerank metric publishes top-k scores and status" {
         .tolerance = 0.0000001,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -16894,7 +17334,7 @@ test "graph metric dirty marker survives reopen and rebuilds later generation" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     {
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -16927,7 +17367,7 @@ test "graph metric dirty marker survives reopen and rebuilds later generation" {
 
     store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     var reopened_stale = try graph.graphMetricStatus("pagerank");
@@ -16971,7 +17411,7 @@ test "graph metric status marks algorithm config drift stale" {
         .max_iterations = 40,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -17046,7 +17486,7 @@ test "graph metric failed rebuild preserves published generation and records eve
         .kind = .pagerank,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -17117,7 +17557,7 @@ test "graph metric rebuild at unchanged edge generation publishes an isolated sc
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
     const metrics = [_]GraphMetricConfig{.{ .name = "degree", .kind = .degree, .refresh = .manual }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-a", "doc-c", "cites", 1.0, 0, 0, "");
@@ -17173,7 +17613,7 @@ test "graph metric failed rebuild preserves published generation across reopen" 
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     {
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -17207,7 +17647,7 @@ test "graph metric failed rebuild preserves published generation across reopen" 
     metrics[0].damping = 0.85;
     store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     var failed = try graph.graphMetricStatus("pagerank");
@@ -17267,7 +17707,7 @@ test "graph metric status exposes queued and active local build lease" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -17462,7 +17902,7 @@ test "graph metric build lease survives reopen and expired lease can be reclaime
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     const target_generation = graph.edge_generation;
@@ -17470,7 +17910,7 @@ test "graph metric build lease survives reopen and expired lease can be reclaime
     try graph.updateGraphMetricBuildLeaseProgressWithCursor("degree", .computing, 5, "edge-page:0013", 13, 20);
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     var active = try graph.graphMetricStatus("degree");
     try std.testing.expectEqual(GraphIndex.GraphMetricState.building, active.state);
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.computing, active.phase);
@@ -17521,7 +17961,7 @@ test "graph metric build lease survives reopen and expired lease can be reclaime
     try expired_batch.commit();
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     var expired = try graph.graphMetricStatus("degree");
     try std.testing.expectEqual(GraphIndex.GraphMetricState.not_ready, expired.state);
@@ -17593,7 +18033,7 @@ test "graph metric build manifest is durable and idempotent across reopen" {
         .kind = .pagerank,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-b", "doc-c", "cites", 1.0, 0, 0, "");
@@ -17628,7 +18068,7 @@ test "graph metric build manifest is durable and idempotent across reopen" {
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     {
         var txn = try graph.beginReadReverseTxn();
@@ -17717,7 +18157,7 @@ test "graph metric build pagerank manifest partitions iterative phase pages" {
         .kind = .pagerank,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -17809,7 +18249,7 @@ test "graph metric floating page aggregates are deterministic across adoption or
     defer cleanupTmp(rev_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
 
     const packed_entries = try graph.encodePackedF64EntriesAlloc(&.{
@@ -17901,7 +18341,7 @@ test "graph metric column snapshots preserve order across chunks and reject stal
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
     const metrics = [_]GraphMetricConfig{.{ .name = "degree", .kind = .degree, .refresh = .manual }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     const small_nodes = [_][]const u8{ "doc-b", "doc-a", "doc-b" };
@@ -17983,7 +18423,7 @@ test "graph metric partition census bounds steps resumes after reopen and fences
     defer store.close();
     const configs = [_]GraphMetricConfig{.{ .name = "rank" }};
     {
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
         defer graph.close();
         try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
         try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
@@ -17995,7 +18435,7 @@ test "graph metric partition census bounds steps resumes after reopen and fences
         defer census.deinit(alloc);
         try std.testing.expectEqual(@as(u64, 2), census.edges_seen);
     }
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
     defer graph.close();
     try std.testing.expect(!try graph.prepareGraphMetricPartitionStep(2));
     try graph.addEdge("d", "a", "cites", 1, 0, 0, "");
@@ -18060,7 +18500,7 @@ test "graph metric large-build summary pages resume and gate dependent partition
         .refresh = .manual,
         .max_iterations = 1,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
     defer graph.close();
 
     try graph.addEdge("doc-0000", "doc-0001", "cites", 1.0, 0, 0, "");
@@ -18162,7 +18602,7 @@ test "graph metric ordinal shuffle selects winning attempts across changed check
     defer cleanupTmp(rev_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .reverse_lsm_options = .{ .flush_threshold = 8192 } });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .reverse_lsm_options = .{ .flush_threshold = 8192 } });
     defer graph.close();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -18216,7 +18656,7 @@ test "graph metric ordinal iterations reuse immutable adjacency without numeric 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
     const cfg = GraphMetricConfig{ .name = "rank", .kind = .pagerank, .refresh = .manual, .max_iterations = 3, .tolerance = 1e-20 };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &.{cfg} });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &.{cfg} });
     defer graph.close();
     try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
     try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
@@ -18347,7 +18787,7 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
     const options = GraphIndexOptions{ .metric_configs = &.{cfg}, .reverse_lsm_options = .{ .flush_threshold = 8192 } };
     const nodes = [_][]const u8{ "a", "z" };
     {
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", options);
         defer graph.close();
         {
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -18387,7 +18827,7 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
         try std.testing.expectEqual(@as(usize, 12), try graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
         try std.testing.expectEqual(@as(usize, 2), try graph.executeOrdinalReduceSummary("rank", cfg, job, page, 256, 2));
     }
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", options);
     defer graph.close();
     // A checkpoint also pins its node group when the requested limit changes.
     try std.testing.expectEqual(@as(usize, 2), try graph.executeOrdinalReduceSummary("rank", cfg, job, page, 1, 2));
@@ -18420,6 +18860,248 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
     try std.testing.expectEqualSlices(f64, &.{ 10 * 256, 15 * 256 }, raw);
 }
 
+test "graph metric shared topology preparation is independent durable and numerical-free" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-independent-preparation");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-independent-preparation");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{
+        .{ .name = "rank", .kind = .pagerank, .refresh = .manual, .max_iterations = 2 },
+        .{ .name = "eigen", .kind = .eigenvector, .refresh = .manual, .max_iterations = 2 },
+        .{ .name = "authority", .kind = .hits_authority, .refresh = .manual, .max_iterations = 2 },
+    };
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    // Production scheduling spans amortize control commits; test-only tiny
+    // spans elsewhere continue to exercise multiple boundaries cheaply.
+    try std.testing.expectEqual(@as(usize, 4), graph.graphMetricDegreeScanPageCount(16384));
+    try std.testing.expectEqual(@as(usize, 1), graph.graphMetricDegreeReducePageCount(1024));
+    try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
+    try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
+    try graph.addEdge("c", "a", "cites", 1, 0, 0, "");
+    for (configs) |cfg| {
+        var queued = try graph.queueGraphMetricBuild(cfg.name, graph.edge_generation);
+        defer queued.deinit(alloc);
+        try std.testing.expectEqual(graph.edge_generation, queued.queued_generation);
+        try std.testing.expectEqual(@as(u64, 0), queued.build_job_id);
+    }
+    while (!try graph.prepareGraphMetricPartitionStep(4096)) {}
+    // A reverse-capable task satisfies all three numerical kinds.
+    try std.testing.expectEqual(GraphIndex.TopologyPreparationAdmission.queued, try graph.prepareGraphMetricTopologyDetailed(configs[0], graph.edge_generation));
+    try std.testing.expectEqual(GraphIndex.TopologyPreparationAdmission.waiting, try graph.prepareGraphMetricTopologyDetailed(configs[1], graph.edge_generation));
+    try std.testing.expectEqual(GraphIndex.TopologyPreparationAdmission.waiting, try graph.prepareGraphMetricTopologyDetailed(configs[2], graph.edge_generation));
+    var ready = false;
+    for (0..256) |i| {
+        // A partial page stays leased to its owner; another worker may have
+        // no eligible page until the first worker resumes its checkpoint.
+        _ = try graph.runGraphMetricTopologyPreparationStep(if (i % 2 == 0) "first" else "second");
+        if (i == 7) {
+            graph.close();
+            graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+        }
+        _ = try graph.cleanupGraphMetricTopologyPage();
+        {
+            var txn = try graph.beginReadReverseTxn();
+            defer txn.abort();
+            for (configs) |cfg| {
+                try std.testing.expect(try graph.metricBuildLease(&txn, cfg.name) == null);
+                try std.testing.expect(try graph.metricBuildJob(&txn, cfg.name) == null);
+                try std.testing.expectEqual(@as(u64, 0), try graph.metricPublishedGeneration(&txn, cfg.name));
+            }
+            var cur = try txn.openCursor();
+            defer cur.close();
+            var entry = try cur.seekAtOrAfter(topology_task_prefix);
+            while (entry) |record| : (entry = try cur.next()) {
+                if (!std.mem.startsWith(u8, record.key, topology_task_prefix)) break;
+                const name = try GraphIndex.topologyTaskNameAlloc(alloc, record.key, record.value);
+                defer alloc.free(name);
+                if (try graph.metricBuildJob(&txn, name)) |job| {
+                    var job_buf: [20]u8 = undefined;
+                    const vectors = try graph.graphMetricControlKeyAlloc(&.{ name, "job", try std.fmt.bufPrint(&job_buf, "{d}", .{job.job_id}), "vector" });
+                    defer alloc.free(vectors);
+                    try std.testing.expect(!try graph.hasKeysWithPrefixInBatch(&txn, vectors));
+                }
+                try std.testing.expectEqual(@as(u64, 0), try graph.metricPublishedGeneration(&txn, name));
+            }
+        }
+        if (try graph.prepareGraphMetricTopology(configs[2], graph.edge_generation)) {
+            ready = true;
+            break;
+        }
+    }
+    if (!ready) return error.TopologyPreparationDidNotSeal;
+    for (0..32) |_| if (!try graph.runGraphMetricTopologyPreparationStep("cleanup")) break;
+    for (configs) |cfg| {
+        try std.testing.expect(try graph.prepareGraphMetricTopology(cfg, graph.edge_generation));
+        var started = try graph.ensureGraphMetricPlannedBuildFromCachedPlan(cfg.name, graph.edge_generation);
+        started.deinit(alloc);
+        var duplicate = try graph.queueGraphMetricBuild(cfg.name, graph.edge_generation);
+        duplicate.deinit(alloc);
+        if (try graph.graphMetricBuildRequested(cfg.name)) return error.TopologyDependentRequestNotConsumed;
+        {
+            var txn = try graph.beginReadReverseTxn();
+            defer txn.abort();
+            const job = (try graph.metricBuildJob(&txn, cfg.name)).?;
+            try std.testing.expect((try graph.topologyBinding(&txn, cfg.name, job.job_id)).?.adopted);
+            try std.testing.expect(!try graph.hasKeysWithPrefixInBatch(&txn, topology_task_prefix));
+            try std.testing.expect(!try graph.hasKeysWithPrefixInBatch(&txn, topology_task_control_prefix));
+        }
+        var result = try graph.runGraphMetricPlannedActive(cfg.name, cfg);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, result.state);
+        const expected: f64 = if (cfg.kind == .pagerank) 1.0 / 3.0 else 1.0 / @sqrt(@as(f64, 3));
+        for ([_][]const u8{ "a", "b", "c" }) |node| try std.testing.expectApproxEqAbs(expected, (try graph.graphMetricScore(cfg.name, node)).?, 1e-12);
+    }
+    for (0..16) |_| _ = try graph.cleanupGraphMetricTopologyPage();
+    const backend = graph.reverse_owner.lsm.backend;
+    const before = backend.snapshotWriteStats();
+    for (0..128) |_| try std.testing.expect(!try graph.cleanupGraphMetricTopologyPage());
+    const after = backend.snapshotWriteStats();
+    try std.testing.expectEqual(before.wal_append_records, after.wal_append_records);
+    try std.testing.expectEqual(before.wal_append_bytes, after.wal_append_bytes);
+}
+
+test "graph metric shared topology preparation failure retires durably and preserves dependent root cause" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-preparation-failure");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-preparation-failure");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{
+        .{ .name = "rank", .kind = .pagerank, .refresh = .background },
+        .{ .name = "eigen", .kind = .eigenvector, .refresh = .manual },
+        .{ .name = "degree", .kind = .degree, .refresh = .background },
+    };
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    try graph.addEdge("source", "sink", "cites", 1, 0, 0, "");
+    var queued = try graph.queueGraphMetricBuild("eigen", graph.edge_generation);
+    queued.deinit(alloc);
+    while (!try graph.prepareGraphMetricPartitionStep(4096)) {}
+    try std.testing.expect(!try graph.prepareGraphMetricTopology(configs[0], graph.edge_generation));
+    try std.testing.expect(try graph.runGraphMetricTopologyPreparationStep("worker"));
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        var cur = try batch.openCursor();
+        const entry = (try cur.seekAtOrAfter(topology_task_prefix)).?;
+        const name = try GraphIndex.topologyTaskNameAlloc(temp, entry.key, entry.value);
+        cur.close();
+        var job = (try graph.metricBuildJob(&batch, name)).?;
+        job.last_error = "InjectedTopologyStorageFailure";
+        job.retry_count = 1;
+        try graph.putGraphMetricBuildJobInBatch(&batch, name, job);
+        // Force several retirement pages, including recovery after the job
+        // pointer itself has already been deleted.
+        for (0..1100) |i| {
+            const suffix = try std.fmt.allocPrint(temp, "retirement-{d:0>5}", .{i});
+            const key = try GraphIndex.graphMetricControlKeyWithAllocator(temp, &.{ name, suffix });
+            try batch.put(key, "x");
+        }
+        try batch.commit();
+    }
+    try std.testing.expect(try graph.runGraphMetricTopologyPreparationStep("retire"));
+    graph.close();
+    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    for (0..8) |_| if (!try graph.runGraphMetricTopologyPreparationStep("reopened")) break;
+    for (configs[0..2]) |cfg| {
+        var status = try graph.graphMetricStatus(cfg.name);
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, status.state);
+        try std.testing.expectEqualStrings("InjectedTopologyStorageFailure", status.last_error);
+        try std.testing.expect(!try graph.graphMetricBuildRequested(cfg.name));
+    }
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.not_ready, (try graph.graphMetricSchedulerStatus("degree", null)).state);
+    var txn = try graph.beginReadReverseTxn();
+    defer txn.abort();
+    try std.testing.expect(!try graph.hasKeysWithPrefixInBatch(&txn, topology_task_prefix));
+    try std.testing.expect(!try graph.hasKeysWithPrefixInBatch(&txn, topology_task_control_prefix));
+}
+
+test "graph metric shared topology retry incarnation fences delayed failure cleanup and admission" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-preparation-incarnation");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-preparation-incarnation");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{.{ .name = "rank", .kind = .pagerank, .refresh = .manual }};
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    try graph.addEdge("source", "sink", "cites", 1, 0, 0, "");
+    var queued = try graph.queueGraphMetricBuild("rank", graph.edge_generation);
+    queued.deinit(alloc);
+    while (!try graph.prepareGraphMetricPartitionStep(4096)) {}
+    try std.testing.expect(!try graph.prepareGraphMetricTopology(configs[0], graph.edge_generation));
+    const old = read: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
+        const entry = (try cur.seekAtOrAfter(topology_task_prefix)).?;
+        break :read .{ .key = try temp.dupe(u8, entry.key), .raw = try temp.dupe(u8, entry.value), .name = try GraphIndex.topologyTaskNameAlloc(temp, entry.key, entry.value) };
+    };
+    const old_cfg = try GraphIndex.topologyTaskConfigAlloc(temp, old.name, old.raw);
+    try graph.propagateTopologyTaskFailure(old_cfg, graph.edge_generation, "FirstFailure");
+    try std.testing.expect(!try graph.graphMetricBuildRequested("rank"));
+    var retry = try graph.queueGraphMetricBuild("rank", graph.edge_generation);
+    retry.deinit(alloc);
+    // A retry can arrive before the prior task has finished retirement.
+    try graph.propagateTopologyTaskFailure(old_cfg, graph.edge_generation, "DelayedDuplicateFailure");
+    try std.testing.expect(try graph.graphMetricBuildRequested("rank"));
+    while (try graph.retireTopologyTaskPage(old.key, old.name, old.raw)) {}
+    graph.close();
+    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    try std.testing.expectEqual(GraphIndex.TopologyPreparationAdmission.queued, try graph.prepareGraphMetricTopologyDetailed(configs[0], graph.edge_generation));
+    try graph.propagateTopologyTaskFailure(old_cfg, graph.edge_generation, "DelayedOldIncarnationFailure");
+    try std.testing.expect(!try graph.retireTopologyTaskPage(old.key, old.name, old.raw));
+    try std.testing.expect(try graph.graphMetricBuildRequested("rank"));
+    var old_view = graph;
+    old_view.metric_configs = &.{old_cfg};
+    old_view.topology_preparation_only = true;
+    old_view.sealed_vectors = .{ .capacity = 0 };
+    try std.testing.expectError(error.GraphMetricBuildSuperseded, old_view.ensureGraphMetricPlannedBuildFromCachedPlan(old.name, graph.edge_generation));
+    try std.testing.expect(try graph.runGraphMetricTopologyPreparationStep("replacement"));
+    var txn = try graph.beginReadReverseTxn();
+    defer txn.abort();
+    const current = try txn.get(old.key);
+    const current_name = try GraphIndex.topologyTaskNameAlloc(temp, old.key, current);
+    try std.testing.expect(try GraphIndex.topologyTaskIncarnation(current) > try GraphIndex.topologyTaskIncarnation(old.raw));
+    try std.testing.expect(!std.mem.eql(u8, old.name, current_name));
+    try std.testing.expect(try graph.metricBuildJob(&txn, current_name) != null);
+    try std.testing.expect(try graph.metricBuildJob(&txn, old.name) == null);
+    var status = try graph.graphMetricStatus("rank");
+    defer status.deinit(alloc);
+    try std.testing.expectEqualStrings("FirstFailure", status.last_error);
+    // An abandoned manual numerical job must accept a new durable request;
+    // its stale job pointer alone is not proof of an active lease.
+    var started = try graph.ensureGraphMetricPlannedBuildFromCachedPlan("rank", graph.edge_generation);
+    started.deinit(alloc);
+    try std.testing.expect(!try graph.graphMetricBuildRequested("rank"));
+    try graph.releaseGraphMetricBuildLease("rank");
+    var resumed = try graph.queueGraphMetricBuild("rank", graph.edge_generation);
+    resumed.deinit(alloc);
+    try std.testing.expect(try graph.graphMetricBuildRequested("rank"));
+}
+
 test "graph metric shared topology survives producer cleanup and reopen across numerical kinds" {
     const alloc = std.testing.allocator;
     var store_buf: [256]u8 = undefined;
@@ -18435,7 +19117,7 @@ test "graph metric shared topology survives producer cleanup and reopen across n
         .{ .name = "rank", .kind = .pagerank, .refresh = .manual, .max_iterations = 2 },
         .{ .name = "eigen", .kind = .eigenvector, .refresh = .manual, .max_iterations = 2 },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
     defer graph.close();
     try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
     try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
@@ -18453,7 +19135,7 @@ test "graph metric shared topology survives producer cleanup and reopen across n
     var published = try graph.runGraphMetricPlannedActive("authority", configs[0]);
     published.deinit(alloc);
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
     for (configs[1..]) |cfg| {
         var building = try graph.ensureGraphMetricPlannedBuild(cfg.name, graph.edge_generation);
         building.deinit(alloc);
@@ -18505,7 +19187,7 @@ test "graph metric shared topology isolates concurrent producers and fences boun
         .{ .name = "second", .kind = .pagerank, .refresh = .manual, .max_iterations = 1, .damping = 0.5 },
         .{ .name = "consumer", .kind = .eigenvector, .refresh = .manual, .max_iterations = 1 },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
     defer graph.close();
     try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
     var owners: [2]topology_owner.Id = undefined;
@@ -18555,9 +19237,9 @@ test "graph metric shared topology isolates concurrent producers and fences boun
             defer alloc.free(key);
             try batch.put(key, "x");
         }
-        batch.delete(topology_owner.gc_cursor_key) catch |err| if (err != error.NotFound) return err;
         try batch.commit();
     }
+    graph.topology_gc_cursor = null;
     try std.testing.expect(try graph.cleanupGraphMetricTopologyPage());
     {
         var txn = try graph.beginReadReverseTxn();
@@ -18568,7 +19250,7 @@ test "graph metric shared topology isolates concurrent producers and fences boun
         try std.testing.expectError(error.GraphMetricBuildSuperseded, graph.topologyBinding(&txn, "consumer", consumer.job_id));
     }
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
     for (0..32) |_| _ = try graph.cleanupGraphMetricTopologyPage();
     var txn = try graph.beginReadReverseTxn();
     defer txn.abort();
@@ -18591,7 +19273,7 @@ test "graph metric shared topology canonicalizes filters and retires removed fil
         .{ .name = "alias", .kind = .pagerank, .refresh = .manual, .max_iterations = 2, .damping = 0.5, .edge_filter = .{ .mode = .types, .types = &.{ "cites", "mentions" } } },
         .{ .name = "changed", .kind = .pagerank, .refresh = .manual, .max_iterations = 1, .edge_filter = .{ .mode = .types, .types = &.{"cites"} } },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
     defer graph.close();
     try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
     try graph.addEdge("b", "a", "mentions", 1, 0, 0, "");
@@ -18650,7 +19332,7 @@ test "graph metric membership initializes all vector lanes without producer redi
         // public entry kinds exercise initialization as lifecycle owners.
         .{ .name = "hub", .kind = .hits_hub, .refresh = .manual, .max_iterations = 2 },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
     defer graph.close();
     try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
     try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
@@ -18724,7 +19406,7 @@ test "graph metric membership resumes across sealed blocks and rejects corrupt r
     defer cleanupTmp(rev_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -18902,7 +19584,7 @@ test "graph metric ordinal publication checkpoints ordered runs and resumes befo
     var scores: [600]GraphIndex.GraphMetricScore = undefined;
     for (&scores, 0..) |*score, i| score.* = .{ .node = try std.fmt.allocPrint(temp, "node-{d:0>4}", .{i}), .score = @floatFromInt(i % 17) };
     {
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", options);
         defer graph.close();
         var batch = try graph.beginWriteReverseBatch();
         errdefer batch.abort();
@@ -18927,7 +19609,7 @@ test "graph metric ordinal publication checkpoints ordered runs and resumes befo
         try std.testing.expectError(error.GraphMetricBuildPublishNotReady, graph.verifyGraphMetricRankReady(&read, cfg.name, job, cfg.name, scores.len));
     }
     {
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", options);
         defer graph.close();
         try std.testing.expect(!try graph.checkpointGraphMetricRankPrefix(cfg.name, cfg, job, cfg.name, scores.len));
         try std.testing.expect(try graph.checkpointGraphMetricRankPrefix(cfg.name, cfg, job, cfg.name, scores.len));
@@ -18974,7 +19656,7 @@ test "graph metric ordinal packing densifies fragmented output and fences incomp
     defer arena.deinit();
     const temp = arena.allocator();
     {
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", options);
         defer graph.close();
         {
             var batch = try graph.beginWriteReverseBatch();
@@ -19009,7 +19691,7 @@ test "graph metric ordinal packing densifies fragmented output and fences incomp
         }
         try std.testing.expectEqual(@as(usize, 512), try graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
     }
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", options);
     defer graph.close();
     const base = blk: {
         var txn = try graph.beginReadReverseTxn();
@@ -19094,7 +19776,7 @@ test "graph metric consumer barrier retires bounded input pages and resumes afte
     var first_cursor: []u8 = "";
     defer if (first_cursor.len != 0) alloc.free(first_cursor);
     {
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", options);
         defer graph.close();
         try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
         var building = try graph.ensureGraphMetricPlannedBuild("rank", graph.edge_generation);
@@ -19146,7 +19828,7 @@ test "graph metric consumer barrier retires bounded input pages and resumes afte
         first_cursor = try alloc.dupe(u8, try txn.get(retirement_key));
         try std.testing.expect(std.mem.startsWith(u8, first_cursor, prefix));
     }
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", options);
     defer graph.close();
     const resumed = try graph.runGraphMetricPlannedWorkerStep("rank", configs[0], "replacement");
     try std.testing.expect(!resumed.advanced_phase and !resumed.claimed_page);
@@ -19178,7 +19860,7 @@ test "graph metric vector chunks checkpoint across blocks preserve caller order 
     defer cleanupTmp(rev_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .reverse_lsm_options = .{ .flush_threshold = 8192 } });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .reverse_lsm_options = .{ .flush_threshold = 8192 } });
     defer graph.close();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -19246,7 +19928,7 @@ test "graph metric vector chunks publish pagerank eigenvector and hits with spar
         .{ .name = "hub", .kind = .hits_hub, .refresh = .manual, .max_iterations = 3 },
         .{ .name = "degree", .kind = .degree, .refresh = .manual },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
     defer graph.close();
     const nodes = [_][]const u8{ "doc-0000", "doc-0001", "doc-4096" };
     try graph.addEdge(nodes[0], nodes[1], "cites", 1, 0, 0, "");
@@ -19300,7 +19982,7 @@ test "graph metric vector chunks publish pagerank eigenvector and hits with spar
         }
         try std.testing.expect(reached_iteration);
         graph.close();
-        graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
+        graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
     }
     for (configs, 0..) |cfg, index| {
         // A compatible HITS pair shares the owner's one build.
@@ -19345,7 +20027,7 @@ test "graph degree large-build summary counts filtered materialization without c
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-0000", "doc-0001", "cites", 1.0, 0, 0, "");
@@ -19411,7 +20093,7 @@ test "graph pagerank planned scan page writes durable out-degree intermediates" 
         .refresh = .manual,
         .edge_filter = .{ .mode = .types, .types = &edge_types },
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -19591,7 +20273,7 @@ test "graph pagerank reclaimed scan page overwrites stale partial output" {
         .refresh = .manual,
         .max_iterations = 1,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -19707,7 +20389,7 @@ test "graph pagerank scan adoption maintains one idempotent out-degree total" {
         .refresh = .manual,
         .max_iterations = 1,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metric_configs });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metric_configs });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -19772,7 +20454,7 @@ test "graph pagerank reclaimed initialize page overwrites stale rank output" {
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -19878,7 +20560,7 @@ test "graph pagerank contribution and reduce pages resume from durable cursor af
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
@@ -19910,7 +20592,7 @@ test "graph pagerank contribution and reduce pages resume from durable cursor af
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     const renewed = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .iterate_contributions, 0, 3, "worker-a", 2001) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, renewed.state);
@@ -19950,7 +20632,7 @@ test "graph pagerank contribution and reduce pages resume from durable cursor af
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     try drainGraphMetricSummaryForTest(&graph, "pagerank", active_job, .reduce_ranks, 0);
     const renewed_reduce = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .reduce_ranks, 0, 4, "worker-r", 3001) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, renewed_reduce.state);
@@ -19998,7 +20680,7 @@ test "graph pagerank contribution and reduce pages resume from durable cursor af
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
@@ -20054,7 +20736,7 @@ test "graph pagerank later iteration pages resume from durable cursor after reop
         .max_iterations = 2,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
@@ -20076,7 +20758,7 @@ test "graph pagerank later iteration pages resume from durable cursor after reop
     }
 
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
@@ -20101,7 +20783,7 @@ test "graph pagerank later iteration pages resume from durable cursor after reop
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     try drainGraphMetricSummaryForTest(&graph, "pagerank", active_job, .reduce_ranks, 1);
     const renewed_reduce = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .reduce_ranks, 1, 4, "worker-reduce", 3001) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, renewed_reduce.state);
@@ -20141,7 +20823,7 @@ test "graph pagerank later iteration pages resume from durable cursor after reop
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     const renewed_check = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .check_convergence, 1, 5, "worker-check", 4001) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, renewed_check.state);
@@ -20185,7 +20867,7 @@ test "graph pagerank dynamic iteration planning updates manifest page count idem
         .max_iterations = 2,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -20243,7 +20925,7 @@ test "graph pagerank later iteration failed pages retry and advance" {
         .max_iterations = 2,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -20345,7 +21027,7 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
         .max_iterations = 2,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -20404,7 +21086,7 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
     }
 
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
@@ -20480,7 +21162,7 @@ test "graph pagerank convergence page reclaim recomputes without stale partial s
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -20615,7 +21297,7 @@ fn drainGraphMetricSummaryForTest(graph: *GraphIndex, metric: []const u8, job: G
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const manifest = (try graph.metricBuildManifest(&txn, metric, job.job_id)).?;
-        break :blk GraphIndex.graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
+        break :blk graph.graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
     };
     for (0..count + 1) |i| {
         const id: u64 = if (i == count) 0 else graph_metric_build_summary_leaf_base + i;
@@ -20654,7 +21336,7 @@ fn expectGraphMetricOrdinalTakeoverForTest(kind: GraphMetricKind) !void {
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
     const cfg = GraphMetricConfig{ .name = "metric", .kind = kind, .refresh = .manual, .max_iterations = 1, .tolerance = 0.000001 };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &.{cfg} });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &.{cfg} });
     defer graph.close();
     try graph.addEdge("doc-a", "doc-b", "cites", 1, 0, 0, "");
     try graph.addEdge("doc-c", "doc-b", "cites", 1, 0, 0, "");
@@ -20785,7 +21467,7 @@ test "graph pagerank planned fixed-iteration publish materializes rank scores" {
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -20858,7 +21540,7 @@ test "graph pagerank planned dynamic iteration reaches fixed-limit publish" {
         .max_iterations = 2,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -20946,7 +21628,7 @@ test "graph pagerank planned cleanup resumes after non-final cleanup page reopen
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.acquireGraphMetricBuildLease("pagerank", graph.edge_generation);
@@ -21014,7 +21696,7 @@ test "graph pagerank planned cleanup resumes after non-final cleanup page reopen
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     const visible_after_reopen = try graph.graphMetricTopK("pagerank", 2);
     defer {
@@ -21071,7 +21753,7 @@ test "graph pagerank cleanup page resumes from durable cursor after reopen" {
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.acquireGraphMetricBuildLease("pagerank", graph.edge_generation);
@@ -21124,7 +21806,7 @@ test "graph pagerank cleanup page resumes from durable cursor after reopen" {
     try std.testing.expectEqualStrings("doc-b", visible_after_partial_cleanup[0].node);
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     const renewed_cleanup = try graph.runGraphMetricPlannedWorkerStep("pagerank", metrics[0], "worker-clean");
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, renewed_cleanup.phase);
@@ -21181,7 +21863,7 @@ test "graph pagerank planned build publishes scores matching local runner" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -21230,7 +21912,7 @@ test "graph pagerank warm rebuild normalizes changed node sets across summary pa
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
         const configs = [_]GraphMetricConfig{.{ .name = "rank", .kind = .pagerank, .refresh = .manual, .damping = 0.999999, .tolerance = 1e-6, .max_iterations = 1 }};
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
         defer graph.close();
         for (0..old_count) |index| {
             var from_buf: [32]u8 = undefined;
@@ -21270,7 +21952,7 @@ test "graph metric execution epoch fences old jobs without hiding published scor
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
     const configs = [_]GraphMetricConfig{.{ .name = "rank", .kind = .pagerank, .refresh = .manual, .max_iterations = 1 }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
     defer graph.close();
     try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
     var published = try graph.runPageRankMetricPlanned("rank");
@@ -21333,7 +22015,7 @@ test "graph pagerank failed planned build preserves prior published generation" 
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -21428,7 +22110,7 @@ test "graph pagerank coordinator publish failure preserves prior published gener
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     var published = try graph.runPageRankMetricPlanned("pagerank");
@@ -21512,7 +22194,7 @@ test "graph pagerank coordinator publish failure preserves prior published gener
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     {
         var txn = try graph.beginReadReverseTxn();
@@ -21583,7 +22265,7 @@ test "graph pagerank exhausted publish page preserves root cause and prior gener
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -21646,7 +22328,7 @@ test "graph pagerank exhausted publish page preserves root cause and prior gener
     }
 
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     const failed_step = try graph.runGraphMetricPlannedCoordinatorStepForMetric("pagerank");
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.publish_generation, failed_step.phase);
@@ -21719,7 +22401,7 @@ test "graph pagerank planned build drains partitioned pages across workers" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -21830,7 +22512,7 @@ test "graph pagerank planned worker page step leaves phase and publish to coordi
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -22015,7 +22697,7 @@ test "graph planned worker coordinator split applies to degree eigenvector and h
             .kind = .degree,
             .refresh = .manual,
         }};
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
         try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
         try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
@@ -22038,7 +22720,7 @@ test "graph planned worker coordinator split applies to degree eigenvector and h
             .max_iterations = 1,
             .tolerance = 0.000001,
         }};
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
         try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
         try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
@@ -22070,7 +22752,7 @@ test "graph planned worker coordinator split applies to degree eigenvector and h
                 .tolerance = 0.000001,
             },
         };
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
         try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
         try graph.addEdge("doc-hub-b", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -22097,7 +22779,7 @@ test "graph pagerank planned build resumes after dynamic iteration planning reop
         .max_iterations = 2,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.acquireGraphMetricBuildLease("pagerank", graph.edge_generation);
@@ -22119,7 +22801,7 @@ test "graph pagerank planned build resumes after dynamic iteration planning reop
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     {
         var status = try graph.graphMetricStatus("pagerank");
@@ -22163,7 +22845,7 @@ test "graph metric build degree manifest partitions reverse-edge scan pages" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -22259,7 +22941,7 @@ test "graph degree scan build page honors reverse-edge key range" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -22351,7 +23033,7 @@ test "graph degree reduce aggregates partials from multiple scan pages" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -22471,7 +23153,7 @@ test "graph degree scan page resumes from persisted cursor" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "hub", "cites", 1.0, 0, 0, "");
@@ -22531,7 +23213,7 @@ test "graph planned metric build retires a superseded generation without poisoni
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -22582,7 +23264,7 @@ test "graph degree scan attempt output adopts only on page completion" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "hub", "cites", 1.0, 0, 0, "");
@@ -22678,7 +23360,7 @@ test "graph degree scan attempt adoption resumes in bounded pages" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -22762,7 +23444,7 @@ test "graph degree scan page reclaim recomputes without double counting partials
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "hub", "cites", 1.0, 0, 0, "");
@@ -22830,7 +23512,7 @@ test "graph degree reduce score write rejects reclaimed stale attempt" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "hub", "cites", 1.0, 0, 0, "");
@@ -22898,7 +23580,7 @@ test "graph metric build page lease lifecycle supports reclaim and idempotent co
         .kind = .pagerank,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -22979,7 +23661,7 @@ test "graph metric build page retry policy refuses exhausted attempts" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23024,7 +23706,7 @@ test "graph metric coordinator fails build after page attempts exhaust" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23088,7 +23770,7 @@ test "graph metric coordinator reports expired exhausted page lease" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23144,7 +23826,7 @@ test "graph metric build scheduler claims next eligible page" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23210,7 +23892,7 @@ test "graph metric status summarizes multiple active build pages with cap" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23297,7 +23979,7 @@ test "graph metric build page progress cursor survives renew and reopen" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-b", "doc-c", "cites", 1.0, 0, 0, "");
@@ -23350,7 +24032,7 @@ test "graph metric build page progress cursor survives renew and reopen" {
     try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.updateGraphMetricBuildPageProgress("degree", active_job.job_id, .scan_edges_and_out_degree, 0, 1, "worker-b", "edge-page:bad", 2, claim.total_units));
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     {
         var txn = try graph.beginReadReverseTxn();
@@ -23404,7 +24086,7 @@ test "graph metric build phase barrier persists summary and advances only when c
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23477,7 +24159,7 @@ test "graph metric build phase barrier summarizes every durable page in phase" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23555,7 +24237,7 @@ test "graph metric build iteration summary records convergence from check phase"
         .max_iterations = 1,
         .tolerance = 0.00001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23617,7 +24299,7 @@ test "graph metric build publish verification requires completed prerequisite ph
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23685,7 +24367,7 @@ test "graph metric build publish verification records iterative convergence read
         .max_iterations = 1,
         .tolerance = 0.00001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23760,7 +24442,7 @@ test "graph pagerank metric edge filter limits typed score graph" {
         .refresh = .manual,
         .edge_filter = .{ .mode = .types, .types = &filter_types },
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23796,7 +24478,7 @@ test "graph degree metric publishes total incident degree scores" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23843,7 +24525,7 @@ test "graph degree planned build publishes scores matching local runner" {
             .refresh = .manual,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -23913,7 +24595,7 @@ test "graph degree planned build executes partitioned scan pages" {
             .refresh = .manual,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -23964,7 +24646,7 @@ test "graph degree planned worker step drives scheduled phases" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -24080,7 +24762,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -24094,7 +24776,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var worker = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var worker = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer worker.close();
 
         const step = try worker.runGraphMetricPlannedWorkerPageStep("degree", metrics[0], "worker-prepare");
@@ -24108,7 +24790,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer coordinator.close();
 
         const step = try coordinator.runGraphMetricPlannedCoordinatorStep("degree", metrics[0]);
@@ -24121,7 +24803,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var worker_a = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var worker_a = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer worker_a.close();
 
         const step = try worker_a.runGraphMetricPlannedWorkerPageStep("degree", metrics[0], "worker-scan-a");
@@ -24135,7 +24817,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var worker_b = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var worker_b = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer worker_b.close();
 
         const step = try worker_b.runGraphMetricPlannedWorkerPageStep("degree", metrics[0], "worker-scan-b");
@@ -24149,7 +24831,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer coordinator.close();
 
         const step = try coordinator.runGraphMetricPlannedCoordinatorStep("degree", metrics[0]);
@@ -24162,7 +24844,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var worker_a = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var worker_a = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer worker_a.close();
 
         const step = try worker_a.runGraphMetricPlannedWorkerPageStep("degree", metrics[0], "worker-reduce-a");
@@ -24176,7 +24858,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var worker_b = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var worker_b = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer worker_b.close();
 
         const step = try worker_b.runGraphMetricPlannedWorkerPageStep("degree", metrics[0], "worker-reduce-b");
@@ -24201,7 +24883,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer coordinator.close();
 
         const reduce_step = try coordinator.runGraphMetricPlannedCoordinatorStep("degree", metrics[0]);
@@ -24236,7 +24918,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var worker = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var worker = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer worker.close();
 
         var completed = false;
@@ -24257,7 +24939,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var worker = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var worker = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer worker.close();
 
         var completed = false;
@@ -24278,7 +24960,7 @@ test "graph degree planned worker and coordinator steps survive reopened handles
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         var status = try graph.graphMetricStatus("degree");
@@ -24319,7 +25001,7 @@ test "graph degree planned public build ensure drives reopened workers" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -24346,7 +25028,7 @@ test "graph degree planned public build ensure drives reopened workers" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer coordinator.close();
 
         var status = try coordinator.ensureGraphMetricPlannedBuild("degree", target_generation);
@@ -24361,7 +25043,7 @@ test "graph degree planned public build ensure drives reopened workers" {
         {
             var store = try docstore.DocStore.open(alloc, store_path, .{});
             defer store.close();
-            var worker = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+            var worker = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
             defer worker.close();
 
             const worker_id = if (step_i % 2 == 0) "worker-public-a" else "worker-public-b";
@@ -24375,7 +25057,7 @@ test "graph degree planned public build ensure drives reopened workers" {
         {
             var store = try docstore.DocStore.open(alloc, store_path, .{});
             defer store.close();
-            var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+            var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
             defer coordinator.close();
 
             const coordinator_step = try coordinator.runGraphMetricPlannedCoordinatorStep("degree", metrics[0]);
@@ -24391,7 +25073,7 @@ test "graph degree planned public build ensure drives reopened workers" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         var status = try graph.graphMetricStatus("degree");
@@ -24428,7 +25110,7 @@ test "graph degree planned name-only public steps require coordinator across wor
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -24567,7 +25249,7 @@ fn runGraphDegreePublicWorkerThread(ctx: *GraphDegreePublicWorkerThreadCtx) void
         return;
     };
     defer store.close();
-    var graph = GraphIndex.open(alloc, &store, ctx.rev_path, "links", .{ .metric_configs = &metrics }) catch |err| {
+    var graph = openTestGraphIndex(alloc, &store, ctx.rev_path, "links", .{ .metric_configs = &metrics }) catch |err| {
         ctx.err = err;
         return;
     };
@@ -24635,7 +25317,7 @@ fn runGraphDegreeClaimWorkerThread(ctx: *GraphDegreeClaimWorkerThreadCtx) void {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = GraphIndex.open(alloc, &store, ctx.rev_path, "links", .{ .metric_configs = &metrics }) catch |err| {
+    var graph = openTestGraphIndex(alloc, &store, ctx.rev_path, "links", .{ .metric_configs = &metrics }) catch |err| {
         ctx.err = err;
         return;
     };
@@ -24694,7 +25376,7 @@ fn runGraphMetricPublicWorkerThread(ctx: *GraphMetricPublicWorkerThreadCtx) void
                 .tolerance = 0.000001,
             },
         };
-        var graph = GraphIndex.open(alloc, &store, ctx.rev_path, "links", .{ .metric_configs = &metrics }) catch |err| {
+        var graph = openTestGraphIndex(alloc, &store, ctx.rev_path, "links", .{ .metric_configs = &metrics }) catch |err| {
             ctx.err = err;
             return;
         };
@@ -24712,7 +25394,7 @@ fn runGraphMetricPublicWorkerThread(ctx: *GraphMetricPublicWorkerThreadCtx) void
             .max_iterations = 1,
             .tolerance = 0.000001,
         }};
-        var graph = GraphIndex.open(alloc, &store, ctx.rev_path, "links", .{ .metric_configs = &metrics }) catch |err| {
+        var graph = openTestGraphIndex(alloc, &store, ctx.rev_path, "links", .{ .metric_configs = &metrics }) catch |err| {
             ctx.err = err;
             return;
         };
@@ -24764,7 +25446,7 @@ fn runGraphMetricPublicWorkerPairForTest(
                 .tolerance = 0.000001,
             },
         };
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
         try runGraphMetricPublicWorkerStepForTest(&graph, worker_ctx_a);
         try runGraphMetricPublicWorkerStepForTest(&graph, worker_ctx_b);
@@ -24776,7 +25458,7 @@ fn runGraphMetricPublicWorkerPairForTest(
             .max_iterations = 1,
             .tolerance = 0.000001,
         }};
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
         try runGraphMetricPublicWorkerStepForTest(&graph, worker_ctx_a);
         try runGraphMetricPublicWorkerStepForTest(&graph, worker_ctx_b);
@@ -24870,7 +25552,7 @@ test "graph degree planned public workers claim phase pages from concurrent hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -24902,7 +25584,7 @@ test "graph degree planned public workers claim phase pages from concurrent hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
         for (0..8) |round| {
             if (scan_page_count >= 2) break;
@@ -24923,7 +25605,7 @@ test "graph degree planned public workers claim phase pages from concurrent hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -24937,7 +25619,7 @@ test "graph degree planned public workers claim phase pages from concurrent hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
         for (0..8) |round| {
             if (reduce_page_count >= 2) break;
@@ -24958,7 +25640,7 @@ test "graph degree planned public workers claim phase pages from concurrent hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25015,7 +25697,7 @@ test "graph degree planned status reports concurrent worker page leases from reo
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25069,7 +25751,7 @@ test "graph degree planned status reports concurrent worker page leases from reo
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
         .metric_configs = &metrics,
     });
     defer graph.close();
@@ -25133,7 +25815,7 @@ test "graph pagerank planned public workers claim partitioned phases from concur
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25181,7 +25863,7 @@ test "graph pagerank planned public workers claim partitioned phases from concur
         try expectGraphMetricConcurrentPublicPhase(alloc, store_path, rev_path, "pagerank", .pagerank, phase, 2);
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25203,7 +25885,7 @@ test "graph pagerank planned public workers claim partitioned phases from concur
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25279,7 +25961,7 @@ test "graph pagerank reopened coordinators do not duplicate publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -25316,7 +25998,7 @@ test "graph pagerank reopened coordinators do not duplicate publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer coordinator.close();
 
         _ = try materializeGraphMetricPublishPagesForTest(&coordinator, "pagerank", "worker-publish-materialize");
@@ -25336,7 +26018,7 @@ test "graph pagerank reopened coordinators do not duplicate publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var duplicate_coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var duplicate_coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer duplicate_coordinator.close();
 
         const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStepForMetric("pagerank");
@@ -25368,7 +26050,7 @@ test "graph pagerank reopened coordinators do not duplicate publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var reader = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var reader = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer reader.close();
 
         var fresh = try reader.graphMetricStatus("pagerank");
@@ -25411,7 +26093,7 @@ test "graph eigenvector reopened coordinators do not duplicate publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         try graph.addEdge("doc-a", "hub", "cites", 1.0, 0, 0, "");
@@ -25446,7 +26128,7 @@ test "graph eigenvector reopened coordinators do not duplicate publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer coordinator.close();
 
         _ = try materializeGraphMetricPublishPagesForTest(&coordinator, "eigenvector", "worker-publish-materialize");
@@ -25466,7 +26148,7 @@ test "graph eigenvector reopened coordinators do not duplicate publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var duplicate_coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var duplicate_coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer duplicate_coordinator.close();
 
         const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStepForMetric("eigenvector");
@@ -25498,7 +26180,7 @@ test "graph eigenvector reopened coordinators do not duplicate publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var reader = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var reader = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer reader.close();
 
         var fresh = try reader.graphMetricStatus("eigenvector");
@@ -25550,7 +26232,7 @@ test "graph hits reopened coordinators do not duplicate paired publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -25585,7 +26267,7 @@ test "graph hits reopened coordinators do not duplicate paired publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer coordinator.close();
 
         _ = try materializeGraphMetricPublishPagesForTest(&coordinator, "hits_authority", "worker-publish-materialize");
@@ -25612,7 +26294,7 @@ test "graph hits reopened coordinators do not duplicate paired publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var duplicate_coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var duplicate_coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer duplicate_coordinator.close();
 
         const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStepForMetric("hits_authority");
@@ -25651,7 +26333,7 @@ test "graph hits reopened coordinators do not duplicate paired publish" {
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var reader = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var reader = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer reader.close();
 
         var authority = try reader.graphMetricStatus("hits_authority");
@@ -25705,7 +26387,7 @@ test "graph eigenvector planned public workers claim partitioned phases from con
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25753,7 +26435,7 @@ test "graph eigenvector planned public workers claim partitioned phases from con
         try expectGraphMetricConcurrentPublicPhase(alloc, store_path, rev_path, "eigenvector", .eigenvector, phase, 2);
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25775,7 +26457,7 @@ test "graph eigenvector planned public workers claim partitioned phases from con
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25859,7 +26541,7 @@ test "graph hits planned public workers claim partitioned paired phases from con
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25910,7 +26592,7 @@ test "graph hits planned public workers claim partitioned paired phases from con
         try expectGraphMetricConcurrentPublicPhase(alloc, store_path, rev_path, "hits_authority", .hits_authority, phase, 2);
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -25932,7 +26614,7 @@ test "graph hits planned public workers claim partitioned paired phases from con
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
             .metric_configs = &metrics,
         });
         defer graph.close();
@@ -26032,7 +26714,7 @@ test "graph planned drain completes single metric families through metric-name b
     };
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -26088,7 +26770,7 @@ test "graph degree planned public failure preserves prior published generation" 
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try std.testing.expectError(error.GraphMetricBuildJobNotFound, graph.failGraphMetricPlannedBuild("degree", error.InvalidGraphMetricScore));
@@ -26179,7 +26861,7 @@ test "graph degree planned expired worker page is reclaimed across reopened hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -26209,7 +26891,7 @@ test "graph degree planned expired worker page is reclaimed across reopened hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var worker = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var worker = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer worker.close();
 
         const claim = try worker.claimGraphMetricBuildPageAt("degree", job_id, .scan_edges_and_out_degree, 0, 1, "worker-dead", 1000) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -26221,7 +26903,7 @@ test "graph degree planned expired worker page is reclaimed across reopened hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var observer = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var observer = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer observer.close();
 
         var status = try observer.graphMetricStatus("degree");
@@ -26243,7 +26925,7 @@ test "graph degree planned expired worker page is reclaimed across reopened hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var early_worker = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var early_worker = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer early_worker.close();
 
         try std.testing.expect((try early_worker.claimGraphMetricBuildPageAt("degree", job_id, .scan_edges_and_out_degree, 0, 1, "worker-early", dead_worker_lease_expires_at_ms - 1)) == null);
@@ -26259,7 +26941,7 @@ test "graph degree planned expired worker page is reclaimed across reopened hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var reclaim_worker = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var reclaim_worker = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer reclaim_worker.close();
 
         const reclaimed = try reclaim_worker.claimGraphMetricBuildPageAt("degree", job_id, .scan_edges_and_out_degree, 0, 1, "worker-reclaim", dead_worker_lease_expires_at_ms + 1) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -26280,7 +26962,7 @@ test "graph degree planned expired worker page is reclaimed across reopened hand
         {
             var store = try docstore.DocStore.open(alloc, store_path, .{});
             defer store.close();
-            var worker = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+            var worker = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
             defer worker.close();
             const worker_id = if (step_i % 2 == 0) "worker-a" else "worker-b";
             const worker_step = try worker.runGraphMetricPlannedWorkerPageStep("degree", metrics[0], worker_id);
@@ -26292,7 +26974,7 @@ test "graph degree planned expired worker page is reclaimed across reopened hand
         {
             var store = try docstore.DocStore.open(alloc, store_path, .{});
             defer store.close();
-            var coordinator = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+            var coordinator = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
             defer coordinator.close();
             const coordinator_step = try coordinator.runGraphMetricPlannedCoordinatorStep("degree", metrics[0]);
             if (coordinator_step.completed_build) {
@@ -26306,7 +26988,7 @@ test "graph degree planned expired worker page is reclaimed across reopened hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
         defer graph.close();
 
         var status = try graph.graphMetricStatus("degree");
@@ -26344,7 +27026,7 @@ test "graph degree planned worker step uses injected time for lease reclaim" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -26435,7 +27117,7 @@ test "graph degree planned coordinator ticks are idempotent across barriers and 
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -26550,7 +27232,7 @@ test "graph degree planned build serves prior generation while active" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -26617,7 +27299,7 @@ test "graph metric verified publish cleans completed job namespace only" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -26689,7 +27371,7 @@ test "graph metric failed planned build records failure before bounded namespace
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -26797,7 +27479,7 @@ test "graph metric failed planned build retains bounded diagnostics" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -26872,7 +27554,7 @@ test "graph metric repeated failed planned builds bound diagnostics and cleanup 
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     const failed_build_count = graph_metric_recent_event_limit + 2;
@@ -27038,7 +27720,7 @@ fn verifyRepeatedFailedIterativeMetricBuildCleanup(
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     const phases = [_]GraphIndex.GraphMetricBuildPhase{
@@ -27155,7 +27837,7 @@ test "graph metric repeated failed hits builds bound diagnostics and cleanup aba
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     const phases = [_]GraphIndex.GraphMetricBuildPhase{
@@ -27276,7 +27958,7 @@ test "graph metric build job cleanup refuses active job namespace" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -27322,7 +28004,7 @@ test "graph degree planned build honors edge filter during scan page execution" 
             .edge_filter = .{ .mode = .types, .types = &filter_types },
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -27372,7 +28054,7 @@ test "graph metric filtered scan checkpoints advance past excluded edges" {
         .refresh = .manual,
         .edge_filter = .{ .mode = .types, .types = &filter_types },
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     // Reverse ordering is target-major, so the excluded edge is encountered
     // first and exactly consumes the first checkpoint budget.
@@ -27432,7 +28114,7 @@ test "graph degree metric edge filter limits typed score graph" {
         .refresh = .manual,
         .edge_filter = .{ .mode = .types, .types = &filter_types },
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -27483,7 +28165,7 @@ test "graph metric materialization deletion clears scores and allows rebuild" {
         .kind = .degree,
         .refresh = .manual,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -27639,7 +28321,7 @@ test "graph metric native rank index retains only the supported top-k prefix" {
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
     const configs = [_]GraphMetricConfig{.{ .name = "degree", .kind = .degree, .refresh = .manual }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
     defer graph.close();
 
     const score_count = graph_metric_rank_entry_limit + 2;
@@ -27715,7 +28397,7 @@ test "graph eigenvector metric publishes normalized centrality scores" {
         .max_iterations = 100,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -27758,7 +28440,7 @@ test "graph eigenvector metric edge filter limits typed score graph" {
         .edge_filter = .{ .mode = .types, .types = &filter_types },
         .max_iterations = 20,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -27810,7 +28492,7 @@ test "graph eigenvector planned build publishes scores matching local runner" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -27877,7 +28559,7 @@ test "graph eigenvector planned build matches local runner on disconnected reduc
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -27947,7 +28629,7 @@ test "graph eigenvector reclaimed scan page overwrites stale partial output" {
         .refresh = .manual,
         .max_iterations = 1,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28064,7 +28746,7 @@ test "graph eigenvector reclaimed initialize page overwrites stale rank output" 
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28156,7 +28838,7 @@ test "graph eigenvector contribution and reduce pages resume from durable cursor
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28183,7 +28865,7 @@ test "graph eigenvector contribution and reduce pages resume from durable cursor
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     const renewed_contribution = try graph.claimGraphMetricBuildPageAt("eigenvector", active_job.job_id, .iterate_contributions, 0, contribution_claim.page_id, "worker-a", 2001) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, renewed_contribution.state);
     try std.testing.expectEqual(@as(u64, 1), renewed_contribution.completed_units);
@@ -28212,7 +28894,7 @@ test "graph eigenvector contribution and reduce pages resume from durable cursor
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     try drainGraphMetricSummaryForTest(&graph, "eigenvector", active_job, .reduce_ranks, 0);
     const renewed_reduce = try graph.claimGraphMetricBuildPageAt("eigenvector", active_job.job_id, .reduce_ranks, 0, reduce_claim.page_id, "worker-r", 3001) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -28257,7 +28939,7 @@ test "graph eigenvector convergence page reclaim recomputes without stale partia
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28349,7 +29031,7 @@ test "graph eigenvector later iteration failed pages retry and advance" {
         .max_iterations = 2,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28458,7 +29140,7 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
         .max_iterations = 2,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28517,7 +29199,7 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
     }
 
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
@@ -28592,7 +29274,7 @@ test "graph eigenvector cleanup page resumes after reopen with published scores 
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28659,7 +29341,7 @@ test "graph eigenvector cleanup page resumes after reopen with published scores 
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     const visible_after_reopen = try graph.graphMetricTopK("eigenvector", 10);
@@ -28718,7 +29400,7 @@ test "graph eigenvector failed planned build preserves prior published generatio
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28817,7 +29499,7 @@ test "graph eigenvector coordinator publish failure preserves prior published ge
         .max_iterations = 1,
         .tolerance = 0.000001,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-c", "doc-b", "cites", 1.0, 0, 0, "");
@@ -28870,7 +29552,7 @@ test "graph eigenvector coordinator publish failure preserves prior published ge
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     {
         var txn = try graph.beginReadReverseTxn();
@@ -28950,7 +29632,7 @@ test "graph hits metrics publish authority and hub scores" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -29007,7 +29689,7 @@ test "graph hits metric edge filter limits typed score graph" {
         .edge_filter = .{ .mode = .types, .types = &filter_types },
         .max_iterations = 20,
     }};
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -29059,7 +29741,7 @@ test "graph hits planned build publishes paired scores matching local runner" {
 
     var local_store = try docstore.DocStore.open(alloc, local_store_path, .{});
     defer local_store.close();
-    var local_graph = try GraphIndex.open(alloc, &local_store, local_rev_path, "links", .{ .metric_configs = &metrics });
+    var local_graph = try openTestGraphIndex(alloc, &local_store, local_rev_path, "links", .{ .metric_configs = &metrics });
     defer local_graph.close();
 
     try local_graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -29080,7 +29762,7 @@ test "graph hits planned build publishes paired scores matching local runner" {
 
     var planned_store = try docstore.DocStore.open(alloc, planned_store_path, .{});
     defer planned_store.close();
-    var planned_graph = try GraphIndex.open(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
+    var planned_graph = try openTestGraphIndex(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
     defer planned_graph.close();
 
     try planned_graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -29168,7 +29850,7 @@ test "graph hits active planned rebuild keeps prior published pair visible" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -29299,7 +29981,7 @@ test "graph hits reclaimed scan page overwrites stale partial output" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub", "doc-authority-a", "cites", 1.0, 0, 0, "");
@@ -29425,7 +30107,7 @@ test "graph hits reclaimed initialize page overwrites stale rank output" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -29533,7 +30215,7 @@ test "graph hits contribution and reduce pages resume from durable cursor after 
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-hub-b", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -29561,7 +30243,7 @@ test "graph hits contribution and reduce pages resume from durable cursor after 
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     const renewed_contribution = try graph.claimGraphMetricBuildPageAt("hits_authority", active_job.job_id, .iterate_contributions, 0, contribution_claim.page_id, "worker-a", 2001) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, renewed_contribution.state);
     try std.testing.expectEqual(@as(u64, 1), renewed_contribution.completed_units);
@@ -29590,7 +30272,7 @@ test "graph hits contribution and reduce pages resume from durable cursor after 
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .reduce_ranks, 0);
     const renewed_reduce = try graph.claimGraphMetricBuildPageAt("hits_authority", active_job.job_id, .reduce_ranks, 0, reduce_claim.page_id, "worker-r", 3001) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -29655,7 +30337,7 @@ test "graph hits hub contribution and hub reduce pages resume from durable curso
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-hub-b", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -29687,7 +30369,7 @@ test "graph hits hub contribution and hub reduce pages resume from durable curso
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     const renewed_hub_contribution = try graph.claimGraphMetricBuildPageAt("hits_authority", active_job.job_id, .hits_hub_contributions, 0, hub_contribution_claim.page_id, "worker-hc", 4001) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, renewed_hub_contribution.state);
     try std.testing.expectEqual(@as(u64, 1), renewed_hub_contribution.attempt);
@@ -29719,7 +30401,7 @@ test "graph hits hub contribution and hub reduce pages resume from durable curso
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
     try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .hits_hub_reduce_ranks, 0);
     const renewed_hub_reduce = try graph.claimGraphMetricBuildPageAt("hits_authority", active_job.job_id, .hits_hub_reduce_ranks, 0, hub_reduce_claim.page_id, "worker-hr", 5001) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -29770,7 +30452,7 @@ test "graph hits reduce pages only write their planned node range" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     var source_buf: [64]u8 = undefined;
@@ -29875,7 +30557,7 @@ test "graph hits reduce pages only write their planned node range" {
     }
 
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .reduce_ranks, 0);
     const second_reduce = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .reduce_ranks, 0, "worker-r2", 3001) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -29952,7 +30634,7 @@ test "graph hits reduce pages only write their planned node range" {
         try std.testing.expectEqual(hits_reduce_fingerprint, persisted_first_hub_reduce.output_fingerprint);
     }
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .hits_hub_reduce_ranks, 0);
     const second_hub_reduce = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .hits_hub_reduce_ranks, 0, "worker-hr2", 4001) orelse return error.TestExpectedGraphMetricBuildPage;
@@ -29998,7 +30680,7 @@ test "graph hits planned build drains partitioned paired pages across workers" {
     defer cleanupTmp(local_rev_path);
     var local_store = try docstore.DocStore.open(alloc, local_store_path, .{});
     defer local_store.close();
-    var local_graph = try GraphIndex.open(alloc, &local_store, local_rev_path, "links", .{ .metric_configs = &metrics });
+    var local_graph = try openTestGraphIndex(alloc, &local_store, local_rev_path, "links", .{ .metric_configs = &metrics });
     defer local_graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -30027,7 +30709,7 @@ test "graph hits planned build drains partitioned paired pages across workers" {
     defer cleanupTmp(planned_rev_path);
     var planned_store = try docstore.DocStore.open(alloc, planned_store_path, .{});
     defer planned_store.close();
-    var planned_graph = try GraphIndex.open(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
+    var planned_graph = try openTestGraphIndex(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
     defer planned_graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -30193,7 +30875,7 @@ test "graph hits larger manifest resumes across reopen boundaries" {
     defer cleanupTmp(local_rev_path);
     var local_store = try docstore.DocStore.open(alloc, local_store_path, .{});
     defer local_store.close();
-    var local_graph = try GraphIndex.open(alloc, &local_store, local_rev_path, "links", .{ .metric_configs = &metrics });
+    var local_graph = try openTestGraphIndex(alloc, &local_store, local_rev_path, "links", .{ .metric_configs = &metrics });
     defer local_graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 9) |i| {
@@ -30221,7 +30903,7 @@ test "graph hits larger manifest resumes across reopen boundaries" {
     defer cleanupTmp(planned_rev_path);
     var planned_store = try docstore.DocStore.open(alloc, planned_store_path, .{});
     defer planned_store.close();
-    var planned_graph = try GraphIndex.open(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
+    var planned_graph = try openTestGraphIndex(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
     defer planned_graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 9) |i| {
@@ -30304,7 +30986,7 @@ test "graph hits larger manifest resumes across reopen boundaries" {
 
         if (steps % 5 == 4) {
             planned_graph.close();
-            planned_graph = try GraphIndex.open(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
+            planned_graph = try openTestGraphIndex(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
             reopen_count += 1;
             var status = try planned_graph.graphMetricStatus("hits_authority");
             defer status.deinit(alloc);
@@ -30424,7 +31106,7 @@ test "graph hits planned drain runs through metric-name worker and coordinator b
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -30506,7 +31188,7 @@ test "graph hits later iteration failed pages retry and advance" {
             .tolerance = 0.0,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -30664,7 +31346,7 @@ test "graph hits later iteration exhausted page fails pair and preserves prior p
             .tolerance = 0.0,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -30758,7 +31440,7 @@ test "graph hits later iteration exhausted page fails pair and preserves prior p
     }
 
     graph.close();
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
@@ -30870,7 +31552,7 @@ test "graph hits coordinator publish failure preserves prior published pair afte
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -30977,7 +31659,7 @@ test "graph hits coordinator publish failure preserves prior published pair afte
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
@@ -31083,7 +31765,7 @@ test "graph hits convergence page reclaim recomputes without stale partial summa
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -31217,7 +31899,7 @@ test "graph hits cleanup page resumes after reopen with published pair visible" 
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-hub-b", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -31333,7 +32015,7 @@ test "graph hits cleanup page resumes after reopen with published pair visible" 
     }
     graph.close();
 
-    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     const visible_after_reopen = try graph.graphMetricTopK("hits_hub", 10);
@@ -31467,7 +32149,7 @@ test "graph hits failed planned build preserves prior published pair" {
             .tolerance = 0.000001,
         },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     try graph.addEdge("doc-hub-a", "doc-authority", "cites", 1.0, 0, 0, "");
@@ -31596,7 +32278,7 @@ test "graph compatible HITS aliases share lifecycle controls and reject stale pu
         .{ .name = "authority", .kind = .hits_authority, .refresh = .manual },
         .{ .name = "hub", .kind = .hits_hub, .refresh = .manual },
     };
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
     defer graph.close();
 
     var scheduled_hub = try graph.ensureGraphMetricPlannedBuild("hub", 1);
@@ -31671,7 +32353,7 @@ test "graph both direction emits one physical self loop and preserves reciprocal
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
 
     try graph.addEdge("same", "same", "loop", 1, 0, 0, "{}");
@@ -31706,7 +32388,7 @@ test "graph durable writes reject invalid edge types before mutation" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
 
     try std.testing.expectError(error.InvalidGraphEdges, graph.addEdge("a", "b", "", 1, 0, 0, ""));
@@ -31730,7 +32412,7 @@ test "graph bounded adjacency pages preserve order and fail before budget overfl
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
 
     for (0..5) |i| {
@@ -31827,7 +32509,7 @@ test "graph addEdge and getEdges in (reverse index)" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
 
     try graph.addEdge("a", "b", "knows", 1.0, 100, 100, "");
@@ -31860,7 +32542,7 @@ test "graph exact edge probes stay aligned and preserve payloads" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
     try graph.addEdge("post:2", "tag", "HAS_TAG", 0.75, 10, 11, "{\"rank\":1}");
     try graph.addEdge("post:1", "other", "HAS_TAG", 1, 10, 11, "");
@@ -31909,7 +32591,7 @@ test "graph edge keys support arbitrary document ids and edge types" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g\x00:i:", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g\x00:i:", .{});
     defer graph.close();
 
     const source = "doc\x00:i:\xff";
@@ -31958,7 +32640,7 @@ test "graph deleteEdge removes both directions" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
 
     try graph.addEdge("x", "y", "rel", 1.0, 0, 0, "");
@@ -31984,7 +32666,7 @@ test "graph batchApply applies writes and deletes together" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
     defer graph.close();
 
     try graph.addEdge("a", "b", "knows", 1.0, 0, 0, "");
@@ -32085,7 +32767,7 @@ test "graph index persists metadata larger than the former stack buffer" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, reverse_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, reverse_path, "g", .{});
     defer graph.close();
 
     try graph.addEdge("source", "target", "references", 1.0, 10, 11, metadata);
@@ -32106,7 +32788,7 @@ test "graph getEdges with edge type filter" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
     try graph.addEdge("n1", "n2", "likes", 1.0, 0, 0, "");
@@ -32135,7 +32817,7 @@ test "graph deleteEdgesForDoc cleanup" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
     try graph.addEdge("doc1", "doc2", "ref", 1.0, 0, 0, "");
@@ -32164,7 +32846,7 @@ test "graph rebuildReverseFromOwnedOutgoingEdges reconstructs incoming index" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
     const edge_val = try encodeEdgeValueAlloc(alloc, 1.0, 10, 11, "");
@@ -32197,7 +32879,7 @@ test "graph rebuildReverseFromOwnedOutgoingEdges respects split ownership bounds
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
     const edge_val = try encodeEdgeValueAlloc(alloc, 1.0, 10, 11, "");
@@ -32241,7 +32923,7 @@ test "graph pruneOwnedRange preserves reverse edges for retained cross-range sou
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
     try graph.addEdge("doc:a", "doc:z", "ref", 1.0, 0, 0, "");
@@ -32285,7 +32967,7 @@ test "tree topology rejects second outgoing edge" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{
         .edge_type_configs = &.{.{ .name = "parent", .topology = .tree }},
     });
     defer graph.close();
@@ -32315,7 +32997,7 @@ test "tree topology allows update to same target" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{
         .edge_type_configs = &.{.{ .name = "parent", .topology = .tree }},
     });
     defer graph.close();
@@ -32345,7 +33027,7 @@ test "graph mode allows multiple outgoing edges" {
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
     // "parent" is tree, "likes" is graph (default)
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{
         .edge_type_configs = &.{.{ .name = "parent", .topology = .tree }},
     });
     defer graph.close();
@@ -32370,7 +33052,7 @@ test "graph reverse backend adapters expose txn cursor and batch operations" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
     {
@@ -32417,7 +33099,7 @@ test "graph stats summary counts unique nodes from reverse edges" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
     try graph.addEdge("doc:a", "doc:b", "links", 1.0, 0, 0, "");
@@ -32439,7 +33121,7 @@ test "graph reverse store opens concrete txn and batch handles" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
     const reverse_store = graph.reverseStore();
@@ -32481,7 +33163,7 @@ test "graph reverse store persists on durable lsm backend across reopen" {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
 
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{
             .reverse_backend = .lsm,
         });
         defer graph.close();
@@ -32495,7 +33177,7 @@ test "graph reverse store persists on durable lsm backend across reopen" {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
 
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{
             .reverse_backend = .lsm,
         });
         defer graph.close();
@@ -32526,7 +33208,7 @@ test "graph reverse lsm durable boundary checkpoint retires retained wal" {
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
 
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{
         .reverse_backend = .lsm,
         .reverse_lsm_options = .{ .flush_threshold = 1024 },
     });

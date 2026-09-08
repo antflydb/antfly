@@ -103,6 +103,19 @@ pub const Stats = struct {
     last_result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = .{},
 };
 
+fn prepareTopologyForRuntimeTest(db: *@import("../mod.zig").DB, name: []const u8) !void {
+    const entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+    const cfg = for (entry.metric_configs) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) break cfg;
+    } else return error.MetricNotConfigured;
+    while (!try entry.index.prepareGraphMetricPartitionStep(4096)) {}
+    for (0..512) |_| {
+        if (try entry.index.prepareGraphMetricTopology(cfg, entry.index.edge_generation)) break;
+        _ = try entry.index.runGraphMetricTopologyPreparationStep("runtime-fixture-preparation");
+    } else return error.TopologyPreparationDidNotSeal;
+    for (0..32) |_| if (!try entry.index.runGraphMetricTopologyPreparationStep("runtime-fixture-cleanup")) break;
+}
+
 pub fn expectPlannedAutoIdleDecision(
     index_manager: *index_manager_mod.IndexManager,
     options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
@@ -2594,6 +2607,8 @@ test "db graph metric runtime role distinct worker owners complete separate acti
     }
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
+    // Keep this lease-takeover fixture multi-page without thousands of writes.
+    db.core.graphIndex("graph_idx").?.index.test_partition_target_units = 64;
 
     const target_generation = blk: {
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
@@ -5418,6 +5433,9 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
         });
 
         try db.runDerivedUntil(db.core.nextDerivedSequence());
+        // This fixture exercises numerical coordinator/page recovery; cold
+        // preparation recovery has its own independent-task regression.
+        try prepareTopologyForRuntimeTest(&db, "pagerank");
 
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         var status = try graph_entry.index.graphMetricStatus("pagerank");
@@ -6797,6 +6815,7 @@ test "db graph metric runtime background cycles multiple worker ids across plann
     }
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
+    db.core.graphIndex("graph_idx").?.index.test_partition_target_units = 64;
 
     const workers = [_][]const u8{ "runtime-worker-a", "runtime-worker-b" };
     const resources = db.core.asyncResources();
@@ -6901,6 +6920,7 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
         try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
+    try prepareTopologyForRuntimeTest(&db, "pagerank");
     const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
         .max_metrics = 8,
         .start_background_builds = true,
@@ -6960,7 +6980,11 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
         .max_metrics = 8,
         .start_background_builds = true,
     });
-    try std.testing.expectEqual(@as(usize, 1), retry_new_generation.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), retry_new_generation.builds_started);
+    try std.testing.expect(retry_new_generation.planning_steps > 0);
+    try prepareTopologyForRuntimeTest(&db, "pagerank");
+    const admitted = try db.runGraphMetricPlannedCoordinatorSweep(.{ .max_metrics = 8, .start_background_builds = true });
+    try std.testing.expectEqual(@as(usize, 1), admitted.builds_started);
     {
         const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
         var status = try graph_entry.index.graphMetricStatus("pagerank");
@@ -8634,8 +8658,9 @@ test "db graph metric runtime planned maintenance reports budget exhaustion and 
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expect(pending.active_builds > 0);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     var finished = false;
@@ -11306,8 +11331,9 @@ test "db graph metric runtime default gate runUntilIdle planned graph metric mai
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expect(pending.active_builds > 0);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -11460,8 +11486,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -11618,8 +11645,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -11693,8 +11721,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 2), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -11780,8 +11809,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -11854,8 +11884,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -12026,8 +12057,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -12163,8 +12195,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -12232,8 +12265,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 2), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -12544,8 +12578,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -12619,8 +12654,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
@@ -12833,8 +12869,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
-        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
-        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+        // Preparation is admitted independently; only numerical jobs count as active.
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
     }
 
     db.graph_metric_idle_planned_options.max_rounds = 200;

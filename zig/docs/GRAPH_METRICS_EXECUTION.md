@@ -22,13 +22,31 @@ discovery and adjacency production, reads the shared canonical membership for
 its own seed/initialization, and uses shared packed tiles for every iteration.
 HITS topology can serve PageRank or eigenvector; a forward-only owner cannot
 satisfy HITS. Published scores keep their existing format; intermediate jobs
-from execution schemas before v15 restart.
+from execution schemas before v16 restart.
 
-Concurrent cold producers have distinct owner and staging namespaces. They may
-duplicate initial preparation, but never share partial attempts or wait on
-another numerical job. The first sealed owner wins each reuse directory entry;
-losing owners are reclaimed after their own jobs release their pins. This avoids
-introducing producer dependencies into worker-pool admission or recovery.
+Cold scheduled builds first enqueue an index-scoped preparation task keyed by
+generation, filter and required orientation. Concurrent PageRank/eigenvector
+requests share it; queued HITS requirements select a bidirectional task. The
+task has its own control namespace, page leases and recovery checkpoints, and
+one independently admitted execution slot per index. It builds membership and
+packed adjacency without rank vectors or score publication. Waiting metrics
+retain durable requests, but hold no numerical lease or admission slot.
+Only after the owner seals does the coordinator admit numerical jobs. Explicit
+low-level planned execution retains an independent-producer path for isolated
+maintenance and parity benchmarks; the first sealed owner wins its directory.
+
+Task failures preserve their root cause on dependent metrics. Retirement is
+durably marked before bounded control-key deletion, so a crash cannot resurrect
+a partially deleted task. A durable monotonic incarnation gives each retry a
+separate control namespace. Admission, failure delivery and retirement validate
+that incarnation, including across reopened handles. Failure delivery is
+idempotent per task/dependent so a delayed reporter cannot consume a new manual
+retry request. Generation changes and loss of all eligible consumers
+retire preparation; independent numerical/publication lifetimes are unchanged.
+Intermediate partition-plan v7 uses 4,096-unit scheduling ranges (capped at 256
+partitions), with byte/work-bounded checkpoints within each range. Canonical
+256-entry membership/vector chunks remain separate from scheduling page size.
+Tests can inject smaller ranges to exercise takeover and partition boundaries.
 
 Reclamation is index-scoped, including indexes with zero configured metrics.
 Each transaction examines at most 64 pins and deletes at most 512 topology
@@ -39,9 +57,10 @@ A durable deleting tombstone atomically unpublishes the owner and fences late
 writes/adoption; deletion resumes after crashes by removing the next key page.
 Superseded packing attempts have a separate bounded retirement queue so a
 retained owner does not retain abandoned tiles indefinitely.
-Cursor-only census advances do not count as eligible worker work: periodic
-wakeups continue scanning without keeping idle worker pools busy. Actual
-reclamation consumes the normal worker-page budget.
+Census position is an in-memory fairness hint: retained-owner and end-of-catalog
+scans write no durable cursor or WAL record. Idle inspections have a per-sweep
+budget without reporting eligible worker work. Actual reclamation consumes the
+normal worker-page budget; durable tombstones/deleted keys provide recovery.
 
 ## Non-serverless
 
@@ -123,7 +142,7 @@ reclamation consumes the normal worker-page budget.
   retired data. Worker handles observe retirement independently of coordinators.
 - Final numeric-score publication admits at most 4,096 nodes or 1 MiB of node
   IDs per checkpoint (one oversized ID is allowed to guarantee progress).
-  This is independent of 64-node planning granularity. Prior scores for both
+  This is independent of scheduling range size. Prior scores for both
   HITS lanes are bulk-read before either lane stages mutations. Primary scores,
   ordered staging keys, and the attempt-fenced page cursor commit atomically.
   The coordinator checkpoints the bounded top-K prefix before pointer publication.
@@ -227,8 +246,20 @@ every row per column. Per-column ownership contains only unresolved block spans,
 not another row map; authenticated cache hits are consumed during preparation.
 Span, range, selected-page and decoded-routing capacities are charged before
 allocation, including possible owned-slice replacement peaks. These reservations
-use the same shared, conservative, request-cumulative budget as score storage.
-The complete transport plan is still admitted before score network I/O.
+share the request memory limit, but point-read scratch and routing leases release
+their conservative charge when the read ends and all children have joined.
+Request-scoped output columns transfer move-only reservations into the staged
+HTTP query cache; replacing or discarding a column releases its prior charge.
+Rebasing reserves the replacement before allocation and commits ownership only
+after successful scatter, preserving old data and admission on failure.
+Public output APIs detach the reservation because their results may outlive the
+session; those escaping results retain a conservative request charge. Network
+requests/bytes, decoded blocks and work remain cumulative and cannot be refunded
+by dropping a stage. The complete transport plan is admitted before score I/O.
+
+Within an authenticated score block, sparse candidates use binary lookup while
+dense sorted candidates merge once through the block. Original row ordinals
+scatter results without reordering callers or losing duplicate/missing IDs.
 
 Top-K reserves descriptor storage before allocation or ranked-block reads, then
 charges each decoded node ID before allocating it. Both per-result and shared
