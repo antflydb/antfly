@@ -611,10 +611,105 @@ def directory_inventory(path: Path | None, limit: int = 32) -> dict[str, Any] | 
     }
 
 
+def materialize_lsm_manifest(raw: bytes) -> bytes:
+    """Replay the durable prefix for inventory without opening the store."""
+    if not raw.startswith(b"ALSMJNL1"):
+        return raw
+    runs: dict[int, bytes] = {}
+    paths: dict[bytes, bytes] = {}
+    offset, sequence, next_id = 8, 0, 0
+    while offset < len(raw):
+        if len(raw) - offset < 24:
+            break
+        length, found_sequence, kind, checksum = struct.unpack_from(
+            "<QQII", raw, offset
+        )
+        if (
+            zlib.crc32(raw[offset : offset + 20]) != checksum
+            or found_sequence != sequence
+            or kind != int(sequence == 0)
+            or length > (1 << 32) - 1
+        ):
+            raise ValueError("invalid manifest journal header")
+        offset += 24
+        if len(raw) - offset < length + 4:
+            break
+        body = raw[offset : offset + length]
+        if zlib.crc32(body) != struct.unpack_from("<I", raw, offset + length)[0]:
+            raise ValueError("invalid manifest journal checksum")
+        cursor = 0
+        removed = struct.unpack_from("<I", body, cursor)[0]
+        cursor += 4
+        if removed > (len(body) - cursor) // 8 or (sequence == 0 and removed):
+            raise ValueError("invalid manifest removals")
+        for _ in range(removed):
+            run_id = struct.unpack_from("<Q", body, cursor)[0]
+            cursor += 8
+            if runs.pop(run_id, None) is None:
+                raise ValueError("unknown removed run")
+        removed = struct.unpack_from("<I", body, cursor)[0]
+        cursor += 4
+        if removed > (len(body) - cursor) // 4 or (sequence == 0 and removed):
+            raise ValueError("invalid obsolete removals")
+        for _ in range(removed):
+            size = struct.unpack_from("<I", body, cursor)[0]
+            cursor += 4
+            if (
+                cursor + size > len(body)
+                or paths.pop(body[cursor : cursor + size], None) is None
+            ):
+                raise ValueError("unknown removed obsolete path")
+            cursor += size
+        manifest = body[cursor:]
+        if (
+            len(manifest) < 32
+            or manifest[:8] != b"ALSMMAN1"
+            or struct.unpack_from("<I", manifest, 8)[0] != 10
+        ):
+            raise ValueError("invalid embedded manifest")
+        if (
+            zlib.crc32(manifest[:-4])
+            != struct.unpack_from("<I", manifest, len(manifest) - 4)[0]
+        ):
+            raise ValueError("invalid embedded checksum")
+        found_id, run_count, path_count = struct.unpack_from("<QII", manifest, 12)
+        if sequence and found_id < next_id:
+            raise ValueError("regressing manifest identity")
+        next_id = found_id
+        cursor = 28
+        if run_count > (len(manifest) - cursor) // 112:
+            raise ValueError("invalid run count")
+        for _ in range(run_count):
+            run_id = struct.unpack_from("<Q", manifest, cursor)[0]
+            size = 112 + sum(struct.unpack_from("<IIIII", manifest, cursor + 60))
+            if cursor + size > len(manifest) - 4:
+                raise ValueError("truncated run")
+            runs[run_id] = manifest[cursor : cursor + size]
+            cursor += size
+        if path_count > (len(manifest) - cursor) // 12:
+            raise ValueError("invalid obsolete count")
+        for _ in range(path_count):
+            size = struct.unpack_from("<I", manifest, cursor + 8)[0]
+            end = cursor + 12 + size
+            if end > len(manifest) - 4:
+                raise ValueError("truncated obsolete path")
+            paths[manifest[cursor + 12 : end]] = manifest[cursor:end]
+            cursor = end
+        if cursor != len(manifest) - 4:
+            raise ValueError("trailing embedded bytes")
+        sequence += 1
+        offset += length + 4
+    if sequence == 0:
+        raise ValueError("missing manifest checkpoint")
+    result = b"ALSMMAN1" + struct.pack("<IQII", 10, next_id, len(runs), len(paths))
+    result += b"".join(runs.values()) + b"".join(paths.values())
+    return result + struct.pack("<I", zlib.crc32(result))
+
+
 def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | None:
     """Decode LSM run ownership without opening or mutating the store."""
     try:
-        raw = manifest_path.read_bytes()
+        raw = materialize_lsm_manifest(manifest_path.read_bytes())
         if len(raw) < 28 or raw[:8] != b"ALSMMAN1":
             return None
         offset = 8
@@ -742,7 +837,7 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
             )
         if offset != len(raw):
             return None
-    except (OSError, UnicodeDecodeError, struct.error):
+    except (OSError, UnicodeDecodeError, struct.error, ValueError):
         return None
 
     physical_paths = list((manifest_path.parent / "runs").glob("*.tbl"))

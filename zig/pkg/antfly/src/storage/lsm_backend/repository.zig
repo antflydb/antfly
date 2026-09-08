@@ -510,25 +510,36 @@ pub fn persistManifestWithStorageCount(
     const manifest_path = try joinPath(allocator, root_dir, "manifest.bin");
     defer allocator.free(manifest_path);
 
+    const encoded = try encodeManifestAlloc(allocator, next_run_id, runs, obsolete_paths);
+    defer allocator.free(encoded);
+    try replaceFileAtomicallyAbsolute(storage, manifest_path, encoded);
+    return @intCast(encoded.len);
+}
+
+pub fn runMeta(run: Run) lsm_manifest.RunMeta {
+    return .{
+        .id = run.id,
+        .level = run.level,
+        .size_bytes = run.size_bytes,
+        .compression_stats = run.compression_stats,
+        .path = run.path.?,
+        .smallest_namespace_name = run.smallest_namespace_name,
+        .smallest_key = run.smallest_key,
+        .largest_namespace_name = run.largest_namespace_name,
+        .largest_key = run.largest_key,
+        .entry_count = run.entry_count,
+        .tombstone_count = run.tombstone_count,
+        .oldest_tombstone_unix_ns = run.oldest_tombstone_unix_ns,
+        .visibility_id = run.visibility_id,
+        .gc_requested = run.gc_requested,
+    };
+}
+
+pub fn encodeManifestAlloc(allocator: Allocator, next_run_id: u64, runs: []const Run, obsolete_paths: []const ObsoletePath) ![]u8 {
     var metas = try allocator.alloc(lsm_manifest.RunMeta, runs.len);
     defer allocator.free(metas);
     for (runs, 0..) |run, i| {
-        metas[i] = .{
-            .id = run.id,
-            .level = run.level,
-            .size_bytes = run.size_bytes,
-            .compression_stats = run.compression_stats,
-            .path = run.path.?,
-            .smallest_namespace_name = run.smallest_namespace_name,
-            .smallest_key = run.smallest_key,
-            .largest_namespace_name = run.largest_namespace_name,
-            .largest_key = run.largest_key,
-            .entry_count = run.entry_count,
-            .tombstone_count = run.tombstone_count,
-            .oldest_tombstone_unix_ns = run.oldest_tombstone_unix_ns,
-            .visibility_id = run.visibility_id,
-            .gc_requested = run.gc_requested,
-        };
+        metas[i] = runMeta(run);
     }
 
     var obsolete_metas = try allocator.alloc(lsm_manifest.ObsoletePathMeta, obsolete_paths.len);
@@ -540,14 +551,195 @@ pub fn persistManifestWithStorageCount(
         };
     }
 
-    const encoded = try lsm_manifest.encodeAlloc(allocator, .{
+    return try lsm_manifest.encodeAlloc(allocator, .{
         .next_run_id = next_run_id,
         .runs = metas,
         .obsolete_paths = obsolete_metas,
     });
-    defer allocator.free(encoded);
-    try replaceFileAtomicallyAbsolute(storage, manifest_path, encoded);
-    return @intCast(encoded.len);
+}
+
+pub const ManifestJournal = struct {
+    sequence: ?u64 = null,
+    bytes: u64 = 0,
+    edit_bytes: u64 = 0,
+    next_run_id: u64 = 0,
+    obsolete: std.StringHashMapUnmanaged(TrackedPath) = .empty,
+    const TrackedPath = struct { deadline: u64, seen: bool };
+    const Measure = struct {
+        wire_bytes: u64 = 128,
+        rows: u64 = 0,
+        pub fn put(measure: *@This(), run: Run) !void {
+            measure.rows += 1;
+            measure.wire_bytes += 112 + run.path.?.len + run.smallest_key.len + run.largest_key.len;
+            if (run.smallest_namespace_name) |name| measure.wire_bytes += name.len;
+            if (run.largest_namespace_name) |name| measure.wire_bytes += name.len;
+        }
+        pub fn remove(measure: *@This(), _: Run) !void {
+            measure.wire_bytes += 8;
+        }
+    };
+    pub const Result = struct { written: u64, total: u64, checkpoint: bool };
+
+    pub fn deinit(self: *@This(), allocator: Allocator) void {
+        var keys = self.obsolete.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        self.obsolete.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn memoryBytes(self: *const @This()) u64 {
+        var bytes: u64 = @as(u64, self.obsolete.capacity()) * (@sizeOf([]const u8) + @sizeOf(TrackedPath) + 1);
+        var keys = self.obsolete.keyIterator();
+        while (keys.next()) |key| bytes += key.len;
+        return bytes;
+    }
+
+    fn checkpointDue(self: *const @This()) bool {
+        const edit_budget = @min(8 * 1024 * 1024, (max_manifest_read_bytes -| (self.bytes -| self.edit_bytes)) / 2);
+        return self.sequence == null or self.sequence.? >= 256 or self.edit_bytes >= edit_budget;
+    }
+
+    /// Caller holds the publication lock. The last durable directory owns SST
+    /// pins until its successor is durable, independently of reader lifetimes.
+    pub fn persist(self: *@This(), backend: anytype, root_dir: []const u8, runs: []const Run) !Result {
+        return self.persistAttempt(backend, root_dir, runs) catch |err| {
+            if (err != error.ManifestEditTooLarge) return err;
+            // The failed preparation already reset the journal state and
+            // released its scratch. Replace it with a full checkpoint rather
+            // than rejecting an otherwise representable large publication.
+            return self.persistAttempt(backend, root_dir, runs);
+        };
+    }
+
+    fn persistAttempt(self: *@This(), backend: anytype, root_dir: []const u8, runs: []const Run) !Result {
+        const allocator = backend.allocator;
+        const current = if (!backend.run_directory_dirty and runs.ptr == backend.runs.items.ptr and runs.len == backend.runs.items.len) backend.run_directory else null;
+        // Count suffix bytes, not the checkpoint itself: large stores must
+        // not checkpoint on every edit merely because their base exceeds 8 MiB.
+        const checkpoint = self.checkpointDue() or current == null or backend.manifest_directory == null;
+        if (!checkpoint and current.?.tree.root == backend.manifest_directory.?.tree.root and self.next_run_id == backend.next_run_id and self.obsolete.count() == backend.obsolete_paths.items.len) {
+            const unchanged = for (backend.obsolete_paths.items) |path| {
+                const tracked = self.obsolete.get(path.path) orelse break false;
+                if (tracked.deadline != path.delete_after_ns) break false;
+            } else true;
+            if (unchanged) return .{ .written = 0, .total = self.bytes, .checkpoint = false };
+        }
+        var reservation: ?resource_manager_mod.Reservation = null;
+        defer {
+            backend.syncTrackedInMemoryStateUsageCurrentLocked();
+            if (reservation) |*lease| lease.release();
+        }
+        if (backend.options.resource_manager) |manager| {
+            var measure: Measure = .{};
+            if (checkpoint) {
+                for (runs) |run| try measure.put(run);
+            } else try current.?.changesSince(backend.manifest_directory.?, &measure);
+            for (backend.obsolete_paths.items) |path| measure.wire_bytes += 12 + path.path.len;
+            var old_paths = self.obsolete.keyIterator();
+            while (old_paths.next()) |path| measure.wire_bytes += 4 + path.len;
+            // Three framed encoding buffers, geometric growth, descriptor
+            // scratch, and path-map rehashing are admitted before allocation.
+            const bound = measure.wire_bytes * 8 + measure.rows * @sizeOf(lsm_manifest.RunMeta) * 2;
+            // Encoding is transient builder work, not retained memtable/run
+            // metadata. Charging it to retained state can prevent a pressured
+            // memtable from flushing precisely when publication frees memory.
+            // The persistent directory/path ledger is observed separately in
+            // the defer above, before this scratch reservation is released.
+            reservation = try manager.reserve(.lsm_table_builder_working_set, bound);
+        }
+        const next_directory = if (current) |directory| try directory.fork(allocator) else null;
+        errdefer if (next_directory) |directory| directory.destroy(allocator);
+        // Any error, including an ambiguous append/sync result, forces the
+        // next attempt to atomically replace the journal with a checkpoint.
+        errdefer self.sequence = null;
+        const Delta = struct {
+            allocator: Allocator,
+            added: std.ArrayListUnmanaged(lsm_manifest.RunMeta) = .empty,
+            removed: std.ArrayListUnmanaged(u64) = .empty,
+            pub fn put(delta: *@This(), run: Run) !void {
+                try delta.added.append(delta.allocator, runMeta(run));
+            }
+            pub fn remove(delta: *@This(), run: Run) !void {
+                try delta.removed.append(delta.allocator, run.id);
+            }
+        };
+        var delta = Delta{ .allocator = allocator };
+        defer delta.added.deinit(allocator);
+        defer delta.removed.deinit(allocator);
+        if (checkpoint) {
+            for (runs) |run| try delta.put(run);
+            self.deinit(allocator);
+        } else try current.?.changesSince(backend.manifest_directory.?, &delta);
+
+        var added_paths: std.ArrayListUnmanaged(lsm_manifest.ObsoletePathMeta) = .empty;
+        defer added_paths.deinit(allocator);
+        var removed_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (removed_paths.items) |path| allocator.free(path);
+            removed_paths.deinit(allocator);
+        }
+        var values = self.obsolete.valueIterator();
+        while (values.next()) |value| value.seen = false;
+        for (backend.obsolete_paths.items) |path| {
+            if (self.obsolete.getPtr(path.path)) |tracked| {
+                tracked.seen = true;
+                if (tracked.deadline == path.delete_after_ns) continue;
+                tracked.deadline = path.delete_after_ns;
+            } else {
+                const owned = try allocator.dupe(u8, path.path);
+                errdefer allocator.free(owned);
+                try self.obsolete.put(allocator, owned, .{ .deadline = path.delete_after_ns, .seen = true });
+            }
+            try added_paths.append(allocator, .{ .path = path.path, .delete_after_ns = path.delete_after_ns });
+        }
+        var entries = self.obsolete.iterator();
+        while (entries.next()) |entry| if (!entry.value_ptr.seen) {
+            const path = entry.key_ptr.*;
+            try removed_paths.append(allocator, path);
+            _ = self.obsolete.remove(path);
+        };
+        if (!checkpoint and delta.added.items.len == 0 and delta.removed.items.len == 0 and added_paths.items.len == 0 and removed_paths.items.len == 0 and self.next_run_id == backend.next_run_id) {
+            backend.publishManifestDirectory(next_directory);
+            return .{ .written = 0, .total = self.bytes, .checkpoint = false };
+        }
+        const sequence = if (checkpoint) 0 else self.sequence.? + 1;
+        const encoded = try lsm_manifest.encodeJournalFrameAlloc(allocator, sequence, checkpoint, delta.removed.items, removed_paths.items, .{
+            .next_run_id = backend.next_run_id,
+            .runs = delta.added.items,
+            .obsolete_paths = added_paths.items,
+        });
+        defer allocator.free(encoded);
+        const total = if (checkpoint) encoded.len else self.bytes + encoded.len;
+        if (total > max_manifest_read_bytes) return if (checkpoint) error.FileTooBig else error.ManifestEditTooLarge;
+        try ensureOpenDirsWithStorage(backend.storage.?, root_dir);
+        const path = try manifestPath(allocator, root_dir);
+        defer allocator.free(path);
+        if (checkpoint) {
+            try replaceFileAtomicallyAbsolute(backend.storage.?, path, encoded);
+        } else {
+            try backend.storage.?.appendFileAbsolute(allocator, path, encoded, true);
+        }
+        self.sequence = sequence;
+        self.bytes = total;
+        self.edit_bytes = if (checkpoint) 0 else self.edit_bytes + encoded.len;
+        self.next_run_id = backend.next_run_id;
+        backend.publishManifestDirectory(next_directory);
+        return .{ .written = encoded.len, .total = total, .checkpoint = checkpoint };
+    }
+};
+
+test "manifest checkpoint cadence measures suffix rather than large base bytes" {
+    var journal = ManifestJournal{ .sequence = 1, .bytes = 32 * 1024 * 1024 };
+    try std.testing.expect(!journal.checkpointDue());
+    journal.edit_bytes = 8 * 1024 * 1024;
+    try std.testing.expect(journal.checkpointDue());
+    journal.edit_bytes = 0;
+    journal.sequence = 256;
+    try std.testing.expect(journal.checkpointDue());
+    journal.sequence = 1;
+    journal.bytes = 127 * 1024 * 1024 + 512 * 1024;
+    journal.edit_bytes = 512 * 1024;
+    try std.testing.expect(journal.checkpointDue());
 }
 
 fn estimateRunBytes(entry_count: u32, bloom_len: usize) u64 {

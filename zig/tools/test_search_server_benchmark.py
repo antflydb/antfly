@@ -240,6 +240,39 @@ class ServerBenchmarkTest(unittest.TestCase):
         self.assertTrue(benchmark.template_has_marker({"expect_contains": "{marker}"}))
         self.assertFalse(benchmark.template_has_marker({"body": {"query": "constant"}}))
 
+    def test_manifest_journal_inventory_and_torn_tail(self):
+        def frame(sequence, checkpoint, manifest, removed=()):
+            body = struct.pack("<I", len(removed))
+            body += b"".join(struct.pack("<Q", run_id) for run_id in removed)
+            body += struct.pack("<I", 0) + manifest
+            header = struct.pack("<QQI", len(body), sequence, int(checkpoint))
+            return (
+                (b"ALSMJNL1" if checkpoint else b"")
+                + header
+                + struct.pack("<I", zlib.crc32(header))
+                + body
+                + struct.pack("<I", zlib.crc32(body))
+            )
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            path = root / "manifest.bin"
+            base = frame(0, True, lsm_manifest([root / "1.tbl"], [], 11, version=10))
+            edit = frame(1, False, lsm_manifest([], [], 0, version=10), (1,))
+            for size in range(len(edit) + 1):
+                path.write_bytes(base + edit[:size])
+                inventory = benchmark.lsm_manifest_inventory(root, path)
+                self.assertIsNotNone(inventory)
+                self.assertEqual(
+                    0 if size == len(edit) else 1, len(inventory["active_runs"])
+                )
+            damaged = bytearray(base + edit)
+            damaged[-1] ^= 1
+            path.write_bytes(damaged)
+            self.assertIsNone(benchmark.lsm_manifest_inventory(root, path))
+            path.write_bytes(base + edit + edit)
+            self.assertIsNone(benchmark.lsm_manifest_inventory(root, path))
+
     def test_response_hit_count_supports_antfly_and_quickwit(self):
         self.assertEqual(1, benchmark.response_hit_count(b'{"hits":[{"id":"doc:1"}]}'))
         self.assertEqual(

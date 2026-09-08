@@ -568,6 +568,50 @@ test "lsm backend simulation immutable flush write fault keeps wal-backed state 
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 }
 
+test "lsm backend simulation journal append and checkpoint faults preserve acknowledged WAL writes" {
+    for (0..2) |checkpoint| for (0..2) |sync_fault| for (0..2) |retry| {
+        var device = storage_sim.ModeledDevice.init(std.testing.allocator);
+        defer device.deinit();
+        const root_dir = "/lsm-journal-publication-fault";
+        const options = lsm_backend_mod.Options{ .storage = device.storage(), .flush_threshold = 1000, .compact_threshold_runs = 1000, .wal_sync_on_commit = true };
+        var backend = try lsm_backend_mod.Backend.open(std.testing.allocator, root_dir, options);
+        defer backend.close();
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "old", "durable");
+            try write.commit();
+        }
+        try backend.sync(true);
+        try std.testing.expectEqual(@as(?u64, 0), backend.manifest_journal.sequence);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "new", "acknowledged");
+            try write.commit();
+        }
+        if (checkpoint != 0) backend.manifest_journal.sequence = 256;
+        if (sync_fault != 0) {
+            try device.injectSyncFailureForPathContains("manifest.bin");
+            try std.testing.expectError(error.InjectedSyncFault, backend.sync(true));
+        } else {
+            try device.injectWriteFailureForPathContains("manifest.bin");
+            try std.testing.expectError(error.InjectedWriteFault, backend.sync(true));
+        }
+        // Releasing retired metadata can itself retry publication. Whether
+        // that cleanup succeeds or leaves debt, explicit retry/crash is safe.
+        if (retry != 0) {
+            try backend.sync(true);
+            try std.testing.expectEqual(@as(?u64, 0), backend.manifest_journal.sequence);
+        }
+        try crashReopenLsm(&backend, &device, root_dir, options);
+        var read = try backend.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("durable", try read.get(.{}, "old"));
+        try std.testing.expectEqualStrings("acknowledged", try read.get(.{}, "new"));
+    };
+}
+
 test "lsm backend simulation manifest sync fault recovers previous compaction view" {
     const root_dir = "/lsm-modeled-compaction-manifest-fault";
     const options = lsm_backend_mod.Options{

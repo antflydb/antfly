@@ -7542,6 +7542,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, restore_report.ptr.?[0..restore_report.len], "\"format\":\"aflite\"") != null);
 
     lite_restore_staging.failNextPublishedFileDirectorySyncForTest();
+    antfly.test_error_logs.expectErrorLogs(1);
     var unknown_report: capi.Buffer = .{ .ptr = @constCast("stale".ptr), .len = "stale".len };
     try std.testing.expectEqual(capi.ErrorCode.outcome_unknown, antfly_lite_restore_backup_json(restore_unknown_path, .{
         .ptr = backup.ptr,

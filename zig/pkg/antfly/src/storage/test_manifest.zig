@@ -211,6 +211,7 @@ comptime {
     _ = @import("lsm_backend/compaction_scheduler.zig");
     _ = @import("lsm_backend/mod.zig");
     _ = @import("lsm_backend/repository.zig");
+    _ = @import("lsm_backend/run_directory.zig");
     _ = @import("lsm_backend/runtime.zig");
     _ = @import("lsm_backend/state.zig");
     _ = @import("lsm_backend/storage_io.zig");

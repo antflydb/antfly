@@ -2798,6 +2798,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // Mach-O ReleaseSafe codegen for the storage-backed C API peaks near
+        // 10 GiB. Keep its scheduler claim above that measured peak instead
+        // of inheriting the aggregate's 7 GiB Linux claim.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_capi_tests = addFilteredTestRunArtifact(b, capi_tests);
     const capi_test_step = b.step("capi-test", "Run C API tests");

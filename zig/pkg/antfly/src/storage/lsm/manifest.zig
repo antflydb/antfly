@@ -18,6 +18,8 @@ const lsm_table_file = @import("table_file.zig");
 
 pub const magic = "ALSMMAN1";
 pub const version: u32 = 10;
+pub const journal_magic = "ALSMJNL1";
+const journal_header_len = 24;
 const checksum_len: usize = @sizeOf(u32);
 
 pub const RunMeta = struct {
@@ -174,7 +176,24 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
     return try bytes.toOwnedSlice(allocator);
 }
 
-pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest {
+pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) anyerror!OwnedManifest {
+    if (std.mem.startsWith(u8, raw, journal_magic)) {
+        const owned_raw = try allocator.dupe(u8, raw);
+        var decoded = decodeBorrowedOwnedAlloc(allocator, owned_raw) catch |err| {
+            allocator.free(owned_raw);
+            return err;
+        };
+        defer decoded.deinit(allocator);
+        const runs = try allocator.alloc(RunMeta, decoded.runs.len);
+        defer allocator.free(runs);
+        for (runs, decoded.runs) |*out, run| out.* = borrowedRunMeta(run);
+        const obsolete = try allocator.alloc(ObsoletePathMeta, decoded.obsolete_paths.len);
+        defer allocator.free(obsolete);
+        for (obsolete, decoded.obsolete_paths) |*out, path| out.* = .{ .path = path.path, .delete_after_ns = path.delete_after_ns };
+        const canonical = try encodeAlloc(allocator, .{ .next_run_id = decoded.next_run_id, .runs = runs, .obsolete_paths = obsolete });
+        defer allocator.free(canonical);
+        return decodeAlloc(allocator, canonical);
+    }
     const body = try verifiedBody(raw);
     var cursor: usize = 0;
     if (body.len < magic.len + 20) return error.InvalidManifest;
@@ -189,15 +208,15 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
     const obsolete_count: usize = @intCast(try readU32(body, &cursor));
     if (run_count > (body.len - cursor) / @as(usize, if (found_version >= 10) 112 else 84)) return error.InvalidManifest;
     if (obsolete_count > (body.len - cursor) / 12) return error.InvalidManifest;
+    const run_metas = try allocator.alloc(OwnedRunMeta, run_count);
+    errdefer allocator.free(run_metas);
+    const obsolete_metas = try allocator.alloc(OwnedObsoletePathMeta, obsolete_count);
+    errdefer allocator.free(obsolete_metas);
     var out: OwnedManifest = .{
         .next_run_id = next_run_id,
-        .runs = try allocator.alloc(OwnedRunMeta, run_count),
-        .obsolete_paths = try allocator.alloc(OwnedObsoletePathMeta, obsolete_count),
+        .runs = run_metas,
+        .obsolete_paths = obsolete_metas,
     };
-    errdefer {
-        allocator.free(out.runs);
-        allocator.free(out.obsolete_paths);
-    }
 
     var initialized: usize = 0;
     errdefer {
@@ -227,16 +246,26 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
         if (gc_requested > 1) return error.InvalidManifest;
         if (id == 0 or path_len == 0) return error.InvalidManifest;
 
+        const path = try allocator.dupe(u8, try readSlice(body, &cursor, path_len));
+        errdefer allocator.free(path);
+        const smallest_namespace = if (smallest_namespace_len > 0) try allocator.dupe(u8, try readSlice(body, &cursor, smallest_namespace_len)) else null;
+        errdefer if (smallest_namespace) |name| allocator.free(name);
+        const smallest_key = try allocator.dupe(u8, try readSlice(body, &cursor, smallest_len));
+        errdefer allocator.free(smallest_key);
+        const largest_namespace = if (largest_namespace_len > 0) try allocator.dupe(u8, try readSlice(body, &cursor, largest_namespace_len)) else null;
+        errdefer if (largest_namespace) |name| allocator.free(name);
+        const largest_key = try allocator.dupe(u8, try readSlice(body, &cursor, largest_len));
+        errdefer allocator.free(largest_key);
         run.* = .{
             .id = id,
             .level = level,
             .size_bytes = size_bytes,
             .compression_stats = compression_stats,
-            .path = try allocator.dupe(u8, try readSlice(body, &cursor, path_len)),
-            .smallest_namespace_name = if (smallest_namespace_len > 0) try allocator.dupe(u8, try readSlice(body, &cursor, smallest_namespace_len)) else null,
-            .smallest_key = try allocator.dupe(u8, try readSlice(body, &cursor, smallest_len)),
-            .largest_namespace_name = if (largest_namespace_len > 0) try allocator.dupe(u8, try readSlice(body, &cursor, largest_namespace_len)) else null,
-            .largest_key = try allocator.dupe(u8, try readSlice(body, &cursor, largest_len)),
+            .path = path,
+            .smallest_namespace_name = smallest_namespace,
+            .smallest_key = smallest_key,
+            .largest_namespace_name = largest_namespace,
+            .largest_key = largest_key,
             .entry_count = entry_count,
             .tombstone_count = tombstone_count,
             .oldest_tombstone_unix_ns = oldest_tombstone_unix_ns,
@@ -261,7 +290,8 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
     return out;
 }
 
-pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !BorrowedManifest {
+pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) anyerror!BorrowedManifest {
+    if (std.mem.startsWith(u8, raw, journal_magic)) return decodeJournalBorrowed(allocator, raw);
     const body = try verifiedBody(raw);
     var cursor: usize = 0;
     if (body.len < magic.len + 20) return error.InvalidManifest;
@@ -276,16 +306,16 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
     const obsolete_count: usize = @intCast(try readU32(body, &cursor));
     if (run_count > (body.len - cursor) / @as(usize, if (found_version >= 10) 112 else 84)) return error.InvalidManifest;
     if (obsolete_count > (body.len - cursor) / 12) return error.InvalidManifest;
+    const run_metas = try allocator.alloc(BorrowedRunMeta, run_count);
+    errdefer allocator.free(run_metas);
+    const obsolete_metas = try allocator.alloc(BorrowedObsoletePathMeta, obsolete_count);
+    errdefer allocator.free(obsolete_metas);
     const out: BorrowedManifest = .{
         .raw = raw,
         .next_run_id = next_run_id,
-        .runs = try allocator.alloc(BorrowedRunMeta, run_count),
-        .obsolete_paths = try allocator.alloc(BorrowedObsoletePathMeta, obsolete_count),
+        .runs = run_metas,
+        .obsolete_paths = obsolete_metas,
     };
-    errdefer {
-        allocator.free(out.runs);
-        allocator.free(out.obsolete_paths);
-    }
 
     for (out.runs) |*run| {
         const id = try readU64(body, &cursor);
@@ -336,6 +366,98 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
 
     if (cursor != body.len) return error.InvalidManifest;
     return out;
+}
+
+pub fn borrowedRunMeta(run: BorrowedRunMeta) RunMeta {
+    var out: RunMeta = undefined;
+    inline for (@typeInfo(RunMeta).@"struct".fields) |field| @field(out, field.name) = @field(run, field.name);
+    return out;
+}
+
+/// A checkpoint starts a new journal file. Each frame independently protects
+/// its length/sequence header and complete payload, so recovery distinguishes
+/// an incomplete final append from corruption of a complete record.
+pub fn encodeJournalFrameAlloc(allocator: std.mem.Allocator, sequence: u64, checkpoint: bool, removed_runs: []const u64, removed_paths: []const []const u8, manifest: Manifest) ![]u8 {
+    if (checkpoint and (sequence != 0 or removed_runs.len != 0 or removed_paths.len != 0)) return error.InvalidManifest;
+    const encoded = try encodeAlloc(allocator, manifest);
+    defer allocator.free(encoded);
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendU32(allocator, &body, @intCast(removed_runs.len));
+    for (removed_runs) |id| try appendU64(allocator, &body, id);
+    try appendU32(allocator, &body, @intCast(removed_paths.len));
+    for (removed_paths) |path| {
+        try appendU32(allocator, &body, @intCast(path.len));
+        try body.appendSlice(allocator, path);
+    }
+    try body.appendSlice(allocator, encoded);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (checkpoint) try out.appendSlice(allocator, journal_magic);
+    const header_start = out.items.len;
+    try appendU64(allocator, &out, body.items.len);
+    try appendU64(allocator, &out, sequence);
+    try appendU32(allocator, &out, @intFromBool(checkpoint));
+    try appendU32(allocator, &out, Crc32.hash(out.items[header_start..]));
+    try out.appendSlice(allocator, body.items);
+    try appendU32(allocator, &out, Crc32.hash(body.items));
+    return try out.toOwnedSlice(allocator);
+}
+
+fn decodeJournalBorrowed(allocator: std.mem.Allocator, raw: []u8) !BorrowedManifest {
+    var runs: std.AutoHashMapUnmanaged(u64, BorrowedRunMeta) = .empty;
+    defer runs.deinit(allocator);
+    var paths: std.StringHashMapUnmanaged(BorrowedObsoletePathMeta) = .empty;
+    defer paths.deinit(allocator);
+    var cursor: usize = journal_magic.len;
+    var sequence: u64 = 0;
+    var next_run_id: u64 = 0;
+    while (cursor < raw.len) {
+        if (raw.len - cursor < journal_header_len) break;
+        const header = raw[cursor..][0..journal_header_len];
+        if (Crc32.hash(header[0..20]) != std.mem.readInt(u32, header[20..24], .little)) return error.InvalidManifest;
+        const length = std.mem.readInt(u64, header[0..8], .little);
+        if (length > std.math.maxInt(u32)) return error.InvalidManifest;
+        const found_sequence = std.mem.readInt(u64, header[8..16], .little);
+        const kind = std.mem.readInt(u32, header[16..20], .little);
+        if (found_sequence != sequence or kind != @intFromBool(sequence == 0)) return error.InvalidManifest;
+        cursor += journal_header_len;
+        if (length > raw.len - cursor or raw.len - cursor - @as(usize, @intCast(length)) < 4) break;
+        const body = raw[cursor..][0..@intCast(length)];
+        if (Crc32.hash(body) != std.mem.readInt(u32, raw[cursor + body.len ..][0..4], .little)) return error.InvalidManifest;
+        var offset: usize = 0;
+        const removed_count = try readU32(body, &offset);
+        if (removed_count > (body.len - offset) / 8 or (sequence == 0 and removed_count != 0)) return error.InvalidManifest;
+        for (0..removed_count) |_| {
+            if (!runs.remove(try readU64(body, &offset))) return error.InvalidManifest;
+        }
+        const removed_paths = try readU32(body, &offset);
+        if (removed_paths > (body.len - offset) / 4 or (sequence == 0 and removed_paths != 0)) return error.InvalidManifest;
+        for (0..removed_paths) |_| {
+            const len = try readU32(body, &offset);
+            if (!paths.remove(try readSlice(body, &offset, len))) return error.InvalidManifest;
+        }
+        // Embedded payloads are ordinary standalone manifests, never journals.
+        if (!std.mem.startsWith(u8, body[offset..], magic)) return error.InvalidManifest;
+        var edit = try decodeBorrowedOwnedAlloc(allocator, body[offset..]);
+        edit.raw = &.{};
+        defer edit.deinit(allocator);
+        if (sequence != 0 and edit.next_run_id < next_run_id) return error.InvalidManifest;
+        next_run_id = edit.next_run_id;
+        for (edit.runs) |run| try runs.put(allocator, run.id, run);
+        for (edit.obsolete_paths) |path| try paths.put(allocator, path.path, path);
+        sequence = std.math.add(u64, sequence, 1) catch return error.InvalidManifest;
+        cursor += body.len + 4;
+    }
+    if (sequence == 0) return error.InvalidManifest;
+    const result_runs = try allocator.alloc(BorrowedRunMeta, runs.count());
+    errdefer allocator.free(result_runs);
+    var run_iter = runs.valueIterator();
+    for (result_runs) |*run| run.* = run_iter.next().?.*;
+    const result_paths = try allocator.alloc(BorrowedObsoletePathMeta, paths.count());
+    var path_iter = paths.valueIterator();
+    for (result_paths) |*path| path.* = path_iter.next().?.*;
+    return .{ .raw = raw, .next_run_id = next_run_id, .runs = result_runs, .obsolete_paths = result_paths };
 }
 
 fn readTombstoneCount(raw: []const u8, cursor: *usize, entry_count: u32) !?u32 {
@@ -436,6 +558,46 @@ test "manifest tombstone counts round trip and reject impossible values" {
     try std.testing.expectError(error.InvalidManifest, decodeAlloc(allocator, invalid_visibility));
     // Ownership transfers only on successful decoding.
     try std.testing.expectError(error.InvalidManifest, decodeBorrowedOwnedAlloc(allocator, invalid_visibility));
+}
+
+test "manifest journal replays edits and accepts only incomplete final frames" {
+    const allocator = std.testing.allocator;
+    const run = RunMeta{ .id = 1, .level = 0, .size_bytes = 1, .path = "runs/1.tbl", .smallest_namespace_name = null, .smallest_key = "a", .largest_namespace_name = null, .largest_key = "z", .entry_count = 4, .tombstone_count = 3 };
+    const base = try encodeJournalFrameAlloc(allocator, 0, true, &.{}, &.{}, .{ .next_run_id = 2, .runs = &.{run}, .obsolete_paths = &.{.{ .path = "old.tbl", .delete_after_ns = 9 }} });
+    defer allocator.free(base);
+    var moved = run;
+    moved.level = 1;
+    moved.gc_requested = true;
+    const edit = try encodeJournalFrameAlloc(allocator, 1, false, &.{1}, &.{"old.tbl"}, .{ .next_run_id = 2, .runs = &.{moved} });
+    defer allocator.free(edit);
+    const combined = try std.mem.concat(allocator, u8, &.{ base, edit });
+    defer allocator.free(combined);
+    for (0..edit.len + 1) |tail| {
+        var decoded = try decodeAlloc(allocator, combined[0 .. base.len + tail]);
+        defer decoded.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), decoded.runs.len);
+        try std.testing.expectEqual(@as(u32, if (tail == edit.len) 1 else 0), decoded.runs[0].level);
+        try std.testing.expectEqual(tail == edit.len, decoded.runs[0].gc_requested);
+        try std.testing.expectEqual(@as(usize, if (tail == edit.len) 0 else 1), decoded.obsolete_paths.len);
+    }
+    for ([_]usize{ base.len, base.len + 8, base.len + 16, base.len + journal_header_len, combined.len - 1 }) |offset| {
+        combined[offset] ^= 1;
+        try std.testing.expectError(error.InvalidManifest, decodeAlloc(allocator, combined));
+        combined[offset] ^= 1;
+    }
+    var borrowed = try decodeBorrowedOwnedAlloc(allocator, try allocator.dupe(u8, combined));
+    defer borrowed.deinit(allocator);
+    try std.testing.expectEqualStrings("runs/1.tbl", borrowed.runs[0].path);
+    const duplicate = try std.mem.concat(allocator, u8, &.{ combined, edit });
+    defer allocator.free(duplicate);
+    try std.testing.expectError(error.InvalidManifest, decodeAlloc(allocator, duplicate));
+    try std.testing.checkAllAllocationFailures(allocator, struct {
+        fn decode(alloc: std.mem.Allocator, bytes: []const u8) !void {
+            var decoded = try decodeAlloc(alloc, bytes);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), decoded.runs.len);
+        }
+    }.decode, .{combined});
 }
 
 test "manifest codec round trips run metadata" {
