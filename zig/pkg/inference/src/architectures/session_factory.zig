@@ -8121,30 +8121,7 @@ fn archBackend(ptr: *anyopaque) BackendType {
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     switch (self.backend_type) {
-        .native => {
-            // Retire borrowed queue guards while the lazy-weight map is alive.
-            native_mod.stopPrefetchWorker(&self.backend_data.native);
-            native_mod.deinitPrefetchQueue(&self.backend_data.native);
-            var it = self.backend_data.native.resident_weights.iterator();
-            while (it.next()) |entry| {
-                var w = entry.value_ptr.*;
-                w.deinit();
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.backend_data.native.resident_weights.deinit(self.allocator);
-
-            var lazy_it = self.backend_data.native.lazy_weights.iterator();
-            while (lazy_it.next()) |entry| {
-                if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
-                entry.value_ptr.tensor_ref.deinit(self.allocator);
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.backend_data.native.lazy_weights.deinit(self.allocator);
-            if (self.backend_data.native.residency) |*residency| residency.deinit();
-            if (self.backend_data.native.tensor_store) |tensor_store| tensor_store.deinit();
-            if (self.backend_data.native.tier_cache) |*tier_cache|
-                tier_cache.deinitAdmission();
-        },
+        .native => self.backend_data.native.deinitOwned(),
         .metal => {
             if (comptime build_options.enable_metal) {
                 const gpu_data = gpuBackendData(self);
@@ -8174,28 +8151,7 @@ fn archClose(ptr: *anyopaque) void {
                     client.deinit();
                 }
             }
-            // Clean up the native CPU host-backend weight store.
-            // Retire borrowed queue guards while the lazy-weight map is alive.
-            native_mod.stopPrefetchWorker(&self.backend_data.pjrt.native);
-            native_mod.deinitPrefetchQueue(&self.backend_data.pjrt.native);
-            var it = self.backend_data.pjrt.native.resident_weights.iterator();
-            while (it.next()) |entry| {
-                var w = entry.value_ptr.*;
-                w.deinit();
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.backend_data.pjrt.native.resident_weights.deinit(self.allocator);
-            var lazy_it = self.backend_data.pjrt.native.lazy_weights.iterator();
-            while (lazy_it.next()) |entry| {
-                if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
-                entry.value_ptr.tensor_ref.deinit(self.allocator);
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.backend_data.pjrt.native.lazy_weights.deinit(self.allocator);
-            if (self.backend_data.pjrt.native.residency) |*residency| residency.deinit();
-            if (self.backend_data.pjrt.native.tensor_store) |tensor_store| tensor_store.deinit();
-            if (self.backend_data.pjrt.native.tier_cache) |*tier_cache|
-                tier_cache.deinitAdmission();
+            self.backend_data.pjrt.native.deinitOwned();
         },
         .cuda => {
             if (comptime build_options.enable_cuda) {

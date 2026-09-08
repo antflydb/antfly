@@ -1626,6 +1626,77 @@ fn reopenWalSimAfterModeledCrash(wal: *WAL, wal_open: *bool, path: [*:0]const u8
     wal_open.* = true;
 }
 
+const ConcurrentAppendWorker = struct {
+    wal: *WAL,
+    payload: []const u8,
+    appends: usize = 1,
+    result: u64 = 0,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        for (0..self.appends) |_| {
+            self.result = self.wal.append(self.payload) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    }
+};
+
+/// Test workload ownership: no append starts until every worker has arrived.
+/// If any launch fails, cancel the barrier waits and drain the admitted tasks
+/// before returning, while the WAL and payloads are still alive.
+fn runConcurrentAppends(io: std.Io, workers: []ConcurrentAppendWorker) !void {
+    const Cohort = struct {
+        remaining: std.atomic.Value(usize),
+        ready: std.Io.Event = .unset,
+
+        fn run(self: *@This(), task_io: std.Io, worker: *ConcurrentAppendWorker) void {
+            if (self.remaining.fetchSub(1, .acq_rel) == 1) self.ready.set(task_io);
+            self.ready.wait(task_io) catch return;
+            worker.run();
+        }
+    };
+    var cohort = Cohort{ .remaining = .init(workers.len) };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (workers) |*worker| try group.concurrent(io, Cohort.run, .{ &cohort, io, worker });
+    try group.await(io);
+}
+
+test "wal concurrent append startup failure drains workers without writing" {
+    for (0..3) |capacity| {
+        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(capacity),
+        });
+        defer io_impl.deinit();
+        var buf: [256]u8 = undefined;
+        const path = walTmpPath(&buf);
+        defer cleanupWalDir(path);
+        var wal = try WAL.open(path, .{});
+        defer wal.close();
+        var workers = [_]ConcurrentAppendWorker{
+            .{ .wal = &wal, .payload = "alpha" },
+            .{ .wal = &wal, .payload = "beta" },
+            .{ .wal = &wal, .payload = "gamma" },
+        };
+        try std.testing.expectError(error.ConcurrencyUnavailable, runConcurrentAppends(io_impl.io(), &workers));
+        try std.testing.expectEqual(@as(u64, 0), wal.lastLsn());
+        for (workers) |worker| {
+            try std.testing.expectEqual(@as(u64, 0), worker.result);
+            try std.testing.expect(worker.err == null);
+        }
+        // Reuse the same WAL and payloads after every partial startup point.
+        try runConcurrentAppends(std.testing.io, &workers);
+        try std.testing.expectEqual(@as(u64, 3), wal.lastLsn());
+        for (workers) |worker| {
+            try std.testing.expect(worker.err == null);
+            try std.testing.expect(worker.result > 0);
+        }
+    }
+}
+
 fn applyWalSimAction(
     allocator: Allocator,
     wal: *WAL,
@@ -1671,58 +1742,20 @@ fn applyWalSimAction(
             runtime_next_lsn.* += batch_len;
         },
         .concurrent_pair => {
-            const StartBarrier = struct {
-                mutex: std.atomic.Mutex = .unlocked,
-                waiting: usize = 0,
-                open: bool = false,
-
-                fn wait(self: *@This(), total: usize) void {
-                    var registered = false;
-                    while (true) {
-                        lockAtomic(&self.mutex);
-                        if (!registered) {
-                            self.waiting += 1;
-                            registered = true;
-                            if (self.waiting == total) self.open = true;
-                        }
-                        const ready = self.open;
-                        self.mutex.unlock();
-                        if (ready) return;
-                        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-                    }
-                }
-            };
-
-            const Worker = struct {
-                wal: *WAL,
-                barrier: *StartBarrier,
-                payload: []const u8,
-                result: u64 = 0,
-                err: ?anyerror = null,
-
-                fn run(self: *@This()) void {
-                    self.barrier.wait(2);
-                    self.result = self.wal.append(self.payload) catch |err| {
-                        self.err = err;
-                        return;
-                    };
-                }
-            };
+            const Worker = ConcurrentAppendWorker;
 
             const left_payload = try walSimPayload(allocator, case_label, step, 0);
             errdefer allocator.free(left_payload);
             const right_payload = try walSimPayload(allocator, case_label, step, 1);
             errdefer allocator.free(right_payload);
 
-            var barrier = StartBarrier{};
-            var left = Worker{ .wal = wal, .barrier = &barrier, .payload = left_payload };
-            var right = Worker{ .wal = wal, .barrier = &barrier, .payload = right_payload };
-
-            var left_thread = try std.testing.io.concurrent(Worker.run, .{&left});
-            defer left_thread.await(std.testing.io);
-            var right_thread = try std.testing.io.concurrent(Worker.run, .{&right});
-            left_thread.await(std.testing.io);
-            right_thread.await(std.testing.io);
+            var workers = [_]Worker{
+                .{ .wal = wal, .payload = left_payload },
+                .{ .wal = wal, .payload = right_payload },
+            };
+            try runConcurrentAppends(std.testing.io, &workers);
+            const left = workers[0];
+            const right = workers[1];
 
             if (left.err) |err| return err;
             if (right.err) |err| return err;
@@ -3511,43 +3544,7 @@ test "wal group commit coalesces concurrent appends" {
 }
 
 test "wal async-io group commit coalesces concurrent appends" {
-    const StartBarrier = struct {
-        mutex: std.atomic.Mutex = .unlocked,
-        waiting: usize = 0,
-        open: bool = false,
-
-        fn wait(self: *@This(), total: usize) void {
-            var registered = false;
-            while (true) {
-                lockAtomic(&self.mutex);
-                if (!registered) {
-                    self.waiting += 1;
-                    registered = true;
-                    if (self.waiting == total) self.open = true;
-                }
-                const ready = self.open;
-                self.mutex.unlock();
-                if (ready) return;
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-            }
-        }
-    };
-
-    const Worker = struct {
-        wal: *WAL,
-        barrier: *StartBarrier,
-        payload: []const u8,
-        result: u64 = 0,
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.barrier.wait(2);
-            self.result = self.wal.append(self.payload) catch |err| {
-                self.err = err;
-                return;
-            };
-        }
-    };
+    const Worker = ConcurrentAppendWorker;
 
     var attempt: usize = 0;
     while (attempt < 8) : (attempt += 1) {
@@ -3562,15 +3559,13 @@ test "wal async-io group commit coalesces concurrent appends" {
         });
         defer wal.close();
 
-        var barrier = StartBarrier{};
-        var worker_a = Worker{ .wal = &wal, .barrier = &barrier, .payload = "alpha" };
-        var worker_b = Worker{ .wal = &wal, .barrier = &barrier, .payload = "beta" };
-
-        var thread_a = try std.testing.io.concurrent(Worker.run, .{&worker_a});
-        defer thread_a.await(std.testing.io);
-        var thread_b = try std.testing.io.concurrent(Worker.run, .{&worker_b});
-        thread_a.await(std.testing.io);
-        thread_b.await(std.testing.io);
+        var workers = [_]Worker{
+            .{ .wal = &wal, .payload = "alpha" },
+            .{ .wal = &wal, .payload = "beta" },
+        };
+        try runConcurrentAppends(std.testing.io, &workers);
+        const worker_a = workers[0];
+        const worker_b = workers[1];
 
         if (worker_a.err) |err| return err;
         if (worker_b.err) |err| return err;
@@ -3653,68 +3648,16 @@ test "wal async-io survives concurrent append burst" {
     defer alloc.free(payload);
     @memset(payload, 'x');
 
-    const StartBarrier = struct {
-        mutex: std.atomic.Mutex = .unlocked,
-        waiting: usize = 0,
-        open: bool = false,
+    const Worker = ConcurrentAppendWorker;
 
-        fn wait(self: *@This(), total: usize) void {
-            var registered = false;
-            while (true) {
-                lockAtomic(&self.mutex);
-                if (!registered) {
-                    self.waiting += 1;
-                    registered = true;
-                    if (self.waiting == total) self.open = true;
-                }
-                const ready = self.open;
-                self.mutex.unlock();
-                if (ready) return;
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-            }
-        }
-    };
-
-    const Worker = struct {
-        wal: *WAL,
-        barrier: *StartBarrier,
-        payload: []const u8,
-        appends: usize,
-        err: ?anyerror = null,
-
-        fn run(self: *@This(), total: usize) void {
-            self.barrier.wait(total);
-            var i: usize = 0;
-            while (i < self.appends) : (i += 1) {
-                _ = self.wal.append(self.payload) catch |err| {
-                    self.err = err;
-                    return;
-                };
-            }
-        }
-    };
-
-    var barrier = StartBarrier{};
     var workers = [_]Worker{
-        .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-        .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-        .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-        .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
+        .{ .wal = &wal, .payload = payload, .appends = 64 },
+        .{ .wal = &wal, .payload = payload, .appends = 64 },
+        .{ .wal = &wal, .payload = payload, .appends = 64 },
+        .{ .wal = &wal, .payload = payload, .appends = 64 },
     };
 
-    var threads: [workers.len]std.Io.Future(void) = undefined;
-    var started_tasks: usize = 0;
-    defer {
-        lockAtomic(&barrier.mutex);
-        barrier.open = true;
-        barrier.mutex.unlock();
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
-    }
-    for (&workers, 0..) |*worker, idx| {
-        threads[idx] = try std.testing.io.concurrent(Worker.run, .{ worker, workers.len });
-        started_tasks += 1;
-    }
-    for (&threads) |*thread| thread.await(std.testing.io);
+    try runConcurrentAppends(std.testing.io, &workers);
     for (workers) |worker| {
         if (worker.err) |err| return err;
     }
@@ -3738,68 +3681,16 @@ test "wal async-io survives grouped concurrent append burst" {
     defer alloc.free(payload);
     @memset(payload, 'x');
 
-    const StartBarrier = struct {
-        mutex: std.atomic.Mutex = .unlocked,
-        waiting: usize = 0,
-        open: bool = false,
+    const Worker = ConcurrentAppendWorker;
 
-        fn wait(self: *@This(), total: usize) void {
-            var registered = false;
-            while (true) {
-                lockAtomic(&self.mutex);
-                if (!registered) {
-                    self.waiting += 1;
-                    registered = true;
-                    if (self.waiting == total) self.open = true;
-                }
-                const ready = self.open;
-                self.mutex.unlock();
-                if (ready) return;
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-            }
-        }
-    };
-
-    const Worker = struct {
-        wal: *WAL,
-        barrier: *StartBarrier,
-        payload: []const u8,
-        appends: usize,
-        err: ?anyerror = null,
-
-        fn run(self: *@This(), total: usize) void {
-            self.barrier.wait(total);
-            var i: usize = 0;
-            while (i < self.appends) : (i += 1) {
-                _ = self.wal.append(self.payload) catch |err| {
-                    self.err = err;
-                    return;
-                };
-            }
-        }
-    };
-
-    var barrier = StartBarrier{};
     var workers = [_]Worker{
-        .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-        .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-        .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-        .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
+        .{ .wal = &wal, .payload = payload, .appends = 64 },
+        .{ .wal = &wal, .payload = payload, .appends = 64 },
+        .{ .wal = &wal, .payload = payload, .appends = 64 },
+        .{ .wal = &wal, .payload = payload, .appends = 64 },
     };
 
-    var threads: [workers.len]std.Io.Future(void) = undefined;
-    var started_tasks: usize = 0;
-    defer {
-        lockAtomic(&barrier.mutex);
-        barrier.open = true;
-        barrier.mutex.unlock();
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
-    }
-    for (&workers, 0..) |*worker, idx| {
-        threads[idx] = try std.testing.io.concurrent(Worker.run, .{ worker, workers.len });
-        started_tasks += 1;
-    }
-    for (&threads) |*thread| thread.await(std.testing.io);
+    try runConcurrentAppends(std.testing.io, &workers);
     for (workers) |worker| {
         if (worker.err) |err| return err;
     }
@@ -3823,68 +3714,16 @@ test "wal async-io survives plain then grouped concurrent runs in one process" {
             defer alloc.free(payload);
             @memset(payload, 'x');
 
-            const StartBarrier = struct {
-                mutex: std.atomic.Mutex = .unlocked,
-                waiting: usize = 0,
-                open: bool = false,
+            const Worker = ConcurrentAppendWorker;
 
-                fn wait(self: *@This(), total: usize) void {
-                    var registered = false;
-                    while (true) {
-                        lockAtomic(&self.mutex);
-                        if (!registered) {
-                            self.waiting += 1;
-                            registered = true;
-                            if (self.waiting == total) self.open = true;
-                        }
-                        const ready = self.open;
-                        self.mutex.unlock();
-                        if (ready) return;
-                        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-                    }
-                }
-            };
-
-            const Worker = struct {
-                wal: *WAL,
-                barrier: *StartBarrier,
-                payload: []const u8,
-                appends: usize,
-                err: ?anyerror = null,
-
-                fn run(self: *@This(), total: usize) void {
-                    self.barrier.wait(total);
-                    var i: usize = 0;
-                    while (i < self.appends) : (i += 1) {
-                        _ = self.wal.append(self.payload) catch |err| {
-                            self.err = err;
-                            return;
-                        };
-                    }
-                }
-            };
-
-            var barrier = StartBarrier{};
             var workers = [_]Worker{
-                .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-                .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-                .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
-                .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
+                .{ .wal = &wal, .payload = payload, .appends = 64 },
+                .{ .wal = &wal, .payload = payload, .appends = 64 },
+                .{ .wal = &wal, .payload = payload, .appends = 64 },
+                .{ .wal = &wal, .payload = payload, .appends = 64 },
             };
 
-            var threads: [workers.len]std.Io.Future(void) = undefined;
-            var started_tasks: usize = 0;
-            defer {
-                lockAtomic(&barrier.mutex);
-                barrier.open = true;
-                barrier.mutex.unlock();
-                for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
-            }
-            for (&workers, 0..) |*worker, idx| {
-                threads[idx] = try std.testing.io.concurrent(Worker.run, .{ worker, workers.len });
-                started_tasks += 1;
-            }
-            for (&threads) |*thread| thread.await(std.testing.io);
+            try runConcurrentAppends(std.testing.io, &workers);
             for (workers) |worker| {
                 if (worker.err) |err| return err;
             }

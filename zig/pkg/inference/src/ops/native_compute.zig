@@ -784,6 +784,31 @@ pub const WeightStore = struct {
     quant_dequant_cache_tier_denied: u64 = 0,
     quant_dequant_cache_scratch_fallbacks: u64 = 0,
     quant_dequant_cache_scratch_denied: u64 = 0,
+
+    /// Destroy a store that owns its map keys, weights, tensor references,
+    /// and attached residency/store/admission resources. All compute users
+    /// must be drained first. `shared_prefetch` remains borrowed.
+    /// Stores with borrowed entries must retain their custom cleanup.
+    pub fn deinitOwned(self: *WeightStore) void {
+        deinitPrefetchQueue(self);
+        var resident_it = self.resident_weights.iterator();
+        while (resident_it.next()) |entry| {
+            entry.value_ptr.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.resident_weights.deinit(self.allocator);
+        var lazy_it = self.lazy_weights.iterator();
+        while (lazy_it.next()) |entry| {
+            if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
+            entry.value_ptr.tensor_ref.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.lazy_weights.deinit(self.allocator);
+        if (self.residency) |*residency| residency.deinit();
+        if (self.tensor_store) |tensor_store| tensor_store.deinit();
+        if (self.tier_cache) |*tier_cache| tier_cache.deinitAdmission();
+        self.* = undefined;
+    }
 };
 
 /// Internal wrapper: an owned or borrowed f32 slice.
@@ -4199,9 +4224,10 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
 /// Stops the worker and retires borrowed guards. Call before destroying
 /// lazy_weights, whose entries still refer to this queue's Io and mutex.
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
+    // Stop before releasing any cache state the worker can access.
+    if (data.prefetch_initialized) data.prefetch.stop();
     deinitGlinerHeadDenseCache(data);
     if (!data.prefetch_initialized) return;
-    data.prefetch.stop();
     var lazy_it = data.lazy_weights.iterator();
     while (lazy_it.next()) |entry| entry.value_ptr.guard = null;
     data.prefetch.deinit();
@@ -5127,6 +5153,41 @@ pub fn reclaimOneHostCacheEntry(data: *WeightStore) usize {
     data.prefetch.lock();
     defer data.prefetch.unlock();
     return reclaimOneHostCacheEntryLocked(data, null);
+}
+
+test "owned native weight store teardown releases populated maps with optional prefetch" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_prefetch| {
+        var store = WeightStore{
+            .allocator = allocator,
+            .resident_weights = .empty,
+            .lazy_weights = .empty,
+        };
+        defer store.deinitOwned();
+        {
+            const key = try allocator.dupe(u8, "resident");
+            errdefer allocator.free(key);
+            var tensor = try tensor_mod.Tensor.initFloat32(allocator, "resident", &.{1}, &.{1});
+            errdefer tensor.deinit();
+            try store.resident_weights.put(allocator, key, .{ .tensor = tensor });
+        }
+        {
+            const key = try allocator.dupe(u8, "lazy");
+            errdefer allocator.free(key);
+            const name = try allocator.dupe(u8, "lazy");
+            errdefer allocator.free(name);
+            const source_name = try allocator.dupe(u8, "source.lazy");
+            errdefer allocator.free(source_name);
+            var tensor = try tensor_mod.Tensor.initFloat32(allocator, "lazy", &.{1}, &.{2});
+            errdefer tensor.deinit();
+            try store.lazy_weights.put(allocator, key, .{
+                .tensor_ref = .{ .name = name, .source_name = source_name },
+                .loaded = .{ .tensor = tensor },
+            });
+        }
+        if (with_prefetch) initPrefetchQueue(&store, allocator);
+        try std.testing.expectEqual(with_prefetch, store.lazy_weights.get("lazy").?.guard != null);
+    }
 }
 
 test "live host cache reservation reclaims only unpinned lazy weights" {
