@@ -1560,6 +1560,7 @@ pub const HttpHost = struct {
 
     pub fn beginTransportShutdown(self: *HttpHost) void {
         self.transport_stack.beginShutdown();
+        if (self.owned_snapshot_store) |store| store.beginShutdown();
     }
 
     pub fn baseUri(self: *const HttpHost, alloc: std.mem.Allocator) ![]u8 {
@@ -3026,6 +3027,8 @@ test "http host reserves service workers through its runtime and rolls back over
     try std.testing.expect(host.transport_stack.snapshot_transport.sender_io == null);
     try std.testing.expect(host.listener.?.accept_io == null);
     try std.testing.expect(host.listener.?.peer_observer.?.control_io == null);
+    host.beginTransportShutdown();
+    try std.testing.expect(host.owned_snapshot_store.?.artifact_maintenance_stop.load(.acquire));
     host.deinit();
     live = false;
     try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);

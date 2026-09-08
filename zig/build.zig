@@ -4673,6 +4673,19 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_raft_storage_tests = addFilteredTestRunArtifact(b, raft_storage_tests);
+    const raft_snapshot_maintenance_vopr_tests = b.addTest(.{
+        .root_module = raft_storage_test_mod,
+        .filters = &.{
+            "raft snapshot storage tests are reachable",
+            "file snapshot maintenance uses borrowed scheduling",
+        },
+    });
+    const run_raft_snapshot_maintenance_vopr_tests = b.addRunArtifact(raft_snapshot_maintenance_vopr_tests);
+    const raft_snapshot_maintenance_vopr_step = b.step(
+        "raft-snapshot-maintenance-vopr-test",
+        "Run snapshot maintenance scheduling, wakeup, and shutdown contracts on VoprIo",
+    );
+    raft_snapshot_maintenance_vopr_step.dependOn(&run_raft_snapshot_maintenance_vopr_tests.step);
 
     // Keep this as the stable behavioral suffix of the declaration rather
     // than duplicating its descriptive worker-model prefix. The exact-filter
@@ -9127,6 +9140,7 @@ pub fn build(b: *std.Build) void {
     vopr_corpus_merge_step.dependOn(&corpus_merge_vopr_cli.step);
 
     const vopr_test_step = b.step("vopr-test", "Run the fast deterministic Antfly VOPR suites");
+    vopr_test_step.dependOn(&run_raft_snapshot_maintenance_vopr_tests.step);
     vopr_test_step.dependOn(&run_vopr_contract_tests.step);
     vopr_test_step.dependOn(&run_transaction_vopr_tests.step);
     vopr_test_step.dependOn(&run_distributed_transaction_vopr_tests.step);
@@ -9532,6 +9546,7 @@ pub fn build(b: *std.Build) void {
     // available as the convenient focused target containing both artifacts.
     unit_test_step.dependOn(&run_ha_cli_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
+    unit_test_step.dependOn(&run_raft_snapshot_maintenance_vopr_tests.step);
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
     unit_test_step.dependOn(&run_raft_restore_tests.step);
     // The standalone Raft library and Antfly-rooted Raft artifacts already
