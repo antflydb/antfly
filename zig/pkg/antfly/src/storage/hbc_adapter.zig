@@ -28162,6 +28162,54 @@ test "hbc stable origin churn bounds debt and disabling experiment repairs stati
     try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 8.0), leaf.centroid[1], 0.0001);
 }
 
+test "hbc stable origins replace changed external vector revisions across reopen" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        changed: bool = false,
+        const replacement = [_]f32{ -100, 12, 5, 1 };
+        fn vector(id: u64) [4]f32 {
+            return .{ @floatFromInt(id), 1, @floatFromInt(id % 7), @floatFromInt(id % 3) };
+        }
+        fn load(ctx: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return a.dupe(f32, if (self.changed and id == 1) &replacement else &vector(id));
+        }
+    };
+    for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
+        var tp: TestPath = .{};
+        const path = tp.init();
+        defer tp.cleanup();
+        const config: HBCConfig = .{ .dims = 4, .leaf_size = 16, .metric = metric, .max_cached_vectors = 0, .stable_posting_origin_max_mutations = 64 };
+        var loader = Loader{};
+        {
+            var idx = try HBCIndex.open(alloc, path, config);
+            defer idx.close();
+            idx.setExternalVectorLoader(&loader, Loader.load);
+            for (1..65) |id| {
+                const v = Loader.vector(id);
+                try idx.batchInsertWithMetadataOptions(&.{.{ .vector_id = id, .vector = &v, .metadata = "member" }}, .{ .skip_vector_store = true });
+            }
+            // Primary artifacts already contain the new revision. Deletion
+            // must filter OLD scoring rows, never reload them from primary.
+            loader.changed = true;
+            try idx.batchApplyOptions(&.{.{ .vector_id = 1, .vector = &Loader.replacement, .metadata = "changed" }}, &.{1}, .{ .preserve_delete_rows = true, .skip_vector_store = true });
+            try std.testing.expect(idx.write_profile.delete_preserved_vector_rows > 0);
+            try std.testing.expectEqual(@as(u64, 64), idx.stats().active_count);
+            var result = try idx.search(&Loader.replacement, 1);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u64, 1), result.getHits()[0].vector_id);
+        }
+        var idx = try HBCIndex.open(alloc, path, config);
+        defer idx.close();
+        idx.setExternalVectorLoader(&loader, Loader.load);
+        var result = try idx.search(&Loader.replacement, 1);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 1), result.getHits()[0].vector_id);
+        const expected_distance = vec.distance(&Loader.replacement, &Loader.replacement, metric);
+        try std.testing.expectApproxEqAbs(expected_distance, result.getHits()[0].distance, 0.0001);
+    }
+}
+
 test "delete removes vector" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};

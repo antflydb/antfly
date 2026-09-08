@@ -9602,5 +9602,69 @@ must replace, not merely hide, the remaining copy/rewrite work. The existing WAL
 has source-coverage/checksum identities and bounded delta chains, but those are
 not substitutes for row-level revision identity or chunk-level reclamation.
 
-Qualification is pending under
-`.benchmark-results/pr593-stable-origins-ab-20260908/`; no default is promoted.
+All four 50K arms subsequently passed under
+`.benchmark-results/pr593-stable-origins-ab-20260908/`. Both arms enabled staged
+readers and the previous coalesced/single-read delete treatment. Only the
+candidate enabled stable origins. The runner requires positive preserved-row
+evidence; that treatment may supersede eager refresh entirely, so zero eager
+reused rows is acceptable only alongside positive preserved-row evidence.
+Public batch size remained 100, mixed offered writes 1,000 rows/s, query
+concurrency 1/10/20/30, and no-copy projection policy remained unchanged.
+
+The paired binary SHA256 was
+`60c60dbfe767d072cec09c8a151b662df611284f454a3ea62e200dc61c86901e`.
+This build started before the last lazy-policy cap guard; that guard affects
+explicit lazy maintenance, which this matrix did not enable. A subsequent
+ReleaseFast build including the guard also passed, SHA256
+`a52229dae8091889818b40fa96fa4c2e2b24a357f2e903d000ee66c97b9fbe5e`, under
+`.benchmark-assets/pr593-stable-origins-final-20260908/`; it is not the binary
+used for the following paired measurements. Both executables are preserved.
+
+| Metric | Pair 1 control → candidate | Pair 2 control → candidate |
+| --- | --- | --- |
+| Ready seconds | 16.388 → 14.972 | 16.982 → 15.246 |
+| C30 QPS | 1,731.4 → 1,678.5 | 1,842.1 → 1,740.1 |
+| C30 p95 ms | 44.215 → 46.003 | 40.258 → 44.987 |
+| Live recall % | 98.27 → 98.40 | 98.42 → 98.34 |
+| Mixed query QPS | 408.54 → 406.96 | 445.71 → 427.92 |
+| Mixed query p95 ms | 58.860 → 60.033 | 60.085 → 58.988 |
+| Mixed query p99 ms | 70.941 → 90.486 | 67.605 → 74.486 |
+| Mixed write p95 ms | 149.459 → 154.426 | 150.637 → 151.204 |
+| Mixed catch-up seconds | 0.849 → 0.115 | 0.653 → 0.226 |
+| Mixed phase peak RSS GB | 1.410 → 1.517 | 1.339 → 1.034 |
+| Read-only phase peak RSS GB | 1.459 → 1.476 | 1.491 → 1.444 |
+| Pre-restart total allocated disk MB | 441.446 → 440.537 | 446.222 → 440.959 |
+| Apply ms / 1,000 replayed rows | 694.55 → 343.62 | 631.06 → 336.21 |
+| Maximum mixed apply window ms | 514 → 97 | 448 → 91 |
+
+Both pairs replayed exactly 30,100 mixed rows per arm through source sequence
+802. The normalized apply reductions were 50.5% and 46.7%. Window counts rose
+from 49 to 242/250, however, and total insertion-stage work rose from
+2.134 to 4.036 seconds and 2.108 to 3.486 seconds. Faster deletion drains the
+backlog into smaller batches, exposing per-mutation setup/copying and reducing
+grouping opportunities. This is evidence for the remaining row-reference design,
+not a reason to add benchmark-specific batching delays.
+
+Each control published three mixed delta checkpoints; neither candidate did.
+That removes those particular completed-worker waits, not maintenance forever:
+pair 1 retained an 84.4 MB logical posting WAL versus 22.9 MB in the control,
+while persisted ANN data fell from 99.3 to 21.9 MB. Total allocated disk was
+nearly unchanged. Fewer checkpoint output bytes cannot be reported as an equal
+reduction in physical disk occupancy or total process write I/O.
+
+Additional Debug tests passed for changed external vector revisions across
+reopen (all three metrics), aborted-publication cache isolation and allocation
+failure ownership. Twenty-seven Python runner/evidence tests passed. Other
+builds/tests were active on this host; source-apply counters demonstrate less
+work, but the public latency/RSS observations are not an all-metric win.
+Read-only queries precede the mixed deletion treatment, so their QPS difference
+is not established as a causal effect of row-preserving deletion.
+
+No default is promoted and no 1M qualification is claimed. The next stage must
+remove aggregate row copying/reconstruction and make native queries consume
+bounded revision-aware base/delta row views under the same generation lease.
+Selective off-writer repacking and a bytes/row-density/age debt policy remain
+necessary to complete the requested shape; the current mutation-count cap is
+only an experimental guard, not that production policy. The mixed p99 regression
+still needs attribution rather than an assumption that all remaining latency
+belongs to HBC maintenance.

@@ -21,6 +21,14 @@ class NativePreparationTests(unittest.TestCase):
                 delete_preparation_evidence(
                     [f"dense delete preserved rows index=vec rows={value}"], flags
                 )
+        flags["ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS"] = "1"
+        reused = "dense delete apply index=vec reused_rows=0"
+        result = delete_preparation_evidence(
+            [reused, "dense delete preserved rows index=vec rows=40"], flags
+        )
+        self.assertEqual(0, result["reused_vector_rows"]["sum"])
+        with self.assertRaises(RuntimeError):
+            delete_preparation_evidence([reused], flags)
 
     def test_delete_treatments_require_saved_work(self):
         flags = {

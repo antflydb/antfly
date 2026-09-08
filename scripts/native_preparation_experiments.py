@@ -170,7 +170,15 @@ def delete_preparation_evidence(lines, environment):
             ]
         except (KeyError, ValueError) as error:
             raise RuntimeError(f"invalid delete treatment evidence: {flag}") from error
-        if not values or min(values) < 0 or max(values) <= 0:
+        # Stable-origin filtering can eliminate every eager refresh. When
+        # reuse is common to both arms, zero reused rows is then expected in
+        # the candidate; the following stable-origin gate must still prove
+        # positive preserved work. Never relax the standalone reuse gate.
+        superseded = (
+            flag == "ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS"
+            and environment.get("ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS") == "1"
+        )
+        if not values or min(values) < 0 or (max(values) <= 0 and not superseded):
             raise RuntimeError(f"inert delete treatment: {flag}")
         result[key] = {"events": len(values), "sum": sum(values), "max": max(values)}
     return result
