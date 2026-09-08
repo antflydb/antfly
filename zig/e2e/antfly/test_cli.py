@@ -36,6 +36,7 @@ from conftest import (
     InferenceGeneratorServer,
     InferenceRerankerServer,
     StandaloneAntflyServer,
+    defer_module_tempdir_cleanup,
     resolve_binary_path,
 )
 from helpers import wait_until
@@ -125,14 +126,10 @@ def cli_server(cli_inference_servers, request):
     server = StandaloneAntflyServer(binary, "127.0.0.1", port)
     server.cli_inference_urls = cli_inference_servers
     yield server
-    test_failed = any(
-        report is not None and report.failed
-        for item in request.session.items
-        if item.getparent(pytest.Module) is request.node
-        for phase in ("setup", "call", "teardown")
-        for report in (getattr(item, f"rep_{phase}", None),)
-    )
-    server.stop(test_failed=test_failed)
+    # Stop processes now, but wait for the final teardown report before deciding
+    # whether this module's runtime directory should be retained for diagnostics.
+    defer_module_tempdir_cleanup(request.node, server.tempdir)
+    server.stop(cleanup_root=False)
 
 
 @pytest.fixture(scope="module")

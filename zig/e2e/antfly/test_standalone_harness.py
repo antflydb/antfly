@@ -16,6 +16,10 @@
 
 import pytest
 import requests
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -23,6 +27,119 @@ import conftest as e2e_conftest
 import helpers
 import test_backup_restore as backups
 import test_standalone as standalone
+
+
+@pytest.mark.parametrize(
+    "failure_phase, preservation, retained",
+    [
+        ("none", "failure", False),
+        ("setup", "failure", True),
+        ("call", "failure", True),
+        ("teardown", "failure", True),
+        ("earlier_call", "failure", True),
+        ("teardown", "never", False),
+        ("none", "always", True),
+        ("cleanup", "never", False),
+    ],
+)
+def test_cli_runtime_preservation_uses_completed_module_reports(
+    tmp_path, failure_phase, preservation, retained
+):
+    # Run real pytest finalizers and the real CLI fixture: a mocked report cannot
+    # expose the ordering between module shutdown and the last teardown report.
+    probe = tmp_path / "test_cli_preservation.py"
+    probe.write_text("""
+import os
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+
+import pytest
+import conftest as harness
+import test_cli as cli_tests
+
+cli_server = cli_tests.cli_server
+phase = os.environ["PROBE_FAILURE_PHASE"]
+
+@pytest.fixture(scope="module")
+def cli_inference_servers():
+    def server_factory(*args):
+        server = object.__new__(harness.StandaloneAntflyServer)
+        server.tempdir = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        root = Path(server.tempdir.name)
+        Path("runtime-path").write_text(str(root))
+        server.log_file = (root / "server.log").open("w")
+        server.log_file.write("retained diagnostics")
+        server.proc = None
+        server.port_reservations = SimpleNamespace(close=lambda: None)
+        server._stop_process = lambda: Path("process-stopped").touch()
+        if phase == "cleanup":
+            def cleanup_error():
+                raise OSError("injected cleanup failure")
+            server.tempdir.cleanup = cleanup_error
+        return server
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("ANTFLY_BIN", sys.executable)
+        patch.setattr(cli_tests, "find_free_port", lambda: 0)
+        patch.setattr(cli_tests, "StandaloneAntflyServer", server_factory)
+        yield {}
+        # This dependency finalizes after cli_server has stopped its process.
+        assert Path("process-stopped").exists()
+        assert Path(Path("runtime-path").read_text()).exists()
+        if phase == "teardown":
+            raise RuntimeError("injected teardown failure")
+
+@pytest.fixture
+def setup_probe(cli_server):
+    if phase == "setup":
+        raise RuntimeError("injected setup failure")
+
+def test_first(cli_server):
+    assert phase != "earlier_call", "injected earlier call failure"
+
+def test_last(cli_server, setup_probe):
+    assert phase != "call", "injected call failure"
+""")
+    env = os.environ.copy()
+    env.update(
+        PYTHONPATH=str(Path(e2e_conftest.__file__).parent),
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+        PROBE_FAILURE_PHASE=failure_phase,
+        ANTFLY_E2E_PRESERVE_ROOT="1" if preservation == "always" else "0",
+        ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE=("1" if preservation == "failure" else "0"),
+    )
+    env.pop("PYTEST_ADDOPTS", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "xdist.plugin",
+            "-p",
+            "conftest",
+            "--confcutdir",
+            str(tmp_path),
+            "-q",
+            str(probe),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = result.stdout + result.stderr
+    assert "INTERNALERROR" not in output, output
+    assert result.returncode == (0 if failure_phase == "none" else 1), output
+    if failure_phase != "none":
+        assert "injected" in output, output
+    root = Path((tmp_path / "runtime-path").read_text())
+    assert root.exists() is retained, output
+    if retained:
+        assert (root / "server.log").read_text() == "retained diagnostics"
 
 
 @pytest.mark.parametrize("total", [10 * 1024**3, 1024**4])

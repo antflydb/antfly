@@ -140,11 +140,50 @@ def maybe_preserve_tempdir(
     return True
 
 
+_DEFERRED_MODULE_TEMPDIRS = pytest.StashKey[list[tempfile.TemporaryDirectory[str]]]()
+
+
+def defer_module_tempdir_cleanup(
+    module: pytest.Module, tempdir: tempfile.TemporaryDirectory[str]
+) -> None:
+    # Keep ownership until the report for the module's last teardown is ready.
+    module.stash.setdefault(_DEFERRED_MODULE_TEMPDIRS, []).append(tempdir)
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
     outcome = yield
     report = outcome.get_result()
     setattr(item, f"rep_{report.when}", report)
+    module = item.getparent(pytest.Module)
+    if report.when != "teardown" or module is None:
+        return
+    pending = module.stash.get(_DEFERRED_MODULE_TEMPDIRS, [])
+    if not pending:
+        return
+    del module.stash[_DEFERRED_MODULE_TEMPDIRS]
+    failed = any(
+        phase_report is not None and phase_report.failed
+        for module_item in item.session.items
+        if module_item.getparent(pytest.Module) is module
+        for phase in ("setup", "call", "teardown")
+        for phase_report in (getattr(module_item, f"rep_{phase}", None),)
+    )
+    for tempdir in pending:
+        if not maybe_preserve_tempdir(tempdir, failed=failed):
+            try:
+                tempdir.cleanup()
+            except OSError as err:
+                # Cleanup now runs after fixture teardown; attach errors to its
+                # report rather than turning them into a pytest internal error.
+                diagnostic = f"E2E directory cleanup failed for {tempdir.name}: {err}"
+                report.longrepr = (
+                    f"{report.longrepr}\n{diagnostic}"
+                    if report.longrepr is not None
+                    else diagnostic
+                )
+                report.outcome = "failed"
+                failed = True
 
 
 def default_antfly_api_root(binary: str) -> str:
@@ -1306,11 +1345,13 @@ class StandaloneAntflyServer:
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
 
-    def stop(self, *, test_failed: bool = False) -> None:
+    def stop(self, *, test_failed: bool = False, cleanup_root: bool = True) -> None:
         self._stop_process()
         self.port_reservations.close()
         self.log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
+        if cleanup_root and not maybe_preserve_tempdir(
+            self.tempdir, failed=test_failed
+        ):
             self.tempdir.cleanup()
 
 
