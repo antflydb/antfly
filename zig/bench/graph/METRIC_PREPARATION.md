@@ -6,6 +6,54 @@ measured samples per case; tables report medians. This was a shared development
 host, not an isolated benchmark machine.
 The compact-query comparison below uses 21 measured samples instead of five.
 
+## Shared admission, sparse work, and publication checkpoints
+
+Measured 2026-09-08 on the same host/toolchain with
+`zig build -Doptimize=ReleaseFast graph-metric-preparation-bench --summary all`.
+One warmup and five measured samples; medians below. Development tests were
+running on this shared host. These are bounded phase measurements, not promises
+about whole-build, HTTP, or cloud-network latency.
+
+| Fixture | Reference | Current | Durable work / admission |
+| --- | ---: | ---: | --- |
+| Publish 8,192 scores, real default storage | 423.880 ms | 96.506 ms | 128 → 2 score/staging/cursor commits |
+| 100 sequential 80-entry routing working sets | 0.968 ms | 0.226 ms | 8,000 → 80 cache fills |
+
+Publication compares 64-node and 4,096-node batches using the same current
+producer helper. IDs are short, so the 1 MiB node-ID budget does not truncate
+either case. Each sample opens fresh storage. Timing includes ordered staging,
+primary scores, checkpoint cursor commits, and full primary-score verification;
+it excludes numerical computation, worker page fencing, and final top-K merging.
+Ranges were 419.238–430.928 ms and 95.571–97.751 ms. Actual production batches
+also stop at their partition boundary or byte allowance; the fixture is not an
+end-to-end 64× speedup claim.
+
+The routing fixture uses the production cache and equal-size 4 KiB payloads.
+A 64-entry-equivalent byte limit models the previous residency ceiling; the
+current case allows 1 MiB. Leases are released sequentially. It allocates/fills
+owned cache entries but excludes codec decoding, network I/O, and query planning.
+Allocation count falls from 16,000 to 160, cumulative allocated bytes from
+34,688,000 to 346,880. Tracked peak rises from 281,840 to 346,880 bytes because the
+whole working set is retained, still below the allowance. Fixed inline cache
+buckets are not heap allocations and are excluded from those byte figures.
+Ranges were 0.944–0.987 ms and 0.222–0.227 ms. Separate regression tests retain all
+80 leases simultaneously and exercise page-vs-metadata eviction under pressure.
+
+The sparse stateful regression has 4,097 dictionary nodes but only three metric
+members in two original leaves. Each later node phase now schedules two data
+pages instead of 65; normalization schedules two leaves instead of 65. Empty
+iteration-zero node pages receive no worker attempt. The test reopens at iteration
+one and compares PageRank, eigenvector, and paired HITS output against the numeric
+oracle. These are asserted work counts, not a timing benchmark. Original ordinal
+identities remain unchanged.
+
+The sealed-vector gather fixture still fetches only 128 storage chunks across
+256 checkpoints (reference: 32,768). Its median is 16.888 ms, with 604,180 tracked
+peak bytes. Cache entries and bucket allocations now draw from a shared 64 MiB
+process pool, rather than multiplying a full allowance by every populated index.
+Failure-injection and retirement tests verify that optional admission failures
+and retired metrics release their charged bytes.
+
 ## Shared point planning and checkpoint-local folds
 
 Same host/toolchain, one warmup and five samples, using the production helpers:

@@ -27,7 +27,12 @@ pub const Entry = struct {
     routing: codec.RoutingIndex,
     references: usize = 0,
     resident: bool = false,
-    touched: u64 = 0,
+    // Metadata gets a separate LRU so streaming decoded pages cannot evict
+    // hot roots/directories ahead of unused pages. Both share the byte limit.
+    class: enum(u1) { metadata, page } = .metadata,
+    hash_next: ?*Entry = null,
+    older: ?*Entry = null,
+    newer: ?*Entry = null,
 
     pub fn bytes(self: *const Entry) usize {
         return @sizeOf(Entry) + self.footer.len + self.routing.entries.len * @sizeOf(codec.RoutingEntry) +
@@ -58,9 +63,12 @@ pub const Lease = struct {
 
 pub const Cache = struct {
     mu: std.atomic.Mutex = .unlocked,
-    entries: [64]?*Entry = @splat(null),
+    // Intrusive buckets have no entry-count ceiling or hidden map allocations.
+    // Every variable-size allocation is included in Entry.bytes().
+    buckets: [1024]?*Entry = @splat(null),
+    oldest: [2]?*Entry = @splat(null),
+    newest: [2]?*Entry = @splat(null),
     retained_bytes: usize = 0,
-    clock: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
     // Fixed-capacity ownership table: fetch/decode happens outside the lock.
@@ -158,10 +166,12 @@ pub const Cache = struct {
         _ = self.wake_epoch.fetchAdd(1, .release);
     }
 
-    fn releaseLocked(_: *Cache, entry: *Entry) void {
+    fn releaseLocked(self: *Cache, entry: *Entry) void {
         std.debug.assert(entry.references > 0);
         entry.references -= 1;
-        if (entry.references == 0 and !entry.resident) entry.destroy();
+        if (entry.references == 0) {
+            if (entry.resident) self.append(entry) else entry.destroy();
+        }
     }
 
     pub fn publish(self: *Cache, index: usize, entry: *Entry, max_bytes: usize) Lease {
@@ -207,12 +217,9 @@ pub const Cache = struct {
     }
 
     fn acquireLocked(self: *Cache, key: [32]u8) ?Lease {
-        self.clock +|= 1;
-        for (self.entries) |maybe_entry| {
-            const entry = maybe_entry orelse continue;
-            if (!std.mem.eql(u8, &entry.key, &key)) continue;
+        if (self.find(key)) |entry| {
+            if (entry.references == 0) self.unlink(entry);
             entry.references += 1;
-            entry.touched = self.clock;
             self.hits +|= 1;
             return .{ .entry = entry, .cache = self };
         }
@@ -228,51 +235,75 @@ pub const Cache = struct {
     }
 
     fn adoptLocked(self: *Cache, entry: *Entry, max_bytes: usize) Lease {
-        self.clock +|= 1;
-        for (self.entries) |maybe_existing| {
-            const existing = maybe_existing orelse continue;
-            if (!std.mem.eql(u8, &existing.key, &entry.key)) continue;
+        if (self.find(entry.key)) |existing| {
+            if (existing.references == 0) self.unlink(existing);
             existing.references += 1;
-            existing.touched = self.clock;
             entry.destroy();
             return .{ .entry = existing, .cache = self };
         }
         const needed = entry.bytes();
         entry.references = 1;
         if (needed > max_bytes) return .{ .entry = entry, .cache = self };
-        while (true) {
-            var empty: ?usize = null;
-            var victim: ?usize = null;
-            for (self.entries, 0..) |maybe_existing, index| {
-                const existing = maybe_existing orelse {
-                    empty = index;
-                    continue;
-                };
-                if (existing.references == 0 and (victim == null or existing.touched < self.entries[victim.?].?.touched)) victim = index;
-            }
-            if (empty != null and self.retained_bytes <= max_bytes - needed) {
-                entry.references = 1;
-                entry.resident = true;
-                entry.touched = self.clock;
-                self.entries[empty.?] = entry;
-                self.retained_bytes += needed;
-                return .{ .entry = entry, .cache = self };
-            }
-            const index = victim orelse return .{ .entry = entry, .cache = self };
-            const old = self.entries[index].?;
+        while (self.retained_bytes > max_bytes - needed) {
+            const old = self.victim(1) orelse self.victim(0) orelse return .{ .entry = entry, .cache = self };
             self.retained_bytes -= old.bytes();
-            self.entries[index] = null;
+            self.unlink(old);
+            var link = &self.buckets[bucket(old.key)];
+            while (link.*.? != old) link = &link.*.?.hash_next;
+            link.* = old.hash_next;
             old.destroy();
         }
+        entry.resident = true;
+        const slot = &self.buckets[bucket(entry.key)];
+        entry.hash_next = slot.*;
+        slot.* = entry;
+        self.retained_bytes += needed;
+        return .{ .entry = entry, .cache = self };
+    }
+
+    fn bucket(key: [32]u8) usize {
+        return std.mem.readInt(u64, key[0..8], .little) % 1024;
+    }
+
+    fn find(self: *Cache, key: [32]u8) ?*Entry {
+        var next = self.buckets[bucket(key)];
+        while (next) |entry| : (next = entry.hash_next) {
+            if (std.mem.eql(u8, &entry.key, &key)) return entry;
+        }
+        return null;
+    }
+
+    fn victim(self: *Cache, class: usize) ?*Entry {
+        // Only unpinned entries enter the LRU. Admission must remain O(1)
+        // when a large query pins thousands of decoded pages.
+        return self.oldest[class];
+    }
+
+    fn unlink(self: *Cache, entry: *Entry) void {
+        const class = @intFromEnum(entry.class);
+        if (entry.older) |older| older.newer = entry.newer else self.oldest[class] = entry.newer;
+        if (entry.newer) |newer| newer.older = entry.older else self.newest[class] = entry.older;
+    }
+
+    fn append(self: *Cache, entry: *Entry) void {
+        const class = @intFromEnum(entry.class);
+        entry.older = self.newest[class];
+        entry.newer = null;
+        if (self.newest[class]) |newest| newest.newer = entry else self.oldest[class] = entry;
+        self.newest[class] = entry;
     }
 
     /// The owning QueryCache outlives all query sessions and their leases.
     pub fn deinit(self: *Cache) void {
         for (self.fills) |fill| std.debug.assert(fill == null);
-        for (self.entries) |maybe_entry| if (maybe_entry) |entry| {
-            std.debug.assert(entry.references == 0);
-            entry.destroy();
-        };
+        for (self.buckets) |head| {
+            var next = head;
+            while (next) |entry| {
+                next = entry.hash_next;
+                std.debug.assert(entry.references == 0);
+                entry.destroy();
+            }
+        }
         self.* = undefined;
     }
 };
@@ -315,6 +346,55 @@ test "serverless graph metric routing cache bounds pinned memory and deduplicate
     try std.testing.expect(cache.acquire(@splat(1)) == null);
     var hit = cache.acquire(@splat(2)).?;
     defer hit.deinit();
+    try std.testing.expectEqual(limit, cache.retained_bytes);
+}
+
+test "serverless graph metric routing cache retains wide multi-metric working sets by bytes" {
+    var cache = Cache{};
+    defer cache.deinit();
+    // Sixteen metrics, each with root + directory + three decoded pages.
+    // The former 64-slot LRU missed all 80 entries on every sequential query.
+    const limit = 1024 * 1024;
+    for (0..80) |i| {
+        const entry = try testEntry(@intCast(i));
+        entry.class = if (i % 5 < 2) .metadata else .page;
+        var lease = cache.adopt(entry, limit);
+        lease.deinit();
+    }
+    for (0..4) |_| {
+        var leases: [80]Lease = undefined;
+        var count: usize = 0;
+        defer for (leases[0..count]) |*lease| lease.deinit();
+        for (&leases, 0..) |*lease, i| {
+            lease.* = cache.acquire(@splat(@intCast(i))) orelse return error.TestUnexpectedResult;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 320), cache.snapshot().hits);
+    try std.testing.expectEqual(@as(u64, 0), cache.snapshot().misses);
+    try std.testing.expect(cache.retained_bytes < limit);
+}
+
+test "serverless graph metric routing cache evicts pages before metadata and preserves pins" {
+    var cache = Cache{};
+    defer cache.deinit();
+    const root = try testEntry(1);
+    const limit = root.bytes() * 3;
+    var metadata = cache.adopt(root, limit);
+    metadata.deinit();
+    const first = try testEntry(2);
+    first.class = .page;
+    var pinned = cache.adopt(first, limit);
+    defer pinned.deinit();
+    for (3..100) |i| {
+        const entry = try testEntry(@intCast(i));
+        entry.class = .page;
+        var lease = cache.adopt(entry, limit);
+        lease.deinit();
+    }
+    var hit = cache.acquire(@splat(1)) orelse return error.TestUnexpectedResult;
+    defer hit.deinit();
+    try std.testing.expectEqualStrings("immutable footer", pinned.entry.footer);
     try std.testing.expectEqual(limit, cache.retained_bytes);
 }
 

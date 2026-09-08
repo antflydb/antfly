@@ -100,6 +100,8 @@ pub fn main(init: std.process.Init) !void {
     try benchmarkMembership(init.io, &output);
     try benchmarkOrdinalFold(&output);
     try benchmarkSealedVectors(init.io, &output);
+    try benchmarkPublication(init.io, &output);
+    try benchmarkRoutingWorkingSet(&output);
     try benchmarkCandidatePlanning(&output);
     try benchmarkAuthenticatedCache(init.io, &output);
     try benchmarkTopOwnership(&output);
@@ -631,6 +633,103 @@ fn benchmarkMembership(io: std.Io, out: anytype) !void {
             .peak_bytes = last.peak_bytes,
             .note = "real default storage; includes transaction, canonical membership and dictionary validation; excludes fixture writes and numeric fold",
         }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkPublication(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const scores = try fixture.alloc(antfly.graph.GraphIndex.GraphMetricScore, 8192);
+    for (scores, 0..) |*score, i| score.* = .{ .node = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i}), .score = @as(f64, @floatFromInt(i)) / 8192 };
+    for ([_]usize{ 64, 4096 }) |limit| {
+        var times: [5]u64 = undefined;
+        var commits: usize = 0;
+        for (0..6) |sample| {
+            const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-publication-bench-{d}", .{antfly.platform_time.monotonicNs()});
+            try std.Io.Dir.cwd().createDirPath(io, root);
+            defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+            const path = try std.fmt.allocPrintSentinel(fixture, "{s}/reverse", .{root}, 0);
+            var index = try antfly.graph.GraphIndex.open(alloc, {}, path, "graph", .{});
+            defer index.close();
+            const start = antfly.platform_time.monotonicNs();
+            commits = try index.benchmarkScorePublication(scores, limit, 1);
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (commits != scores.len / limit) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (limit == 64) "publication_64_node_reference" else "publication_bounded_4096_nodes",
+            .nodes = scores.len,
+            .checkpoint_commits = commits,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .note = "real default storage; atomic score/staging/cursor commits and full primary-score validation; excludes graph computation, page fencing, and final top-k merge",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkRoutingWorkingSet(out: anytype) !void {
+    const routing = antfly.serverless.query.graph_metric_routing_cache;
+    const alloc = std.heap.smp_allocator;
+    for ([_]bool{ true, false }) |reference| {
+        var times: [5]u64 = undefined;
+        var last = PhaseAllocStats{};
+        var fills: usize = 0;
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            const tracked = tracking.allocator();
+            var cache = routing.Cache{};
+            const entry_bytes = @sizeOf(routing.Entry) + 4096;
+            const budget: usize = if (reference) entry_bytes * 64 else 1024 * 1024;
+            fills = 0;
+            const start = antfly.platform_time.monotonicNs();
+            for (0..100) |_| {
+                for (0..80) |i| {
+                    var key: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(std.mem.asBytes(&i), &key, .{});
+                    var lease = cache.acquire(key) orelse blk: {
+                        const entry = try tracked.create(routing.Entry);
+                        entry.* = .{ .key = key, .alloc = tracked, .footer = try tracked.alloc(u8, 4096), .routing = .{ .entries = &.{}, .ranked_entries = &.{}, .footer_offset = 1, .top_score_count = 0 } };
+                        @memset(entry.footer, @intCast(i));
+                        fills += 1;
+                        break :blk cache.adopt(entry, budget);
+                    };
+                    if (lease.entry.footer[0] != i) return error.InvalidBenchmarkResult;
+                    lease.deinit();
+                }
+            }
+            cache.deinit();
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (fills != (if (reference) @as(usize, 8000) else 80) or stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+            last = stats;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(alloc, .{
+            .mode = if (reference) "routing_64_entry_capacity_model" else "routing_byte_admission",
+            .queries = 100,
+            .entries_per_query = 80,
+            .fills = fills,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .allocation_count = last.alloc_count,
+            .allocated_bytes = last.total_alloc_bytes,
+            .peak_bytes = last.peak_bytes,
+            .note = "production cache; equal 4 KiB entries model former 64-slot capacity with a byte limit; sequential released leases; excludes codec decoding, object I/O, and query execution",
+        }, .{});
+        defer alloc.free(json);
         try out.interface.writeAll(json);
         try out.interface.writeByte('\n');
         try out.flush();

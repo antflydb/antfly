@@ -1284,6 +1284,7 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
             const entry = try owner.create(routing_cache.Entry);
             entry.* = .{
                 .key = pointPageCacheKey(artifact, page, block_count, root),
+                .class = .page,
                 .alloc = owner,
                 .footer = owned,
                 .routing = .{ .entries = decoded, .ranked_entries = &.{}, .top_score_count = 0, .footer_offset = footer_offset },

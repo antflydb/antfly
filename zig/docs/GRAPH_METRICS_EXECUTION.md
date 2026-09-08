@@ -41,14 +41,34 @@ full-graph calculation hidden inside a query or maintenance tick.
   membership and carries its validated slots into all rank/factor/HITS lane
   writes. It does not rediscover producers or resolve the same node dictionary
   separately for each output lane. Numerical seeds still use the global summary.
+- The initialization phase barrier seals a bounded metric-specific active-node
+  plan. Empty node partitions in iteration zero are completed without worker
+  claims; later iterations omit their data pages and scalar leaves. Original
+  leaf IDs and membership blocks remain unchanged because vector slots encode
+  those identities. Plan totals must match the sealed initialization root, and
+  missing active leaves fail closed. Reopen and retries reuse the same plan.
 - Numerical folds validate and borrow each immutable 256-edge tile from the read
   transaction. One checkpoint-local scratch buffer gathers vector values and
   maps chunk-local target slots directly to compensated accumulators. Warm vector
   gathers allocate no per-tile arrays; cold gathers reuse arena capacity. Chunk
   changes clear target mappings, and framing, receipt counts, ordinal validity,
-  generation/attempt fences and accumulation order remain enforced. Scratch and
-  caches are bounded by checkpoint limits, not total graph size.
-- Execution schema 11 fences older intermediate jobs. Published score epochs
+  generation/attempt fences and accumulation order remain enforced. Transaction
+  scratch is bounded by checkpoint limits, not total graph size.
+- Sealed source-vector chunks may be reused across checkpoints. Each index has
+  a lazy 4,096-entry LRU, but all indexes share a 64 MiB admission pool by default,
+  charging entries and hash buckets. Hosts may inject a different shared pool
+  through `GraphIndexOptions.sealed_vector_budget`; it must outlive its indexes.
+  A full pool causes local recycling or storage-read fallback, never build
+  failure. Metric retirement releases cached chunks and empty bucket storage;
+  admission tickets prevent already-running checkpoints from repopulating
+  retired data. Worker handles observe retirement independently of coordinators.
+- Final numeric-score publication admits at most 4,096 nodes or 1 MiB of node
+  IDs per checkpoint (one oversized ID is allowed to guarantee progress).
+  This is independent of 64-node planning granularity. Prior scores for both
+  HITS lanes are bulk-read before either lane stages mutations. Primary scores,
+  ordered staging keys, and the attempt-fenced page cursor commit atomically.
+  The coordinator checkpoints the bounded top-K prefix before pointer publication.
+- Execution schema 13 fences older intermediate jobs. Published score epochs
   retain their existing read contract; an execution-format change does not hide
   previously published results.
 
@@ -98,6 +118,14 @@ fill or pinned-capacity pressure. Point-score consumers borrow ref-counted lease
 on warm blocks instead of copying payloads; leases keep entries alive during
 decoding. Authentication is unchanged, and a cache failure remains a miss rather
 than authority over the immutable source.
+
+Decoded point-routing pages, roots, and directories share the configured
+`max_graph_metric_routing_bytes` allowance (16 MiB by default), without a separate
+64-entry residency ceiling. Intrusive hash buckets provide keyed lookup and
+separate unpinned LRUs prioritize page eviction over metadata eviction. Pinned
+entries stay charged; a saturated cache safely bypasses admission. Eviction does
+not scan pinned entries. The bounded 64-slot in-flight ownership table is still
+independent of residency and retains its cancellation/single-flight contract.
 
 Point queries admit output descriptors/cells before allocating them, then admit
 one `u32` candidate permutation shared by every physical metric column. IDs are

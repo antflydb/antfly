@@ -22,6 +22,7 @@ pub const cache = @import("cache.zig");
 pub const indexed_reader = @import("indexed_reader.zig");
 pub const graph_reader = @import("graph_reader.zig");
 pub const graph_metric_reader = @import("graph_metric_reader.zig");
+pub const graph_metric_routing_cache = @import("graph_metric_routing_cache.zig");
 pub const lake_rows = @import("lake_rows.zig");
 pub const lake_explain = @import("lake_explain.zig");
 pub const lake_sidecar_selection = @import("lake_sidecar_selection.zig");

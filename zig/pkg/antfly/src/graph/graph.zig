@@ -629,6 +629,9 @@ pub const GraphIndexOptions = struct {
     reverse_lsm_root_generation: u64 = 0,
     edge_type_configs: []const EdgeTypeConfig = &.{},
     metric_configs: []const GraphMetricConfig = &.{},
+    /// Optional host-owned pool; must outlive the index. Null uses the shared
+    /// process pool, not a separate allowance for each graph index.
+    sealed_vector_budget: ?*@import("sealed_vector_cache.zig").Budget = null,
     rebuild_root_path: ?[]const u8 = null,
     rebuild_owner_generation: u64 = 0,
     algebraic_semiring_traversal: bool = false,
@@ -2731,6 +2734,7 @@ pub const GraphIndex = struct {
         job: GraphMetricBuildJob,
         reason: []const u8,
     ) !void {
+        self.sealed_vectors.retire(self.alloc, sealedVectorScope(metric_name));
         const retry_count = try self.nextGraphMetricFailureRetryCountInBatch(batch, metric_name);
         try self.putGraphMetricFailureDetailInBatch(batch, metric_name, retry_count, reason);
         const published_generation = try self.metricPublishedGeneration(batch, metric_name);
@@ -3435,6 +3439,81 @@ pub const GraphIndex = struct {
         }
     }
 
+    /// A bounded, metric-specific work plan. Original leaf IDs remain stable
+    /// because numeric slots encode those IDs; only scheduling is compacted.
+    const GraphMetricActivePlan = struct {
+        count: usize,
+        counts: [graph_metric_build_max_partition_pages]u64 = @splat(0),
+
+        fn total(self: *const @This()) u64 {
+            var sum: u64 = 0;
+            for (self.counts[0..self.count]) |count| sum += count;
+            return sum;
+        }
+    };
+
+    fn graphMetricActivePlanKey(self: *GraphIndex, metric: []const u8, job_id: u64) ![]u8 {
+        var job_buf: [20]u8 = undefined;
+        return self.graphMetricControlKeyAlloc(&.{ metric, "job", try std.fmt.bufPrint(&job_buf, "{d}", .{job_id}), "active-nodes" });
+    }
+
+    fn graphMetricActivePlan(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64) !GraphMetricActivePlan {
+        const key = try self.graphMetricActivePlanKey(metric, job_id);
+        defer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidGraphMetricBuildManifest,
+            else => return err,
+        };
+        if (raw.len < 8) return error.InvalidGraphMetricBuildManifest;
+        const count = std.mem.readInt(u64, raw[0..8], .little);
+        if (count == 0 or count > graph_metric_build_max_partition_pages or raw.len != 8 + count * 8) return error.InvalidGraphMetricBuildManifest;
+        const manifest = try self.metricBuildManifest(txn, metric, job_id) orelse return error.InvalidGraphMetricBuildManifest;
+        if (count != graphMetricDegreeReducePageCount(@intCast(manifest.node_count))) return error.InvalidGraphMetricBuildManifest;
+        var plan = GraphMetricActivePlan{ .count = @intCast(count) };
+        var total: u64 = 0;
+        for (plan.counts[0..plan.count], 0..) |*units, i| {
+            units.* = std.mem.readInt(u64, raw[8 + i * 8 ..][0..8], .little);
+            total = std.math.add(u64, total, units.*) catch return error.InvalidGraphMetricBuildManifest;
+        }
+        if (total > manifest.node_count) return error.InvalidGraphMetricBuildManifest;
+        const initialized = try self.metricBuildPage(txn, metric, job_id, .initialize_ranks, 0, 0) orelse return error.InvalidGraphMetricBuildManifest;
+        if (initialized.state != .complete or initialized.completed_units != total) return error.InvalidGraphMetricBuildManifest;
+        return plan;
+    }
+
+    fn sealGraphMetricActivePlan(self: *GraphIndex, batch: anytype, metric: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob) !void {
+        const manifest = try self.metricBuildManifest(batch, metric, job.job_id) orelse return error.InvalidGraphMetricBuildManifest;
+        const count = graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
+        var encoded: [8 + 8 * graph_metric_build_max_partition_pages]u8 = undefined;
+        std.mem.writeInt(u64, encoded[0..8], count, .little);
+        for (0..count) |index| {
+            const leaf = try self.metricBuildPage(batch, metric, job.job_id, .initialize_ranks, 0, graph_metric_build_summary_leaf_base + index) orelse return error.InvalidGraphMetricBuildManifest;
+            if (leaf.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
+            std.mem.writeInt(u64, encoded[8 + index * 8 ..][0..8], leaf.completed_units, .little);
+            // Iteration zero was planned before membership was known. Finish
+            // empty node ranges atomically with sealing the active plan. Future
+            // iterations omit them entirely, including their scalar leaves.
+            if (leaf.completed_units != 0) continue;
+            for (graphMetricBuildManifestPhases(cfg.kind)) |phase| {
+                if (phase == .initialize_ranks or graphMetricBuildManifestPhaseRangeKind(phase) != .nodes) continue;
+                const data_id = graphMetricBuildPhasePageIdBase(cfg.kind, phase) + index;
+                for ([_]u64{ data_id, graph_metric_build_summary_leaf_base + index }) |id| {
+                    var empty = try self.metricBuildPage(batch, metric, job.job_id, phase, 0, id) orelse continue;
+                    if (empty.state != .pending) return error.InvalidGraphMetricBuildManifest;
+                    empty.state = .complete;
+                    empty.total_units = 0;
+                    empty.completed_units = 0;
+                    empty.output_fingerprint = 1;
+                    empty.converged = true;
+                    try self.putGraphMetricBuildPageInBatch(batch, metric, empty);
+                }
+            }
+        }
+        const key = try self.graphMetricActivePlanKey(metric, job.job_id);
+        defer self.alloc.free(key);
+        try batch.put(key, encoded[0 .. 8 + count * 8]);
+    }
+
     fn planGraphMetricIterationPagesInBatch(
         self: *GraphIndex,
         batch: anytype,
@@ -3443,7 +3522,8 @@ pub const GraphIndex = struct {
         job: GraphMetricBuildJob,
         iteration: u32,
     ) !void {
-        const planned_node_count = std.math.cast(usize, self.node_count) orelse std.math.maxInt(usize);
+        const active = try self.graphMetricActivePlan(batch, metric_name, job.job_id);
+        const planned_node_count: usize = @intCast(active.total());
         const raw_partition_plan = batch.get(graph_metric_partition_plan_key) catch |err| switch (err) {
             error.NotFound => return error.InvalidGraphMetricBuildManifest,
             else => return err,
@@ -3454,6 +3534,7 @@ pub const GraphIndex = struct {
         if (partition_plan.edge_count != self.edge_count or partition_plan.node_count != self.node_count) {
             return error.GraphMetricBuildSnapshotChanged;
         }
+        if (partition_plan.node_page_count != active.count) return error.InvalidGraphMetricBuildManifest;
         const output_prefix = try self.graphMetricBuildJobNamespacePrefixAlloc(metric_name, job.job_id);
         defer self.alloc.free(output_prefix);
         const iterative_planned_phases = [_]GraphMetricBuildPhase{
@@ -3501,6 +3582,7 @@ pub const GraphIndex = struct {
                 }
             }
             for (0..page_count) |page_idx| {
+                if (range_kind == .nodes and active.counts[page_idx] == 0) continue;
                 const page_id = page_id_base + @as(u64, @intCast(page_idx));
                 if (try self.metricBuildPage(batch, metric_name, job.job_id, phase, iteration, page_id)) |_| continue;
                 // Topology does not change during a fenced metric build. Clone
@@ -3520,7 +3602,7 @@ pub const GraphIndex = struct {
                     .range_upper = template.range_upper,
                     .output_prefix = output_prefix,
                     .worker_id = "",
-                    .total_units = template.total_units,
+                    .total_units = if (range_kind == .nodes) active.counts[page_idx] else template.total_units,
                 });
                 created_pages += 1;
             }
@@ -3566,9 +3648,11 @@ pub const GraphIndex = struct {
     /// producers. The root combines at most 256 durable records, never V nodes.
     fn planGraphMetricSummaryLeaves(self: *GraphIndex, batch: anytype, metric_name: []const u8, job: GraphMetricBuildJob, phase: GraphMetricBuildPhase, iteration: u32, plan: GraphMetricPartitionPlan, output_prefix: []const u8) !usize {
         var created: usize = 0;
+        const active = if (iteration != 0) try self.graphMetricActivePlan(batch, metric_name, job.job_id) else null;
         const kind = (self.metricConfig(metric_name) orelse return error.MetricNotReady).kind;
         const count = graphMetricSummaryLeafCount(kind, @intCast(plan.node_count), plan.node_page_count);
         for (0..count) |index| {
+            if (active) |work| if (work.counts[index] == 0) continue;
             const id = graph_metric_build_summary_leaf_base + index;
             if (try self.metricBuildPage(batch, metric_name, job.job_id, phase, iteration, id)) |_| continue;
             try self.putGraphMetricBuildPageInBatch(batch, metric_name, .{
@@ -3580,7 +3664,7 @@ pub const GraphIndex = struct {
                 .range_lower = if (index < plan.node_boundaries.items.len) plan.node_boundaries.items[index] else "",
                 .range_upper = if (index + 1 < plan.node_boundaries.items.len) plan.node_boundaries.items[index + 1] else "",
                 .output_prefix = output_prefix,
-                .total_units = graphMetricPartitionSpan(@intCast(plan.node_count), count, index).len,
+                .total_units = if (active) |work| work.counts[index] else graphMetricPartitionSpan(@intCast(plan.node_count), count, index).len,
             });
             created += 1;
         }
@@ -3905,9 +3989,17 @@ pub const GraphIndex = struct {
                 // Scalar leaves may run concurrently, but neither the root nor
                 // data reducers can observe a partially adopted normalization.
                 var waiting_for_leaves = false;
+                const active = if (iteration != 0) try self.graphMetricActivePlan(&batch, metric_name, job_id) else null;
                 var leaf_index: u64 = 0;
                 while (leaf_index < graph_metric_build_max_partition_pages) : (leaf_index += 1) {
-                    const leaf = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, graph_metric_build_summary_leaf_base + leaf_index) orelse break;
+                    if (active) |work| {
+                        if (leaf_index >= work.count) break;
+                        if (work.counts[leaf_index] == 0) continue;
+                    }
+                    const leaf = try self.metricBuildPage(&batch, metric_name, job_id, phase, iteration, graph_metric_build_summary_leaf_base + leaf_index) orelse {
+                        if (active != null) return error.InvalidGraphMetricBuildManifest;
+                        break;
+                    };
                     if (leaf.range_kind != .summary) return error.InvalidGraphMetricBuildManifest;
                     if (leaf.state == .complete) continue;
                     waiting_for_leaves = true;
@@ -4569,6 +4661,10 @@ pub const GraphIndex = struct {
             try batch.commit();
             return false;
         }
+        if (phase == .check_convergence or phase == .cleanup_old_generations)
+            self.sealed_vectors.retire(self.alloc, sealedVectorScope(metric_name));
+        if (phase == .initialize_ranks and graphMetricKindUsesPlannedIterativeRunner(cfg.kind))
+            try self.sealGraphMetricActivePlan(&batch, metric_name, cfg, job);
         if ((phase == .reduce_ranks and graphMetricKindUsesPlannedIterativeRunner(cfg.kind)) or phase == .hits_hub_reduce_ranks) {
             var job_buf: [20]u8 = undefined;
             var iteration_buf: [10]u8 = undefined;
@@ -5427,6 +5523,7 @@ pub const GraphIndex = struct {
         };
         if (try self.metricBuildJob(&batch, metric_name)) |job| {
             failure_record.job_id = job.job_id;
+            self.sealed_vectors.retire(self.alloc, sealedVectorScope(metric_name));
             failure_record.target_generation = job.target_generation;
             failure_record.score_generation = job.score_generation;
             failure_record.phase = job.phase;
@@ -5722,6 +5819,7 @@ pub const GraphIndex = struct {
             .reverse_owner = reverse_store.owner,
             .edge_type_configs = opts.edge_type_configs,
             .metric_configs = opts.metric_configs,
+            .sealed_vectors = if (opts.sealed_vector_budget) |budget| .{ .budget = budget } else .{},
             .rebuild_root_path = if (opts.rebuild_root_path) |path| try alloc.dupe(u8, path) else null,
             .rebuild_storage = opts.reverse_lsm_storage,
             .rebuild_owner_generation = opts.rebuild_owner_generation,
@@ -7082,8 +7180,10 @@ pub const GraphIndex = struct {
     // v8 retains attempt-fenced adjacency once and folds input vectors directly.
     // v9 packs producer fragments into dense, receipt-selected adjacency tiles.
     // v10 bounds partition census work; v11 seals canonical membership blocks.
+    // v12 stages ordered publication runs; v13 seals metric-specific node work
+    // plans so later iterations omit empty leaves without changing ordinals.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 12;
+    const graph_metric_build_execution_schema_version: u64 = 13;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -8978,7 +9078,7 @@ pub const GraphIndex = struct {
         try self.validateGraphMetricVectorManifest(txn, metric_name, job_id);
         // Initialization seals canonical blocks once. Iterations never revisit
         // per-producer membership partials, even when a fold resumes many times.
-        const complete = try self.collectSealedGraphMetricMembership(txn, metric_name, job_id, lower, upper, resume_node, limit, nodes, slots);
+        const complete = try self.collectSealedGraphMetricMembership(txn, metric_name, job_id, lower, upper, resume_node, limit, null, nodes, slots);
         try self.validateGraphMetricOrdinalDictionary(txn, metric_name, job_id, nodes.items, slots.items);
         return complete;
     }
@@ -9088,7 +9188,8 @@ pub const GraphIndex = struct {
         }
     }
 
-    fn collectSealedGraphMetricMembership(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, lower: []const u8, upper: []const u8, resume_node: []const u8, limit: ?usize, nodes: *std.ArrayListUnmanaged([]u8), slots: *std.ArrayListUnmanaged(u64)) !bool {
+    fn collectSealedGraphMetricMembership(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, lower: []const u8, upper: []const u8, resume_node: []const u8, limit: ?usize, max_node_bytes: ?usize, nodes: *std.ArrayListUnmanaged([]u8), slots: *std.ArrayListUnmanaged(u64)) !bool {
+        var node_bytes: usize = 0;
         const manifest = try self.metricBuildManifest(txn, metric, job_id) orelse return error.GraphMetricBuildManifestNotFound;
         const leaf_count = graphMetricDegreeReducePageCount(@intCast(manifest.node_count));
         const seek = if (resume_node.len != 0) resume_node else lower;
@@ -9137,6 +9238,10 @@ pub const GraphIndex = struct {
                     if (upper.len != 0 and std.mem.order(u8, row.node, upper) != .lt) return true;
                     if (lower.len == 0 or std.mem.order(u8, row.node, lower) != .lt) {
                         if (limit) |cap| if (nodes.items.len == cap) return false;
+                        // Permit a single oversized ID so progress never stalls.
+                        // Admission happens before copying, not after allocation.
+                        if (max_node_bytes) |cap| if (nodes.items.len != 0 and row.node.len > cap -| node_bytes) return false;
+                        node_bytes +|= row.node.len;
                         try nodes.ensureUnusedCapacity(self.alloc, 1);
                         try slots.ensureUnusedCapacity(self.alloc, 1);
                         nodes.appendAssumeCapacity(try self.alloc.dupe(u8, row.node));
@@ -9163,6 +9268,7 @@ pub const GraphIndex = struct {
         map: Map = .empty,
         owned: std.ArrayListUnmanaged([]u8) = .empty,
         sealed: ?*@import("sealed_vector_cache.zig").Cache = null,
+        admission_ticket: ?u64 = null,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.owned.items) |bytes| alloc.free(bytes);
@@ -9182,6 +9288,10 @@ pub const GraphIndex = struct {
             try self.map.put(alloc, chunk, bytes);
         }
     };
+
+    fn sealedVectorScope(metric: []const u8) [32]u8 {
+        return @import("sealed_vector_cache.zig").Cache.key(metric);
+    }
 
     fn readGraphMetricVectorSlotsAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, lane: []const u8, iteration: u32, slots: []const u64, required: bool) ![]f64 {
         var cache = VectorReadCache.empty;
@@ -9210,6 +9320,9 @@ pub const GraphIndex = struct {
 
     fn readGraphMetricVectorSlotsTypedInto(self: *GraphIndex, comptime T: type, txn: anytype, metric_name: []const u8, job_id: u64, lane: []const u8, iteration: u32, slots: []const u64, required: bool, cache: *VectorReadCache, values: []T, temp: Allocator) !void {
         if (values.len != slots.len) return error.InvalidGraphMetricScore;
+        if (cache.sealed) |sealed| if (cache.admission_ticket == null) {
+            cache.admission_ticket = sealed.ticket();
+        };
         var missing = std.AutoHashMapUnmanaged(u64, void).empty;
         var chunk_ids = std.ArrayListUnmanaged(u64).empty;
         var keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -9238,7 +9351,7 @@ pub const GraphIndex = struct {
             for (chunk_ids.items, keys.items, chunks) |chunk, key, raw| {
                 try cache.put(self.alloc, chunk, raw);
                 if (cache.sealed) |sealed| if (raw) |bytes| {
-                    sealed.put(self.alloc, @import("sealed_vector_cache.zig").Cache.key(key), bytes);
+                    sealed.putAt(self.alloc, @import("sealed_vector_cache.zig").Cache.key(key), bytes, sealedVectorScope(metric_name), cache.admission_ticket.?);
                 };
             }
         }
@@ -9909,6 +10022,9 @@ pub const GraphIndex = struct {
     // receipt produced by this same worker; large chunks remain checkpointed.
     fn executeOrdinalReduceSummaryCheckpoint(self: *GraphIndex, metric_name: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob, claimed: GraphMetricBuildPage, max_nodes: usize, max_records: usize, may_pack: bool) !usize {
         if (max_nodes == 0 or max_records == 0) return error.InvalidGraphMetricBuildProgress;
+        // Capture before opening the snapshot/validating the lease. Retirement
+        // can race a reclaimed worker, but its old ticket cannot repopulate it.
+        const admission_ticket = self.sealed_vectors.ticket();
         // Dense tiles contain at most 256 edges. Bound both tile reads and
         // vector-gather work independently of producer checkpoint boundaries.
         const record_limit = @min(max_records, ordinal_blocks.max_edges / vector_chunk.entries);
@@ -9986,7 +10102,7 @@ pub const GraphIndex = struct {
             }
             // The phase barrier seals this source lane before reducers run.
             // Only this path may reuse owned bytes across read transactions.
-            var vector_cache = VectorReadCache{ .sealed = &self.sealed_vectors };
+            var vector_cache = VectorReadCache{ .sealed = &self.sealed_vectors, .admission_ticket = admission_ticket };
             defer vector_cache.deinit(self.alloc);
             var scratch = OrdinalFoldScratch{ .arena = std.heap.ArenaAllocator.init(self.alloc) };
             defer scratch.arena.deinit();
@@ -10149,8 +10265,10 @@ pub const GraphIndex = struct {
             {
                 var txn = try self.beginReadReverseTxn();
                 defer txn.abort();
-                const count = graphMetricDegreeReducePageCount(@intCast(total_units));
+                const active = if (page.iteration != 0) try self.graphMetricActivePlan(&txn, metric_name, job.job_id) else null;
+                const count = if (active) |work| work.count else graphMetricDegreeReducePageCount(@intCast(total_units));
                 for (0..count) |index| {
+                    if (active) |work| if (work.counts[index] == 0) continue;
                     const leaf = try self.metricBuildPage(&txn, metric_name, job.job_id, page.phase, page.iteration, graph_metric_build_summary_leaf_base + index) orelse return error.InvalidGraphMetricBuildManifest;
                     if (leaf.range_kind != .summary or leaf.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
                     units = std.math.add(u64, units, leaf.completed_units) catch return error.InvalidGraphMetricBuildManifest;
@@ -12567,16 +12685,23 @@ pub const GraphIndex = struct {
         const reached_end = blk: {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
-            break :blk try self.collectGraphMetricInitializedNodesInRange(
+            var slots = std.ArrayListUnmanaged(u64).empty;
+            defer slots.deinit(self.alloc);
+            try self.validateGraphMetricVectorManifest(&txn, metric_name, job.job_id);
+            const complete = try self.collectSealedGraphMetricMembership(
                 &txn,
                 metric_name,
                 job.job_id,
                 range_lower,
                 range_upper,
                 resume_cursor,
-                graph_metric_build_target_reduce_page_units,
+                graph_metric_build_checkpoint_reduce_units,
+                1024 * 1024,
                 &nodes,
+                &slots,
             );
+            try self.validateGraphMetricOrdinalDictionary(&txn, metric_name, job.job_id, nodes.items, slots.items);
+            break :blk complete;
         };
 
         var primary_scores = std.ArrayListUnmanaged(GraphMetricScore).empty;
@@ -12619,8 +12744,12 @@ pub const GraphIndex = struct {
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .publish_generation, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, page);
-        try self.putPlannedGraphMetricScorePageInBatch(&batch, metric_name, job, metric_name, primary_scores.items);
-        if (pair_cfg) |pair| try self.putPlannedGraphMetricScorePageInBatch(&batch, metric_name, job, pair.name, pair_scores.items);
+        const primary_prior = try self.plannedGraphMetricPriorScoresAlloc(&batch, metric_name, job.score_generation, primary_scores.items);
+        defer self.alloc.free(primary_prior);
+        const pair_prior = if (pair_cfg) |pair| try self.plannedGraphMetricPriorScoresAlloc(&batch, pair.name, job.score_generation, pair_scores.items) else null;
+        defer if (pair_prior) |prior| self.alloc.free(prior);
+        try self.putPlannedGraphMetricScorePageWithPrior(&batch, metric_name, job, metric_name, primary_scores.items, primary_prior);
+        if (pair_cfg) |pair| try self.putPlannedGraphMetricScorePageWithPrior(&batch, metric_name, job, pair.name, pair_scores.items, pair_prior.?);
 
         page.completed_units = completed_units;
         page.total_units = total_units;
@@ -14251,17 +14380,41 @@ pub const GraphIndex = struct {
     /// Score, staging key, and page-attempt checkpoint share one transaction.
     /// Reclaimed attempts can replace a value without leaving a stale rank key.
     fn putPlannedGraphMetricScorePageInBatch(self: *GraphIndex, batch: anytype, owner: []const u8, job: GraphMetricBuildJob, metric: []const u8, scores: []const GraphMetricScore) !void {
+        const prior = try self.plannedGraphMetricPriorScoresAlloc(batch, metric, job.score_generation, scores);
+        defer self.alloc.free(prior);
+        try self.putPlannedGraphMetricScorePageWithPrior(batch, owner, job, metric, scores, prior);
+    }
+
+    fn plannedGraphMetricPriorScoresAlloc(self: *GraphIndex, batch: anytype, metric: []const u8, generation: u64, scores: []const GraphMetricScore) ![]?f64 {
+        // Read the entire previous page before staging mutations. In backends
+        // with a linear pending-write overlay, interleaving reads and writes
+        // makes a large publication checkpoint quadratic.
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const keys = try arena.allocator().alloc([]const u8, scores.len);
+        for (scores, 0..) |score, i| {
+            const primary = try self.graphMetricScoreKeyAlloc(metric, generation, score.node);
+            defer self.alloc.free(primary);
+            keys[i] = try arena.allocator().dupe(u8, primary);
+        }
+        const prior = try self.getManyValuesAlloc(batch, keys);
+        defer self.alloc.free(prior);
+        const old_scores = try self.alloc.alloc(?f64, scores.len);
+        errdefer self.alloc.free(old_scores);
+        for (prior, old_scores) |raw, *old| old.* = if (raw) |value| decodeF64(value) orelse return error.InvalidGraphMetricScore else null;
+        return old_scores;
+    }
+
+    fn putPlannedGraphMetricScorePageWithPrior(self: *GraphIndex, batch: anytype, owner: []const u8, job: GraphMetricBuildJob, metric: []const u8, scores: []const GraphMetricScore, old_scores: []const ?f64) !void {
+        std.debug.assert(scores.len == old_scores.len);
         const stage = try self.graphMetricRankStagePrefixAlloc(owner, job.job_id, metric, "rank-run");
         defer self.alloc.free(stage);
         const rank_prefix = try self.graphMetricRankPrefixAlloc(metric, job.score_generation);
         defer self.alloc.free(rank_prefix);
         var key = std.ArrayListUnmanaged(u8).empty;
         defer key.deinit(self.alloc);
-        for (scores) |score| {
-            const primary = try self.graphMetricScoreKeyAlloc(metric, job.score_generation, score.node);
-            defer self.alloc.free(primary);
-            if (batch.get(primary)) |raw| {
-                const old = decodeF64(raw) orelse return error.InvalidGraphMetricScore;
+        for (scores, old_scores) |score, old_value| {
+            if (old_value) |old| {
                 if (old != score.score) {
                     const old_rank = try self.graphMetricRankKeyAlloc(metric, job.score_generation, old, score.node);
                     defer self.alloc.free(old_rank);
@@ -14273,9 +14426,6 @@ pub const GraphIndex = struct {
                         else => return err,
                     };
                 }
-            } else |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
             }
             const rank = try self.graphMetricRankKeyAlloc(metric, job.score_generation, score.score, score.node);
             defer self.alloc.free(rank);
@@ -14288,6 +14438,36 @@ pub const GraphIndex = struct {
     }
 
     const graph_metric_rank_checkpoint_entries = 256;
+
+    /// Measures only atomic score/staging/cursor publication, excluding graph
+    /// computation and the final top-k merge. Every sample uses a fresh job.
+    pub fn benchmarkScorePublication(self: *GraphIndex, scores: []const GraphMetricScore, limit: usize, generation: u64) !usize {
+        const job = GraphMetricBuildJob{ .job_id = generation, .score_generation = generation, .target_generation = generation };
+        const cursor = try self.graphMetricRankStagePrefixAlloc("bench", generation, "bench", "publication-benchmark-cursor");
+        defer self.alloc.free(cursor);
+        var offset: usize = 0;
+        var commits: usize = 0;
+        while (offset < scores.len) {
+            const end = @min(scores.len, offset + limit);
+            var batch = try self.beginWriteReverseBatch();
+            errdefer batch.abort();
+            try self.putPlannedGraphMetricScorePageInBatch(&batch, "bench", job, "bench", scores[offset..end]);
+            try putU64(&batch, cursor, end);
+            try batch.commit();
+            commits += 1;
+            offset = end;
+        }
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        if (try readU64OrZero(&txn, cursor) != scores.len) return error.InvalidBenchmarkResult;
+        for (scores) |score| {
+            const key = try self.graphMetricScoreKeyAlloc("bench", generation, score.node);
+            defer self.alloc.free(key);
+            const actual = decodeF64(try txn.get(key)) orelse return error.InvalidBenchmarkResult;
+            if (actual != score.score) return error.InvalidBenchmarkResult;
+        }
+        return commits;
+    }
 
     /// The producer barrier makes the staging lane immutable. Each transaction
     /// copies at most 256 ordered winners and persists its cursor atomically.
@@ -14991,6 +15171,11 @@ pub const GraphIndex = struct {
         defer self.deinitClonedGraphMetricBuildJob(job);
 
         if (job.target_generation != self.edge_generation) return error.GraphMetricBuildSuperseded;
+        // A worker may own a different reopened handle from its coordinator.
+        // Observe retirement locally too, including old jobs whose coordinator
+        // could not reach this handle's cache. Full keys still isolate epochs.
+        if (job.phase != .reduce_ranks and job.phase != .hits_hub_reduce_ranks)
+            self.sealed_vectors.retire(self.alloc, sealedVectorScope(metric_name));
         if (job.phase == .complete) return .{ .phase = .complete, .published = true, .completed_build = true };
         if (job.phase == .publish_generation and !graphMetricKindUsesPlannedIterativeRunner(cfg.kind)) {
             return .{ .phase = .publish_generation };
@@ -17838,6 +18023,25 @@ test "graph metric membership resumes across sealed blocks and rejects corrupt r
         for (ids, 0..) |id, i| try GraphIndex.putU64(&batch, try GraphIndex.graphMetricNodeSlotKey(temp, "rank", 1, id), (@as(u64, 1) << 32) | i);
         try batch.commit();
     }
+    // Publication admission is independent of the 64-node planning unit.
+    // Test the exact byte boundary, resume, oversized-first-row progress, and
+    // a whole sealed leaf larger than the former publication checkpoint.
+    for ([_]usize{ 0, 9, 18, 1024 * 1024 }) |byte_limit| {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        var admitted = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (admitted.items) |node| alloc.free(node);
+            admitted.deinit(alloc);
+        }
+        var slots = std.ArrayListUnmanaged(u64).empty;
+        defer slots.deinit(alloc);
+        const complete = try graph.collectSealedGraphMetricMembership(&txn, "rank", 1, "", "z-0000", "", 4096, byte_limit, &admitted, &slots);
+        const expected = @min(ids.len, @max(@as(usize, 1), byte_limit / ids[0].len));
+        try std.testing.expectEqual(expected, admitted.items.len);
+        try std.testing.expectEqual(expected == ids.len, complete);
+        try graph.validateGraphMetricOrdinalDictionary(&txn, "rank", 1, admitted.items, slots.items);
+    }
     for ([_]bool{ false, true }) |corrupt| {
         if (corrupt) {
             var batch = try graph.beginWriteReverseBatch();
@@ -18299,6 +18503,44 @@ test "graph metric vector chunks publish pagerank eigenvector and hits with spar
     defer hits.deinit(alloc);
     var degree = try metric_kernels.degreeAlloc(alloc, nodes.len, &edges, .{});
     defer degree.deinit(alloc);
+    {
+        var building = try graph.ensureGraphMetricPlannedBuild("rank", graph.edge_generation);
+        building.deinit(alloc);
+        var reached_iteration = false;
+        for (0..2000) |_| {
+            _ = try graph.runGraphMetricPlannedWorkerPageStepForMetric("rank", "plan-worker");
+            _ = try graph.runGraphMetricPlannedCoordinatorStepForMetric("rank");
+            var txn = try graph.beginReadReverseTxn();
+            defer txn.abort();
+            const job = (try graph.metricBuildJob(&txn, "rank")).?;
+            if (job.iteration != 1) continue;
+            const plan = try graph.graphMetricActivePlan(&txn, "rank", job.job_id);
+            try std.testing.expectEqual(@as(usize, 65), plan.count);
+            try std.testing.expectEqual(@as(u64, 3), plan.total());
+            var active_count: usize = 0;
+            for (plan.counts[0..plan.count], 0..) |count, i| {
+                const id = GraphIndex.graphMetricBuildPhasePageIdBase(.pagerank, .reduce_ranks) + i;
+                const page = try graph.metricBuildPage(&txn, "rank", job.job_id, .reduce_ranks, 1, id);
+                const leaf = try graph.metricBuildPage(&txn, "rank", job.job_id, .reduce_ranks, 1, graph_metric_build_summary_leaf_base + i);
+                if (count == 0) {
+                    try std.testing.expect(page == null and leaf == null);
+                    const initial = (try graph.metricBuildPage(&txn, "rank", job.job_id, .reduce_ranks, 0, id)).?;
+                    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, initial.state);
+                    try std.testing.expectEqual(@as(u32, 0), initial.attempt);
+                } else {
+                    active_count += 1;
+                    try std.testing.expectEqual(count, page.?.total_units);
+                    try std.testing.expectEqual(count, leaf.?.total_units);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 2), active_count);
+            reached_iteration = true;
+            break;
+        }
+        try std.testing.expect(reached_iteration);
+        graph.close();
+        graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
+    }
     for (configs, 0..) |cfg, index| {
         // A compatible HITS pair shares the owner's one build.
         if (cfg.kind != .hits_hub) {
