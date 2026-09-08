@@ -59,7 +59,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(
             "zig",
-            ["build", "unit-test", "-Doptimize=Debug"],
+            ["build", "antfly-unit-test", "-Doptimize=Debug"],
             Path("/tmp/patched-runner.zig"),
             10_000,
         )
@@ -68,7 +68,7 @@ class BoundedZigBuildTest(unittest.TestCase):
             [
                 "zig",
                 "build",
-                "unit-test",
+                "antfly-unit-test",
                 "-Doptimize=Debug",
                 "--build-runner",
                 "/tmp/patched-runner.zig",
@@ -81,7 +81,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_preserves_explicit_scheduler_options(self):
         arguments = [
             "build",
-            "unit-test",
+            "antfly-unit-test",
             "--build-runner=/tmp/ci-runner.zig",
             "--maxrss=20000",
         ]
@@ -94,7 +94,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_adds_scheduler_options_before_runtime_arguments(self):
         command = launcher.build_command(
             "zig",
-            ["build", "unit-metadata-test", "--", "reconciler test"],
+            ["build", "antfly-metadata-test", "--", "reconciler test"],
             Path("/tmp/patched-runner.zig"),
             10_000,
         )
@@ -103,7 +103,7 @@ class BoundedZigBuildTest(unittest.TestCase):
             [
                 "zig",
                 "build",
-                "unit-metadata-test",
+                "antfly-metadata-test",
                 "--build-runner",
                 "/tmp/patched-runner.zig",
                 "--maxrss",

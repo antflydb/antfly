@@ -116,6 +116,10 @@ jobs:
             scripts/ci/toolchain-policy.json \
             .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
+            scripts/run_db_query_matrix.py \
+            scripts/test_run_db_query_matrix.py \
+            scripts/fetch-conformance-fixtures.sh \
+            scripts/test_fetch_conformance_fixtures.py \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -336,6 +340,12 @@ jobs:
           tools/test_audit_storage_test_shards.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
+          tools/test_test_runner.py
+
+      - name: Test benchmark orchestration and fixture setup
+        run: |
+          python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+          python3 -m unittest discover -s scripts -p test_fetch_conformance_fixtures.py
 
       - name: Check inference kernel generator
         working-directory: zig/pkg/inference
@@ -625,6 +635,12 @@ jobs:
           tools/test_audit_storage_test_shards.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
+          tools/test_test_runner.py
+
+      - name: Test benchmark orchestration and fixture setup
+        run: |
+          python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+          python3 -m unittest discover -s scripts -p test_fetch_conformance_fixtures.py
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget.
@@ -642,7 +658,7 @@ jobs:
             "$patched_runner"
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
-      - name: Run full Zig unit tests
+      - name: Run library, Antfly, and inference unit tests
         run: |
           set +e
           taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
@@ -665,7 +681,7 @@ jobs:
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
           release-scale-test
-          recall-harness-build
+          recall-harness
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -686,7 +702,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          sim-test
+          antfly-sim-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -695,7 +711,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          integration-test
+          antfly-integration-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -704,7 +720,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          recall-ci-test
+          antfly-recall-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -713,7 +729,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          chaos-test
+          antfly-chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 

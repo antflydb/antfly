@@ -19,7 +19,7 @@ The benchmark goal is to make these costs visible before changing the write path
 
 ### Disk LSM write bench
 
-Add `bench/storage/lsm_write_bench.zig` and a `zig build lsm-write-bench` step.
+Add `bench/storage/lsm_write_bench.zig` and a `zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 20000 --hot-keys 1000 --overwrite-rounds 20 --value-size 128 --batch-size 1000 --storage host --mode both` step.
 
 Workloads:
 
@@ -44,12 +44,12 @@ Metrics:
 Useful commands:
 
 ```sh
-zig build lsm-write-bench -- --samples 3 --keys 100000 --batch-size 5000 --storage native --mode both
-zig build lsm-write-bench -- --samples 3 --keys 100000 --batch-size 5000 --storage host --mode both
-zig build lsm-write-bench -- --samples 3 --keys 100000 --batch-size 5000 --storage native --mode bulk_ingest --flush-threshold 1024
-zig build lsm-write-bench-compare -- --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl
-zig build text-segment-write-bench -- --samples 3 --docs 100000 --batch-size 5000 --merge-width 8 --storage native
-zig build hbc-write-bench -- --samples 3 --vectors 100000 --dims 128 --batch-size 5000 --storage host
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 100000 --batch-size 5000 --storage native --mode both
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 100000 --batch-size 5000 --storage host --mode both
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 100000 --batch-size 5000 --storage native --mode bulk_ingest --flush-threshold 1024
+zig build lsm-write-bench-compare && ./zig-out/bin/lsm_write_bench_compare --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl
+zig build text-segment-write-bench && ./zig-out/bin/text_segment_write_bench --samples 3 --docs 100000 --batch-size 5000 --merge-width 8 --storage native
+zig build hbc-write-bench && ./zig-out/bin/hbc_write_bench --samples 3 --vectors 100000 --dims 128 --batch-size 5000 --storage host
 ```
 
 Use `--storage native` for filesystem timings and `--storage host` for lower-noise persisted table/manifest write counts through the host storage abstraction.
@@ -110,7 +110,7 @@ Metrics:
 Useful command shape:
 
 ```sh
-zig build text-segment-write-bench -- --samples 3 --docs 100000 --batch-size 5000 --merge-width 8 --storage native
+zig build text-segment-write-bench && ./zig-out/bin/text_segment_write_bench --samples 3 --docs 100000 --batch-size 5000 --merge-width 8 --storage native
 ```
 
 ## Longer-Term Shape
@@ -128,10 +128,10 @@ The durable write path should look closer to Lucene/Tantivy/Pebble:
 
 Current status:
 
-- `zig build lsm-write-bench` exists and emits JSONL for sorted load, random load, focused random-ingest-plus-compaction-drain, overwrite, and delete workloads.
-- `zig build lsm-write-bench-compare` compares median timings and write-amplification counters by scenario/workload.
-- `zig build text-segment-write-bench` exists for full-text segment build, on-disk publish, merge, and force-merge mechanics outside the DB catalog.
-- `zig build hbc-write-bench` exists for empty bulk build vs default online HBC batches vs online batches with absent-id hints vs experimental coalesced leaf writes, with storage write counters and `HBCIndex.WriteProfile`.
+- `zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 20000 --hot-keys 1000 --overwrite-rounds 20 --value-size 128 --batch-size 1000 --storage host --mode both` exists and emits JSONL for sorted load, random load, focused random-ingest-plus-compaction-drain, overwrite, and delete workloads.
+- `zig build lsm-write-bench-compare && ./zig-out/bin/lsm_write_bench_compare --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl` compares median timings and write-amplification counters by scenario/workload.
+- `zig build text-segment-write-bench && ./zig-out/bin/text_segment_write_bench --samples 3 --docs 20000 --batch-size 1000 --terms-per-doc 12 --merge-width 8 --storage host` exists for full-text segment build, on-disk publish, merge, and force-merge mechanics outside the DB catalog.
+- `zig build hbc-write-bench && ./zig-out/bin/hbc_write_bench --samples 3 --vectors 10000 --dims 128 --batch-size 1000 --leaf-size 128 --storage host` exists for empty bulk build vs default online HBC batches vs online batches with absent-id hints vs experimental coalesced leaf writes, with storage write counters and `HBCIndex.WriteProfile`.
 - Native 100k baselines are checked in under `bench/baselines/` for LSM writes, HBC writes, and full-text segment writes.
 - Derived dense replay now threads `.bulk_ingest` into the HBC insert choice: empty indexes use the HBC bulk builder, and replay batches whose vector IDs were newly allocated skip per-vector existence probes.
 - HBC leaf-write coalescing is implemented behind `BatchInsertOptions.coalesce_leaf_writes`. It reduces bytes but can be slower than the absent-id path, so production only enables it for bulk replay batches where vector IDs are known-new.
@@ -159,7 +159,7 @@ Current status:
 - On 100k native HBC smoke runs after bounded recursive split batching, coalesced online batches consistently wrote fewer bytes, about 715 MB versus default/assume-absent at about 738 MB, but timing is not consistently faster. A later 100k run measured coalesced at 68.4 us/vector versus default and assume-absent at about 66.8 us/vector. A deferred sorted leaf-range publication experiment was rolled back because it worsened timing while preserving the same byte reduction.
 - Deferred quantized rebuild now tracks the HBC nodes whose bodies changed during the write transaction and refreshes only that touched-node set at finish. This replaces the full-tree `rebuildAllQuantized()` behavior for adapters that provide the touched-node tracker. A 10k native smoke run with 5k batches moved coalesced deferred quantized puts to 182 versus 6,419 for non-deferred coalesced and 10,354 for default/assume-absent online batches.
 - The true mutation-batch work is partly implemented, not a clean win yet. The successful pieces are sorted raw-vector/metadata pre-store, no-split leaf grouping, bounded batch-end split handling, ancestor range refresh coalescing, and touched-node quantized rebuild. The rolled-back pieces were narrower experiments: final-only vec-leaf mapping and deferred sorted leaf-range publication both preserved byte reductions but worsened timing/storage behavior. The next safe HBC slice avoids writing an oversized temporary leaf before splitting a grouped overflow leaf; instead the grouped path now splits directly from the in-memory mutated leaf and queues the resulting leaves only for recursive overflow checks.
-- `zig build lsm-backend-test` is a focused LSM backend unit-test step; the current bucket passes 244 tests with one platform-specific skip, zero failures, and zero allocator leaks.
+- `zig build lsm-backend-test` is a focused LSM backend antfly-unit-test step; the current bucket passes 244 tests with one platform-specific skip, zero failures, and zero allocator leaks.
 - The bench can run against host-backed in-memory persistence, native filesystem storage, or memory-only storage.
 - `Backend.WriteStats` now exposes flush, table-file, manifest, and compaction timing/byte counters via `snapshotWriteStats()`.
 
@@ -636,7 +636,7 @@ sanity checks but is too compressible for write-amplification comparison.
 Useful first comparison:
 
 ```sh
-zig build lsm-write-bench -- --samples 1 --keys 20000 --hot-keys 1000 \
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 1 --keys 20000 --hot-keys 1000 \
   --overwrite-rounds 20 --value-size 65536 --value-pattern keyed \
   --batch-size 1000 --storage native --mode default \
   --workload-set hot_overwrite
@@ -787,7 +787,7 @@ Changes made:
 Small Zig smoke after this change, matching the Pebble smoke shape:
 
 ```sh
-zig build lsm-write-bench -- --samples 1 --keys 2000 --hot-keys 500 \
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 1 --keys 2000 --hot-keys 500 \
   --overwrite-rounds 2 --value-size 512 --value-pattern keyed \
   --batch-size 500 --storage memory --mode default \
   --workload-set hot_overwrite --hot-maintenance-steps 1 --readers 2
@@ -810,7 +810,7 @@ compaction policy, not repeated publication of every overwrite round.
 For a more overwrite-heavy comparison:
 
 ```sh
-zig build lsm-write-bench -- --samples 1 --keys 2000 --hot-keys 500 \
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 1 --keys 2000 --hot-keys 500 \
   --overwrite-rounds 20 --value-size 512 --value-pattern keyed \
   --batch-size 500 --storage memory --mode default \
   --workload-set hot_overwrite --hot-maintenance-steps 1
@@ -1050,7 +1050,7 @@ entire large runs.
      the production envelope: 1536D vectors, 500-document chunks, weak-sync
      API/replay semantics, async derived catch-up, HBC session publication, LSM
      maintenance pressure, and status probes while ingest is active.
-   - `zig build dense-ingest-guardrail` now runs `dense_stack_bench` in
+   - `zig build dense-ingest-guardrail && ./zig-out/bin/dense_ingest_guardrail --docs 5000 --dims 1536 --batch-size 500 --sync-level write --status-probe-every 1 --max-dense-lsm-run-bytes 1073741824 --max-dense-l0-runs 64 --max-status-probe-ns 500000000` now runs `dense_stack_bench` in
      ingest-only mode with a VectorDBBench-shaped smoke:
      `--docs 5000 --dims 1536 --batch-size 500 --sync-level write`.
      It emits an `ingest_summary` JSON line with write wall time, final drain
@@ -1067,9 +1067,10 @@ entire large runs.
      The HBC bench catches raw quantized/node publication debt; the dense ingest
      guardrail catches the DB/catalog/derived replay shape that can accidentally
      reintroduce that debt.
-   - `zig build hbc-write-guardrail` runs the focused HBC version with 1536D,
-     500-vector batches, and the per-batch-session scenario. `zig build
-     vector-write-guardrails` runs both the HBC and dense ingest smokes.
+   - `zig build antfly-storage-vectorindex-write-test` runs the focused HBC
+     case (1536D, 500-vector batches, per-batch-session) and dense ingest smoke.
+     For benchmark sweeps, build `hbc-write-bench` once and invoke its binary
+     with the desired arguments; see [BENCHMARKS.md](../../../../../BENCHMARKS.md).
    - Remaining local coverage to add: a `DataServer`/write-source level smoke
      that starts the real background LSM maintenance scheduler and polls the
      public status path during ingest. The direct DB guardrail measures status

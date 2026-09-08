@@ -1430,7 +1430,7 @@ algebraic-summary baseline-file comparison ratios for stable local performance g
 `algebraic-planner-ownership-guardrail` build step under `tools/guardrails/` that rejects production raw tensor-program construction outside the algebraic planner/IR layer
 `algebraic-archive-guardrail` build step that verifies archived production-hardening run directories include environment notes, raw/summary JSONL, threshold flags, optional baseline comparison, and non-smoke provenance
 `algebraic-roadmap-guardrail` build step that combines CI-safe algebraic performance, planner-ownership, and archive-evidence checks
-`scripts/run_algebraic_production_hardening.sh` runner for archived LSM analytics, adaptive coverage, cold/warm read coverage, graph traversal, public query no-schema/schema/algebraic comparisons, summary generation, threshold enforcement, optional baseline-ratio checks, bounded cardinality and per-stage sizing/churn knobs, query-shape coverage thresholds for cold/warm/constrained/wide/stats/cardinality/range/histogram records, path-promotion FST rebuild thresholds, public-query mode selection through `ALGEBRAIC_HARDENING_PUBLIC_MODE`, optional public-query symbolic-profile enforcement through `ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`, optional LSM bulk-ingest stress through `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` across LSM analytics and adaptive coverage stages, LSM bulk finish knobs for flush, compact, deferred-L0 targets, and bounded foreground compaction budgets, and optional broad unit-test evidence
+`scripts/run_algebraic_production_hardening.sh` runner for archived LSM analytics, adaptive coverage, cold/warm read coverage, graph traversal, public query no-schema/schema/algebraic comparisons, summary generation, threshold enforcement, optional baseline-ratio checks, bounded cardinality and per-stage sizing/churn knobs, query-shape coverage thresholds for cold/warm/constrained/wide/stats/cardinality/range/histogram records, path-promotion FST rebuild thresholds, public-query mode selection through `ALGEBRAIC_HARDENING_PUBLIC_MODE`, optional public-query symbolic-profile enforcement through `ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`, optional LSM bulk-ingest stress through `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` across LSM analytics and adaptive coverage stages, LSM bulk finish knobs for flush, compact, deferred-L0 targets, and bounded foreground compaction budgets, and optional broad antfly-unit-test evidence
 LSM bulk-session finish direct-ingests the final mutable state as a sorted run when direct bulk ingest is enabled and no immutable flush is pending, so algebraic bulk sidecars avoid a final normal flush and archived runs can guard `total_lsm_sorted_ingest_runs`
 algebraic bulk-ingest sessions defer promoted path dictionary FST rebuilds across all flushed coalescer batches and rebuild each dirty promoted dictionary once at DB bulk-session finish, before the primary store publishes the final sorted run
 `scripts/run_algebraic_integration_matrix.sh` runner for archived enabled/disabled integration evidence across roadmap guardrails, public-query default no-schema, schema-only, schema-plus-algebraic, focused algebraic DB tests, provisioned distributed non-algebraic fallback coverage, optional broad unit tests, and optional selected e2e tests
@@ -1547,32 +1547,32 @@ large JSONL result files.
 Adaptive coverage smoke:
 
 ```sh
-zig build algebraic-bench -- --mode adaptive-coverage --algebraic-backend mem --docs 1000 --repeats 1 --batch-size 250 --churn-ops 100 2> /tmp/algebraic-adaptive-coverage.jsonl
-zig build algebraic-summary -- --input /tmp/algebraic-adaptive-coverage.jsonl
+zig build algebraic-bench && ./zig-out/bin/algebraic_bench --mode adaptive-coverage --algebraic-backend mem --docs 1000 --repeats 1 --batch-size 250 --churn-ops 100 2> /tmp/algebraic-adaptive-coverage.jsonl
+zig build algebraic-summary && ./zig-out/bin/algebraic_summary --input /tmp/algebraic-adaptive-coverage.jsonl
 ```
 
 Durable LSM analytics smoke:
 
 ```sh
-zig build algebraic-bench -- --mode lsm-analytics-smoke --docs 100 --repeats 1 --batch-size 50 --churn-ops 1 2> /tmp/algebraic-lsm-analytics-smoke.jsonl
-zig build algebraic-summary -- --input /tmp/algebraic-lsm-analytics-smoke.jsonl
+zig build algebraic-bench && ./zig-out/bin/algebraic_bench --mode lsm-analytics-smoke --docs 100 --repeats 1 --batch-size 50 --churn-ops 1 2> /tmp/algebraic-lsm-analytics-smoke.jsonl
+zig build algebraic-summary && ./zig-out/bin/algebraic_summary --input /tmp/algebraic-lsm-analytics-smoke.jsonl
 ```
 
 Full durable LSM analytics run:
 
 ```sh
-zig build algebraic-bench -- --mode lsm-analytics --docs 5000 --repeats 3 --batch-size 500 --churn-ops 500 2> /tmp/algebraic-lsm-analytics.jsonl
-zig build algebraic-summary -- --input /tmp/algebraic-lsm-analytics.jsonl
+zig build algebraic-bench && ./zig-out/bin/algebraic_bench --mode lsm-analytics --docs 5000 --repeats 3 --batch-size 500 --churn-ops 500 2> /tmp/algebraic-lsm-analytics.jsonl
+zig build algebraic-summary && ./zig-out/bin/algebraic_summary --input /tmp/algebraic-lsm-analytics.jsonl
 ```
 
 Hybrid vector symbolic-pruning smoke:
 
 ```sh
-zig build public-query-guardrail -- --query-shape hybrid-filter --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-noschema.jsonl
-zig build public-query-guardrail -- --query-shape hybrid-filter --with-schema --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-schema.jsonl
-zig build public-query-guardrail -- --query-shape hybrid-filter --with-algebraic --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-algebraic.jsonl
+zig build public-query-guardrail && ./zig-out/bin/public_query_guardrail --query-shape hybrid-filter --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-noschema.jsonl
+zig build public-query-guardrail && ./zig-out/bin/public_query_guardrail --query-shape hybrid-filter --with-schema --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-schema.jsonl
+zig build public-query-guardrail && ./zig-out/bin/public_query_guardrail --query-shape hybrid-filter --with-algebraic --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-algebraic.jsonl
 cat /tmp/public-query-noschema.jsonl /tmp/public-query-schema.jsonl /tmp/public-query-algebraic.jsonl > /tmp/public-query-compare.jsonl
-zig build algebraic-summary -- --input /tmp/public-query-compare.jsonl
+zig build algebraic-summary && ./zig-out/bin/algebraic_summary --input /tmp/public-query-compare.jsonl
 ```
 
 `--with-algebraic` implies `--with-schema`. Without either flag, the public API
@@ -1590,7 +1590,7 @@ zig build algebraic-planner-ownership-guardrail
 zig build algebraic-archive-guardrail
 zig build algebraic-roadmap-guardrail
 
-zig build algebraic-summary -- --input /tmp/algebraic-combined.jsonl \
+zig build algebraic-summary && ./zig-out/bin/algebraic_summary --input /tmp/algebraic-combined.jsonl \
   --baseline /tmp/algebraic-baseline-summary.jsonl \
   --require-performance-evidence \
   --min-lsm-dataset-cases 1 \
@@ -1639,8 +1639,8 @@ and `--require-non-smoke` for representative archived runs.
 Bounded graph traversal smoke:
 
 ```sh
-zig build algebraic-bench -- --mode graph-traversal-smoke --docs 100 --repeats 3 --fanout 2 2> /tmp/algebraic-graph-traversal.jsonl
-zig build algebraic-summary -- --input /tmp/algebraic-graph-traversal.jsonl
+zig build algebraic-bench && ./zig-out/bin/algebraic_bench --mode graph-traversal-smoke --docs 100 --repeats 3 --fanout 2 2> /tmp/algebraic-graph-traversal.jsonl
+zig build algebraic-summary && ./zig-out/bin/algebraic_summary --input /tmp/algebraic-graph-traversal.jsonl
 ```
 
 The important summary events are:

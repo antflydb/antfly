@@ -3946,7 +3946,15 @@ test "metadata.table status encoder canonicalizes embeddings indexes without inl
 
     const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"semantic_kg\":{\"name\":\"semantic_kg\",\"type\":\"embeddings\"") != null);
+    // Canonical values are the contract; serialized object-key order is not.
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const indexes = parsed.value.object.get("indexes") orelse return error.TestUnexpectedResult;
+    const index = indexes.object.get("semantic_kg") orelse return error.TestUnexpectedResult;
+    const name = index.object.get("name") orelse return error.TestUnexpectedResult;
+    const index_type = index.object.get("type") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("semantic_kg", name.string);
+    try std.testing.expectEqualStrings("embeddings", index_type.string);
 }
 
 fn testFieldCapabilityByIdentifier(root: std.json.Value, identifier: []const u8) ?std.json.Value {

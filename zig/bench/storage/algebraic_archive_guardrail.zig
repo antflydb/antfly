@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
         .{
             .name = "summary-command.txt",
             .must_contain = &.{
-                "zig build algebraic-summary",
+                "./zig-out/bin/algebraic_summary",
                 "--require-performance-evidence",
                 "--min-lsm-dataset-cases",
                 "--min-public-query-comparison-pairs",

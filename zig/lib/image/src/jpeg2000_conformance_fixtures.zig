@@ -51,11 +51,14 @@ pub const FixtureError = error{
 /// the returned slice when `allocator` is provided; the convenience
 /// `fixtureDir()` without allocator returns a static slice.
 pub fn fixtureDir() []const u8 {
+    if (@import("builtin").is_test) {
+        if (std.testing.environ.get("OPENJPEG_DATA_DIR")) |path| return path;
+    }
     return default_root_dir;
 }
 
 pub fn conformanceDirAlloc(allocator: Allocator) ![]u8 {
-    return std.fs.path.join(allocator, &.{ default_root_dir, "input", "conformance" });
+    return std.fs.path.join(allocator, &.{ fixtureDir(), "input", "conformance" });
 }
 
 /// Ensure the openjpeg-data checkout exists under `root_dir`.
@@ -142,7 +145,7 @@ fn runChild(allocator: Allocator, argv: []const []const u8) !void {
 }
 
 /// Entry point so the helper can be built as a standalone binary
-/// (`zig build lib-image-conformance-fetch`) mirroring the JPEG
+/// (`../scripts/fetch-conformance-fixtures.sh --suite image`) mirroring the JPEG
 /// seed-corpora fetcher. Keeps the network-touching path out of `zig
 /// test` by default; the test invokes the library helper instead.
 pub fn main(init: std.process.Init) !void {

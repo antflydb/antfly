@@ -52,8 +52,8 @@ Current harness:
 Suggested usage:
 
 ```sh
-zig build lib-audio-conformance-fetch
-zig build lib-audio-conformance-run
+../scripts/fetch-conformance-fixtures.sh --suite audio
+zig build lib-audio-conformance
 zig build lib-audio-conformance
 ```
 

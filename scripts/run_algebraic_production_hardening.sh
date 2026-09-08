@@ -18,6 +18,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+run_zig_build() {
+  (cd "$ROOT/zig" && zig build "$@")
+}
+
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${ALGEBRAIC_HARDENING_OUT:-bench/results/algebraic-production-hardening/$STAMP}"
 
@@ -281,8 +285,10 @@ if [[ -n "$LSM_LEVEL_TARGET_BYTES_MULTIPLIER" ]]; then
   LSM_TUNING_ARGS+=(--lsm-level-target-bytes-multiplier "$LSM_LEVEL_TARGET_BYTES_MULTIPLIER")
 fi
 
+run_zig_build algebraic-bench public-query-guardrail algebraic-summary
+
 lsm_args=(
-  zig build algebraic-bench --
+  "$ROOT/zig/zig-out/bin/algebraic_bench"
   --mode "$LSM_MODE"
   --algebraic-backend lsm
   --algebraic-profile production_hardening
@@ -303,7 +309,7 @@ fi
 run_jsonl_stderr lsm_analytics "${lsm_args[@]}"
 
 adaptive_args=(
-  zig build algebraic-bench --
+  "$ROOT/zig/zig-out/bin/algebraic_bench"
   --mode adaptive-coverage
   --algebraic-backend "$ADAPTIVE_BACKEND"
   --algebraic-profile production_hardening
@@ -323,7 +329,7 @@ fi
 run_jsonl_stderr adaptive_coverage "${adaptive_args[@]}"
 
 cold_args=(
-  zig build algebraic-bench --
+  "$ROOT/zig/zig-out/bin/algebraic_bench"
   --mode cold
   --algebraic-backend lsm
   --algebraic-profile production_hardening
@@ -343,7 +349,7 @@ fi
 run_jsonl_stderr cold_warm_reads "${cold_args[@]}"
 
 graph_args=(
-  zig build algebraic-bench --
+  "$ROOT/zig/zig-out/bin/algebraic_bench"
   --mode "$GRAPH_MODE"
   --algebraic-backend "$GRAPH_BACKEND"
   --algebraic-profile production_hardening
@@ -360,7 +366,7 @@ run_jsonl_stderr graph_traversal "${graph_args[@]}"
 
 for schema_mode in no_schema schema_only schema_algebraic; do
   args=(
-    zig build public-query-guardrail --
+    "$ROOT/zig/zig-out/bin/public_query_guardrail"
     --mode "$PUBLIC_MODE"
     --query-shape hybrid-filter-exclude-project
     --docs "$PUBLIC_DOCS"
@@ -390,7 +396,7 @@ COMBINED="$OUT/algebraic-production-hardening-combined.jsonl"
 cat "${STAGE_JSONL_FILES[@]}" > "$COMBINED"
 
 summary_args=(
-  zig build algebraic-summary --
+  "$ROOT/zig/zig-out/bin/algebraic_summary"
   --input "$COMBINED"
   --require-performance-evidence
   --min-dataset-cases "$MIN_DATASET_CASES"
@@ -475,7 +481,7 @@ printf "\n" >> "$OUT/summary-command.txt"
 
 if [[ "$RUN_UNIT_TEST" == "1" ]]; then
   echo "running unit_test"
-  zig build unit-test > "$OUT/unit-test.stdout" 2> "$OUT/unit-test.stderr"
+  run_zig_build lib-test antfly-unit-test inference-test inference-finetune-test > "$OUT/unit-test.stdout" 2> "$OUT/unit-test.stderr"
 fi
 
 echo "wrote $OUT"

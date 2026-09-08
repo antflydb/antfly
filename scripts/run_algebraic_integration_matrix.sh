@@ -17,6 +17,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+run_zig_build() { (cd "$ROOT/zig" && zig build "$@"); }
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${ALGEBRAIC_MATRIX_OUT:-bench/results/algebraic-integration-matrix/$STAMP}"
@@ -106,21 +107,21 @@ public_query_args=(
 )
 
 if [[ "$WARM_BUILDS" == "1" ]]; then
-  warm_case roadmap_guardrail zig build algebraic-roadmap-guardrail
-  warm_case public_query_guardrail zig build public-query-guardrail-build
-  warm_case lib_db_algebraic zig build lib-db-test -- --test-filter algebraic
-  warm_case provisioned_distributed_non_algebraic_name zig build lib-db-test -- --test-filter "provisioned distributed aggregations collect path terms nested cardinality"
+  warm_case roadmap_guardrail run_zig_build algebraic-roadmap-guardrail
+  warm_case public_query_guardrail run_zig_build public-query-guardrail
+  warm_case lib_db_algebraic run_zig_build antfly-storage-db-test -- --test-filter algebraic
+  warm_case provisioned_distributed_non_algebraic_name run_zig_build antfly-storage-db-test -- --test-filter "provisioned distributed aggregations collect path terms nested cardinality"
 fi
 
-run_case roadmap_guardrail zig build algebraic-roadmap-guardrail
-run_case public_query_default_no_schema zig build public-query-guardrail -- "${public_query_args[@]}"
-run_case public_query_schema_only zig build public-query-guardrail -- "${public_query_args[@]}" --with-schema
-run_case public_query_schema_algebraic zig build public-query-guardrail -- "${public_query_args[@]}" --with-schema --with-algebraic
-run_case lib_db_algebraic zig build lib-db-test -- --test-filter algebraic
-run_case provisioned_distributed_non_algebraic_name zig build lib-db-test -- --test-filter "provisioned distributed aggregations collect path terms nested cardinality"
+run_case roadmap_guardrail run_zig_build algebraic-roadmap-guardrail
+run_case public_query_default_no_schema "$ROOT/zig/zig-out/bin/public_query_guardrail" "${public_query_args[@]}"
+run_case public_query_schema_only "$ROOT/zig/zig-out/bin/public_query_guardrail" "${public_query_args[@]}" --with-schema
+run_case public_query_schema_algebraic "$ROOT/zig/zig-out/bin/public_query_guardrail" "${public_query_args[@]}" --with-schema --with-algebraic
+run_case lib_db_algebraic run_zig_build antfly-storage-db-test -- --test-filter algebraic
+run_case provisioned_distributed_non_algebraic_name run_zig_build antfly-storage-db-test -- --test-filter "provisioned distributed aggregations collect path terms nested cardinality"
 
 if [[ "$RUN_UNIT_TEST" == "1" ]]; then
-  run_case unit_test zig build unit-test
+  run_case unit_test run_zig_build lib-test antfly-unit-test inference-test inference-finetune-test
 fi
 
 if [[ "$RUN_E2E" == "1" ]]; then

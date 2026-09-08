@@ -52,7 +52,7 @@ const Config = struct {
 
 fn usage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\usage: zig build bench-tokenizer -- <tokenizer.json> <corpus.txt> [options]
+        \\usage: ./zig-out/bin/tokenizer_benchmark <tokenizer.json> <corpus.txt> [options]
         \\
         \\options:
         \\  --warmup N                warm-cache iterations (default: 2)

@@ -20,9 +20,9 @@ Suggested usage:
 
 ```sh
 zig build image-jpeg-seed-corpora-e2e
-zig build image-jpeg-seed-corpora-e2e-fetch
-zig build image-jpeg-seed-corpora-e2e-run
-zig build image-jpeg-seed-corpora-e2e-triage
+../scripts/fetch-conformance-fixtures.sh --suite image
+zig build image-jpeg-seed-corpora-e2e && ./zig-out/bin/image-jpeg-seed-corpora-e2e run /tmp/libjpeg-turbo-seed-corpora --no-fetch
+zig build image-jpeg-seed-corpora-e2e && ./zig-out/bin/image-jpeg-seed-corpora-e2e triage-djpeg /tmp/libjpeg-turbo-seed-corpora --no-fetch
 ```
 
 Quick local status:
@@ -31,7 +31,7 @@ Quick local status:
 zig run lib/image/src/image_jpeg_seed_corpora_e2e.zig -- status /tmp/libjpeg-turbo-seed-corpora
 ```
 
-The named `zig build` run/triage steps use `--no-fetch`, so they expect an
+The installed-binary examples use `--no-fetch`, so they expect an
 existing checkout at `/tmp/libjpeg-turbo-seed-corpora`. Fetch once explicitly if
 needed:
 

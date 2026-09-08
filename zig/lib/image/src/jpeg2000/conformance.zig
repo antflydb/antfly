@@ -5153,7 +5153,7 @@ test "external jpeg2000 iso conformance corpus decodes within baseline" {
     if (!isoConformanceDirPresent(conformance_dir)) {
         std.debug.print(
             "iso conformance: fixtures not present at {s} — skipping. " ++
-                "Populate via `zig build lib-image-conformance-fetch` " ++
+                "Populate via `../scripts/fetch-conformance-fixtures.sh --suite image` " ++
                 "or `git clone --depth=1 https://github.com/uclouvain/openjpeg-data {s}`.\n",
             .{ conformance_dir, root_dir },
         );

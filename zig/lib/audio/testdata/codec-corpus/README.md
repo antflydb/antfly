@@ -19,9 +19,9 @@ Current status:
 - The `lib/audio` tests verify both that every encoded fixture here is present
   in the shared passing table and that the fixture list documented in this file
   stays aligned with the files on disk.
-- `zig build lib-audio-conformance-run` runs the external Xiph-family and
+- `zig build lib-audio-conformance` runs the external Xiph-family and
   MP3/AAC/MP4 conformance sweeps against already-fetched corpora. Use
-  `zig build lib-audio-conformance-fetch` once to populate the external
+  `../scripts/fetch-conformance-fixtures.sh --suite audio` once to populate the external
   fixtures, or `zig build lib-audio-conformance` to fetch and run them.
 
 - `tone-stereo.aac`
