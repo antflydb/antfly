@@ -566,11 +566,18 @@ pub const QuerySession = struct {
     }
 
     pub fn readCachedAuthenticatedBlockAlloc(self: *QuerySession, alloc: Allocator, index: usize, block_id: []const u8, offset: u64, len: usize, checksum: *const [32]u8) !?[]u8 {
+        var lease = (try self.readCachedAuthenticatedBlockLease(alloc, index, block_id, offset, len, checksum)) orelse return null;
+        if (lease == .owned) return lease.owned.data;
+        defer lease.deinit();
+        return try alloc.dupe(u8, lease.bytes());
+    }
+
+    pub fn readCachedAuthenticatedBlockLease(self: *QuerySession, alloc: Allocator, index: usize, block_id: []const u8, offset: u64, len: usize, checksum: *const [32]u8) !?cache_mod.AuthenticatedBlockLease {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const cache = self.cache orelse return null;
-        return cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.cancellation) catch |err| switch (err) {
+        return cache.readAuthenticatedBlockIfPresentLease(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.cancellation) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled => return err,
             // A damaged/unavailable local cache is a miss, never authority.
             // The origin read still authenticates against the manifest digest.

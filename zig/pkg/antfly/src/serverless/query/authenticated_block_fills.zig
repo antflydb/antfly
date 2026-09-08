@@ -255,7 +255,24 @@ pub const Cache = struct {
         return .{ .bytes = self.retained, .entries = self.live_entries, .waiters = self.waiters };
     }
 
-    pub fn copyIfReadyAlloc(self: *Cache, result_alloc: Allocator, key: [32]u8) !?[]u8 {
+    pub const Lease = struct {
+        cache: *Cache,
+        entry: *Entry,
+
+        pub fn bytes(self: Lease) []const u8 {
+            return self.entry.data;
+        }
+
+        pub fn deinit(self: *Lease) void {
+            self.cache.lock();
+            self.cache.releaseLocked(self.entry, false);
+            self.cache.wake(null);
+            self.cache.mu.unlock();
+            self.* = undefined;
+        }
+    };
+
+    pub fn leaseIfReady(self: *Cache, key: [32]u8) ?Lease {
         self.lock();
         const entry = self.entries.get(key) orelse {
             self.mu.unlock();
@@ -269,15 +286,57 @@ pub const Cache = struct {
         self.clock +%= 1;
         entry.touched = self.clock;
         self.mu.unlock();
-        defer {
-            self.lock();
-            self.releaseLocked(entry, false);
-            self.wake(null);
-            self.mu.unlock();
+        return .{ .cache = self, .entry = entry };
+    }
+
+    pub fn copyIfReadyAlloc(self: *Cache, result_alloc: Allocator, key: [32]u8) !?[]u8 {
+        var lease = self.leaseIfReady(key) orelse return null;
+        defer lease.deinit();
+        return try result_alloc.dupe(u8, lease.bytes());
+    }
+
+    /// Optional disk-hit promotion. Never wait: the caller may itself own a
+    /// pending fill, and retention pressure must not prevent serving a hit.
+    /// The caller authenticates bytes against this canonical key first.
+    pub fn retainVerified(self: *Cache, owner: Allocator, key: [32]u8, bytes: []const u8) void {
+        switch (self.begin(owner, owner, &.{.{ .key = key, .len = bytes.len }}) catch return) {
+            .batch => |reserved| {
+                var batch = reserved;
+                defer batch.deinit();
+                if (batch.items[0].producer) @memcpy(batch.items[0].buffer(), bytes);
+                batch.publish(null);
+            },
+            .wait => |registered| {
+                var waiter = registered;
+                waiter.deinit();
+            },
+            .saturated => {},
         }
-        return try result_alloc.dupe(u8, entry.data);
     }
 };
+
+test "serverless canonical block disk promotion bypasses pending fills and allocation pressure" {
+    const alloc = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit();
+    const key = [_]u8{7} ** 32;
+    var pending = try cache.acquire(alloc, alloc, &.{.{ .key = key, .len = 4 }}, null, .none);
+    defer pending.deinit();
+    cache.retainVerified(alloc, key, "data");
+    try std.testing.expectEqual(@as(usize, 0), cache.snapshot().waiters);
+    try std.testing.expect(cache.leaseIfReady(key) == null);
+    @memcpy(pending.items[0].buffer(), "data");
+    pending.publish(null);
+    var lease = cache.leaseIfReady(key).?;
+    defer lease.deinit();
+    try std.testing.expectEqualStrings("data", lease.bytes());
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var pressured = Cache{};
+    defer pressured.deinit();
+    pressured.retainVerified(failing.allocator(), key, "data");
+    try std.testing.expectEqual(@as(usize, 0), pressured.snapshot().entries);
+}
 
 test "serverless canonical block fills atomically share overlapping transport sets" {
     const alloc = std.testing.allocator;
@@ -373,6 +432,9 @@ test "serverless canonical block admission bounds failed pinned entries and pres
     var waiter = (try cache.begin(alloc, alloc, specs[0..1])).wait;
     const extra = Cache.Spec{ .key = @splat(255), .len = 1 };
     try std.testing.expect((try cache.begin(alloc, alloc, &.{extra})) == .saturated);
+    cache.retainVerified(alloc, extra.key, "x");
+    try std.testing.expectEqual(Cache.max_entries, cache.snapshot().entries);
+    try std.testing.expect(cache.leaseIfReady(extra.key) == null);
     producer.deinit();
     // The failed entry has left the map, but its waiter still pins memory.
     try std.testing.expectEqual(@as(usize, 1), cache.live_entries);

@@ -212,6 +212,26 @@ const CachePublicationLease = struct {
     }
 };
 
+pub const AuthenticatedBlockLease = union(enum) {
+    cached: @import("authenticated_block_fills.zig").Cache.Lease,
+    owned: struct { alloc: Allocator, data: []u8 },
+
+    pub fn bytes(self: AuthenticatedBlockLease) []const u8 {
+        return switch (self) {
+            .cached => |lease| lease.bytes(),
+            .owned => |value| value.data,
+        };
+    }
+
+    pub fn deinit(self: *AuthenticatedBlockLease) void {
+        switch (self.*) {
+            .cached => |*lease| lease.deinit(),
+            .owned => |value| value.alloc.free(value.data),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const QueryCache = struct {
     alloc: Allocator,
     root_dir: []u8,
@@ -809,6 +829,24 @@ pub const QueryCache = struct {
         len: usize,
         cancellation: CancellationToken,
     ) !?[]u8 {
+        var lease = (try self.readAuthenticatedBlockIfPresentLease(result_alloc, artifact_id, block_id, expected_byte_len, expected_checksum, block_checksum, offset, len, cancellation)) orelse return null;
+        if (lease == .owned) return lease.owned.data;
+        defer lease.deinit();
+        return try result_alloc.dupe(u8, lease.bytes());
+    }
+
+    pub fn readAuthenticatedBlockIfPresentLease(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        block_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        block_checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) !?AuthenticatedBlockLease {
         try cancellation.check();
         try validateExpectedRange(artifact_id, .{
             .byte_len = expected_byte_len,
@@ -819,11 +857,12 @@ pub const QueryCache = struct {
         const block_class = classifyBlockId(block_id);
         const payload_block_class = classifyPayloadBlockId(block_id);
         const key = @import("authenticated_block_fills.zig").blockKey(artifact_id, expected_checksum, offset, len, block_checksum);
-        if (try self.graph_metric_blocks.copyIfReadyAlloc(result_alloc, key)) |value| {
-            errdefer result_alloc.free(value);
+        if (self.graph_metric_blocks.leaseIfReady(key)) |value| {
+            var lease = value;
+            errdefer lease.deinit();
             try cancellation.check();
             recordBlockHit(self, block_class, payload_block_class);
-            return value;
+            return .{ .cached = lease };
         }
         const block_path = try blockCachePathAlloc(self.alloc, self.root_dir, artifact_id, block_id, offset, len, block_class);
         defer self.alloc.free(block_path);
@@ -839,9 +878,10 @@ pub const QueryCache = struct {
             var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(value, &actual, .{});
             if (std.mem.eql(u8, &actual, block_checksum)) {
+                self.graph_metric_blocks.retainVerified(self.alloc, key, value);
                 touchFileNow(block_path) catch {};
                 recordBlockHit(self, block_class, payload_block_class);
-                return value;
+                return .{ .owned = .{ .alloc = result_alloc, .data = value } };
             }
             result_alloc.free(value);
             try removeCorruptCacheEntry(self, block_path, cancellation);
@@ -2815,6 +2855,15 @@ test "serverless query cache persistence bounds outstanding jobs and owns reques
     const stored = (try cache.readAuthenticatedBlockIfPresentAlloc(alloc, artifact_id, block.block_id, 4, checksum, &digest, 0, 4, .none)).?;
     defer alloc.free(stored);
     try std.testing.expectEqualStrings("data", stored);
+    // A restart-style disk hit must warm the canonical memory tier. Warm
+    // borrowers neither touch the filesystem nor allocate a payload copy.
+    try std.testing.expectEqual(@as(usize, 1), cache.graph_metric_blocks.snapshot().entries);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var warm = (try cache.readAuthenticatedBlockIfPresentLease(failing.allocator(), artifact_id, block.block_id, 4, checksum, &digest, 0, 4, .none)).?;
+    defer warm.deinit();
+    try std.testing.expect(warm == .cached);
+    try std.testing.expectEqualStrings("data", warm.bytes());
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }
 
 test "serverless query cache batches authenticated publication with one eviction pass" {

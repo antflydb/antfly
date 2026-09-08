@@ -3138,13 +3138,10 @@ pub const HttpHandler = struct {
             try session.checkCancellation();
             var metric = try query_mod.graphMetricTopAlloc(self.alloc, session, named.query.index_name, named.query.metric_name, named.query.top_k);
             defer metric.deinit(self.alloc);
-            const scores = try self.alloc.alloc(db_types.GraphMetricScore, metric.scores.len);
-            errdefer self.alloc.free(scores);
-            var initialized_scores: usize = 0;
-            errdefer for (scores[0..initialized_scores]) |*score| score.deinit(self.alloc);
-            for (metric.scores, 0..) |score, score_index| {
-                scores[score_index] = .{ .node = try self.alloc.dupe(u8, score.node_id), .score = score.value };
-                initialized_scores += 1;
+            const scores = try metric.takePublicScoresAlloc(self.alloc, session);
+            errdefer {
+                for (scores) |*score| score.deinit(self.alloc);
+                self.alloc.free(scores);
             }
             const name = try self.alloc.dupe(u8, named.name);
             errdefer self.alloc.free(name);

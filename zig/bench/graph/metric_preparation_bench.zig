@@ -98,6 +98,8 @@ pub fn main(init: std.process.Init) !void {
     try benchmarkVectorWrites(&output);
     try benchmarkQuerySnapshots(init.io, &output);
     try benchmarkMembership(init.io, &output);
+    try benchmarkAuthenticatedCache(init.io, &output);
+    try benchmarkTopOwnership(&output);
     for ([_]usize{ 2_000, 20_000, 50_000 }) |nodes| {
         var fixture = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer fixture.deinit();
@@ -429,6 +431,120 @@ fn benchmarkQuerySnapshots(io: std.Io, out: anytype) !void {
         try out.interface.writeByte('\n');
         try out.flush();
     };
+}
+
+fn benchmarkAuthenticatedCache(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const cache_mod = antfly.serverless.query.cache;
+    const root = try std.fmt.allocPrint(alloc, "/tmp/antfly-cache-promotion-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    defer alloc.free(root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var cache = try cache_mod.QueryCache.init(alloc, root);
+    defer cache.deinit();
+    const checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const artifact_id = "sha256:" ++ checksum;
+    const payload = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const block_id = "graph-metric-score-0-exact";
+    try cache.publishAuthenticatedBlocks(artifact_id, payload.len, checksum, &.{.{ .block_id = block_id, .offset = 0, .contents = payload, .checksum = digest }}, .none);
+    for ([_]bool{ false, true }) |warm| {
+        var times: [5]u64 = undefined;
+        var last = PhaseAllocStats{};
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            var elapsed: u64 = 0;
+            for (0..64) |_| {
+                if (!warm) {
+                    cache.graph_metric_blocks.deinit();
+                    cache.graph_metric_blocks = .{};
+                }
+                const start = antfly.platform_time.monotonicNs();
+                var hit = (try cache.readAuthenticatedBlockIfPresentLease(tracking.allocator(), artifact_id, block_id, payload.len, checksum, &digest, 0, payload.len, .none)).?;
+                elapsed += antfly.platform_time.monotonicNs() - start;
+                if (!std.mem.eql(u8, hit.bytes(), payload)) return error.InvalidBenchmarkResult;
+                hit.deinit();
+            }
+            if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+            last = stats;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(alloc, .{
+            .mode = if (warm) "authenticated_warm_memory_lease" else "authenticated_cold_memory_disk_hit",
+            .lookups = 64,
+            .block_bytes = payload.len,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .allocation_count = last.alloc_count,
+            .allocated_bytes = last.total_alloc_bytes,
+            .peak_bytes = last.peak_bytes,
+            .note = "warm disk in both cases; cold memory includes authentication and promotion; reset excluded; request payload allocations only, cache-owned allocations excluded; no network",
+        }, .{});
+        defer alloc.free(json);
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkTopOwnership(out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const reader = antfly.serverless.query.graph_metric_reader;
+    for ([_]bool{ true, false }) |reference| {
+        var times: [5]u64 = undefined;
+        var last = PhaseAllocStats{};
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            const a = tracking.allocator();
+            const scores = try a.alloc(reader.Score, 10_000);
+            for (scores) |*score| {
+                const node = try a.alloc(u8, 4096);
+                @memset(node, 'x');
+                score.* = .{ .node_id = node, .value = 1 };
+            }
+            var result = reader.Result{ .scores = scores, .config_fingerprint = 1, .converged = true, .iterations_completed = 1, .delta = 0, .edge_filter = .{}, .metadata_version = 9, .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 };
+            const resident = stats.current_bytes;
+            stats = .{ .current_bytes = resident, .peak_bytes = resident };
+            var session = antfly.serverless.query.QuerySession{ .alloc = a, .artifacts = undefined, .manifest = undefined };
+            const start = antfly.platform_time.monotonicNs();
+            const output: []reader.PublicScore = if (reference) blk: {
+                const cloned = try a.alloc(reader.PublicScore, scores.len);
+                for (scores, cloned) |score, *copy| copy.* = .{ .node = try a.dupe(u8, score.node_id), .score = score.value };
+                break :blk cloned;
+            } else try result.takePublicScoresAlloc(a, &session);
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (output.len != 10_000 or output[0].node.len != 4096 or output[0].score != 1) return error.InvalidBenchmarkResult;
+            last = stats;
+            for (output) |*score| score.deinit(a);
+            a.free(output);
+            result.deinit(a);
+            if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(alloc, .{
+            .mode = if (reference) "top_public_response_copy_reference" else "top_public_response_ownership_transfer",
+            .nodes = 10_000,
+            .node_id_bytes = 4096,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .allocation_count = last.alloc_count,
+            .allocated_bytes = last.total_alloc_bytes,
+            .peak_bytes = last.peak_bytes,
+            .note = "conversion only; peak includes retained input; input construction, result destruction, fetch and JSON encoding excluded",
+        }, .{});
+        defer alloc.free(json);
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
 }
 
 fn benchmarkMembership(io: std.Io, out: anytype) !void {

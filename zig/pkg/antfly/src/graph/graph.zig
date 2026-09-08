@@ -8478,6 +8478,7 @@ pub const GraphIndex = struct {
 
     const PageRankInitializeNode = struct {
         node: []const u8,
+        slot: u64 = 0,
         out_degree: u64 = 0,
         initial_rank: ?f64 = null,
         secondary_rank: ?f64 = null,
@@ -10511,10 +10512,12 @@ pub const GraphIndex = struct {
             for (nodes.items) |node| self.alloc.free(node);
             nodes.deinit(self.alloc);
         }
+        var slots = std.ArrayListUnmanaged(u64).empty;
+        defer slots.deinit(self.alloc);
         const reached_page_end = blk: {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
-            break :blk try self.collectPageRankScannedNodesInRange(
+            break :blk try self.collectGraphMetricOrdinalNodesInRange(
                 &txn,
                 metric_name,
                 job.job_id,
@@ -10523,6 +10526,7 @@ pub const GraphIndex = struct {
                 resume_cursor,
                 if (max_initialize_units) |limit| @intCast(limit) else null,
                 &nodes,
+                &slots,
             );
         };
 
@@ -10551,7 +10555,7 @@ pub const GraphIndex = struct {
                 out_degree_total += out_degree;
                 initialized_nodes += 1;
                 rank_sum += seed;
-                try initialized.append(self.alloc, .{ .node = node, .out_degree = out_degree, .initial_rank = seed });
+                try initialized.append(self.alloc, .{ .node = node, .slot = slots.items[node_index], .out_degree = out_degree, .initial_rank = seed });
             }
         }
         try self.writePageRankInitializeOutputForAttempt(metric_name, job, page, initialized.items, initial_rank);
@@ -10587,16 +10591,16 @@ pub const GraphIndex = struct {
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
         if (!std.math.isFinite(initial_rank)) return error.InvalidGraphMetricScore;
         try self.validateGraphMetricVectorManifest(&batch, metric_name, job.job_id);
-        const scores = try self.alloc.alloc(GraphMetricScore, initialized.len);
+        const scores = try self.alloc.alloc(OrdinalMetricScore, initialized.len);
         defer self.alloc.free(scores);
         const degrees = try self.alloc.alloc(u64, initialized.len);
         defer self.alloc.free(degrees);
         for (initialized, 0..) |entry, i| {
-            scores[i] = .{ .node = entry.node, .score = entry.initial_rank orelse initial_rank };
+            scores[i] = .{ .node = entry.node, .slot = entry.slot, .score = entry.initial_rank orelse initial_rank };
             degrees[i] = entry.out_degree;
         }
-        try self.writeGraphMetricVector(&batch, metric_name, job.job_id, "rank", 0, scores, null, null);
-        try self.writeGraphMetricVector(&batch, metric_name, job.job_id, "factor", 0, scores, degrees, null);
+        try self.writeGraphMetricVectorRows(&batch, metric_name, job.job_id, "rank", 0, scores, null, null);
+        try self.writeGraphMetricVectorRows(&batch, metric_name, job.job_id, "factor", 0, scores, degrees, null);
         try batch.commit();
     }
 
@@ -10907,10 +10911,12 @@ pub const GraphIndex = struct {
             for (nodes.items) |node| self.alloc.free(node);
             nodes.deinit(self.alloc);
         }
+        var slots = std.ArrayListUnmanaged(u64).empty;
+        defer slots.deinit(self.alloc);
         const reached_page_end = blk: {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
-            break :blk try self.collectPageRankScannedNodesInRange(
+            break :blk try self.collectGraphMetricOrdinalNodesInRange(
                 &txn,
                 metric_name,
                 job.job_id,
@@ -10919,6 +10925,7 @@ pub const GraphIndex = struct {
                 resume_cursor,
                 if (max_initialize_units) |limit| @intCast(limit) else null,
                 &nodes,
+                &slots,
             );
         };
 
@@ -10931,11 +10938,11 @@ pub const GraphIndex = struct {
         {
             // Spectral seeds must cover components that previously had zero
             // score; use the same canonical cold start as the shared kernel.
-            for (nodes.items) |node| {
+            for (nodes.items, slots.items) |node, slot| {
                 const seed = initial_rank;
                 initialized_nodes += 1;
                 rank_sum += seed;
-                try initialized.append(self.alloc, .{ .node = node, .initial_rank = seed });
+                try initialized.append(self.alloc, .{ .node = node, .slot = slot, .initial_rank = seed });
             }
         }
         try self.writeEigenvectorInitializeOutputForAttempt(metric_name, job, page, initialized.items, initial_rank);
@@ -10971,10 +10978,10 @@ pub const GraphIndex = struct {
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
         if (!std.math.isFinite(initial_rank)) return error.InvalidGraphMetricScore;
         try self.validateGraphMetricVectorManifest(&batch, metric_name, job.job_id);
-        const scores = try self.alloc.alloc(GraphMetricScore, initialized_nodes.len);
+        const scores = try self.alloc.alloc(OrdinalMetricScore, initialized_nodes.len);
         defer self.alloc.free(scores);
-        for (initialized_nodes, 0..) |entry, i| scores[i] = .{ .node = entry.node, .score = entry.initial_rank orelse initial_rank };
-        try self.writeGraphMetricVector(&batch, metric_name, job.job_id, "rank", 0, scores, null, null);
+        for (initialized_nodes, 0..) |entry, i| scores[i] = .{ .node = entry.node, .slot = entry.slot, .score = entry.initial_rank orelse initial_rank };
+        try self.writeGraphMetricVectorRows(&batch, metric_name, job.job_id, "rank", 0, scores, null, null);
         try batch.commit();
     }
 
@@ -11158,10 +11165,12 @@ pub const GraphIndex = struct {
             for (nodes.items) |node| self.alloc.free(node);
             nodes.deinit(self.alloc);
         }
+        var slots = std.ArrayListUnmanaged(u64).empty;
+        defer slots.deinit(self.alloc);
         const reached_page_end = blk: {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
-            break :blk try self.collectPageRankScannedNodesInRange(
+            break :blk try self.collectGraphMetricOrdinalNodesInRange(
                 &txn,
                 metric_name,
                 job.job_id,
@@ -11170,6 +11179,7 @@ pub const GraphIndex = struct {
                 resume_cursor,
                 if (max_initialize_units) |limit| @intCast(limit) else null,
                 &nodes,
+                &slots,
             );
         };
 
@@ -11180,12 +11190,12 @@ pub const GraphIndex = struct {
         var initialized = std.ArrayListUnmanaged(PageRankInitializeNode).empty;
         defer initialized.deinit(self.alloc);
         {
-            for (nodes.items) |node| {
+            for (nodes.items, slots.items) |node, slot| {
                 const authority_seed = initial_rank;
                 const hub_seed = initial_rank;
                 initialized_nodes += 1;
                 rank_sum += authority_seed + hub_seed;
-                try initialized.append(self.alloc, .{ .node = node, .initial_rank = authority_seed, .secondary_rank = hub_seed });
+                try initialized.append(self.alloc, .{ .node = node, .slot = slot, .initial_rank = authority_seed, .secondary_rank = hub_seed });
             }
         }
         try self.writeHitsInitializeOutputForAttempt(metric_name, job, page, initialized.items, initial_rank);
@@ -11221,12 +11231,12 @@ pub const GraphIndex = struct {
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, current_page);
         if (!std.math.isFinite(initial_rank)) return error.InvalidGraphMetricScore;
         try self.validateGraphMetricVectorManifest(&batch, metric_name, job.job_id);
-        const scores = try self.alloc.alloc(GraphMetricScore, initialized_nodes.len);
+        const scores = try self.alloc.alloc(OrdinalMetricScore, initialized_nodes.len);
         defer self.alloc.free(scores);
-        for (initialized_nodes, 0..) |entry, i| scores[i] = .{ .node = entry.node, .score = entry.initial_rank orelse initial_rank };
-        try self.writeGraphMetricVector(&batch, metric_name, job.job_id, "authority", 0, scores, null, null);
+        for (initialized_nodes, 0..) |entry, i| scores[i] = .{ .node = entry.node, .slot = entry.slot, .score = entry.initial_rank orelse initial_rank };
+        try self.writeGraphMetricVectorRows(&batch, metric_name, job.job_id, "authority", 0, scores, null, null);
         for (initialized_nodes, 0..) |entry, i| scores[i].score = entry.secondary_rank orelse initial_rank;
-        try self.writeGraphMetricVector(&batch, metric_name, job.job_id, "hub", 0, scores, null, null);
+        try self.writeGraphMetricVectorRows(&batch, metric_name, job.job_id, "hub", 0, scores, null, null);
         try batch.commit();
     }
 
@@ -17413,6 +17423,88 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
     const raw = try graph.pageRankContributionsForNodesAlloc(&txn, "rank", 1, 0, &nodes);
     defer alloc.free(raw);
     try std.testing.expectEqualSlices(f64, &.{ 10 * 256, 15 * 256 }, raw);
+}
+
+test "graph metric membership initializes all vector lanes without producer rediscovery" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-membership-initialize");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-membership-initialize");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{
+        .{ .name = "rank", .kind = .pagerank, .refresh = .manual },
+        .{ .name = "eigen", .kind = .eigenvector, .refresh = .manual },
+        .{ .name = "authority", .kind = .hits_authority, .refresh = .manual },
+        // Keep this independent from the compatible authority job so both
+        // public entry kinds exercise initialization as lifecycle owners.
+        .{ .name = "hub", .kind = .hits_hub, .refresh = .manual, .max_iterations = 2 },
+    };
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs, .reverse_lsm_options = .{ .flush_threshold = 8192 } });
+    defer graph.close();
+    try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
+    try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
+    for (configs) |cfg| {
+        var building = try graph.ensureGraphMetricPlannedBuild(cfg.name, graph.edge_generation);
+        defer building.deinit(alloc);
+        var ready = false;
+        for (0..64) |_| {
+            _ = try graph.runGraphMetricPlannedWorkerPageStep(cfg.name, cfg, "worker");
+            {
+                var txn = try graph.beginReadReverseTxn();
+                defer txn.abort();
+                const job = (try graph.metricBuildJob(&txn, cfg.name)).?;
+                if (job.phase == .initialize_ranks) {
+                    if (try graph.metricBuildPage(&txn, cfg.name, job.job_id, .initialize_ranks, 0, 0)) |root| {
+                        if (root.state == .complete) {
+                            ready = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            _ = try graph.runGraphMetricPlannedCoordinatorStep(cfg.name, cfg);
+        }
+        try std.testing.expect(ready);
+        var txn = try graph.beginReadReverseTxn();
+        const job = (try graph.metricBuildJob(&txn, cfg.name)).?;
+        txn.abort();
+        // A post-seal consumer must not touch this discovery-only namespace.
+        const partial = try graph.graphMetricBuildPageRankNodePartialKeyAlloc(cfg.name, job.job_id, "a", 0);
+        defer alloc.free(partial);
+        {
+            var batch = try graph.beginWriteReverseBatch();
+            errdefer batch.abort();
+            try batch.put(partial, "invalid-discovery-row");
+            try batch.commit();
+        }
+        const page = (try graph.claimNextGraphMetricBuildPage(cfg.name, job.job_id, .initialize_ranks, 0, "worker")).?;
+        for (0..3) |_| {
+            const count = switch (cfg.kind) {
+                .pagerank => try graph.executePageRankInitializeBuildPageWithLimit(cfg.name, job, page, 1),
+                .eigenvector => try graph.executeEigenvectorInitializeBuildPageWithLimit(cfg.name, job, page, 1),
+                .hits_authority, .hits_hub => try graph.executeHitsInitializeBuildPageWithLimit(cfg.name, job, page, 1),
+                else => unreachable,
+            };
+            try std.testing.expectEqual(@as(usize, 1), count);
+        }
+        var read = try graph.beginReadReverseTxn();
+        defer read.abort();
+        const lanes: []const []const u8 = if (cfg.kind == .pagerank) &.{ "rank", "factor" } else if (cfg.kind == .eigenvector) &.{"rank"} else &.{ "authority", "hub" };
+        for (lanes) |lane| {
+            const values = try graph.readGraphMetricVectorAlloc(&read, cfg.name, job.job_id, lane, 0, &.{ "a", "b", "c" }, true);
+            defer alloc.free(values);
+            try std.testing.expectEqual(@as(usize, 3), values.len);
+            for (values, 0..) |value, i| {
+                const expected: f64 = if (cfg.kind != .pagerank) 1.0 / @sqrt(@as(f64, 3)) else if (std.mem.eql(u8, lane, "factor") and i == 2) 0 else 1.0 / 3.0;
+                try std.testing.expectApproxEqAbs(expected, value, 1e-12);
+            }
+        }
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, (try graph.metricBuildPage(&read, cfg.name, job.job_id, .initialize_ranks, 0, page.page_id)).?.state);
+    }
 }
 
 test "graph metric membership resumes across sealed blocks and rejects corrupt resume ordinals" {

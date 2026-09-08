@@ -6,7 +6,37 @@ measured samples per case; tables report medians. This was a shared development
 host, not an isolated benchmark machine.
 The compact-query comparison below uses 21 measured samples instead of five.
 
-## Sealed membership and output admission
+## Initialization and query ownership follow-up
+
+Same host/toolchain, one warmup and five measured samples:
+
+| Phase / scenario | Reference or cold median | New or warm median | Allocations, before → after |
+| --- | ---: | ---: | ---: |
+| Membership discovery, 64 nodes / 16,384 producer partials | 2.063 ms | 0.069 ms | 16,398 → 90 |
+| 64 authenticated 64-KiB disk hits versus warm memory leases | 5.838 ms | 0.009 ms | 64 → 0 request-payload allocations |
+| Top-K response conversion, 10,000 IDs of 4,096 bytes | 3.169 ms | 0.021 ms | 10,001 → 1 |
+
+The membership reader is now used by vector initialization as well as iterations,
+convergence and publication. This measures discovery and dictionary validation,
+not a whole initializer, vector writes or a complete build. Maximum fan-in is a
+deliberate stress case; fewer producer duplicates reduce the benefit.
+
+Cache measurements use warm filesystem data in both cases. The cold-memory case
+includes verification and promotion; clearing memory between lookups is excluded.
+It is a cache-state comparison, **not an exact pre-change implementation**.
+Allocation tracking covers request payloads, excluding cache-owned allocations.
+Disk-hit times ranged 5.817–5.887 ms; warm leases ranged 0.006–0.010 ms across 64
+lookups. Network and score decoding are excluded. A regression also verifies that
+a warm leased hit succeeds with an allocator that rejects every allocation.
+
+Response-conversion peak includes the still-resident input: 82,400,000 bytes for
+copying versus 41,440,000 for ownership transfer. New cumulative allocation falls
+from 41,200,000 to 240,000 bytes. Copy times ranged 1.227–3.237 ms, transfer times
+0.019–0.022 ms. Input construction, cleanup, fetching and JSON serialization are
+excluded. Long IDs stress the ownership boundary; ordinary shorter IDs benefit
+less. These are phase measurements, not end-to-end latency guarantees.
+
+## Sealed membership and output admission (initial measurements)
 
 Additional measurements on the same host/toolchain (one warmup, five samples):
 

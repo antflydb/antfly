@@ -27,7 +27,7 @@ full-graph calculation hidden inside a query or maintenance tick.
   physical work. An unbounded final partition cannot walk all metric state.
 - Initialization writes canonical membership once in checksummed 256-row blocks,
   alongside ordinal assignments. Completed initialization leaves seal exact row
-  counts. Iteration, convergence and publication read these addressed blocks,
+  counts. Vector initialization, iteration, convergence and publication read these addressed blocks,
   not up to 256 producer partials per node on every checkpoint. Readers bind
   block ordinals and node ranges to the leaf, validate resume-node identity, and
   reject missing/truncated/misplaced blocks. Replayed writes accept only identical
@@ -37,6 +37,10 @@ full-graph calculation hidden inside a query or maintenance tick.
   canonical membership check is essential: a missing dictionary row is an error,
   not permission to omit a node. PageRank stores immutable out-degrees in exact
   `u64` chunks, avoiding per-node string-key lookups on every iteration.
+- After the initialization-summary barrier, every initializer consumes the sealed
+  membership and carries its validated slots into all rank/factor/HITS lane
+  writes. It does not rediscover producers or resolve the same node dictionary
+  separately for each output lane. Numerical seeds still use the global summary.
 - Execution schema 11 fences older intermediate jobs. Published score epochs
   retain their existing read contract; an execution-format change does not hide
   previously published results.
@@ -80,6 +84,20 @@ and scores under one stable transaction. Queries do not fetch operator event or
 failure histories, aggregate worker progress, or enumerate page details. Detailed
 administrative status remains available through the existing operator paths.
 Freshness requirements are checked before score reads, including reranking.
+
+Serverless authenticated disk hits promote into the same bounded canonical block
+cache used by network fills. Promotion is optional and never waits on a pending
+fill or pinned-capacity pressure. Point-score consumers borrow ref-counted leases
+on warm blocks instead of copying payloads; leases keep entries alive during
+decoding. Authentication is unchanged, and a cache failure remains a miss rather
+than authority over the immutable source.
+
+Top-K reserves descriptor storage before allocation or ranked-block reads, then
+charges each decoded node ID before allocating it. Both per-result and shared
+request limits apply. The HTTP response transfers those node allocations, rather
+than temporarily retaining a second copy; its replacement descriptor array is
+also admitted before allocation. Transfer failure leaves the original owner
+intact. Retained-byte accounting remains conservative and request-cumulative.
 
 ## Validation and measurements
 

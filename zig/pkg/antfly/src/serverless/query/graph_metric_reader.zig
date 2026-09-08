@@ -37,6 +37,26 @@ pub const Limits = struct {
     max_result_bytes: usize = 64 * 1024 * 1024,
 };
 
+const TopResultBudget = struct {
+    bytes: usize,
+    limit: usize,
+    session: *runtime_mod.QuerySession,
+
+    fn init(session: *runtime_mod.QuerySession, count: usize, limit: usize) !TopResultBudget {
+        const bytes = std.math.mul(usize, count, @sizeOf(Score)) catch return error.GraphMetricQueryBudgetExceeded;
+        if (bytes > limit) return error.GraphMetricQueryBudgetExceeded;
+        try session.chargeGraphMetricRetained(bytes);
+        return .{ .bytes = bytes, .limit = limit, .session = session };
+    }
+
+    fn addNode(self: *TopResultBudget, len: usize) !void {
+        const next = std.math.add(usize, self.bytes, len) catch return error.GraphMetricQueryBudgetExceeded;
+        if (next > self.limit) return error.GraphMetricQueryBudgetExceeded;
+        try self.session.chargeGraphMetricRetained(len);
+        self.bytes = next;
+    }
+};
+
 fn recordRejectionDiagnostic(
     session: *runtime_mod.QuerySession,
     graph_index_name: []const u8,
@@ -60,8 +80,11 @@ pub const Score = struct {
     }
 };
 
+pub const PublicScore = @import("../../storage/db/types.zig").GraphMetricScore;
+
 pub const Result = struct {
     scores: []Score,
+    owns_scores: bool = true,
     config_fingerprint: u64,
     converged: bool,
     iterations_completed: u32,
@@ -73,10 +96,25 @@ pub const Result = struct {
     computed_at_ms: u64,
 
     pub fn deinit(self: *Result, alloc: Allocator) void {
-        for (self.scores) |*score| score.deinit(alloc);
-        alloc.free(self.scores);
+        if (self.owns_scores) {
+            for (self.scores) |*score| score.deinit(alloc);
+            alloc.free(self.scores);
+        }
         self.edge_filter.deinit(alloc);
         self.* = undefined;
+    }
+
+    /// Reframe the score descriptors, transferring node ownership without
+    /// copying their potentially large payloads. Failure leaves this intact.
+    pub fn takePublicScoresAlloc(self: *Result, alloc: Allocator, session: *runtime_mod.QuerySession) ![]PublicScore {
+        if (!self.owns_scores) return error.GraphMetricScoresAlreadyTaken;
+        try session.chargeGraphMetricRetained(std.math.mul(usize, self.scores.len, @sizeOf(PublicScore)) catch return error.GraphMetricQueryBudgetExceeded);
+        const result = try alloc.alloc(PublicScore, self.scores.len);
+        for (self.scores, result) |score, *out| out.* = .{ .node = score.node_id, .score = score.value };
+        alloc.free(self.scores);
+        self.scores = &.{};
+        self.owns_scores = false;
+        return result;
     }
 };
 
@@ -534,9 +572,10 @@ fn preparePointScoresAlloc(
             const entry = routing.entries[touched.block_index];
             var id_buf: [64]u8 = undefined;
             const id = try metricBlockId(&id_buf, .score, entry.block_index);
-            if (try session.readCachedAuthenticatedBlockAlloc(std.heap.smp_allocator, metric_index, id, entry.offset, entry.len, &entry.checksum)) |bytes| {
-                defer std.heap.smp_allocator.free(bytes);
-                try decodePointScoreBlock(session, entry, control.score_count, bytes, pending_nodes.items[touched.first_pending..][0..touched.pending_count], node_ids, values);
+            if (try session.readCachedAuthenticatedBlockLease(std.heap.smp_allocator, metric_index, id, entry.offset, entry.len, &entry.checksum)) |hit| {
+                var lease = hit;
+                defer lease.deinit();
+                try decodePointScoreBlock(session, entry, control.score_count, lease.bytes(), pending_nodes.items[touched.first_pending..][0..touched.pending_count], node_ids, values);
             } else {
                 touched_blocks.items[missing_count] = touched;
                 missing_count += 1;
@@ -1605,13 +1644,13 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
     {
         const required_blocks = result_count / metric_segment.codec.ranked_score_block_entries +
             @intFromBool(result_count % metric_segment.codec.ranked_score_block_entries != 0);
+        var result_budget = try TopResultBudget.init(session, result_count, limits.max_result_bytes);
         const scores = try alloc.alloc(Score, result_count);
         var initialized: usize = 0;
         errdefer {
             for (scores[0..initialized]) |*score| score.deinit(alloc);
             alloc.free(scores);
         }
-        var result_bytes = std.math.mul(usize, result_count, @sizeOf(Score)) catch return error.GraphMetricQueryBudgetExceeded;
         var block_cursor: usize = 0;
         var boundary_validator = RankedScoreBoundaryValidator{};
         while (block_cursor < required_blocks) {
@@ -1641,8 +1680,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
                 if (decoded.len != expected_block_count) return error.InvalidGraphMetricSegment;
                 try boundary_validator.observeBlock(decoded);
                 for (decoded.scores[0..@min(decoded.len, result_count - initialized)]) |score| {
-                    result_bytes = std.math.add(usize, result_bytes, score.nodeIdLen(decoded.node_prefix)) catch return error.GraphMetricQueryBudgetExceeded;
-                    if (result_bytes > limits.max_result_bytes) return error.GraphMetricQueryBudgetExceeded;
+                    try result_budget.addNode(score.nodeIdLen(decoded.node_prefix));
                     scores[initialized] = .{ .node_id = try score.dupeNodeAlloc(alloc, decoded.node_prefix), .value = score.value };
                     initialized += 1;
                 }
@@ -1650,7 +1688,6 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
             block_cursor = range_end;
         }
         if (initialized != result_count) return error.InvalidGraphMetricSegment;
-        try session.chargeGraphMetricRetained(result_bytes);
         var edge_filter = try config.edge_filter.cloneAlloc(alloc);
         errdefer edge_filter.deinit(alloc);
         return .{
@@ -1746,6 +1783,55 @@ test "serverless graph metric column reads bound shape and accept empty dependen
         error.GraphMetricQueryBudgetExceeded,
         scoreColumnsAlloc(alloc, &unused_session, "graph_idx", &too_many, &.{}),
     );
+}
+
+test "serverless graph metric top result admission bounds descriptors and incremental node ownership" {
+    var session = runtime_mod.QuerySession{ .alloc = std.testing.allocator, .artifacts = undefined, .manifest = undefined };
+    const base = 2 * @sizeOf(Score);
+    session.graph_metric_read_budget = .{ .limits = .{ .max_retained_bytes = base - 1 } };
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, TopResultBudget.init(&session, 2, 1024));
+    try std.testing.expectEqual(@as(u64, 0), session.graph_metric_read_budget.retained_bytes);
+    session.graph_metric_read_budget = .{ .limits = .{ .max_retained_bytes = base + 10 } };
+    var budget = try TopResultBudget.init(&session, 2, base + 20);
+    try budget.addNode(6);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.addNode(5));
+    try std.testing.expectEqual(base + 6, budget.bytes);
+    try std.testing.expectEqual(@as(u64, base + 6), session.graph_metric_read_budget.retained_bytes);
+    try budget.addNode(4);
+    session.graph_metric_read_budget = .{};
+    budget = try TopResultBudget.init(&session, 2, base + 2);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.addNode(3));
+    try std.testing.expectEqual(@as(u64, base), session.graph_metric_read_budget.retained_bytes);
+}
+
+test "serverless graph metric top score transfer preserves ownership across allocation failures" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const scores = try alloc.alloc(Score, 1);
+            const node = alloc.dupe(u8, "owned-node") catch |err| {
+                alloc.free(scores);
+                return err;
+            };
+            scores[0] = .{ .node_id = node, .value = 0.5 };
+            var result = Result{ .scores = scores, .config_fingerprint = 1, .converged = true, .iterations_completed = 1, .delta = 0, .edge_filter = .{}, .metadata_version = metric_segment.wire_version, .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 };
+            defer result.deinit(alloc);
+            var session = runtime_mod.QuerySession{ .alloc = alloc, .artifacts = undefined, .manifest = undefined };
+            session.graph_metric_read_budget.limits.max_retained_bytes = 0;
+            try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, result.takePublicScoresAlloc(alloc, &session));
+            try std.testing.expect(result.owns_scores);
+            session.graph_metric_read_budget = .{};
+            const moved = try result.takePublicScoresAlloc(alloc, &session);
+            defer {
+                for (moved) |*score| score.deinit(alloc);
+                alloc.free(moved);
+            }
+            try std.testing.expectEqual(node.ptr, moved[0].node.ptr);
+            try std.testing.expectEqualStrings("owned-node", moved[0].node);
+            try std.testing.expectEqual(@as(f64, 0.5), moved[0].score);
+            try std.testing.expectError(error.GraphMetricScoresAlreadyTaken, result.takePublicScoresAlloc(alloc, &session));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless graph metric top limit cannot exceed the persisted ranked tier" {
@@ -2490,10 +2576,22 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
 
     state.range_calls.store(0, .monotonic);
     state.reject_point_index_reads = true;
+    session.graph_metric_read_budget = .{};
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", 1, .{ .max_result_bytes = @sizeOf(Score) - 1 }));
+    try std.testing.expectEqual(@as(usize, 2), state.range_calls.load(.monotonic));
+    state.range_calls.store(0, .monotonic);
+    session.graph_metric_read_budget = .{};
     var top_one = try topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", 1, .{});
     defer top_one.deinit(alloc);
     try std.testing.expectEqualStrings(last_id, top_one.scores[0].node_id);
     try std.testing.expectEqual(@as(usize, 3), state.range_calls.load(.monotonic));
+    const routing_retained = session.graph_metric_read_budget.retained_bytes - @sizeOf(Score) - last_id.len;
+    session.graph_metric_read_budget = .{ .limits = .{ .max_retained_bytes = routing_retained } };
+    state.range_calls.store(0, .monotonic);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, topAlloc(alloc, &session, "graph_idx", "rank", 1));
+    // Shared result admission must stop before the ranked score fetch too.
+    try std.testing.expectEqual(@as(usize, 2), state.range_calls.load(.monotonic));
+    session.graph_metric_read_budget = .{};
     state.range_calls.store(0, .monotonic);
     var top = try topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", metric_segment.score_block_entries + 1, .{});
     defer top.deinit(alloc);
