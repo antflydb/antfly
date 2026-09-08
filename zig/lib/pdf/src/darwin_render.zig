@@ -55,6 +55,12 @@ pub fn renderPagePngAlloc(
     return try session.renderPagePngAlloc(alloc, page_number, dpi, max_pixels, rotation);
 }
 
+pub fn renderPageRgbaAlloc(alloc: std.mem.Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64, rotation: render.PageRotation) !render.RgbaCanvas {
+    var session = try Session.init(pdf_bytes);
+    defer session.deinit();
+    return session.renderPageRgbaAlloc(alloc, page_number, dpi, max_pixels, rotation);
+}
+
 pub const SharedSession = struct {
     pdf_bytes: []const u8,
     mutex: std.Io.Mutex = .init,
@@ -98,6 +104,20 @@ pub const SharedSession = struct {
         if (self.session == null) self.session = try Session.init(self.pdf_bytes);
         return try self.session.?.renderPagePngAlloc(alloc, page_number, dpi, max_pixels, rotation);
     }
+
+    /// Only the final canvas is charged to the retained-output allocator.
+    /// Keep the same document lock and cancellation boundary as PNG rendering.
+    pub fn renderPageRgbaAlloc(self: *@This(), alloc: std.mem.Allocator, page_number: usize, dpi: u16, max_pixels: u64, rotation: render.PageRotation, cancellation: anytype) !render.RgbaCanvas {
+        try cancellation.check();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        try cancellation.check();
+        if (self.session == null) self.session = try Session.init(self.pdf_bytes);
+        const raw = try self.session.?.renderPageRgbaAlloc(alloc, page_number, dpi, max_pixels, rotation);
+        errdefer alloc.free(raw.rgba);
+        try cancellation.check();
+        return raw;
+    }
 };
 
 test "shared session checks cancellation before opening the document" {
@@ -117,6 +137,25 @@ test "shared session checks cancellation before opening the document" {
         .none,
         Cancelled{},
     ));
+}
+
+test "compatibility raster needs only one retained canvas and matches PNG" {
+    var session = SharedSession.init(@embedFile("../testdata/simple_text_fixture.pdf"));
+    defer session.deinit();
+    const Probe = struct {
+        fn check(_: @This()) !void {}
+    };
+    const png = try session.renderPagePngAlloc(std.testing.allocator, 1, 72, 1_000_000, .none, Probe{});
+    defer std.testing.allocator.free(png);
+    const decoded = try image.png.decodeRgba(std.testing.allocator, png);
+    defer std.testing.allocator.free(decoded.rgba);
+    const storage = try std.testing.allocator.alloc(u8, decoded.rgba.len);
+    defer std.testing.allocator.free(storage);
+    var output = std.heap.FixedBufferAllocator.init(storage);
+    const raw = try session.renderPageRgbaAlloc(output.allocator(), 1, 72, 1_000_000, .none, Probe{});
+    defer output.allocator().free(raw.rgba);
+    try std.testing.expectEqualSlices(u8, decoded.rgba, raw.rgba);
+    try std.testing.expectEqual(storage.len, output.end_index);
 }
 
 pub const Session = struct {
@@ -153,6 +192,12 @@ pub const Session = struct {
         max_pixels: u64,
         rotation: render.PageRotation,
     ) ![]u8 {
+        const raw = try self.renderPageRgbaAlloc(alloc, page_number, dpi, max_pixels, rotation);
+        defer alloc.free(raw.rgba);
+        return image.png.encodeRgba(alloc, @intCast(raw.width), @intCast(raw.height), raw.rgba);
+    }
+
+    pub fn renderPageRgbaAlloc(self: *@This(), alloc: std.mem.Allocator, page_number: usize, dpi: u16, max_pixels: u64, rotation: render.PageRotation) !render.RgbaCanvas {
         if (page_number == 0) return error.InvalidPageNumber;
         if (page_number > CGPDFDocumentGetNumberOfPages(self.document)) return error.InvalidPageNumber;
         const page = CGPDFDocumentGetPage(self.document, page_number) orelse return error.SystemPdfRenderingFailed;
@@ -171,7 +216,7 @@ pub const Session = struct {
         if (pixel_count == 0 or pixel_count > max_pixels) return error.RenderedPageTooLarge;
         const row_bytes = std.math.mul(usize, width, 4) catch return error.RenderedPageTooLarge;
         const rgba = try alloc.alloc(u8, std.math.mul(usize, row_bytes, height) catch return error.RenderedPageTooLarge);
-        defer alloc.free(rgba);
+        errdefer alloc.free(rgba);
 
         const color_space = CGColorSpaceCreateDeviceRGB() orelse return error.SystemPdfRenderingFailed;
         defer CGColorSpaceRelease(color_space);
@@ -182,6 +227,6 @@ pub const Session = struct {
         CGContextFillRect(context, destination);
         CGContextConcatCTM(context, CGPDFPageGetDrawingTransform(page, crop_box, destination, 0, true));
         CGContextDrawPDFPage(context, page);
-        return try image.png.encodeRgba(alloc, width, height, rgba);
+        return .{ .rgba = rgba, .width = width, .height = height };
     }
 };

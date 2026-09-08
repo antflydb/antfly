@@ -21,6 +21,7 @@ const storage_io = @import("lsm_backend/storage_io.zig");
 const threaded_connect_io = @import("../common/threaded_connect_io.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const bounded_worker_lane = @import("../common/bounded_worker_lane.zig");
+pub const MaintenanceScheduler = @import("../common/maintenance_scheduler.zig").Scheduler;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -752,6 +753,7 @@ pub const BackendRuntime = struct {
     /// not become the process-wide authority for unrelated operations.
     threaded_network_io_vtable: ?*Io.VTable = null,
     io_impl: ?*IoImpl = null,
+    maintenance_scheduler: std.atomic.Value(?*MaintenanceScheduler) = .init(null),
     /// Specialized executor lanes are activated on first use. The runtime is
     /// their sole owner; this mutex serializes first publication and teardown
     /// never starts until the corresponding public lease gates are closed.
@@ -837,6 +839,23 @@ pub const BackendRuntime = struct {
         return runtime;
     }
 
+    pub fn maintenanceScheduler(self: *BackendRuntime) !*MaintenanceScheduler {
+        lockAtomic(&self.lane_init_mutex);
+        defer self.lane_init_mutex.unlock();
+        if (self.lanes_closing) return error.BackendRuntimeShuttingDown;
+        if (self.maintenance_scheduler.load(.acquire)) |scheduler| return scheduler;
+        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        // One coordinator and the durable-job reaper also use this lane.
+        if (self.lane_limits.durable_background < 8) return error.InvalidMaintenanceCapacity;
+        const scheduler = try MaintenanceScheduler.create(self.alloc, io_impl.io(), @max(1, self.lane_limits.durable_background / 2));
+        self.maintenance_scheduler.store(scheduler, .release);
+        return scheduler;
+    }
+
+    pub fn wakeMaintenance(self: *BackendRuntime, context: *anyopaque) void {
+        if (self.maintenance_scheduler.load(.acquire)) |scheduler| scheduler.wake(context);
+    }
+
     pub fn deinit(self: *BackendRuntime) void {
         // Publish the activation fence before closing lease admission. A
         // caller that committed a gate acquisition just before shutdown may
@@ -860,6 +879,7 @@ pub const BackendRuntime = struct {
         self.inference_lane_gate.waitDrained(coordinator_io);
         self.pdf_render_lane_gate.waitDrained(coordinator_io);
         self.control_lane_gate.waitDrained(coordinator_io);
+        if (self.maintenance_scheduler.swap(null, .acq_rel)) |scheduler| scheduler.destroy();
         if (self.threaded_jobs) |jobs| {
             jobs.deinit();
             self.alloc.destroy(jobs);
@@ -1314,6 +1334,7 @@ pub const BackendRuntime = struct {
 
     pub const LaneStats = struct {
         limits: threaded_io_limits.BackendRuntimeLaneLimits,
+        maintenance: ?MaintenanceScheduler.Stats,
         api_active_leases: usize,
         api_peak_leases: usize,
         api_acquisitions_total: u64,
@@ -1336,6 +1357,7 @@ pub const BackendRuntime = struct {
     pub fn laneStats(self: *const BackendRuntime) LaneStats {
         return .{
             .limits = self.lane_limits,
+            .maintenance = if (self.maintenance_scheduler.load(.acquire)) |scheduler| scheduler.snapshot() else null,
             .api_active_leases = self.api_lane_gate.active(),
             .api_peak_leases = self.api_lane_peak_leases.load(.acquire),
             .api_acquisitions_total = self.api_lane_acquisitions_total.load(.acquire),

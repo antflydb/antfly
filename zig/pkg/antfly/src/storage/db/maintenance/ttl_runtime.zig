@@ -107,7 +107,8 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     mutex: Io.Mutex = .init,
     shutdown: bool = false,
     stats_value: types.TTLCleanupStats = .{},
-    future: ?Io.Future(void) = null,
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub fn init(
         alloc: Allocator,
@@ -125,6 +126,7 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
+            .backend_runtime = backend_runtime,
             .store = runtime_store.store,
             .owns_store = runtime_store.owned,
             .delete_ctx = delete_ctx,
@@ -160,8 +162,9 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn start(self: *TtlRuntime) !void {
         if (!self.config.enabled) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        const io = io_impl.io();
-        self.future = try io.concurrent(workerMain, .{self});
+        _ = io_impl;
+        if (self.future != null) return;
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).register(self, workerStep);
     }
 
     pub fn runOnce(self: *TtlRuntime) !void {
@@ -194,29 +197,19 @@ const ScanSummary = struct {
     deleted_docs: u32 = 0,
 };
 
-fn workerMain(runtime: *TtlRuntime) void {
-    while (true) {
-        if (isShutdown(runtime)) return;
-        if (workDeferred(runtime)) {
-            sleepInterval(runtime);
-            continue;
-        }
+fn workerStep(runtime: *TtlRuntime) ?u64 {
+    if (isShutdown(runtime)) return null;
+    if (!workDeferred(runtime)) {
         const now_ns = runtime.config.clock.nowRealtimeNs();
-        if (!ensureLease(runtime, now_ns)) {
-            sleepInterval(runtime);
-            continue;
+        if (ensureLease(runtime, now_ns)) {
+            const summary = collectAndDelete(runtime, now_ns) catch {
+                recordRun(runtime, now_ns, .{}, true);
+                return @max(1, runtime.config.interval_ms);
+            };
+            recordRun(runtime, now_ns, summary, false);
         }
-        const summary = collectAndDelete(runtime, now_ns) catch {
-            recordRun(runtime, now_ns, .{
-                .scanned_timestamps = 0,
-                .deleted_docs = 0,
-            }, true);
-            sleepInterval(runtime);
-            continue;
-        };
-        recordRun(runtime, now_ns, summary, false);
-        sleepInterval(runtime);
     }
+    return @max(1, runtime.config.interval_ms);
 }
 
 fn workDeferred(runtime: *const TtlRuntime) bool {
@@ -338,18 +331,6 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
         .store = try backend_erased.storeFrom(alloc, store),
         .owned = true,
     };
-}
-
-fn sleepInterval(runtime: *TtlRuntime) void {
-    var remaining_ms = runtime.config.interval_ms;
-    if (remaining_ms == 0) remaining_ms = 1;
-
-    while (remaining_ms > 0) {
-        if (isShutdown(runtime)) return;
-        const slice_ms: u64 = @min(remaining_ms, 100);
-        runtime.config.clock.sleepMs(slice_ms);
-        remaining_ms -= slice_ms;
-    }
 }
 
 fn isShutdown(runtime: *TtlRuntime) bool {

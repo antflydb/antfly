@@ -176,10 +176,14 @@ pub fn renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(
     cancellation: reader.CancellationProbe,
 ) !RgbaCanvas {
     try cancellation.check();
-    var raw = try renderPageContentRgbaInBoxAllocWithBudget(scratch_alloc, output_alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
-    errdefer output_alloc.free(raw.rgba);
+    // Quarter turns require a second canvas. The unrotated image is temporary,
+    // not retained output, and must not consume the final canvas's reservation.
+    var canvas_alloc = if (rotation == .clockwise_90 or rotation == .clockwise_270) scratch_alloc else output_alloc;
+    var raw = try renderPageContentRgbaInBoxAllocWithBudget(scratch_alloc, canvas_alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
+    errdefer canvas_alloc.free(raw.rgba);
     try cancellation.check();
-    try rotateRawPageCanvasAlloc(output_alloc, &raw, rotation, cancellation);
+    try rotateRawPageCanvasWithAllocators(canvas_alloc, output_alloc, &raw, rotation, cancellation);
+    canvas_alloc = output_alloc;
     try cancellation.check();
     return raw;
 }
@@ -418,6 +422,10 @@ const BilevelCancellationPoller = struct {
 };
 
 fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RgbaCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
+    return rotateRawPageCanvasWithAllocators(alloc, alloc, raw, rotation, cancellation);
+}
+
+fn rotateRawPageCanvasWithAllocators(source_alloc: Allocator, alloc: Allocator, raw: *RgbaCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
     switch (rotation) {
         .none => return,
         .clockwise_180 => {
@@ -452,7 +460,7 @@ fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RgbaCanvas, rotation: PageRo
                     @memcpy(rotated[dst_offset .. dst_offset + 4], raw.rgba[src_offset .. src_offset + 4]);
                 }
             }
-            alloc.free(raw.rgba);
+            source_alloc.free(raw.rgba);
             raw.rgba = rotated;
             std.mem.swap(usize, &raw.width, &raw.height);
         },
@@ -3533,6 +3541,28 @@ test "render page content in box uses page dimensions" {
     try std.testing.expectEqual(@as(u32, 100), std.mem.readInt(u32, png[20..24], .big));
 }
 
+test "rotated render retains exactly one output canvas" {
+    for ([_]PageRotation{ .none, .clockwise_90, .clockwise_180, .clockwise_270 }) |rotation| {
+        var storage: [20 * 30 * 4]u8 = undefined;
+        var output = std.heap.FixedBufferAllocator.init(&storage);
+        const raw = try renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(
+            std.testing.allocator,
+            output.allocator(),
+            .{ .min_x = 0, .min_y = 0, .max_x = 20, .max_y = 30 },
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            &.{},
+            rotation,
+            .{},
+        );
+        defer output.allocator().free(raw.rgba);
+        try std.testing.expectEqual(storage.len, raw.rgba.len);
+        try std.testing.expectEqual(storage.len, output.end_index);
+    }
+}
+
 test "raw page rotation normalizes dimensions and pixel orientation" {
     const alloc = std.testing.allocator;
     const Case = struct {
@@ -4480,11 +4510,11 @@ test "OCR bilevel fallback scales alpha by transformed source coverage" {
 
 test "bilevel cancellation polling is amortized across destination pixels" {
     const ProbeState = struct {
-        checks: usize = 0,
+        checks: std.atomic.Value(usize) = .init(0),
 
         fn isCancelled(context: ?*const anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
-            self.checks += 1;
+            _ = self.checks.fetchAdd(1, .monotonic);
             return false;
         }
     };
@@ -4496,7 +4526,7 @@ test "bilevel cancellation polling is amortized across destination pixels" {
     });
     for (0..BilevelCancellationPoller.work_per_check * 3 + 17) |_| try cancellation.complete(1);
 
-    try std.testing.expectEqual(@as(usize, 3), state.checks);
+    try std.testing.expectEqual(@as(usize, 3), state.checks.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 17), cancellation.work_since_check);
 }
 

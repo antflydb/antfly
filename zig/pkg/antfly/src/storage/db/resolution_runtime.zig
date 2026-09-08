@@ -1611,7 +1611,8 @@ pub const ResolutionRuntime = struct {
     worker_started: std.atomic.Value(bool),
     worker_mutex: Io.Mutex = .init,
     worker_cond: Io.Condition = .init,
-    future: ?Io.Future(void),
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub fn init(
         alloc: Allocator,
@@ -1635,6 +1636,7 @@ pub const ResolutionRuntime = struct {
             .write_ctx = write_ctx,
             .write_fn = write_fn,
             .io_impl = backend_runtime.io_impl,
+            .backend_runtime = backend_runtime,
             .candidate_source = candidate_source,
             .embedder = embedder,
             .applied_sequence = .init(applied),
@@ -1696,7 +1698,7 @@ pub const ResolutionRuntime = struct {
         defer self.worker_mutex.unlock(io);
         if (self.worker_started.load(.acquire)) return;
         self.shutdown_flag.store(false, .release);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.propagation, self, workerStep);
         self.worker_started.store(true, .release);
         self.worker_cond.broadcast(io);
     }
@@ -1719,6 +1721,7 @@ pub const ResolutionRuntime = struct {
     }
 
     fn wakeWorker(self: *ResolutionRuntime) void {
+        if (self.backend_runtime) |backend| backend.wakeMaintenance(self);
         if (!self.worker_started.load(.acquire)) return;
         const io_impl = self.io_impl orelse return;
         const io = io_impl.io();
@@ -1735,7 +1738,10 @@ pub const ResolutionRuntime = struct {
     pub fn catchUp(self: *ResolutionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        return self.catchUpLocked(false);
+    }
 
+    fn catchUpLocked(self: *ResolutionRuntime, single_window: bool) !void {
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
@@ -1777,6 +1783,7 @@ pub const ResolutionRuntime = struct {
             }
             try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, max_seen);
             self.applied_sequence.store(max_seen, .release);
+            if (single_window) return;
             // Loop to process the next window if max_seen is still below target.
         }
     }
@@ -1883,26 +1890,16 @@ pub const ResolutionRuntime = struct {
         return listPendingReviews(alloc, das.artifactStore(), resolvers);
     }
 
-    fn workerMain(self: *ResolutionRuntime) void {
-        const io = (self.io_impl orelse return).io();
-        while (!self.shutdown_flag.load(.acquire)) {
-            self.worker_mutex.lockUncancelable(io);
-            while (!self.shutdown_flag.load(.acquire) and
-                self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire))
-            {
-                self.worker_cond.waitUncancelable(io, &self.worker_mutex);
-            }
-            self.worker_mutex.unlock(io);
-            if (self.shutdown_flag.load(.acquire)) break;
-
-            if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
-                self.catchUp() catch |err| {
-                    std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
-                    io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
-                };
-            }
-        }
-        self.catchUp() catch {};
+    fn workerStep(self: *ResolutionRuntime) ?u64 {
+        if (self.shutdown_flag.load(.acquire)) return null;
+        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) return null;
+        if (!self.catch_up_mutex.tryLock()) return 25;
+        defer self.catch_up_mutex.unlock();
+        self.catchUpLocked(true) catch |err| {
+            std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
+            return 50;
+        };
+        return 0;
     }
 };
 

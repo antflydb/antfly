@@ -3389,6 +3389,7 @@ const CompositeAssetsLoadFlight = struct {
     /// Protected by ModelManager.load_lock. The owner starts with one reference;
     /// every waiter takes one before dropping the manager lock.
     refs: usize = 1,
+    registered: bool = true,
     // Reuse the model-loader waiter/cancellation state machine. The component
     // task is manager-owned; no individual request controls a shared cold load.
     load_state: LoadFlight,
@@ -5798,8 +5799,11 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return;
         }
-        const removed = self.in_flight_composite_assets.fetchRemove(flight_key) orelse unreachable;
-        std.debug.assert(removed.value == flight);
+        if (flight.registered) {
+            const removed = self.in_flight_composite_assets.fetchRemove(flight_key) orelse unreachable;
+            std.debug.assert(removed.value == flight);
+            flight.registered = false;
+        }
         self.unlockLoadedModels();
 
         self.allocator.destroy(flight);
@@ -6215,7 +6219,7 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return .{ .manager = self, .assets = assets };
         }
-        if (self.in_flight_composite_assets.get(asset_generation)) |flight| {
+        if (self.joinableCompositeLoadFlightLocked(asset_generation)) |flight| {
             if (!flight.load_state.tryAddWaiter()) {
                 self.unlockLoadedModels();
                 return error.ResourceTemporarilyUnavailable;
@@ -6526,6 +6530,29 @@ pub const ModelManager = struct {
         flight.completed.set(flight.io);
     }
 
+    /// Completed failures are not negative cache entries. The task and its old
+    /// waiters may still own the flight, but a new request must be able to retry
+    /// after admission or artifacts change. Detachment does not destroy it, and
+    /// old-reference cleanup must never remove a replacement with the same key.
+    fn joinableCompositeLoadFlightLocked(self: *ModelManager, key: ComponentPlanKey) ?*CompositeAssetsLoadFlight {
+        const flight = self.in_flight_composite_assets.get(key) orelse return null;
+        if (!flight.completed.isSet() or flight.err == null) return flight;
+        const removed = self.in_flight_composite_assets.fetchRemove(key) orelse unreachable;
+        std.debug.assert(removed.value == flight);
+        flight.registered = false;
+        return null;
+    }
+
+    fn joinableLoadFlightLocked(self: *ModelManager, key: []const u8) ?*LoadFlight {
+        const flight = self.in_flight_loads.get(key) orelse return null;
+        if (!flight.completed.isSet() or flight.err == null) return flight;
+        const removed = self.in_flight_loads.fetchRemove(key) orelse unreachable;
+        std.debug.assert(removed.value == flight);
+        flight.registered = false;
+        self.allocator.free(removed.key);
+        return null;
+    }
+
     fn runLoadTask(task: *LoadTask) std.Io.Cancelable!void {
         defer task.deinit();
         const manager = task.manager;
@@ -6717,7 +6744,7 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return .{ .manager = self, .model = model };
         }
-        if (self.in_flight_loads.get(flight_key)) |flight| {
+        if (self.joinableLoadFlightLocked(flight_key)) |flight| {
             flight.refs += 1;
             if (!flight.tryAddWaiter()) {
                 flight.refs -= 1;
@@ -10550,6 +10577,46 @@ test "composite cold load cancellation abandons only the departing waiter" {
     try std.testing.expectError(error.TestLoadFailure, manager.waitForCompositeAssetsLoadFlight(key, flight, null));
     manager.releaseCompositeAssetsLoadFlight(key, flight);
     try std.testing.expectEqual(@as(usize, 0), manager.in_flight_composite_assets.count());
+}
+
+test "failed load flights allow immediate retry before the old task releases" {
+    const alloc = std.testing.allocator;
+    var manager = ModelManager.init(alloc, backends.SessionManager.init(alloc));
+    defer manager.deinit();
+    const key = [_]u8{1} ** 32;
+    const old = try alloc.create(CompositeAssetsLoadFlight);
+    old.* = .{ .io = std.testing.io, .refs = 2, .load_state = .{ .io = std.testing.io } };
+    try manager.in_flight_composite_assets.put(alloc, key, old);
+    manager.finishCompositeAssetsLoadFlight(old, null, error.ResourceTemporarilyUnavailable);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.waitForCompositeAssetsLoadFlight(key, old, null));
+    manager.lockLoadedModels();
+    const joinable = manager.joinableCompositeLoadFlightLocked(key);
+    manager.unlockLoadedModels();
+    try std.testing.expect(joinable == null);
+    try std.testing.expect(!old.registered);
+    const replacement = try alloc.create(CompositeAssetsLoadFlight);
+    replacement.* = .{ .io = std.testing.io, .load_state = .{ .io = std.testing.io } };
+    try manager.in_flight_composite_assets.put(alloc, key, replacement);
+    manager.releaseCompositeAssetsLoadFlight(key, old);
+    try std.testing.expect(manager.in_flight_composite_assets.get(key).? == replacement);
+    manager.releaseCompositeAssetsLoadFlight(key, replacement);
+
+    const old_model = try alloc.create(LoadFlight);
+    old_model.* = .{ .io = std.testing.io };
+    try manager.in_flight_loads.put(alloc, try alloc.dupe(u8, "retry"), old_model);
+    manager.finishLoadFlight(old_model, null, error.ResourceTemporarilyUnavailable);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.waitForLoadFlight("retry", old_model, null));
+    manager.lockLoadedModels();
+    const model_joinable = manager.joinableLoadFlightLocked("retry");
+    manager.unlockLoadedModels();
+    try std.testing.expect(model_joinable == null);
+    try std.testing.expect(!old_model.registered);
+    const new_model = try alloc.create(LoadFlight);
+    new_model.* = .{ .io = std.testing.io, .refs = 1 };
+    try manager.in_flight_loads.put(alloc, try alloc.dupe(u8, "retry"), new_model);
+    manager.releaseLoadFlight("retry", old_model);
+    try std.testing.expect(manager.in_flight_loads.get("retry").? == new_model);
+    manager.releaseLoadFlight("retry", new_model);
 }
 
 test "component compatibility rejects malformed directory-backed native artifacts" {

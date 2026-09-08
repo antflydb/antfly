@@ -176,7 +176,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     producer_admission_tail: ?*ProducerAdmissionWaiter = null,
     admission_closed: bool = false,
     fd_retry_epoch: ?u32 = null,
-    future: ?Io.Future(void) = null,
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub const ProducerPermit = struct {
         runtime: *TextMergeRuntime,
@@ -234,6 +235,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
+            .backend_runtime = backend_runtime,
             .native_storage_pool = backend_runtime.nativeStoragePool(),
             .index_manager = index_manager,
             .apply_mutex = apply_mutex,
@@ -338,7 +340,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         self.shutdown = false;
         self.notified = true;
         self.mutex.unlock(io);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).register(self, workerStep);
     }
 
     fn stopLocked(self: *TextMergeRuntime) bool {
@@ -364,6 +366,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn notify(self: *TextMergeRuntime) void {
+        if (self.backend_runtime) |backend| backend.wakeMaintenance(self);
         if (!self.config.enabled) return;
         const io_impl = self.io_impl orelse return;
         const io = io_impl.io();
@@ -878,83 +881,27 @@ fn quarantineBlocks(stats: types.TextMergeStats) bool {
         stats.quarantined_segments >= stats.pending_segments;
 }
 
-fn workerMain(runtime: *TextMergeRuntime) void {
+fn workerStep(runtime: *TextMergeRuntime) ?u64 {
+    if (isShutdown(runtime)) return null;
+    if (runtime.fd_retry_epoch) |epoch| {
+        if (runtime.native_storage_pool.admissionEpoch() == epoch) return @max(1, runtime.config.idle_interval_ms);
+        runtime.fd_retry_epoch = null;
+    }
     if (builtin.is_test and test_wait_for_fd_admission.swap(false, .acq_rel)) {
         test_fd_admission_entered.store(true, .release);
         const io = runtime.io_impl.?.io();
         runtime.native_storage_pool.reserveDescriptorsForTest(io, 1) catch |err| {
             if (err == error.Canceled) test_fd_admission_canceled.store(true, .release);
-            return;
+            return null;
         };
         runtime.native_storage_pool.releaseDescriptorsForTest(io, 1);
     }
-    while (true) {
-        if (isShutdown(runtime)) return;
-        const ran = runtime.runOnce() catch |err| {
-            if (err == error.Canceled) return;
-            if (err == error.ResourceBudgetExceeded) {
-                sleepMs(runtime, runtime.config.error_interval_ms);
-                continue;
-            }
-            if (builtin.os.tag != .freestanding) {
-                std.log.err("text merge worker failed: {s}", .{@errorName(err)});
-            }
-            sleepMs(runtime, runtime.config.error_interval_ms);
-            continue;
-        };
-        if (ran) continue;
-        if (runtime.fd_retry_epoch != null) {
-            waitForFdAdmissionChange(runtime);
-            continue;
-        }
-        waitForWork(runtime);
-    }
-}
-
-fn waitForFdAdmissionChange(runtime: *TextMergeRuntime) void {
-    const observed_epoch = runtime.fd_retry_epoch orelse return;
-    const io = runtime.io_impl.?.io();
-    while (!isShutdown(runtime) and runtime.native_storage_pool.admissionEpoch() == observed_epoch) {
-        runtime.native_storage_pool.waitForAdmissionChange(io, observed_epoch) catch return;
-    }
-    runtime.fd_retry_epoch = null;
-}
-
-fn waitForWork(runtime: *TextMergeRuntime) void {
-    var remaining_ms = runtime.config.idle_interval_ms;
-    if (remaining_ms == 0) remaining_ms = 1;
-
-    const io_impl = runtime.io_impl orelse return;
-    const io = io_impl.io();
-    runtime.mutex.lockUncancelable(io);
-    if (runtime.notified or runtime.shutdown) {
-        runtime.notified = false;
-        runtime.mutex.unlock(io);
-        return;
-    }
-    runtime.mutex.unlock(io);
-
-    while (remaining_ms > 0) {
-        if (isShutdown(runtime)) return;
-        const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
-        remaining_ms -= slice_ms;
-        runtime.mutex.lockUncancelable(io);
-        const notified = runtime.notified;
-        runtime.notified = false;
-        runtime.mutex.unlock(io);
-        if (notified) return;
-    }
-}
-
-fn sleepMs(runtime: *TextMergeRuntime, ms: u64) void {
-    var remaining_ms = if (ms == 0) 1 else ms;
-    while (remaining_ms > 0) {
-        if (isShutdown(runtime)) return;
-        const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
-        remaining_ms -= slice_ms;
-    }
+    const ran = runtime.runOnce() catch |err| {
+        if (err == error.Canceled) return null;
+        if (err != error.ResourceBudgetExceeded) std.log.err("text merge worker failed: {s}", .{@errorName(err)});
+        return @max(1, runtime.config.error_interval_ms);
+    };
+    return if (ran) 0 else @max(1, runtime.config.idle_interval_ms);
 }
 
 fn isShutdown(runtime: *TextMergeRuntime) bool {

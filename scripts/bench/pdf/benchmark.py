@@ -105,14 +105,14 @@ def artifact_errors(selected, manifests):
         manifest = manifests[row["path"]]
         if manifest.get("unit_count") != row["pages"]:
             errors.append(
-                f'{row["path"]}: page coverage {manifest.get("unit_count")}/{row["pages"]}'
+                f"{row['path']}: page coverage {manifest.get('unit_count')}/{row['pages']}"
             )
         if not manifest.get("chunk_count"):
-            errors.append(f'{row["path"]}: no chunks')
+            errors.append(f"{row['path']}: no chunks")
         if manifest.get("ocr_failed_count", 0):
-            errors.append(f'{row["path"]}: OCR failures')
+            errors.append(f"{row['path']}: OCR failures")
         if row["role"] == "ocr_required" and not manifest.get("ocr_selected_count"):
-            errors.append(f'{row["path"]}: required OCR was not selected')
+            errors.append(f"{row['path']}: required OCR was not selected")
     return errors
 
 
@@ -151,7 +151,7 @@ def run_created(args, out):
         selected = [r for r in selected if r["role"] in roles]
     for row in selected:
         if sha256(ROOT / "corpus" / row["path"]) != row["sha256"]:
-            raise ValueError(f'Corpus file changed: {row["path"]}')
+            raise ValueError(f"Corpus file changed: {row['path']}")
     origin = PdfOrigin(("127.0.0.1", 0), ROOT / "corpus", out / "origin.jsonl")
     thread = threading.Thread(target=origin.serve_forever, daemon=True)
     source_url = f"http://127.0.0.1:{origin.server_port}"
@@ -224,14 +224,17 @@ def run_created(args, out):
         # Do not accidentally send table writes to an unrelated server using the
         # requested port. Require our child's successful bind before any HTTP.
         wait_until(
-            lambda: f"standalone public api listening on {url}"
-            in (out / "antfly.log").read_text(),
+            lambda: (
+                f"standalone public api listening on {url}"
+                in (out / "antfly.log").read_text()
+            ),
             120,
             proc,
         )
         wait_until(
-            lambda: api.json_request("GET", url + "/db/v1/tables", timeout=2)
-            is not None,
+            lambda: (
+                api.json_request("GET", url + "/db/v1/tables", timeout=2) is not None
+            ),
             120,
             proc,
         )
@@ -265,7 +268,7 @@ def run_created(args, out):
             )
             started = time.perf_counter()
             print(
-                f'{args.name} trial={trial} ingest {len(records)} PDFs, {sum(r["pages"] for r in selected)} pages',
+                f"{args.name} trial={trial} ingest {len(records)} PDFs, {sum(r['pages'] for r in selected)} pages",
                 flush=True,
             )
             groups = [records] if args.batch else [{k: v} for k, v in records.items()]
@@ -336,7 +339,7 @@ def run_created(args, out):
                 if r["method"] == "GET" and r["status"] == 200 and r["bytes"] > 0
             }
             errors.extend(
-                f'{r["path"]}: not fetched'
+                f"{r['path']}: not fetched"
                 for r in selected
                 if r["path"] not in fetched
             )

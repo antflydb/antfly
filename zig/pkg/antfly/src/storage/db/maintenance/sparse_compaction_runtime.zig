@@ -90,7 +90,8 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     paused: bool = false,
     shutdown: bool = false,
     notified: bool = false,
-    future: ?Io.Future(void) = null,
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub fn init(
         alloc: Allocator,
@@ -104,6 +105,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
+            .backend_runtime = backend_runtime,
             .index_manager = index_manager,
             .apply_mutex = apply_mutex,
             .config = config,
@@ -176,7 +178,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         self.shutdown = false;
         self.notified = true;
         self.mutex.unlock(io);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).register(self, workerStep);
     }
 
     fn stopLocked(self: *SparseCompactionRuntime) bool {
@@ -196,6 +198,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
     }
 
     pub fn notify(self: *SparseCompactionRuntime) void {
+        if (self.backend_runtime) |backend| backend.wakeMaintenance(self);
         if (!self.config.enabled) return;
         const io_impl = self.io_impl orelse return;
         const io = io_impl.io();
@@ -297,60 +300,14 @@ const MandatoryApplyRetirement = struct {
     }
 };
 
-fn workerMain(runtime: *SparseCompactionRuntime) void {
-    while (true) {
-        if (isShutdown(runtime)) return;
-        const ran = runtime.runOnce() catch |err| {
-            // `std.Io` cancellation is a task-lifetime boundary, not a
-            // recoverable compaction failure. Do not consume its one-shot
-            // notification and re-enter the worker loop.
-            if (err == error.Canceled) return;
-            if (builtin.os.tag != .freestanding) {
-                std.log.warn("sparse compaction worker failed: {s}", .{@errorName(err)});
-            }
-            sleepMs(runtime, runtime.config.error_interval_ms);
-            continue;
-        };
-        if (ran) continue;
-        waitForWork(runtime);
-    }
-}
-
-fn waitForWork(runtime: *SparseCompactionRuntime) void {
-    var remaining_ms = runtime.config.idle_interval_ms;
-    if (remaining_ms == 0) remaining_ms = 1;
-
-    const io_impl = runtime.io_impl orelse return;
-    const io = io_impl.io();
-    runtime.mutex.lockUncancelable(io);
-    if (runtime.notified or runtime.shutdown) {
-        runtime.notified = false;
-        runtime.mutex.unlock(io);
-        return;
-    }
-    runtime.mutex.unlock(io);
-
-    while (remaining_ms > 0) {
-        if (isShutdown(runtime)) return;
-        const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
-        remaining_ms -= slice_ms;
-        runtime.mutex.lockUncancelable(io);
-        const notified = runtime.notified;
-        runtime.notified = false;
-        runtime.mutex.unlock(io);
-        if (notified) return;
-    }
-}
-
-fn sleepMs(runtime: *SparseCompactionRuntime, ms: u64) void {
-    var remaining_ms = if (ms == 0) 1 else ms;
-    while (remaining_ms > 0) {
-        if (isShutdown(runtime)) return;
-        const slice_ms: u64 = @min(remaining_ms, 10);
-        runtime.config.clock.sleepMs(slice_ms);
-        remaining_ms -= slice_ms;
-    }
+fn workerStep(runtime: *SparseCompactionRuntime) ?u64 {
+    if (isShutdown(runtime)) return null;
+    const ran = runtime.runOnce() catch |err| {
+        if (err == error.Canceled) return null;
+        std.log.warn("sparse compaction worker failed: {s}", .{@errorName(err)});
+        return @max(1, runtime.config.error_interval_ms);
+    };
+    return if (ran) 0 else @max(1, runtime.config.idle_interval_ms);
 }
 
 fn isShutdown(runtime: *SparseCompactionRuntime) bool {

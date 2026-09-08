@@ -4060,10 +4060,10 @@ pub const DB = struct {
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
-    quarantine_retry_thread: ?std.Thread = null,
+    quarantine_retry_thread: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
-    artifact_repair_metadata_future: ?Io.Future(void) = null,
+    artifact_repair_metadata_future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shadow: ?ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
@@ -23795,10 +23795,8 @@ pub const DB = struct {
     }
 
     const quarantine_retry_poll_ns: u64 = 10 * std.time.ns_per_s;
-    const quarantine_retry_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
     const artifact_repair_metadata_poll_ns: u64 = 5 * std.time.ns_per_s;
     const artifact_repair_metadata_active_poll_ns: u64 = 100 * std.time.ns_per_ms;
-    const artifact_repair_metadata_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
 
     /// Start only after the DB has reached its final address. DB.open returns
     /// by value, so cache owners invoke this after installing that value in a
@@ -23810,9 +23808,12 @@ pub const DB = struct {
         if (!self.start_index_workers) return;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
         if (self.artifact_repair_metadata_future != null) return;
-        const io_impl = self.backend_runtime.io_impl orelse return;
+        const scheduler = self.backend_runtime.maintenanceScheduler() catch |err| {
+            std.log.warn("artifact repair scheduler unavailable: {}", .{err});
+            return;
+        };
         self.artifact_repair_metadata_stop.store(false, .release);
-        self.artifact_repair_metadata_future = io_impl.io().concurrent(artifactRepairMetadataWorkerMain, .{self}) catch |err| {
+        self.artifact_repair_metadata_future = scheduler.register(self, artifactRepairMetadataWorkerStep) catch |err| {
             std.log.warn("artifact repair metadata worker spawn failed: {}", .{err});
             return;
         };
@@ -23828,29 +23829,17 @@ pub const DB = struct {
         }
     }
 
-    fn sleepArtifactRepairMetadataWorker(self: *DB, target_ns: u64) bool {
-        var slept: u64 = 0;
-        while (slept < target_ns) : (slept += artifact_repair_metadata_sleep_slice_ns) {
-            if (self.artifact_repair_metadata_stop.load(.acquire)) return false;
-            sleepNs(artifact_repair_metadata_sleep_slice_ns);
-        }
-        return !self.artifact_repair_metadata_stop.load(.acquire);
+    fn artifactRepairMetadataWorkerStep(self: *DB) ?u64 {
+        if (self.artifact_repair_metadata_stop.load(.acquire)) return null;
+        _ = self.runArtifactRepairMetadataMaintenancePass() catch |err| {
+            std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
+            return artifact_repair_metadata_poll_ns / std.time.ns_per_ms;
+        };
+        return (if (self.artifactRepairMetadataRebuildPending()) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns) / std.time.ns_per_ms;
     }
 
-    fn artifactRepairMetadataWorkerMain(self: *DB) void {
-        while (true) {
-            const active = self.artifactRepairMetadataRebuildPending();
-            if (!self.sleepArtifactRepairMetadataWorker(if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns)) return;
-            if (self.artifact_repair_metadata_stop.load(.acquire)) return;
-            _ = self.runArtifactRepairMetadataMaintenancePass() catch |err| {
-                std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
-                continue;
-            };
-        }
-    }
-
-    /// Start only after the DB has reached its final address. The spawned
-    /// thread retains `self` after this call returns.
+    /// Start only after the DB has reached its final address. The scheduler
+    /// registration retains `self` until its stop/join boundary.
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         // Tests drive retries deterministically via retryQuarantinedIndexLoads;
         // a background worker racing them turns every quarantine-shaped test
@@ -23865,7 +23854,11 @@ pub const DB = struct {
         if (!self.optional_runtime_workers_enabled or self.open_mode != .writer) return;
         if (self.quarantine_retry_thread != null) return;
         if (!self.core.index_manager.hasLoadFailures()) return;
-        self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
+        const scheduler = self.backend_runtime.maintenanceScheduler() catch |err| {
+            std.log.warn("quarantine retry scheduler unavailable: {}", .{err});
+            return;
+        };
+        self.quarantine_retry_thread = scheduler.register(self, quarantineRetryWorkerStep) catch |err| {
             // Self-healing is best-effort: the quarantine still recovers on
             // the next open or via drop+recreate.
             std.log.warn("quarantine retry worker spawn failed: {}", .{err});
@@ -23883,26 +23876,19 @@ pub const DB = struct {
 
     fn stopQuarantineRetryWorker(self: *DB) void {
         self.quarantine_retry_stop.store(true, .release);
-        if (self.quarantine_retry_thread) |thread| {
-            thread.join();
+        if (self.quarantine_retry_thread) |*task| {
+            task.await(self.backend_runtime.io().?);
             self.quarantine_retry_thread = null;
         }
     }
 
-    fn quarantineRetryWorkerMain(self: *DB) void {
-        while (true) {
-            var slept: u64 = 0;
-            while (slept < quarantine_retry_poll_ns) : (slept += quarantine_retry_sleep_slice_ns) {
-                if (self.quarantine_retry_stop.load(.acquire)) return;
-                sleepNs(quarantine_retry_sleep_slice_ns);
-            }
-            if (self.quarantine_retry_stop.load(.acquire)) return;
-            const result = self.retryQuarantinedIndexLoads(false) catch |err| {
-                std.log.warn("quarantine retry pass failed: {}", .{err});
-                continue;
-            };
-            if (result.remaining == 0) return;
-        }
+    fn quarantineRetryWorkerStep(self: *DB) ?u64 {
+        if (self.quarantine_retry_stop.load(.acquire)) return null;
+        const result = self.retryQuarantinedIndexLoads(false) catch |err| {
+            std.log.warn("quarantine retry pass failed: {}", .{err});
+            return quarantine_retry_poll_ns / std.time.ns_per_ms;
+        };
+        return if (result.remaining == 0) null else quarantine_retry_poll_ns / std.time.ns_per_ms;
     }
 
     fn runRestoreRepairDrainAsync(self: *DB) !void {

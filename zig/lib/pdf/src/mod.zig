@@ -524,9 +524,9 @@ fn renderParsedPageRgbaEffectiveWithRotationAllocators(
         => if (builtin.os.tag == .macos) blk: {
             if (used_compatibility_backend) |value| value.* = true;
             try parsed.checkCancellation();
-            const png = if (compatibility_session) |session|
-                try session.renderPagePngAlloc(
-                    scratch_alloc,
+            const raw = if (compatibility_session) |session|
+                try session.renderPageRgbaAlloc(
+                    output_alloc,
                     page_number,
                     dpi,
                     max_pixels,
@@ -534,14 +534,12 @@ fn renderParsedPageRgbaEffectiveWithRotationAllocators(
                     parsed.cancellationProbe(),
                 )
             else
-                try darwin_render.renderPagePngAlloc(scratch_alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
-            defer scratch_alloc.free(png);
-            const decoded = try image.png.decodeRgba(output_alloc, png);
-            errdefer output_alloc.free(decoded.rgba);
+                try darwin_render.renderPageRgbaAlloc(output_alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+            errdefer output_alloc.free(raw.rgba);
             try parsed.checkCancellation();
-            const pixels = std.math.mul(u64, decoded.width, decoded.height) catch return error.RenderedPageTooLarge;
+            const pixels = std.math.mul(u64, raw.width, raw.height) catch return error.RenderedPageTooLarge;
             if (pixels > max_pixels) return error.RenderedPageTooLarge;
-            break :blk .{ .rgba = decoded.rgba, .width = decoded.width, .height = decoded.height };
+            break :blk raw;
         } else return err,
         else => return err,
     };
@@ -1539,6 +1537,11 @@ const PageRenderWorker = struct {
     }
 
     fn recordRenderFailure(self: *PageRenderWorker, err: anyerror) void {
+        if (err == error.OutOfMemory and (self.scratch_budget.limit_exceeded or self.output_budget.limit_exceeded))
+            std.log.warn("PDF render budget exhausted page={d} scratch_limit_exceeded={} scratch_limit={d} output_limit_exceeded={} output_limit={d}", .{
+                self.request.page_number,          self.scratch_budget.limit_exceeded, self.scratch_budget.max_live_bytes,
+                self.output_budget.limit_exceeded, self.output_budget.max_live_bytes,
+            });
         self.failure = if (err == error.OutOfMemory and
             (self.scratch_budget.limit_exceeded or self.output_budget.limit_exceeded))
             error.RenderWorkerMemoryLimitExceeded

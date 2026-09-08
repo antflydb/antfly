@@ -63,8 +63,11 @@ class CompletionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = SimpleNamespace(name="failed-run")
-            with patch.object(benchmark, "ROOT", root), patch.object(
-                benchmark, "run_created", side_effect=ValueError("missing model")
+            with (
+                patch.object(benchmark, "ROOT", root),
+                patch.object(
+                    benchmark, "run_created", side_effect=ValueError("missing model")
+                ),
             ):
                 with self.assertRaisesRegex(ValueError, "missing model"):
                     benchmark.run(args)

@@ -5020,14 +5020,67 @@ payload allocation, borrowed ownership and every allocation failure.
 
 Verification of this fix includes the real seven-page remote-PDF forced-OCR
 case on Metal: all seven OCR attempts finish without the previous `InvalidShape`
-failure. This is not full benchmark qualification: the separate newspaper page
-still reports `RenderWorkerMemoryLimitExceeded`. Keep scratch and retained-output
-allocation lifetimes distinct when resolving that admission failure; do not
-silently raise caps or treat retained embedded text as successful forced OCR.
-Companion multi-table E2E tests also reproduce `ConcurrencyUnavailable` when
-per-shard parked maintenance loops exhaust the bounded background lane. The
-long-term remedy is shared bounded runnable scheduling with owner registration,
-in-flight draining and shutdown safety, not a larger fixed thread limit or timeout.
+failure. Follow-up verification exposed a newspaper-page
+`RenderWorkerMemoryLimitExceeded` and multi-table `ConcurrencyUnavailable`.
+
+The renderer now produces RGBA directly from the serialized macOS compatibility
+session: there is no PNG encode/decode round trip or temporary PNG decoder state
+charged to a one-canvas output reservation. Native quarter-turn rotation renders
+the unrotated canvas in scratch and allocates only the final rotated canvas from
+retained-output credit. Both paths keep existing memory ceilings and cancellation
+cleanup. Exact-one-canvas allocator regressions cover rotations and compatibility
+output parity. CoreGraphics's internal allocations remain outside the portable
+allocator contract, as before; this does not claim complete native-framework RSS
+accounting. Retained embedded text never counts as successful forced OCR.
+
+The newspaper also demonstrates that geometry plus decoder limits is an
+estimate, not a bound on expanded font outlines. OCR/generation and embedding
+windows therefore share one admitted scratch-retry path. On a worker-budget
+failure, it non-blockingly reserves the delta up to the already configured
+scratch ceiling, keeps output credit pinned, frees the joined attempt's outputs,
+and retries rendering once with one worker. No model invocation is replayed.
+The original deadline, transforms, page identities and output caps remain in
+force. If extra admission is denied, the ordered original failures are retained;
+if the second attempt still exceeds the cap, it remains a failure. Both grants
+are released when rendering finishes, including cancellation/error cleanup.
+Regressions cover both output representations, denied growth, repeated failure,
+and cancellation. The newspaper renders at its existing 256 MiB ceiling in the
+isolated render-window probe; this alone is not end-to-end OCR qualification.
+
+`BackendRuntime` lazily owns one maintenance scheduler. TTL, transaction recovery,
+text merging, sparse compaction, enrichment, resolution/promotion, derived-index
+replay, artifact repair and quarantine retry register work instead of parking a
+thread per shard/index. A callback performs a pass, then parks or returns a retry
+delay; notifications coalesce and survive a running pass. Derived workers yield
+after a replay window while retaining their session until its idle deadline or
+an explicit close request. Runnable scans rotate fairly, and completed callbacks
+are joined before dispatch so newly available capacity cannot strand ready work.
+
+The default 48-worker durable I/O lane is unchanged. At most half its capacity is
+admitted to maintenance callbacks, with separate reserved shares for maintenance,
+producers, derived publication and propagation. This prevents producer waiters
+from starving their derived dependencies, and propagation writes from starving
+the target's enrichment. Scheduler activation requires at least eight configured
+durable workers, leaving capacity for its coordinator, durable-job reaper and
+storage/commit work. Smaller configured lanes fail explicitly at activation.
+Lane statistics expose registrations, active/class counts, peaks, dispatches and
+dispatch retries. No capacity error is converted into a larger thread ceiling.
+
+Registration handles are lifetime leases. Stop detaches queued work and joins
+active callbacks before the owner is freed; cancellation-sensitive compaction
+also cancels its active I/O future. Runtime shutdown closes registration and
+waits for handles to drain in release builds before destroying the coordinator.
+Tests cover hundreds of owners on a tiny lane, in-flight wakeups, dependency
+capacity, cancellation, shutdown fencing, session reuse and retry recovery.
+
+Model loading also separates a flight's join eligibility from its reference
+lifetime. Completed failed flights are detached when a new request retries;
+existing waiters still receive the original result and the task may finish its
+cleanup independently. This applies to ordinary models and composite assets
+(including Whisper metadata). A failed load is not an implicit negative cache,
+and cleanup of the old flight cannot remove a new flight registered under the
+same key. A deterministic regression holds the old task reference across retry
+and replacement, reproducing the immediate-retry CI failure without sleeps.
 
 ### Remaining resident-decoder execution contract
 
