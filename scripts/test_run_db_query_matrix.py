@@ -52,10 +52,10 @@ class QueryMatrixTest(unittest.TestCase):
             storage_arg=[],
             public_arg=[],
         )
-        with patch.object(
-            matrix.platform, "platform", return_value="test-platform"
-        ), patch.object(matrix.subprocess, "run", side_effect=run), patch.object(
-            matrix.subprocess, "check_output", return_value="commit\n"
+        with (
+            patch.object(matrix.platform, "platform", return_value="test-platform"),
+            patch.object(matrix.subprocess, "run", side_effect=run),
+            patch.object(matrix.subprocess, "check_output", return_value="commit\n"),
         ):
             matrix.run_matrix(args)
         return calls
@@ -76,9 +76,10 @@ class QueryMatrixTest(unittest.TestCase):
 
     def test_failure_and_missing_evidence_fail(self):
         for code, summary in ((7, True), (0, False)):
-            with self.subTest(
-                code=code, summary=summary
-            ), tempfile.TemporaryDirectory() as temp:
+            with (
+                self.subTest(code=code, summary=summary),
+                tempfile.TemporaryDirectory() as temp,
+            ):
                 root = Path(temp)
                 with self.assertRaises(SystemExit):
                     self.run_fake(root, exit_code=code, emit_summary=summary)

@@ -55664,6 +55664,98 @@ test "db match_all consumes resolved ordinal filter" {
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
+test "db native document filters preserve paged totals across representations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{ .name = "sp_v1", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[5]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha alpha\",\"embedding\":[1,0],\"sparse\":{\"indices\":[1],\"values\":[4]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha alpha alpha\",\"embedding\":[2,0],\"sparse\":{\"indices\":[1],\"values\":[3]}}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"alpha alpha alpha alpha\",\"embedding\":[3,0],\"sparse\":{\"indices\":[1],\"values\":[2]}}" },
+            .{ .key = "doc:e", .value = "{\"body\":\"alpha\",\"embedding\":[4,0],\"sparse\":{\"indices\":[1],\"values\":[1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    const ids: []const []const u8 = &.{ "doc:a", "doc:b", "doc:c", "doc:d" };
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try db.resolveDocSetForIdsAlloc(alloc, ids),
+        .exclude = .none,
+    };
+    defer filter.deinit(alloc);
+    filter.exclude = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:d"});
+
+    const Shape = enum { match_all, full_text, dense, sparse, primary_store };
+    for (std.enums.values(Shape)) |shape| {
+        if (shape == .primary_store) try std.testing.expect(try db.deleteIndex("ft_v1"));
+        for ([_]types.SearchRequest{
+            .{ .limit = 1 },
+            .{ .limit = 1, .offset = 1 },
+            .{ .limit = 10 },
+            .{ .limit = 1, .offset = 10 },
+            .{ .limit = 1, .count_only = true },
+        }) |page| {
+            // Count-only text collectors omit hit materialization. The primary
+            // store and vector paths leave count-only response shaping to the API.
+            if (page.count_only and shape != .match_all and shape != .full_text) continue;
+            errdefer std.debug.print("shape={s} limit={d} offset={d} count_only={}\n", .{ @tagName(shape), page.limit, page.offset, page.count_only });
+            var req = page;
+            req.include_stored = false;
+            req.query = .{ .match_all = {} };
+            switch (shape) {
+                .match_all, .primary_store => {},
+                .full_text => req.full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .dense => {
+                    req.index_name = "dv_v1";
+                    req.dense = .{ .vector = &.{ 0, 0 }, .k = 10 };
+                },
+                .sparse => {
+                    req.index_name = "sp_v1";
+                    req.query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 10 } };
+                },
+            }
+            req.filter_doc_ids = ids;
+            req.filter_doc_ids_positive = true;
+            req.exclude_doc_ids = &.{"doc:d"};
+            var public = try db.search(alloc, req);
+            defer public.deinit();
+            req.filter_doc_ids = &.{};
+            req.filter_doc_ids_positive = false;
+            req.exclude_doc_ids = &.{};
+            req.resolved_doc_filter = &filter;
+            var ordinal = try db.search(alloc, req);
+            defer ordinal.deinit();
+
+            // The native engine counted all three matches before paging. Neither
+            // their representation nor an empty result page changes that count.
+            try std.testing.expectEqual(@as(u32, 3), public.total_hits);
+            try std.testing.expectEqual(types.TotalHitsRelation.exact, public.total_hits_relation);
+            try std.testing.expectEqual(public.total_hits, ordinal.total_hits);
+            try std.testing.expectEqual(public.total_hits_relation, ordinal.total_hits_relation);
+            const expected_page_len: usize = if (page.count_only) 0 else @min(page.limit, 3 -| page.offset);
+            try std.testing.expectEqual(expected_page_len, public.hits.len);
+            try std.testing.expectEqual(public.hits.len, ordinal.hits.len);
+            for (public.hits, ordinal.hits) |expected, actual| {
+                try std.testing.expectEqualStrings(expected.id, actual.id);
+                try std.testing.expectEqual(expected.doc_ordinal, actual.doc_ordinal);
+                try std.testing.expect(!std.mem.eql(u8, actual.id, "doc:d"));
+                try std.testing.expect(!std.mem.eql(u8, actual.id, "doc:e"));
+            }
+        }
+    }
+}
+
 test "db stats report engine-owned algebraic adaptive observation status" {
     const alloc = std.testing.allocator;
     const algebraic_ir = @import("algebraic/ir.zig");

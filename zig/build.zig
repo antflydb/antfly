@@ -3573,7 +3573,7 @@ pub fn build(b: *std.Build) void {
         "api.tables.test.metadata.table lsm status exposes wal retry and publication debt",
         "api.tables.test.metadata.table status encoder emits antfly-style shard map",
         "api.tables.test.metadata.table detail encoder includes replication source status and action hint",
-        "api.tables.test.metadata.table status encoder canonicalizes embeddings indexes without inline names",
+        "api.tables.test.metadata.table status encoder canonicalizes embeddings indexes independent of JSON key order",
         "api.tables.test.metadata.table status includes observed dynamic field capabilities",
         "api.tables.test.metadata.table status merges query modes conservatively",
         "api.tables.test.metadata.table status encoder preserves enrichment summaries without producer configuration",

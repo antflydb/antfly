@@ -1820,11 +1820,20 @@ fn hasStoredPatternFilters(req: types.SearchRequest) bool {
         req.exclusion_query_json.len > 0;
 }
 
-fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
+fn requestAfterNativeFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
     var next = req;
-    // Native text filters are resolved into the candidate constraints before
-    // post-processing. Clear the borrowed query views so later stages cannot
-    // accidentally resolve or apply them a second time.
+    // Candidate collectors enforce these constraints against their pinned native
+    // snapshot. Only residual predicates belong in post-processing: applying an
+    // admitted document filter again to a page discards the upstream total and
+    // can confuse source document IDs with derived artifact IDs. This is a
+    // borrowed request copy; ownership and identity generation remain with req.
+    next.filter_doc_ids = &.{};
+    next.filter_doc_ids_positive = false;
+    next.exclude_doc_ids = &.{};
+    next.resolved_doc_filter = null;
+    next.resolved_doc_filter_owned = false;
+    next.resolved_doc_filter_wire_context = null;
+    next.resolved_text_doc_filter = null;
     next.filter_text = null;
     next.exclusion_text = null;
     if (filter_query_json_resolved) next.filter_query_json = "";
@@ -11740,7 +11749,11 @@ pub fn searchTextQuery(
             .window_len = 0,
             .total_ns = platform_time.monotonicNs() - total_start_ns,
         }) else null;
-        return executor.postprocess(executor.ctx, alloc, effective_req, .{
+        return executor.postprocess(executor.ctx, alloc, requestAfterNativeFilters(
+            effective_req,
+            native_constraints.filter_query_json_resolved,
+            native_constraints.exclusion_query_json_resolved,
+        ), .{
             .alloc = alloc,
             .hits = &.{},
             .total_hits = 0,
@@ -11926,19 +11939,15 @@ pub fn searchTextQuery(
     while (true) {
         try checkSearchRequestDeadline(effective_req);
         candidate_iterations += 1;
-        var postprocess_req = effective_req;
+        var postprocess_req = requestAfterNativeFilters(
+            effective_req,
+            native_constraints.filter_query_json_resolved,
+            native_constraints.exclusion_query_json_resolved,
+        );
         if (late_visibility_paginate or requires_field_sort or group_chunk_parents) {
             postprocess_req.offset = 0;
             postprocess_req.limit = candidate_limit;
         }
-        // Explicit document-ID constraints have already been resolved against
-        // this exact text snapshot and enforced by its native collector. Do
-        // not apply them a second time to derived artifact hit IDs in the
-        // stored-pattern layer, where source and artifact IDs intentionally
-        // use different representations of the same document.
-        postprocess_req.filter_doc_ids = &.{};
-        postprocess_req.filter_doc_ids_positive = false;
-        postprocess_req.exclude_doc_ids = &.{};
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
@@ -13173,7 +13182,7 @@ fn searchDenseInternal(
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    const postprocess_req = requestWithoutResolvedStoredFilters(
+    const postprocess_req = requestAfterNativeFilters(
         req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
@@ -13549,7 +13558,9 @@ fn searchDenseInternal(
             source_artifact_ref_owned = false;
         }
         const ordinal_lookup_start = platform_time.monotonicNs();
-        try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
+        // Hit identity is materialized for the admitted request before its
+        // already-enforced filters are removed from the post-processing copy.
+        try lookupDenseHitDocOrdinals(alloc, req, executor, hit_vector_ids.items, hits.items);
         profile.doc_ordinal_lookup_ns += platform_time.monotonicNs() - ordinal_lookup_start;
 
         const postprocess_start = platform_time.monotonicNs();
@@ -15175,7 +15186,7 @@ pub fn searchSparse(
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    const postprocess_req = requestWithoutResolvedStoredFilters(
+    const postprocess_req = requestAfterNativeFilters(
         req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
@@ -17063,7 +17074,7 @@ pub fn searchMatchAll(
     const unresolved_stored_filters =
         (exec_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (exec_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    const postprocess_req = requestWithoutResolvedStoredFilters(
+    const postprocess_req = requestAfterNativeFilters(
         exec_req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,

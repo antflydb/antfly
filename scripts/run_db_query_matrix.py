@@ -114,13 +114,12 @@ def run_matrix(args):
         ),
     }
     (out / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    with (out / "commands.txt").open("w") as commands, (out / "status.tsv").open(
-        "w"
-    ) as status, (out / "combined.jsonl").open("w") as combined, (
-        out / "summary.jsonl"
-    ).open(
-        "w"
-    ) as summaries:
+    with (
+        (out / "commands.txt").open("w") as commands,
+        (out / "status.tsv").open("w") as status,
+        (out / "combined.jsonl").open("w") as combined,
+        (out / "summary.jsonl").open("w") as summaries,
+    ):
         if not args.skip_build:
             command = ["zig", "build", *targets]
             commands.write("build\t" + shlex.join(command) + "\n")
@@ -132,9 +131,10 @@ def run_matrix(args):
             commands.write(name + "\t" + shlex.join(command) + "\n")
             commands.flush()
             print(f"running {name}", flush=True)
-            with (out / f"{name}.stdout").open("w") as stdout, (
-                out / f"{name}.stderr"
-            ).open("w") as stderr:
+            with (
+                (out / f"{name}.stdout").open("w") as stdout,
+                (out / f"{name}.stderr").open("w") as stderr,
+            ):
                 proc = subprocess.run(command, cwd=ROOT, stdout=stdout, stderr=stderr)
             found_summary = False
             for stream in ("stdout", "stderr"):
