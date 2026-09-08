@@ -3275,7 +3275,12 @@ pub const Backend = struct {
         try clearRunsAndFiles(&dest);
 
         var wrote_any = false;
-        for (self.runs.items) |*run| {
+        // L0 precedence is encoded by run ID. Assign replacement IDs oldest
+        // first so the child keeps the source's newest-write-wins ordering.
+        var source_index = self.runs.items.len;
+        while (source_index > 0) {
+            source_index -= 1;
+            const run = &self.runs.items[source_index];
             switch (classifyRun(run.*, split_key)) {
                 .left => {},
                 .right => {
@@ -3328,9 +3333,9 @@ pub const Backend = struct {
 
         var actions = try allocator.alloc(RunAction, old_runs.items.len);
         defer allocator.free(actions);
-        var actions_initialized: usize = 0;
+        for (actions) |*action| action.* = .keep;
         errdefer {
-            for (actions[0..actions_initialized]) |*action| {
+            for (actions) |*action| {
                 switch (action.*) {
                     .replace => |*runs| compaction_mod.discardOutputRuns(Backend, self, runs),
                     .keep, .drop => {},
@@ -3338,10 +3343,26 @@ pub const Backend = struct {
             }
         }
 
+        // Any newly numbered L0 replacement would outrank every retained L0
+        // run, including newer left-only writes. Renumber all surviving L0
+        // runs together when a straddling L0 run needs replacement.
+        const rewrite_l0 = for (old_runs.items) |run| {
+            if (run.level == 0 and classifyRun(run, split_key) == .overlap) break true;
+        } else false;
         var changed = false;
-        for (old_runs.items, 0..) |*run, i| {
+        var source_index = old_runs.items.len;
+        while (source_index > 0) {
+            source_index -= 1;
+            const i = source_index;
+            const run = &old_runs.items[i];
             switch (classifyRun(run.*, split_key)) {
-                .left => actions[i] = .keep,
+                .left => if (run.level == 0 and rewrite_l0) {
+                    const run_state = try self.resolveRunStateWithAllocator(run, allocator);
+                    actions[i] = .{ .replace = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, run_state, run.level) };
+                    changed = true;
+                } else {
+                    actions[i] = .keep;
+                },
                 .right => {
                     actions[i] = .drop;
                     changed = true;
@@ -3358,7 +3379,6 @@ pub const Backend = struct {
                     changed = true;
                 },
             }
-            actions_initialized = i + 1;
         }
 
         if (!changed) {
@@ -3372,13 +3392,13 @@ pub const Backend = struct {
         var prospective_runs = std.ArrayListUnmanaged(Run).empty;
         defer prospective_runs.deinit(allocator);
         var prospective_run_count: usize = 0;
-        for (actions[0..actions_initialized]) |action| switch (action) {
+        for (actions) |action| switch (action) {
             .keep => prospective_run_count += 1,
             .drop => {},
             .replace => |replacements| prospective_run_count += replacements.items.len,
         };
         try prospective_runs.ensureTotalCapacity(allocator, prospective_run_count);
-        for (old_runs.items, actions[0..actions_initialized]) |run, action| switch (action) {
+        for (old_runs.items, actions) |run, action| switch (action) {
             .keep => prospective_runs.appendAssumeCapacity(run),
             .drop => {},
             .replace => |replacements| for (replacements.items) |replacement| {
@@ -3394,7 +3414,7 @@ pub const Backend = struct {
         }
         var rewritten_run_count: usize = 0;
         var obsolete_run_count: usize = 0;
-        for (actions[0..actions_initialized]) |action| switch (action) {
+        for (actions) |action| switch (action) {
             .keep => rewritten_run_count += 1,
             .drop => obsolete_run_count += 1,
             .replace => |replacements| {
@@ -3417,7 +3437,7 @@ pub const Backend = struct {
             obsolete_paths.deinit(allocator);
         }
         try obsolete_paths.ensureTotalCapacity(allocator, obsolete_run_count);
-        for (old_runs.items, actions[0..actions_initialized]) |run, action| switch (action) {
+        for (old_runs.items, actions) |run, action| switch (action) {
             .keep => {},
             .drop, .replace => if (run.path) |path| {
                 obsolete_paths.appendAssumeCapacity(try allocator.dupe(u8, path));
@@ -17483,6 +17503,83 @@ test "lsm backend fast split prepares child and rewrites left in place" {
         defer txn.abort();
         try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
         try std.testing.expectError(error.NotFound, txn.get("doc:z"));
+    }
+}
+
+test "lsm backend physical split preserves L0 overwrite and tombstone order" {
+    const alloc = std.testing.allocator;
+    var parent_buf: [256]u8 = undefined;
+    const parent_path = repository_mod.tmpPath(&parent_buf, "split-order-parent");
+    defer repository_mod.cleanupTmp(parent_path);
+    var child_buf: [256]u8 = undefined;
+    const child_path = repository_mod.tmpPath(&child_buf, "split-order-child");
+    defer repository_mod.cleanupTmp(child_path);
+    const options: Options = .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .foreground_soft_compaction = false,
+    };
+    const Check = struct {
+        fn run(backend: *Backend, left: bool) !void {
+            var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+            defer runtime.deinit();
+            var txn = try runtime.beginRead();
+            defer txn.abort();
+            try std.testing.expectEqualStrings("latest", try txn.get(if (left) "doc:a" else "doc:z"));
+            try std.testing.expectEqualStrings("revived", try txn.get(if (left) "doc:b" else "doc:y"));
+            try std.testing.expectError(error.NotFound, txn.get(if (left) "doc:c" else "doc:x"));
+            try std.testing.expectError(error.NotFound, txn.get(if (left) "doc:z" else "doc:a"));
+        }
+    };
+    {
+        var backend = try Backend.open(alloc, std.mem.span(parent_path), options);
+        defer backend.close();
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            for ([_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:x", "doc:y", "doc:z" }) |key| try txn.put(key, "old");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:a", "middle");
+            try txn.put("doc:z", "middle");
+            for ([_][]const u8{ "doc:b", "doc:c", "doc:x", "doc:y" }) |key| try txn.delete(key);
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        // Newer left-only and right-only runs must retain precedence over
+        // replacements of older straddling runs, including old tombstones.
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:a", "latest");
+            try txn.put("doc:b", "revived");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:z", "latest");
+            try txn.put("doc:y", "revived");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        try std.testing.expectEqual(@as(usize, 4), backend.runs.items.len);
+        for (backend.runs.items) |run| try std.testing.expectEqual(@as(u32, 0), run.level);
+        try std.testing.expect(try backend.prepareSplitRightToDir("doc:m", std.mem.span(child_path), options));
+        try std.testing.expect(try backend.rewriteLeftInPlace("doc:m"));
+        try Check.run(&backend, true);
+    }
+    for ([_]bool{ true, false }) |left| {
+        var reopened = try Backend.open(alloc, std.mem.span(if (left) parent_path else child_path), options);
+        defer reopened.close();
+        try Check.run(&reopened, left);
     }
 }
 

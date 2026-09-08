@@ -3608,6 +3608,55 @@ passes 69/69, all with zero skips, failures, and leaks. `make fmt-check`,
 pre-push checks on the previous head had no failures but still had pending
 jobs; these results do not certify remote CI for this checkpoint.
 
+### Merge Receipt Ownership Through Physical Split Cutover (2026-09-07)
+
+The split-start retry fix did not cover physical LSM finalization. The old
+`raftmerge:state` key sorted after encoded document keys, so the physical split
+copied it to the child and discarded it from the parent. Subsequent receiver
+checkpoints could then fail with `MergeTransitionNotReady`, or resurrect an
+old accept when the retained range happened to equal its original base.
+
+Merge receipts now live in the protected system-metadata prefix: physical
+cutover retains them on the parent and destination cleanup excludes them
+from the child. Existing production records under the old key remain readable;
+checkpoint and direct-coordinator writes retire that key atomically. Split
+preparation and finalization promote any remaining old-key receipt with an
+atomic write/delete batch and sync it before the physical split. This avoids
+a receipt-loss crash window between destructive rewriting and restoration.
+Destination cleanup also removes inherited old-key records.
+
+The migration regression exposed a second storage defect: physical split
+rewrites assigned new L0 run IDs newest-first, making older writes and
+tombstones outrank newer data. Child construction now assigns IDs oldest-first.
+When a parent L0 run straddles the boundary, all surviving parent L0 runs are
+rewritten oldest-first, including newer left-only runs that would otherwise
+be outranked by newly numbered replacements. Lower-level ordering and physical
+run-size limits remain unchanged. A low-level regression checks overwrites,
+tombstones, revived keys, straddling runs, and newer one-sided runs on both
+parent and child after reopen.
+
+The LSM regression covers finalized and rolled-back receipts in both current
+and old-key layouts, retains retired-transition IDs and copy-attempt evidence,
+performs real split preparation/finalization, checks the raw destructive-rewrite
+boundary before any later restoration, and reopens both databases.
+It replays all five receiver controls plus a retired accept, checks continued
+parent write progress and range ownership, verifies the child has no inherited
+receipt, and starts an independent child merge at Raft index one. The finalized
+case deliberately splits back to the original receiver base to guard against
+old-accept resurrection. This preserves receipts through future cutovers; it
+does not reconstruct receipts already lost by an earlier physical split.
+
+Validation: the DB regression reproduced `MissingMergeReceiptAfterSplit`
+before the key fix, and boundary inspection then reproduced old-tombstone
+precedence during migration before the L0 ordering fix. With both fixes, the
+seven focused DB/split regressions pass in Debug and ReleaseSafe; the three
+focused LSM split/run-cap tests, all 12 LSM workload/fault-recovery tests, and
+the default 69-test data-storage gate pass. All report zero skips, failures,
+and leaks. `make fmt-check`, changed-file `zig fmt --check`, and
+`git diff --check` pass. Pre-push checks on the previous head had no failures,
+with the x86 Zig and E2E build jobs still pending; remote CI for this checkpoint
+is not yet verified.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and

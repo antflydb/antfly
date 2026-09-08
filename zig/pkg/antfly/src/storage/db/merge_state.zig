@@ -12,8 +12,43 @@
 const std = @import("std");
 const db_types = @import("types.zig");
 const doc_identity = @import("doc_identity.zig");
+const docstore = @import("../docstore.zig");
 
-pub const key = "raftmerge:state";
+// Group-owned metadata must sort before document keys so a physical LSM
+// split retains it on the parent. Split destinations clear this prefix.
+pub const key = "\x00\x00__metadata__:raftmerge";
+pub const legacy_key = "raftmerge:state";
+
+pub fn loadRawAlloc(alloc: std.mem.Allocator, store: *docstore.DocStore) !?[]u8 {
+    return store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => store.get(alloc, legacy_key) catch |legacy_err| switch (legacy_err) {
+            error.NotFound => null,
+            else => return legacy_err,
+        },
+        else => return err,
+    };
+}
+
+/// Upgrade existing production receipts before a physical split can move or
+/// discard the old key. The protected copy and old-key deletion commit in one
+/// batch and are synced before the destructive rewrite, not restored after it.
+pub fn protectForSplit(alloc: std.mem.Allocator, store: *docstore.DocStore) !void {
+    const old = store.get(alloc, legacy_key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    defer alloc.free(old);
+    const current = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (current) |value| alloc.free(value);
+    const raw = current orelse old;
+    var state = try decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try store.putBatch(&.{.{ .key = key, .value = raw }}, &.{legacy_key});
+    try store.sync(true);
+}
 
 pub const Phase = enum(u8) {
     none = 0,

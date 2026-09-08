@@ -7289,7 +7289,7 @@ pub const DB = struct {
             req.graph_writes.len != 0 or req.graph_deletes.len != 0))
             return error.InvalidBatchRequest;
         if (req.merge_replication) |replication| if (req.merge_checkpoint == null) {
-            const raw = try self.core.getStoreValue(self.alloc, merge_state_mod.key);
+            const raw = try merge_state_mod.loadRawAlloc(self.alloc, self.core.store);
             defer if (raw) |value| self.alloc.free(value);
             var state = if (raw) |value| try merge_state_mod.decodeAlloc(self.alloc, value) else null;
             defer if (state) |*value| value.deinit(self.alloc);
@@ -8084,7 +8084,7 @@ pub const DB = struct {
             } else if (checkpoint.allow_doc_identity_reassignment) {
                 return error.InvalidBatchRequest;
             }
-            const existing_raw = try self.core.getStoreValue(self.alloc, merge_state_mod.key);
+            const existing_raw = try merge_state_mod.loadRawAlloc(self.alloc, self.core.store);
             defer if (existing_raw) |value| self.alloc.free(value);
             var existing_state: ?merge_state_mod.State = if (existing_raw) |value|
                 try merge_state_mod.decodeAlloc(self.alloc, value)
@@ -8111,6 +8111,7 @@ pub const DB = struct {
                 .key = merge_state_mod.key,
                 .value = merge_state_value.items,
             });
+            try delete_keys.append(self.alloc, merge_state_mod.legacy_key);
         }
         try appendDenseArtifactCounterMutations(
             self.alloc,
@@ -51622,7 +51623,7 @@ fn rebaseRangeCoverageMetadata(
     try store.putBatch(writes.items, &.{});
 }
 
-fn finalizePrimarySplitPreservingIdentity(
+fn finalizePrimarySplitPreservingMetadata(
     self: *DB,
     split_lower: []const u8,
     retained_range: types.ByteRange,
@@ -51631,6 +51632,7 @@ fn finalizePrimarySplitPreservingIdentity(
     const identity_rows = try self.core.store.scanRange(self.alloc, range.lower[0..], range.upper[0..]);
     defer docstore_mod.DocStore.freeResults(self.alloc, identity_rows);
 
+    try merge_state_mod.protectForSplit(self.alloc, self.core.store);
     _ = try tryFinalizePrimarySplitFast(self, split_lower);
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
     try rebaseRangeCoverageMetadata(
@@ -51647,6 +51649,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     const split_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
     defer self.alloc.free(split_lower);
 
+    try merge_state_mod.protectForSplit(self.alloc, self.core.store);
     const page_split_built = try tryPreparePrimarySplitFast(self, split_lower, dest_dir);
 
     var opened_dest_store = try openSplitDestinationStore(self, dest_dir);
@@ -52489,7 +52492,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
     try markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);
-    try finalizePrimarySplitPreservingIdentity(self, split_lower, new_range);
+    try finalizePrimarySplitPreservingMetadata(self, split_lower, new_range);
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
     try self.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -52658,7 +52661,12 @@ fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docsto
     // The destination owns an independent Raft log. A physical page split can
     // copy the source's higher applied index; retaining it would suppress valid
     // low-index entries in the new group.
-    try dest_store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
+    // A destination prepared from an older layout must not inherit the
+    // parent's merge ownership or retired-transition fences either.
+    try dest_store.putBatch(&.{}, &.{
+        internal_keys.raft_document_applied_entry_key[0..],
+        merge_state_mod.legacy_key,
+    });
 }
 
 fn ensureReplayFloor(store: *docstore_mod.DocStore, next_sequence: u64) !void {
@@ -105212,6 +105220,142 @@ test "db terminal merge controls preserve a subsequent split across reopen" {
         defer alloc.free(value);
         try std.testing.expectEqualStrings("{\"live\":true}", value);
         try std.testing.expectEqual(@as(u64, 10), (try reopened.raftAppliedEntry()).?.index);
+    }
+}
+
+test "db physical lsm split retains parent merge receipts and clears child receipts across reopen" {
+    const alloc = std.testing.allocator;
+    const options: OpenOptions = .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+    };
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .finalize, .rollback }) |terminal| {
+        for ([_]bool{ false, true }) |old_key_layout| {
+            var parent_buf: [256]u8 = undefined;
+            const parent_path = tempPath(&parent_buf);
+            defer cleanupTempDir(parent_path);
+            var child_buf: [256]u8 = undefined;
+            const child_path = tempPath(&child_buf);
+            defer cleanupTempDir(child_path);
+            var checkpoint: types.MergeReplicationCheckpoint = .{
+                .kind = .accept,
+                .transition_id = 70,
+                .donor_group_id = 71,
+                .receiver_group_id = 72,
+                .receiver_base_start = "a",
+                .receiver_base_end = "m",
+                .merged_start = "a",
+                .merged_end = "z",
+            };
+            const split_key = if (terminal == .finalize) "m" else "g";
+            const right_key = if (terminal == .finalize) "t" else "j";
+            {
+                var parent = try DB.open(alloc, std.mem.span(parent_path), options);
+                defer parent.close();
+                try parent.updateRange(.{ .start = "a", .end = "m" });
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+                checkpoint.kind = .rollback;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+                checkpoint.kind = .accept;
+                checkpoint.transition_id = 80;
+                checkpoint.donor_group_id = 81;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+                checkpoint.kind = .begin_copy;
+                checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
+                checkpoint.kind = .bootstrap_complete;
+                checkpoint.bootstrap_applied_index = 4;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 5 });
+                checkpoint.kind = terminal;
+                checkpoint.bootstrap_applied_index = if (terminal == .finalize) 4 else 0;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 6 });
+                try parent.batchRaftReplicatedApply(.{ .writes = &.{
+                    .{ .key = "b", .value = "{\"side\":\"parent\"}" },
+                    .{ .key = right_key, .value = "{\"side\":\"child\"}" },
+                } }, .{ .term = 1, .index = 7 });
+                const before = (try parent.core.getStoreValue(alloc, merge_state_mod.key)).?;
+                defer alloc.free(before);
+                // Production records predating the protected metadata key
+                // must be promoted before a physical split can discard them.
+                if (old_key_layout and !std.mem.eql(u8, merge_state_mod.key, "raftmerge:state")) {
+                    try parent.core.store.putBatch(&.{.{ .key = "raftmerge:state", .value = before }}, &.{merge_state_mod.key});
+                }
+                try parent.split(parent.getRange(), split_key, "", std.mem.span(child_path), true);
+                const prepared_receipt = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterPrepare;
+                defer alloc.free(prepared_receipt);
+                try std.testing.expectEqualSlices(u8, before, prepared_receipt);
+                // Inspect the destructive rewrite boundary itself: receipt
+                // preservation must not rely on a later restoration write.
+                const split_lower = try documentRangeLowerAlloc(alloc, split_key);
+                defer alloc.free(split_lower);
+                _ = try tryFinalizePrimarySplitFast(&parent, split_lower);
+                const rewritten_receipt = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterPhysicalRewrite;
+                defer alloc.free(rewritten_receipt);
+                try std.testing.expectEqualSlices(u8, before, rewritten_receipt);
+                try parent.finalizeSplit(.{ .start = "a", .end = split_key });
+                const after = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterSplit;
+                defer alloc.free(after);
+                try std.testing.expectEqualSlices(u8, before, after);
+                try std.testing.expect((try parent.get(alloc, right_key)) == null);
+            }
+            {
+                var parent = try DB.open(alloc, std.mem.span(parent_path), options);
+                defer parent.close();
+                for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 8..) |kind, index| {
+                    checkpoint.kind = kind;
+                    checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+                    checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+                    try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+                    try std.testing.expectEqualStrings("a", parent.getRange().start);
+                    try std.testing.expectEqualStrings(split_key, parent.getRange().end);
+                }
+                var retired = checkpoint;
+                retired.kind = .accept;
+                retired.transition_id = 70;
+                retired.donor_group_id = 71;
+                retired.bootstrap_applied_index = 0;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = retired }, .{ .term = 2, .index = 13 });
+                try parent.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "b", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 14 });
+                const raw = (try parent.core.getStoreValue(alloc, merge_state_mod.key)).?;
+                defer alloc.free(raw);
+                var receipt = try merge_state_mod.decodeAlloc(alloc, raw);
+                defer receipt.deinit(alloc);
+                try std.testing.expectEqual(if (terminal == .finalize) merge_state_mod.Phase.finalized else .rolled_back, receipt.phase);
+                try std.testing.expectEqual(@as(u64, 80), receipt.transition_id);
+                try std.testing.expectEqualSlices(u64, &.{70}, receipt.retired_transition_ids);
+                try std.testing.expectEqual(std.math.Order.eq, receipt.copy_attempt.order(.{ .donor_term = 1, .sequence = 1 }));
+                try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 4 else 0), receipt.bootstrap_applied_index);
+                try std.testing.expectEqual(@as(u64, 14), (try parent.raftAppliedEntry()).?.index);
+            }
+            {
+                var child = try DB.open(alloc, std.mem.span(child_path), options);
+                defer child.close();
+                try std.testing.expect((try child.core.getStoreValue(alloc, merge_state_mod.key)) == null);
+                try std.testing.expect((try child.core.getStoreValue(alloc, "raftmerge:state")) == null);
+                const value = (try child.get(alloc, right_key)).?;
+                defer alloc.free(value);
+                try std.testing.expectEqualStrings("{\"side\":\"child\"}", value);
+                var fresh = checkpoint;
+                fresh.kind = .accept;
+                fresh.transition_id = 90;
+                fresh.donor_group_id = 91;
+                fresh.receiver_group_id = 92;
+                fresh.receiver_base_start = split_key;
+                fresh.receiver_base_end = if (terminal == .finalize) "z" else "m";
+                fresh.merged_start = "a";
+                fresh.merged_end = fresh.receiver_base_end;
+                fresh.bootstrap_applied_index = 0;
+                fresh.copy_attempt = .{};
+                try child.batchRaftReplicatedApply(.{ .merge_checkpoint = fresh }, .{ .term = 1, .index = 1 });
+                try std.testing.expectEqual(@as(u64, 1), (try child.raftAppliedEntry()).?.index);
+            }
+            var reopened = try DB.open(alloc, std.mem.span(parent_path), options);
+            defer reopened.close();
+            try std.testing.expectEqualStrings(split_key, reopened.getRange().end);
+            const value = (try reopened.get(alloc, "b")).?;
+            defer alloc.free(value);
+            try std.testing.expectEqualStrings("{\"live\":true}", value);
+        }
     }
 }
 

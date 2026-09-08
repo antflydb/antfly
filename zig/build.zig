@@ -4894,6 +4894,8 @@ pub fn build(b: *std.Build) void {
         "db replicated merge checkpoints persist phase range and watermark across reopen",
         "db replicated merge checkpoints keep rolled back receivers live across delayed controls and reopen",
         "db terminal merge controls preserve a subsequent split across reopen",
+        "db physical lsm split retains parent merge receipts and clears child receipts across reopen",
+        "lsm backend physical split preserves L0 overwrite and tombstone order",
         "db merge receiver fences stale copies and retains retired transitions across reopen",
         "db merge copy attempts fence delayed leaders before finalize across reopen",
         "data runtime health metrics include replay debt and provisioned warmup counters",

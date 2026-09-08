@@ -381,7 +381,7 @@ pub const Destination = struct {
     }
 
     pub fn loadMergeState(self: *Destination, alloc: std.mem.Allocator) !?PersistedMergeState {
-        const raw = (try self.db.core.getStoreValue(alloc, merge_state_key)) orelse return null;
+        const raw = (try merge_state.loadRawAlloc(alloc, self.db.core.store)) orelse return null;
         defer alloc.free(raw);
         return try merge_state.decodeAlloc(alloc, raw);
     }
@@ -392,7 +392,7 @@ pub const Destination = struct {
         try merge_state.encode(&encoded, alloc, state);
         try self.db.core.putStoreBatch(&.{
             .{ .key = merge_state_key, .value = encoded.items },
-        }, &.{});
+        }, &.{merge_state.legacy_key});
     }
 
     pub fn deleteDocsInRange(self: *Destination, alloc: std.mem.Allocator, byte_range: db_types.ByteRange) !void {
