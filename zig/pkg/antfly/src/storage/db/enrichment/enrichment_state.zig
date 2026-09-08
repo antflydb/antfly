@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
 const docstore_mod = @import("../../docstore.zig");
@@ -172,7 +173,7 @@ fn encodeReplayCursor(alloc: Allocator, cursor: ReplayCursor) ![]u8 {
     writeCheckpointInt(raw, &pos, u32, @intCast(cursor.doc_key.len));
     @memcpy(raw[pos .. pos + cursor.doc_key.len], cursor.doc_key);
     pos += cursor.doc_key.len;
-    writeCheckpointInt(raw, &pos, u32, std.hash.Crc32.hash(raw[0..body_len]));
+    writeCheckpointInt(raw, &pos, u32, Crc32.hash(raw[0..body_len]));
     return raw;
 }
 
@@ -182,7 +183,7 @@ fn decodeReplayCursor(alloc: Allocator, raw: []const u8) !ReplayCursor {
         return error.InvalidEnrichmentState;
     const body_len = raw.len - 4;
     const expected_crc = std.mem.readInt(u32, raw[body_len..][0..4], .little);
-    if (std.hash.Crc32.hash(raw[0..body_len]) != expected_crc) return error.InvalidEnrichmentState;
+    if (Crc32.hash(raw[0..body_len]) != expected_crc) return error.InvalidEnrichmentState;
     var pos: usize = replay_cursor_magic.len;
     if (readCheckpointInt(raw, &pos, u32) != replay_cursor_format_version)
         return error.InvalidEnrichmentState;
