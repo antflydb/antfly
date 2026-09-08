@@ -24,6 +24,31 @@ pub fn load(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
     return try decode(raw);
 }
 
+/// A new empty store has no range counter until its first primary mutation.
+/// Prove that case with a single bounded user-key probe. Any user record keeps
+/// a missing counter unknown, including legacy documents without identity
+/// metadata and orphaned artifacts; never count a populated corpus here.
+pub fn loadOrProveEmpty(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
+    if (try load(alloc, store)) |count| return count;
+    const Probe = struct {
+        found: bool = false,
+        fn visit(ctx: ?*anyopaque, _: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const probe: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            probe.found = true;
+            return .stop;
+        }
+    };
+    var probe = Probe{};
+    try store.scanWithContext(
+        &.{internal_keys.user_namespace},
+        &.{internal_keys.user_namespace + 1},
+        .{},
+        &probe,
+        Probe.visit,
+    );
+    return if (probe.found) null else 0;
+}
+
 pub fn countPrimaryDocuments(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
