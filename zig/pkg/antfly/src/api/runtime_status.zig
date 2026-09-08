@@ -272,6 +272,7 @@ const TargetedIndexAuthority = struct {
         // a property that a late owner snapshot may revoke. A new commit or
         // incarnation replaces the requirement and clears this proof.
         observed: bool = false,
+        observed_source_target_sequence: u64 = 0,
     };
 
     const TerminalFailure = struct {
@@ -904,6 +905,7 @@ pub const TableRuntimeSnapshotCache = struct {
             // and proves that the sampled source target includes the commit.
             source_target_sequence: u64,
             observed: bool = false,
+            observed_source_target_sequence: u64 = 0,
         };
 
         ref_count: std.atomic.Value(usize) = .init(1),
@@ -3701,8 +3703,13 @@ pub const TableRuntimeSnapshotCache = struct {
         if (state.required_target_observation_revisions.getPtr(group_id)) |required| {
             const includes_target = status.metadata.target_observation_revision >= required.source_target_sequence;
             if (status.metadata.target_observation_complete and includes_target and
-                observed_revision >= required.event_revision) required.observed = true;
-            status.metadata.target_observation_complete = required.observed and includes_target;
+                observed_revision >= required.event_revision)
+            {
+                required.observed = true;
+                required.observed_source_target_sequence = @max(required.observed_source_target_sequence, status.metadata.target_observation_revision);
+            }
+            status.metadata.target_observation_complete = required.observed and includes_target and
+                status.metadata.target_observation_revision <= required.observed_source_target_sequence;
         }
         for (status.stats.indexes) |*item| {
             item.runtime_target_observation_complete = true;
@@ -3710,8 +3717,12 @@ pub const TableRuntimeSnapshotCache = struct {
             if (!targetAuthorityAcceptsIdentity(authority, item.*)) continue;
             const index_required = authority.convergence_requirements.getPtr(group_id) orelse continue;
             const includes_target = item.replay_target_sequence >= index_required.source_target_sequence;
-            if (observed_revision >= index_required.event_revision and includes_target) index_required.observed = true;
-            item.runtime_target_observation_complete = index_required.observed and includes_target;
+            if (observed_revision >= index_required.event_revision and includes_target) {
+                index_required.observed = true;
+                index_required.observed_source_target_sequence = @max(index_required.observed_source_target_sequence, item.replay_target_sequence);
+            }
+            item.runtime_target_observation_complete = index_required.observed and includes_target and
+                item.replay_target_sequence <= index_required.observed_source_target_sequence;
         }
     }
 };
@@ -9237,6 +9248,18 @@ test "accepted target observation survives late snapshots but not new commit fen
     defer settled.deinit(alloc);
     try std.testing.expect(settled.metadata.target_observation_complete);
     try std.testing.expect(settled.stats.indexes[0].runtime_target_observation_complete);
+    // A proof for target 6 cannot certify a previously unseen target 7,
+    // even before its commit notification reaches the cache.
+    indexes[0].replay_target_sequence = 7;
+    _ = try cache.publishGroup(late, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 7, .target_observation_complete = false },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    var unseen = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer unseen.deinit(alloc);
+    try std.testing.expect(!unseen.metadata.target_observation_complete);
+    try std.testing.expect(!unseen.stats.indexes[0].runtime_target_observation_complete);
     cache.markGroupTargetObservationPending("docs", 7, 7);
     cache.markIndexTargetObservationPending("docs", 7, identity, 7);
     indexes[0].replay_target_sequence = 7;
