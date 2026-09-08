@@ -3538,15 +3538,12 @@ pub const GraphIndex = struct {
         const output_prefix = try self.graphMetricBuildJobNamespacePrefixAlloc(metric_name, job.job_id);
         defer self.alloc.free(output_prefix);
         const iterative_planned_phases = [_]GraphMetricBuildPhase{
-            .iterate_contributions,
             .reduce_ranks,
             .check_convergence,
             .publish_generation,
         };
         const hits_planned_phases = [_]GraphMetricBuildPhase{
-            .iterate_contributions,
             .reduce_ranks,
-            .hits_hub_contributions,
             .hits_hub_reduce_ranks,
             .check_convergence,
             .publish_generation,
@@ -3773,10 +3770,10 @@ pub const GraphIndex = struct {
             .prepare_generation,
             .scan_edges_and_out_degree,
             .initialize_ranks,
-            => 0,
             .iterate_contributions,
-            .reduce_ranks,
             .hits_hub_contributions,
+            => 0,
+            .reduce_ranks,
             .hits_hub_reduce_ranks,
             .check_convergence,
             .publish_generation,
@@ -4724,7 +4721,7 @@ pub const GraphIndex = struct {
             try self.putGraphMetricBuildIterationSummaryInBatch(&batch, metric_name, iteration_summary);
             const next_iteration = iteration + 1;
             try self.planGraphMetricIterationPagesInBatch(&batch, metric_name, cfg.kind, job, next_iteration);
-            job.phase = .iterate_contributions;
+            job.phase = .reduce_ranks;
             job.iteration = next_iteration;
             job.updated_at_ms = @divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms);
             job.completed_units = summary.completed_units;
@@ -4737,7 +4734,7 @@ pub const GraphIndex = struct {
                 if (decodeGraphMetricBuildLease(raw)) |lease| {
                     if (lease.job_id == job.job_id) {
                         var updated_lease = lease;
-                        updated_lease.phase = .iterate_contributions;
+                        updated_lease.phase = .reduce_ranks;
                         updated_lease.iteration = next_iteration;
                         const encoded = try self.alloc.alloc(u8, graphMetricBuildLeaseEncodedLen(updated_lease));
                         defer self.alloc.free(encoded);
@@ -4767,7 +4764,11 @@ pub const GraphIndex = struct {
             };
             try self.putGraphMetricBuildIterationSummaryInBatch(&batch, metric_name, iteration_summary);
         }
-        const next_phase = graphMetricBuildManifestNextPhase(cfg.kind, phase) orelse {
+        const next_phase = (if (iteration != 0 and phase == .reduce_ranks and
+            (cfg.kind == .hits_authority or cfg.kind == .hits_hub))
+            .hits_hub_reduce_ranks
+        else
+            graphMetricBuildManifestNextPhase(cfg.kind, phase)) orelse {
             try batch.commit();
             return false;
         };
@@ -7182,8 +7183,9 @@ pub const GraphIndex = struct {
     // v10 bounds partition census work; v11 seals canonical membership blocks.
     // v12 stages ordered publication runs; v13 seals metric-specific node work
     // plans so later iterations omit empty leaves without changing ordinals.
+    // v14 removes later producer phases; reducers reuse iteration-zero adjacency.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 13;
+    const graph_metric_build_execution_schema_version: u64 = 14;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -8555,12 +8557,13 @@ pub const GraphIndex = struct {
             },
             .iterate_contributions, .reduce_ranks, .hits_hub_contributions, .hits_hub_reduce_ranks, .check_convergence => blk: {
                 if (cfg.max_iterations == 0) break :blk 0.96;
-                const step_count: f64 = if (cfg.kind == .hits_authority or cfg.kind == .hits_hub) 5.0 else 3.0;
+                const hits = cfg.kind == .hits_authority or cfg.kind == .hits_hub;
+                const step_count: f64 = if (iteration == 0) (if (hits) @as(f64, 5.0) else 3.0) else (if (hits) @as(f64, 3.0) else 2.0);
                 const step: f64 = switch (phase) {
                     .iterate_contributions => 0.0,
-                    .reduce_ranks => 1.0,
+                    .reduce_ranks => if (iteration == 0) 1.0 else 0.0,
                     .hits_hub_contributions => 2.0,
-                    .hits_hub_reduce_ranks => 3.0,
+                    .hits_hub_reduce_ranks => if (iteration == 0) 3.0 else 1.0,
                     .check_convergence => step_count - 1.0,
                     else => unreachable,
                 };
@@ -9539,25 +9542,12 @@ pub const GraphIndex = struct {
         return .{ .edges = edges, .cursor = try self.alloc.dupe(u8, cursor), .scanned = scanned, .complete = complete };
     }
 
-    // Build row-oriented immutable adjacency once. Subsequent contribution
-    // barriers are metadata-only; reducers pull from the current score vector.
+    // Build row-oriented immutable adjacency once. Later iterations schedule
+    // only reducers, which pull from the sealed topology and current vector.
     fn executeOrdinalContributionPage(self: *GraphIndex, metric_name: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob, page: GraphMetricBuildPage, max_scan_units: ?u64) !usize {
         const limit: usize = @intCast(@min(max_scan_units orelse ordinal_blocks.max_edges, ordinal_blocks.max_edges));
         if (limit == 0) return error.InvalidGraphMetricBuildProgress;
-        if (page.iteration != 0) {
-            var batch = try self.beginWriteReverseBatch();
-            errdefer batch.abort();
-            var current = try self.metricBuildPage(&batch, metric_name, job.job_id, page.phase, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
-            try self.validateGraphMetricBuildPageExecutionLease(page, current);
-            current.state = .complete;
-            current.completed_units = current.total_units;
-            current.cursor = "";
-            current.lease_expires_at_ms = 0;
-            current.output_fingerprint = job.job_id;
-            try self.putGraphMetricBuildPageInBatch(&batch, metric_name, current);
-            try batch.commit();
-            return 0;
-        }
+        if (page.iteration != 0) return error.InvalidGraphMetricBuildManifest;
         var topology: ordinal_blocks.Topology = undefined;
         var prior: u64 = 0;
         {
@@ -16922,14 +16912,14 @@ test "graph metric planned progress is monotonic across pages phases and iterati
     const first_contribution_start = GraphIndex.graphMetricActiveBuildProgress(pagerank, .iterate_contributions, 0, 0);
     const first_contribution_half = GraphIndex.graphMetricActiveBuildProgress(pagerank, .iterate_contributions, 0, 0.5);
     const first_convergence_end = GraphIndex.graphMetricActiveBuildProgress(pagerank, .check_convergence, 0, 1);
-    const second_contribution_start = GraphIndex.graphMetricActiveBuildProgress(pagerank, .iterate_contributions, 1, 0);
+    const second_contribution_start = GraphIndex.graphMetricActiveBuildProgress(pagerank, .reduce_ranks, 1, 0);
     try std.testing.expect(first_contribution_start < first_contribution_half);
     try std.testing.expect(first_contribution_half < first_convergence_end);
     try std.testing.expectApproxEqAbs(first_convergence_end, second_contribution_start, 0.0000001);
 
     const hits = GraphMetricConfig{ .name = "hits", .kind = .hits_authority, .max_iterations = 10 };
     const first_hits_end = GraphIndex.graphMetricActiveBuildProgress(hits, .check_convergence, 0, 1);
-    const second_hits_start = GraphIndex.graphMetricActiveBuildProgress(hits, .iterate_contributions, 1, 0);
+    const second_hits_start = GraphIndex.graphMetricActiveBuildProgress(hits, .reduce_ranks, 1, 0);
     try std.testing.expectApproxEqAbs(first_hits_end, second_hits_start, 0.0000001);
 
     const degree = GraphMetricConfig{ .name = "degree", .kind = .degree };
@@ -17783,7 +17773,7 @@ test "graph metric ordinal iterations reuse immutable adjacency without numeric 
     defer alloc.free(prefix);
     var first_digest: ?u64 = null;
     for (0..3) |iteration| {
-        try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{.iterate_contributions});
+        if (iteration == 0) try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{.iterate_contributions});
         try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{.reduce_ranks});
         {
             var txn = try graph.beginReadReverseTxn();
@@ -18791,11 +18781,9 @@ test "graph pagerank planned scan page writes durable out-degree intermediates" 
         try std.testing.expectApproxEqAbs(@as(f64, 1.0), page.rank_sum, 0.0000001);
         try std.testing.expect(!page.converged);
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
-        const next_contribution = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.pending, next_contribution.state);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.reverse_edges, next_contribution.range_kind);
+        try std.testing.expect((try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3)) == null);
         const next_reduce = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .reduce_ranks, 1, 4) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.pending, next_reduce.state);
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.nodes, next_reduce.range_kind);
@@ -19310,42 +19298,20 @@ test "graph pagerank later iteration pages resume from durable cursor after reop
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
-        const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
+        const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .reduce_ranks, 1, 4) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.pending, page.state);
     }
 
-    const contribution_claim = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .iterate_contributions, 1, 3, "worker-contrib", 2000) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, contribution_claim.state);
-    _ = try graph.executePageRankContributionBuildPageWithLimit("pagerank", metrics[0], active_job, contribution_claim, 1);
-    {
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
-        try std.testing.expectEqual(page.total_units, page.completed_units);
-        try std.testing.expectEqualStrings("", page.cursor);
-        const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqualStrings("", job.cursor);
-    }
     graph.close();
-
     graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
-    // The metadata-only later-iteration barrier survives reopen as complete;
-    // no edge cursor or numeric shuffle needs to be resumed.
-    try std.testing.expect((try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .iterate_contributions, 1, 3, "worker-contrib", 2001)) == null);
-    try std.testing.expect(try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .iterate_contributions, 1));
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
-        const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
-        try std.testing.expectEqual(@as(u64, 2), page.completed_units);
-        try std.testing.expect(page.output_fingerprint != 0);
-        const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
+        try std.testing.expect((try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3)) == null);
+        const job = (try graph.metricBuildJob(&txn, "pagerank")).?;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
-        try std.testing.expectEqual(@as(u32, 1), job.iteration);
     }
 
     try drainGraphMetricSummaryForTest(&graph, "pagerank", active_job, .reduce_ranks, 1);
@@ -19468,10 +19434,10 @@ test "graph pagerank dynamic iteration planning updates manifest page count idem
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
         const manifest = try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id) orelse return error.TestExpectedGraphMetricBuildManifest;
-        try std.testing.expectEqual(initial_page_count + 6, manifest.page_count);
+        try std.testing.expectEqual(initial_page_count + 5, manifest.page_count);
     }
 
     {
@@ -19484,7 +19450,7 @@ test "graph pagerank dynamic iteration planning updates manifest page count idem
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const manifest = try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id) orelse return error.TestExpectedGraphMetricBuildManifest;
-        try std.testing.expectEqual(initial_page_count + 6, manifest.page_count);
+        try std.testing.expectEqual(initial_page_count + 5, manifest.page_count);
     }
 }
 
@@ -19522,37 +19488,8 @@ test "graph pagerank later iteration failed pages retry and advance" {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
-        try std.testing.expectEqual(@as(u32, 1), job.iteration);
-    }
-
-    const contribution_failed_claim = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .iterate_contributions, 1, 3, "worker-fail-contrib", 2000) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(@as(u64, 1), contribution_failed_claim.attempt);
-    const contribution_failed = try graph.failGraphMetricBuildPage("pagerank", active_job.job_id, .iterate_contributions, 1, 3, "worker-fail-contrib", "later contribution failed");
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, contribution_failed.state);
-    try std.testing.expectEqualStrings("later contribution failed", contribution_failed.last_error);
-    try std.testing.expect(!(try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .iterate_contributions, 1)));
-    {
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const summary = try graph.metricBuildPhaseSummary(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.failed, summary.state);
-        try std.testing.expectEqual(@as(u64, 1), summary.failed_pages);
-    }
-    const contribution_retry = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .iterate_contributions, 1, 3, "worker-retry-contrib", 2001) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.leased, contribution_retry.state);
-    try std.testing.expectEqual(@as(u64, 2), contribution_retry.attempt);
-    try std.testing.expectEqualStrings("", contribution_retry.last_error);
-    _ = try graph.executePageRankContributionBuildPageWithLimit("pagerank", metrics[0], active_job, contribution_retry, null);
-    try std.testing.expect(try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .iterate_contributions, 1));
-    {
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const summary = try graph.metricBuildPhaseSummary(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.complete, summary.state);
-        try std.testing.expectEqual(@as(u64, 0), summary.failed_pages);
-        const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
+        try std.testing.expectEqual(@as(u32, 1), job.iteration);
     }
 
     try drainGraphMetricSummaryForTest(&graph, "pagerank", active_job, .reduce_ranks, 1);
@@ -19677,11 +19614,12 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(active_job.job_id, job.job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
-        _ = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
+        _ = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .reduce_ranks, 1, 4) orelse return error.TestExpectedGraphMetricBuildPage;
     }
 
+    try drainGraphMetricSummaryForTest(&graph, "pagerank", active_job, .reduce_ranks, 1);
     var attempt: u64 = 0;
     while (attempt < graph_metric_build_max_page_attempts) : (attempt += 1) {
         const worker_id = switch (attempt) {
@@ -19689,9 +19627,9 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
             1 => "worker-b",
             else => "worker-c",
         };
-        const page = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .iterate_contributions, 1, 3, worker_id, 2000 + attempt) orelse return error.TestExpectedGraphMetricBuildPage;
+        const page = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .reduce_ranks, 1, 4, worker_id, 2000 + attempt) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(attempt + 1, page.attempt);
-        _ = try graph.failGraphMetricBuildPage("pagerank", active_job.job_id, .iterate_contributions, 1, 3, worker_id, "retryable later contribution failure");
+        _ = try graph.failGraphMetricBuildPage("pagerank", active_job.job_id, .reduce_ranks, 1, 4, worker_id, "retryable later reduction failure");
     }
 
     graph.close();
@@ -19699,18 +19637,18 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
-        const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
+        const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .reduce_ranks, 1, 4) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, page.state);
         try std.testing.expectEqual(@as(u64, graph_metric_build_max_page_attempts), page.attempt);
-        try std.testing.expectEqualStrings("retryable later contribution failure", page.last_error);
+        try std.testing.expectEqualStrings("retryable later reduction failure", page.last_error);
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(active_job.job_id, job.job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
     }
 
     const failed_step = try graph.runGraphMetricPlannedCoordinatorStepForMetric("pagerank");
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_step.phase);
+    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, failed_step.phase);
     try std.testing.expect(failed_step.failed_build);
     try std.testing.expect(!failed_step.advanced_phase);
     try std.testing.expect(!failed_step.published);
@@ -19720,11 +19658,11 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
     try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed_status.state);
     try std.testing.expectEqual(published_generation, failed_status.published_generation);
     try std.testing.expectEqual(@as(u64, 0), failed_status.build_job_id);
-    const exhaustion_reason = "GraphMetricBuildPageAttemptsExhausted: phase=iterate_contributions, iteration=1, page_id=3, attempt=3, cause=retryable later contribution failure";
+    const exhaustion_reason = "GraphMetricBuildPageAttemptsExhausted: phase=reduce_ranks, iteration=1, page_id=4, attempt=3, cause=retryable later reduction failure";
     try std.testing.expectEqualStrings(exhaustion_reason, failed_status.last_error);
     try std.testing.expectEqual(@as(usize, 1), failed_status.recent_failures.len);
     try std.testing.expectEqual(active_job.job_id, failed_status.recent_failures[0].job_id);
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_status.recent_failures[0].phase);
+    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, failed_status.recent_failures[0].phase);
     try std.testing.expectEqual(@as(u32, 1), failed_status.recent_failures[0].iteration);
     try std.testing.expectEqualStrings(exhaustion_reason, failed_status.recent_failures[0].last_error);
 
@@ -19745,7 +19683,7 @@ test "graph pagerank later iteration exhausted page fails build and preserves pr
         defer txn.abort();
         const failed_job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(active_job.job_id, failed_job.job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, failed_job.phase);
         try std.testing.expectEqual(@as(u32, 1), failed_job.iteration);
         try std.testing.expectEqualStrings(exhaustion_reason, failed_job.last_error);
         try std.testing.expect((try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id)) == null);
@@ -20169,14 +20107,14 @@ test "graph pagerank planned dynamic iteration reaches fixed-limit publish" {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
         const iteration_zero = try graph.metricBuildIterationSummary(&txn, "pagerank", active_job.job_id, 0) orelse return error.TestExpectedGraphMetricBuildIterationSummary;
         try std.testing.expect(!iteration_zero.converged);
         try std.testing.expect(!iteration_zero.fixed_iteration_limit);
     }
 
-    try drainGraphMetricBuildToPublishForTest(&graph, "pagerank", metrics[0], "worker-a", &.{ .iterate_contributions, .reduce_ranks, .check_convergence });
+    try drainGraphMetricBuildToPublishForTest(&graph, "pagerank", metrics[0], "worker-a", &.{ .reduce_ranks, .check_convergence });
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
@@ -21403,9 +21341,9 @@ test "graph pagerank planned build resumes after dynamic iteration planning reop
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(active_job.job_id, job.job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
-        _ = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
+        _ = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .reduce_ranks, 1, 4) orelse return error.TestExpectedGraphMetricBuildPage;
         _ = try graph.metricBuildIterationSummary(&txn, "pagerank", active_job.job_id, 0) orelse return error.TestExpectedGraphMetricBuildIterationSummary;
     }
     graph.close();
@@ -21417,7 +21355,7 @@ test "graph pagerank planned build resumes after dynamic iteration planning reop
         defer status.deinit(alloc);
         try std.testing.expectEqual(GraphIndex.GraphMetricState.building, status.state);
         try std.testing.expectEqual(active_job.job_id, status.build_job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, status.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, status.phase);
         try std.testing.expectEqual(@as(u32, 1), status.build_iteration);
     }
 
@@ -27658,41 +27596,8 @@ test "graph eigenvector later iteration failed pages retry and advance" {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "eigenvector") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
-        try std.testing.expectEqual(@as(u32, 1), job.iteration);
-    }
-
-    const contribution_failed_claim = try graph.claimGraphMetricBuildPageAt("eigenvector", active_job.job_id, .iterate_contributions, 1, 3, "worker-fail-contrib", 2000) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(@as(u64, 1), contribution_failed_claim.attempt);
-    const contribution_failed = try graph.failGraphMetricBuildPage("eigenvector", active_job.job_id, .iterate_contributions, 1, 3, "worker-fail-contrib", "later eigenvector contribution failed");
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, contribution_failed.state);
-    try std.testing.expectEqualStrings("later eigenvector contribution failed", contribution_failed.last_error);
-    try std.testing.expect(!(try graph.advanceGraphMetricBuildPhaseIfReady("eigenvector", active_job.job_id, .iterate_contributions, 1)));
-    {
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const summary = try graph.metricBuildPhaseSummary(&txn, "eigenvector", active_job.job_id, .iterate_contributions, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.failed, summary.state);
-        try std.testing.expectEqual(@as(u64, 1), summary.failed_pages);
-    }
-    {
-        const step = try graph.runGraphMetricPlannedWorkerStep("eigenvector", metrics[0], "worker-retry-contrib");
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, step.phase);
-        try std.testing.expectEqual(@as(u64, 3), step.page_id);
-        try std.testing.expect(step.claimed_page);
-        try std.testing.expect(step.completed_page);
-        try std.testing.expect(step.advanced_phase);
-    }
-    {
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const page = try graph.metricBuildPage(&txn, "eigenvector", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
-        try std.testing.expectEqual(@as(u64, 2), page.attempt);
-        const summary = try graph.metricBuildPhaseSummary(&txn, "eigenvector", active_job.job_id, .iterate_contributions, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.complete, summary.state);
-        const job = try graph.metricBuildJob(&txn, "eigenvector") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
+        try std.testing.expectEqual(@as(u32, 1), job.iteration);
     }
 
     try drainGraphMetricSummaryForTest(&graph, "eigenvector", active_job, .reduce_ranks, 1);
@@ -27822,11 +27727,12 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "eigenvector") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(active_job.job_id, job.job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
-        _ = try graph.metricBuildPage(&txn, "eigenvector", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
+        _ = try graph.metricBuildPage(&txn, "eigenvector", active_job.job_id, .reduce_ranks, 1, 4) orelse return error.TestExpectedGraphMetricBuildPage;
     }
 
+    try drainGraphMetricSummaryForTest(&graph, "eigenvector", active_job, .reduce_ranks, 1);
     var attempt: u64 = 0;
     while (attempt < graph_metric_build_max_page_attempts) : (attempt += 1) {
         const worker_id = switch (attempt) {
@@ -27834,9 +27740,9 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
             1 => "worker-b",
             else => "worker-c",
         };
-        const page = try graph.claimGraphMetricBuildPageAt("eigenvector", active_job.job_id, .iterate_contributions, 1, 3, worker_id, 2000 + attempt) orelse return error.TestExpectedGraphMetricBuildPage;
+        const page = try graph.claimGraphMetricBuildPageAt("eigenvector", active_job.job_id, .reduce_ranks, 1, 4, worker_id, 2000 + attempt) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(attempt + 1, page.attempt);
-        _ = try graph.failGraphMetricBuildPage("eigenvector", active_job.job_id, .iterate_contributions, 1, 3, worker_id, "retryable later eigenvector contribution failure");
+        _ = try graph.failGraphMetricBuildPage("eigenvector", active_job.job_id, .reduce_ranks, 1, 4, worker_id, "retryable later eigenvector reduction failure");
     }
 
     graph.close();
@@ -27844,18 +27750,18 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
-        const page = try graph.metricBuildPage(&txn, "eigenvector", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
+        const page = try graph.metricBuildPage(&txn, "eigenvector", active_job.job_id, .reduce_ranks, 1, 4) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, page.state);
         try std.testing.expectEqual(@as(u64, graph_metric_build_max_page_attempts), page.attempt);
-        try std.testing.expectEqualStrings("retryable later eigenvector contribution failure", page.last_error);
+        try std.testing.expectEqualStrings("retryable later eigenvector reduction failure", page.last_error);
         const job = try graph.metricBuildJob(&txn, "eigenvector") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(active_job.job_id, job.job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
     }
 
     const failed_step = try graph.runGraphMetricPlannedCoordinatorStepForMetric("eigenvector");
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_step.phase);
+    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, failed_step.phase);
     try std.testing.expect(failed_step.failed_build);
     try std.testing.expect(!failed_step.advanced_phase);
     try std.testing.expect(!failed_step.published);
@@ -27865,11 +27771,11 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
     try std.testing.expectEqual(GraphIndex.GraphMetricState.failed, failed_status.state);
     try std.testing.expectEqual(published_generation, failed_status.published_generation);
     try std.testing.expectEqual(@as(u64, 0), failed_status.build_job_id);
-    const exhaustion_reason = "GraphMetricBuildPageAttemptsExhausted: phase=iterate_contributions, iteration=1, page_id=3, attempt=3, cause=retryable later eigenvector contribution failure";
+    const exhaustion_reason = "GraphMetricBuildPageAttemptsExhausted: phase=reduce_ranks, iteration=1, page_id=4, attempt=3, cause=retryable later eigenvector reduction failure";
     try std.testing.expectEqualStrings(exhaustion_reason, failed_status.last_error);
     try std.testing.expectEqual(@as(usize, 1), failed_status.recent_failures.len);
     try std.testing.expectEqual(active_job.job_id, failed_status.recent_failures[0].job_id);
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_status.recent_failures[0].phase);
+    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, failed_status.recent_failures[0].phase);
     try std.testing.expectEqual(@as(u32, 1), failed_status.recent_failures[0].iteration);
     try std.testing.expectEqualStrings(exhaustion_reason, failed_status.recent_failures[0].last_error);
 
@@ -27889,7 +27795,7 @@ test "graph eigenvector later iteration exhausted page fails build and preserves
         defer txn.abort();
         const failed_job = try graph.metricBuildJob(&txn, "eigenvector") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(active_job.job_id, failed_job.job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, failed_job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, failed_job.phase);
         try std.testing.expectEqual(@as(u32, 1), failed_job.iteration);
         try std.testing.expectEqualStrings(exhaustion_reason, failed_job.last_error);
         try std.testing.expect((try graph.metricBuildManifest(&txn, "eigenvector", active_job.job_id)) == null);
@@ -29854,39 +29760,8 @@ test "graph hits later iteration failed pages retry and advance" {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "hits_authority") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
-        try std.testing.expectEqual(@as(u32, 1), job.iteration);
-    }
-
-    const contribution_failed_claim = try graph.claimGraphMetricBuildPageAt("hits_authority", active_job.job_id, .iterate_contributions, 1, 3, "worker-fail-contrib", 2000) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(@as(u64, 1), contribution_failed_claim.attempt);
-    const contribution_failed = try graph.failGraphMetricBuildPage("hits_authority", active_job.job_id, .iterate_contributions, 1, 3, "worker-fail-contrib", "later hits contribution failed");
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, contribution_failed.state);
-    try std.testing.expectEqualStrings("later hits contribution failed", contribution_failed.last_error);
-    try std.testing.expect(!(try graph.advanceGraphMetricBuildPhaseIfReady("hits_authority", active_job.job_id, .iterate_contributions, 1)));
-    {
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const summary = try graph.metricBuildPhaseSummary(&txn, "hits_authority", active_job.job_id, .iterate_contributions, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.failed, summary.state);
-        try std.testing.expectEqual(@as(u64, 1), summary.failed_pages);
-    }
-    {
-        const step = try graph.runGraphMetricPlannedWorkerStep("hits_authority", metrics[0], "worker-retry-contrib");
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, step.phase);
-        try std.testing.expect(step.claimed_page);
-        try std.testing.expect(step.completed_page);
-        try std.testing.expect(step.advanced_phase);
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const page = try graph.metricBuildPage(&txn, "hits_authority", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
-        try std.testing.expectEqual(@as(u64, 2), page.attempt);
-        const summary = try graph.metricBuildPhaseSummary(&txn, "hits_authority", active_job.job_id, .iterate_contributions, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.complete, summary.state);
-        try std.testing.expectEqual(@as(u64, 0), summary.failed_pages);
-        const job = try graph.metricBuildJob(&txn, "hits_authority") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
+        try std.testing.expectEqual(@as(u32, 1), job.iteration);
     }
 
     try drainGraphMetricSummaryForTest(&graph, "hits_authority", active_job, .reduce_ranks, 1);
@@ -29915,37 +29790,6 @@ test "graph hits later iteration failed pages retry and advance" {
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
         try std.testing.expectEqual(@as(u64, 2), page.attempt);
         const summary = try graph.metricBuildPhaseSummary(&txn, "hits_authority", active_job.job_id, .reduce_ranks, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.complete, summary.state);
-        try std.testing.expectEqual(@as(u64, 0), summary.failed_pages);
-        const job = try graph.metricBuildJob(&txn, "hits_authority") orelse return error.TestExpectedGraphMetricBuildJob;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.hits_hub_contributions, job.phase);
-    }
-
-    const hub_contribution_failed_claim = try graph.claimNextGraphMetricBuildPageAt("hits_authority", active_job.job_id, .hits_hub_contributions, 1, "worker-fail-hub-contrib", 3500) orelse return error.TestExpectedGraphMetricBuildPage;
-    try std.testing.expectEqual(@as(u64, 1), hub_contribution_failed_claim.attempt);
-    const hub_contribution_failed = try graph.failGraphMetricBuildPage("hits_authority", active_job.job_id, .hits_hub_contributions, 1, hub_contribution_failed_claim.page_id, "worker-fail-hub-contrib", "later hits hub contribution failed");
-    try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, hub_contribution_failed.state);
-    try std.testing.expectEqualStrings("later hits hub contribution failed", hub_contribution_failed.last_error);
-    try std.testing.expect(!(try graph.advanceGraphMetricBuildPhaseIfReady("hits_authority", active_job.job_id, .hits_hub_contributions, 1)));
-    {
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const summary = try graph.metricBuildPhaseSummary(&txn, "hits_authority", active_job.job_id, .hits_hub_contributions, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.failed, summary.state);
-        try std.testing.expectEqual(@as(u64, 1), summary.failed_pages);
-    }
-    {
-        const step = try graph.runGraphMetricPlannedWorkerStep("hits_authority", metrics[0], "worker-retry-hub-contrib");
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.hits_hub_contributions, step.phase);
-        try std.testing.expect(step.claimed_page);
-        try std.testing.expect(step.completed_page);
-        try std.testing.expect(step.advanced_phase);
-        var txn = try graph.beginReadReverseTxn();
-        defer txn.abort();
-        const page = try graph.metricBuildPage(&txn, "hits_authority", active_job.job_id, .hits_hub_contributions, 1, hub_contribution_failed_claim.page_id) orelse return error.TestExpectedGraphMetricBuildPage;
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
-        try std.testing.expectEqual(@as(u64, 2), page.attempt);
-        const summary = try graph.metricBuildPhaseSummary(&txn, "hits_authority", active_job.job_id, .hits_hub_contributions, 1) orelse return error.TestExpectedGraphMetricBuildPhaseSummary;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhaseState.complete, summary.state);
         try std.testing.expectEqual(@as(u64, 0), summary.failed_pages);
         const job = try graph.metricBuildJob(&txn, "hits_authority") orelse return error.TestExpectedGraphMetricBuildJob;
@@ -30108,12 +29952,12 @@ test "graph hits later iteration exhausted page fails pair and preserves prior p
         defer txn.abort();
         const job = try graph.metricBuildJob(&txn, "hits_authority") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(active_job.job_id, job.job_id);
-        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.reduce_ranks, job.phase);
         try std.testing.expectEqual(@as(u32, 1), job.iteration);
-        _ = try graph.metricBuildPage(&txn, "hits_authority", active_job.job_id, .iterate_contributions, 1, 3) orelse return error.TestExpectedGraphMetricBuildPage;
+        _ = try graph.metricBuildPage(&txn, "hits_authority", active_job.job_id, .reduce_ranks, 1, 4) orelse return error.TestExpectedGraphMetricBuildPage;
     }
 
-    try drainGraphMetricBuildToPublishForTest(&graph, "hits_authority", metrics[0], "worker-advance-to-hub-reduce", &.{ .iterate_contributions, .reduce_ranks, .hits_hub_contributions });
+    try drainGraphMetricBuildToPublishForTest(&graph, "hits_authority", metrics[0], "worker-advance-to-hub-reduce", &.{.reduce_ranks});
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();

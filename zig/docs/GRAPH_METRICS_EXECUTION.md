@@ -47,6 +47,12 @@ full-graph calculation hidden inside a query or maintenance tick.
   leaf IDs and membership blocks remain unchanged because vector slots encode
   those identities. Plan totals must match the sealed initialization root, and
   missing active leaves fail closed. Reopen and retries reuse the same plan.
+- Adjacency producer phases exist only in iteration zero. Subsequent PageRank
+  and eigenvector iterations start at reduction; HITS moves from authority
+  reduction directly to hub reduction. Publication still verifies the sealed
+  iteration-zero producer barriers. No metadata-only producer pages, claims,
+  or completion transactions are scheduled for later iterations, and progress
+  fractions use only the phases that actually run.
 - Numerical folds validate and borrow each immutable 256-edge tile from the read
   transaction. One checkpoint-local scratch buffer gathers vector values and
   maps chunk-local target slots directly to compensated accumulators. Warm vector
@@ -68,7 +74,7 @@ full-graph calculation hidden inside a query or maintenance tick.
   HITS lanes are bulk-read before either lane stages mutations. Primary scores,
   ordered staging keys, and the attempt-fenced page cursor commit atomically.
   The coordinator checkpoints the bounded top-K prefix before pointer publication.
-- Execution schema 13 fences older intermediate jobs. Published score epochs
+- Execution schema 14 fences older intermediate jobs. Published score epochs
   retain their existing read contract; an execution-format change does not hide
   previously published results.
 
@@ -77,12 +83,18 @@ full-graph calculation hidden inside a query or maintenance tick.
 - Verified packed graph ordinals are prepared once per immutable source.
   Compatible projection requirements share preparation when the combined work
   and memory fit. Otherwise, cheaper exact requirements are admitted first.
-- Preparation has two admission phases. The source census is charged before
+- Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
   census and before CSR allocation. Reserved census work remains charged when
   construction is rejected. Exhausted publications cannot repeatedly construct
   unaffordable projections. A live-allocation limiter also covers scratch buffers
   and failure paths before a post-census size estimate is available.
+- If selected edges are at most 1/64 of the source node count, projection sorts
+  and deduplicates their endpoints and uses binary ordinal lookup while replaying
+  the original edge order. Scratch and census work then depend on the selection,
+  not the source dictionary. Dense projections retain linear-time source-wide
+  maps/counts. Both paths preserve canonical node order and numerical summation
+  order; degree projections do not retain neighbors.
 - Output has two admission phases too: a framing/row lower bound rejects
   impossible output before kernels or warm-start reads; a prepared encoding plan
   then reserves exact payload bytes before allocation. Compatible HITS lanes
@@ -96,12 +108,22 @@ full-graph calculation hidden inside a query or maintenance tick.
   SHA-256 provider metadata can authenticate a cold object without downloading it.
   Custom stores use conservative full-object admission. Exhausting reuse admission
   skips that optimization and leaves materialization subject to its own budgets.
+- Optional PageRank warm starts authenticate control, root, directory, selected
+  routing pages and primary score windows. Sparse selections skip unrelated
+  blocks; consecutive selected blocks share windows up to 1 MiB, narrowed to
+  available memory headroom (one larger block is allowed if it fits). Only one
+  page/window is retained alongside the seed and
+  bounded metadata. Ranked score payloads are not read. A live allocator bounds
+  preparation memory, and requested bytes plus any cold provider verification
+  are charged to the seed budget before I/O. Budget/integrity failures discard
+  the partial seed and fall back to cold computation; cancellation and genuine
+  allocation failures propagate.
 - Cold providers without comparable SHA-256 metadata still require a bounded
   full-content hash. Identity caches are process-local; no untrusted durable
   “verified” flag bypasses authentication. Persisting verification evidence would
   require a defined trust and provider-generation contract, not just caching a
   boolean in a manifest.
-- Materializer epoch 15 captures changed output admission. Serverless remains
+- Materializer epoch 17 captures sparse projection and seed-window admission. Serverless remains
   current-version-only; no obsolete wire decoder or migration path is introduced.
 
 ## Query and operator views
@@ -126,6 +148,11 @@ separate unpinned LRUs prioritize page eviction over metadata eviction. Pinned
 entries stay charged; a saturated cache safely bypasses admission. Eviction does
 not scan pinned entries. The bounded 64-slot in-flight ownership table is still
 independent of residency and retains its cancellation/single-flight contract.
+Decoded page misses reserve this same ownership table before fetching or
+decoding. A bounded group publishes and finishes every owned fill before
+waiting on other producers or table capacity, preventing multi-page deadlocks.
+Waiters share the decoded lease and are charged retained memory, not a duplicate
+decode. Cancellation and failed producers release fill registrations.
 
 Point queries admit output descriptors/cells before allocating them, then admit
 one `u32` candidate permutation shared by every physical metric column. IDs are

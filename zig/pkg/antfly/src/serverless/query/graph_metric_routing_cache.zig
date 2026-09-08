@@ -198,10 +198,14 @@ pub const Cache = struct {
         try cancellation.check();
     }
 
-    pub fn snapshot(self: *Cache) struct { hits: u64, misses: u64, bytes: usize } {
+    pub fn snapshot(self: *Cache) struct { hits: u64, misses: u64, bytes: usize, waiters: usize } {
         self.lock();
         defer self.mu.unlock();
-        return .{ .hits = self.hits, .misses = self.misses, .bytes = self.retained_bytes };
+        var waiters: usize = 0;
+        for (self.fills) |fill| if (fill) |active| {
+            waiters += active.waiters;
+        };
+        return .{ .hits = self.hits, .misses = self.misses, .bytes = self.retained_bytes, .waiters = waiters };
     }
 
     fn lock(self: *Cache) void {

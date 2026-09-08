@@ -91,6 +91,53 @@ const PhaseTrackingAllocator = struct {
     }
 };
 
+fn benchmarkSparseProjections(output: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const ids = try alloc.alloc([]const u8, 1_000_000);
+    defer alloc.free(ids);
+    @memset(ids, "unused");
+    ids[0] = "a";
+    ids[ids.len - 1] = "z";
+    inline for (.{ .degree, .pagerank }) |kind| {
+        var expected: ?u64 = null;
+        for ([_]bool{ true, false }) |reference| {
+            var times: [5]u64 = undefined;
+            var last = PhaseAllocStats{};
+            for (0..6) |sample| {
+                var stats = PhaseAllocStats{};
+                var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+                const start = antfly.platform_time.monotonicNs();
+                for (0..256) |_| {
+                    const digest = try metric.benchmarkSparseProjection(tracking.allocator(), ids, kind, reference);
+                    if (expected) |value| {
+                        if (value != digest) return error.InvalidBenchmarkResult;
+                    } else expected = digest;
+                }
+                const elapsed = (antfly.platform_time.monotonicNs() - start) / 256;
+                if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+                if (sample != 0) times[sample - 1] = elapsed;
+                last = stats;
+            }
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(alloc, .{
+                .mode = if (reference) "sparse_source_wide_reference" else "sparse_active_endpoints",
+                .kind = @tagName(kind),
+                .source_nodes = ids.len,
+                .active_nodes = 2,
+                .edges = 2,
+                .median_ns = times[2],
+                .peak_bytes = last.peak_bytes,
+                .allocation_count = last.alloc_count / 256,
+                .note = "prepared dictionary excluded; exact node/CSR checksum parity; 256 repetitions per sample; six samples, first discarded",
+            }, .{});
+            defer alloc.free(json);
+            try output.interface.writeAll(json);
+            try output.interface.writeByte('\n');
+            try output.flush();
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     var output_buf: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buf);
@@ -102,6 +149,7 @@ pub fn main(init: std.process.Init) !void {
     try benchmarkSealedVectors(init.io, &output);
     try benchmarkPublication(init.io, &output);
     try benchmarkRoutingWorkingSet(&output);
+    try benchmarkSparseProjections(&output);
     try benchmarkCandidatePlanning(&output);
     try benchmarkAuthenticatedCache(init.io, &output);
     try benchmarkTopOwnership(&output);

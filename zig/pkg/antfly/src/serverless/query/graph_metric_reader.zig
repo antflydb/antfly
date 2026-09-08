@@ -1220,60 +1220,96 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
     }
     var misses = std.ArrayListUnmanaged(usize).empty;
     defer misses.deinit(alloc);
-    try misses.ensureTotalCapacityPrecise(alloc, selected.items.len);
-    for (selected.items, 0..) |i, view_index| {
-        const page = directory.entries[i];
-        const count = @min(codec.routing_page_entries, block_count - page.block_index);
-        const key = pointPageCacheKey(artifact, page, block_count, root);
-        if (session.cache) |cache| if (cache.graph_metric_routing.acquire(key)) |cached| {
-            page_leases[view_index] = cached;
-            try session.chargeGraphMetricRetained(cached.entry.bytes());
-            try session.chargeGraphMetricDecode(0, 1);
-            continue;
+    try misses.ensureTotalCapacityPrecise(alloc, @min(selected.items.len, 64));
+    var completed: usize = 0;
+    var first_missing: usize = 0;
+    while (completed < selected.items.len) {
+        try session.checkCancellation();
+        while (first_missing < selected.items.len and page_leases[first_missing] != null) first_missing += 1;
+        // Never wait while owning unpublished fills: overlapping multi-page
+        // requests can otherwise deadlock each other or saturate the fill table.
+        const PendingPage = struct {
+            view_index: usize,
+            fill: ?usize = null,
+            waiter: ?routing_cache.Cache.Waiter = null,
         };
-        try session.chargeGraphMetricDecode(1, count);
-        try session.chargeGraphMetricRetained(2 * page.len + count * @sizeOf(codec.RoutingEntry) + @sizeOf(routing_cache.Entry));
-        var id_buf: [64]u8 = undefined;
-        const id = try metricBlockId(&id_buf, .routing, page.block_index);
-        if (try session.readCachedAuthenticatedBlockAlloc(payload_alloc, metric_index, id, page.offset, page.len, &page.checksum)) |bytes| {
-            payloads.append(alloc, bytes) catch |err| {
-                payload_alloc.free(bytes);
-                return err;
+        var pending: [64]PendingPage = undefined;
+        var pending_count: usize = 0;
+        var saturated: ?u32 = null;
+        defer for (pending[0..pending_count]) |*item| {
+            if (item.fill) |index| session.cache.?.graph_metric_routing.finish(index, session.io);
+            if (item.waiter) |*waiter| waiter.deinit();
+        };
+        misses.clearRetainingCapacity();
+        for (selected.items[first_missing..], first_missing..) |i, view_index| {
+            if (page_leases[view_index] != null) continue;
+            if (pending_count == pending.len) break;
+            const page = directory.entries[i];
+            var item = PendingPage{ .view_index = view_index };
+            if (session.cache) |cache| switch (cache.graph_metric_routing.begin(pointPageCacheKey(artifact, page, block_count, root))) {
+                .hit => |cached| {
+                    page_leases[view_index] = cached;
+                    completed += 1;
+                    try session.chargeGraphMetricRetained(cached.entry.bytes());
+                    try session.chargeGraphMetricDecode(0, 1);
+                    continue;
+                },
+                .fill => |index| item.fill = index,
+                .wait => |waiter| item.waiter = waiter,
+                .saturated => |epoch| {
+                    saturated = epoch;
+                    break;
+                },
             };
-            page_views[view_index] = bytes;
-        } else try misses.append(alloc, i);
-    }
-    try session.chargeGraphMetricRetained(misses.items.len * 2 * @sizeOf(ScoreFetchRange));
-    const ranges = try planRoutingPageRangesAlloc(alloc, directory.entries, misses.items);
-    defer alloc.free(ranges);
-    var start: usize = 0;
-    while (start < ranges.len) {
-        const end = metricRangeBatchEnd(ranges, start);
-        var fetched = try fetchMetricRangeBatchAlloc(alloc, session, metric_index, control.header.version, directory.entries, ranges[start..end], .routing);
-        defer fetched.deinit(alloc);
-        for (ranges[start..end], fetched.payloads) |range, *payload| {
-            try payloads.append(alloc, payload.*);
-            const bytes = payload.*;
-            payload.* = @constCast((&[_]u8{})[0..]);
-            const first_view = std.sort.lowerBound(usize, selected.items, range.first_block, struct {
-                fn order(needle: usize, item: usize) std.math.Order {
-                    return std.math.order(needle, item);
-                }
-            }.order);
-            for (range.first_block..range.last_block + 1) |i| {
-                const page = directory.entries[i];
-                const offset: usize = @intCast(page.offset - range.offset);
-                const view_index = first_view + i - range.first_block;
-                std.debug.assert(selected.items[view_index] == i);
-                page_views[view_index] = bytes[offset..][0..page.len];
-            }
+            pending[pending_count] = item;
+            pending_count += 1;
+            if (item.waiter != null) continue;
+            const count = @min(codec.routing_page_entries, block_count - page.block_index);
+            try session.chargeGraphMetricDecode(1, count);
+            try session.chargeGraphMetricRetained(2 * page.len + count * @sizeOf(codec.RoutingEntry) + @sizeOf(routing_cache.Entry));
+            var id_buf: [64]u8 = undefined;
+            const id = try metricBlockId(&id_buf, .routing, page.block_index);
+            if (try session.readCachedAuthenticatedBlockAlloc(payload_alloc, metric_index, id, page.offset, page.len, &page.checksum)) |bytes| {
+                payloads.append(alloc, bytes) catch |err| {
+                    payload_alloc.free(bytes);
+                    return err;
+                };
+                page_views[view_index] = bytes;
+            } else try misses.append(alloc, i);
         }
-        start = end;
-    }
-    pages.position = 0;
-    for (selected.items, 0..) |i, view_index| {
-        const page = directory.entries[i];
-        if (page_leases[view_index] == null) {
+        try session.chargeGraphMetricRetained(misses.items.len * 2 * @sizeOf(ScoreFetchRange));
+        const ranges = try planRoutingPageRangesAlloc(alloc, directory.entries, misses.items);
+        defer alloc.free(ranges);
+        var start: usize = 0;
+        while (start < ranges.len) {
+            const end = metricRangeBatchEnd(ranges, start);
+            var fetched = try fetchMetricRangeBatchAlloc(alloc, session, metric_index, control.header.version, directory.entries, ranges[start..end], .routing);
+            defer fetched.deinit(alloc);
+            for (ranges[start..end], fetched.payloads) |range, *payload| {
+                try payloads.append(alloc, payload.*);
+                const bytes = payload.*;
+                payload.* = @constCast((&[_]u8{})[0..]);
+                const first_view = std.sort.lowerBound(usize, selected.items, range.first_block, struct {
+                    fn order(needle: usize, item: usize) std.math.Order {
+                        return std.math.order(needle, item);
+                    }
+                }.order);
+                for (range.first_block..range.last_block + 1) |i| {
+                    const page = directory.entries[i];
+                    const offset: usize = @intCast(page.offset - range.offset);
+                    const view_index = first_view + i - range.first_block;
+                    std.debug.assert(selected.items[view_index] == i);
+                    page_views[view_index] = bytes[offset..][0..page.len];
+                }
+            }
+            start = end;
+        }
+
+        for (pending[0..pending_count]) |*item| {
+            if (item.waiter != null) continue;
+            const view_index = item.view_index;
+            const i = selected.items[view_index];
+            const page = directory.entries[i];
             const bytes = page_views[view_index] orelse return error.InvalidGraphMetricSegment;
             const owner = if (session.cache) |cache| cache.alloc else alloc;
             const owned = try owner.dupe(u8, bytes);
@@ -1290,10 +1326,35 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
                 .routing = .{ .entries = decoded, .ranked_entries = &.{}, .top_score_count = 0, .footer_offset = footer_offset },
             };
             page_leases[view_index] = if (session.cache) |cache|
-                cache.graph_metric_routing.adopt(entry, cache.cfg.max_graph_metric_routing_bytes)
+                cache.graph_metric_routing.publish(item.fill.?, entry, cache.cfg.max_graph_metric_routing_bytes)
             else
                 .{ .entry = entry };
+
+            completed += 1;
+            if (item.fill) |index| {
+                session.cache.?.graph_metric_routing.finish(index, session.io);
+                item.fill = null;
+            }
         }
+        for (pending[0..pending_count]) |*item| {
+            if (item.waiter) |*waiter| {
+                if (try waiter.awaitResult(session.io, session.cancellation)) |shared| {
+                    page_leases[item.view_index] = shared;
+                    completed += 1;
+                    try session.chargeGraphMetricRetained(shared.entry.bytes());
+                    try session.chargeGraphMetricDecode(0, 1);
+                }
+                waiter.deinit();
+                item.waiter = null;
+            }
+        }
+        // With no ownership or registrations, wait for table capacity. Failed
+        // leaders are retried by the next pass under the same cancellation.
+        if (pending_count == 0) if (saturated) |epoch|
+            try session.cache.?.graph_metric_routing.awaitFill(session.io, session.cancellation, epoch);
+    }
+    pages.position = 0;
+    for (selected.items, 0..) |i, view_index| {
         const decoded = page_leases[view_index].?.entry.routing.entries;
         if (i + 1 < directory.entries.len and std.mem.order(u8, decoded[decoded.len - 1].first_node_id, directory.entries[i + 1].first_node_id) != .lt) return error.InvalidGraphMetricSegment;
         const span = pages.next() orelse return error.InvalidGraphMetricSegment;
@@ -3046,10 +3107,72 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         session.graph_metric_read_budget = .{};
         state.range_calls.store(0, .monotonic);
         const adjacent = [_][]const u8{ metric.scores[0].node_id, metric.scores[64 * metric_segment.score_block_entries].node_id };
+        {
+            const io = io_impl.io();
+            // Leave one fill slot: a two-page request must publish its owned
+            // page before waiting for capacity or another request's page.
+            var held: [63]usize = undefined;
+            for (&held, 0..) |*slot, i| {
+                var key: [32]u8 = @splat(0);
+                key[0] = 0xff;
+                key[1] = @intCast(i);
+                slot.* = cache.graph_metric_routing.begin(key).fill;
+            }
+            defer for (held) |slot| cache.graph_metric_routing.finish(slot, io);
+            const misses_before = cache.graph_metric_routing.snapshot().misses;
+            var root_view = try metric_segment.codec.decodeRoutingRootAlloc(alloc, payload[state.root_offset..], payload.len, metric_segment.wire_version, .none);
+            defer root_view.deinit(alloc);
+            const directory_start = state.root_offset - root_view.directory_len;
+            const directory_view = try metric_segment.codec.decodePointDirectoryAlloc(alloc, payload[directory_start..state.root_offset], directory_start, state.footer_offset, std.math.divCeil(usize, score_count, metric_segment.score_block_entries) catch unreachable, .none);
+            defer alloc.free(directory_view);
+            state.blocked_offset = directory_view[0].offset;
+            state.release_reads.store(false, .release);
+            var children = [_]runtime_mod.QuerySession{ session.forkGraphMetricRead(std.heap.smp_allocator), session.forkGraphMetricRead(std.heap.smp_allocator) };
+            defer for (&children) |*child| child.deinit();
+            for (&children) |*child| child.io = io;
+            const control = try metric_segment.decodeControl(payload, config.edge_filter);
+            const Worker = struct {
+                fn run(child: *runtime_mod.QuerySession, ref: manifest_mod.ArtifactRef, ctl: metric_segment.codec.Control, ids: []const []const u8, output: *?PointRouting, failure: *?anyerror) void {
+                    output.* = loadPointRouting(std.heap.smp_allocator, child, 1, ref, ctl, ref.byte_len - ref.graph_metric_routing_footer_len, std.math.divCeil(usize, ctl.score_count, metric_segment.score_block_entries) catch unreachable, ids, &.{ 0, 1 }) catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                }
+            };
+            var outputs: [2]?PointRouting = @splat(null);
+            defer for (&outputs) |*output| if (output.*) |*routing| routing.deinit();
+            var failures: [2]?anyerror = @splat(null);
+            var group: std.Io.Group = .init;
+            defer {
+                state.release_reads.store(true, .release);
+                group.await(io) catch {};
+                state.blocked_offset = null;
+            }
+            group.async(io, Worker.run, .{ &children[0], refs[1], control, &adjacent, &outputs[0], &failures[0] });
+            for (0..1000) |_| {
+                if (state.range_calls.load(.monotonic) != 0) break;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            group.async(io, Worker.run, .{ &children[1], refs[1], control, &adjacent, &outputs[1], &failures[1] });
+            for (0..1000) |_| {
+                if (cache.graph_metric_routing.snapshot().waiters != 0) break;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            const waiters = cache.graph_metric_routing.snapshot().waiters;
+            state.release_reads.store(true, .release);
+            try group.await(io);
+            try std.testing.expect(waiters != 0);
+            for (failures) |failure| if (failure) |err| return err;
+            try std.testing.expectEqual(@as(u64, 2), cache.graph_metric_routing.snapshot().misses - misses_before);
+            try std.testing.expectEqual(@as(u64, 2), session.graph_metric_read_budget.decoded_blocks);
+            try std.testing.expectEqual(@as(usize, 2), state.range_calls.load(.monotonic));
+            for (outputs[0].?.page_leases, outputs[1].?.page_leases) |left, right| try std.testing.expect(left.?.entry == right.?.entry);
+        }
+        state.range_calls.store(0, .monotonic);
         var pair = try scoresAlloc(alloc, &session, "graph_idx", "rank", &adjacent);
         defer pair.deinit(alloc);
-        // One coalesced routing miss plus two exact score misses.
-        try std.testing.expectEqual(@as(usize, 3), state.range_calls.load(.monotonic));
+        // Both decoded pages are shared; only two exact score misses remain.
+        try std.testing.expectEqual(@as(usize, 2), state.range_calls.load(.monotonic));
         session.graph_metric_read_budget = .{};
         state.range_calls.store(0, .monotonic);
         const overlap = [_][]const u8{ adjacent[1], last_id };

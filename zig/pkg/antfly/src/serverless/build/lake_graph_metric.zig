@@ -1039,6 +1039,7 @@ const Projection = struct {
     topology: ?metrics.Topology = null,
     source_node_count: usize = 0,
     source_edge_count: usize = 0,
+    census_work: ?u64 = null,
     node_id_bytes: usize = 0,
     decoded_retained_bytes: usize = 0,
 
@@ -1441,7 +1442,7 @@ fn buildProjectionFromTopologyAlloc(
     if (retained >= options.limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
     // Charge the census before touching edges, even if the later exact-sized
     // projection cannot fit. Rejected work must never disappear from accounting.
-    const census_work = try graph_metric_policy.workItems(topology.source_node_count, topology.source_edge_count, 1, 1);
+    const census_work = try compiledProjectionCensusWork(topology, options);
     if (census_work > options.limits.max_work_items) return error.GraphMetricBuildBudgetExceeded;
     if (options.batch_budget) |budget| try budget.chargeWork(census_work);
     // Unlike an estimate made after the census, this also bounds scratch
@@ -1474,12 +1475,18 @@ fn buildProjectionWithEdgeCopyAlloc(alloc: Allocator, topology: CompiledTopology
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     if (!requirements.satisfies(topologyRequirementsForKind(options.config.kind)))
         return error.InvalidGraphMetricBuildOptions;
+    const selected_edges = try selectedEdgeCount(topology, options.config.edge_filter, options.cancellation);
+    // Sorting a tiny endpoint set avoids allocating/clearing source-wide
+    // bitsets and ordinal/count arrays. Dense projections retain O(V + E) CSR.
+    if (!copy_edges and useSparseProjection(topology.node_ids.len, selected_edges))
+        return buildSparseProjectionAlloc(alloc, topology, options, selected_edges, requirements);
     if (requirements.incoming == .degrees and requirements.outgoing == .degrees) {
         return try buildDegreeProjectionFromTopologyAlloc(alloc, topology, decoded_retained_bytes, options);
     }
     var projection = Projection{
         .source_node_count = topology.source_node_count,
         .source_edge_count = topology.source_edge_count,
+        .census_work = try compiledProjectionCensusWork(topology, options),
     };
     errdefer projection.deinit(alloc);
     var filter = try EdgeFilterIndex.init(alloc, options.config.edge_filter);
@@ -1581,6 +1588,7 @@ const ProjectedEdges = struct {
     topology: CompiledTopology,
     allowed: []const bool,
     ordinals: []const u32,
+    sparse: bool = false,
     type_index: usize = 0,
     edge_index: usize = 0,
 
@@ -1594,11 +1602,163 @@ const ProjectedEdges = struct {
             }
             const edge = self.topology.edges[self.edge_index];
             self.edge_index += 1;
-            return .{ .source = self.ordinals[edge.source], .target = self.ordinals[edge.target] };
+            return .{ .source = self.localOrdinal(edge.source), .target = self.localOrdinal(edge.target) };
         }
         return null;
     }
+
+    fn localOrdinal(self: @This(), ordinal: u32) u32 {
+        if (!self.sparse) return self.ordinals[ordinal];
+        const index = std.sort.lowerBound(u32, self.ordinals, ordinal, struct {
+            fn order(a: u32, b: u32) std.math.Order {
+                return std.math.order(a, b);
+            }
+        }.order);
+        std.debug.assert(index < self.ordinals.len and self.ordinals[index] == ordinal);
+        return @intCast(index);
+    }
 };
+
+fn selectedEdgeCount(topology: CompiledTopology, filter: graph_mod.GraphMetricEdgeFilter, cancellation: CancellationToken) !usize {
+    if (topology.edge_type_offsets.len != topology.edge_types.len + 1 or
+        topology.edge_type_offsets[topology.edge_types.len] != topology.edges.len) return error.InvalidGraphMetricBuildOptions;
+    var count: usize = 0;
+    for (topology.edge_types, 0..) |edge_type, i| {
+        if (i % 4096 == 0) try cancellation.check();
+        const start = topology.edge_type_offsets[i];
+        const end = topology.edge_type_offsets[i + 1];
+        if (start > end or end > topology.edges.len) return error.InvalidGraphMetricBuildOptions;
+        if (filter.mode != .all and for (filter.types) |allowed| {
+            if (std.mem.eql(u8, allowed, edge_type)) break false;
+        } else true) continue;
+        count += end - start;
+    }
+    return count;
+}
+
+fn useSparseProjection(nodes: usize, edges: usize) bool {
+    return edges <= nodes / 64;
+}
+
+fn compiledProjectionCensusWork(topology: CompiledTopology, options: BuildOptions) !u64 {
+    const edges = try selectedEdgeCount(topology, options.config.edge_filter, options.cancellation);
+    const filter_work = try graph_metric_policy.workItems(topology.edge_types.len, options.config.edge_filter.types.len, 1, @max(1, topology.edge_types.len));
+    const census = if (useSparseProjection(topology.node_ids.len, edges)) blk: {
+        // Endpoint sort plus binary searches in both replay passes. This
+        // upper bound is charged before scratch allocation, including rejects.
+        const levels: u64 = if (edges == 0) 1 else std.math.log2_int_ceil(usize, edges * 2) + 1;
+        break :blk try graph_metric_policy.workItems(0, edges, 1, 6 * levels + 1);
+    } else try graph_metric_policy.workItems(topology.node_ids.len, edges, 1, 1);
+    return std.math.add(u64, filter_work, census) catch error.GraphMetricBuildBudgetExceeded;
+}
+
+fn buildSparseProjectionAlloc(alloc: Allocator, topology: CompiledTopology, options: BuildOptions, edge_count: usize, requirements: metrics.TopologyRequirements) !Projection {
+    var projection = Projection{
+        .source_node_count = topology.source_node_count,
+        .source_edge_count = topology.source_edge_count,
+        .census_work = try compiledProjectionCensusWork(topology, options),
+    };
+    errdefer projection.deinit(alloc);
+    var filter = try EdgeFilterIndex.init(alloc, options.config.edge_filter);
+    defer filter.deinit(alloc);
+    const allowed = try alloc.alloc(bool, topology.edge_types.len);
+    defer alloc.free(allowed);
+    const endpoints = try alloc.alloc(u32, edge_count * 2);
+    defer alloc.free(endpoints);
+    var count: usize = 0;
+    for (topology.edge_types, 0..) |edge_type, i| {
+        allowed[i] = filter.allows(edge_type);
+        if (!allowed[i]) continue;
+        for (topology.edges[topology.edge_type_offsets[i]..topology.edge_type_offsets[i + 1]]) |edge| {
+            if (count % 4096 == 0) try options.cancellation.check();
+            if (edge.source >= topology.node_ids.len or edge.target >= topology.node_ids.len) return error.InvalidGraphMetricBuildOptions;
+            endpoints[count] = edge.source;
+            endpoints[count + 1] = edge.target;
+            count += 2;
+        }
+    }
+    std.mem.sort(u32, endpoints, {}, std.sort.asc(u32));
+    try options.cancellation.check();
+    var active_count: usize = 0;
+    for (endpoints) |ordinal| {
+        if (active_count != 0 and endpoints[active_count - 1] == ordinal) continue;
+        endpoints[active_count] = ordinal;
+        active_count += 1;
+    }
+    try chargeProjectionConstruction(options, topology, active_count, edge_count);
+    try projection.node_ids.ensureTotalCapacityPrecise(alloc, active_count);
+    for (endpoints[0..active_count]) |ordinal| {
+        const id = topology.node_ids[ordinal];
+        projection.node_ids.appendAssumeCapacity(id);
+        projection.node_id_bytes += id.len;
+    }
+    projection.topology = try metrics.Topology.initFromSourceAlloc(alloc, active_count, edge_count, ProjectedEdges{
+        .topology = topology,
+        .allowed = allowed,
+        .ordinals = endpoints[0..active_count],
+        .sparse = true,
+    }, requirements, options.cancellation);
+    return projection;
+}
+
+/// Prepared-source sparse projection versus the former source-wide scratch.
+pub fn benchmarkSparseProjection(alloc: Allocator, ids: []const []const u8, kind: graph_mod.GraphMetricKind, reference: bool) !u64 {
+    const topology = sparseProjectionFixture(ids);
+    const options = BuildOptions{
+        .graph_index_name = "bench",
+        .config = .{ .name = "metric", .kind = kind },
+        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "fixture", .byte_len = 1 },
+    };
+    var projection = if (reference)
+        try buildProjectionWithEdgeCopyAlloc(alloc, topology, 0, options, true)
+    else
+        try buildProjectionFromTopologyAlloc(alloc, topology, 0, options);
+    defer projection.deinit(alloc);
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(std.mem.sliceAsBytes(projection.topology.?.incoming_offsets));
+    hash.update(std.mem.sliceAsBytes(projection.topology.?.incoming_sources));
+    hash.update(std.mem.sliceAsBytes(projection.topology.?.outgoing_offsets));
+    for (projection.node_ids.items) |id| hash.update(id);
+    return hash.final();
+}
+
+fn sparseProjectionFixture(ids: []const []const u8) CompiledTopology {
+    std.debug.assert(ids.len == 1_000_000);
+    return .{
+        .node_ids = ids,
+        .edge_types = &.{"cites"},
+        .string_bytes = &.{},
+        .edge_type_offsets = &.{ 0, 2 },
+        .edges = &.{ .{ .source = 0, .target = 999_999 }, .{ .source = 999_999, .target = 999_999 } },
+        .source_node_count = ids.len,
+        .source_edge_count = 2,
+        .retained_bytes = ids.len * @sizeOf([]const u8),
+    };
+}
+
+test "serverless sparse projections bound scratch independently of the source dictionary" {
+    const alloc = std.testing.allocator;
+    const ids = try alloc.alloc([]const u8, 1_000_000);
+    defer alloc.free(ids);
+    @memset(ids, "unused");
+    ids[0] = "a";
+    ids[ids.len - 1] = "z";
+    for ([_]graph_mod.GraphMetricKind{ .degree, .pagerank, .eigenvector, .hits_authority }) |kind| {
+        try std.testing.expectEqual(try benchmarkSparseProjection(alloc, ids, kind, true), try benchmarkSparseProjection(alloc, ids, kind, false));
+        const topology = sparseProjectionFixture(ids);
+        var budget = graph_metric_policy.Budget{ .limits = .{} };
+        var projection = try buildProjectionFromTopologyAlloc(alloc, topology, 0, .{
+            .graph_index_name = "graph",
+            .config = .{ .name = "metric", .kind = kind },
+            .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "fixture", .byte_len = 1 },
+            .limits = .{ .max_peak_memory_bytes = topology.retained_bytes + 2048, .max_work_items = 100 },
+            .batch_budget = &budget,
+        });
+        defer projection.deinit(alloc);
+        try std.testing.expectEqualSlices([]const u8, &.{ "a", "z" }, projection.node_ids.items);
+        try std.testing.expect(budget.work_items < 100);
+    }
+}
 
 /// Exact former edge-copy oracle; source preparation is common to both paths.
 pub fn benchmarkProjection(alloc: Allocator, payload: []const u8, reference: bool) !usize {
@@ -1636,6 +1796,7 @@ fn buildDegreeProjectionFromTopologyAlloc(
     var projection = Projection{
         .source_node_count = topology.source_node_count,
         .source_edge_count = topology.source_edge_count,
+        .census_work = try compiledProjectionCensusWork(topology, options),
     };
     errdefer projection.deinit(alloc);
     var filter = try EdgeFilterIndex.init(alloc, options.config.edge_filter);
@@ -1903,6 +2064,7 @@ fn kernelOptions(options: BuildOptions) metrics.Options {
 fn projectionWorkItems(projection: Projection, options: BuildOptions) !u64 {
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     const projected_passes: u64 = if (requirements.incoming == .neighbors or requirements.outgoing == .neighbors) 4 else 3;
+    if (projection.census_work) |census| return std.math.add(u64, census, try graph_metric_policy.workItems(projection.node_ids.items.len, projection.edgeCount(), 1, projected_passes)) catch error.GraphMetricBuildBudgetExceeded;
     return try graph_metric_policy.projectionWorkItems(
         projection.source_node_count,
         projection.source_edge_count,
@@ -1915,7 +2077,7 @@ fn projectionWorkItems(projection: Projection, options: BuildOptions) !u64 {
 fn chargeProjectionConstruction(options: BuildOptions, topology: CompiledTopology, nodes: usize, edges: usize) !void {
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     const passes: u64 = if (requirements.incoming == .neighbors or requirements.outgoing == .neighbors) 4 else 3;
-    const total = try graph_metric_policy.projectionWorkItems(topology.source_node_count, topology.source_edge_count, nodes, edges, passes);
+    const total = std.math.add(u64, try compiledProjectionCensusWork(topology, options), try graph_metric_policy.workItems(nodes, edges, 1, passes)) catch return error.GraphMetricBuildBudgetExceeded;
     if (total > options.limits.max_work_items) return error.GraphMetricBuildBudgetExceeded;
     if (options.batch_budget) |budget| try budget.chargeWork(try graph_metric_policy.workItems(nodes, edges, 1, passes));
 }
@@ -2136,9 +2298,8 @@ fn populateGraphMetricIntegrity(ref: *artifact_ref.ArtifactRef, segment: metric_
 
 /// Maps the last published node-sorted vector onto the current canonical node
 /// dictionary without materializing the old segment's node IDs. The verified
-/// payload is walked block-by-block and a linear merge fills the ordinal seed;
-/// added nodes remain zero and deleted nodes are skipped. This keeps warm-start
-/// preparation O(V_old + V_new) with one dense output vector.
+/// primary score windows are merged into one dense output vector; added nodes
+/// remain zero and deleted nodes are skipped. No full prior payload is retained.
 fn warmStartVectorAlloc(
     alloc: Allocator,
     artifacts: *artifact_store.ArtifactStore,
@@ -2162,97 +2323,160 @@ fn warmStartVectorAlloc(
     // preparation may not fit alongside the kernel and encoded output.
     if (execution_peak_bytes > limits.max_peak_memory_bytes or
         seed_bytes > limits.max_peak_memory_bytes - execution_peak_bytes) return null;
-    var retained = std.math.add(u64, prior.byte_len, seed_bytes) catch return error.GraphMetricBuildBudgetExceeded;
-    retained = std.math.add(u64, retained, existing_resident_bytes) catch return error.GraphMetricBuildBudgetExceeded;
-    // Decoding borrows IDs but allocates primary/ranked routing structs. Their
-    // layout is bounded by twice the encoded footer size.
-    retained = std.math.add(u64, retained, @as(u64, prior.graph_metric_routing_footer_len) * 2) catch return null;
-    if (retained > limits.max_peak_memory_bytes) return null;
+    if (existing_resident_bytes >= limits.max_peak_memory_bytes) return null;
     var local_budget = graph_metric_policy.Budget{ .limits = limits };
-    const seed_budget = batch_budget orelse &local_budget;
-    if (!seed_budget.admitSeed(prior.byte_len, current_node_ids.len)) return null;
-
-    const payload = artifacts.getVerifiedAllocWithCancellationUsingAllocator(
-        alloc,
-        prior.artifact_id,
-        prior.byte_len,
-        prior.checksum,
-        cancellation,
-    ) catch |err| switch (err) {
-        error.Canceled, error.OutOfMemory => return err,
+    const budget = batch_budget orelse &local_budget;
+    if (!budget.admitSeed(0, current_node_ids.len)) return null;
+    var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes - existing_resident_bytes);
+    return readWarmStartVectorAlloc(&limiter, artifacts, prior, current_node_ids, config, cancellation, budget) catch |err| switch (err) {
+        error.Canceled => return err,
+        error.OutOfMemory => if (limiter.limit_exceeded) null else error.OutOfMemory,
         else => {
-            // The old vector is an optional accelerator, never an input to
-            // the authoritative cold build. Authentication failures must not
-            // use the seed, but must not poison fresh topology publication.
+            // Optional acceleration never poisons an otherwise valid cold build.
             try cancellation.check();
-            std.log.warn("graph metric warm start unavailable; using cold seed metric={s} artifact={s} err={s}", .{ config.name, prior.artifact_id, @errorName(err) });
+            if (err != error.ArtifactReadBudgetExceeded)
+                std.log.warn("graph metric warm start unavailable; using cold seed metric={s} artifact={s} err={s}", .{ config.name, prior.artifact_id, @errorName(err) });
             return null;
         },
     };
-    defer alloc.free(payload);
-    const header = metric_segment.decodeHeader(payload) catch return null;
-    if (header.kind != config.kind or header.materialization_state != .ready or
-        header.config_fingerprint != configFingerprint(config)) return null;
-    const control = metric_segment.decodeControl(payload, config.edge_filter) catch return null;
-    if (control.score_count == 0 or payload.len < metric_segment.routing_trailer_len) return null;
-    const footer_len = metric_segment.routingFooterLenFromTrailer(
-        payload.len,
-        payload[payload.len - metric_segment.routing_trailer_len ..],
-    ) catch return null;
-    if (footer_len != prior.graph_metric_routing_footer_len) return null;
-    var routing = metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(
-        alloc,
-        payload[payload.len - footer_len ..],
-        payload.len,
-        header.version,
-        cancellation,
-    ) catch |err| switch (err) {
-        error.Canceled, error.OutOfMemory => return err,
-        else => return null,
-    };
-    defer routing.deinit(alloc);
+}
 
-    const expected_blocks = control.score_count / metric_segment.score_block_entries +
-        @intFromBool(control.score_count % metric_segment.score_block_entries != 0);
-    if (routing.entries.len != expected_blocks) return null;
+/// A range reader charges provider verification as well as requested bytes
+/// before I/O. Cold providers without pinned integrity may require a full
+/// verification; that must fit the optional budget or the build uses cold rank.
+const SeedReader = struct {
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    prior: artifact_ref.ArtifactRef,
+    cancellation: CancellationToken,
+    budget: *graph_metric_policy.Budget,
+
+    fn read(self: @This(), offset: u64, len: usize, checksum: ?[32]u8) ![]u8 {
+        var remaining = @min(
+            self.budget.limits.max_total_seed_payload_bytes -| self.budget.seed_payload_bytes,
+            self.budget.limits.max_total_seed_work_items -| self.budget.seed_work_items,
+        );
+        const before = remaining;
+        defer {
+            self.budget.seed_payload_bytes += before - remaining;
+            self.budget.seed_work_items += before - remaining;
+        }
+        const bytes = try self.artifacts.getVerifiedRangeAllocWithBudget(self.alloc, self.prior.artifact_id, self.prior.byte_len, self.prior.checksum, offset, len, self.cancellation, &remaining);
+        errdefer self.alloc.free(bytes);
+        if (checksum) |expected| try verifySeedChecksum(bytes, expected);
+        return bytes;
+    }
+};
+
+fn verifySeedChecksum(bytes: []const u8, expected: [32]u8) !void {
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+    if (!std.mem.eql(u8, &actual, &expected)) return error.ArtifactIntegrityMismatch;
+}
+
+fn seedNodeLowerBound(nodes: []const []const u8, node: []const u8) usize {
+    return std.sort.lowerBound([]const u8, nodes, node, struct {
+        fn order(a: []const u8, b: []const u8) std.math.Order {
+            return std.mem.order(u8, a, b);
+        }
+    }.order);
+}
+
+/// Read only primary score windows intersecting the current sorted dictionary.
+/// Dense selections coalesce adjacent blocks (up to 1 MiB); sparse selections
+/// skip unrelated pages and blocks. Root/directory and one page/window are the
+/// only retained old-artifact buffers, regardless of the old payload size.
+fn readWarmStartVectorAlloc(limiter: *bounded_decode.AllocationLimiter, artifacts: *artifact_store.ArtifactStore, prior: artifact_ref.ArtifactRef, current_node_ids: []const []const u8, config: graph_mod.GraphMetricConfig, cancellation: CancellationToken, budget: *graph_metric_policy.Budget) !?[]f64 {
+    const alloc = limiter.allocator();
+    const codec = metric_segment.codec;
+    const reader = SeedReader{ .alloc = alloc, .artifacts = artifacts, .prior = prior, .cancellation = cancellation, .budget = budget };
+    const control_bytes = try reader.read(0, prior.graph_metric_control_len, prior.graph_metric_control_checksum);
+    defer alloc.free(control_bytes);
+    const control = try metric_segment.decodeControl(control_bytes, config.edge_filter);
+    if (control.header.kind != config.kind or control.header.materialization_state != .ready or
+        control.header.config_fingerprint != configFingerprint(config) or
+        control.score_data_offset != control_bytes.len or control.score_count == 0) return null;
+    const root_len = codec.routingRootLen(control.score_count);
+    if (root_len > prior.byte_len or prior.graph_metric_routing_footer_len > prior.byte_len) return null;
+    const root_bytes = try reader.read(prior.byte_len - root_len, root_len, prior.graph_metric_routing_checksum);
+    defer alloc.free(root_bytes);
+    var root = try codec.decodeRoutingRootAlloc(alloc, root_bytes, prior.byte_len, control.header.version, cancellation);
+    defer root.deinit(alloc);
+    if (root.primary_data_offset != control.score_data_offset or
+        root.footer_offset != prior.byte_len - prior.graph_metric_routing_footer_len or
+        !std.mem.eql(u8, &root.point_index_checksum, &prior.graph_metric_point_index_checksum)) return null;
+    const block_count = std.math.divCeil(usize, control.score_count, codec.score_block_entries) catch return null;
+    const directory_offset = prior.byte_len - root_len - root.directory_len;
+    const directory_bytes = try reader.read(directory_offset, root.directory_len, root.directory_checksum);
+    defer alloc.free(directory_bytes);
+    const directory = try codec.decodePointDirectoryAlloc(alloc, directory_bytes, directory_offset, root.footer_offset, block_count, cancellation);
+    defer alloc.free(directory);
     const seed = try alloc.alloc(f64, current_node_ids.len);
     var seed_owned = true;
     defer if (seed_owned) alloc.free(seed);
     @memset(seed, 0);
-    var current_index: usize = 0;
-    var matched: usize = 0;
+    var current: usize = 0;
     var positive_sum: f64 = 0;
-    for (routing.entries, 0..) |entry, block_index| {
-        if (block_index % 32 == 0) try cancellation.check();
-        const offset = std.math.cast(usize, entry.offset) orelse return null;
-        if (offset > payload.len or entry.len > payload.len - offset) return null;
-        const decoded = metric_segment.decodeScoreBlockWithCancellation(payload[offset..][0..entry.len], cancellation) catch |err| switch (err) {
-            error.Canceled => return err,
-            else => return null,
-        };
-        var old_index: usize = 0;
-        var comparisons: usize = 0;
-        while (current_index < current_node_ids.len and old_index < decoded.len) {
-            if (comparisons % 4096 == 0) try cancellation.check();
-            comparisons += 1;
-            switch (decoded.scores[old_index].orderNode(decoded.node_prefix, current_node_ids[current_index])) {
-                .lt => old_index += 1,
-                .gt => current_index += 1,
-                .eq => {
-                    const value = decoded.scores[old_index].value;
-                    seed[current_index] = value;
-                    positive_sum += value;
-                    matched += 1;
-                    old_index += 1;
-                    current_index += 1;
-                },
+    for (directory, 0..) |page, page_index| {
+        try cancellation.check();
+        current += seedNodeLowerBound(current_node_ids[current..], page.first_node_id);
+        if (current == current_node_ids.len) break;
+        const page_end = if (page_index + 1 < directory.len) seedNodeLowerBound(current_node_ids, directory[page_index + 1].first_node_id) else current_node_ids.len;
+        if (current >= page_end) continue;
+        const page_bytes = try reader.read(page.offset, page.len, page.checksum);
+        defer alloc.free(page_bytes);
+        const entries = try codec.decodePointPageAlloc(alloc, page_bytes, page, block_count, root.primary_data_offset, root.primary_data_end, cancellation);
+        defer alloc.free(entries);
+        if (page_index + 1 < directory.len and std.mem.order(u8, entries[entries.len - 1].first_node_id, directory[page_index + 1].first_node_id) != .lt) return error.InvalidGraphMetricSegment;
+        var index: usize = 0;
+        while (index < entries.len and current < page_end) {
+            const first = entries[index];
+            if (index + 1 < entries.len and std.mem.order(u8, current_node_ids[current], entries[index + 1].first_node_id) != .lt) {
+                index += 1;
+                continue;
             }
+            var end = index + 1;
+            var window_len: usize = first.len;
+            const window_limit = @min(1024 * 1024, limiter.max_live_bytes -| limiter.live_bytes);
+            while (end < entries.len) : (end += 1) {
+                const candidate = seedNodeLowerBound(current_node_ids[current..page_end], entries[end].first_node_id) + current;
+                if (candidate == page_end or
+                    (end + 1 < entries.len and std.mem.order(u8, current_node_ids[candidate], entries[end + 1].first_node_id) != .lt) or
+                    entries[end].len > window_limit -| window_len) break;
+                window_len += entries[end].len;
+            }
+            const window = try reader.read(first.offset, window_len, null);
+            defer alloc.free(window);
+            for (entries[index..end]) |entry| {
+                const bytes = window[@intCast(entry.offset - first.offset)..][0..entry.len];
+                try verifySeedChecksum(bytes, entry.checksum);
+                const decoded = try codec.decodeScoreBlockWithCancellation(bytes, cancellation);
+                const expected_rows = @min(codec.score_block_entries, control.score_count - entry.block_index * codec.score_block_entries);
+                if (decoded.len != expected_rows or decoded.scores[0].orderNode(decoded.node_prefix, entry.first_node_id) != .eq) return error.InvalidGraphMetricSegment;
+                const local_index = entry.block_index - page.block_index;
+                const upper: ?[]const u8 = if (local_index + 1 < entries.len) entries[local_index + 1].first_node_id else if (page_index + 1 < directory.len) directory[page_index + 1].first_node_id else null;
+                if (upper) |bound| if (decoded.scores[decoded.len - 1].orderNode(decoded.node_prefix, bound) != .lt) return error.InvalidGraphMetricSegment;
+                var old: usize = 0;
+                var comparisons: usize = 0;
+                while (current < page_end and old < decoded.len) {
+                    if (comparisons % 4096 == 0) try cancellation.check();
+                    comparisons += 1;
+                    switch (decoded.scores[old].orderNode(decoded.node_prefix, current_node_ids[current])) {
+                        .lt => old += 1,
+                        .gt => current += 1,
+                        .eq => {
+                            seed[current] = decoded.scores[old].value;
+                            positive_sum += seed[current];
+                            old += 1;
+                            current += 1;
+                        },
+                    }
+                }
+            }
+            index = end;
         }
-        if (current_index == current_node_ids.len) break;
     }
-    if (matched == 0 or !std.math.isFinite(positive_sum) or positive_sum <= 0) {
-        return null;
-    }
+    if (!std.math.isFinite(positive_sum) or positive_sum <= 0) return null;
     seed_owned = false;
     return seed;
 }
@@ -2676,6 +2900,68 @@ test "serverless lake graph metrics persist a budget rejection with exact proven
     try std.testing.expectEqual(materializerFingerprint(.{ .max_nodes = 1 }), decoded.materializer_fingerprint);
 }
 
+test "serverless graph metric warm starts read bounded sparse and dense primary windows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/seed-windows", .{tmp.sub_path});
+    defer alloc.free(root_path);
+    var fs = try fs_artifact_store.FsStore.init(alloc, root_path);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    const checksum = "a" ** 64;
+    const config = graph_mod.GraphMetricConfig{ .name = "rank" };
+    var segment = metric_segment.Segment{
+        .kind = .pagerank,
+        .source_graph_artifact_id = try alloc.dupe(u8, "sha256:" ++ checksum),
+        .source_graph_checksum = try alloc.dupe(u8, checksum),
+        .config_fingerprint = configFingerprint(config),
+        .materializer_fingerprint = materializerFingerprint(.{}),
+        .edge_filter = .{},
+        .converged = true,
+        .iterations_completed = 2,
+        .delta = 0,
+        .scores = try alloc.alloc(metric_segment.Score, 8192),
+    };
+    for (segment.scores, 0..) |*score, i| score.* = .{
+        .node_id = try std.fmt.allocPrint(alloc, "node:{d:0>8}", .{i}),
+        .value = @floatFromInt(i + 1),
+    };
+    defer segment.deinit(alloc);
+    const payload = try metric_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(payload);
+    var meta = try artifacts.put(payload);
+    defer meta.deinit(alloc);
+    var ref = artifact_ref.ArtifactRef{ .kind = .graph_metric_segment, .artifact_id = meta.artifact_id, .checksum = meta.checksum, .byte_len = meta.byte_len, .metadata_version = metric_segment.wire_version };
+    try populateGraphMetricIntegrity(&ref, segment, payload);
+    // Establish the provider's immutable verification identity before measuring
+    // warm reads; unverified full-object costs must still be paid separately.
+    var verification_budget: u64 = ref.byte_len + 1;
+    const verified = try artifacts.getVerifiedRangeAllocWithBudget(alloc, ref.artifact_id, ref.byte_len, ref.checksum, 0, 1, .none, &verification_budget);
+    alloc.free(verified);
+    var sparse_budget = graph_metric_policy.Budget{ .limits = .{ .max_peak_memory_bytes = 64 * 1024, .max_total_seed_payload_bytes = 64 * 1024 } };
+    try std.testing.expect(ref.byte_len > sparse_budget.limits.max_total_seed_payload_bytes);
+    const ids = [_][]const u8{ "absent-before", segment.scores[4096].node_id, "zzzz" };
+    const sparse = (try warmStartVectorAlloc(alloc, &artifacts, ref, &ids, config, .none, sparse_budget.limits, 0, 0, &sparse_budget)) orelse return error.TestExpectedWarmSeed;
+    defer alloc.free(sparse);
+    try std.testing.expectEqualSlices(f64, &.{ 0, 4097, 0 }, sparse);
+    try std.testing.expect(sparse_budget.seed_payload_bytes < ref.byte_len / 2);
+    const all_ids = try alloc.alloc([]const u8, segment.scores.len);
+    defer alloc.free(all_ids);
+    for (segment.scores, all_ids) |score, *id| id.* = score.node_id;
+    // The entire primary lane plus the seed cannot coexist in this allowance;
+    // the coalescer must shrink windows to remaining live-allocation headroom.
+    var dense_budget = graph_metric_policy.Budget{ .limits = .{ .max_peak_memory_bytes = 128 * 1024 } };
+    const dense = (try warmStartVectorAlloc(alloc, &artifacts, ref, all_ids, config, .none, dense_budget.limits, 0, 0, &dense_budget)).?;
+    defer alloc.free(dense);
+    for (dense, segment.scores) |value, score| try std.testing.expectEqual(score.value, value);
+    try std.testing.expect(dense_budget.seed_payload_bytes < ref.byte_len);
+    // Rejection after a partial read accounts the bytes and releases the seed.
+    var exhausted = graph_metric_policy.Budget{ .limits = .{ .max_total_seed_payload_bytes = ref.graph_metric_control_len } };
+    try std.testing.expect((try warmStartVectorAlloc(alloc, &artifacts, ref, &ids, config, .none, exhausted.limits, 0, 0, &exhausted)) == null);
+    try std.testing.expectEqual(ref.graph_metric_control_len, exhausted.seed_payload_bytes);
+}
+
 test "serverless graph metric warm start maps an authenticated prior vector onto new ordinals" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2891,7 +3177,7 @@ test "serverless graph metric projection admits census before allocations and bo
             .limits = .{ .max_peak_memory_bytes = topology.retained_bytes + 1 },
         }));
         // A failed preparation still consumes its reserved census allowance.
-        try std.testing.expectEqual(@as(u64, 3), budget.work_items);
+        try std.testing.expectEqual(@as(u64, 4), budget.work_items);
     }
 }
 
@@ -2989,8 +3275,8 @@ test "serverless lake graph metrics share one bounded HITS execution for a compa
         .{ .name = "authority", .kind = .hits_authority },
         .{ .name = "hub", .kind = .hits_hub },
     };
-    // 604 HITS kernel work items plus the fifteen-item indexed projection.
-    const limits = Limits{ .max_work_items = 619, .max_total_work_items = 619 };
+    // 604 HITS kernel work items plus sixteen projection/filter work items.
+    const limits = Limits{ .max_work_items = 620, .max_total_work_items = 620 };
     const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, limits, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
@@ -3062,9 +3348,9 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         .{ .name = "rank_a", .kind = .pagerank },
         .{ .name = "rank_b", .kind = .pagerank, .damping = 0.75 },
     };
-    // One PageRank consumes 254 kernel work items plus fifteen projection
+    // One PageRank consumes 254 kernel work items plus sixteen projection
     // items; the table-wide budget admits the first and rejects the second.
-    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_work_items = 269, .max_total_work_items = 269 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_work_items = 270, .max_total_work_items = 270 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -3078,11 +3364,11 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     }
 
     // An unaffordable PageRank must not force its larger CSR projection on a
-    // degree metric. Degree fits exactly: source 3 + projection 9 + kernel 2.
+    // degree metric. Degree fits exactly: source 3 + filter 1 + projection 9 + kernel 2.
     const pressure = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "pressure", source, &.{
         .{ .name = "rank", .kind = .pagerank },
         .{ .name = "degree", .kind = .degree },
-    }, .none, .{ .max_work_items = 14, .max_total_work_items = 14 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    }, .none, .{ .max_work_items = 15, .max_total_work_items = 15 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (pressure) |ref| freeArtifactRef(alloc, ref);
         alloc.free(pressure);
@@ -3090,7 +3376,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     try std.testing.expectEqual(artifact_ref.GraphMetricMaterializationState.rejected, pressure[0].graph_metric_materialization_state);
     try std.testing.expectEqual(artifact_ref.GraphMetricMaterializationState.ready, pressure[1].graph_metric_materialization_state);
 
-    var shared_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 269, .max_total_work_items = 269 } };
+    var shared_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 270, .max_total_work_items = 270 } };
     const one_config = [_]graph_mod.GraphMetricConfig{.{ .name = "shared_rank", .kind = .pagerank }};
     var prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, shared_budget.limits);
     defer prepared.deinit(alloc);
@@ -3165,9 +3451,9 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     // aggregate work budget both publications reuse the cached projection and
     // converge on the same object-store identity; only their manifest names
     // differ.
-    // Two 254-item kernels plus one 15-item projection fit exactly. A second
+    // Two 254-item kernels plus one 16-item projection fit exactly. A second
     // projection would force the alias publication into terminal rejection.
-    const alias_limits = Limits{ .max_work_items = 523, .max_total_work_items = 523 };
+    const alias_limits = Limits{ .max_work_items = 524, .max_total_work_items = 524 };
     var alias_budget = graph_metric_policy.Budget{ .limits = alias_limits };
     var alias_prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, alias_limits);
     defer alias_prepared.deinit(alloc);
@@ -3335,7 +3621,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     // A publication exhausted by the first computation rejects the second.
     // Its unchanged plan stays terminal, but removing the expensive sibling
     // must make the remaining metric eligible again, with fresh provenance.
-    var rejected_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 269, .max_total_work_items = 269 } };
+    var rejected_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 270, .max_total_work_items = 270 } };
     const rejected = try publishRequestsAlloc(alloc, &artifacts, &.{ request_a, request_b }, .none, rejected_budget.limits, &rejected_budget, .{});
     defer {
         for (rejected) |ref| freeArtifactRef(alloc, ref);

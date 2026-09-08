@@ -264,3 +264,39 @@ setting latency guarantees.
 
 See [execution and resource ownership](../../docs/GRAPH_METRICS_EXECUTION.md)
 for the associated admission, checkpoint, and integrity contracts.
+
+## Sparse projection and resource-bounded iterations
+
+ReleaseFast measurements on the same host/toolchain, with a prepared
+1,000,000-entry dictionary and two selected edges (two active endpoints).
+Each sample contains 256 repetitions; one warmup sample is discarded and the
+median of five samples is reported. The inactive dictionary entries are fixture
+placeholders; preparation, storage I/O, kernels and upload are excluded.
+
+| Projection | Source-wide scratch reference | Active-endpoint path | Peak scratch, reference → current |
+| --- | ---: | ---: | ---: |
+| Degree | 795.582 µs | 0.179 µs | 8,125,065 → 73 bytes |
+| PageRank | 830.437 µs | 0.218 µs | 4,125,097 → 89 bytes |
+
+Node-ID and CSR checksums must match in every repetition. The dense degree
+reference is the previous direct-count path; PageRank's reference retains the
+former projected-edge copy (only 16 bytes in this fixture). These are deliberately
+sparse phase measurements, not end-to-end speedups. Dense projections continue
+to use linear-time maps/counts rather than sorting every edge endpoint.
+Concurrent development builds were active; use isolated runs for latency
+guarantees. The allocation and output-parity checks do not depend on timing.
+
+Stateful iteration planning now eliminates later adjacency-producer pages
+entirely. With 256 edge partitions and 100 iterations this removes 25,344
+PageRank/eigenvector no-op page executions and at least 50,688 claim/completion
+commits; HITS removes twice those counts. This is a deterministic work-count
+comparison, not a measured storage-latency claim. Regression tests verify
+absence of later producer pages, immutable adjacency reuse, recovery, retries,
+publication barriers and numerical parity.
+
+Serverless regressions also enforce two resource oracles: an 8,192-score prior
+larger than 64 KiB can seed a sparse selection within a 64 KiB read/memory budget,
+while dense seeds read less than the whole artifact by omitting ranked payloads;
+and two concurrent requests for two cold routing pages perform exactly two
+decoded fills even with 63 of the 64 fill slots occupied. The latter checks
+shared lease identity and completion under fill-table saturation.
