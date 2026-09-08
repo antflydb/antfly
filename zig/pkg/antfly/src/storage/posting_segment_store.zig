@@ -67,9 +67,13 @@ pub const RetainedSegment = union(enum) {
         return .{ .shared = shared };
     }
 
+    pub fn matchesIdentity(self: RetainedSegment, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment) bool {
+        return self == .shared and std.mem.eql(u8, self.shared.namespace, namespace) and
+            std.meta.eql(self.shared.descriptor, descriptor);
+    }
+
     fn retainMatching(self: RetainedSegment, namespace: []const u8, descriptor: posting_wal.Checkpoint.Segment) ?RetainedSegment {
-        if (self != .shared or !std.mem.eql(u8, self.shared.namespace, namespace) or
-            !std.meta.eql(self.shared.descriptor, descriptor)) return null;
+        if (!self.matchesIdentity(namespace, descriptor)) return null;
         const previous = self.shared.refs.fetchAdd(1, .monotonic);
         std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
         return self;
@@ -792,6 +796,70 @@ pub const Store = struct {
     }
 
     pub const PublicationMode = enum { full, delta, compact_deltas };
+
+    /// Open only the immutable part of a staged checkpoint. This must not
+    /// prepare/rotate a WAL or write CURRENT: the real writer may already be
+    /// appending a newer tail. The publication owner later validates every
+    /// descriptor against its independently prepared durable transaction.
+    pub fn openStagedReadersReusing(
+        self: *const Store,
+        alloc: Allocator,
+        staged: StagedCheckpointSegment,
+        sequence: u64,
+        mode: PublicationMode,
+        previous: []const RetainedSegment,
+    ) !OpenedWithSegment {
+        const current = self.checkpoint orelse return error.MissingPostingCheckpoint;
+        if (staged.generation <= current.latestSegmentGeneration()) return error.OutOfOrderPostingSegmentGeneration;
+        if (sequence < current.covered_source_sequence) return error.OutOfOrderPostingCheckpointSequence;
+        const descriptor: posting_wal.Checkpoint.Segment = .{
+            .generation = staged.generation,
+            .checksum = staged.checksum,
+            .admission_checksum = staged.admission_checksum,
+        };
+        var checkpoint = current;
+        checkpoint.covered_source_sequence = sequence;
+        switch (mode) {
+            .full => {
+                checkpoint.segment_generation = descriptor.generation;
+                checkpoint.segment_checksum = descriptor.checksum;
+                checkpoint.segment_admission_checksum = descriptor.admission_checksum;
+                checkpoint.delta_segment_count = 0;
+            },
+            .delta, .compact_deltas => {
+                if (mode == .compact_deltas) {
+                    if (current.delta_segment_count == 0) return error.MissingPostingDeltaSegments;
+                    checkpoint.delta_segment_count = 0;
+                }
+                if (checkpoint.delta_segment_count >= posting_wal.Checkpoint.max_delta_segments)
+                    return error.TooManyPostingDeltaSegments;
+                checkpoint.delta_segments[checkpoint.delta_segment_count] = descriptor;
+                checkpoint.delta_segment_count += 1;
+            },
+        }
+        var next = self.*;
+        next.alloc = alloc;
+        next.root_dir = try alloc.dupe(u8, self.root_dir);
+        errdefer next.deinit();
+        next.checkpoint = checkpoint;
+        next.covered_source_sequence = sequence;
+        const segments = try alloc.alloc(RetainedSegment, checkpoint.segmentCount());
+        var count: usize = 0;
+        errdefer {
+            for (segments[0..count]) |*segment| segment.deinit(alloc);
+            alloc.free(segments);
+        }
+        for (segments, 0..) |*segment, index| {
+            const wanted = checkpoint.segment(index);
+            segment.* = reuse: {
+                for (previous) |retained| if (retained.retainMatching(next.root_dir, wanted)) |shared|
+                    break :reuse shared;
+                break :reuse try next.readSegmentRetainedFor(wanted);
+            };
+            count += 1;
+        }
+        return .{ .store = next, .segments = segments };
+    }
 
     /// A durable candidate which is not authoritative until commitPrepared.
     /// Reader construction/admission must happen before CURRENT changes. On
@@ -1991,6 +2059,80 @@ test "storage.posting segment publication rejects a non-commit WAL boundary" {
         error.InvalidPostingWalBoundary,
         store.publishCheckpointPreservingWalTail(2, 2, segment, store.wal_committed_bytes - 1),
     );
+}
+
+test "storage.posting reader staging neither changes CURRENT nor rewrites the live WAL" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-read-stage");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(7, 1, "base");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    try store.publishCheckpoint(1, 1, bytes);
+    const delta = try store.stageCheckpointSegment(2, bytes);
+    try store.publishStagedDeltaPreservingWalTail(2, 1, bytes, 0, delta);
+    var old = try Store.openWithSegmentAlloc(alloc, memory.storage(), "/posting-read-stage");
+    defer old.deinit();
+    const staged = try store.stageCheckpointSegment(3, bytes);
+    try store.appendCoverage(1, 2, .{ .sync = true });
+    const checkpoint_before = store.checkpoint;
+    const wal_generation_before = store.wal_generation;
+    var before = try store.recoverWal();
+    defer before.deinit();
+    for ([_]Store.PublicationMode{ .full, .delta, .compact_deltas }) |mode| {
+        var readers = try store.openStagedReadersReusing(alloc, staged, 1, mode, old.segments);
+        defer readers.deinit();
+        const checkpoint = readers.store.checkpoint.?;
+        try std.testing.expectEqual(@as(u64, 1), readers.store.covered_source_sequence);
+        try std.testing.expectEqual(@as(u64, 3), checkpoint.latestSegmentGeneration());
+        try std.testing.expectEqual(@as(usize, switch (mode) {
+            .full => 1,
+            .delta => 3,
+            .compact_deltas => 2,
+        }), readers.segments.len);
+        if (mode != .full) try std.testing.expectEqual(old.segments[0].bytes().ptr, readers.segments[0].bytes().ptr);
+        for (readers.segments, 0..) |segment, i|
+            try std.testing.expect(segment.matchesIdentity(store.root_dir, checkpoint.segment(i)));
+        try std.testing.expectEqual(checkpoint_before, store.checkpoint);
+        try std.testing.expectEqual(wal_generation_before, store.wal_generation);
+        var after = try store.recoverWal();
+        defer after.deinit();
+        try std.testing.expectEqualSlices(u8, before.bytes, after.bytes);
+        var reopened = try Store.open(alloc, memory.storage(), "/posting-read-stage");
+        defer reopened.deinit();
+        try std.testing.expectEqual(checkpoint_before, reopened.checkpoint);
+        try std.testing.expectEqual(@as(u64, 2), reopened.covered_source_sequence);
+    }
+}
+
+fn testStagedReaderAllocationFailure(reader_alloc: Allocator) !void {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/posting-reader-allocation");
+    defer store.deinit();
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(7, 1, "base");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+    try store.publishCheckpoint(1, 1, bytes);
+    var old = try Store.openWithSegmentAlloc(alloc, memory.storage(), store.root_dir);
+    defer old.deinit();
+    const staged = try store.stageCheckpointSegment(2, bytes);
+    // Fail only the new reader allocations, including a failure after an old
+    // mapping has been retained. Every partial lease/array must unwind.
+    var readers = try store.openStagedReadersReusing(reader_alloc, staged, 1, .delta, old.segments);
+    defer readers.deinit();
+    try std.testing.expectEqual(old.segments[0].bytes().ptr, readers.segments[0].bytes().ptr);
+}
+
+test "storage.posting staged readers unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testStagedReaderAllocationFailure, .{});
 }
 
 test "storage.posting segment store bounds WAL tails relative to the segment" {

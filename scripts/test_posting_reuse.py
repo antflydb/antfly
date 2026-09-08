@@ -1,9 +1,30 @@
 import unittest
+from pathlib import Path
 
-from summarize_posting_reuse import summarize_lines
+from summarize_posting_reuse import FLAG, suffix_enabled_for_arm, summarize_lines
 
 
 class PostingReuseTests(unittest.TestCase):
+    def test_limited_harness_environment_does_not_certify_absent_flag(self):
+        enabled = suffix_enabled_for_arm(
+            Path("arm"), {"experiment_environment": {}}, None
+        )
+        self.assertIsNone(enabled)
+        self.assertFalse(summarize_lines([], enabled)["evidence_consistent"])
+
+    def test_full_runner_receipt_overrides_the_limited_harness_allowlist(self):
+        config = {"experiment_environment": {}, "antfly_binary_sha256": "binary-hash"}
+        receipt = {
+            "command": ["harness", str(Path("arm").resolve())],
+            "exit_code": 0,
+            "environment": {"ANTFLY_BIN": "binary", FLAG: "1"},
+            "inputs_sha256": {"binary": "binary-hash"},
+        }
+        self.assertTrue(suffix_enabled_for_arm(Path("arm"), config, [receipt]))
+        receipt["inputs_sha256"]["binary"] = "different-binary"
+        with self.assertRaises(ValueError):
+            suffix_enabled_for_arm(Path("arm"), config, [receipt])
+
     def test_flag_and_worker_alone_do_not_qualify(self):
         result = summarize_lines(
             [

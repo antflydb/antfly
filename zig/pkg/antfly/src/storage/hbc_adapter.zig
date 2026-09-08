@@ -4390,6 +4390,8 @@ const ExperimentalPostingCheckpointBuild = struct {
     build_error: ?anyerror = null,
     result: ?ExperimentalPostingCheckpointBuildResult = null,
     staged: ?posting_segment_store_mod.StagedCheckpointSegment = null,
+    staged_readers: ?*ExperimentalPostingReadGeneration = null,
+    readers_stage_ns: u64 = 0,
 
     fn allocator() Allocator {
         return platform.allocator.processAllocator(std.heap.smp_allocator);
@@ -4407,10 +4409,10 @@ const ExperimentalPostingCheckpointBuild = struct {
             self.completed_ns = nowNs();
             const cpu_end = platform.time.threadCpuNs();
             const cpu_ns: ?u64 = if (cpu_start != null and cpu_end != null and cpu_end.? >= cpu_start.?) cpu_end.? - cpu_start.? else null;
-            std.log.info("dense checkpoint worker generation={} sequence={} kind={s} queue_ns={} admission_ns={} build_wall_ns={} build_thread_cpu_ns={?} success={}", .{
+            std.log.info("dense checkpoint worker generation={} sequence={} kind={s} queue_ns={} admission_ns={} build_wall_ns={} build_thread_cpu_ns={?} readers_stage_ns={} success={}", .{
                 self.segment_generation,      self.covered_source_sequence, @tagName(self.kind),
                 started_ns -| self.queued_ns, admitted_ns -| started_ns,    self.completed_ns -| admitted_ns,
-                cpu_ns,                       self.build_error == null,
+                cpu_ns,                       self.readers_stage_ns,        self.build_error == null,
             });
             self.completed.store(true, .release);
             if (self.resource_manager) |manager| manager.dense_checkpoint_ready.notify();
@@ -4431,7 +4433,53 @@ const ExperimentalPostingCheckpointBuild = struct {
         if (built) |value| {
             self.staged = value.staged;
             self.result = value.result;
+            if (@import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_STAGE_POSTING_READERS")) {
+                const readers_started_ns = nowNs();
+                defer self.readers_stage_ns = nowNs() -| readers_started_ns;
+                self.stageReaders() catch |err| {
+                    self.build_error = err;
+                    return;
+                };
+            }
         }
+    }
+
+    /// The immutable directory/index scan is independent of the writer's
+    /// growing WAL. Keep it off the mutation lane, and retain its mappings
+    /// until publication either validates them or discards this candidate.
+    fn stageReaders(self: *ExperimentalPostingCheckpointBuild) !void {
+        if (self.staged_readers != null) return;
+        const staged = self.staged orelse return error.MissingPostingCheckpoint;
+        const root = experimentalPostingRootState(self.source_generation) orelse return error.Corrupted;
+        // A caller's index allocator need not support concurrent mutations.
+        // Keep persistent worker-built readers on the process allocator; each
+        // root owns its allocator through the last query lease. Tests retain
+        // their checked allocator so staged/failing paths get leak coverage.
+        const read_alloc = if (builtin.is_test) self.owner_alloc else allocator();
+        const opened = try self.staging_store.openStagedReadersReusing(
+            read_alloc,
+            staged,
+            self.covered_source_sequence,
+            switch (self.kind) {
+                .full => .full,
+                .delta => .delta,
+                .compact_deltas => .compact_deltas,
+            },
+            root.retained_segments,
+        );
+        const state = try HBCIndex.loadExperimentalPostingStateFromOpenedOptions(
+            read_alloc,
+            self.metadata,
+            self.resource_manager,
+            opened,
+            self.covered_source_sequence,
+            false,
+        );
+        errdefer {
+            state.deinit();
+            read_alloc.destroy(state);
+        }
+        self.staged_readers = try ExperimentalPostingReadGeneration.createRoot(read_alloc, state);
     }
 
     fn buildAndStage(self: *ExperimentalPostingCheckpointBuild, build_alloc: Allocator) !?StagedExperimentalPostingCheckpoint {
@@ -4487,6 +4535,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     fn deinit(self: *ExperimentalPostingCheckpointBuild) void {
         self.awaitCompletion();
         if (self.owned_io) |*io_impl| io_impl.deinit();
+        if (self.staged_readers) |readers| readers.release();
         if (self.result) |result| if (result.segment_bytes.len != 0) allocator().free(result.segment_bytes);
         self.staging_store.deinit();
         self.source_generation.release();
@@ -8591,6 +8640,10 @@ pub const HBCIndex = struct {
     }
 
     fn decodeExperimentalPostingMetadata(self: *const HBCIndex, encoded: []const u8) !IndexMetadata {
+        return decodeExperimentalPostingMetadataForConfig(self.metadata, encoded);
+    }
+
+    fn decodeExperimentalPostingMetadataForConfig(expected: IndexMetadata, encoded: []const u8) !IndexMetadata {
         if (encoded.len != IndexMetadata.encoded_size and encoded.len != IndexMetadata.legacy_encoded_size)
             return error.CorruptedPostingMetadata;
         const metadata = IndexMetadata.decode(encoded);
@@ -8598,12 +8651,12 @@ pub const HBCIndex = struct {
         // generation. Comparing two copies only proves self-consistency and
         // would accept a future or corrupt format version on this build.
         if (metadata.version != vectorindex_hbc.hbc_index_version) return error.UnsupportedVersion;
-        if (metadata.dims != self.metadata.dims or
-            metadata.branching_factor != self.metadata.branching_factor or
-            metadata.leaf_size != self.metadata.leaf_size or
-            metadata.use_quantization != self.metadata.use_quantization or
-            metadata.quantizer_seed != self.metadata.quantizer_seed or
-            metadata.metric != self.metadata.metric)
+        if (metadata.dims != expected.dims or
+            metadata.branching_factor != expected.branching_factor or
+            metadata.leaf_size != expected.leaf_size or
+            metadata.use_quantization != expected.use_quantization or
+            metadata.quantizer_seed != expected.quantizer_seed or
+            metadata.metric != expected.metric)
         {
             return error.PostingCheckpointMetadataMismatch;
         }
@@ -9010,7 +9063,7 @@ pub const HBCIndex = struct {
         );
         defer prepared.deinit();
         const install_started_ns = nowNs();
-        try self.installPreparedExperimentalPostingCheckpointRebased(posting_store, &prepared, build.source_generation);
+        try self.installPreparedExperimentalPostingCheckpointRebased(posting_store, &prepared, build.source_generation, build.staged_readers);
         std.log.info("dense checkpoint handoff generation={} sequence={} kind={s} completed_wait_ns={} prepare_ns={} install_ns={} written_bytes={} retained_bytes={}", .{
             build.segment_generation,                 build.covered_source_sequence,                     @tagName(build.kind),
             prepare_started_ns -| build.completed_ns, install_started_ns -| prepare_started_ns,          nowNs() -| install_started_ns,
@@ -9046,7 +9099,7 @@ pub const HBCIndex = struct {
         posting_store: *posting_segment_store_mod.Store,
         prepared: *posting_segment_store_mod.Store.PreparedPublication,
     ) !void {
-        return self.installPreparedExperimentalPostingCheckpointRebased(posting_store, prepared, null);
+        return self.installPreparedExperimentalPostingCheckpointRebased(posting_store, prepared, null, null);
     }
 
     fn installPreparedExperimentalPostingCheckpointRebased(
@@ -9054,6 +9107,7 @@ pub const HBCIndex = struct {
         posting_store: *posting_segment_store_mod.Store,
         prepared: *posting_segment_store_mod.Store.PreparedPublication,
         captured: ?*ExperimentalPostingReadGeneration,
+        staged_readers: ?*ExperimentalPostingReadGeneration,
     ) !void {
         const started_ns = nowNs();
         const previous = self.retainCurrentExperimentalPostingReadGeneration();
@@ -9066,17 +9120,37 @@ pub const HBCIndex = struct {
                 experimentalPostingRootState(live) != experimentalPostingRootState(captured.?))
                 return error.PostingCheckpointSourceBoundaryMismatch;
         }
-        const state = try self.loadExperimentalPostingStateFromOpenedMode(
-            try prepared.openReadersReusing(if (previous) |old| experimentalPostingRootState(old).?.retained_segments else &.{}),
-            prepared.next.covered_source_sequence,
-            captured == null,
-        );
-        const readers_finished_ns = nowNs();
-        const base = ExperimentalPostingReadGeneration.createRoot(self.alloc, state) catch |err| {
-            state.deinit();
-            self.alloc.destroy(state);
-            return err;
+        const base = if (staged_readers) |ready| reuse: {
+            if (captured == null) return error.PostingCheckpointSourceBoundaryMismatch;
+            const checkpoint = prepared.next.checkpoint orelse return error.MissingPostingCheckpoint;
+            const state = ready.root orelse return error.PostingCheckpointSourceBoundaryMismatch;
+            if (ready.covered_source_sequence.load(.acquire) != checkpoint.covered_source_sequence or
+                state.retained_segments.len != checkpoint.segmentCount())
+                return error.PostingCheckpointSourceBoundaryMismatch;
+            for (state.retained_segments, 0..) |segment, i| {
+                if (!segment.matchesIdentity(prepared.next.root_dir, checkpoint.segment(i)))
+                    return error.PostingCheckpointSourceBoundaryMismatch;
+            }
+            // Reader staging intentionally did not rotate a WAL. Bind the
+            // private immutable root to the real publication's WAL identity;
+            // rebase below supplies exactly the newer committed mutations.
+            state.wal_generation = prepared.next.wal_generation;
+            ready.advanceDurableBoundary(checkpoint.covered_source_sequence, prepared.next.wal_generation, 0);
+            ready.retain();
+            break :reuse ready;
+        } else create: {
+            const state = try self.loadExperimentalPostingStateFromOpenedMode(
+                try prepared.openReadersReusing(if (previous) |old| experimentalPostingRootState(old).?.retained_segments else &.{}),
+                prepared.next.covered_source_sequence,
+                captured == null,
+            );
+            break :create ExperimentalPostingReadGeneration.createRoot(self.alloc, state) catch |err| {
+                state.deinit();
+                self.alloc.destroy(state);
+                return err;
+            };
         };
+        const readers_finished_ns = nowNs();
         defer base.release();
         const generation = if (captured) |source|
             try previous.?.rebaseOnto(source, base, prepared.next.covered_source_sequence, prepared.next.wal_generation, prepared.next.wal_committed_bytes, self.metadata.dims, self.metadata.use_quantization)
@@ -11534,27 +11608,38 @@ pub const HBCIndex = struct {
         expected_source_sequence: ?u64,
         replay_wal: bool,
     ) !*ExperimentalPostingReadState {
+        return loadExperimentalPostingStateFromOpenedOptions(self.alloc, self.metadata, self.resource_manager, source, expected_source_sequence, replay_wal);
+    }
+
+    fn loadExperimentalPostingStateFromOpenedOptions(
+        alloc: Allocator,
+        metadata_config: IndexMetadata,
+        resource_manager: ?*resource_manager_mod.ResourceManager,
+        source: posting_segment_store_mod.OpenedWithSegment,
+        expected_source_sequence: ?u64,
+        replay_wal: bool,
+    ) !*ExperimentalPostingReadState {
         var opened = source;
         defer opened.store.deinit();
         var retained_segments_owned = true;
         errdefer if (retained_segments_owned) {
-            for (opened.segments) |*retained| retained.deinit(self.alloc);
-            self.alloc.free(opened.segments);
+            for (opened.segments) |*retained| retained.deinit(alloc);
+            alloc.free(opened.segments);
         };
         if (opened.store.checkpoint == null) return error.MissingPostingCheckpoint;
         if (expected_source_sequence) |expected| if (opened.store.covered_source_sequence != expected) {
             return error.PostingCheckpointSequenceMismatch;
         };
 
-        const segments = try self.alloc.alloc(vectorindex_posting_segment.VerifiedReader, opened.segments.len);
+        const segments = try alloc.alloc(vectorindex_posting_segment.VerifiedReader, opened.segments.len);
         var segment_count: usize = 0;
         var segments_owned = true;
         errdefer if (segments_owned) {
             for (segments[0..segment_count]) |*segment| segment.deinit();
-            self.alloc.free(segments);
+            alloc.free(segments);
         };
         for (opened.segments, 0..) |retained, index| {
-            segments[index] = try vectorindex_posting_segment.VerifiedReader.init(self.alloc, retained.bytes());
+            segments[index] = try vectorindex_posting_segment.VerifiedReader.init(alloc, retained.bytes());
             segment_count += 1;
         }
         var encoded_metadata: ?[]const u8 = null;
@@ -11568,14 +11653,14 @@ pub const HBCIndex = struct {
             if (segment_index > 0 and (try segments[segment_index].getValue(0, .index_metadata_tombstone)) != null) break;
         }
         const metadata_bytes = encoded_metadata orelse return error.MissingHbcNativeMetadata;
-        _ = try self.decodeExperimentalPostingMetadata(metadata_bytes);
+        _ = try decodeExperimentalPostingMetadataForConfig(metadata_config, metadata_bytes);
         var wal = if (replay_wal) try opened.store.recoverWal() else empty: {
-            const bytes = try self.alloc.alloc(u8, 0);
-            errdefer self.alloc.free(bytes);
+            const bytes = try alloc.alloc(u8, 0);
+            errdefer alloc.free(bytes);
             break :empty posting_segment_store_mod.RecoveredWal{
-                .alloc = self.alloc,
+                .alloc = alloc,
                 .bytes = bytes,
-                .replay = try vectorindex_posting_wal.Replay.parse(self.alloc, bytes),
+                .replay = try vectorindex_posting_wal.Replay.parse(alloc, bytes),
             };
         };
         var wal_owned = true;
@@ -11607,21 +11692,21 @@ pub const HBCIndex = struct {
         // here: hashing the entire nested container would fault every metadata
         // page on an otherwise cold mmap.
         var vector_directory = if (try segments[0].getNestedContainer(0, .vector_directory)) |bytes|
-            try vectorindex_hbc_vector_directory.Reader.init(self.alloc, bytes)
+            try vectorindex_hbc_vector_directory.Reader.init(alloc, bytes)
         else
             null;
         var vector_directory_owned = vector_directory != null;
         errdefer if (vector_directory_owned) if (vector_directory) |*directory| directory.deinit();
         var quantized_directory = if (try segments[0].getNestedContainer(0, .quantized_directory)) |bytes|
-            try vectorindex_quantized_directory.VerifiedReader.init(self.alloc, bytes)
+            try vectorindex_quantized_directory.VerifiedReader.init(alloc, bytes)
         else
             null;
         var quantized_directory_owned = quantized_directory != null;
         errdefer if (quantized_directory_owned) if (quantized_directory) |*directory| directory.deinit();
-        const state = try self.alloc.create(ExperimentalPostingReadState);
-        errdefer self.alloc.destroy(state);
+        const state = try alloc.create(ExperimentalPostingReadState);
+        errdefer alloc.destroy(state);
         state.* = .{
-            .alloc = self.alloc,
+            .alloc = alloc,
             .covered_source_sequence = if (replay_wal) opened.store.covered_source_sequence else opened.store.checkpoint.?.covered_source_sequence,
             .wal_generation = opened.store.wal_generation,
             .retained_segments = opened.segments,
@@ -11636,10 +11721,10 @@ pub const HBCIndex = struct {
         quantized_directory_owned = false;
         var state_initialized = true;
         errdefer if (state_initialized) state.deinit();
-        if (self.resource_manager) |manager| try state.attachPatchCacheManager(manager);
+        if (resource_manager) |manager| try state.attachPatchCacheManager(manager);
         try state.materializeWal(&wal);
-        try state.loadDeltaScanBlocks(self.metadata.dims, self.metadata.metric);
-        try state.rebuildScanAdmission(self.metadata.dims, self.metadata.use_quantization);
+        try state.loadDeltaScanBlocks(metadata_config.dims, metadata_config.metric);
+        try state.rebuildScanAdmission(metadata_config.dims, metadata_config.use_quantization);
         // Materialized full values borrow from the recovered byte buffer; the
         // replay frame index itself is no longer needed after activation.
         state.wal_bytes = wal.bytes;
@@ -24017,6 +24102,8 @@ test "native suffix checkpoint preserves pinned readers tombstones and a concurr
         fn checkpoint(idx: *HBCIndex, kind: ExperimentalPostingCheckpointKind) !void {
             try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, kind));
             idx.experimental_posting_checkpoint_build.?.awaitCompletion();
+            try idx.experimental_posting_checkpoint_build.?.stageReaders();
+            try std.testing.expect(idx.experimental_posting_checkpoint_build.?.staged_readers != null);
             try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
         }
     };
@@ -24067,6 +24154,10 @@ test "native suffix checkpoint preserves pinned readers tombstones and a concurr
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(5, .{});
         if (idx.experimental_posting_checkpoint_build) |build| {
             build.awaitCompletion();
+            try build.stageReaders();
+            const staged = build.staged_readers.?;
+            try std.testing.expectEqual(@as(u64, 4), staged.covered_source_sequence.load(.acquire));
+            try std.testing.expect(staged.root.?.retained_segments[0].bytes().ptr == retained_base);
             try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
         }
         try std.testing.expectEqual(@as(usize, 1), idx.experimental_posting_write_store.?.deltaSegmentCount());
@@ -24125,6 +24216,14 @@ test "prepared posting activation rejects incompatible metadata before CURRENT a
     defer alloc.free(segment);
     var prepared = try posting_store.prepareCheckpoint(posting_store.latestSegmentGeneration().? + 1, 1, segment);
     defer prepared.deinit();
+    // A cached reader for another immutable file cannot bypass validation,
+    // even if its source sequence happens to be identical.
+    try std.testing.expectError(error.PostingCheckpointSourceBoundaryMismatch, idx.installPreparedExperimentalPostingCheckpointRebased(
+        posting_store,
+        &prepared,
+        original,
+        original,
+    ));
     try std.testing.expectError(error.PostingCheckpointMetadataMismatch, idx.installPreparedExperimentalPostingCheckpoint(posting_store, &prepared));
     try std.testing.expectEqual(original, idx.experimental_posting_read_generation.?);
     try std.testing.expectEqual(original_checkpoint, posting_store.checkpoint);

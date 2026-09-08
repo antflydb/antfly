@@ -52,16 +52,18 @@ def summarize_lines(lines, enabled):
             invalid.append(number)
     observed = publications["compact_deltas"] > 0
     reasons = []
+    if enabled is None:
+        reasons.append("No complete experiment-environment receipt")
     if invalid:
         reasons.append("Malformed or incomplete checkpoint evidence")
     if enabled and not observed:
         reasons.append("Suffix flag enabled but no suffix publication observed")
-    if not enabled and observed:
+    if enabled is False and observed:
         reasons.append("Suffix publication observed with the flag disabled")
     return {
         "suffix_enabled": enabled,
         "suffix_publication_observed": observed,
-        "treatment_exercised": enabled and observed and not invalid,
+        "treatment_exercised": enabled is True and observed and not invalid,
         "evidence_consistent": not reasons,
         "reasons": reasons,
         "invalid_lines": invalid,
@@ -80,6 +82,32 @@ def summarize_lines(lines, enabled):
     }
 
 
+def suffix_enabled_for_arm(arm, config, receipts):
+    if receipts is None:
+        environment = config.get("experiment_environment", {})
+        # The older harness records only a short environment allowlist.
+        # Absence there does not certify that the process had the flag off.
+        return environment[FLAG] == "1" if FLAG in environment else None
+    matches = [
+        row
+        for row in receipts
+        if len(row.get("command", [])) > 1
+        and Path(row["command"][1]).resolve() == arm.resolve()
+    ]
+    if len(matches) != 1:
+        raise ValueError("Missing or ambiguous matched-arm receipt")
+    row = matches[0]
+    if row.get("exit_code") != 0 or row.get("invalid_reason"):
+        raise ValueError("Arm has not completed with valid measurement inputs")
+    environment = row["environment"]
+    binary = environment["ANTFLY_BIN"]
+    if row["inputs_sha256"].get(binary) != config["antfly_binary_sha256"]:
+        raise ValueError("Arm and harness binary receipts disagree")
+    # The matched runner scrubs inherited experiment variables and records
+    # the complete controlled environment, so absence here does mean off.
+    return environment.get(FLAG) == "1"
+
+
 def summarize_arm(arm):
     config = json.loads((arm / "run-config.json").read_text())
     # This receipt is written only after live, mixed and reopened profiles.
@@ -90,7 +118,11 @@ def summarize_arm(arm):
     # Hash and parse the same bytes; do not combine an old receipt with a
     # concurrently changed log. Run after the arm has completed.
     data = log.read_bytes()
-    enabled = config.get("experiment_environment", {}).get(FLAG) == "1"
+    matrix_receipt = arm.parent / "ab-runs.json"
+    receipts = (
+        json.loads(matrix_receipt.read_text()) if matrix_receipt.exists() else None
+    )
+    enabled = suffix_enabled_for_arm(arm, config, receipts)
     return {
         "arm": str(arm),
         "case": config["case"],
