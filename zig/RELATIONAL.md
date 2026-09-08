@@ -556,7 +556,7 @@ that domain. A mapping selects noncontiguous global inputs without including
 intervening cold families. Publication relocates exact input IDs and recomputes
 the domain closure after an unlocked build. Changed closures reject stale work.
 Global L0 pressure still drains small domains, input-byte admission still applies,
-and a single nonoverlapping input moves levels through the manifest without
+and a single nonoverlapping input without tombstones moves levels through the manifest without
 rewriting its SST. Existing mixed SSTs use the complete global overlap closure
 until reshaped; they are never hidden from a domain-local read or merge.
 Payloads remain ordinary LSM values: payload-domain compaction can rewrite them,
@@ -586,16 +586,96 @@ shared descriptors never acquire unsynchronized lazy Bloom-filter ownership.
 The topology is built lazily once per version under the backend mutex, not once
 per key. SST I/O remains outside the writer lock.
 
-Mutable snapshots retain immutable entry allocations and copy/sort only their
-ordered index. Values overwritten after a snapshot remain alive until their
-last owner releases them; unreferenced overwritten bytes are reclaimed without
-waiting for a whole arena to flush. This does **not** make mutable snapshot
-creation O(1): index construction remains O(keys log keys), and retained-state
-pressure accounting is conservative when states share bytes. It removes
-whole-value copying without forcing smaller flushes or additional SSTs.
+Mutable snapshots now pin a reference-counted, rank-indexed AVL root in O(1).
+Writers mutate unique paths and copy shared paths; edits reserve node capacity
+before changing either index. Forward merge cursors traverse tree edges in
+amortized O(1) per entry. Transaction-local batches keep only the hash index;
+admission includes the ordered nodes and potential path copies at publication.
+Values overwritten after a snapshot remain alive until their last owner
+releases them. The primary store no longer rotates memtables to open ordinary
+read snapshots; configured write, WAL, idle and retention limits still apply.
+Retained-state accounting remains conservative across epochs sharing bytes.
+The active ordered index adds one AVL node per key plus a bounded spare pool;
+this is a memory-for-snapshot-latency tradeoff, especially for narrow values,
+and is included in the memory guard rather than hidden from it.
+Mutable allocation charges are incremental and immutable charges are frozen
+at publication, so memory guards no longer rescan every key on narrow writes.
 `mutable_snapshot_clone_bytes_total` now counts copied index/owned bytes rather
 than counting shared payload bytes as copies. `read_version_builds` and
 `read_version_pins` distinguish topology publication from request pinning.
+
+Domain membership, global level budgets and complete overlap components are
+cached once per published run version. `domain_index_builds` exposes rebuilds.
+Selection retains normalized pressure scores across domains and uses the same
+global level targets as maintenance debt accounting. A collection of individually
+small domains can no longer strand global lower-level debt.
+
+Manifest v10 records each run's tombstone count. The existing main-branch v9
+manifest remains readable with unknown counts until runs are rewritten; no
+historical relational format is retained. Ordinary compaction drops tombstones
+only with complete all-level coverage. Below ordinary level thresholds,
+maintenance schedules a complete overlapping SST component containing deletes,
+including singleton runs. To avoid rewriting mostly live data after every small
+delete, standalone GC defaults to at least 50% of the largest input's key count
+in tombstones. It does not sum duplicate older versions into that denominator:
+fully retired components still qualify, even with many historical copies.
+Ordinary compaction elides covered deletes regardless of this threshold.
+Selection prefers the smallest eligible component and honors
+input, scheduler and IO budgets, including the configured oversized-single-job
+exception. Strict budgets can defer a larger component until reconfigured.
+Publication revalidates exact input IDs, levels and all-level coverage after
+the unlocked streaming build. Empty output atomically retires every input.
+Pinned readers retain their old files; actual deletion still waits for reader
+release, manifest publication and the configured grace period. The
+`tombstone_entries` maintenance counter exposes remaining known delete debt.
+
+Development-host measurements for this redesign:
+
+| Fixture | Before | After |
+| --- | ---: | ---: |
+| 40,000 single-row writes, 8-byte values, guarded, median | 1.722 s | 0.691 s |
+| 8,192 narrow keys / 32 snapshot setups, median | 95.595 ms | 0.003 ms |
+| Descriptor bytes copied by those snapshots | 16 MiB | 0 |
+| 24 unique-key insert/delete generations after maintenance | Retained delete entries | 0 SSTs |
+
+The write fixture uses ReleaseFast, three samples, memory-backed real WAL/SST
+encoding, a 64 MiB byte guard and no intermediate row-count flush. Accounting
+alone measured 0.666 s; the ordered index adds about 4% to that narrow-write
+fixture. The snapshot fixture uses ReleaseSafe and five alternating samples;
+it measures root pin/release and point lookup, not end-to-end request latency.
+The churn regression keeps an old reader during GC, reopens the store repeatedly,
+and verifies old/current visibility and physical reclamation (539 bytes peak
+retained files for this tiny fixture). These are diagnostics, not timing gates
+or a universal physical-to-live-byte bound.
+
+The native production-shaped churn fixture compares eager standalone GC with
+the 50% trigger using otherwise identical primary options (ReleaseFast, one
+sample per policy, 16 overwrite batches followed by deleting half the rows):
+
+| GC policy | SST bytes written | Peak SST+WAL | Settled SST+WAL |
+| --- | ---: | ---: | ---: |
+| Eager | 29,307,851 | 8,265,193 | 2,768,258 |
+| 50% trigger | 17,283,948 | 8,529,796 | 3,055,160 |
+
+The threshold avoids about 41% of eager-GC SST writes while retaining about
+10% more settled bytes in this fixture. WAL writes are identical (10,093,136
+bytes). Batch median/max times were 23.115/23.956 ms and 22.826/23.977 ms;
+these single-run timings do not establish a latency improvement. Both policies
+validate pinned-reader visibility, payload ownership and an integer projection
+reading 1,050 payload bytes with zero primary-row reads.
+
+Reproduce the narrow-write measurement with:
+
+```sh
+zig build lsm-write-bench -Doptimize=ReleaseFast -- \
+  --samples 3 --keys 40000 --batch-size 1 --value-size 8 \
+  --storage memory --mode default --workload-set ingest_compact \
+  --flush-threshold 1000000 --flush-threshold-bytes 67108864
+```
+
+The storage test filters `ordered mutable snapshot setup benchmark`,
+`lsm tombstone GC bounds unique key churn`, and
+`production LSM physical churn benchmark` reproduce the other fixtures.
 
 Column read scopes expose snapshot-consistent sorted multi-get with scope-local
 result ownership. Predicate metadata is gathered in bounded batches; payload

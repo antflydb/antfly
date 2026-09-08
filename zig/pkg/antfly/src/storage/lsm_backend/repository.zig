@@ -58,6 +58,7 @@ pub const Run = struct {
     largest_namespace_name: ?[]u8,
     largest_key: []u8,
     entry_count: u32,
+    tombstone_count: ?u32 = null,
     bloom_filter: ?bloom.OwnedFilter,
     owns_metadata: bool = true,
     owns_path: bool = false,
@@ -170,6 +171,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
         .largest_namespace_name = largest_namespace_name,
         .largest_key = largest_key,
         .entry_count = source.entry_count,
+        .tombstone_count = source.tombstone_count,
         .bloom_filter = if (source.bloom_filter) |filter| try filter.clone(allocator) else null,
         .cached_state_index = null,
         .cached_index_index = null,
@@ -207,6 +209,7 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
         .largest_namespace_name = largest_namespace_name,
         .largest_key = largest_key,
         .entry_count = source.entry_count,
+        .tombstone_count = source.tombstone_count,
         .bloom_filter = null,
         .owns_bloom_filter = false,
         .cached_state_index = null,
@@ -292,6 +295,7 @@ pub fn loadManifestIfPresentWithStorage(
             .largest_namespace_name = if (meta.largest_namespace_name) |name| @constCast(name) else null,
             .largest_key = @constCast(meta.largest_key),
             .entry_count = meta.entry_count,
+            .tombstone_count = meta.tombstone_count,
             .bloom_filter = null,
             .owns_metadata = false,
             .owns_path = true,
@@ -504,6 +508,7 @@ pub fn persistManifestWithStorageCount(
             .largest_namespace_name = run.largest_namespace_name,
             .largest_key = run.largest_key,
             .entry_count = run.entry_count,
+            .tombstone_count = run.tombstone_count,
         };
     }
 

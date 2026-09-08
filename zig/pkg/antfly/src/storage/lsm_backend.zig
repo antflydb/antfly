@@ -385,6 +385,10 @@ pub const Options = struct {
     level_target_bytes_multiplier: usize = 8,
     max_compaction_input_bytes: u64 = 0,
     max_compaction_input_allow_oversized_single_job: bool = true,
+    // Standalone GC waits for this percentage of the largest input's key
+    // count in tombstones. Summing all versions would strand deleted keys
+    // behind duplicate older values. Ordinary compaction reclaims eagerly.
+    tombstone_gc_min_percent: u8 = 50,
     // Preferred logical payload target used to shape runs.
     max_run_file_bytes: usize = 512 * 1024 * 1024,
     // Hard physical publication bound. Keep this no larger than the reader
@@ -440,7 +444,8 @@ pub const Options = struct {
     root_generation: u64 = 0,
     obsolete_retention_ns: u64 = 250 * std.time.ns_per_ms,
     obsolete_delete_retry_ns: u64 = 250 * std.time.ns_per_ms,
-    read_snapshot_rotate_mutable_bytes: u64 = 256 * 1024,
+    // Root-pinned ordered snapshots need no read-triggered flush by default.
+    read_snapshot_rotate_mutable_bytes: u64 = 0,
     // Per-scan cap; 0 disables bulk current-scan mutable cloning.
     bulk_ingest_current_scan_clone_max_bytes: u64 = 256 * 1024 * 1024,
     // Aggregate active clone cap; 0 leaves aggregate admission uncapped.
@@ -782,6 +787,8 @@ pub const Backend = struct {
 
     pub const MaintenanceStats = struct {
         read_version_builds: u64 = 0,
+        domain_index_builds: u64 = 0,
+        tombstone_entries: u64 = 0,
         read_version_pins: u64 = 0,
         mutable_entries: u64 = 0,
         mutable_bytes: u64 = 0,
@@ -889,6 +896,8 @@ pub const Backend = struct {
 
     pub fn accumulateMaintenanceStats(dst: *MaintenanceStats, src: MaintenanceStats) void {
         dst.read_version_builds +|= src.read_version_builds;
+        dst.domain_index_builds +|= src.domain_index_builds;
+        dst.tombstone_entries +|= src.tombstone_entries;
         dst.read_version_pins +|= src.read_version_pins;
         dst.mutable_entries +|= src.mutable_entries;
         dst.mutable_bytes +|= src.mutable_bytes;
@@ -1547,6 +1556,8 @@ pub const Backend = struct {
     recovery_replaying_wal: bool = false,
     runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty,
     read_version: ?*runtime_mod.ReadVersion = null,
+    domain_index: ?*compaction_mod.DomainIndex = null,
+    domain_index_builds: u64 = 0,
     read_version_builds: u64 = 0,
     read_version_pins: u64 = 0,
 
@@ -2027,6 +2038,7 @@ pub const Backend = struct {
     fn snapshotMaintenanceStatsLockedWithOptions(self: *Backend, include_retention: bool) MaintenanceStats {
         var stats = MaintenanceStats{
             .read_version_builds = self.read_version_builds,
+            .domain_index_builds = self.domain_index_builds,
             .read_version_pins = self.read_version_pins,
             .mutable_entries = @intCast(self.mutable.entries.items.len),
             .mutable_bytes = estimateStateBytes(&self.mutable),
@@ -2106,6 +2118,7 @@ pub const Backend = struct {
             while (i < self.runs.items.len and self.runs.items[i].level == level) : (i += 1) {
                 const run = self.runs.items[i];
                 level_bytes += run.size_bytes;
+                stats.tombstone_entries +|= run.tombstone_count orelse 0;
                 stats.total_run_logical_entry_bytes +|= run.compression_stats.logical_entry_bytes;
                 stats.total_run_physical_entry_bytes +|= run.compression_stats.physical_entry_bytes;
                 stats.total_run_compressed_blocks +|= run.compression_stats.compressed_blocks;
@@ -2350,6 +2363,7 @@ pub const Backend = struct {
         var l0_bytes: u64 = 0;
         var level_overflow_runs: u64 = 0;
         var level_overflow_bytes: u64 = 0;
+        var has_tombstones = false;
         var i: usize = 0;
         while (i < self.runs.items.len) {
             const level = self.runs.items[i].level;
@@ -2357,6 +2371,7 @@ pub const Backend = struct {
             var level_bytes: u64 = 0;
             while (i < self.runs.items.len and self.runs.items[i].level == level) : (i += 1) {
                 level_bytes += self.runs.items[i].size_bytes;
+                has_tombstones = has_tombstones or (self.runs.items[i].tombstone_count orelse 0) > 0;
             }
 
             const level_len = i - start;
@@ -2389,6 +2404,7 @@ pub const Backend = struct {
 
         score +|= level_overflow_runs * 500;
         score +|= level_overflow_bytes / (64 * 1024);
+        if (has_tombstones and compaction_mod.hasTombstoneGcDebt(self)) score +|= 1;
         score +|= self.walRetentionPressureScoreLocked();
         if (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()) score +|= 1;
         return score;
@@ -2438,6 +2454,7 @@ pub const Backend = struct {
 
     fn estimateInMemoryStateBytesLocked(self: *const Backend) u64 {
         var bytes = estimateStateBytes(&self.mutable);
+        if (self.domain_index) |index| bytes +|= index.memoryBytes();
         for (self.activeImmutableMemtables()) |state| {
             bytes +|= estimateStateBytes(state);
         }
@@ -2581,12 +2598,13 @@ pub const Backend = struct {
             else
                 false;
             if (!defer_soft_compaction) {
-                _ = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
+                const compacted = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
                     Backend,
                     self,
                     if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
                     score,
                 );
+                if (!compacted) _ = try compaction_mod.compactTombstonesScheduled(Backend, self, score);
             }
         }
         // Hard L0/WAL bounds remain authoritative even while latency-sensitive
@@ -2804,6 +2822,7 @@ pub const Backend = struct {
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.cloneMutableStateWithReason(reason);
+        snapshot.freezeMemoryAccounting();
         errdefer snapshot.deinit(self.allocator);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         try self.retired_mutable_snapshot_by_state.ensureUnusedCapacity(self.allocator, 1);
@@ -2877,6 +2896,7 @@ pub const Backend = struct {
         const snapshot_bytes = estimateStateBytes(&snapshot);
         if (!self.canAdmitBulkIngestCurrentScanClone(snapshot_bytes)) {
             self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
+            snapshot.deinit(self.allocator);
             return null;
         }
         self.bulk_ingest_current_scan_clone_active_bytes +|= snapshot_bytes;
@@ -3043,6 +3063,7 @@ pub const Backend = struct {
     }
 
     fn estimateStateBytes(state: anytype) u64 {
+        if (comptime @hasDecl(@TypeOf(state.*), "estimatedMemoryBytes")) return state.estimatedMemoryBytes();
         var total: u64 = @as(u64, @intCast(state.entries.capacity)) * @sizeOf(state_mod.OwnedEntry);
         if (state.arena_owner) |arena| {
             // Arena frees are intentionally deferred until the whole memtable
@@ -3200,9 +3221,14 @@ pub const Backend = struct {
     /// a non-blocking pre-WAL rejection.
     pub fn enforceMutableWriteAdmission(self: *Backend, incoming: *const ActiveMemTable) !void {
         const manager = self.options.resource_manager orelse return;
-        const incoming_bytes = estimateStateBytes(incoming);
-
         while (true) {
+            // Transaction-local batches have no ordered index. Include the
+            // published nodes, spare pool and worst-case shared-path copies
+            // before WAL admission. Recompute after local draining.
+            const incoming_bytes = estimateStateBytes(incoming) +| self.mutable.ordered.admissionGrowthBytes(
+                incoming.entryCount(),
+                self.mutable_read_snapshot != null or self.retired_mutable_snapshots.items.len != 0 or self.bulk_ingest_current_scan_clone_active_bytes != 0,
+            );
             const decision = manager.admissionDecision(.lsm_in_memory_state, incoming_bytes);
             switch (decision.action) {
                 .report, .shrink_cache, .defer_background_work => return,
@@ -4473,9 +4499,19 @@ pub const Backend = struct {
     }
 
     pub fn invalidateReadVersion(self: *Backend) void {
+        if (self.domain_index) |index| index.destroy(self.allocator);
+        self.domain_index = null;
         const version = self.read_version orelse return;
         self.read_version = null;
         version.release(self);
+    }
+
+    pub fn domainIndex(self: *Backend) !*const compaction_mod.DomainIndex {
+        if (self.domain_index == null) {
+            self.domain_index = try compaction_mod.DomainIndex.create(self);
+            self.domain_index_builds +|= 1;
+        }
+        return self.domain_index.?;
     }
 
     pub fn retainRunSnapshotRef(_: *Backend, run: *Run) !void {
@@ -7628,15 +7664,17 @@ test "lsm backend rejects aggregate hard throttle without waiting" {
 }
 
 test "lsm backend resource manager rejects before wal apply" {
-    var sample: ActiveMemTable = .{};
+    var sample: ActiveMemTable = .{ .ordered_enabled = false };
     defer sample.deinit(std.testing.allocator);
     try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
     const one_memtable_bytes = Backend.estimateStateBytes(&sample);
+    const empty: ActiveMemTable = .{};
+    const admission_bytes = one_memtable_bytes + empty.ordered.admissionGrowthBytes(1, false);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
-        .soft_limit_bytes = one_memtable_bytes,
-        .hard_limit_bytes = one_memtable_bytes + one_memtable_bytes / 2,
+        .soft_limit_bytes = admission_bytes,
+        .hard_limit_bytes = admission_bytes + one_memtable_bytes / 2,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
     policies[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].hard_action = .reject_work;
@@ -15034,7 +15072,7 @@ test "lsm backend attributes mutable snapshot clones by reader class" {
     try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_calls);
     try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].calls);
     try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.namespace_read_txn)].calls);
-    try std.testing.expect(maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].bytes_total > 0);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].bytes_total);
 
     {
         var txn = try backend.beginWrite();
@@ -16222,6 +16260,8 @@ test "lsm backend open manifest version refs pin obsolete files across handles" 
         .backend = .{ .read_only = true },
         .obsolete_retention_ns = 0,
     });
+    var reader_open = true;
+    defer if (reader_open) reader.close();
 
     {
         var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
@@ -16232,6 +16272,9 @@ test "lsm backend open manifest version refs pin obsolete files across handles" 
         try txn.commit();
     }
 
+    // Tombstone GC is useful work even while an older manifest is pinned.
+    // Once it settles, identical pinned-obsolete manifests remain idle.
+    while (try writer.runMaintenanceStep()) {}
     var stats = writer.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), stats.obsolete_paths);
     try std.testing.expectEqual(@as(u64, 1), stats.obsolete_paths_pinned_by_versions);
@@ -16250,6 +16293,7 @@ test "lsm backend open manifest version refs pin obsolete files across handles" 
     }
 
     reader.close();
+    reader_open = false;
     try std.testing.expect(try writer.runMaintenanceStep());
     stats = writer.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths);
@@ -16979,6 +17023,102 @@ test "lsm shared read versions reuse topology and scoped batches preserve old va
         try std.testing.expectEqualStrings("old", batch_values[0][0].?);
         try std.testing.expectEqualStrings("old", batch_values[1][0].?);
     }
+}
+
+test "lsm domain planning index is reused until run publication" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .run_partition_key = struct {
+            fn key(bytes: []const u8) []const u8 {
+                return bytes;
+            }
+        }.key,
+        .compact_threshold_runs = 1,
+        .max_compaction_input_bytes = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+    try appendStateLevelRunsForTest(&backend, 0, 16);
+    for (0..20) |_| {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+    }
+    try std.testing.expectEqual(@as(u64, 1), backend.domain_index_builds);
+    backend.invalidateReadVersion();
+    _ = try backend.domainIndex();
+    try std.testing.expectEqual(@as(u64, 2), backend.domain_index_builds);
+}
+
+test "lsm tombstone GC bounds unique key churn and preserves old readers across reopen" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    const options = Options{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1000,
+        .l0_soft_limit_runs = 1000,
+        .l0_hard_limit_runs = 1000,
+        .l0_overlap_compact_threshold_runs = 0,
+        .obsolete_retention_ns = 0,
+        .obsolete_delete_retry_ns = 0,
+    };
+    var backend = try Backend.open(alloc, "/tombstone-churn", options);
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+    var retained_peak: u64 = 0;
+    for (0..24) |round| {
+        var key: [24]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "block:{d:0>6}", .{round});
+        {
+            var write = try backend.beginWrite();
+            try write.put(.{}, name, "obsolete payload");
+            try write.commit();
+        }
+        var old = try backend.beginRead();
+        var old_open = true;
+        defer if (old_open) old.abort();
+        {
+            var write = try backend.beginWrite();
+            try write.delete(.{}, name);
+            try write.commit();
+        }
+        // Below all ordinary compaction thresholds, durable tombstone debt
+        // still schedules a complete overlap component and an empty output.
+        try std.testing.expect(backend.snapshotMaintenanceStats().tombstone_entries > 0);
+        if (round == 0) {
+            var read_options = options;
+            read_options.backend.read_only = true;
+            var reopened = try Backend.open(alloc, "/tombstone-churn", read_options);
+            defer reopened.close();
+            try std.testing.expectEqual(@as(u64, 1), reopened.snapshotMaintenanceStats().tombstone_entries);
+        }
+        for (0..16) |_| {
+            if (!try backend.runMaintenanceStep()) break;
+        }
+        try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+        try std.testing.expectEqualStrings("obsolete payload", try old.get(.{}, name));
+        var retained_bytes: u64 = 0;
+        var files = storage.files.valueIterator();
+        while (files.next()) |bytes| retained_bytes += bytes.len;
+        retained_peak = @max(retained_peak, retained_bytes);
+        old.abort();
+        old_open = false;
+        for (0..16) |_| {
+            if (!try backend.runMaintenanceStep()) break;
+        }
+        try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().tombstone_entries);
+        try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, name));
+        if (round % 4 == 0) {
+            backend.close();
+            backend_open = false;
+            backend = try Backend.open(alloc, "/tombstone-churn", options);
+            backend_open = true;
+            try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+        }
+    }
+    std.debug.print("\nLSM unique-key churn: 24 generations, settled SSTs=0, peak retained file bytes={d}\n", .{retained_peak});
 }
 
 test "lsm shared read version point setup benchmark" {

@@ -95,7 +95,8 @@ test "primary LSM isolates relational payload generations from metadata" {
 
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
-    .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
+    // Immutable ordered roots make snapshot setup independent of table size.
+    .read_snapshot_rotate_mutable_bytes = 0,
     // Preserve throughput batching while bounding retained WAL for every
     // workload shape. Meaningful bursts checkpoint promptly; low-rate tables
     // accumulate instead of producing one run per write and checkpoint at the
@@ -599,7 +600,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(@TypeOf(opts.graph_reverse_lsm_options.table_prefix_extractor), .first_separator), opts.graph_reverse_lsm_options.table_prefix_extractor);
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
-    try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
+    try std.testing.expectEqual(@as(u64, 0), primary_opts.read_snapshot_rotate_mutable_bytes);
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), primary_opts.mutable_idle_flush_after_ns);
     try std.testing.expectEqual(@as(u64, mib), primary_opts.mutable_idle_flush_min_bytes);
     try std.testing.expectEqual(@as(u64, 5 * 60 * std.time.ns_per_s), primary_opts.mutable_idle_flush_max_age_ns);

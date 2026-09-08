@@ -23,6 +23,7 @@ import subprocess
 import threading
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -611,7 +612,7 @@ def directory_inventory(path: Path | None, limit: int = 32) -> dict[str, Any] | 
 
 
 def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | None:
-    """Decode Antfly LSM v8 run ownership without opening or mutating the store."""
+    """Decode LSM run ownership without opening or mutating the store."""
     try:
         raw = manifest_path.read_bytes()
         if len(raw) < 28 or raw[:8] != b"ALSMMAN1":
@@ -619,8 +620,16 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
         offset = 8
         version = struct.unpack_from("<I", raw, offset)[0]
         offset += 4
-        if version != 8:
+        if version not in (8, 9, 10):
             return None
+        if version >= 9:
+            if (
+                len(raw) < 32
+                or zlib.crc32(raw[:-4])
+                != struct.unpack_from("<I", raw, len(raw) - 4)[0]
+            ):
+                return None
+            raw = raw[:-4]
         next_run_id = struct.unpack_from("<Q", raw, offset)[0]
         offset += 8
         run_count, obsolete_count = struct.unpack_from("<II", raw, offset)
@@ -654,6 +663,14 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
             offset += 20
             entry_count = struct.unpack_from("<I", raw, offset)[0]
             offset += 4
+            tombstone_count = None
+            if version >= 10:
+                count = struct.unpack_from("<Q", raw, offset)[0]
+                offset += 8
+                if count != (1 << 64) - 1:
+                    if count > entry_count:
+                        return None
+                    tombstone_count = count
             (
                 path_length,
                 smallest_namespace_length,
@@ -679,6 +696,7 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
                     "level": level,
                     "size_bytes": size_bytes,
                     "entry_count": entry_count,
+                    "tombstone_count": tombstone_count,
                     "logical_entry_bytes": run_logical_entry_bytes,
                     "physical_entry_bytes": run_physical_entry_bytes,
                     "raw_blocks": run_raw_blocks,

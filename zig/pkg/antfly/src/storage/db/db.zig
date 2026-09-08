@@ -64349,6 +64349,11 @@ test "relational columnar production LSM staging snapshot benchmark" {
 }
 
 test "relational columnar production LSM physical churn benchmark" {
+    try productionLsmPhysicalChurnBenchmark(0);
+    try productionLsmPhysicalChurnBenchmark(50);
+}
+
+fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -64356,6 +64361,7 @@ test "relational columnar production LSM physical churn benchmark" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
     var options = db_config.primary_lsm_options_default;
+    options.tombstone_gc_min_percent = gc_min_percent;
     // Exercise real persisted files; make only the obsolete-file grace period
     // deterministic. Pinned readers must still prevent premature reclamation.
     options.obsolete_retention_ns = 0;
@@ -64431,11 +64437,16 @@ test "relational columnar production LSM physical churn benchmark" {
     try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
     std.mem.sort(u64, &mutation_ns, {}, std.sort.asc(u64));
     const after = backend.snapshotWriteStats();
-    std.debug.print("\nproduction LSM physical churn: SST/WAL written={d}/{d}, peak/settled SST+WAL={d}/{d}, batch median/max ns={d}/{d}, live column payload={d}, projected payload bytes={d}\n", .{
-        after.table_file_bytes - before.table_file_bytes,              after.wal_append_bytes - before.wal_append_bytes,
-        peak_physical,                                                 try Size.physical(backend),
-        mutation_ns[8],                                                mutation_ns[15],
-        try relational_columns.payloadStorageBytesForTest(&db, alloc), stats.payload_bytes_read,
+    std.debug.print("\nproduction LSM physical churn: GC minimum={d}%, SST/WAL written={d}/{d}, peak/settled SST+WAL={d}/{d}, batch median/max ns={d}/{d}, live column payload={d}, projected payload bytes={d}\n", .{
+        gc_min_percent,
+        after.table_file_bytes - before.table_file_bytes,
+        after.wal_append_bytes - before.wal_append_bytes,
+        peak_physical,
+        try Size.physical(backend),
+        mutation_ns[8],
+        mutation_ns[15],
+        try relational_columns.payloadStorageBytesForTest(&db, alloc),
+        stats.payload_bytes_read,
     });
 }
 

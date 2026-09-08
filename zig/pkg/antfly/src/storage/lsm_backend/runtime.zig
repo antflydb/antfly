@@ -119,7 +119,7 @@ fn bulkStateHasDuplicateKeys(allocator: Allocator, state: *const State) !bool {
             gop.value_ptr.* = std.ArrayListUnmanaged(usize).empty;
         } else {
             for (gop.value_ptr.items) |existing_idx| {
-                const existing = state.entries.items[existing_idx];
+                const existing = state.entryAt(existing_idx);
                 if (compareEntryTo(existing, namespace, entry.key) == .eq) return true;
             }
         }
@@ -514,14 +514,14 @@ pub fn BoundCursor(comptime StateType: type) type {
         pub fn last(self: *@This()) !?backend_adapter.Entry {
             const idx = self.lastIndex() orelse return null;
             self.current = idx;
-            return self.state.entries.items[idx].entry();
+            return self.state.entryAt(idx).entry();
         }
 
         pub fn next(self: *@This()) !?backend_adapter.Entry {
             const current = self.current orelse return null;
             var idx = current + 1;
-            while (idx < self.state.entries.items.len) : (idx += 1) {
-                if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) == .eq) {
+            while (idx < self.state.entryCount()) : (idx += 1) {
+                if (compareNamespace(namespaceOf(self.state.entryAt(idx)), self.namespace) == .eq) {
                     self.current = idx;
                     return self.entryIfBeforeUpper(idx);
                 }
@@ -534,9 +534,9 @@ pub fn BoundCursor(comptime StateType: type) type {
             if (current == 0) return null;
             var idx = current - 1;
             while (true) {
-                if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) == .eq) {
+                if (compareNamespace(namespaceOf(self.state.entryAt(idx)), self.namespace) == .eq) {
                     self.current = idx;
-                    return self.state.entries.items[idx].entry();
+                    return self.state.entryAt(idx).entry();
                 }
                 if (idx == 0) break;
                 idx -= 1;
@@ -546,24 +546,24 @@ pub fn BoundCursor(comptime StateType: type) type {
 
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
             const idx = self.state.lowerBound(self.namespace, key);
-            if (idx >= self.state.entries.items.len) return null;
-            if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) != .eq) return null;
+            if (idx >= self.state.entryCount()) return null;
+            if (compareNamespace(namespaceOf(self.state.entryAt(idx)), self.namespace) != .eq) return null;
             self.current = idx;
             return self.entryIfBeforeUpper(idx);
         }
 
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
             const idx = self.state.lowerBound(self.namespace, key);
-            if (idx < self.state.entries.items.len and compareEntryTo(self.state.entries.items[idx], self.namespace, key) == .eq) {
+            if (idx < self.state.entryCount() and compareEntryTo(self.state.entryAt(idx), self.namespace, key) == .eq) {
                 self.current = idx;
-                return self.state.entries.items[idx].entry();
+                return self.state.entryAt(idx).entry();
             }
             if (idx == 0) return null;
             var probe = idx - 1;
             while (true) {
-                if (compareNamespace(namespaceOf(self.state.entries.items[probe]), self.namespace) == .eq) {
+                if (compareNamespace(namespaceOf(self.state.entryAt(probe)), self.namespace) == .eq) {
                     self.current = probe;
-                    return self.state.entries.items[probe].entry();
+                    return self.state.entryAt(probe).entry();
                 }
                 if (probe == 0) break;
                 probe -= 1;
@@ -573,23 +573,23 @@ pub fn BoundCursor(comptime StateType: type) type {
 
         fn firstIndex(self: *const @This()) ?usize {
             const idx = self.state.lowerBound(self.namespace, "");
-            if (idx >= self.state.entries.items.len) return null;
-            if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) != .eq) return null;
+            if (idx >= self.state.entryCount()) return null;
+            if (compareNamespace(namespaceOf(self.state.entryAt(idx)), self.namespace) != .eq) return null;
             return idx;
         }
 
         fn lastIndex(self: *const @This()) ?usize {
-            if (self.state.entries.items.len == 0) return null;
-            var idx = self.state.entries.items.len;
+            if (self.state.entryCount() == 0) return null;
+            var idx = self.state.entryCount();
             while (idx > 0) {
                 idx -= 1;
-                if (compareNamespace(namespaceOf(self.state.entries.items[idx]), self.namespace) == .eq) return idx;
+                if (compareNamespace(namespaceOf(self.state.entryAt(idx)), self.namespace) == .eq) return idx;
             }
             return null;
         }
 
         fn entryIfBeforeUpper(self: *const @This(), idx: usize) ?backend_adapter.Entry {
-            const entry = self.state.entries.items[idx].entry();
+            const entry = self.state.entryAt(idx).entry();
             if (!self.keyBeforeUpper(entry.key)) return null;
             return entry;
         }
@@ -644,6 +644,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         cursor_storage: []align(cursor_storage_alignment) u8 = &.{},
         visible_entry_bytes: VisibleBytes = .none,
         mutable_source_entry_bytes: ?[]u8 = null,
+        mutable_entry_cursor: State.EntryCursor = .{},
         current_key: ?[]const u8 = null,
         current_visible_source: ?usize = null,
         upper_bound: ?[]const u8 = null,
@@ -1079,17 +1080,17 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn sourceEntryAt(self: *@This(), source_index: usize, idx: usize) !SourceEntry {
             if (source_index == 0) {
                 if (comptime MutableType == ActiveMemTable) return try self.copyMutableSourceEntryAt(idx);
-                const entry = self.mutable.entries.items[idx];
+                const entry = self.mutable_entry_cursor.at(self.mutable, idx);
                 return .{ .namespace_name = namespaceOf(entry).name, .key = entry.key, .value = entry.value, .tombstone = entry.tombstone };
             }
             if (self.immutableForSource(source_index)) |state| {
-                const entry = state.entries.items[idx];
+                const entry = state.entryAt(idx);
                 return .{ .namespace_name = namespaceOf(entry).name, .key = entry.key, .value = entry.value, .tombstone = entry.tombstone };
             }
 
             const run = try self.runForSource(source_index);
             if (run.state) |*state| {
-                const entry = state.entries.items[idx];
+                const entry = state.entryAt(idx);
                 return .{ .namespace_name = namespaceOf(entry).name, .key = entry.key, .value = entry.value, .tombstone = entry.tombstone };
             }
 
@@ -1186,6 +1187,20 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn advanceSource(self: *@This(), source_index: usize, current: usize) !void {
             if (source_index == 0 and comptime MutableType == ActiveMemTable) {
                 try self.advanceMutableSource();
+                return;
+            }
+            if (source_index == 0 and comptime MutableType == State) {
+                const idx = current + 1;
+                if (idx < self.mutable.entryCount()) {
+                    const entry = try self.sourceEntryAt(0, idx);
+                    if (compareNamespace(.{ .name = entry.namespace_name }, self.namespace) == .eq) {
+                        self.positions[0] = idx;
+                        self.source_entries[0] = entry;
+                        return;
+                    }
+                }
+                self.positions[0] = null;
+                self.source_entries[0] = null;
                 return;
             }
             if (source_index == 0 or self.immutableForSource(source_index) != null) {
@@ -1328,13 +1343,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     .value => |entry| return entry,
                 }
             } else if (self.mutable.findIndex(self.namespace, key)) |idx| {
-                const entry = self.mutable.entries.items[idx];
+                const entry = self.mutable.entryAt(idx);
                 if (entry.tombstone) return null;
                 return entry.entry();
             }
             for (self.immutable_memtables) |state| {
                 if (state.findIndex(self.namespace, key)) |idx| {
-                    const entry = state.entries.items[idx];
+                    const entry = state.entryAt(idx);
                     if (entry.tombstone) return null;
                     return entry.entry();
                 }
@@ -1418,7 +1433,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn copyMutableSourceEntryAt(self: *@This(), idx: usize) !SourceEntry {
-            const entry = self.mutable.entries.items[idx];
+            const entry = self.mutable.entryAt(idx);
             const namespace_name = namespaceOf(entry).name;
             const namespace_len = if (namespace_name) |name| name.len else 0;
             const bytes = try self.mutableSourceEntryScratch(namespace_len + entry.key.len + entry.value.len);
@@ -1501,7 +1516,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
             const idx = self.mutable.findIndex(self.namespace, key) orelse return .absent;
-            const entry = self.mutable.entries.items[idx];
+            const entry = self.mutable.entryAt(idx);
             if (entry.tombstone) return .tombstone;
             const bytes = try self.backend.allocator.alloc(u8, entry.key.len + entry.value.len);
             errdefer self.backend.allocator.free(bytes);
@@ -2132,7 +2147,7 @@ fn getCurrentPointRetainedLocked(
     key: []const u8,
 ) !?[]const u8 {
     if (backend.mutable.findIndex(namespace, key)) |idx| {
-        const entry = backend.mutable.entries.items[idx];
+        const entry = backend.mutable.entryAt(idx);
         if (entry.tombstone) return error.NotFound;
         const owned = try allocator.dupe(u8, entry.value);
         errdefer allocator.free(owned);
@@ -2147,7 +2162,7 @@ fn getCurrentPointRetainedLocked(
         immutable_index -= 1;
         const immutable = backend.immutable_memtables.items[immutable_index];
         if (immutable.findIndex(namespace, key)) |idx| {
-            const entry = immutable.entries.items[idx];
+            const entry = immutable.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             const owned = try allocator.dupe(u8, entry.value);
             errdefer allocator.free(owned);
@@ -2206,7 +2221,7 @@ fn getFromRunPointRetainedLocked(
 
     const state = if (run.state) |*present_state| present_state else return null;
     if (state.findIndex(namespace, key)) |idx| {
-        const entry = state.entries.items[idx];
+        const entry = state.entryAt(idx);
         if (entry.tombstone) return error.NotFound;
         const owned = try value_allocator.dupe(u8, entry.value);
         errdefer value_allocator.free(owned);
@@ -2238,7 +2253,7 @@ fn readManyCurrentSortedPointByRunLocked(
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
         if (backend.mutable.findIndex(namespace, key)) |idx| {
-            const entry = backend.mutable.entries.items[idx];
+            const entry = backend.mutable.entryAt(idx);
             resolved[i] = true;
             if (entry.tombstone) {
                 result.misses += 1;
@@ -2261,7 +2276,7 @@ fn readManyCurrentSortedPointByRunLocked(
         for (keys, 0..) |key, i| {
             if (resolved[i]) continue;
             if (immutable.findIndex(namespace, key)) |idx| {
-                const entry = immutable.entries.items[idx];
+                const entry = immutable.entryAt(idx);
                 resolved[i] = true;
                 if (entry.tombstone) {
                     result.misses += 1;
@@ -2353,7 +2368,7 @@ fn readManyCurrentSortedPointByRunLocked(
 
             if (maybe_value) |present_state| {
                 if (present_state.findIndex(namespace, keys[key_index])) |idx| {
-                    const entry = present_state.entries.items[idx];
+                    const entry = present_state.entryAt(idx);
                     resolved[key_index] = true;
                     if (entry.tombstone) {
                         result.misses += 1;
@@ -2900,7 +2915,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             try retainReadReader(BackendType, backend, .probe_txn);
             errdefer releaseReadReader(BackendType, backend, .probe_txn);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
-            const stable_point_view = backend.mutable.entries.items.len == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
+            const stable_point_view = backend.mutable.entryCount() == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
                 .metadata_allocator = metadata_allocator,
@@ -3008,7 +3023,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 const locked = lockBackend(BackendType, self.backend);
                 defer unlockBackend(BackendType, self.backend, locked);
                 if (self.backend.mutable.findIndex(self.namespace, key)) |idx| {
-                    const entry = self.backend.mutable.entries.items[idx];
+                    const entry = self.backend.mutable.entryAt(idx);
                     if (entry.tombstone) return error.NotFound;
                     self.backend.recordMutableHit();
                     if (lease and entry.shared != null) {
@@ -3120,7 +3135,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     defer unlockBackend(BackendType, self.backend, locked);
                     for (keys, 0..) |key, i| {
                         const idx = self.backend.mutable.findIndex(self.namespace, key) orelse continue;
-                        const entry = self.backend.mutable.entries.items[idx];
+                        const entry = self.backend.mutable.entryAt(idx);
                         resolved[i] = true;
                         unresolved_count -= 1;
                         if (entry.tombstone) {
@@ -3572,7 +3587,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 .metadata_allocator = runtimeScratchAllocator(backend.allocator),
                 .backend = backend,
                 .namespace = namespace,
-                .mutable = .{},
+                .mutable = .{ .ordered_enabled = false },
                 .batch_options = options,
             };
         }
@@ -3613,7 +3628,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             var committed_write = direct_ingested_bulk_appends;
             const direct_ingested_bulk_state = try self.tryCommitDirectBulkIngest();
             if (!direct_ingested_bulk_state) {
-                const mutated = self.mutable.entries.items.len > 0;
+                const mutated = self.mutable.entryCount() > 0;
                 committed_write = committed_write or mutated;
                 if (mutated) {
                     try enforceMutableWriteAdmission(self.backend, &self.mutable);
@@ -3662,12 +3677,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         fn drainBulkAppendsToMutable(self: *@This()) !void {
-            if (self.bulk_appends.entries.items.len == 0) return;
+            if (self.bulk_appends.entryCount() == 0) return;
             try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
         }
 
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
-            const entries = self.bulk_appends.entries.items.len;
+            const entries = self.bulk_appends.entryCount();
             if (entries == 0) return false;
             if (self.batch_options.mode != .bulk_ingest) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
@@ -3681,7 +3696,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
-            if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
+            if (self.backend.mutable.entryCount() != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
                     if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                     if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
@@ -3689,13 +3704,13 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     return false;
                 }
             }
-            if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
+            if (self.backend.mutable.entryCount() != 0 or self.backend.activeImmutableMemtableCount() != 0) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
-            if (self.mutable.entries.items.len > 0) {
+            if (self.mutable.entryCount() > 0) {
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
@@ -3731,8 +3746,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         fn bulkStateEntriesAreUnique(state: *const State) bool {
-            if (state.entries.items.len <= 1) return true;
-            var previous = state.entries.items[0];
+            if (state.entryCount() <= 1) return true;
+            var previous = state.entryAt(0);
             for (state.entries.items[1..]) |entry| {
                 if (compareEntryTo(previous, state_mod.namespaceOf(entry), entry.key) == .eq) return false;
                 previous = entry;
@@ -3742,14 +3757,14 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
             if (self.batch_options.mode != .bulk_ingest) return false;
-            const entries = self.mutable.entries.items.len;
+            const entries = self.mutable.entryCount();
             if (entries == 0) return false;
             if (@hasDecl(BackendType, "recordDirectBulkIngestAttempt")) self.backend.recordDirectBulkIngestAttempt(entries);
             if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackUnsupported")) self.backend.recordDirectBulkIngestFallbackUnsupported();
                 return false;
             }
-            if (self.backend.mutable.entries.items.len != 0 and
+            if (self.backend.mutable.entryCount() != 0 and
                 @hasDecl(BackendType, "shouldDrainMutableBeforeDirectBulkIngest") and
                 self.backend.shouldDrainMutableBeforeDirectBulkIngest(&self.mutable) and
                 @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
@@ -3759,7 +3774,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     return false;
                 }
             }
-            if (self.backend.mutable.entries.items.len != 0) {
+            if (self.backend.mutable.entryCount() != 0) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
                 return false;
             }
@@ -3806,17 +3821,17 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-            var bulk_idx = self.bulk_appends.entries.items.len;
+            var bulk_idx = self.bulk_appends.entryCount();
             while (bulk_idx > 0) {
                 bulk_idx -= 1;
-                const entry = self.bulk_appends.entries.items[bulk_idx];
+                const entry = self.bulk_appends.entryAt(bulk_idx);
                 if (compareEntryTo(entry, self.namespace, key) == .eq) {
                     if (entry.tombstone) return error.NotFound;
                     return entry.value;
                 }
             }
             if (self.mutable.findIndex(self.namespace, key)) |idx| {
-                const entry = self.mutable.entries.items[idx];
+                const entry = self.mutable.entryAt(idx);
                 if (entry.tombstone) return error.NotFound;
                 return entry.value;
             }
@@ -3845,10 +3860,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
             for (keys, 0..) |key, i| {
-                var bulk_idx = self.bulk_appends.entries.items.len;
+                var bulk_idx = self.bulk_appends.entryCount();
                 while (bulk_idx > 0) {
                     bulk_idx -= 1;
-                    const entry = self.bulk_appends.entries.items[bulk_idx];
+                    const entry = self.bulk_appends.entryAt(bulk_idx);
                     if (compareEntryTo(entry, self.namespace, key) == .eq) {
                         overlay_point_gets += 1;
                         if (entry.tombstone) {
@@ -3862,7 +3877,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 } else {
                     if (self.mutable.findIndex(self.namespace, key)) |idx| {
                         overlay_point_gets += 1;
-                        const entry = self.mutable.entries.items[idx];
+                        const entry = self.mutable.entryAt(idx);
                         if (entry.tombstone) {
                             misses += 1;
                         } else {
@@ -3952,7 +3967,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
-            if (self.batch_options.mode == .bulk_ingest and self.mutable.entries.items.len == 0) {
+            if (self.batch_options.mode == .bulk_ingest and self.mutable.entryCount() == 0) {
                 const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
                 try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
                 self.invalidateCursorSnapshot();
@@ -4307,7 +4322,7 @@ fn getFromSnapshotRuns(
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) ![]const u8 {
     if (mutable.findIndex(namespace, key)) |idx| {
-        const entry = mutable.entries.items[idx];
+        const entry = mutable.entryAt(idx);
         if (entry.tombstone) return error.NotFound;
         read_hint.* = null;
         backend.recordMutableHit();
@@ -4315,7 +4330,7 @@ fn getFromSnapshotRuns(
     }
     for (immutable_memtables) |state| {
         if (state.findIndex(namespace, key)) |idx| {
-            const entry = state.entries.items[idx];
+            const entry = state.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             read_hint.* = null;
             backend.recordMutableHit();
@@ -5055,7 +5070,7 @@ fn getFromRunIndices(
         const run = &runs[run_index];
         if (run.state) |*state| {
             if (state.findIndex(namespace, key)) |idx| {
-                const entry = state.entries.items[idx];
+                const entry = state.entryAt(idx);
                 if (entry.tombstone) return error.NotFound;
                 read_hint.* = null;
                 return entry.value;
@@ -5068,7 +5083,7 @@ fn getFromRunIndices(
                 if (backend.cachedRunStateIndexMatches(index, run.path.?, run.id)) {
                     const state = backend.getCachedRunStateByIndex(index);
                     if (state.findIndex(namespace, key)) |idx| {
-                        const entry = state.entries.items[idx];
+                        const entry = state.entryAt(idx);
                         if (entry.tombstone) return error.NotFound;
                         read_hint.* = null;
                         return entry.value;
@@ -5220,7 +5235,7 @@ fn getFromCachedRunStates(
             break :blk backend.getCachedRunStateByIndex(index);
         };
         if (state.findIndex(namespace, key)) |idx| {
-            const entry = state.entries.items[idx];
+            const entry = state.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             return .{ .hit = entry.value };
         }
@@ -5653,7 +5668,7 @@ fn visibleEntryFromRunIndices(
         if (!try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
         if (run.state) |*state| {
             if (state.findIndex(namespace, key)) |idx| {
-                const entry = state.entries.items[idx];
+                const entry = state.entryAt(idx);
                 if (entry.tombstone) return .tombstone;
                 return .{ .value = entry.entry() };
             }
@@ -6241,8 +6256,8 @@ fn compareRunBound(lhs_namespace_name: ?[]const u8, lhs_key: []const u8, rhs_nam
 
 fn nextStateKey(state: *const State, namespace: backend_types.Namespace, target: []const u8, inclusive: bool) ?[]const u8 {
     var idx = state.lowerBound(namespace, target);
-    while (idx < state.entries.items.len) : (idx += 1) {
-        const entry = state.entries.items[idx];
+    while (idx < state.entryCount()) : (idx += 1) {
+        const entry = state.entryAt(idx);
         if (compareNamespace(namespaceOf(entry), namespace) != .eq) return null;
         if (!inclusive and std.mem.eql(u8, entry.key, target)) continue;
         return entry.key;
@@ -6261,7 +6276,7 @@ fn nextStateIndex(state: anytype, namespace: backend_types.Namespace, target: []
                 .eq => if (!inclusive) continue,
                 .gt => {},
             }
-            if (best == null or std.mem.order(u8, entry.key, state.entries.items[best.?].key) == .lt) {
+            if (best == null or std.mem.order(u8, entry.key, state.entryAt(best.?).key) == .lt) {
                 best = idx;
             }
         }
@@ -6269,8 +6284,8 @@ fn nextStateIndex(state: anytype, namespace: backend_types.Namespace, target: []
     }
 
     var idx = state.lowerBound(namespace, target);
-    while (idx < state.entries.items.len) : (idx += 1) {
-        const entry = state.entries.items[idx];
+    while (idx < state.entryCount()) : (idx += 1) {
+        const entry = state.entryAt(idx);
         if (compareNamespace(namespaceOf(entry), namespace) != .eq) return null;
         if (!inclusive and std.mem.eql(u8, entry.key, target)) continue;
         return idx;
@@ -6281,14 +6296,14 @@ fn nextStateIndex(state: anytype, namespace: backend_types.Namespace, target: []
 fn nextIndexFrom(state: anytype, namespace: backend_types.Namespace, current: usize) ?usize {
     const StateType = @TypeOf(state.*);
     if (StateType == ActiveMemTable) {
-        if (current >= state.entries.items.len) return null;
-        const current_entry = state.entries.items[current];
+        if (current >= state.entryCount()) return null;
+        const current_entry = state.entryAt(current);
         var best: ?usize = null;
         for (state.entries.items, 0..) |entry, idx| {
             if (idx == current) continue;
             if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
             if (std.mem.order(u8, entry.key, current_entry.key) != .gt) continue;
-            if (best == null or std.mem.order(u8, entry.key, state.entries.items[best.?].key) == .lt) {
+            if (best == null or std.mem.order(u8, entry.key, state.entryAt(best.?).key) == .lt) {
                 best = idx;
             }
         }
@@ -6296,9 +6311,9 @@ fn nextIndexFrom(state: anytype, namespace: backend_types.Namespace, current: us
     }
 
     var idx = current + 1;
-    while (idx < state.entries.items.len) : (idx += 1) {
-        if (compareNamespace(namespaceOf(state.entries.items[idx]), namespace) == .eq) return idx;
-        if (compareNamespace(namespaceOf(state.entries.items[idx]), namespace) == .gt) return null;
+    while (idx < state.entryCount()) : (idx += 1) {
+        if (compareNamespace(namespaceOf(state.entryAt(idx)), namespace) == .eq) return idx;
+        if (compareNamespace(namespaceOf(state.entryAt(idx)), namespace) == .gt) return null;
     }
     return null;
 }
@@ -6322,7 +6337,7 @@ fn prevStateKey(state: anytype, namespace: backend_types.Namespace, target: []co
     }
 
     const idx = state.lowerBound(namespace, target);
-    var probe: usize = if (idx < state.entries.items.len and inclusive and compareEntryTo(state.entries.items[idx], namespace, target) == .eq)
+    var probe: usize = if (idx < state.entryCount() and inclusive and compareEntryTo(state.entryAt(idx), namespace, target) == .eq)
         idx
     else if (idx > 0)
         idx - 1
@@ -6330,7 +6345,7 @@ fn prevStateKey(state: anytype, namespace: backend_types.Namespace, target: []co
         return null;
 
     while (true) {
-        const entry = state.entries.items[probe];
+        const entry = state.entryAt(probe);
         if (compareNamespace(namespaceOf(entry), namespace) == .eq) {
             if (inclusive or !std.mem.eql(u8, entry.key, target)) return entry.key;
         } else if (compareNamespace(namespaceOf(entry), namespace) == .lt) {
@@ -6343,12 +6358,12 @@ fn prevStateKey(state: anytype, namespace: backend_types.Namespace, target: []co
 }
 
 fn mutableLastKey(state: anytype, namespace: backend_types.Namespace) ?[]const u8 {
-    if (state.entries.items.len == 0) return null;
-    var idx = state.entries.items.len;
+    if (state.entryCount() == 0) return null;
+    var idx = state.entryCount();
     while (idx > 0) {
         idx -= 1;
-        if (compareNamespace(namespaceOf(state.entries.items[idx]), namespace) == .eq) {
-            return state.entries.items[idx].key;
+        if (compareNamespace(namespaceOf(state.entryAt(idx)), namespace) == .eq) {
+            return state.entryAt(idx).key;
         }
     }
     return null;
@@ -6388,7 +6403,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 .allocator = backend.allocator,
                 .metadata_allocator = runtimeScratchAllocator(backend.allocator),
                 .backend = backend,
-                .mutable = .{},
+                .mutable = .{ .ordered_enabled = false },
                 .batch_options = options,
             };
         }
@@ -6429,7 +6444,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             var committed_write = direct_ingested_bulk_appends;
             const direct_ingested_bulk_state = try self.tryCommitDirectBulkIngest();
             if (!direct_ingested_bulk_state) {
-                const mutated = self.mutable.entries.items.len > 0;
+                const mutated = self.mutable.entryCount() > 0;
                 committed_write = committed_write or mutated;
                 if (mutated) {
                     try enforceMutableWriteAdmission(self.backend, &self.mutable);
@@ -6478,12 +6493,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         fn drainBulkAppendsToMutable(self: *@This()) !void {
-            if (self.bulk_appends.entries.items.len == 0) return;
+            if (self.bulk_appends.entryCount() == 0) return;
             try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
         }
 
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
-            const entries = self.bulk_appends.entries.items.len;
+            const entries = self.bulk_appends.entryCount();
             if (entries == 0) return false;
             if (self.batch_options.mode != .bulk_ingest) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
@@ -6497,7 +6512,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
-            if (self.backend.mutable.entries.items.len != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
+            if (self.backend.mutable.entryCount() != 0 and @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest")) {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
                     if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                     if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
@@ -6505,13 +6520,13 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     return false;
                 }
             }
-            if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
+            if (self.backend.mutable.entryCount() != 0 or self.backend.activeImmutableMemtableCount() != 0) {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
-            if (self.mutable.entries.items.len > 0) {
+            if (self.mutable.entryCount() > 0) {
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
@@ -6547,8 +6562,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         fn bulkStateEntriesAreUnique(state: *const State) bool {
-            if (state.entries.items.len <= 1) return true;
-            var previous = state.entries.items[0];
+            if (state.entryCount() <= 1) return true;
+            var previous = state.entryAt(0);
             for (state.entries.items[1..]) |entry| {
                 if (compareEntryTo(previous, state_mod.namespaceOf(entry), entry.key) == .eq) return false;
                 previous = entry;
@@ -6558,14 +6573,14 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         fn tryCommitDirectBulkIngest(self: *@This()) !bool {
             if (self.batch_options.mode != .bulk_ingest) return false;
-            const entries = self.mutable.entries.items.len;
+            const entries = self.mutable.entryCount();
             if (entries == 0) return false;
             if (@hasDecl(BackendType, "recordDirectBulkIngestAttempt")) self.backend.recordDirectBulkIngestAttempt(entries);
             if (!@hasDecl(BackendType, "ingestSortedState") or !@hasDecl(BackendType, "shouldDirectIngestBulkState")) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackUnsupported")) self.backend.recordDirectBulkIngestFallbackUnsupported();
                 return false;
             }
-            if (self.backend.mutable.entries.items.len != 0 and
+            if (self.backend.mutable.entryCount() != 0 and
                 @hasDecl(BackendType, "shouldDrainMutableBeforeDirectBulkIngest") and
                 self.backend.shouldDrainMutableBeforeDirectBulkIngest(&self.mutable) and
                 @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
@@ -6575,7 +6590,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     return false;
                 }
             }
-            if (self.backend.mutable.entries.items.len != 0) {
+            if (self.backend.mutable.entryCount() != 0) {
                 if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBackendMutable")) self.backend.recordDirectBulkIngestFallbackBackendMutable();
                 return false;
             }
@@ -6622,17 +6637,17 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-            var bulk_idx = self.bulk_appends.entries.items.len;
+            var bulk_idx = self.bulk_appends.entryCount();
             while (bulk_idx > 0) {
                 bulk_idx -= 1;
-                const entry = self.bulk_appends.entries.items[bulk_idx];
+                const entry = self.bulk_appends.entryAt(bulk_idx);
                 if (compareEntryTo(entry, namespace, key) == .eq) {
                     if (entry.tombstone) return error.NotFound;
                     return entry.value;
                 }
             }
             if (self.mutable.findIndex(namespace, key)) |idx| {
-                const entry = self.mutable.entries.items[idx];
+                const entry = self.mutable.entryAt(idx);
                 if (entry.tombstone) return error.NotFound;
                 return entry.value;
             }
@@ -6668,10 +6683,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
             for (keys, 0..) |key, i| {
-                var bulk_idx = self.bulk_appends.entries.items.len;
+                var bulk_idx = self.bulk_appends.entryCount();
                 while (bulk_idx > 0) {
                     bulk_idx -= 1;
-                    const entry = self.bulk_appends.entries.items[bulk_idx];
+                    const entry = self.bulk_appends.entryAt(bulk_idx);
                     if (compareEntryTo(entry, namespace, key) == .eq) {
                         overlay_point_gets += 1;
                         if (!entry.tombstone) values[i] = entry.value;
@@ -6679,7 +6694,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     }
                 } else if (self.mutable.findIndex(namespace, key)) |idx| {
                     overlay_point_gets += 1;
-                    const entry = self.mutable.entries.items[idx];
+                    const entry = self.mutable.entryAt(idx);
                     if (!entry.tombstone) values[i] = entry.value;
                 } else {
                     miss_keys[miss_count] = key;
@@ -6711,7 +6726,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         }
 
         pub fn appendPut(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-            if (self.batch_options.mode == .bulk_ingest and self.mutable.entries.items.len == 0) {
+            if (self.batch_options.mode == .bulk_ingest and self.mutable.entryCount() == 0) {
                 const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
                 try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false));
                 self.invalidateCursorSnapshot();
@@ -6886,10 +6901,10 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
     try txn.put(.{ .name = "docs" }, "doc:a", "A");
     try std.testing.expectError(error.InjectedFlushFailure, txn.commit());
 
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
-    try std.testing.expectEqualStrings("docs", backend.mutable.entries.items[0].namespace_name.?);
-    try std.testing.expectEqualStrings("doc:a", backend.mutable.entries.items[0].key);
-    try std.testing.expectEqualStrings("A", backend.mutable.entries.items[0].value);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
+    try std.testing.expectEqualStrings("docs", backend.mutable.entryAt(0).namespace_name.?);
+    try std.testing.expectEqualStrings("doc:a", backend.mutable.entryAt(0).key);
+    try std.testing.expectEqualStrings("A", backend.mutable.entryAt(0).value);
     try std.testing.expect(txn.closed);
 }
 
@@ -6944,8 +6959,8 @@ test "lsm namespace write txn releases local mutable state when wal append fails
     try std.testing.expectError(error.InjectedWalFailure, txn.commit());
 
     try std.testing.expect(txn.closed);
-    try std.testing.expectEqual(@as(usize, 0), txn.mutable.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), txn.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
 }
 
 test "lsm merge cursor frees loaded blocks with backend allocator" {
