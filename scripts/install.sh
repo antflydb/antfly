@@ -188,6 +188,66 @@ detect_platform() {
     echo "$OS $ARCH"
 }
 
+ANTFLY_MIN_GLIBC="2.28"
+
+version_at_least() {
+    ACTUAL_VERSION="$1"
+    MINIMUM_VERSION="$2"
+
+    case "$ACTUAL_VERSION:$MINIMUM_VERSION" in
+        *.*:*.*) ;;
+        *) return 1 ;;
+    esac
+
+    ACTUAL_MAJOR="${ACTUAL_VERSION%%.*}"
+    ACTUAL_REST="${ACTUAL_VERSION#*.}"
+    ACTUAL_MINOR="${ACTUAL_REST%%.*}"
+    MINIMUM_MAJOR="${MINIMUM_VERSION%%.*}"
+    MINIMUM_MINOR="${MINIMUM_VERSION#*.}"
+
+    for VERSION_COMPONENT in "$ACTUAL_MAJOR" "$ACTUAL_MINOR" "$MINIMUM_MAJOR" "$MINIMUM_MINOR"; do
+        case "$VERSION_COMPONENT" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+    done
+
+    [ "$ACTUAL_MAJOR" -gt "$MINIMUM_MAJOR" ] || {
+        [ "$ACTUAL_MAJOR" -eq "$MINIMUM_MAJOR" ] &&
+            [ "$ACTUAL_MINOR" -ge "$MINIMUM_MINOR" ]
+    }
+}
+
+select_linux_archive_libc() {
+    case "${ANTFLY_LIBC:-auto}" in
+        gnu|musl) echo "$ANTFLY_LIBC"; return ;;
+        auto|'') ;;
+        *) error "ANTFLY_LIBC must be auto, gnu, or musl" ;;
+    esac
+
+    if available getconf; then
+        GLIBC_INFO=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+        case "$GLIBC_INFO" in
+            'glibc '*)
+                GLIBC_VERSION="${GLIBC_INFO#glibc }"
+                if version_at_least "$GLIBC_VERSION" "$ANTFLY_MIN_GLIBC"; then
+                    echo "gnu"
+                else
+                    warning "glibc $GLIBC_VERSION is older than the supported GNU archive floor ($ANTFLY_MIN_GLIBC); using the portable musl build"
+                    echo "musl"
+                fi
+                return
+                ;;
+        esac
+    fi
+    if available ldd && ldd --version 2>&1 | grep -qi musl; then
+        echo "musl"
+        return
+    fi
+
+    warning "Could not detect the Linux libc; using the portable musl build"
+    echo "musl"
+}
+
 # Download and install antfly
 install_antfly() {
     require curl tar
@@ -221,13 +281,30 @@ EOF
 
     status "Installing Antfly $TAG..."
 
-    ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
+    ARCHIVE_SUFFIX=""
+    if [ "$OS" = "Linux" ]; then
+        LINUX_ARCHIVE_LIBC=$(select_linux_archive_libc)
+        status "Selected Linux archive libc: $LINUX_ARCHIVE_LIBC"
+        if [ "$LINUX_ARCHIVE_LIBC" = "gnu" ]; then
+            ARCHIVE_SUFFIX="_gnu"
+        fi
+    fi
+    ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}${ARCHIVE_SUFFIX}.tar.gz"
     DOWNLOAD_URL="https://releases.antfly.io/antfly/${TAG}/${ARCHIVE_NAME}"
     CHECKSUMS_URL="https://releases.antfly.io/antfly/${TAG}/antfly_zig_checksums.txt"
 
     status "Downloading from $DOWNLOAD_URL..."
     if ! download_archive -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
-        error "Failed to download Antfly. Please check your internet connection and the version number."
+        if [ "$OS" = "Linux" ] && [ "${LINUX_ARCHIVE_LIBC:-}" = "gnu" ] && [ "${ANTFLY_LIBC:-auto}" = "auto" ]; then
+            warning "GNU archive is unavailable; falling back to the portable musl build"
+            ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
+            DOWNLOAD_URL="https://releases.antfly.io/antfly/${TAG}/${ARCHIVE_NAME}"
+            status "Downloading from $DOWNLOAD_URL..."
+            download_archive -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME" || \
+                error "Failed to download Antfly. Please check your internet connection and the version number."
+        else
+            error "Failed to download Antfly. Please check your internet connection and the version number."
+        fi
     fi
 
     status "Downloading release checksums..."
@@ -346,6 +423,10 @@ Options:
 Environment:
   This script will automatically detect your OS and architecture,
   download the appropriate binaries, and install them.
+
+  ANTFLY_LIBC overrides Linux archive selection. Supported values are auto
+  (default), gnu, and musl. Auto uses GNU for glibc $ANTFLY_MIN_GLIBC or newer
+  and the portable musl build for older or unknown Linux libc versions.
 
   ANTFLY_DOWNLOAD_CLASS supplies a best-effort analytics label for archive
   requests. Set it to employee for staff downloads or ci for automated jobs;

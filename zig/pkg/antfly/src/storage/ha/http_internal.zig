@@ -20,7 +20,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const platform_sync = @import("antfly_platform").sync;
 const http_common = @import("../../common/http/http_common.zig");
 const http_operation = @import("http_operation.zig");
 const internal_api = @import("../../internal/mod.zig");
@@ -89,7 +88,10 @@ pub const Server = struct {
     fn executeOperationWithAllocator(self: *Server, response_alloc: Allocator, req: http_operation.Request) !http_operation.OwnedResponse {
         const state_mutex = self.state_mutex;
         if (state_mutex) |mutex| {
-            platform_sync.lockYielding(mutex);
+            // Replication retries are bounded by the caller. Fail fast while a
+            // role transition owns state so stale/disconnected requests cannot
+            // consume the internal request pool waiting on a spin lock.
+            if (!mutex.tryLock()) return try textResponse(response_alloc, 503, "HAStateTransitionBusy");
         }
         defer if (state_mutex) |mutex| mutex.unlock();
         const path = requestPath(req.target);
@@ -470,6 +472,29 @@ test "storage.ha internal typed operation bypasses legacy request dispatch" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 409), response.status);
     try std.testing.expectEqualStrings("primary unavailable", response.body);
+}
+
+test "storage.ha internal http adapter sheds requests while state transition is busy" {
+    const alloc = std.testing.allocator;
+    var mutex: std.atomic.Mutex = .unlocked;
+    var server = Server.initWithOptions(alloc, null, .{ .state_mutex = &mutex });
+
+    try std.testing.expect(mutex.tryLock());
+    var busy = try server.handle(.{
+        .method = .GET,
+        .uri = internal_api.routes.ha_replication_identify,
+    });
+    defer busy.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), busy.status);
+    try std.testing.expectEqualStrings("HAStateTransitionBusy", busy.body);
+    mutex.unlock();
+
+    var unavailable = try server.handle(.{
+        .method = .GET,
+        .uri = internal_api.routes.ha_replication_identify,
+    });
+    defer unavailable.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), unavailable.status);
 }
 
 test "storage.ha internal http adapter handles every generated HA replication route method" {

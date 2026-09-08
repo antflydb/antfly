@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import mimetypes
 import os
@@ -14,6 +15,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from verify_release_ledger import verify_payload
 
 API_BASE = "https://api.github.com"
 UPLOAD_BASE = "https://uploads.github.com"
@@ -53,7 +55,9 @@ def request_json(
     return json.loads(payload)
 
 
-def request_bytes(method: str, url: str, token: str, data: bytes, content_type: str) -> dict:
+def request_bytes(
+    method: str, url: str, token: str, data: bytes, content_type: str
+) -> dict:
     req = Request(
         url,
         data=data,
@@ -73,8 +77,46 @@ def request_bytes(method: str, url: str, token: str, data: bytes, content_type: 
         raise GitHubError(f"{method} {url} failed with {exc.code}: {detail}") from exc
 
 
-def github_api(method: str, repo: str, path: str, token: str, body: dict | None = None) -> dict | list | None:
+def download_bytes(url: str, token: str) -> bytes:
+    req = Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urlopen(req) as resp:
+            return resp.read()
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise GitHubError(f"GET {url} failed with {exc.code}: {detail}") from exc
+
+
+def github_api(
+    method: str, repo: str, path: str, token: str, body: dict | None = None
+) -> dict | list | None:
     return request_json(method, f"{API_BASE}/repos/{repo}{path}", token, body)
+
+
+def paginated_github_api(repo: str, path: str, token: str) -> list[dict]:
+    results: list[dict] = []
+    page = 1
+    separator = "&" if "?" in path else "?"
+    while True:
+        response = github_api(
+            "GET", repo, f"{path}{separator}per_page=100&page={page}", token
+        )
+        if not isinstance(response, list):
+            raise GitHubError(f"paginated GitHub response is not a list: {path}")
+        batch = [item for item in response if isinstance(item, dict)]
+        if len(batch) != len(response):
+            raise GitHubError(f"paginated GitHub response has invalid entries: {path}")
+        results.extend(batch)
+        if len(response) < 100:
+            return results
+        page += 1
 
 
 def get_release_by_tag(repo: str, tag: str, token: str) -> dict | None:
@@ -83,15 +125,81 @@ def get_release_by_tag(repo: str, tag: str, token: str) -> dict | None:
     except GitHubError as exc:
         if "failed with 404" not in str(exc):
             raise
-        releases = github_api("GET", repo, "/releases?per_page=100", token)
-        if isinstance(releases, list):
-            for candidate in releases:
-                if isinstance(candidate, dict) and candidate.get("tag_name") == tag:
-                    return candidate
-            return None
-        raise
+        releases = paginated_github_api(repo, "/releases", token)
+        for candidate in releases:
+            if candidate.get("tag_name") == tag:
+                return candidate
+        return None
     assert isinstance(release, dict)
     return release
+
+
+def with_complete_assets(repo: str, release: dict, token: str) -> dict:
+    release_id = release.get("id")
+    if not isinstance(release_id, int):
+        raise GitHubError("GitHub release has no numeric id")
+    complete = dict(release)
+    complete["assets"] = paginated_github_api(
+        repo, f"/releases/{release_id}/assets", token
+    )
+    return complete
+
+
+def reconcile_release_asset_names(
+    repo: str,
+    release: dict,
+    expected_names: set[str],
+    token: str,
+    repair_assets: bool,
+) -> dict:
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise GitHubError("GitHub release has no complete asset listing")
+    unexpected = [
+        asset
+        for asset in assets
+        if isinstance(asset, dict) and asset.get("name") not in expected_names
+    ]
+    malformed = [asset for asset in assets if not isinstance(asset, dict)]
+    if malformed:
+        raise GitHubError("GitHub release has malformed assets")
+    if unexpected and not repair_assets:
+        names = sorted(str(asset.get("name")) for asset in unexpected)
+        raise SystemExit(f"GitHub release has unledgered assets: {names}")
+    unexpected_ids: set[int] = set()
+    for asset in unexpected:
+        asset_id = asset.get("id")
+        if not isinstance(asset_id, int):
+            raise GitHubError("unledgered GitHub release asset has no numeric id")
+        github_api("DELETE", repo, f"/releases/assets/{asset_id}", token)
+        unexpected_ids.add(asset_id)
+        print(f"removed unledgered GitHub release asset: {asset.get('name')}")
+    reconciled = dict(release)
+    reconciled["assets"] = [
+        asset for asset in assets if asset.get("id") not in unexpected_ids
+    ]
+    return reconciled
+
+
+def create_or_update_release(repo: str, tag: str, token: str, payload: dict) -> dict:
+    release = get_release_by_tag(repo, tag, token)
+    if release is None:
+        created = github_api("POST", repo, "/releases", token, payload)
+        assert isinstance(created, dict)
+        print(f"created GitHub release draft for {tag}")
+        return created
+
+    # Publishing is a one-way state transition. Recovery may repair missing
+    # assets on an existing release, but must never hide it by returning it to
+    # draft state.
+    if not release.get("draft", False) and payload.get("draft", False):
+        print(f"preserving already-published GitHub release for {tag}")
+        return release
+
+    updated = github_api("PATCH", repo, f"/releases/{release['id']}", token, payload)
+    assert isinstance(updated, dict)
+    print(f"updated GitHub release for {tag}")
+    return updated
 
 
 def generate_notes(repo: str, tag: str, commit: str, token: str) -> str:
@@ -146,10 +254,52 @@ def expand_assets(patterns: list[str]) -> list[Path]:
     return sorted(assets, key=lambda path: path.name)
 
 
-def upload_asset(repo: str, release: dict, asset: Path, token: str, replace_assets: bool) -> None:
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as src:
+        for chunk in iter(lambda: src.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def existing_asset_sha256(existing: dict, token: str) -> str:
+    digest = existing.get("digest")
+    if isinstance(digest, str) and digest.startswith("sha256:"):
+        return digest.removeprefix("sha256:")
+    url = existing.get("url") or existing.get("browser_download_url")
+    if not isinstance(url, str) or not url:
+        raise GitHubError(f"release asset {existing.get('name')} has no download URL")
+    return hashlib.sha256(download_bytes(url, token)).hexdigest()
+
+
+def upload_asset(
+    repo: str,
+    release: dict,
+    asset: Path,
+    token: str,
+    replace_assets: bool,
+    immutable_assets: bool,
+    repair_assets: bool = False,
+) -> None:
     release_id = release["id"]
     for existing in release.get("assets", []):
         if existing.get("name") == asset.name:
+            if immutable_assets or repair_assets:
+                local_digest = sha256(asset)
+                remote_digest = existing_asset_sha256(existing, token)
+                if local_digest == remote_digest:
+                    print(
+                        f"immutable GitHub release asset already matches: {asset.name}"
+                    )
+                    return
+                if immutable_assets:
+                    raise SystemExit(
+                        f"immutable release asset differs: {asset.name}\n"
+                        f"GitHub: {remote_digest}\nlocal:  {local_digest}"
+                    )
+                print(f"repairing corrupt GitHub release asset: {asset.name}")
+                github_api("DELETE", repo, f"/releases/assets/{existing['id']}", token)
+                break
             if not replace_assets:
                 raise SystemExit(f"release asset already exists: {asset.name}")
             github_api("DELETE", repo, f"/releases/assets/{existing['id']}", token)
@@ -164,19 +314,78 @@ def upload_asset(repo: str, release: dict, asset: Path, token: str, replace_asse
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"), help="owner/repo")
+    parser.add_argument(
+        "--repo", default=os.environ.get("GITHUB_REPOSITORY"), help="owner/repo"
+    )
     parser.add_argument("--tag", required=True)
     parser.add_argument("--commit", required=True)
-    parser.add_argument("--asset", action="append", default=[], help="asset glob to upload")
-    parser.add_argument("--draft", action="store_true", help="create/update as a draft release")
-    parser.add_argument("--replace-assets", action="store_true", help="replace existing assets with matching names")
+    parser.add_argument(
+        "--asset", action="append", default=[], help="asset glob to upload"
+    )
+    parser.add_argument(
+        "--draft", action="store_true", help="create/update as a draft release"
+    )
+    parser.add_argument(
+        "--replace-assets",
+        action="store_true",
+        help="replace existing assets with matching names",
+    )
+    parser.add_argument(
+        "--immutable-assets",
+        action="store_true",
+        help="skip byte-identical existing assets and reject content drift",
+    )
+    parser.add_argument(
+        "--repair-assets",
+        action="store_true",
+        help="restore drifted assets from a complete digest-verified payload",
+    )
+    parser.add_argument(
+        "--exact-assets",
+        action="store_true",
+        help="reject release assets outside the supplied complete payload",
+    )
+    parser.add_argument("--verified-ledger-sha256")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    if sum((args.replace_assets, args.immutable_assets, args.repair_assets)) > 1:
+        raise SystemExit(
+            "--replace-assets, --immutable-assets, and --repair-assets are mutually exclusive"
+        )
+    if args.exact_assets and not (args.immutable_assets or args.repair_assets):
+        raise SystemExit(
+            "--exact-assets requires --immutable-assets or --repair-assets"
+        )
 
     if not args.repo:
         raise SystemExit("--repo is required when GITHUB_REPOSITORY is unset")
     assets = expand_assets(args.asset)
     prerelease = "-" in args.tag.lstrip("v")
+
+    if args.repair_assets:
+        if not args.verified_ledger_sha256:
+            raise SystemExit("--repair-assets requires --verified-ledger-sha256")
+        payload_dirs = {asset.parent.resolve() for asset in assets}
+        if len(payload_dirs) != 1:
+            raise SystemExit(
+                "repair assets must come from one release payload directory"
+            )
+        payload_dir = payload_dirs.pop()
+        verify_payload(
+            payload_dir / "artifacts.json",
+            payload_dir,
+            args.tag,
+            args.commit,
+            args.verified_ledger_sha256,
+        )
+        local_names = {path.name for path in payload_dir.iterdir() if path.is_file()}
+        supplied_names = {asset.name for asset in assets}
+        if supplied_names != local_names:
+            raise SystemExit(
+                "repair requires every verified payload file: "
+                f"expected {sorted(local_names)}, got {sorted(supplied_names)}"
+            )
 
     if args.dry_run:
         print(f"would create/update GitHub release {args.repo}@{args.tag}")
@@ -201,21 +410,33 @@ def main() -> int:
         "prerelease": prerelease,
     }
 
-    release = get_release_by_tag(args.repo, args.tag, token)
-    if release is None:
-        created = github_api("POST", args.repo, "/releases", token, payload)
-        assert isinstance(created, dict)
-        release = created
-        print(f"created GitHub release draft for {args.tag}")
-    else:
-        updated = github_api("PATCH", args.repo, f"/releases/{release['id']}", token, payload)
-        assert isinstance(updated, dict)
-        release = updated
-        print(f"updated GitHub release draft for {args.tag}")
+    release = with_complete_assets(
+        args.repo,
+        create_or_update_release(args.repo, args.tag, token, payload),
+        token,
+    )
+    if args.exact_assets or args.repair_assets:
+        release = reconcile_release_asset_names(
+            args.repo,
+            release,
+            {asset.name for asset in assets},
+            token,
+            args.repair_assets,
+        )
 
     for asset in assets:
-        upload_asset(args.repo, release, asset, token, args.replace_assets)
-        release = get_release_by_tag(args.repo, args.tag, token) or release
+        upload_asset(
+            args.repo,
+            release,
+            asset,
+            token,
+            args.replace_assets,
+            args.immutable_assets,
+            args.repair_assets,
+        )
+        refreshed = get_release_by_tag(args.repo, args.tag, token)
+        if refreshed is not None:
+            release = with_complete_assets(args.repo, refreshed, token)
     return 0
 
 

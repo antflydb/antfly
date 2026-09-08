@@ -17,7 +17,7 @@ description: "One query that matches exact words and meaning at once, with fusio
 One query finds documents that contain your words and documents that mean the same thing, fuses the two lists, reorders them with a cross-encoder, and drops the weak tail. Each stage is independent, and the steps below add them one at a time:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -26,11 +26,12 @@ curl -X POST http://localhost:8080/db/v1/query \
     "indexes": ["title_body"],
     "fields": ["title", "url"],
     "merge_config": {"strategy": "rsf"},
-    "limit": 50,
+    "limit": 10,
     "reranker": {
       "provider": "antfly",
-      "model": "mixedbread-ai/mxbai-rerank-base-v1",
-      "field": "body"
+      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+      "field": "body",
+      "candidate_count": 50
     },
     "pruner": {"min_score_ratio": 0.5, "max_score_gap_percent": 40}
   }'
@@ -69,7 +70,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -98,7 +99,7 @@ score = sum over lists of 1 / (rank_constant + rank)
 Relative Score Fusion keeps score magnitude. It min-max normalizes each list within a window (`window_size`, defaulting to `limit`) and combines them, producing a wider spread:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -133,19 +134,22 @@ antfly query --table wikipedia \
   --semantic-search "theory of relativity and physics" \
   --indexes "title_body" \
   --fields "title,url" \
-  --limit 50 \
+  --limit 10 \
   --reranker '{
     "provider": "antfly",
-    "model": "mixedbread-ai/mxbai-rerank-base-v1",
-    "field": "body"
+    "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+    "field": "body",
+    "candidate_count": 50
   }'
 ```
 
-`field` names the document text the reranker scores; use `template` instead when the text spans several fields. Retrieve more than you need (50 to 100) and let the reranker sort them. It runs on Antfly Inference in the same process, and it adds latency in proportion to the candidate count, so `limit` is the knob.
+`field` names the document text the reranker scores; use `template` instead when the text spans several fields. `candidate_count` is the scoring window and `limit` is what comes back: Antfly retrieves a bounded window from each shard, keeps the globally best `candidate_count` hits, makes one batched reranker call at the coordinator, and applies `offset` and `limit` after that. Set `candidate_count` to at least `offset + limit`, usually 50 to 100. The window is capped at 1,000 (200 on Vertex), and an oversized request returns `422 reranker_candidate_limit_exceeded` before any work starts. `hits.total` still reports the retrieval match count. The legacy `top_n` field remains as a deprecated limit override.
+
+The reranker providers that execute are `antfly`, `cohere`, and `vertex`. With `antfly`, `model` may be omitted and the runtime picks a model from its reranker directory; set it when more than one reranker is installed. A larger window improves recall and costs latency, and on a hosted provider, money.
 
 ### 4. Prune the Tail
 
-Pruning runs after fusion and reranking. Instead of returning a fixed count, it returns only what clears a quality bar. The strategies combine in one `pruner` object:
+Pruning runs once at the coordinator after global fusion and reranking, before `offset` and `limit` select the page, so standalone and distributed deployments share one score domain. Instead of returning a fixed count, it returns only what clears a quality bar. The strategies combine in one `pruner` object:
 
 | Field | Keeps |
 |-------|-------|
@@ -161,7 +165,7 @@ antfly query --table wikipedia \
   --semantic-search "theory of relativity and physics" \
   --indexes "title_body" \
   --fields "title,url" \
-  --limit 50 \
+  --limit 10 \
   --pruner '{"min_score_ratio": 0.5, "max_score_gap_percent": 30}'
 ```
 

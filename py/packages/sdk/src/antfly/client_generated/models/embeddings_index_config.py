@@ -12,11 +12,16 @@ from ..models.index_publication_policy import IndexPublicationPolicy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.antfly_embedder_config import AntflyEmbedderConfig
     from ..models.artifact_index_source import ArtifactIndexSource
+    from ..models.bedrock_embedder_config import BedrockEmbedderConfig
     from ..models.chunker_config import ChunkerConfig
-    from ..models.embedder_config import EmbedderConfig
-    from ..models.generator_config import GeneratorConfig
+    from ..models.cohere_embedder_config import CohereEmbedderConfig
+    from ..models.google_embedder_config import GoogleEmbedderConfig
     from ..models.index_execution_config import IndexExecutionConfig
+    from ..models.ollama_embedder_config import OllamaEmbedderConfig
+    from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
+    from ..models.vertex_embedder_config import VertexEmbedderConfig
 
 
 T = TypeVar("T", bound="EmbeddingsIndexConfig")
@@ -24,8 +29,8 @@ T = TypeVar("T", bound="EmbeddingsIndexConfig")
 
 @_attrs_define
 class EmbeddingsIndexConfig:
-    r"""Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted
-    index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be
+    """Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted
+    index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be
     omitted if an embedder is configured — it will be auto-detected.
 
         Attributes:
@@ -37,7 +42,7 @@ class EmbeddingsIndexConfig:
             external (bool | Unset): When true, embeddings are supplied externally via _embeddings and the index does not
                 derive prompts from a field or template. Default: False.
             sparse (bool | Unset): When true, creates a sparse (SPLADE) inverted index. When false (default), creates a
-                dense (HNSW) vector index. Default: False.
+                dense HBC vector index. Default: False.
             dimension (int | Unset): Vector dimension for dense indexes. Required for external dense indexes. Can be omitted
                 for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
             field (str | Unset): Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -57,184 +62,14 @@ class EmbeddingsIndexConfig:
                 "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..
             distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
                 models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
-                product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+                product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
             mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
-            embedder (EmbedderConfig | Unset): A unified configuration for an embedding provider.
-
-                Embedders can be configured with templates to customize how documents are
-                converted to text before embedding. Templates use Handlebars syntax and
-                support various built-in helpers.
-
-                **Template System:**
-                - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/)
-                - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes)
-                - **Context**: Templates receive the full document as context
-
-                **Built-in Helpers:**
-
-                1. **scrubHtml** - Remove script/style tags and extract clean text from HTML
-                   ```handlebars
-                   {{scrubHtml html_content}}
-                   ```
-                   - Removes `<script>` and `<style>` tags
-                   - Adds newlines after block elements (p, div, h1-h6, li, etc.)
-                   - Returns plain text with preserved readability
-
-                2. **eq** - Equality comparison for conditionals
-                   ```handlebars
-                   {{#if (eq status "active")}}Active user{{/if}}
-                   {{#if (eq @key "special")}}Special field{{/if}}
-                   ```
-
-                3. **media** - GenKit dotprompt media directive for multimodal content
-                   ```handlebars
-                   {{media url=imageDataURI}}
-                   {{media url=this.image_url}}
-                   {{media url="https://example.com/image.jpg"}}
-                   {{media url="s3://endpoint/bucket/image.png"}}
-                   {{media url="file:///path/to/image.jpg"}}
-                   ```
-
-                   **Supported URL Schemes:**
-                   - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`)
-                   - `http://` / `https://` - Web URLs with automatic content type detection
-                   - `file://` - Local filesystem paths
-                   - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`)
-
-                   **Automatic Content Processing:**
-                   - **Images**: Downloaded, resized (if needed), converted to data URIs
-                   - **PDFs**: Text extracted or first page rendered as image
-                   - **HTML**: Readable text extracted using Mozilla Readability
-
-                   **Security Controls:**
-                   Downloads are protected by content security settings (see Configuration Reference):
-                   - Allowed host whitelist
-                   - Private IP blocking (prevents SSRF attacks)
-                   - Download size limits (default: 100MB)
-                   - HTTP downloads time out after 30 seconds by default; zero disables the deadline
-                   - Image dimension limits (default: 2048px, auto-resized)
-
-                   See: https://antfly.io/docs/configuration#security--cors
-
-                4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-                   ```handlebars
-                   {{encodeToon this.fields}}
-                   {{encodeToon this.fields lengthMarker=false indent=4}}
-                   {{encodeToon this.fields delimiter="\t"}}
-                   ```
-
-                   **What is TOON?**
-                   TOON is a compact, human-readable format designed for passing structured data to LLMs.
-                   It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-                   comprehension accuracy.
-
-                   **Key Features:**
-                   - Compact syntax using `:` for key-value pairs
-                   - Array length markers: `tags[#3]: ai,search,ml`
-                   - Tabular format for uniform data structures
-                   - Optimized for LLM parsing and understanding
-                   - Maintains human readability
-
-                   **Benefits:**
-                   - **Lower API costs** - Reduced token usage means lower LLM API costs
-                   - **Faster responses** - Less tokens to process
-                   - **More context** - Fit more documents within token limits
-
-                   **Options:**
-                   - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-                   - `indent` (int): Indentation spacing for nested objects (default: 2)
-                   - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-
-                   **Example output:**
-                   ```
-                   title: Introduction to Vector Search
-                   author: Jane Doe
-                   tags[#3]: ai,search,ml
-                   metadata:
-                     edition: 2
-                     pages: 450
-                   ```
-
-                   **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-
-                   **References:**
-                   - TOON Specification: https://github.com/toon-format/toon
-                   - Go Implementation: https://github.com/alpkeskin/gotoon
-
-                **Template Examples:**
-
-                Document with metadata:
-                ```handlebars
-                Title: {{metadata.title}}
-                Date: {{metadata.date}}
-                Tags: {{#each metadata.tags}}{{this}}, {{/each}}
-
-                {{content}}
-                ```
-
-                HTML content extraction:
-                ```handlebars
-                Product: {{name}}
-                Description: {{scrubHtml description_html}}
-                Price: ${{price}}
-                ```
-
-                Multimodal with image:
-                ```handlebars
-                Product: {{title}}
-                {{media url=image}}
-                Description: {{description}}
-                ```
-
-                Conditional formatting:
-                ```handlebars
-                {{title}}
-                {{#if author}}By: {{author}}{{/if}}
-                {{#if (eq category "premium")}}⭐ Premium Content{{/if}}
-                {{body}}
-                ```
-
-                **Environment Variables:**
-                - `GEMINI_API_KEY` - API key for Google AI
-                - `OPENAI_API_KEY` - API key for OpenAI
-                - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs
-                - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434)
-
-                **Importing Pre-computed Embeddings:**
-
-                You can import existing embeddings (from OpenAI, Cohere, or any provider), but only
-                for indexes configured with `external: true`. External indexes accept vectors written
-                directly through the document `_embeddings` field and do not generate prompts from
-                `field` or `template`.
-
-                **Steps:**
-                1. Create an embeddings index with `external: true`
-                2. For dense indexes, set the index `dimension`
-                3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }`
-
-                **Example:**
-                ```json
-                {
-                  "title": "My Document",
-                  "content": "Document text...",
-                  "_embeddings": {
-                    "my_vector_index": [0.1, 0.2, 0.3, ...]
-                  }
-                }
-                ```
-
-                **Delete Behavior:**
-                - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector
-                - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged
-
-                **Use Cases:**
-                - Migrating from another vector database with existing embeddings
-                - Using embeddings generated by external systems
-                - Importing pre-computed OpenAI, Cohere, or other provider embeddings
-                - Batch processing embeddings offline before ingestion Example: {'provider': 'openai', 'model': 'text-
-                embedding-3-small'}.
-            summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
-                 Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
+            embedder (AntflyEmbedderConfig | BedrockEmbedderConfig | CohereEmbedderConfig | GoogleEmbedderConfig |
+                OllamaEmbedderConfig | OpenAIEmbedderConfig | Unset | VertexEmbedderConfig): Embedding provider configuration
+                accepted when Antfly creates and
+                maintains an embeddings index. This purpose-specific subset reuses the
+                canonical provider configurations; it does not define a second provider
+                namespace.
             chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
                 'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
             top_k (int | Unset): Default number of results to return from search (sparse only) Default: 10.
@@ -256,8 +91,16 @@ class EmbeddingsIndexConfig:
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
-    embedder: EmbedderConfig | Unset = UNSET
-    summarizer: GeneratorConfig | Unset = UNSET
+    embedder: (
+        AntflyEmbedderConfig
+        | BedrockEmbedderConfig
+        | CohereEmbedderConfig
+        | GoogleEmbedderConfig
+        | OllamaEmbedderConfig
+        | OpenAIEmbedderConfig
+        | Unset
+        | VertexEmbedderConfig
+    ) = UNSET
     chunker: ChunkerConfig | Unset = UNSET
     top_k: int | Unset = 10
     min_weight: float | Unset = 0.0
@@ -266,6 +109,13 @@ class EmbeddingsIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.bedrock_embedder_config import BedrockEmbedderConfig
+        from ..models.cohere_embedder_config import CohereEmbedderConfig
+        from ..models.google_embedder_config import GoogleEmbedderConfig
+        from ..models.ollama_embedder_config import OllamaEmbedderConfig
+        from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
+        from ..models.vertex_embedder_config import VertexEmbedderConfig
+
         publication_policy: str | Unset = UNSET
         if not isinstance(self.publication_policy, Unset):
             publication_policy = self.publication_policy.value
@@ -301,13 +151,23 @@ class EmbeddingsIndexConfig:
 
         mem_only = self.mem_only
 
-        embedder: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.embedder, Unset):
+        embedder: dict[str, Any] | Unset
+        if isinstance(self.embedder, Unset):
+            embedder = UNSET
+        elif isinstance(self.embedder, OllamaEmbedderConfig):
             embedder = self.embedder.to_dict()
-
-        summarizer: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.summarizer, Unset):
-            summarizer = self.summarizer.to_dict()
+        elif isinstance(self.embedder, OpenAIEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, BedrockEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, CohereEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, GoogleEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        elif isinstance(self.embedder, VertexEmbedderConfig):
+            embedder = self.embedder.to_dict()
+        else:
+            embedder = self.embedder.to_dict()
 
         chunker: dict[str, Any] | Unset = UNSET
         if not isinstance(self.chunker, Unset):
@@ -352,8 +212,6 @@ class EmbeddingsIndexConfig:
             field_dict["mem_only"] = mem_only
         if embedder is not UNSET:
             field_dict["embedder"] = embedder
-        if summarizer is not UNSET:
-            field_dict["summarizer"] = summarizer
         if chunker is not UNSET:
             field_dict["chunker"] = chunker
         if top_k is not UNSET:
@@ -369,11 +227,16 @@ class EmbeddingsIndexConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.antfly_embedder_config import AntflyEmbedderConfig
         from ..models.artifact_index_source import ArtifactIndexSource
+        from ..models.bedrock_embedder_config import BedrockEmbedderConfig
         from ..models.chunker_config import ChunkerConfig
-        from ..models.embedder_config import EmbedderConfig
-        from ..models.generator_config import GeneratorConfig
+        from ..models.cohere_embedder_config import CohereEmbedderConfig
+        from ..models.google_embedder_config import GoogleEmbedderConfig
         from ..models.index_execution_config import IndexExecutionConfig
+        from ..models.ollama_embedder_config import OllamaEmbedderConfig
+        from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
+        from ..models.vertex_embedder_config import VertexEmbedderConfig
 
         d = dict(src_dict)
         _publication_policy = d.pop("publication_policy", UNSET)
@@ -422,19 +285,75 @@ class EmbeddingsIndexConfig:
 
         mem_only = d.pop("mem_only", UNSET)
 
-        _embedder = d.pop("embedder", UNSET)
-        embedder: EmbedderConfig | Unset
-        if isinstance(_embedder, Unset):
-            embedder = UNSET
-        else:
-            embedder = EmbedderConfig.from_dict(_embedder)
+        def _parse_embedder(
+            data: object,
+        ) -> (
+            AntflyEmbedderConfig
+            | BedrockEmbedderConfig
+            | CohereEmbedderConfig
+            | GoogleEmbedderConfig
+            | OllamaEmbedderConfig
+            | OpenAIEmbedderConfig
+            | Unset
+            | VertexEmbedderConfig
+        ):
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_0 = OllamaEmbedderConfig.from_dict(data)
 
-        _summarizer = d.pop("summarizer", UNSET)
-        summarizer: GeneratorConfig | Unset
-        if isinstance(_summarizer, Unset):
-            summarizer = UNSET
-        else:
-            summarizer = GeneratorConfig.from_dict(_summarizer)
+                return componentsschemas_index_embedder_config_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_1 = OpenAIEmbedderConfig.from_dict(data)
+
+                return componentsschemas_index_embedder_config_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_2 = BedrockEmbedderConfig.from_dict(data)
+
+                return componentsschemas_index_embedder_config_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_3 = CohereEmbedderConfig.from_dict(data)
+
+                return componentsschemas_index_embedder_config_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_4 = GoogleEmbedderConfig.from_dict(data)
+
+                return componentsschemas_index_embedder_config_type_4
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_index_embedder_config_type_5 = VertexEmbedderConfig.from_dict(data)
+
+                return componentsschemas_index_embedder_config_type_5
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            componentsschemas_index_embedder_config_type_6 = AntflyEmbedderConfig.from_dict(data)
+
+            return componentsschemas_index_embedder_config_type_6
+
+        embedder = _parse_embedder(d.pop("embedder", UNSET))
 
         _chunker = d.pop("chunker", UNSET)
         chunker: ChunkerConfig | Unset
@@ -470,7 +389,6 @@ class EmbeddingsIndexConfig:
             distance_metric=distance_metric,
             mem_only=mem_only,
             embedder=embedder,
-            summarizer=summarizer,
             chunker=chunker,
             top_k=top_k,
             min_weight=min_weight,

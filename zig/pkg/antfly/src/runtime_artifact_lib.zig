@@ -66,6 +66,9 @@ else
 // user-manager adapter likewise imports its storage types through this root.
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const backup_bundle = @import("storage/backup_bundle.zig");
+pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
+pub const backup_repository = @import("storage/backup_repository.zig");
 pub const db = @import("storage/db/mod.zig");
 pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");

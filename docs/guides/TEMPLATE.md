@@ -38,10 +38,13 @@ believes what it retrieves").
 
 ## Frontmatter
 
-`title`, `description`, `order`, and optionally `unlisted` and `sidebar`. Nothing else.
-No `difficulty`, `estimatedTime`, `prerequisites`, or `tags`: labels about the doing rot
-once an agent does the doing. A real state requirement (credentials, a running Postgres)
-goes in the opener as prose with a verification command.
+`title`, `description`, `order`, and optionally `unlisted` and `sidebar` drive the site.
+Pages that carry `prerequisites`, `difficulty`, `estimatedTime`, and `tags` keep them,
+and the site renders them as a banner under the title; the estimates describe hand
+execution, so keep them honest and do not invent them for a page that lacks them. A
+real state requirement (credentials, a running Postgres) still goes in Before You Start
+as prose with a verification command, whether or not it is also listed in
+`prerequisites`.
 
 - Guide titles are an outcome with a verb: "Build a Support Answer Agent", "Tune Hybrid
   Search". The `description` is what the reader ends with, one sentence.
@@ -129,21 +132,30 @@ Every endpoint, flag, provider name, enum value, and default is verified against
 break silently. The recurring traps:
 
 - API bases are `/db/v1` (database), `/auth/v1` (users and keys), `/ai/v1` (inference).
-  Never `/api/v1` or a bare `/v1`.
+  Never `/api/v1` or a bare `/v1`. The host is `http://127.0.0.1:8080`, not
+  `localhost`, because standalone's default bind is the numeric loopback and
+  `localhost` resolves to IPv6 first on some systems.
 - The local inference provider is `antfly` (not `termite`); the CLI namespace is
   `antfly inference` and the local server command is `antfly standalone`.
 - Fusion is configured with `merge_config: {strategy, weights, window_size,
   rank_constant}`. `strategy` is `rrf` (default) or `rsf`; `failover` parses but is
   rejected with a 422. There is no `merge_strategy` field.
-- A `reranker` needs `provider`, `model`, and `field` (or `template`). Only
-  `provider: antfly` executes.
+- A `reranker` takes `provider`, `field` (or `template`), `candidate_count` (the
+  scoring window, at least `offset + limit`, capped at 1,000 and at 200 on Vertex),
+  and `model`, which the `antfly` provider can omit when one reranker is installed.
+  The providers that execute are `antfly`, `cohere`, and `vertex`. Pruning runs
+  after fusion and reranking and before `offset` and `limit`.
+- The models the Quickstart installs, and so the ones every guide should use: text
+  embedding `Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1`, reranking
+  `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0`, images and audio
+  `antflydb/clipclap`, generation `ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0`. Pull refs
+  carry the `hf:` prefix. `dimension` is probed, not passed.
 - Retrieval-agent generation runs via `steps.generation` and accepts providers
   `gemini`, `vertex`, `openai`, `ollama`, `antfly` only; responses are JSON unless
   `stream: true`.
 - `semantic_search` requires `indexes: [...]`; omitting it is an HTTP 422.
 - `sync_level: "full_index"` for read-after-write vector queries.
-- Model refs are owner-qualified (`BAAI/bge-small-en-v1.5`,
-  `mixedbread-ai/mxbai-rerank-base-v1`).
+- Model refs are owner-qualified; a bare name is rejected.
 
 When in doubt, `antfly-skills/references/` is the verified corpus (CI-checked against
 `openapi.yaml`); the implementation outranks spec prose.

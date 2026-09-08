@@ -18,7 +18,9 @@ from gliner2_release_contract import (
 
 class ReleaseContractTest(unittest.TestCase):
     def test_canonical_normalization_is_versioned_and_unicode_aware(self) -> None:
-        self.assertEqual("unicode_nfc_collapsed_whitespace_casefold/v1", CANONICAL_NORMALIZATION)
+        self.assertEqual(
+            "unicode_nfc_collapsed_whitespace_casefold/v1", CANONICAL_NORMALIZATION
+        )
         with self.subTest(rule="NFC"):
             self.assertEqual("café", canonical_text("cafe\u0301"))
         with self.subTest(rule="collapsed whitespace"):
@@ -54,7 +56,9 @@ class ReleaseContractTest(unittest.TestCase):
                 if not entry.optional:
                     path.write_bytes(b"required")
             (model_dir / "spm.model").mkdir()
-            with self.assertRaisesRegex(ValueError, "optional fingerprint path is not a regular file"):
+            with self.assertRaisesRegex(
+                ValueError, "optional fingerprint path is not a regular file"
+            ):
                 directory_fingerprint(model_dir, MODEL_FINGERPRINT_ENTRIES)
 
     def test_oracle_checkout_accepts_only_the_fixed_clean_commit(self) -> None:
@@ -64,16 +68,24 @@ class ReleaseContractTest(unittest.TestCase):
             package.mkdir()
             (package / "__init__.py").write_text("", encoding="utf-8")
             clean = [
-                SimpleNamespace(returncode=0, stdout="8f3fc399bcc5a00749a62a1565e5c6529f04b574\n"),
+                SimpleNamespace(
+                    returncode=0, stdout="8f3fc399bcc5a00749a62a1565e5c6529f04b574\n"
+                ),
                 SimpleNamespace(returncode=0, stdout=""),
             ]
-            with mock.patch("gliner2_release_contract.subprocess.run", side_effect=clean):
+            with mock.patch(
+                "gliner2_release_contract.subprocess.run", side_effect=clean
+            ):
                 result = verify_upstream_checkout(checkout)
-            self.assertEqual("8f3fc399bcc5a00749a62a1565e5c6529f04b574", result["commit"])
+            self.assertEqual(
+                "8f3fc399bcc5a00749a62a1565e5c6529f04b574", result["commit"]
+            )
 
             wrong = SimpleNamespace(returncode=0, stdout="wrong\n")
             with (
-                mock.patch("gliner2_release_contract.subprocess.run", return_value=wrong),
+                mock.patch(
+                    "gliner2_release_contract.subprocess.run", return_value=wrong
+                ),
                 self.assertRaisesRegex(ValueError, "does not match frozen"),
             ):
                 verify_upstream_checkout(checkout)
@@ -96,7 +108,9 @@ class ReleaseContractTest(unittest.TestCase):
 
     def test_oracle_dependency_versions_are_pinned(self) -> None:
         versions = dict(contract.CANONICAL_ORACLE_PACKAGE_VERSIONS)
-        requirements = Path(contract.__file__).with_name("requirements-gliner2-oracle.txt")
+        requirements = Path(contract.__file__).with_name(
+            "requirements-gliner2-oracle.txt"
+        )
         locked = {}
         for raw_line in requirements.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
@@ -106,12 +120,16 @@ class ReleaseContractTest(unittest.TestCase):
             locked[package] = version
         self.assertEqual(versions, locked)
 
-        with mock.patch.object(contract.importlib.metadata, "version", side_effect=versions.__getitem__):
+        with mock.patch.object(
+            contract.importlib.metadata, "version", side_effect=versions.__getitem__
+        ):
             self.assertEqual(versions, contract.verify_canonical_oracle_packages())
 
         versions["torch"] = "future"
         with (
-            mock.patch.object(contract.importlib.metadata, "version", side_effect=versions.__getitem__),
+            mock.patch.object(
+                contract.importlib.metadata, "version", side_effect=versions.__getitem__
+            ),
             self.assertRaisesRegex(ValueError, "torch=future"),
         ):
             contract.verify_canonical_oracle_packages()

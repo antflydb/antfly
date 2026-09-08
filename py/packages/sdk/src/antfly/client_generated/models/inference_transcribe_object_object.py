@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceTranscribeObjectObject(str, Enum):
+class InferenceTranscribeObjectObject(StrEnum):
     TRANSCRIPTION = "transcription"
 
     def __str__(self) -> str:

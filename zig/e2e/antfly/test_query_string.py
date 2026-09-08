@@ -32,7 +32,10 @@ def _hit_ids(result: dict, response_index: int = 0) -> list[str]:
     responses = result.get("responses", [])
     if len(responses) <= response_index:
         return []
-    return [hit.get("_id") for hit in responses[response_index].get("hits", {}).get("hits", [])]
+    return [
+        hit.get("_id")
+        for hit in responses[response_index].get("hits", {}).get("hits", [])
+    ]
 
 
 def _query_hit_ids(stateful_api, table_name: str, payload: dict) -> list[str] | None:
@@ -44,7 +47,10 @@ def _query_hit_ids(stateful_api, table_name: str, payload: dict) -> list[str] | 
 
 
 def _post_ndjson_multiquery(stateful_api, path: str, payloads: list[dict]) -> dict:
-    body = "\n".join(json.dumps(payload, separators=(",", ":")) for payload in payloads) + "\n"
+    body = (
+        "\n".join(json.dumps(payload, separators=(",", ":")) for payload in payloads)
+        + "\n"
+    )
     response = requests.post(
         f"{stateful_api.url}{path}",
         data=body,
@@ -86,16 +92,18 @@ def test_bleve_query_string_full_text_and_filter(stateful_api):
     full_text_result = wait_until(
         lambda: (
             ids
-            if (ids := _query_hit_ids(
-                stateful_api,
-                table_name,
-                {
-                    "full_text_search": {
-                        "query": "title:guide AND body:hello",
+            if (
+                ids := _query_hit_ids(
+                    stateful_api,
+                    table_name,
+                    {
+                        "full_text_search": {
+                            "query": "title:guide AND body:hello",
+                        },
+                        "limit": 5,
                     },
-                    "limit": 5,
-                },
-            ))
+                )
+            )
             else None
         ),
         timeout_s=30.0,
@@ -107,22 +115,24 @@ def test_bleve_query_string_full_text_and_filter(stateful_api):
     filtered_result = wait_until(
         lambda: (
             ids
-            if (ids := _query_hit_ids(
-                stateful_api,
-                table_name,
-                {
-                    "full_text_search": {
-                        "query": "body:hello",
+            if (
+                ids := _query_hit_ids(
+                    stateful_api,
+                    table_name,
+                    {
+                        "full_text_search": {
+                            "query": "body:hello",
+                        },
+                        "filter_query": {
+                            "query": "status:published OR status:review",
+                        },
+                        "exclusion_query": {
+                            "query": "status:draft",
+                        },
+                        "limit": 5,
                     },
-                    "filter_query": {
-                        "query": "status:published OR status:review",
-                    },
-                    "exclusion_query": {
-                        "query": "status:draft",
-                    },
-                    "limit": 5,
-                },
-            ))
+                )
+            )
             else None
         ),
         timeout_s=30.0,
@@ -135,20 +145,25 @@ def test_bleve_query_string_full_text_and_filter(stateful_api):
     table_multiquery = wait_until(
         lambda: (
             result
-            if len((result := _post_ndjson_multiquery(
-                stateful_api,
-                f"/tables/{table_name}/query",
-                [
-                    {
-                        "fields": ["title"],
-                        "limit": 5,
-                    },
-                    {
-                        "fields": ["status"],
-                        "limit": 5,
-                    },
-                ],
-            )).get("responses", [])) == 2
+            if len(
+                (
+                    result := _post_ndjson_multiquery(
+                        stateful_api,
+                        f"/tables/{table_name}/query",
+                        [
+                            {
+                                "fields": ["title"],
+                                "limit": 5,
+                            },
+                            {
+                                "fields": ["status"],
+                                "limit": 5,
+                            },
+                        ],
+                    )
+                ).get("responses", [])
+            )
+            == 2
             and len(result["responses"][0].get("hits", {}).get("hits", [])) > 0
             and len(result["responses"][1].get("hits", {}).get("hits", [])) > 0
             else None
@@ -161,22 +176,27 @@ def test_bleve_query_string_full_text_and_filter(stateful_api):
     global_multiquery = wait_until(
         lambda: (
             result
-            if len((result := _post_ndjson_multiquery(
-                stateful_api,
-                "/query",
-                [
-                    {
-                        "table": table_name,
-                        "fields": ["body"],
-                        "limit": 5,
-                    },
-                    {
-                        "table": table_name,
-                        "fields": ["status"],
-                        "limit": 5,
-                    },
-                ],
-            )).get("responses", [])) == 2
+            if len(
+                (
+                    result := _post_ndjson_multiquery(
+                        stateful_api,
+                        "/query",
+                        [
+                            {
+                                "table": table_name,
+                                "fields": ["body"],
+                                "limit": 5,
+                            },
+                            {
+                                "table": table_name,
+                                "fields": ["status"],
+                                "limit": 5,
+                            },
+                        ],
+                    )
+                ).get("responses", [])
+            )
+            == 2
             and len(result["responses"][0].get("hits", {}).get("hits", [])) > 0
             and len(result["responses"][1].get("hits", {}).get("hits", [])) > 0
             else None
@@ -212,19 +232,21 @@ def test_direct_full_text_match_and_prefix(stateful_api):
     match_result = wait_until(
         lambda: (
             ids
-            if (ids := _query_hit_ids(
-                stateful_api,
-                table_name,
-                {
-                    "full_text_search": {
-                        "match": {
-                            "field": "body",
-                            "text": "hello world",
-                        }
+            if (
+                ids := _query_hit_ids(
+                    stateful_api,
+                    table_name,
+                    {
+                        "full_text_search": {
+                            "match": {
+                                "field": "body",
+                                "text": "hello world",
+                            }
+                        },
+                        "limit": 5,
                     },
-                    "limit": 5,
-                },
-            ))
+                )
+            )
             else None
         ),
         timeout_s=30.0,
@@ -236,19 +258,21 @@ def test_direct_full_text_match_and_prefix(stateful_api):
     prefix_result = wait_until(
         lambda: (
             ids
-            if (ids := _query_hit_ids(
-                stateful_api,
-                table_name,
-                {
-                    "full_text_search": {
-                        "prefix": {
-                            "field": "body",
-                            "text": "hel",
-                        }
+            if (
+                ids := _query_hit_ids(
+                    stateful_api,
+                    table_name,
+                    {
+                        "full_text_search": {
+                            "prefix": {
+                                "field": "body",
+                                "text": "hel",
+                            }
+                        },
+                        "limit": 5,
                     },
-                    "limit": 5,
-                },
-            ))
+                )
+            )
             else None
         ),
         timeout_s=30.0,

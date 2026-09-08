@@ -96,7 +96,16 @@ pub const PersistentReplicaProvider = struct {
     fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
         const self: *PersistentReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = try self.ensureState(record);
-        var desc = try self.base_factory.buildDescriptor(record);
+        // Snapshot bootstrap is a one-shot recovery source. Once this exact
+        // local replica path has durable Raft state, restart must use it rather
+        // than depend on a remote artifact that was released after the first
+        // successful fetch. Empty state still preserves the original source.
+        var effective_record = record;
+        if (try state.storage().lastIndex() > 0) {
+            effective_record.bootstrap_mode = .persisted;
+            effective_record.snapshot_bootstrap = null;
+        }
+        var desc = try self.base_factory.buildDescriptor(effective_record);
         errdefer self.base_factory.freeDescriptor(self.alloc, &desc);
         try state.seedConfStateIfEmpty(desc.initial_voters orelse desc.group.raft_config.peers);
         desc.group.storage = state.storage();

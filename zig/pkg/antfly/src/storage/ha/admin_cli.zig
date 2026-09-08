@@ -1022,6 +1022,7 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
     var promoted_node_id: ?[]const u8 = null;
     var new_timeline_id: ?u64 = null;
     var new_epoch: ?u64 = null;
+    var generation: ?u64 = null;
     var required_lsn: ?u64 = null;
     var observed_lsn: ?u64 = null;
     var force = false;
@@ -1055,6 +1056,9 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
         } else if (std.mem.eql(u8, arg, "--new-epoch")) {
             _ = cursor.next();
             new_epoch = try parseU64(try cursor.value("--new-epoch"));
+        } else if (std.mem.eql(u8, arg, "--generation")) {
+            _ = cursor.next();
+            generation = try parseU64(try cursor.value("--generation"));
         } else if (std.mem.eql(u8, arg, "--required-lsn")) {
             _ = cursor.next();
             required_lsn = try parseU64(try cursor.value("--required-lsn"));
@@ -1082,6 +1086,7 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
         .promoted_node_id = promoted_node_id orelse return error.PromotedNodeIdMissing,
         .new_timeline_id = new_timeline_id orelse return error.NewTimelineIdMissing,
         .new_epoch = new_epoch orelse return error.NewEpochMissing,
+        .generation = generation orelse return error.FenceGenerationMissing,
         .required_lsn = required_lsn orelse return error.RequiredLsnMissing,
         .observed_lsn = observed_lsn orelse return error.ObservedLsnMissing,
         .force = force,
@@ -1850,6 +1855,8 @@ test "storage.ha admin cli parses fenced promotion request" {
         "6",
         "--new-epoch",
         "7",
+        "--generation",
+        "9",
         "--required-lsn",
         "100",
         "--observed-lsn",
@@ -1863,6 +1870,7 @@ test "storage.ha admin cli parses fenced promotion request" {
     try std.testing.expectEqualStrings("primary-a", acquired.command.fence_acquire.old_primary_id);
     try std.testing.expectEqualStrings("standby-b", acquired.command.fence_acquire.promoted_node_id);
     try std.testing.expectEqual(@as(u64, 6), acquired.command.fence_acquire.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 9), acquired.command.fence_acquire.generation);
     try std.testing.expect(acquired.command.fence_acquire.force);
 
     var current = try parse(alloc, &.{ "fence", "current" });
@@ -1909,6 +1917,8 @@ test "storage.ha admin cli parses fenced promotion request" {
         "6",
         "--new-epoch",
         "7",
+        "--generation",
+        "9",
         "--required-lsn",
         "100",
         "--observed-lsn",
@@ -1947,6 +1957,8 @@ test "storage.ha admin cli parses fenced promotion request" {
         "6",
         "--new-epoch",
         "7",
+        "--generation",
+        "9",
         "--required-lsn",
         "100",
         "--observed-lsn",

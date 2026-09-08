@@ -227,17 +227,17 @@ const api = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, {
 This package has a hosted/shared WASM smoke path built on the shared embedded
 DB/API surface, not the older portable-only path.
 
-Build:
+Build and install the bundle from the `zig` directory (without running tests):
 
-- `zig build antfly-embedded-wasm-smoke`
+- `zig build wasm`
 
-Run under Node:
+Build the bundle and run its smoke test under Node:
 
-- `zig build antfly-embedded-wasm-smoke-run`
+- `zig build wasm-test`
 
 Artifacts are installed under:
 
-- `zig-out/antfly-embedded-wasm-smoke/`
+- `zig-out/antfly-wasm/`
 
 The smoke uses:
 
@@ -252,8 +252,8 @@ The smoke uses:
 ## Validation
 
 - `zig build antfly-embedded-test --summary failures`
-- `zig build antfly-embedded-wasm-smoke`
-- `zig build antfly-embedded-wasm-smoke-run`
+- `zig build wasm`
+- `zig build wasm-test`
 
 ## Current Limits
 

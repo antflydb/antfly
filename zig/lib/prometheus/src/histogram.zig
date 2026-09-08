@@ -508,20 +508,20 @@ test "Histogram: simple" {
         const buf = writer.writer.buffered();
         try t.expectString(
             \\# TYPE hst_1 histogram
-             \\hst_1_bucket{le="0.005"} 161
-             \\hst_1_bucket{le="0.01"} 231
-             \\hst_1_bucket{le="0.025"} 323
-             \\hst_1_bucket{le="0.05"} 393
-             \\hst_1_bucket{le="0.1"} 462
-             \\hst_1_bucket{le="0.25"} 554
-             \\hst_1_bucket{le="0.5"} 624
-             \\hst_1_bucket{le="1"} 694
-             \\hst_1_bucket{le="2.5"} 786
-             \\hst_1_bucket{le="5"} 856
-             \\hst_1_bucket{le="10"} 926
-             \\hst_1_bucket{le="+Inf"} 1001
-             \\hst_1_sum 2119.573719419178
-             \\hst_1_count 1001
+            \\hst_1_bucket{le="0.005"} 161
+            \\hst_1_bucket{le="0.01"} 231
+            \\hst_1_bucket{le="0.025"} 323
+            \\hst_1_bucket{le="0.05"} 393
+            \\hst_1_bucket{le="0.1"} 462
+            \\hst_1_bucket{le="0.25"} 554
+            \\hst_1_bucket{le="0.5"} 624
+            \\hst_1_bucket{le="1"} 694
+            \\hst_1_bucket{le="2.5"} 786
+            \\hst_1_bucket{le="5"} 856
+            \\hst_1_bucket{le="10"} 926
+            \\hst_1_bucket{le="+Inf"} 1001
+            \\hst_1_sum 2119.573719419178
+            \\hst_1_count 1001
             \\
         , buf);
     }

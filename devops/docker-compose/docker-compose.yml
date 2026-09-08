@@ -1,14 +1,14 @@
 services:
   antfly:
     image: ghcr.io/antflydb/antfly:latest
-    command: ["standalone"]
+    command: ["standalone", "--host", "0.0.0.0", "--data-dir", "/antflydb", "--config", "/config.json"]
     ports:
       - "8080:8080" # Public API port
       # - "9090:9090" # MCP port
       - "4200:4200" # Metrics port
     volumes:
       - ./antfly-data:/antflydb
-      - ./config.json:/config.json
+      - ./config.json:/config.json:ro
     container_name: antfly-standalone
     environment:
       - ANTFLY_LOG_LEVEL=info

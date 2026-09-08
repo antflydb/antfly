@@ -87,6 +87,46 @@ pub const SnapshotBootstrapRecord = struct {
     term: u64 = 0,
     snapshot_id: []const u8,
     uri: []const u8 = "",
+    format: raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat = .unknown,
+
+    /// Keep the durable catalog predecessor-readable during the decoder-first
+    /// rollout. The isolated v2 URI is already a lossless discriminator for
+    /// Antfly snapshot artifacts, so emitting `format` here would only make a
+    /// node rollback reject an otherwise valid local catalog as an unknown JSON
+    /// field. The default parser still accepts catalogs written by development
+    /// builds that included the explicit field.
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("from_node_id");
+        try writer.write(self.from_node_id);
+        try writer.objectField("term");
+        try writer.write(self.term);
+        try writer.objectField("snapshot_id");
+        try writer.write(self.snapshot_id);
+        try writer.objectField("uri");
+        try writer.write(self.uri);
+        try writer.endObject();
+    }
+
+    pub fn inferFormat(snapshot_id: []const u8, uri: []const u8) raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat {
+        const v2_routes = [_][]const u8{
+            "/raft/v2/snapshot/upload",
+            "/raft/v2/snapshot/fetch",
+        };
+        for (v2_routes) |route| {
+            const pos = std.mem.lastIndexOf(u8, uri, route) orelse continue;
+            const suffix = uri[pos + route.len ..];
+            if (suffix.len == snapshot_id.len + 1 and suffix[0] == '/' and
+                std.mem.eql(u8, suffix[1..], snapshot_id))
+                return .chunked_manifest_v2;
+        }
+        return .unknown;
+    }
+
+    pub fn effectiveFormat(self: SnapshotBootstrapRecord) raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat {
+        if (self.format != .unknown) return self.format;
+        return inferFormat(self.snapshot_id, self.uri);
+    }
 
     pub fn clone(self: SnapshotBootstrapRecord, alloc: std.mem.Allocator) !SnapshotBootstrapRecord {
         var cloned = SnapshotBootstrapRecord{
@@ -94,6 +134,7 @@ pub const SnapshotBootstrapRecord = struct {
             .term = self.term,
             .snapshot_id = try alloc.dupe(u8, self.snapshot_id),
             .uri = "",
+            .format = self.effectiveFormat(),
         };
         errdefer alloc.free(cloned.snapshot_id);
         cloned.uri = try alloc.dupe(u8, self.uri);
@@ -113,6 +154,7 @@ pub const SnapshotBootstrapRecord = struct {
             .locator = .{
                 .snapshot_id = try alloc.dupe(u8, self.snapshot_id),
                 .uri = "",
+                .format = self.effectiveFormat(),
             },
             .fetch_immediately = true,
         };
@@ -290,6 +332,7 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
         const other = right.snapshot_bootstrap.?;
         if (snapshot.from_node_id != other.from_node_id) return false;
         if (snapshot.term != other.term) return false;
+        if (snapshot.effectiveFormat() != other.effectiveFormat()) return false;
         if (!std.mem.eql(u8, snapshot.snapshot_id, other.snapshot_id)) return false;
         if (!std.mem.eql(u8, snapshot.uri, other.uri)) return false;
     }
@@ -343,14 +386,22 @@ pub const ReplicaCatalog = struct {
     pub const VTable = struct {
         upsert_replica: *const fn (ptr: *anyopaque, record: ReplicaRecord) anyerror!void,
         remove_replica: *const fn (ptr: *anyopaque, group_id: u64) anyerror!bool,
+        contains_replica: *const fn (ptr: *anyopaque, group_id: u64) bool,
         list_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]ReplicaRecord,
-        revision: *const fn (ptr: *anyopaque) u64,
+        snapshot_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!ReplicaCatalogSnapshot,
+        revision: *const fn (ptr: *anyopaque) ReplicaCatalogToken,
         apply_batch: *const fn (
             ptr: *anyopaque,
-            expected_revision: u64,
+            expected_token: ReplicaCatalogToken,
             upserts: []const ReplicaRecord,
             removals: []const u64,
-        ) anyerror!void,
+        ) anyerror!ReplicaCatalogToken,
+        prepare_batch: *const fn (
+            ptr: *anyopaque,
+            expected_token: ReplicaCatalogToken,
+            upserts: []const ReplicaRecord,
+            removals: []const u64,
+        ) anyerror!PreparedReplicaCatalogBatch,
     };
 
     pub fn upsertReplica(self: ReplicaCatalog, record: ReplicaRecord) !void {
@@ -362,22 +413,94 @@ pub const ReplicaCatalog = struct {
         return try self.vtable.remove_replica(self.ptr, group_id);
     }
 
+    pub fn containsReplica(self: ReplicaCatalog, group_id: u64) bool {
+        return self.vtable.contains_replica(self.ptr, group_id);
+    }
+
     pub fn listReplicas(self: ReplicaCatalog, alloc: std.mem.Allocator) ![]ReplicaRecord {
         return try self.vtable.list_replicas(self.ptr, alloc);
     }
 
-    pub fn revision(self: ReplicaCatalog) u64 {
+    /// Captures membership and its revision under one catalog lock. Reconcilers
+    /// must use this instead of separately listing records and reading the
+    /// revision, which would allow an intervening writer to make a stale diff
+    /// pass the optimistic revision fence.
+    pub fn snapshotReplicas(self: ReplicaCatalog, alloc: std.mem.Allocator) !ReplicaCatalogSnapshot {
+        return try self.vtable.snapshot_replicas(self.ptr, alloc);
+    }
+
+    pub fn token(self: ReplicaCatalog) ReplicaCatalogToken {
         return self.vtable.revision(self.ptr);
+    }
+
+    /// Numeric revision is exposed for diagnostics and observability only.
+    /// Mutations require the opaque token returned by `token` or a snapshot.
+    pub fn revision(self: ReplicaCatalog) u64 {
+        return self.token().revision;
     }
 
     pub fn applyBatch(
         self: ReplicaCatalog,
-        expected_revision: u64,
+        expected_token: ReplicaCatalogToken,
         upserts: []const ReplicaRecord,
         removals: []const u64,
-    ) !void {
+    ) !ReplicaCatalogToken {
         for (upserts) |record| try validateReplicaRecord(record);
-        return try self.vtable.apply_batch(self.ptr, expected_revision, upserts, removals);
+        return try self.vtable.apply_batch(self.ptr, expected_token, upserts, removals);
+    }
+
+    /// Performs allocation, cloning, serialization, and file fsync before the
+    /// caller enters a correctness-critical publication barrier. `commit`
+    /// performs only the optimistic revision check and atomic publication.
+    pub fn prepareBatch(
+        self: ReplicaCatalog,
+        expected_token: ReplicaCatalogToken,
+        upserts: []const ReplicaRecord,
+        removals: []const u64,
+    ) !PreparedReplicaCatalogBatch {
+        for (upserts) |record| try validateReplicaRecord(record);
+        return try self.vtable.prepare_batch(self.ptr, expected_token, upserts, removals);
+    }
+};
+
+/// Opaque optimistic-concurrency capability for one catalog generation.
+/// Reconciliation carries this value forward across admission and retirement
+/// instead of reconstructing a fence from a newly observed integer.
+pub const ReplicaCatalogToken = struct {
+    revision: u64,
+};
+
+/// An owned catalog transaction whose expensive preparation has completed.
+/// Handles are single-use and must always be deinitialized, including after a
+/// successful commit. Implementations may transfer the retired generation to
+/// the handle so reclamation stays out of a caller's publication barrier;
+/// callers should therefore defer deinit until after releasing that barrier.
+pub const PreparedReplicaCatalogBatch = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        commit: *const fn (ptr: *anyopaque) anyerror!ReplicaCatalogToken,
+        deinit: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn commit(self: *PreparedReplicaCatalogBatch) !ReplicaCatalogToken {
+        return try self.vtable.commit(self.ptr);
+    }
+
+    pub fn deinit(self: *PreparedReplicaCatalogBatch) void {
+        self.vtable.deinit(self.ptr);
+        self.* = undefined;
+    }
+};
+
+pub const ReplicaCatalogSnapshot = struct {
+    token: ReplicaCatalogToken,
+    records: []ReplicaRecord,
+
+    pub fn deinit(self: *ReplicaCatalogSnapshot, alloc: std.mem.Allocator) void {
+        freeReplicaRecords(alloc, self.records);
+        self.* = undefined;
     }
 };
 
@@ -386,6 +509,7 @@ pub const MemoryReplicaCatalog = struct {
     mutex: std.atomic.Mutex = .unlocked,
     current_revision: u64 = 1,
     records: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+    test_prepared_reclamations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
 
     pub fn init(alloc: std.mem.Allocator) MemoryReplicaCatalog {
         return .{ .alloc = alloc };
@@ -404,9 +528,12 @@ pub const MemoryReplicaCatalog = struct {
             .vtable = &.{
                 .upsert_replica = upsertReplica,
                 .remove_replica = removeReplica,
+                .contains_replica = containsReplica,
                 .list_replicas = listReplicas,
+                .snapshot_replicas = snapshotReplicas,
                 .revision = revision,
                 .apply_batch = applyBatch,
+                .prepare_batch = prepareBatch,
             },
         };
     }
@@ -447,6 +574,13 @@ pub const MemoryReplicaCatalog = struct {
         return true;
     }
 
+    fn containsReplica(ptr: *anyopaque, group_id: u64) bool {
+        const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.records.contains(group_id);
+    }
+
     fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicaRecord {
         const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
@@ -454,32 +588,129 @@ pub const MemoryReplicaCatalog = struct {
         return try cloneReplicaRecordsFromMap(alloc, &self.records);
     }
 
-    fn revision(ptr: *anyopaque) u64 {
+    fn snapshotReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) !ReplicaCatalogSnapshot {
         const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return self.current_revision;
+        return .{
+            .token = .{ .revision = self.current_revision },
+            .records = try cloneReplicaRecordsFromMap(alloc, &self.records),
+        };
+    }
+
+    fn revision(ptr: *anyopaque) ReplicaCatalogToken {
+        const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return .{ .revision = self.current_revision };
     }
 
     fn applyBatch(
         ptr: *anyopaque,
-        expected_revision: u64,
+        expected_token: ReplicaCatalogToken,
         upserts: []const ReplicaRecord,
         removals: []const u64,
-    ) !void {
+    ) !ReplicaCatalogToken {
         const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        if (self.current_revision != expected_revision) return error.ReplicaCatalogRevisionChanged;
-        if (upserts.len == 0 and removals.len == 0) return;
-        const next_revision = try nextRevision(self.current_revision);
+        if (self.current_revision != expected_token.revision) return error.ReplicaCatalogRevisionChanged;
+        if (upserts.len == 0 and removals.len == 0) return .{ .revision = self.current_revision };
+        if (replicaBatchClearlyNoOp(&self.records, upserts, removals)) return .{ .revision = self.current_revision };
 
         var next = try cloneReplicaMapFromMap(self.alloc, &self.records);
         errdefer deinitReplicaMap(self.alloc, &next);
         try applyReplicaBatchToMap(self.alloc, &next, upserts, removals);
+        if (replicaMapsEqual(&self.records, &next)) {
+            deinitReplicaMap(self.alloc, &next);
+            return .{ .revision = self.current_revision };
+        }
+        const next_revision = try nextRevision(self.current_revision);
         deinitReplicaMap(self.alloc, &self.records);
         self.records = next;
         self.current_revision = next_revision;
+        return .{ .revision = next_revision };
+    }
+
+    const PreparedBatch = struct {
+        owner: *MemoryReplicaCatalog,
+        expected_token: ReplicaCatalogToken,
+        next: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+        retired: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+        changed: bool,
+        commit_attempted: bool = false,
+        map_transferred: bool = false,
+
+        fn commitOpaque(ptr: *anyopaque) !ReplicaCatalogToken {
+            const self: *PreparedBatch = @ptrCast(@alignCast(ptr));
+            if (self.commit_attempted) return error.ReplicaCatalogBatchAlreadyCommitted;
+            self.commit_attempted = true;
+            lockAtomic(&self.owner.mutex);
+            defer self.owner.mutex.unlock();
+            if (self.owner.current_revision != self.expected_token.revision)
+                return error.ReplicaCatalogRevisionChanged;
+            if (!self.changed) return .{ .revision = self.owner.current_revision };
+            const next_revision = try nextRevision(self.owner.current_revision);
+            self.retired = self.owner.records;
+            self.owner.records = self.next;
+            self.next = .empty;
+            self.map_transferred = true;
+            self.owner.current_revision = next_revision;
+            return .{ .revision = next_revision };
+        }
+
+        fn deinitOpaque(ptr: *anyopaque) void {
+            const self: *PreparedBatch = @ptrCast(@alignCast(ptr));
+            if (!self.map_transferred) deinitReplicaMap(self.owner.alloc, &self.next);
+            if (builtin.is_test and self.retired.count() != 0)
+                self.owner.test_prepared_reclamations += 1;
+            deinitReplicaMap(self.owner.alloc, &self.retired);
+            const alloc = self.owner.alloc;
+            alloc.destroy(self);
+        }
+    };
+
+    fn prepareBatch(
+        ptr: *anyopaque,
+        expected_token: ReplicaCatalogToken,
+        upserts: []const ReplicaRecord,
+        removals: []const u64,
+    ) !PreparedReplicaCatalogBatch {
+        const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
+        const prepared = try self.alloc.create(PreparedBatch);
+        errdefer self.alloc.destroy(prepared);
+        prepared.* = .{
+            .owner = self,
+            .expected_token = expected_token,
+            .changed = false,
+        };
+        errdefer deinitReplicaMap(self.alloc, &prepared.next);
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.current_revision != expected_token.revision)
+            return error.ReplicaCatalogRevisionChanged;
+        if (upserts.len == 0 and removals.len == 0 or
+            replicaBatchClearlyNoOp(&self.records, upserts, removals))
+        {
+            return .{
+                .ptr = prepared,
+                .vtable = &.{
+                    .commit = PreparedBatch.commitOpaque,
+                    .deinit = PreparedBatch.deinitOpaque,
+                },
+            };
+        }
+        prepared.next = try cloneReplicaMapFromMap(self.alloc, &self.records);
+        try applyReplicaBatchToMap(self.alloc, &prepared.next, upserts, removals);
+        prepared.changed = !replicaMapsEqual(&self.records, &prepared.next);
+        return .{
+            .ptr = prepared,
+            .vtable = &.{
+                .commit = PreparedBatch.commitOpaque,
+                .deinit = PreparedBatch.deinitOpaque,
+            },
+        };
     }
 };
 
@@ -491,6 +722,7 @@ pub const FileReplicaCatalog = struct {
     current_revision: u64 = 1,
     records: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
     test_persist_failure_boundary: if (builtin.is_test) ?TestPersistFailureBoundary else void = if (builtin.is_test) null else {},
+    test_prepared_reclamations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileReplicaCatalog {
         var self = FileReplicaCatalog{
@@ -503,6 +735,12 @@ pub const FileReplicaCatalog = struct {
             alloc.free(self.path);
             self.io_impl.deinit();
         }
+        self.cleanupPreparedArtifacts() catch |err| {
+            std.log.warn(
+                "replica catalog prepared-image cleanup deferred path={s} err={s}",
+                .{ self.path, @errorName(err) },
+            );
+        };
         try self.load();
         return self;
     }
@@ -522,9 +760,12 @@ pub const FileReplicaCatalog = struct {
             .vtable = &.{
                 .upsert_replica = upsertReplica,
                 .remove_replica = removeReplica,
+                .contains_replica = containsReplica,
                 .list_replicas = listReplicas,
+                .snapshot_replicas = snapshotReplicas,
                 .revision = revision,
                 .apply_batch = applyBatch,
+                .prepare_batch = prepareBatch,
             },
         };
     }
@@ -546,9 +787,15 @@ pub const FileReplicaCatalog = struct {
             var previous = entry.value_ptr.*;
             entry.value_ptr.* = owned;
             map_owns_record = true;
-            self.persist() catch |err| {
-                entry.value_ptr.* = previous;
-                map_owns_record = false;
+            var published = false;
+            self.persist(&published) catch |err| {
+                if (!published) {
+                    entry.value_ptr.* = previous;
+                    map_owns_record = false;
+                } else {
+                    previous.deinit(self.alloc);
+                    self.current_revision = next_revision;
+                }
                 return err;
             };
             previous.deinit(self.alloc);
@@ -556,9 +803,14 @@ pub const FileReplicaCatalog = struct {
         } else {
             entry.value_ptr.* = owned;
             map_owns_record = true;
-            self.persist() catch |err| {
-                _ = self.records.fetchRemove(record.group_id) orelse unreachable;
-                map_owns_record = false;
+            var published = false;
+            self.persist(&published) catch |err| {
+                if (!published) {
+                    _ = self.records.fetchRemove(record.group_id) orelse unreachable;
+                    map_owns_record = false;
+                } else {
+                    self.current_revision = next_revision;
+                }
                 return err;
             };
             self.current_revision = next_revision;
@@ -572,14 +824,28 @@ pub const FileReplicaCatalog = struct {
         if (!self.records.contains(group_id)) return false;
         const next_revision = try nextRevision(self.current_revision);
         const removed = self.records.fetchRemove(group_id) orelse unreachable;
-        self.persist() catch |err| {
-            self.records.putAssumeCapacity(group_id, removed.value);
+        var published = false;
+        self.persist(&published) catch |err| {
+            if (!published) {
+                self.records.putAssumeCapacity(group_id, removed.value);
+            } else {
+                var record = removed.value;
+                record.deinit(self.alloc);
+                self.current_revision = next_revision;
+            }
             return err;
         };
         var record = removed.value;
         record.deinit(self.alloc);
         self.current_revision = next_revision;
         return true;
+    }
+
+    fn containsReplica(ptr: *anyopaque, group_id: u64) bool {
+        const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.records.contains(group_id);
     }
 
     fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicaRecord {
@@ -589,38 +855,208 @@ pub const FileReplicaCatalog = struct {
         return try cloneReplicaRecordsFromMap(alloc, &self.records);
     }
 
-    fn revision(ptr: *anyopaque) u64 {
+    fn snapshotReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) !ReplicaCatalogSnapshot {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return self.current_revision;
+        return .{
+            .token = .{ .revision = self.current_revision },
+            .records = try cloneReplicaRecordsFromMap(alloc, &self.records),
+        };
+    }
+
+    fn revision(ptr: *anyopaque) ReplicaCatalogToken {
+        const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return .{ .revision = self.current_revision };
     }
 
     fn applyBatch(
         ptr: *anyopaque,
-        expected_revision: u64,
+        expected_token: ReplicaCatalogToken,
         upserts: []const ReplicaRecord,
         removals: []const u64,
-    ) !void {
+    ) !ReplicaCatalogToken {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        if (self.current_revision != expected_revision) return error.ReplicaCatalogRevisionChanged;
-        if (upserts.len == 0 and removals.len == 0) return;
-        const next_revision = try nextRevision(self.current_revision);
+        if (self.current_revision != expected_token.revision) return error.ReplicaCatalogRevisionChanged;
+        if (upserts.len == 0 and removals.len == 0) return .{ .revision = self.current_revision };
+        if (replicaBatchClearlyNoOp(&self.records, upserts, removals)) return .{ .revision = self.current_revision };
 
         var next = try cloneReplicaMapFromMap(self.alloc, &self.records);
         errdefer deinitReplicaMap(self.alloc, &next);
         try applyReplicaBatchToMap(self.alloc, &next, upserts, removals);
+        if (replicaMapsEqual(&self.records, &next)) {
+            deinitReplicaMap(self.alloc, &next);
+            return .{ .revision = self.current_revision };
+        }
+        const next_revision = try nextRevision(self.current_revision);
 
         var previous = self.records;
         self.records = next;
-        self.persist() catch |err| {
-            self.records = previous;
+        var published = false;
+        self.persist(&published) catch |err| {
+            if (!published) {
+                self.records = previous;
+            } else {
+                deinitReplicaMap(self.alloc, &previous);
+                self.current_revision = next_revision;
+                // Ownership moved into self.records even though durability
+                // confirmation failed; keep errdefer from freeing the live
+                // map through its local alias.
+                next = .empty;
+            }
             return err;
         };
         deinitReplicaMap(self.alloc, &previous);
         self.current_revision = next_revision;
+        return .{ .revision = next_revision };
+    }
+
+    const PreparedBatch = struct {
+        owner: *FileReplicaCatalog,
+        expected_token: ReplicaCatalogToken,
+        next: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+        retired: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+        staging_path: ?[]u8 = null,
+        changed: bool,
+        commit_attempted: bool = false,
+        map_transferred: bool = false,
+        staging_published: bool = false,
+
+        fn commitOpaque(ptr: *anyopaque) !ReplicaCatalogToken {
+            const self: *PreparedBatch = @ptrCast(@alignCast(ptr));
+            if (self.commit_attempted) return error.ReplicaCatalogBatchAlreadyCommitted;
+            self.commit_attempted = true;
+            lockAtomic(&self.owner.mutex);
+            defer self.owner.mutex.unlock();
+            if (self.owner.current_revision != self.expected_token.revision)
+                return error.ReplicaCatalogRevisionChanged;
+            if (!self.changed) return .{ .revision = self.owner.current_revision };
+
+            const next_revision = try nextRevision(self.owner.current_revision);
+            const staging_path = self.staging_path orelse return error.MissingPreparedReplicaCatalog;
+            if (std.fs.path.isAbsolute(self.owner.path)) {
+                try std.Io.Dir.renameAbsolute(staging_path, self.owner.path, self.owner.io());
+            } else {
+                try std.Io.Dir.rename(
+                    std.Io.Dir.cwd(),
+                    staging_path,
+                    std.Io.Dir.cwd(),
+                    self.owner.path,
+                    self.owner.io(),
+                );
+            }
+            self.staging_published = true;
+
+            // Once rename publishes the prepared image, process memory must
+            // reflect it even if the following directory sync reports an
+            // error. This avoids allowing a later write to resurrect the
+            // pre-rename ownership set.
+            self.retired = self.owner.records;
+            self.owner.records = self.next;
+            self.next = .empty;
+            self.map_transferred = true;
+            self.owner.current_revision = next_revision;
+            try fs_paths.syncDirPortable(
+                self.owner.io(),
+                std.fs.path.dirname(self.owner.path) orelse ".",
+            );
+            return .{ .revision = next_revision };
+        }
+
+        fn deinitOpaque(ptr: *anyopaque) void {
+            const self: *PreparedBatch = @ptrCast(@alignCast(ptr));
+            if (!self.map_transferred) deinitReplicaMap(self.owner.alloc, &self.next);
+            if (builtin.is_test and self.retired.count() != 0)
+                self.owner.test_prepared_reclamations += 1;
+            deinitReplicaMap(self.owner.alloc, &self.retired);
+            if (self.staging_path) |path| {
+                if (!self.staging_published) {
+                    if (std.fs.path.isAbsolute(path)) {
+                        std.Io.Dir.deleteFileAbsolute(self.owner.io(), path) catch {};
+                    } else {
+                        std.Io.Dir.cwd().deleteFile(self.owner.io(), path) catch {};
+                    }
+                }
+                self.owner.alloc.free(path);
+            }
+            const alloc = self.owner.alloc;
+            alloc.destroy(self);
+        }
+    };
+
+    fn prepareBatch(
+        ptr: *anyopaque,
+        expected_token: ReplicaCatalogToken,
+        upserts: []const ReplicaRecord,
+        removals: []const u64,
+    ) !PreparedReplicaCatalogBatch {
+        const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        const prepared = try self.alloc.create(PreparedBatch);
+        errdefer self.alloc.destroy(prepared);
+        prepared.* = .{
+            .owner = self,
+            .expected_token = expected_token,
+            .changed = false,
+        };
+        errdefer deinitReplicaMap(self.alloc, &prepared.next);
+
+        lockAtomic(&self.mutex);
+        var catalog_locked = true;
+        defer if (catalog_locked) self.mutex.unlock();
+        if (self.current_revision != expected_token.revision)
+            return error.ReplicaCatalogRevisionChanged;
+        if (upserts.len == 0 and removals.len == 0 or
+            replicaBatchClearlyNoOp(&self.records, upserts, removals))
+        {
+            return .{
+                .ptr = prepared,
+                .vtable = &.{
+                    .commit = PreparedBatch.commitOpaque,
+                    .deinit = PreparedBatch.deinitOpaque,
+                },
+            };
+        }
+        prepared.next = try cloneReplicaMapFromMap(self.alloc, &self.records);
+        self.mutex.unlock();
+        catalog_locked = false;
+
+        try applyReplicaBatchToMap(self.alloc, &prepared.next, upserts, removals);
+        prepared.changed = true;
+        var entropy: [16]u8 = undefined;
+        self.io().random(&entropy);
+        const suffix = std.fmt.bytesToHex(entropy, .lower);
+        prepared.staging_path = try std.fmt.allocPrint(
+            self.alloc,
+            "{s}.prepared-{s}",
+            .{ self.path, &suffix },
+        );
+        errdefer {
+            const path = prepared.staging_path.?;
+            if (std.fs.path.isAbsolute(path)) {
+                std.Io.Dir.deleteFileAbsolute(self.io(), path) catch {};
+            } else {
+                std.Io.Dir.cwd().deleteFile(self.io(), path) catch {};
+            }
+            self.alloc.free(path);
+            prepared.staging_path = null;
+        }
+        var staging_published = false;
+        try self.persistMapAtPath(
+            &prepared.next,
+            prepared.staging_path.?,
+            &staging_published,
+        );
+        return .{
+            .ptr = prepared,
+            .vtable = &.{
+                .commit = PreparedBatch.commitOpaque,
+                .deinit = PreparedBatch.deinitOpaque,
+            },
+        };
     }
 
     fn load(self: *FileReplicaCatalog) !void {
@@ -686,13 +1122,54 @@ pub const FileReplicaCatalog = struct {
         if (!footer_seen) return error.InvalidReplicaCatalog;
     }
 
-    fn persist(self: *FileReplicaCatalog) !void {
-        const parent_dir = std.fs.path.dirname(self.path);
+    /// Prepared images are private, never authoritative until renamed over
+    /// the catalog, and may survive an unclean process exit. Remove only this
+    /// catalog's namespaced files on startup so repeated crashes cannot grow
+    /// the directory without bound.
+    fn cleanupPreparedArtifacts(self: *FileReplicaCatalog) !void {
+        const parent_path = std.fs.path.dirname(self.path) orelse ".";
+        var dir = (if (std.fs.path.isAbsolute(parent_path))
+            std.Io.Dir.openDirAbsolute(self.io(), parent_path, .{ .iterate = true })
+        else
+            std.Io.Dir.cwd().openDir(self.io(), parent_path, .{ .iterate = true })) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(self.io());
+
+        const prefix = try std.fmt.allocPrint(
+            self.alloc,
+            "{s}.prepared-",
+            .{std.fs.path.basename(self.path)},
+        );
+        defer self.alloc.free(prefix);
+        var iter = dir.iterateAssumeFirstIteration();
+        while (try iter.next(self.io())) |entry| {
+            if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, prefix)) continue;
+            dir.deleteFile(self.io(), entry.name) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+        }
+    }
+
+    fn persist(self: *FileReplicaCatalog, published: *bool) !void {
+        return try self.persistMapAtPath(&self.records, self.path, published);
+    }
+
+    fn persistMapAtPath(
+        self: *FileReplicaCatalog,
+        records_map: *const std.AutoHashMapUnmanaged(u64, ReplicaRecord),
+        path: []const u8,
+        published: *bool,
+    ) !void {
+        published.* = false;
+        const parent_dir = std.fs.path.dirname(path);
         if (parent_dir) |dir| try fs_paths.createDirPathPortable(self.io(), dir);
 
-        const records = try self.alloc.alloc(*const ReplicaRecord, self.records.count());
+        const records = try self.alloc.alloc(*const ReplicaRecord, records_map.count());
         defer self.alloc.free(records);
-        var values = self.records.valueIterator();
+        var values = records_map.valueIterator();
         var count: usize = 0;
         while (values.next()) |record| : (count += 1) records[count] = record;
         std.debug.assert(count == records.len);
@@ -704,9 +1181,10 @@ pub const FileReplicaCatalog = struct {
         try writeCatalogAtomicallyDurableWithFailure(
             self.alloc,
             self.io(),
-            self.path,
+            path,
             records,
             if (comptime builtin.is_test) self.test_persist_failure_boundary else {},
+            published,
         );
     }
 
@@ -790,6 +1268,37 @@ fn deinitReplicaMap(
     records.* = .empty;
 }
 
+fn replicaMapsEqual(
+    left: *const std.AutoHashMapUnmanaged(u64, ReplicaRecord),
+    right: *const std.AutoHashMapUnmanaged(u64, ReplicaRecord),
+) bool {
+    if (left.count() != right.count()) return false;
+    var it = left.iterator();
+    while (it.next()) |entry| {
+        const other = right.get(entry.key_ptr.*) orelse return false;
+        if (!eqlReplicaRecord(entry.value_ptr.*, other)) return false;
+    }
+    return true;
+}
+
+/// Allocation-free fast path for the overwhelmingly common idempotent batch.
+/// Ambiguous remove+upsert overlaps deliberately fall through to the exact
+/// cloned-map comparison below rather than spending memory on a second index.
+fn replicaBatchClearlyNoOp(
+    records: *const std.AutoHashMapUnmanaged(u64, ReplicaRecord),
+    upserts: []const ReplicaRecord,
+    removals: []const u64,
+) bool {
+    for (upserts) |record| {
+        const existing = records.get(record.group_id) orelse return false;
+        if (!eqlReplicaRecord(existing, record)) return false;
+    }
+    for (removals) |group_id| {
+        if (records.contains(group_id)) return false;
+    }
+    return true;
+}
+
 fn validateReplicaRecord(record: ReplicaRecord) !void {
     if (record.snapshot_bootstrap != null and record.backup_restore_bootstrap != null)
         return error.InvalidReplicaCatalog;
@@ -804,12 +1313,14 @@ fn writeCatalogAtomicallyDurable(
     path: []const u8,
     records: []const *const ReplicaRecord,
 ) !void {
+    var published = false;
     return writeCatalogAtomicallyDurableWithFailure(
         alloc,
         io,
         path,
         records,
         if (comptime builtin.is_test) null else {},
+        &published,
     );
 }
 
@@ -819,7 +1330,9 @@ fn writeCatalogAtomicallyDurableWithFailure(
     path: []const u8,
     records: []const *const ReplicaRecord,
     failure_boundary: if (builtin.is_test) ?TestPersistFailureBoundary else void,
+    published: *bool,
 ) !void {
+    published.* = false;
     if (records.len > max_replica_catalog_records) return error.ReplicaCatalogTooLarge;
     // A process-local counter can collide with a temp file left by a crash
     // after restart. A 128-bit random suffix keeps stale files harmless while
@@ -901,6 +1414,7 @@ fn writeCatalogAtomicallyDurableWithFailure(
             try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
         }
         tmp_exists = false;
+        published.* = true;
         if (comptime builtin.is_test) {
             if (failure_boundary == .after_publish)
                 return error.TestCatalogPersistAfterPublish;
@@ -1045,16 +1559,26 @@ test "memory replica catalog batch is revision fenced and publishes atomically" 
     const iface = replica_catalog.catalog();
 
     try iface.upsertReplica(.{ .group_id = 11, .replica_id = 1, .local_node_id = 3 });
-    const revision = iface.revision();
-    try iface.applyBatch(revision, &.{
+    const token = iface.token();
+    const revision = token.revision;
+    const committed_token = try iface.applyBatch(token, &.{
         .{ .group_id = 12, .replica_id = 2, .local_node_id = 3 },
         .{ .group_id = 13, .replica_id = 3, .local_node_id = 3 },
     }, &.{11});
+    try std.testing.expectEqual(revision + 1, committed_token.revision);
     try std.testing.expectEqual(revision + 1, iface.revision());
+    const converged_token = iface.token();
+    const converged_revision = converged_token.revision;
+    const no_op_token = try iface.applyBatch(converged_token, &.{
+        .{ .group_id = 12, .replica_id = 2, .local_node_id = 3 },
+        .{ .group_id = 13, .replica_id = 3, .local_node_id = 3 },
+    }, &.{11});
+    try std.testing.expectEqual(converged_revision, no_op_token.revision);
+    try std.testing.expectEqual(converged_revision, iface.revision());
 
     try std.testing.expectError(
         error.ReplicaCatalogRevisionChanged,
-        iface.applyBatch(revision, &.{.{ .group_id = 14, .replica_id = 4, .local_node_id = 3 }}, &.{}),
+        iface.applyBatch(token, &.{.{ .group_id = 14, .replica_id = 4, .local_node_id = 3 }}, &.{}),
     );
     const records = try iface.listReplicas(std.testing.allocator);
     defer freeReplicaRecords(std.testing.allocator, records);
@@ -1062,6 +1586,160 @@ test "memory replica catalog batch is revision fenced and publishes atomically" 
     for (records) |record| {
         try std.testing.expect(record.group_id == 12 or record.group_id == 13);
     }
+}
+
+test "prepared memory catalog reclaims retired maps after publication" {
+    var replica_catalog = MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    const iface = replica_catalog.catalog();
+
+    try iface.upsertReplica(.{ .group_id = 21, .replica_id = 1, .local_node_id = 3 });
+    var prepared = try iface.prepareBatch(iface.token(), &.{}, &.{21});
+    var prepared_live = true;
+    defer if (prepared_live) prepared.deinit();
+    _ = try prepared.commit();
+    try std.testing.expectEqual(@as(usize, 0), replica_catalog.test_prepared_reclamations);
+    try std.testing.expect(!iface.containsReplica(21));
+
+    prepared.deinit();
+    prepared_live = false;
+    try std.testing.expectEqual(@as(usize, 1), replica_catalog.test_prepared_reclamations);
+}
+
+test "file replica catalog prepares durable images without publishing stale ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/prepared-replica-catalog.json",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(path);
+
+    {
+        var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer replica_catalog.deinit();
+        const iface = replica_catalog.catalog();
+        try iface.upsertReplica(.{ .group_id = 41, .replica_id = 1, .local_node_id = 7 });
+        try iface.upsertReplica(.{ .group_id = 42, .replica_id = 2, .local_node_id = 7 });
+
+        var stale = try iface.prepareBatch(iface.token(), &.{}, &.{41});
+        defer stale.deinit();
+        // Preparation writes and fsyncs only a private image.
+        try std.testing.expect(iface.containsReplica(41));
+        try iface.upsertReplica(.{ .group_id = 43, .replica_id = 3, .local_node_id = 7 });
+        try std.testing.expectError(error.ReplicaCatalogRevisionChanged, stale.commit());
+        try std.testing.expect(iface.containsReplica(41));
+        try std.testing.expect(iface.containsReplica(43));
+
+        {
+            var current = try iface.prepareBatch(iface.token(), &.{}, &.{41});
+            var current_live = true;
+            defer if (current_live) current.deinit();
+            const committed = try current.commit();
+            try std.testing.expectEqual(committed.revision, iface.revision());
+            try std.testing.expect(!iface.containsReplica(41));
+            try std.testing.expect(iface.containsReplica(42));
+            try std.testing.expect(iface.containsReplica(43));
+            try std.testing.expectEqual(@as(usize, 0), replica_catalog.test_prepared_reclamations);
+            current.deinit();
+            current_live = false;
+            try std.testing.expectEqual(@as(usize, 1), replica_catalog.test_prepared_reclamations);
+        }
+    }
+
+    const crash_debris = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}.prepared-crash-debris",
+        .{path},
+    );
+    defer std.testing.allocator.free(crash_debris);
+    {
+        var debris = try fs_paths.createFilePortable(std.testing.io, crash_debris, .{
+            .truncate = true,
+            .exclusive = true,
+        });
+        debris.close(std.testing.io);
+    }
+
+    var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer reopened.deinit();
+    const reopened_iface = reopened.catalog();
+    try std.testing.expect(!reopened_iface.containsReplica(41));
+    try std.testing.expect(reopened_iface.containsReplica(42));
+    try std.testing.expect(reopened_iface.containsReplica(43));
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openFile(std.testing.io, crash_debris, .{}),
+    );
+}
+
+test "file replica catalog never resurrects state after post-publication durability errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/published-error-replica-catalog.json",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(path);
+
+    {
+        var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer replica_catalog.deinit();
+        const iface = replica_catalog.catalog();
+        try iface.upsertReplica(.{ .group_id = 51, .replica_id = 1, .local_node_id = 7 });
+
+        replica_catalog.test_persist_failure_boundary = .after_publish;
+        try std.testing.expectError(error.TestCatalogPersistAfterPublish, iface.upsertReplica(.{
+            .group_id = 51,
+            .replica_id = 2,
+            .local_node_id = 7,
+        }));
+        {
+            const records = try iface.listReplicas(std.testing.allocator);
+            defer freeReplicaRecords(std.testing.allocator, records);
+            try std.testing.expectEqual(@as(usize, 1), records.len);
+            try std.testing.expectEqual(@as(u64, 2), records[0].replica_id);
+        }
+
+        try std.testing.expectError(error.TestCatalogPersistAfterPublish, iface.upsertReplica(.{
+            .group_id = 52,
+            .replica_id = 3,
+            .local_node_id = 7,
+        }));
+        try std.testing.expect(iface.containsReplica(52));
+        try std.testing.expectError(error.TestCatalogPersistAfterPublish, iface.removeReplica(51));
+        try std.testing.expect(!iface.containsReplica(51));
+
+        const token = iface.token();
+        try std.testing.expectError(
+            error.TestCatalogPersistAfterPublish,
+            iface.applyBatch(
+                token,
+                &.{.{ .group_id = 53, .replica_id = 4, .local_node_id = 7 }},
+                &.{52},
+            ),
+        );
+        try std.testing.expectEqual(token.revision + 1, iface.revision());
+        try std.testing.expect(!iface.containsReplica(52));
+        try std.testing.expect(iface.containsReplica(53));
+
+        // A later successful write must extend the published image instead of
+        // rebuilding it from the stale pre-rename map.
+        replica_catalog.test_persist_failure_boundary = null;
+        try iface.upsertReplica(.{ .group_id = 54, .replica_id = 5, .local_node_id = 7 });
+    }
+
+    var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
+    defer reopened.deinit();
+    const iface = reopened.catalog();
+    try std.testing.expect(!iface.containsReplica(51));
+    try std.testing.expect(!iface.containsReplica(52));
+    try std.testing.expect(iface.containsReplica(53));
+    try std.testing.expect(iface.containsReplica(54));
 }
 
 test "file replica catalog persists records across reopen" {
@@ -1084,7 +1762,8 @@ test "file replica catalog persists records across reopen" {
                 .from_node_id = 4,
                 .term = 7,
                 .snapshot_id = "snap-21",
-                .uri = "http://127.0.0.1:7777/raft/v1/snapshot/fetch/snap-21",
+                .uri = "http://127.0.0.1:7777/raft/v2/snapshot/fetch/snap-21",
+                .format = .chunked_manifest_v2,
             },
         });
     }
@@ -1092,6 +1771,14 @@ test "file replica catalog persists records across reopen" {
     {
         var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
         defer reopened.deinit();
+        const raw = try std.Io.Dir.cwd().readFileAlloc(
+            reopened.io(),
+            path,
+            std.testing.allocator,
+            .limited(max_replica_catalog_bytes),
+        );
+        defer std.testing.allocator.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"format\"") == null);
         const records = try reopened.catalog().listReplicas(std.testing.allocator);
         defer freeReplicaRecords(std.testing.allocator, records);
         try std.testing.expectEqual(@as(usize, 1), records.len);
@@ -1102,6 +1789,10 @@ test "file replica catalog persists records across reopen" {
         try std.testing.expectEqual(@as(u64, 4), records[0].snapshot_bootstrap.?.from_node_id);
         try std.testing.expectEqual(@as(u64, 7), records[0].snapshot_bootstrap.?.term);
         try std.testing.expectEqualStrings("snap-21", records[0].snapshot_bootstrap.?.snapshot_id);
+        try std.testing.expectEqual(
+            raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat.chunked_manifest_v2,
+            records[0].snapshot_bootstrap.?.format,
+        );
     }
 }
 
@@ -1135,7 +1826,7 @@ test "file replica catalog reopens catalogs larger than one MiB" {
         var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
         defer replica_catalog.deinit();
         const iface = replica_catalog.catalog();
-        try iface.applyBatch(iface.revision(), upserts, &.{});
+        _ = try iface.applyBatch(iface.token(), upserts, &.{});
     }
 
     var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);

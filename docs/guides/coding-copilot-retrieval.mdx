@@ -16,7 +16,7 @@ order: 5
 Your copilot asks Antfly for context and gets back the files that matter, whether it asked by symbol name (`parseConfig`) or by intent ("where are configuration defaults applied?"), already trimmed to fit its context window:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/agents/retrieval \
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -d '{
     "query": "where configuration defaults are applied",
@@ -29,8 +29,9 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
       "limit": 30,
       "reranker": {
         "provider": "antfly",
-        "model": "mixedbread-ai/mxbai-rerank-base-v1",
-        "field": "body"
+        "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+        "field": "body",
+        "candidate_count": 50
       },
       "pruner": {"min_score_ratio": 0.5}
     }],
@@ -64,7 +65,7 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
 Antfly running in standalone mode, which the [Quickstart](/docs/guides/quickstart) leaves you with:
 
 ```bash
-curl -s http://localhost:8080/db/v1/status | head -c 200
+curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
 ```
 
 ## Build It
@@ -74,7 +75,7 @@ curl -s http://localhost:8080/db/v1/status | head -c 200
 One embeddings index over file contents. Code wants smaller chunks than prose, so a function does not get split from its signature:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/repo \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/repo \
   -H "Content-Type: application/json" \
   -d '{
     "indexes": {
@@ -83,7 +84,7 @@ curl -X POST http://localhost:8080/db/v1/tables/repo \
         "template": "{{path}} {{body}}",
         "embedder": {
           "provider": "antfly",
-          "model": "BAAI/bge-small-en-v1.5"
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
         },
         "chunker": {
           "provider": "antfly",
@@ -100,7 +101,7 @@ curl -X POST http://localhost:8080/db/v1/tables/repo \
 Insert one document per file, keyed by path:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/repo/batch \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/repo/batch \
   -H "Content-Type: application/json" \
   -d '{
     "inserts": {
@@ -146,8 +147,9 @@ antfly query --table repo \
   --limit 30 \
   --reranker '{
     "provider": "antfly",
-    "model": "mixedbread-ai/mxbai-rerank-base-v1",
-    "field": "body"
+    "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+    "field": "body",
+    "candidate_count": 50
   }' \
   --pruner '{"min_score_ratio": 0.5}'
 ```

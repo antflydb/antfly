@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TopologyChangedErrorAction(str, Enum):
+class TopologyChangedErrorAction(StrEnum):
     RETRY_QUERY = "retry_query"
 
     def __str__(self) -> str:

@@ -25,8 +25,11 @@ pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
+pub const request_context = @import("request_context.zig");
 pub const list_models = @import("list_models.zig");
 pub const query_embedding_cache = @import("query_embedding_cache.zig");
+const credential_source_identity = @import("../common/credential_source_identity.zig");
+const google_auth = @import("antfly_google").auth;
 
 pub const Embedder = types.Embedder;
 pub const Generator = types.Generator;
@@ -36,8 +39,10 @@ pub const SparseEmbedResult = types.SparseEmbedResult;
 pub const GenerateResult = types.GenerateResult;
 pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
+pub const GenerationOptions = types.GenerationOptions;
 pub const Role = types.Role;
 pub const ContentPart = types.ContentPart;
+pub const RequestContext = request_context.RequestContext;
 
 test "inference module compiles" {
     _ = types;
@@ -46,11 +51,13 @@ test "inference module compiles" {
     _ = openai;
     _ = vertex;
     _ = managed_embedder;
+    _ = request_context;
     _ = list_models;
     _ = query_embedding_cache;
 }
 
 test "bedrock provider request helpers" {
+    try managed_embedder.testBedrockCredentialTrafficBypassesModelQuota();
     try bedrock.testBedrockSigningClockUsesUnixWallTime();
     try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
@@ -62,6 +69,7 @@ test "bedrock provider request helpers" {
     try bedrock.testSharedCredentialsProfileParser();
     try bedrock.testMetadataCredentialParsers();
     try bedrock.testCredentialUrlEncoding();
+    try bedrock.testCredentialSourceKeysAreStructured();
     try bedrock.testRequestShapeBatchesByProviderRequest();
     try bedrock.testBedrockRequestFormatResolution();
     try bedrock.testBedrockInvokePathEscapesModelId();
@@ -70,6 +78,22 @@ test "bedrock provider request helpers" {
     try bedrock.testBedrockSignerSignsGetRequests();
     try bedrock.testEndpointHostIncludesExplicitPort();
     try managed_embedder.testBedrockRequestFormatConfiguration();
+}
+
+test "embedding provider request helpers" {
+    try @import("../common/provider_limits.zig").testProviderQuotas();
+    try vertex.testEmbeddingStatusMapping();
+    try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
+    try managed_embedder.testLocalForegroundEmbeddingAdmissionCapabilities();
+    try managed_embedder.testManagedEmbeddingRequestContextProgress();
+    try google_auth.testCredentialSourceCacheKeys();
+    try credential_source_identity.testCredentialSourceIdentities();
+    try managed_embedder.testManagedEmbeddingCredentialSourceIdentities();
+    try managed_embedder.testCohereBatchLimit();
+    try managed_embedder.testVertexEmbeddingRequestPlanning();
+    try managed_embedder.testManagedVertexCredentialManagerLifetime();
+    try managed_embedder.testCatalogSemanticIdentityRejectsProducerOnlyFields();
+    try managed_embedder.testTextOnlyManagedProvidersRejectMedia();
 }
 
 test "managed embedder resolves file-backed api key rotation at request time" {
@@ -97,6 +121,7 @@ test "managed embedder rejects malformed provider vectors" {
 }
 
 test "managed embedder artifact backed embedding translation" {
+    try managed_embedder.testArtifactBackedEmbeddingRequestsWithoutIndexEmbedder();
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
     try managed_embedder.testArtifactBackedSparseEmbeddingTranslation();
 }
@@ -111,6 +136,10 @@ test "managed embedder sends antfly media parts when local provider is configure
 
 test "managed embedder normalizes local admission overload across embedding modes" {
     try managed_embedder.testLocalAdmissionOverloadNormalization();
+}
+
+test "managed embedder routes query and document embedding tasks" {
+    try managed_embedder.testEmbeddingTaskRouting();
 }
 
 test "query embedding cache owns results and coalesces misses" {

@@ -606,6 +606,7 @@ test "GLiNER2 real training: loss decreases on actual model weights" {
     // 2. Create compute backend
     // ----------------------------------------------------------------
     var native = NativeCompute.init(allocator, &weight_store, null);
+    defer native.deinit();
     var cb = native.computeBackend();
 
     // ----------------------------------------------------------------
@@ -936,6 +937,7 @@ test "GLiNER2 real training: gliner2_total_loss produces nonzero finite loss and
     }
 
     var native = NativeCompute.init(allocator, &weight_store, null);
+    defer native.deinit();
     var cb = native.computeBackend();
 
     // ── Upstream-format records + entity vocab + HF tokenizer ─────────────

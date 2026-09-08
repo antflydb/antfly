@@ -311,6 +311,24 @@ pub const Parser = struct {
             attr = attr_tok.value;
         }
 
+        if (attr == null and self.peekToken().kind == .stmt_close) {
+            const open_close = self.nextToken();
+            const body = try self.parseBody(&.{"endset"});
+            const close_strip_left = self.last_stmt_open_strip;
+            try self.expectIdent("endset");
+            const close = try self.expect(.stmt_close);
+            const node = try self.allocNode();
+            node.* = .{ .capture_stmt = .{
+                .name = name.value,
+                .body = body,
+                .open_strip_left = strip_left,
+                .open_strip_right = open_close.strip,
+                .close_strip_left = close_strip_left,
+                .close_strip_right = close.strip,
+            } };
+            return node;
+        }
+
         _ = try self.expect(.assign);
         const value = try self.parseExpr();
         const close_tok = try self.expect(.stmt_close);
@@ -728,8 +746,18 @@ pub const Parser = struct {
 
         switch (tok.kind) {
             .string => {
-                const node = try self.allocExpr();
+                var node = try self.allocExpr();
                 node.* = .{ .literal = .{ .string = tok.value } };
+                // Jinja joins adjacent string literals (including literals
+                // split across lines inside function calls).
+                while (self.peekToken().kind == .string) {
+                    const next = self.nextToken();
+                    const right = try self.allocExpr();
+                    right.* = .{ .literal = .{ .string = next.value } };
+                    const joined = try self.allocExpr();
+                    joined.* = .{ .bin_op = .{ .op = .concat, .left = node, .right = right } };
+                    node = joined;
+                }
                 return node;
             },
             .integer => {

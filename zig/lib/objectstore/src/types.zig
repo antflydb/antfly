@@ -128,6 +128,17 @@ pub const PutOptions = struct {
     content_type: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
     if_none_match: bool = false,
+    /// Borrowed for the duration of this operation. Remote providers interrupt
+    /// their active transport; streaming providers check between bounded
+    /// chunks and before the final publication step.
+    cancellation: ?CancellationToken = null,
+};
+
+pub const BucketOptions = struct {
+    /// Borrowed for the duration of bucket discovery or creation. Remote
+    /// providers must attach it to the active transport, since provisioning is
+    /// part of the caller's operation budget rather than repository startup.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const GetOptions = struct {
@@ -156,6 +167,9 @@ pub const StatOptions = struct {
 pub const DeleteOptions = struct {
     version_id: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
+    /// Borrowed for the duration of this operation. Remote providers interrupt
+    /// their active transport; local providers check before committing delete.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const ListOptions = struct {
@@ -167,6 +181,34 @@ pub const ListOptions = struct {
     start_after: ?[]const u8 = null,
     /// Opaque provider cursor. Mutually exclusive with `start_after`.
     continuation_token: ?[]const u8 = null,
+    max_keys: u32 = 1000,
+    /// Borrowed for the duration of one listing page. Providers attach this
+    /// to remote transport and local implementations check it while walking
+    /// bounded candidates.
+    cancellation: ?CancellationToken = null,
+};
+
+/// One immutable entry returned by a provider's object-version inventory.
+/// Delete markers are entries too and must be deleted by version ID when a
+/// caller needs to prove that a versioned prefix is physically empty.
+pub const ObjectVersionEntry = struct {
+    key: []u8,
+    version_id: []u8,
+    is_delete_marker: bool,
+
+    pub fn deinit(self: *ObjectVersionEntry, alloc: Allocator) void {
+        alloc.free(self.key);
+        alloc.free(self.version_id);
+        self.* = undefined;
+    }
+};
+
+pub const ListObjectVersionsOptions = struct {
+    prefix: []const u8 = "",
+    /// S3-style pagination is a tuple. `version_id_marker` is invalid without
+    /// `key_marker`; a key marker alone is permitted by the provider API.
+    key_marker: ?[]const u8 = null,
+    version_id_marker: ?[]const u8 = null,
     max_keys: u32 = 1000,
 };
 
@@ -249,6 +291,21 @@ pub const ListResult = struct {
         for (self.common_prefixes) |prefix| alloc.free(prefix);
         alloc.free(self.common_prefixes);
         if (self.next_continuation_token) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const ListObjectVersionsResult = struct {
+    entries: []ObjectVersionEntry,
+    is_truncated: bool,
+    next_key_marker: ?[]u8 = null,
+    next_version_id_marker: ?[]u8 = null,
+
+    pub fn deinit(self: *ListObjectVersionsResult, alloc: Allocator) void {
+        for (self.entries) |*entry| entry.deinit(alloc);
+        alloc.free(self.entries);
+        if (self.next_key_marker) |value| alloc.free(value);
+        if (self.next_version_id_marker) |value| alloc.free(value);
         self.* = undefined;
     }
 };

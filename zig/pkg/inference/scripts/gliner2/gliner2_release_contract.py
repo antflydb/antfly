@@ -69,7 +69,10 @@ def verify_canonical_python_runtime() -> dict[str, str]:
     """Require the Python/Unicode pair used to define normalization v1."""
     actual_python = sys.version_info[:2]
     actual_unicode = unicodedata.unidata_version
-    if actual_python != CANONICAL_PYTHON_VERSION or actual_unicode != CANONICAL_UNICODE_VERSION:
+    if (
+        actual_python != CANONICAL_PYTHON_VERSION
+        or actual_unicode != CANONICAL_UNICODE_VERSION
+    ):
         raise ValueError(
             "canonical GLiNER2 normalization requires Python "
             f"{CANONICAL_PYTHON_VERSION[0]}.{CANONICAL_PYTHON_VERSION[1]} / Unicode "
@@ -95,7 +98,9 @@ def verify_canonical_oracle_packages() -> dict[str, str]:
             for package, expected in CANONICAL_ORACLE_PACKAGE_VERSIONS.items()
             if actual[package] != expected
         ]
-        raise ValueError("canonical GLiNER2 oracle dependency mismatch: " + ", ".join(mismatches))
+        raise ValueError(
+            "canonical GLiNER2 oracle dependency mismatch: " + ", ".join(mismatches)
+        )
     return actual
 
 
@@ -139,7 +144,9 @@ def path_fingerprint(path: Path) -> str:
     if path.is_dir():
         shards = sorted(path.glob("*.jsonl"))
         if not shards:
-            raise ValueError(f"{path}: expected a file or directory containing JSONL files")
+            raise ValueError(
+                f"{path}: expected a file or directory containing JSONL files"
+            )
         return directory_fingerprint(
             path,
             tuple(FingerprintEntry(shard.name) for shard in shards),
@@ -160,7 +167,9 @@ def verify_upstream_checkout(source: Path) -> dict[str, str]:
     )
     commit = head.stdout.strip() if head.returncode == 0 else ""
     if commit != UPSTREAM_COMMIT:
-        raise ValueError(f"upstream commit {commit or 'unknown'} does not match frozen {UPSTREAM_COMMIT}")
+        raise ValueError(
+            f"upstream commit {commit or 'unknown'} does not match frozen {UPSTREAM_COMMIT}"
+        )
     dirty = subprocess.run(
         ["git", "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
         text=True,

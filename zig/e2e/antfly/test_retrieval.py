@@ -21,9 +21,7 @@ import time
 
 import pytest
 import requests
-
 from helpers import assert_created_index, wait_until
-
 
 pytestmark = pytest.mark.reuse_antfly_process
 
@@ -89,6 +87,31 @@ def _post_until_hit_ids(
     )
     assert result is not None
     return result
+
+
+def _create_ready_tree_index(backup_api, table_name: str) -> None:
+    index_name = "doc_hierarchy"
+    assert_created_index(
+        backup_api.post(
+            f"/tables/{table_name}/indexes/{index_name}",
+            {
+                "type": "graph",
+                "edge_types": [{"name": "contains", "topology": "tree"}],
+            },
+        ),
+        index_name,
+        "graph",
+    )
+    # Index creation durably accepts the definition and activation continues
+    # asynchronously. A full-index write intentionally waits for the physical
+    # incarnation rather than racing the activation owner.
+    backup_api.wait_index_ready(
+        table_name,
+        index_name,
+        timeout_s=30.0,
+        interval_s=0.05,
+        until="complete",
+    )
 
 
 def _index_status(api, table_name: str, index_name: str) -> dict | None:
@@ -410,6 +433,7 @@ def test_retrieval_agent_semantic_and_hybrid_queries(backup_api):
         "dense_idx",
         timeout_s=30.0,
         interval_s=0.5,
+        until="complete",
         require_query_fresh=True,
     )
     backup_api.wait_index_ready(
@@ -417,6 +441,7 @@ def test_retrieval_agent_semantic_and_hybrid_queries(backup_api):
         "sparse_idx",
         timeout_s=30.0,
         interval_s=0.5,
+        until="complete",
         require_query_fresh=True,
     )
 
@@ -545,17 +570,7 @@ def test_retrieval_agent_tree_search_pipeline(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert_created_index(
-        backup_api.post(
-            f"/tables/{table_name}/indexes/doc_hierarchy",
-            {
-                "type": "graph",
-                "edge_types": [{"name": "contains", "topology": "tree"}],
-            },
-        ),
-        "doc_hierarchy",
-        "graph",
-    )
+    _create_ready_tree_index(backup_api, table_name)
 
     batch = backup_api.batch_write(
         table_name,
@@ -626,17 +641,7 @@ def test_retrieval_agent_tree_search_from_roots(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert_created_index(
-        backup_api.post(
-            f"/tables/{table_name}/indexes/doc_hierarchy",
-            {
-                "type": "graph",
-                "edge_types": [{"name": "contains", "topology": "tree"}],
-            },
-        ),
-        "doc_hierarchy",
-        "graph",
-    )
+    _create_ready_tree_index(backup_api, table_name)
 
     batch = backup_api.batch_write(
         table_name,
@@ -700,17 +705,7 @@ def test_retrieval_agent_tree_search_generation(backup_api, inference_generator)
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert_created_index(
-        backup_api.post(
-            f"/tables/{table_name}/indexes/doc_hierarchy",
-            {
-                "type": "graph",
-                "edge_types": [{"name": "contains", "topology": "tree"}],
-            },
-        ),
-        "doc_hierarchy",
-        "graph",
-    )
+    _create_ready_tree_index(backup_api, table_name)
 
     batch = backup_api.batch_write(
         table_name,
@@ -1228,6 +1223,22 @@ def test_retrieval_agent_streaming_probe_progress(backup_api):
     assert '"phase":"probe"' in body
     assert '"selection_source":"probe"' in body
     assert '"probe_relevance":' in body
+    events = _parse_sse_events(body)
+    probes = [
+        data
+        for name, data in events
+        if name == "step_progress" and data.get("phase") == "probe"
+    ]
+    assert probes, events
+    assert all(probe["details"]["selection_source"] == "probe" for probe in probes)
+    assert any(
+        "probe_relevance" in candidate
+        for probe in probes
+        for candidate in probe["details"]["candidate_scores"]
+    )
+    assert sum(name == "done" for name, _ in events) == 1
+    assert events[-1][0] == "done"
+    assert not any(name == "error" for name, _ in events)
     assert "event: reasoning" in body
     assert "event: tool_mode" in body
     assert '"mode":"structured_output"' in body
@@ -1296,17 +1307,7 @@ def test_retrieval_agent_streaming_tree_progress(backup_api):
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
 
-    assert_created_index(
-        backup_api.post(
-            f"/tables/{table_name}/indexes/doc_hierarchy",
-            {
-                "type": "graph",
-                "edge_types": [{"name": "contains", "topology": "tree"}],
-            },
-        ),
-        "doc_hierarchy",
-        "graph",
-    )
+    _create_ready_tree_index(backup_api, table_name)
 
     batch = backup_api.batch_write(
         table_name,

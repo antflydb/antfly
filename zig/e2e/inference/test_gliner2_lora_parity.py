@@ -51,13 +51,21 @@ from pathlib import Path
 
 import pytest
 
+
 def _find_repo_root() -> Path:
     # Walk up until the directory containing zig/pkg/inference is found, so the
     # gate resolves correctly regardless of how deep e2e/inference is nested
     # (the file lives at <repo>/zig/e2e/inference/).
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / "zig" / "pkg" / "inference" / "scripts" / "compare_gliner2_lora_python_zig.py").exists():
+        if (
+            parent
+            / "zig"
+            / "pkg"
+            / "inference"
+            / "scripts"
+            / "compare_gliner2_lora_python_zig.py"
+        ).exists():
             return parent
     # Fall back to the historical assumption (file three levels under the root).
     return here.parents[3]
@@ -91,10 +99,24 @@ FULL_TASK_PARITY_FIXTURES = [
     pytest.param("negative_smoke.jsonl", 1, True, id="negative-classification"),
 ]
 
-MODEL_DIR = Path(os.environ.get("TERMITE_GLINER2_PARITY_MODEL_DIR", "/private/tmp/termite-models/gliner2"))
-PARITY_PYTHON = Path(os.environ.get("TERMITE_GLINER2_PARITY_PYTHON", "/private/tmp/gliner2-parity-venv/bin/python"))
-UPSTREAM_SOURCE = Path(os.environ.get("TERMITE_GLINER2_PARITY_UPSTREAM_SOURCE", "/private/tmp/gliner2-oracle"))
-REQUIRE_PARITY = os.environ.get("TERMITE_GLINER2_REQUIRE_PARITY", "").strip().lower() not in {"", "0", "false", "no"}
+MODEL_DIR = Path(
+    os.environ.get(
+        "TERMITE_GLINER2_PARITY_MODEL_DIR", "/private/tmp/termite-models/gliner2"
+    )
+)
+PARITY_PYTHON = Path(
+    os.environ.get(
+        "TERMITE_GLINER2_PARITY_PYTHON", "/private/tmp/gliner2-parity-venv/bin/python"
+    )
+)
+UPSTREAM_SOURCE = Path(
+    os.environ.get(
+        "TERMITE_GLINER2_PARITY_UPSTREAM_SOURCE", "/private/tmp/gliner2-oracle"
+    )
+)
+REQUIRE_PARITY = os.environ.get(
+    "TERMITE_GLINER2_REQUIRE_PARITY", ""
+).strip().lower() not in {"", "0", "false", "no"}
 
 
 def _skip_reason() -> str | None:
@@ -115,7 +137,9 @@ def _skip_reason() -> str | None:
 
 _reason = _skip_reason()
 if REQUIRE_PARITY and _reason is not None:
-    raise RuntimeError(f"GLiNER2 Python/Zig parity was required but cannot run: {_reason}")
+    raise RuntimeError(
+        f"GLiNER2 Python/Zig parity was required but cannot run: {_reason}"
+    )
 pytestmark = [
     pytest.mark.skipif(_reason is not None, reason=_reason or ""),
     pytest.mark.slow,
@@ -130,35 +154,57 @@ def test_gliner2_lora_python_zig_strict_parity(tmp_path: Path):
         str(COMPARE_SCRIPT),
         "--strict",
         "--deterministic",
-        "--model-dir", str(MODEL_DIR),
-        "--python-model", str(MODEL_DIR),
-        "--python-bin", str(PARITY_PYTHON),
-        "--upstream-source", str(UPSTREAM_SOURCE),
-        "--train-data", str(TRAIN_FIXTURE),
-        "--out-dir", str(out_dir),
-        "--zig-objective", "gliner2-total-loss",
-        "--zig-backend", "native",
-        "--steps", "1",
-        "--batch-size", "2",
-        "--seq-len", "64",
-        "--max-span-width", "4",
-        "--lora-rank", "4",
-        "--lora-alpha", "8",
-        "--span-loss-reduction", "sum",
-        "--span-positive-weight", "1",
-        "--span-negative-weight", "1",
-        "--span-hard-negative-weight", "1",
-        "--seed", "42",
+        "--model-dir",
+        str(MODEL_DIR),
+        "--python-model",
+        str(MODEL_DIR),
+        "--python-bin",
+        str(PARITY_PYTHON),
+        "--upstream-source",
+        str(UPSTREAM_SOURCE),
+        "--train-data",
+        str(TRAIN_FIXTURE),
+        "--out-dir",
+        str(out_dir),
+        "--zig-objective",
+        "gliner2-total-loss",
+        "--zig-backend",
+        "native",
+        "--steps",
+        "1",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "64",
+        "--max-span-width",
+        "4",
+        "--lora-rank",
+        "4",
+        "--lora-alpha",
+        "8",
+        "--span-loss-reduction",
+        "sum",
+        "--span-positive-weight",
+        "1",
+        "--span-negative-weight",
+        "1",
+        "--span-hard-negative-weight",
+        "1",
+        "--seed",
+        "42",
         "--dump-preprocess-parity",
-        "--loss-parity-tolerance", "1e-4",
+        "--loss-parity-tolerance",
+        "1e-4",
         # Same-artifact round-trip integrity is always exact. This tolerance is
         # only for the separate independently-trained Python-vs-Zig diagnostic,
         # where forward logits amplify ordinary f32 weight differences
         # (measured: weights ~1.4e-6 -> span scores ~8.1e-4 after one step).
         # Keep the same diagnostic threshold as the Metal one-step run; the
         # dedicated multi-step optimizer gate supplies its own strict bound.
-        "--adapter-roundtrip-tolerance", "2e-3",
-        "--timeout-seconds", "1800",
+        "--adapter-roundtrip-tolerance",
+        "2e-3",
+        "--timeout-seconds",
+        "1800",
     ]
     proc = subprocess.run(
         cmd,
@@ -170,7 +216,9 @@ def test_gliner2_lora_python_zig_strict_parity(tmp_path: Path):
     )
     report_path = out_dir / "comparison_report.json"
     tail = proc.stdout[-8000:]
-    assert proc.returncode == 0, f"strict parity run failed (exit {proc.returncode}):\n{tail}"
+    assert proc.returncode == 0, (
+        f"strict parity run failed (exit {proc.returncode}):\n{tail}"
+    )
     assert report_path.exists(), f"comparison report missing at {report_path}:\n{tail}"
 
     summary = json.loads(report_path.read_text(encoding="utf-8"))["summary"]
@@ -181,7 +229,11 @@ def test_gliner2_lora_python_zig_strict_parity(tmp_path: Path):
     failed = {name: value for name, value in strict_checks.items() if value is False}
     assert not failed, f"strict parity checks failed: {failed}\n{tail}"
     # The headline comparisons must actually have run (not been skipped).
-    for required in ("component_loss_parity_matches", "step_loss_parity_matches", "preprocess_parity_matches"):
+    for required in (
+        "component_loss_parity_matches",
+        "step_loss_parity_matches",
+        "preprocess_parity_matches",
+    ):
         assert strict_checks.get(required) is True, (
             f"expected strict check '{required}' to run and pass, got {strict_checks.get(required)!r}\n{tail}"
         )
@@ -222,33 +274,56 @@ def test_gliner2_lora_metal_strict_parity(tmp_path: Path):
         str(COMPARE_SCRIPT),
         "--strict",
         "--deterministic",
-        "--model-dir", str(MODEL_DIR),
-        "--python-model", str(MODEL_DIR),
-        "--python-bin", str(PARITY_PYTHON),
-        "--upstream-source", str(UPSTREAM_SOURCE),
-        "--train-data", str(TRAIN_FIXTURE),
-        "--out-dir", str(out_dir),
-        "--zig-objective", "gliner2-total-loss",
-        "--zig-backend", "metal",
+        "--model-dir",
+        str(MODEL_DIR),
+        "--python-model",
+        str(MODEL_DIR),
+        "--python-bin",
+        str(PARITY_PYTHON),
+        "--upstream-source",
+        str(UPSTREAM_SOURCE),
+        "--train-data",
+        str(TRAIN_FIXTURE),
+        "--out-dir",
+        str(out_dir),
+        "--zig-objective",
+        "gliner2-total-loss",
+        "--zig-backend",
+        "metal",
         "--zig-training-graph-executor",
-        "--steps", "1",
-        "--batch-size", "2",
-        "--seq-len", "64",
-        "--max-span-width", "4",
-        "--lora-rank", "4",
-        "--lora-alpha", "8",
-        "--span-loss-reduction", "sum",
-        "--span-positive-weight", "1",
-        "--span-negative-weight", "1",
-        "--span-hard-negative-weight", "1",
-        "--seed", "42",
+        "--steps",
+        "1",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "64",
+        "--max-span-width",
+        "4",
+        "--lora-rank",
+        "4",
+        "--lora-alpha",
+        "8",
+        "--span-loss-reduction",
+        "sum",
+        "--span-positive-weight",
+        "1",
+        "--span-negative-weight",
+        "1",
+        "--span-hard-negative-weight",
+        "1",
+        "--seed",
+        "42",
         "--dump-preprocess-parity",
-        "--loss-parity-tolerance", "1e-4",
+        "--loss-parity-tolerance",
+        "1e-4",
         # Exact same-artifact integrity is tolerance-free. These bounds apply
         # only to independently trained Metal-vs-Python adapter diagnostics.
-        "--adapter-roundtrip-tolerance", "2e-3",
-        "--adapter-roundtrip-weights-tolerance", "5e-4",
-        "--timeout-seconds", "1800",
+        "--adapter-roundtrip-tolerance",
+        "2e-3",
+        "--adapter-roundtrip-weights-tolerance",
+        "5e-4",
+        "--timeout-seconds",
+        "1800",
     ]
     proc = subprocess.run(
         cmd,
@@ -260,7 +335,9 @@ def test_gliner2_lora_metal_strict_parity(tmp_path: Path):
     )
     report_path = out_dir / "comparison_report.json"
     tail = proc.stdout[-8000:]
-    assert proc.returncode == 0, f"strict Metal parity run failed (exit {proc.returncode}):\n{tail}"
+    assert proc.returncode == 0, (
+        f"strict Metal parity run failed (exit {proc.returncode}):\n{tail}"
+    )
     assert report_path.exists(), f"comparison report missing at {report_path}:\n{tail}"
 
     summary = json.loads(report_path.read_text(encoding="utf-8"))["summary"]
@@ -292,7 +369,9 @@ def test_gliner2_lora_metal_strict_parity(tmp_path: Path):
         )
 
 
-@pytest.mark.parametrize(("fixture_name", "steps", "has_classifications"), FULL_TASK_PARITY_FIXTURES)
+@pytest.mark.parametrize(
+    ("fixture_name", "steps", "has_classifications"), FULL_TASK_PARITY_FIXTURES
+)
 def test_gliner2_lora_metal_full_task_strict_parity(
     tmp_path: Path, fixture_name: str, steps: int, has_classifications: bool
 ):
@@ -301,38 +380,62 @@ def test_gliner2_lora_metal_full_task_strict_parity(
         pytest.skip(metal_reason)
     fixture = FIXTURE_DIR / fixture_name
     assert fixture.exists(), f"fixture missing at {fixture}"
-    out_dir = tmp_path / f"gliner2-lora-metal-full-task-{fixture.stem.replace('_', '-')}"
+    out_dir = (
+        tmp_path / f"gliner2-lora-metal-full-task-{fixture.stem.replace('_', '-')}"
+    )
     cmd = [
         sys.executable,
         str(COMPARE_SCRIPT),
         "--strict",
         "--require-full-task-parity",
         "--deterministic",
-        "--model-dir", str(MODEL_DIR),
-        "--python-model", str(MODEL_DIR),
-        "--python-bin", str(PARITY_PYTHON),
-        "--upstream-source", str(UPSTREAM_SOURCE),
-        "--train-data", str(fixture),
-        "--out-dir", str(out_dir),
-        "--zig-objective", "gliner2-total-loss",
-        "--zig-backend", "metal",
+        "--model-dir",
+        str(MODEL_DIR),
+        "--python-model",
+        str(MODEL_DIR),
+        "--python-bin",
+        str(PARITY_PYTHON),
+        "--upstream-source",
+        str(UPSTREAM_SOURCE),
+        "--train-data",
+        str(fixture),
+        "--out-dir",
+        str(out_dir),
+        "--zig-objective",
+        "gliner2-total-loss",
+        "--zig-backend",
+        "metal",
         "--zig-training-graph-executor",
-        "--steps", str(steps),
-        "--batch-size", "2",
-        "--seq-len", "64",
-        "--max-span-width", "4",
-        "--lora-rank", "4",
-        "--lora-alpha", "8",
-        "--span-loss-reduction", "sum",
-        "--span-positive-weight", "1",
-        "--span-negative-weight", "1",
-        "--span-hard-negative-weight", "1",
-        "--seed", "42",
+        "--steps",
+        str(steps),
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "64",
+        "--max-span-width",
+        "4",
+        "--lora-rank",
+        "4",
+        "--lora-alpha",
+        "8",
+        "--span-loss-reduction",
+        "sum",
+        "--span-positive-weight",
+        "1",
+        "--span-negative-weight",
+        "1",
+        "--span-hard-negative-weight",
+        "1",
+        "--seed",
+        "42",
         "--dump-preprocess-parity",
-        "--loss-parity-tolerance", "1e-4",
-        "--classification-debug-tolerance", "3e-2",
+        "--loss-parity-tolerance",
+        "1e-4",
+        "--classification-debug-tolerance",
+        "3e-2",
         "--no-adapter-roundtrip",
-        "--timeout-seconds", "1800",
+        "--timeout-seconds",
+        "1800",
     ]
     proc = subprocess.run(
         cmd,
@@ -354,7 +457,9 @@ def test_gliner2_lora_metal_full_task_strict_parity(
     assert summary["zig_returncode"] == 0
     strict_checks = summary.get("strict_checks", {})
     failed = {name: value for name, value in strict_checks.items() if value is False}
-    assert not failed, f"strict Metal parity checks failed for {fixture_name}: {failed}\n{tail}"
+    assert not failed, (
+        f"strict Metal parity checks failed for {fixture_name}: {failed}\n{tail}"
+    )
     required = [
         "component_loss_parity_matches",
         "step_loss_parity_matches",
@@ -375,7 +480,9 @@ def test_gliner2_lora_metal_full_task_strict_parity(
         "metal_interpreter_fallbacks_within_threshold",
     ]
     if has_classifications:
-        required.extend(["classification_debug_matches", "full_task_classification_debug_ran"])
+        required.extend(
+            ["classification_debug_matches", "full_task_classification_debug_ran"]
+        )
     for check in required:
         assert strict_checks.get(check) is True, (
             f"expected strict check '{check}' to run and pass for {fixture_name}, "
@@ -393,7 +500,11 @@ def test_gliner2_lora_all_task_multi_step_roundtrip(tmp_path: Path):
     """
     out_dir = tmp_path / "gliner2-lora-all-task-multi-step"
     # 3 steps x batch 2 needs 6 examples; cycle the 4-line fixture.
-    lines = [line for line in ALL_TASK_FIXTURE.read_text(encoding="utf-8").splitlines() if line.strip()]
+    lines = [
+        line
+        for line in ALL_TASK_FIXTURE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     fixture = tmp_path / "gliner2_all_task_x6.jsonl"
     fixture.write_text("\n".join((lines * 2)[:6]) + "\n", encoding="utf-8")
     cmd = [
@@ -401,33 +512,57 @@ def test_gliner2_lora_all_task_multi_step_roundtrip(tmp_path: Path):
         str(COMPARE_SCRIPT),
         "--strict",
         "--deterministic",
-        "--model-dir", str(MODEL_DIR),
-        "--python-model", str(MODEL_DIR),
-        "--python-bin", str(PARITY_PYTHON),
-        "--upstream-source", str(UPSTREAM_SOURCE),
-        "--train-data", str(fixture),
-        "--out-dir", str(out_dir),
-        "--zig-objective", "gliner2-total-loss",
-        "--zig-backend", "native",
-        "--steps", "3",
-        "--batch-size", "2",
-        "--seq-len", "64",
-        "--max-span-width", "4",
-        "--lora-rank", "4",
-        "--lora-alpha", "8",
-        "--span-loss-reduction", "sum",
-        "--span-positive-weight", "1",
-        "--span-negative-weight", "1",
-        "--span-hard-negative-weight", "1",
+        "--model-dir",
+        str(MODEL_DIR),
+        "--python-model",
+        str(MODEL_DIR),
+        "--python-bin",
+        str(PARITY_PYTHON),
+        "--upstream-source",
+        str(UPSTREAM_SOURCE),
+        "--train-data",
+        str(fixture),
+        "--out-dir",
+        str(out_dir),
+        "--zig-objective",
+        "gliner2-total-loss",
+        "--zig-backend",
+        "native",
+        "--steps",
+        "3",
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "64",
+        "--max-span-width",
+        "4",
+        "--lora-rank",
+        "4",
+        "--lora-alpha",
+        "8",
+        "--span-loss-reduction",
+        "sum",
+        "--span-positive-weight",
+        "1",
+        "--span-negative-weight",
+        "1",
+        "--span-hard-negative-weight",
+        "1",
         # Exercise decoupled AdamW weight decay end to end (upstream default
         # 0.01); every other gate runs wd=0, leaving the decay path untested.
-        "--weight-decay", "0.01",
-        "--seed", "42",
+        "--weight-decay",
+        "0.01",
+        "--seed",
+        "42",
         "--dump-optimizer-parity",
-        "--loss-parity-tolerance", "3e-3",
-        "--adapter-roundtrip-tolerance", "0.3",
-        "--adapter-roundtrip-weights-tolerance", "6e-3",
-        "--timeout-seconds", "1800",
+        "--loss-parity-tolerance",
+        "3e-3",
+        "--adapter-roundtrip-tolerance",
+        "0.3",
+        "--adapter-roundtrip-weights-tolerance",
+        "6e-3",
+        "--timeout-seconds",
+        "1800",
     ]
     proc = subprocess.run(
         cmd,
@@ -439,7 +574,9 @@ def test_gliner2_lora_all_task_multi_step_roundtrip(tmp_path: Path):
     )
     report_path = out_dir / "comparison_report.json"
     tail = proc.stdout[-8000:]
-    assert proc.returncode == 0, f"all-task multi-step parity run failed (exit {proc.returncode}):\n{tail}"
+    assert proc.returncode == 0, (
+        f"all-task multi-step parity run failed (exit {proc.returncode}):\n{tail}"
+    )
     assert report_path.exists(), f"comparison report missing at {report_path}:\n{tail}"
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -476,7 +613,9 @@ def test_gliner2_lora_all_task_multi_step_roundtrip(tmp_path: Path):
         )
 
 
-@pytest.mark.parametrize(("fixture_name", "steps", "has_classifications"), FULL_TASK_PARITY_FIXTURES)
+@pytest.mark.parametrize(
+    ("fixture_name", "steps", "has_classifications"), FULL_TASK_PARITY_FIXTURES
+)
 def test_gliner2_lora_full_task_strict_parity(
     tmp_path: Path, fixture_name: str, steps: int, has_classifications: bool
 ):
@@ -499,29 +638,50 @@ def test_gliner2_lora_full_task_strict_parity(
         "--strict",
         "--require-full-task-parity",
         "--deterministic",
-        "--model-dir", str(MODEL_DIR),
-        "--python-model", str(MODEL_DIR),
-        "--python-bin", str(PARITY_PYTHON),
-        "--upstream-source", str(UPSTREAM_SOURCE),
-        "--train-data", str(fixture),
-        "--out-dir", str(out_dir),
-        "--zig-objective", "gliner2-total-loss",
-        "--zig-backend", "native",
-        "--steps", str(steps),
-        "--batch-size", "2",
-        "--seq-len", "64",
-        "--max-span-width", "4",
-        "--lora-rank", "4",
-        "--lora-alpha", "8",
-        "--span-loss-reduction", "sum",
-        "--span-positive-weight", "1",
-        "--span-negative-weight", "1",
-        "--span-hard-negative-weight", "1",
-        "--seed", "42",
+        "--model-dir",
+        str(MODEL_DIR),
+        "--python-model",
+        str(MODEL_DIR),
+        "--python-bin",
+        str(PARITY_PYTHON),
+        "--upstream-source",
+        str(UPSTREAM_SOURCE),
+        "--train-data",
+        str(fixture),
+        "--out-dir",
+        str(out_dir),
+        "--zig-objective",
+        "gliner2-total-loss",
+        "--zig-backend",
+        "native",
+        "--steps",
+        str(steps),
+        "--batch-size",
+        "2",
+        "--seq-len",
+        "64",
+        "--max-span-width",
+        "4",
+        "--lora-rank",
+        "4",
+        "--lora-alpha",
+        "8",
+        "--span-loss-reduction",
+        "sum",
+        "--span-positive-weight",
+        "1",
+        "--span-negative-weight",
+        "1",
+        "--span-hard-negative-weight",
+        "1",
+        "--seed",
+        "42",
         "--dump-preprocess-parity",
-        "--loss-parity-tolerance", "1e-4",
+        "--loss-parity-tolerance",
+        "1e-4",
         "--no-adapter-roundtrip",
-        "--timeout-seconds", "1800",
+        "--timeout-seconds",
+        "1800",
     ]
     proc = subprocess.run(
         cmd,
@@ -544,7 +704,9 @@ def test_gliner2_lora_full_task_strict_parity(
     assert summary.get("require_full_task_parity") is True, tail
     strict_checks = summary.get("strict_checks", {})
     failed = {name: value for name, value in strict_checks.items() if value is False}
-    assert not failed, f"strict parity checks failed for {fixture_name}: {failed}\n{tail}"
+    assert not failed, (
+        f"strict parity checks failed for {fixture_name}: {failed}\n{tail}"
+    )
     required = [
         "component_loss_parity_matches",
         "step_loss_parity_matches",
@@ -557,7 +719,9 @@ def test_gliner2_lora_full_task_strict_parity(
         "full_task_objective_parity",
     ]
     if has_classifications:
-        required.extend(["classification_debug_matches", "full_task_classification_debug_ran"])
+        required.extend(
+            ["classification_debug_matches", "full_task_classification_debug_ran"]
+        )
     for check in required:
         assert strict_checks.get(check) is True, (
             f"expected strict check '{check}' to run and pass for {fixture_name}, "

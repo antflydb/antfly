@@ -474,15 +474,29 @@ fn validateGenericAdaptivePoints(at: [4][2]i8, count: usize) !void {
     }
 }
 
-fn decodeGenericBitmap(alloc: Allocator, work: *DecodeWorkBudget, arith: *ArithmeticDecoder, contexts: []u8, width: u32, height: u32, template: u2, at: [4][2]i8, max_bytes: usize) !Bitmap {
+fn decodeGenericBitmap(alloc: Allocator, work: *DecodeWorkBudget, arith: *ArithmeticDecoder, contexts: []u8, width: u32, height: u32, template: u2, at: [4][2]i8, typical_prediction: bool, max_bytes: usize) !Bitmap {
     if (contexts.len < genericContextCount(template)) return error.InvalidJbig2Context;
     try validateGenericAdaptivePoints(at, genericAdaptivePointCount(template));
     try work.chargePixels(width, height);
     var bitmap = try Bitmap.blank(alloc, work, width, height, max_bytes);
     errdefer bitmap.deinit(alloc);
+    var line_is_typical: u1 = 0;
     var y: u32 = 0;
     while (y < height) : (y += 1) {
         try work.checkCancellation();
+        if (typical_prediction) {
+            const ltp_context: usize = switch (template) {
+                0 => 0x9b25,
+                1 => 0x0795,
+                2 => 0x00e5,
+                3 => 0x0195,
+            };
+            line_is_typical ^= try arith.decode(contexts, ltp_context);
+            if (line_is_typical == 1) {
+                copyPreviousBitmapRow(bitmap, y);
+                continue;
+            }
+        }
         var x: u32 = 0;
         while (x < width) : (x += 1) {
             const ix: i64 = x;
@@ -558,6 +572,13 @@ fn decodeGenericBitmap(alloc: Allocator, work: *DecodeWorkBudget, arith: *Arithm
         }
     }
     return bitmap;
+}
+
+fn copyPreviousBitmapRow(bitmap: Bitmap, y: u32) void {
+    if (y == 0) return;
+    const row = @as(usize, y) * bitmap.stride;
+    const previous = row - bitmap.stride;
+    @memcpy(bitmap.data[row .. row + bitmap.stride], bitmap.data[previous .. previous + bitmap.stride]);
 }
 
 fn decodeRefinement0(alloc: Allocator, work: *DecodeWorkBudget, arith: *ArithmeticDecoder, contexts: []u8, width: u32, height: u32, reference: Bitmap, dx: i64, dy: i64, at: [2][2]i8, max_bytes: usize) !Bitmap {
@@ -984,7 +1005,7 @@ const Decoder = struct {
                 try symbols.ensureUnusedCapacity(self.alloc, 1);
                 var symbol: Bitmap = undefined;
                 if (!refine) {
-                    symbol = try decodeGenericBitmap(self.alloc, self.work, &arith, generic_ctx, @intCast(width), @intCast(height), @intCast(template), at, self.max_bytes);
+                    symbol = try decodeGenericBitmap(self.alloc, self.work, &arith, generic_ctx, @intCast(width), @intCast(height), @intCast(template), at, false, self.max_bytes);
                 } else {
                     const instances = try decodeInteger(&arith, iaai) orelse return error.InvalidJbig2Integer;
                     if (instances == 1) {
@@ -1118,7 +1139,8 @@ const Decoder = struct {
         const region_flags = try cursor.byte();
         const flags = try cursor.byte();
         const template: u2 = @truncate((flags >> 1) & 3);
-        if ((flags & 1) != 0 or ((flags >> 3) & 1) != 0 or ((flags >> 4) & 1) != 0) return error.UnsupportedJbig2GenericProfile;
+        const typical_prediction = ((flags >> 3) & 1) != 0;
+        if ((flags & 1) != 0 or ((flags >> 4) & 1) != 0) return error.UnsupportedJbig2GenericProfile;
         var at: [4][2]i8 = @splat(.{ 0, 0 });
         for (at[0..genericAdaptivePointCount(template)]) |*point| {
             point[0] = @bitCast(try cursor.byte());
@@ -1127,7 +1149,7 @@ const Decoder = struct {
         var arith = try ArithmeticDecoder.init(payload[cursor.pos..]);
         const contexts = try allocZeroedBytes(self.alloc, self.work, genericContextCount(template));
         defer self.alloc.free(contexts);
-        var region = try decodeGenericBitmap(self.alloc, self.work, &arith, contexts, width, height, template, at, self.max_bytes);
+        var region = try decodeGenericBitmap(self.alloc, self.work, &arith, contexts, width, height, template, at, typical_prediction, self.max_bytes);
         defer region.deinit(self.alloc);
         try self.page.?.compose(region, x, y, if (self.page_allows_op_override) @truncate(region_flags & 7) else self.page_op, self.work);
     }
@@ -1231,6 +1253,23 @@ test "bitmap composition clips work to visible pixels" {
     var exhausted = DecodeWorkBudget{ .remaining = 1 };
     try std.testing.expectError(error.Jbig2WorkLimitExceeded, target.compose(source, 0, 0, 4, &exhausted));
     try std.testing.expectEqual(@as(u64, 1), exhausted.remaining);
+}
+
+test "generic typical prediction copies the preceding packed row" {
+    var work = DecodeWorkBudget{ .remaining = 100 };
+    var bitmap = try Bitmap.blank(std.testing.allocator, &work, 10, 3, 1024);
+    defer bitmap.deinit(std.testing.allocator);
+    bitmap.set(0, 0, 1);
+    bitmap.set(8, 0, 1);
+
+    copyPreviousBitmapRow(bitmap, 1);
+    try std.testing.expectEqual(@as(u1, 1), bitmap.get(0, 1));
+    try std.testing.expectEqual(@as(u1, 1), bitmap.get(8, 1));
+    try std.testing.expectEqual(@as(u1, 0), bitmap.get(9, 1));
+
+    // The implicit row above the bitmap is white.
+    copyPreviousBitmapRow(bitmap, 0);
+    try std.testing.expectEqual(@as(u1, 1), bitmap.get(0, 0));
 }
 
 test "embedded generic region decodes through segment and page composition" {

@@ -30,6 +30,8 @@ components:
           $ref: "#/components/schemas/GraphExecutionConfig"
         mcp:
           $ref: "#/components/schemas/McpConfig"
+        backup:
+          $ref: "#/components/schemas/BackupConfig"
         storage:
           $ref: "#/components/schemas/StorageConfig"
         transaction_sessions:
@@ -223,7 +225,6 @@ components:
                Omit `api_key` from config and set the appropriate env var:
                - Gemini: `GEMINI_API_KEY`
                - OpenAI: `OPENAI_API_KEY`
-               - Anthropic: `ANTHROPIC_API_KEY`
 
             See [Secrets Management](/docs/secrets) for complete documentation.
 
@@ -276,7 +277,7 @@ components:
                 ],
                 "with-inline": [
                   { "generator": "gemini-flash" },
-                  { "generator_config": { "provider": "anthropic", "model": "claude-sonnet-4-5-20250929" } }
+                  { "generator_config": { "provider": "openai", "model": "gpt-4.1" } }
                 ]
               }
             }
@@ -293,8 +294,8 @@ components:
             with-inline:
               - generator: gemini-flash
               - generator_config:
-                  provider: anthropic
-                  model: claude-sonnet-4-5-20250929
+                  provider: openai
+                  model: gpt-4.1
         rerankers:
           type: object
           additionalProperties:
@@ -866,6 +867,19 @@ components:
             leaving envelope headroom beneath common 100 KiB connector limits.
             Nonzero values must be at least 512 bytes so the replacement error
             itself fits. Set to 0 to disable the compatibility guard.
+
+    BackupConfig:
+      type: object
+      additionalProperties: false
+      description: Operator-owned limits for backup execution.
+      properties:
+        operation_timeout_seconds:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 86400
+          default: 3600
+          description: End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
 
     QueryAdmissionConfig:
       type: object

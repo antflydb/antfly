@@ -52,6 +52,10 @@ export type QueryRequest = Omit<
   /** Named graph queries with non-scoring, stored-document node filters. */
   graph_queries?: Record<string, GraphQuery>;
 };
+/** Query body for the global endpoint, where the target table is part of the body. */
+export type GlobalQueryRequest = QueryRequest & {
+  table: string;
+};
 /**
  * Query body for a table-scoped endpoint. The table is selected exclusively by
  * the route argument so one request cannot carry two competing table names.
@@ -330,31 +334,34 @@ export type CdcConnection = components["schemas"]["CdcConnection"];
 
 // Model and reranker types
 export type EmbedderConfig = components["schemas"]["EmbedderConfig"];
+export type IndexEmbedderConfig = components["schemas"]["IndexEmbedderConfig"];
 export type RerankerConfig = components["schemas"]["RerankerConfig"];
 export type GeneratorConfig = components["schemas"]["GeneratorConfig"];
 export type EmbedderProvider = components["schemas"]["EmbedderProvider"];
-export const embedderProviders: components["schemas"]["EmbedderProvider"][] = [
-  "antfly",
-  "ollama",
-  "gemini",
-  "vertex",
-  "openai",
-  "openrouter",
-  "bedrock",
-  "cohere",
-  "mock",
-];
+export type IndexEmbedderProvider = NonNullable<IndexEmbedderConfig["provider"]>;
+export const embedderProviderCapabilities = {
+  antfly: { index: true },
+  bedrock: { index: true },
+  cohere: { index: false },
+  gemini: { index: false },
+  ollama: { index: true },
+  openai: { index: true },
+  openrouter: { index: false },
+  vertex: { index: false },
+} as const satisfies Record<EmbedderProvider, { index: boolean }>;
+export const embedderProviders = Object.keys(embedderProviderCapabilities) as EmbedderProvider[];
+export const indexEmbedderProviders = embedderProviders.filter(
+  (provider): provider is IndexEmbedderProvider => embedderProviderCapabilities[provider].index
+);
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
-export const generatorProviders: components["schemas"]["GeneratorProvider"][] = [
-  "antfly",
-  "ollama",
-  "gemini",
-  "openai",
-  "anthropic",
-  "vertex",
-  "cohere",
-  "openrouter",
-];
+export const generatorProviderCapabilities = {
+  antfly: {},
+  gemini: {},
+  ollama: {},
+  openai: {},
+  vertex: {},
+} as const satisfies Record<GeneratorProvider, object>;
+export const generatorProviders = Object.keys(generatorProviderCapabilities) as GeneratorProvider[];
 
 // AI response types
 export type ClassificationTransformationResult =
@@ -448,6 +455,7 @@ export type RetrievalAgentRequest = components["schemas"]["RetrievalAgentRequest
 export type RetrievalAgentResult = components["schemas"]["RetrievalAgentResult"];
 export type RetrievalAgentSteps = components["schemas"]["RetrievalAgentSteps"];
 export type SSEStepStarted = components["schemas"]["SSEStepStarted"];
+export type SSEToolMode = components["schemas"]["SSEToolMode"];
 
 // Retrieval Agent streaming callbacks for structured SSE events
 export interface RetrievalAgentStreamCallbacks {
@@ -458,8 +466,7 @@ export interface RetrievalAgentStreamCallbacks {
   onConfidence?: (data: GenerationConfidence) => void;
   onFollowup?: (question: string) => void;
   onEvalResult?: (data: EvalResult) => void;
-  onFilterApplied?: (filter: FilterSpec) => void;
-  onSearchExecuted?: (data: { query: string }) => void;
+  onToolMode?: (data: SSEToolMode) => void;
   onStepStarted?: (step: SSEStepStarted) => void;
   onStepProgress?: (data: Record<string, unknown>) => void;
   onStepCompleted?: (step: AgentStep) => void;

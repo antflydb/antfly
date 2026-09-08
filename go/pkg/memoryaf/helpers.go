@@ -30,10 +30,10 @@ type queryResponse struct {
 }
 
 type queryResult struct {
-	Hits         queryHits                          `json:"hits"`
-	Aggregations map[string]aggregationResult       `json:"aggregations"`
+	Hits         queryHits                     `json:"hits"`
+	Aggregations map[string]aggregationResult  `json:"aggregations"`
 	GraphResults map[string]client.GraphResult `json:"graph_results"`
-	Error        string                             `json:"error"`
+	Error        string                        `json:"error"`
 }
 
 type queryHits struct {

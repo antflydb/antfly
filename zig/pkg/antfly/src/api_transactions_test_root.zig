@@ -13,11 +13,13 @@
 // limitations.
 
 const distributed_txn = @import("api/distributed_txn.zig");
+const distributed_entity_sink = @import("api/distributed_entity_sink.zig");
 const internal_group_operations = @import("api/internal_group_operations.zig");
 const transactions = @import("api/transactions.zig");
 
 test {
     _ = distributed_txn;
+    _ = distributed_entity_sink;
     _ = internal_group_operations;
     _ = transactions;
 }

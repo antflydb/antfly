@@ -29,6 +29,11 @@ pub const DistanceMetric = enum(i32) {
     cosine = 2,
 };
 
+/// Default used when a public vector-index configuration omits its metric.
+/// Persist the resolved value with built artifacts so later default changes do
+/// not alter existing index behavior.
+pub const default_distance_metric: DistanceMetric = .l2_squared;
+
 pub const RotAlgorithm = enum(i32) {
     none = 0,
     givens = 1,

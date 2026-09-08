@@ -33,13 +33,17 @@ const EmbedWireRequest = struct {
     model: []const u8,
     input: std.json.Value,
     encoding_format: []const u8 = "float",
+    task_type: ?[]const u8 = null,
+    instruction: ?[]const u8 = null,
 };
 
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
+    request_timeout_ms: ?u64 = null,
     auth_header: ?[2][]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
@@ -81,6 +85,10 @@ pub const Provider = struct {
 
     pub fn setRequestCancellation(self: *Provider, cancellation: ?CancellationToken) void {
         self.cancellation = cancellation;
+    }
+
+    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: ?u64) void {
+        self.request_timeout_ms = timeout_ms;
     }
 
     pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
@@ -145,8 +153,10 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -213,56 +223,72 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        var values = std.json.Array.init(alloc);
-        defer values.deinit();
-        var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (encoded_buffers.items) |buf| alloc.free(buf);
-            encoded_buffers.deinit(alloc);
-        }
+        return self.embedPartsWithTask(alloc, model, parts, null, null);
+    }
+
+    pub fn embedPartsWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        parts: []const template_mod.ContentPart,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
+        // The multimodal request tree is only borrowed while embedJsonInput
+        // serializes it. Keep every nested map and encoded buffer under one
+        // request-scoped owner so success, cancellation, and construction
+        // failures all have the same cleanup path.
+        var input_arena = std.heap.ArenaAllocator.init(alloc);
+        defer input_arena.deinit();
+        const input_alloc = input_arena.allocator();
+        var values = std.json.Array.init(input_alloc);
 
         for (parts) |part| {
             switch (part) {
                 .text => |text| {
                     var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
-                    try obj.put(alloc, "type", .{ .string = "text" });
-                    try obj.put(alloc, "text", .{ .string = text });
+                    try obj.put(input_alloc, "type", .{ .string = "text" });
+                    try obj.put(input_alloc, "text", .{ .string = text });
                     try values.append(.{ .object = obj });
                 },
                 .media_url => |url| {
                     var image_url = std.json.ObjectMap.empty;
-                    errdefer image_url.deinit(alloc);
-                    try image_url.put(alloc, "url", .{ .string = url });
+                    try image_url.put(input_alloc, "url", .{ .string = url });
 
                     var obj = std.json.ObjectMap.empty;
-                    errdefer obj.deinit(alloc);
-                    try obj.put(alloc, "type", .{ .string = "image_url" });
-                    try obj.put(alloc, "image_url", .{ .object = image_url });
+                    try obj.put(input_alloc, "type", .{ .string = "image_url" });
+                    try obj.put(input_alloc, "image_url", .{ .object = image_url });
                     try values.append(.{ .object = obj });
                 },
                 .binary => |binary_part| {
                     const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
-                    const encoded = try alloc.alloc(u8, encoded_len);
-                    errdefer alloc.free(encoded);
+                    const encoded = try input_alloc.alloc(u8, encoded_len);
                     _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
-                    try encoded_buffers.append(alloc, encoded);
 
                     var obj = std.json.ObjectMap.empty;
-                    errdefer {
-                        obj.deinit(alloc);
-                        _ = encoded_buffers.pop();
-                        alloc.free(encoded);
-                    }
-                    try obj.put(alloc, "type", .{ .string = "media" });
-                    try obj.put(alloc, "data", .{ .string = encoded });
-                    try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
+                    try obj.put(input_alloc, "type", .{ .string = "media" });
+                    try obj.put(input_alloc, "data", .{ .string = encoded });
+                    try obj.put(input_alloc, "mime_type", .{ .string = binary_part.mime_type });
                     try values.append(.{ .object = obj });
                 },
             }
         }
 
-        return try self.embedJsonInput(alloc, model, .{ .array = values });
+        return try self.embedJsonInputWithTask(alloc, model, .{ .array = values }, task_type, instruction);
+    }
+
+    pub fn embedWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        inputs: []const []const u8,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
+        var input_array = std.json.Array.init(alloc);
+        defer input_array.deinit();
+        for (inputs) |input| try input_array.append(.{ .string = input });
+        return try self.embedJsonInputWithTask(alloc, model, .{ .array = input_array }, task_type, instruction);
     }
 
     fn embedImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, inputs: []const []const u8) anyerror!inference.EmbedResult {
@@ -274,16 +300,31 @@ pub const Provider = struct {
     }
 
     fn embedJsonInput(self: *Provider, alloc: std.mem.Allocator, model: []const u8, input: std.json.Value) !inference.EmbedResult {
+        return self.embedJsonInputWithTask(alloc, model, input, null, null);
+    }
+
+    fn embedJsonInputWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        input: std.json.Value,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, EmbedWireRequest{
             .model = model,
             .input = input,
+            .task_type = task_type,
+            .instruction = instruction,
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
             .cancellation = if (self.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
@@ -336,21 +377,6 @@ pub const Provider = struct {
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
-        const Response = struct {
-            choices: []const struct {
-                message: struct {
-                    content: ?[]const u8 = null,
-                    tool_calls: ?[]const struct {
-                        id: ?[]const u8 = null,
-                        function: struct {
-                            name: []const u8,
-                            arguments: []const u8,
-                        },
-                    } = null,
-                },
-            },
-        };
-
         const url = try std.fmt.allocPrint(self.allocator, "{s}/generate", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try inference.chatRequestJsonWithOptionsAlloc(self.allocator, model, messages, .termite_native, .{
@@ -362,16 +388,37 @@ pub const Provider = struct {
             .top_k = self.top_k,
             .frequency_penalty = self.frequency_penalty,
             .presence_penalty = self.presence_penalty,
+            .enable_thinking = if (self.tools_json != null) false else null,
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
-            .timeout_ms = 300_000,
+            .timeout_ms = self.request_timeout_ms orelse 300_000,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
         });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return inference.localGenerationStatusError(alloc, resp.status.code, resp.body);
         const body = resp.body orelse return error.EmptyResponse;
+        return parseGenerationResponse(alloc, body, self.tools_json, self.tool_choice_json);
+    }
+
+    pub fn parseGenerationResponse(alloc: std.mem.Allocator, body: []const u8, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) !inference.GenerateResult {
+        const Response = struct {
+            choices: []const struct {
+                message: struct {
+                    content: ?[]const u8 = null,
+                    tool_calls: ?[]const struct {
+                        id: ?[]const u8 = null,
+                        function: struct { name: []const u8, arguments: []const u8 },
+                    } = null,
+                },
+            },
+        };
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const choices = parsed.value.choices;
@@ -380,7 +427,7 @@ pub const Provider = struct {
         errdefer freeToolCalls(alloc, tool_calls);
         const content = choices[0].message.content orelse "";
         if (tool_calls.len == 0 and content.len > 0) {
-            tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+            tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, tools_json, tool_choice_json);
         }
         if (content.len == 0 and tool_calls.len == 0) return error.EmptyResponse;
 
@@ -431,7 +478,16 @@ pub const Provider = struct {
             .prompts = documents,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{
+            .attempt_observer = self.attempt_observer,
+            .json = json_body,
+            .headers = self.authHeaders(),
+            .timeout_ms = self.request_timeout_ms,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        });
         defer resp.deinit();
         if (!resp.ok()) return error.RerankRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
@@ -496,6 +552,24 @@ test "antfly embed request omits nullable generated fields" {
     try std.testing.expect(std.mem.indexOf(u8, body, "null") == null);
 }
 
+test "antfly embed request carries retrieval task and instruction" {
+    const alloc = std.testing.allocator;
+    var input = std.json.Array.init(alloc);
+    defer input.deinit();
+    try input.append(.{ .string = "history of Korea" });
+
+    const body = try httpx.json.Json.stringify(alloc, EmbedWireRequest{
+        .model = "nomic-ai/nomic-embed-text-v1.5",
+        .input = .{ .array = input },
+        .task_type = "RETRIEVAL_QUERY",
+        .instruction = "retrieve relevant encyclopedia passages",
+    });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"task_type\":\"RETRIEVAL_QUERY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instruction\":\"retrieve relevant encyclopedia passages\"") != null);
+}
+
 test "antfly embed parts preserves binary base64 until request serialization" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -556,6 +630,39 @@ test "antfly embed parts preserves binary base64 until request serialization" {
         return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(usize, 3), result_dim);
+}
+
+test "generating backend local HTTP preserves retryable capacity" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/generate", .respond = .{
+        .status = 503,
+        .body = "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true,\"reason\":\"inference_capacity\",\"retry_after_ms\":1000}",
+    } }});
+    defer server.deinit();
+    var result_error: anyerror = error.TestUnexpectedResult;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    const Call = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, url: []const u8, result: *anyerror) std.Io.Cancelable!void {
+            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+            defer client.deinit();
+            var provider = Provider.init(a, &client, url);
+            defer provider.deinit();
+            var generator = provider.generator();
+            var response = generator.generate(a, "gemma", &.{.{ .role = .user, .content = .{ .text = "Hello" } }}) catch |err| {
+                result.* = err;
+                return;
+            };
+            response.deinit();
+        }
+    };
+    try group.concurrent(io, Call.run, .{ alloc, io, server.baseUrl(), &result_error });
+    try server.handleOne();
+    try group.await(io);
+    try std.testing.expectEqual(error.GenerationCapacityUnavailable, result_error);
 }
 
 test "antfly generate round trip" {

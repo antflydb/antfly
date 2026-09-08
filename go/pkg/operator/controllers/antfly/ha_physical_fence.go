@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,36 @@ type haPhysicalIsolationGraceKey struct {
 	processBootID       string
 }
 
+// observeHAPrimaryAdminStatusForReconcile avoids serially paying the full HTTP
+// timeout after a generation-bound Kubernetes isolation transaction has
+// already frozen the unreachable-primary observation. Lease and candidate
+// status are still refreshed on every pass, and the isolation receipt is
+// revalidated uncached before any dependent action can advance.
+func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatusForReconcile(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster != nil && haPhysicalIsolationOwnsPrimaryFailure(cluster.Status.HAStatus) {
+		return errors.New(strings.TrimSpace(cluster.Status.HAStatus.PrimaryAdminLastError))
+	}
+	return r.observeHAPrimaryAdminStatus(ctx, cluster)
+}
+
+func haPhysicalIsolationOwnsPrimaryFailure(status *antflyv1.HAStatus) bool {
+	if status == nil || status.LastPromotion != nil || status.PrimaryAdminReachable ||
+		!status.PrimaryAdminFailureThresholdMet || strings.TrimSpace(status.PrimaryAdminLastError) == "" {
+		return false
+	}
+	for i := range status.PlannedActions {
+		action := &status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionIsolateFormerPrimary ||
+			action.AdminJobName != haKubernetesPhysicalFenceName || action.PhysicalIsolationReceipt == nil {
+			continue
+		}
+		if action.AdminJobPhase == haAdminJobPhaseRunning || action.AdminJobPhase == haAdminJobPhaseSucceeded {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileHAFormerPrimaryIsolation is the fail-safe path for an automatic
 // failover whose former primary cannot be reached through its admin endpoint.
 // A Kubernetes Lease or Pod API absence alone does not stop the old writer.
@@ -41,6 +72,9 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 	if r == nil || r.Client == nil || cluster == nil || cluster.Status.HAStatus == nil {
 		return nil
 	}
+	if err := r.refreshCompletedHAFormerPrimaryIsolation(ctx, cluster); err != nil {
+		return err
+	}
 	for i := range cluster.Status.HAStatus.PlannedActions {
 		action := &cluster.Status.HAStatus.PlannedActions[i]
 		if haActionKind(action.Kind) != haActionIsolateFormerPrimary {
@@ -48,6 +82,18 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		}
 		if err := validateHAFormerPrimaryIsolationAction(cluster, action); err != nil {
 			return err
+		}
+		// Once an exact promotion receipt exists, the completed isolation receipt
+		// is immutable historical authority. The shared Lease may expire or advance
+		// while the route and durable topology are still converging. Requiring that
+		// mutable Lease to remain current here would block the very reconciliation
+		// that commits those later steps. Before promotion, a restarted controller
+		// must still repeat its local monotonic watchdog barrier below.
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded && haPhysicalIsolationPromotionRecorded(cluster, action) {
+			if !haPhysicalIsolationSucceededWithEvidence(cluster, *action) {
+				return fmt.Errorf("isolate former primary: completed action lacks a complete matching physical-isolation receipt")
+			}
+			return nil
 		}
 		lease := &coordinationv1.Lease{}
 		reader := r.haBoundaryReader()
@@ -68,9 +114,6 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		if !ready {
 			return fmt.Errorf("isolate former primary: fencing Lease is not current: %s", reason)
 		}
-		if !haLeaseFenceScopeMatches(lease, scope) {
-			return fmt.Errorf("isolate former primary: fencing Lease scope does not match the planned topology")
-		}
 
 		statefulSet := &appsv1.StatefulSet{}
 		key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
@@ -82,11 +125,15 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			return fmt.Errorf("isolate former primary: StatefulSet %s is not controlled by AntflyCluster UID %s", statefulSet.Name, cluster.UID)
 		}
 		if action.AdminJobPhase == "" || action.AdminJobPhase == haAdminJobPhaseWaitingDependency {
-			var initialPods corev1.PodList
-			if err := reader.List(ctx, &initialPods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
+			proofPodUID := ""
+			if cluster.Status.HAStatus.PrimaryWatchdogProof != nil {
+				proofPodUID = cluster.Status.HAStatus.PrimaryWatchdogProof.PodUID
+			}
+			initialPods, err := listStatefulSetPodsForPhysicalIsolation(ctx, reader, statefulSet, proofPodUID)
+			if err != nil {
 				return fmt.Errorf("isolate former primary: list initial runtime pods: %w", err)
 			}
-			receipt, err := newHAPhysicalIsolationIntentReceipt(cluster, action, statefulSet, &initialPods, lease, scope)
+			receipt, err := newHAPhysicalIsolationIntentReceipt(cluster, action, statefulSet, initialPods, lease, scope)
 			if err != nil {
 				return err
 			}
@@ -126,11 +173,18 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			if err := r.Patch(ctx, statefulSet, patch); err != nil {
 				return fmt.Errorf("isolate former primary: hold StatefulSet at zero: %w", err)
 			}
-			return nil
+			// Stop this reconciliation after the irreversible workload mutation.
+			// Continuing through admin execution and a broad status write only
+			// increases the conflict window before the watchdog barrier can start.
+			return errHAStatusCheckpointed
 		}
 
-		var pods corev1.PodList
-		if err := reader.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(serviceSelectorLabels(cluster.Name, standaloneComponent(cluster)))); err != nil {
+		proofPodUID := ""
+		if action.PhysicalIsolationReceipt != nil && action.PhysicalIsolationReceipt.WatchdogProof != nil {
+			proofPodUID = action.PhysicalIsolationReceipt.WatchdogProof.PodUID
+		}
+		pods, err := listStatefulSetPodsForPhysicalIsolation(ctx, reader, statefulSet, proofPodUID)
+		if err != nil {
 			return fmt.Errorf("isolate former primary: list runtime pods: %w", err)
 		}
 		absenceProven := true
@@ -197,8 +251,28 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			}
 			return nil
 		}
+		if !absenceProven {
+			if !haPhysicalIsolationWatchdogFallbackProven(*action, pods) {
+				return nil
+			}
+			// A Service-selector partition can make the StatefulSet controller
+			// orphan its still-running Pod before the scale-to-zero update. Once
+			// the exact pre-transfer process has exceeded its fail-closed watchdog
+			// bound, remove that orphan with UID and resource-version
+			// preconditions. The zero grace period only cleans up the Kubernetes
+			// object; promotion safety continues to come from the process-bound
+			// watchdog proof because a partitioned kubelet may keep a deleted
+			// container alive.
+			deleted, err := r.deletePhysicallyIsolatedOrphan(ctx, action, pods)
+			if err != nil {
+				return err
+			}
+			if deleted {
+				return errHAStatusCheckpointed
+			}
+		}
 		if receipt.ObservedAt == nil {
-			if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, &pods) {
+			if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, pods) {
 				return nil
 			}
 			// Checkpoint the first post-watchdog-bound topology observation and
@@ -223,10 +297,10 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			}
 			return errHAStatusCheckpointed
 		}
-		if err := validateRecordedPhysicalIsolationObservation(action, statefulSet, lease, &pods, absenceProven); err != nil {
+		if err := validateRecordedPhysicalIsolationObservation(action, statefulSet, lease, pods, absenceProven); err != nil {
 			return err
 		}
-		if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, &pods) {
+		if !absenceProven && !haPhysicalIsolationWatchdogFallbackProven(*action, pods) {
 			return nil
 		}
 		if action.AdminJobPhase == haAdminJobPhaseSucceeded {
@@ -267,6 +341,120 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		return errHAStatusCheckpointed
 	}
 	return nil
+}
+
+// The action status checkpoint and the shared Lease are separate Kubernetes
+// objects. The main reconciler normally starts from its informer cache while
+// the physical-fence path deliberately reads the Lease through the uncached
+// boundary reader. Immediately after the final isolation checkpoint, that can
+// otherwise pair a pre-checkpoint Running action with the post-checkpoint Lease
+// boundary and reject a transition that is already durably complete.
+//
+// Refresh only an exact, fully validated terminal isolation receipt. This is
+// not a general status refresh and cannot manufacture progress: CR identity,
+// spec generation, operation identity, topology, Pod/process evidence, and the
+// completed receipt all have to match before the cached working copy advances.
+func (r *AntflyClusterReconciler) refreshCompletedHAFormerPrimaryIsolation(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if r == nil || cluster == nil || cluster.Status.HAStatus == nil {
+		return nil
+	}
+	live := &antflyv1.AntflyCluster{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("isolate former primary: refresh durable action checkpoint: %w", err)
+	}
+	if live.UID != cluster.UID || live.Generation != cluster.Generation || live.Status.HAStatus == nil {
+		return nil
+	}
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		working := &cluster.Status.HAStatus.PlannedActions[i]
+		if haActionKind(working.Kind) != haActionIsolateFormerPrimary || working.AdminJobPhase == haAdminJobPhaseSucceeded {
+			continue
+		}
+		for j := range live.Status.HAStatus.PlannedActions {
+			persisted := &live.Status.HAStatus.PlannedActions[j]
+			if haActionKind(persisted.Kind) != haActionIsolateFormerPrimary ||
+				!haSamePlannedActionIdentity(*working, *persisted) ||
+				persisted.AdminJobPhase != haAdminJobPhaseSucceeded ||
+				!haPhysicalIsolationSucceededWithEvidence(live, *persisted) {
+				continue
+			}
+			*working = *persisted.DeepCopy()
+			break
+		}
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) deletePhysicallyIsolatedOrphan(ctx context.Context, action *antflyv1.HAPlannedActionStatus, pods *corev1.PodList) (bool, error) {
+	if r == nil || r.Client == nil || action == nil || action.PhysicalIsolationReceipt == nil ||
+		action.PhysicalIsolationReceipt.WatchdogProof == nil || pods == nil {
+		return false, nil
+	}
+	proof := action.PhysicalIsolationReceipt.WatchdogProof
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Name != proof.PodName || string(pod.UID) != proof.PodUID ||
+			pod.UID == "" || strings.TrimSpace(pod.ResourceVersion) == "" ||
+			pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		uid := pod.UID
+		resourceVersion := pod.ResourceVersion
+		err := r.Delete(ctx, pod,
+			client.GracePeriodSeconds(0),
+			client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+		)
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			// Re-read through the uncached boundary reader before deciding
+			// whether this exact process disappeared or merely changed version.
+			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("isolate former primary: delete exact orphan Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// listStatefulSetPodsForPhysicalIsolation discovers old-writer processes by
+// controller ownership and by the exact runtime-attested Pod UID. StatefulSet
+// ownership is not durable across a selector-label mutation: the controller
+// can orphan the still-running Pod. The proof UID plus the stable ordinal Pod
+// name preserves process identity across that orphaning without trusting the
+// mutable Service selector.
+func listStatefulSetPodsForPhysicalIsolation(ctx context.Context, reader client.Reader, statefulSet *appsv1.StatefulSet, proofPodUID string) (*corev1.PodList, error) {
+	if reader == nil || statefulSet == nil || statefulSet.UID == "" || statefulSet.Namespace == "" {
+		return nil, fmt.Errorf("StatefulSet namespace and UID are required")
+	}
+	var namespacePods corev1.PodList
+	if err := reader.List(ctx, &namespacePods, client.InNamespace(statefulSet.Namespace)); err != nil {
+		return nil, err
+	}
+	owned := &corev1.PodList{ListMeta: namespacePods.ListMeta}
+	for i := range namespacePods.Items {
+		pod := &namespacePods.Items[i]
+		owner := metav1.GetControllerOf(pod)
+		ownedByStatefulSet := owner != nil && owner.UID == statefulSet.UID
+		proofBoundOrphan := string(pod.UID) == strings.TrimSpace(proofPodUID) && statefulSetOrdinalPodName(statefulSet.Name, pod.Name)
+		if ownedByStatefulSet || proofBoundOrphan {
+			owned.Items = append(owned.Items, *pod.DeepCopy())
+		}
+	}
+	return owned, nil
+}
+
+func statefulSetOrdinalPodName(statefulSetName, podName string) bool {
+	prefix := strings.TrimSpace(statefulSetName) + "-"
+	if prefix == "-" || !strings.HasPrefix(podName, prefix) {
+		return false
+	}
+	ordinalText := strings.TrimPrefix(podName, prefix)
+	ordinal, err := strconv.Atoi(ordinalText)
+	return err == nil && ordinal >= 0 && strconv.Itoa(ordinal) == ordinalText
 }
 
 func newHAPhysicalIsolationIntentReceipt(
@@ -325,10 +513,13 @@ func newHAPhysicalIsolationIntentReceipt(
 		LeaseHolder:                       strings.TrimSpace(*lease.Spec.HolderIdentity),
 		LeaseGeneration:                   action.FenceGeneration,
 		LeaseScope:                        haPhysicalIsolationLeaseScope(scope, topologyID),
-		LeaseTransferTime:                 metav1.NewTime(lease.Spec.AcquireTime.Time),
+		LeaseTransferTime:                 metav1.NewMicroTime(lease.Spec.AcquireTime.Time),
 		WatchdogMaxFenceLatencyMS:         watchdogMaxFenceLatencyMS,
 	}
 	receipt.WatchdogProof = haBindPhysicalIsolationWatchdogProof(cluster, action, pods, receipt)
+	if receipt.WatchdogProof == nil {
+		return nil, fmt.Errorf("isolate former primary: exact pre-transfer runtime watchdog proof is unavailable")
+	}
 	return receipt, nil
 }
 
@@ -408,7 +599,18 @@ func validateCurrentPhysicalIsolationLease(lease *coordinationv1.Lease, action *
 	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != strings.TrimSpace(action.RouteTo) {
 		return fmt.Errorf("isolate former primary: fencing Lease holder does not match promotion candidate %q", action.RouteTo)
 	}
-	if !haLeaseFenceScopeMatches(lease, scope) {
+	scopeMatches := haLeaseFenceScopeMatches(lease, scope)
+	if !scopeMatches && haPhysicalIsolationSucceededStructurallyWithEvidence(*action) {
+		// Once isolation freezes the old writer, the former holder advances the
+		// same Lease incarnation from the election lower bound to the proven tail.
+		// Revalidation must accept that one-way strengthening or it would revoke
+		// the receipt immediately before promotion. No other field or boundary is
+		// allowed to drift.
+		frozenScope := scope
+		frozenScope.primaryLSN = action.PhysicalIsolationReceipt.FrozenBoundaryLSN
+		scopeMatches = haLeaseFenceScopeMatches(lease, frozenScope)
+	}
+	if !scopeMatches {
 		return fmt.Errorf("isolate former primary: fencing Lease scope does not match the planned topology")
 	}
 	expectedTopologyID := ""
@@ -536,13 +738,50 @@ func validateHAFormerPrimaryIsolationAction(cluster *antflyv1.AntflyCluster, act
 	ha := cluster.Spec.HighAvailability
 	identity := haReplicationIdentity(ha)
 	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" ||
-		strings.TrimSpace(action.StandbyName) != strings.TrimSpace(identity.CurrentPrimaryID) ||
+		!haPhysicalIsolationActionMatchesIdentity(cluster, action, identity) ||
 		strings.TrimSpace(action.RouteTo) == "" || strings.TrimSpace(action.RouteTo) != strings.TrimSpace(action.FenceHolder) ||
 		action.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease || action.FenceGeneration == 0 || action.TargetLSN == 0 {
 		return fmt.Errorf("isolate former primary: action identity or Kubernetes Lease authority is incomplete")
 	}
 	return nil
+}
+
+func haPhysicalIsolationActionMatchesIdentity(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, identity *antflyv1.HAReplicationIdentitySpec) bool {
+	if cluster == nil || action == nil || identity == nil {
+		return false
+	}
+	if strings.TrimSpace(action.StandbyName) == strings.TrimSpace(identity.CurrentPrimaryID) {
+		return true
+	}
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	return promotion != nil && haIdentityMatchesPromotionParentOrChild(identity, promotion) &&
+		strings.TrimSpace(action.StandbyName) == strings.TrimSpace(promotion.OldPrimaryID) &&
+		strings.TrimSpace(action.RouteTo) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		action.FenceGeneration == promotion.FenceGeneration
+}
+
+func haPhysicalIsolationTopologyAdvanced(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) bool {
+	if !haPhysicalIsolationPromotionRecorded(cluster, action) {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	return identity != nil &&
+		strings.TrimSpace(identity.CurrentPrimaryID) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		identity.TimelineID == promotion.NewTimelineID && identity.Epoch == promotion.NewEpoch
+}
+
+func haPhysicalIsolationPromotionRecorded(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) bool {
+	if cluster == nil || action == nil || action.AdminJobPhase != haAdminJobPhaseSucceeded {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	return identity != nil && promotion != nil && haIdentityMatchesPromotionParentOrChild(identity, promotion) &&
+		strings.TrimSpace(action.StandbyName) == strings.TrimSpace(promotion.OldPrimaryID) &&
+		strings.TrimSpace(action.RouteTo) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		action.FenceGeneration == promotion.FenceGeneration
 }
 
 func validateHAPhysicalIsolationIntent(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) error {
@@ -558,9 +797,20 @@ func validateHAPhysicalIsolationIntent(cluster *antflyv1.AntflyCluster, action *
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
 	scope, ok := haPhysicalIsolationReceiptScope(receipt)
 	configuredMaxFenceLatencyMS, latencyOK := haRuntimeLeaseMaxFenceLatencyMS(cluster)
-	if identity == nil || !ok || scope.clusterID != identity.ClusterID || scope.shardID != identity.ShardID ||
-		scope.tableID != identity.TableID || scope.timelineID != identity.TimelineID || scope.epoch != identity.Epoch ||
-		strings.TrimSpace(scope.currentPrimaryID) != strings.TrimSpace(identity.CurrentPrimaryID) ||
+	identityMatchesScope := identity != nil && scope.clusterID == identity.ClusterID && scope.shardID == identity.ShardID &&
+		scope.tableID == identity.TableID && scope.timelineID == identity.TimelineID && scope.epoch == identity.Epoch &&
+		strings.TrimSpace(scope.currentPrimaryID) == strings.TrimSpace(identity.CurrentPrimaryID)
+	if !identityMatchesScope && identity != nil {
+		promotion := haPromotionReceipt(cluster.Status.HAStatus)
+		identityMatchesScope = promotion != nil && haIdentityMatchesPromotionParentOrChild(identity, promotion) &&
+			scope.clusterID == identity.ClusterID && scope.shardID == identity.ShardID && scope.tableID == identity.TableID &&
+			scope.timelineID == promotion.ParentTimelineID && scope.epoch == promotion.ParentEpoch &&
+			strings.TrimSpace(scope.currentPrimaryID) == strings.TrimSpace(promotion.OldPrimaryID) &&
+			strings.TrimSpace(action.StandbyName) == strings.TrimSpace(promotion.OldPrimaryID) &&
+			strings.TrimSpace(action.RouteTo) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+			action.FenceGeneration == promotion.FenceGeneration
+	}
+	if identity == nil || !ok || !identityMatchesScope ||
 		scope.primaryLSN == 0 || scope.primaryLSN > action.TargetLSN ||
 		strings.TrimSpace(receipt.LeaseScope.TopologyID) != haFencingLeaseTopologyID(cluster) || !latencyOK ||
 		receipt.WatchdogMaxFenceLatencyMS != configuredMaxFenceLatencyMS {
@@ -667,11 +917,11 @@ func haPhysicalIsolationWatchdogProofStructurallyValid(action antflyv1.HAPlanned
 	return false
 }
 
-func haWatchdogProofObservedBeforeTransfer(observedAt, transferAt metav1.Time) bool {
+func haWatchdogProofObservedBeforeTransfer(observedAt metav1.Time, transferAt metav1.MicroTime) bool {
 	if observedAt.IsZero() || transferAt.IsZero() {
 		return false
 	}
-	return observedAt.Before(&transferAt)
+	return observedAt.Time.Before(transferAt.Time)
 }
 
 func haIsolatedPromotionBoundary(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) (uint64, bool) {

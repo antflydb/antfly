@@ -68,7 +68,9 @@ def summarize(values: list[float]) -> dict[str, Any]:
     }
 
 
-def aggregate_top_dot_shape_families(top_shapes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def aggregate_top_dot_shape_families(
+    top_shapes: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
     families: dict[str, dict[str, Any]] = {}
     for shape in top_shapes:
         if not isinstance(shape, dict):
@@ -89,11 +91,17 @@ def aggregate_top_dot_shape_families(top_shapes: list[dict[str, Any]]) -> dict[s
         count = entry["count"]
         entry["total_ms"] = round(float(entry["total_ms"]), 3)
         entry["avg_ms"] = round(float(entry["total_ms"]) / count, 6) if count else None
-    return dict(sorted(families.items(), key=lambda item: item[1]["total_ms"], reverse=True))
+    return dict(
+        sorted(families.items(), key=lambda item: item[1]["total_ms"], reverse=True)
+    )
 
 
-def first_summary_list(successful: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
-    return next((run["summary"].get(key) for run in successful if run["summary"].get(key)), [])
+def first_summary_list(
+    successful: list[dict[str, Any]], key: str
+) -> list[dict[str, Any]]:
+    return next(
+        (run["summary"].get(key) for run in successful if run["summary"].get(key)), []
+    )
 
 
 COMMAND_DISPATCH_FAMILY_KEYS = [
@@ -109,7 +117,9 @@ COMMAND_DISPATCH_FAMILY_KEYS = [
 ]
 
 
-def top_command_dispatch_families(metrics: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def top_command_dispatch_families(
+    metrics: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
     families: list[dict[str, Any]] = []
     for name, key in COMMAND_DISPATCH_FAMILY_KEYS:
         median = metrics.get(key, {}).get("median")
@@ -119,7 +129,13 @@ def top_command_dispatch_families(metrics: dict[str, dict[str, Any]]) -> list[di
     return sorted(families, key=lambda item: item["median"], reverse=True)
 
 
-def run_compare(argv: list[str], out_dir: Path, run_index: int, timeout: int | None, env: dict[str, str] | None) -> dict[str, Any]:
+def run_compare(
+    argv: list[str],
+    out_dir: Path,
+    run_index: int,
+    timeout: int | None,
+    env: dict[str, str] | None,
+) -> dict[str, Any]:
     run_dir = out_dir / f"run-{run_index:02d}"
     report_path = run_dir / "comparison_report.json"
     report_path.unlink(missing_ok=True)
@@ -162,7 +178,9 @@ def run_compare(argv: list[str], out_dir: Path, run_index: int, timeout: int | N
         "argv": cmd,
         "report_path": str(report_path),
         "summary": report.get("summary", {}),
-        "output_tail": (proc.stdout + (f"\n{report_error}" if report_error else ""))[-8000:],
+        "output_tail": (proc.stdout + (f"\n{report_error}" if report_error else ""))[
+            -8000:
+        ],
     }
 
 
@@ -185,7 +203,11 @@ def main() -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--out-dir", type=Path, default=Path("/private/tmp/termite-gliner2-lora-perf-runs"))
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("/private/tmp/termite-gliner2-lora-perf-runs"),
+    )
     parser.add_argument("--timeout-seconds", type=int, default=900)
     parser.add_argument("--allow-failures", action="store_true")
     parser.add_argument(
@@ -193,37 +215,85 @@ def main() -> int:
         default=None,
         help="Comma-separated isolated comparison seeds; count must equal --runs",
     )
-    parser.add_argument("--op-stats", action="store_true", help="Set TERMITE_METAL_PARTITION_OP_STATS=1 for each comparison run")
-    parser.add_argument("--op-runs", action="store_true", help="Set TERMITE_METAL_PARTITION_OP_RUNS=1 for grouped-dot candidate summaries")
-    parser.add_argument("--loop-profile", action="store_true", help="Set TERMITE_METAL_PARTITION_LOOP_PROFILE=1 for executor loop timing summaries")
-    parser.add_argument("--hazard-profile", action="store_true", help="Set TERMITE_METAL_PLANNED_ACCESS_PROFILE=1 for planned-access hazard timing summaries")
+    parser.add_argument(
+        "--op-stats",
+        action="store_true",
+        help="Set TERMITE_METAL_PARTITION_OP_STATS=1 for each comparison run",
+    )
+    parser.add_argument(
+        "--op-runs",
+        action="store_true",
+        help="Set TERMITE_METAL_PARTITION_OP_RUNS=1 for grouped-dot candidate summaries",
+    )
+    parser.add_argument(
+        "--loop-profile",
+        action="store_true",
+        help="Set TERMITE_METAL_PARTITION_LOOP_PROFILE=1 for executor loop timing summaries",
+    )
+    parser.add_argument(
+        "--hazard-profile",
+        action="store_true",
+        help="Set TERMITE_METAL_PLANNED_ACCESS_PROFILE=1 for planned-access hazard timing summaries",
+    )
     parser.add_argument("--max-zig-median-ms", type=float, default=None)
     parser.add_argument("--max-zig-python-step-ratio-median", type=float, default=None)
     parser.add_argument("--max-zig-python-step-ratio-any-run", type=float, default=None)
-    parser.add_argument("--max-zig-python-warm-step-ratio-median", type=float, default=None)
-    parser.add_argument("--max-zig-python-warm-step-ratio-any-run", type=float, default=None)
+    parser.add_argument(
+        "--max-zig-python-warm-step-ratio-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--max-zig-python-warm-step-ratio-any-run", type=float, default=None
+    )
     parser.add_argument("--max-host-output-median", type=float, default=None)
     parser.add_argument("--max-true-host-output-median", type=float, default=None)
-    parser.add_argument("--max-parameter-materialization-median", type=float, default=None)
-    parser.add_argument("--warn-parameter-materialization-median", type=float, default=None)
+    parser.add_argument(
+        "--max-parameter-materialization-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--warn-parameter-materialization-median", type=float, default=None
+    )
     parser.add_argument("--max-fallback-median", type=float, default=None)
     parser.add_argument("--max-command-dispatch-median", type=float, default=None)
     parser.add_argument("--max-dot-general-count-median", type=float, default=None)
     parser.add_argument("--max-dot-general-ms-median", type=float, default=None)
     parser.add_argument("--max-gather-host-output-median", type=float, default=None)
-    parser.add_argument("--max-zig-metal-peak-live-bytes-median", type=float, default=None)
-    parser.add_argument("--max-zig-metal-planned-barriers-median", type=float, default=None)
-    parser.add_argument("--max-zig-metal-planned-scopes-median", type=float, default=None)
-    parser.add_argument("--max-zig-low-rank-lora-backward-region-median", type=float, default=None)
-    parser.add_argument("--min-zig-residual-layernorm-region-median", type=float, default=None)
+    parser.add_argument(
+        "--max-zig-metal-peak-live-bytes-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--max-zig-metal-planned-barriers-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--max-zig-metal-planned-scopes-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--max-zig-low-rank-lora-backward-region-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--min-zig-residual-layernorm-region-median", type=float, default=None
+    )
     parser.add_argument("--max-zig-scaffold-region-median", type=float, default=None)
-    parser.add_argument("--max-zig-encoder-lora-fallback-median", type=float, default=None)
-    parser.add_argument("--min-zig-lora-backward-region-median", type=float, default=None)
-    parser.add_argument("--min-zig-low-rank-lora-backward-region-median", type=float, default=None)
-    parser.add_argument("--min-zig-rank-adapter-backward-region-median", type=float, default=None)
-    parser.add_argument("--min-zig-ffn-gelu-backward-region-median", type=float, default=None)
-    parser.add_argument("--min-zig-head-mlp-forward-region-median", type=float, default=None)
-    parser.add_argument("--min-zig-head-mlp-backward-region-median", type=float, default=None)
+    parser.add_argument(
+        "--max-zig-encoder-lora-fallback-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--min-zig-lora-backward-region-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--min-zig-low-rank-lora-backward-region-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--min-zig-rank-adapter-backward-region-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--min-zig-ffn-gelu-backward-region-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--min-zig-head-mlp-forward-region-median", type=float, default=None
+    )
+    parser.add_argument(
+        "--min-zig-head-mlp-backward-region-median", type=float, default=None
+    )
     parser.add_argument("--warn-zig-median-ms", type=float, default=None)
     parser.add_argument("--require-loss-parity", action="store_true")
     parser.add_argument("--require-adapter-roundtrip", action="store_true")
@@ -240,13 +310,19 @@ def main() -> int:
     seeds: list[int] | None = None
     if args.seeds is not None:
         try:
-            seeds = [int(value.strip()) for value in args.seeds.split(",") if value.strip()]
+            seeds = [
+                int(value.strip()) for value in args.seeds.split(",") if value.strip()
+            ]
         except ValueError as exc:
             parser.error(f"--seeds must contain integers: {exc}")
         if len(seeds) != args.runs:
             parser.error("--seeds count must equal --runs")
     for name, value in vars(args).items():
-        if name.startswith(("max_", "min_", "warn_")) and value is not None and not math.isfinite(value):
+        if (
+            name.startswith(("max_", "min_", "warn_"))
+            and value is not None
+            and not math.isfinite(value)
+        ):
             parser.error(f"--{name.replace('_', '-')} must be finite")
     forwarded = args.compare_args
     if forwarded and forwarded[0] == "--":
@@ -264,15 +340,24 @@ def main() -> int:
     if args.hazard_profile:
         run_env["TERMITE_METAL_PLANNED_ACCESS_PROFILE"] = "1"
     for idx in range(1, args.runs + 1):
-        run_args = args_with_seed(forwarded, seeds[idx - 1]) if seeds is not None else forwarded
+        run_args = (
+            args_with_seed(forwarded, seeds[idx - 1])
+            if seeds is not None
+            else forwarded
+        )
         result = run_compare(run_args, args.out_dir, idx, args.timeout_seconds, run_env)
         runs.append(result)
-        print(json.dumps({
-            "event": "perf_run",
-            "run": idx,
-            "returncode": result["returncode"],
-            "summary": result["summary"],
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "event": "perf_run",
+                    "run": idx,
+                    "returncode": result["returncode"],
+                    "summary": result["summary"],
+                },
+                sort_keys=True,
+            )
+        )
         if result["returncode"] != 0 and not args.allow_failures:
             break
 
@@ -459,7 +544,13 @@ def main() -> int:
         "valid_loss_parity",
     ]
     metrics = {
-        key: summarize([value for run in successful if (value := metric(run["summary"], key)) is not None])
+        key: summarize(
+            [
+                value
+                for run in successful
+                if (value := metric(run["summary"], key)) is not None
+            ]
+        )
         for key in keys
     }
     zig_median = metrics["zig_avg_trainer_ms"]["median"]
@@ -479,7 +570,9 @@ def main() -> int:
     warm_py_median = metrics["python_warm_avg_step_wall_ms"]["median"]
     zig_python_warm_step_ratio = (
         warm_zig_median / warm_py_median
-        if warm_zig_median is not None and warm_py_median is not None and warm_py_median > 0.0
+        if warm_zig_median is not None
+        and warm_py_median is not None
+        and warm_py_median > 0.0
         else None
     )
     zig_python_warm_step_ratios = []
@@ -499,8 +592,12 @@ def main() -> int:
             "zig_warm_step_count": run["summary"].get("zig_warm_step_count"),
             "step_count_match": run["summary"].get("step_count_match"),
             "warm_step_count_match": run["summary"].get("warm_step_count_match"),
-            "python_step_count_matches_requested": run["summary"].get("python_step_count_matches_requested"),
-            "zig_step_count_matches_requested": run["summary"].get("zig_step_count_matches_requested"),
+            "python_step_count_matches_requested": run["summary"].get(
+                "python_step_count_matches_requested"
+            ),
+            "zig_step_count_matches_requested": run["summary"].get(
+                "zig_step_count_matches_requested"
+            ),
         }
         for run in successful
         if run["summary"].get("step_count_valid") is not True
@@ -539,10 +636,14 @@ def main() -> int:
         "compare_args": forwarded,
         "metrics": metrics,
         "zig_beats_python_median_step_time": (
-            zig_median < py_median if zig_median is not None and py_median is not None else None
+            zig_median < py_median
+            if zig_median is not None and py_median is not None
+            else None
         ),
         "zig_python_step_ratio_median": zig_python_step_ratio,
-        "zig_python_step_ratio_max": max(zig_python_step_ratios) if zig_python_step_ratios else None,
+        "zig_python_step_ratio_max": max(zig_python_step_ratios)
+        if zig_python_step_ratios
+        else None,
         "zig_python_step_ratios": zig_python_step_ratios,
         "zig_python_warm_step_ratio_median": zig_python_warm_step_ratio,
         "zig_python_warm_step_ratio_max": (
@@ -558,9 +659,15 @@ def main() -> int:
         "top_dot_shapes": top_dot_shapes,
         "top_dot_shape_families": aggregate_top_dot_shape_families(top_dot_shapes),
         "top_command_dispatch_families": top_command_dispatch_families(metrics),
-        "top_host_output_families": first_summary_list(successful, "zig_top_host_output_families"),
-        "top_fallback_families": first_summary_list(successful, "zig_top_fallback_families"),
-        "top_host_output_reasons": first_summary_list(successful, "zig_top_host_output_reasons"),
+        "top_host_output_families": first_summary_list(
+            successful, "zig_top_host_output_families"
+        ),
+        "top_fallback_families": first_summary_list(
+            successful, "zig_top_fallback_families"
+        ),
+        "top_host_output_reasons": first_summary_list(
+            successful, "zig_top_host_output_reasons"
+        ),
         "host_output_accounting": {
             key: metrics[key]["median"]
             for key in host_output_accounting_keys
@@ -568,12 +675,24 @@ def main() -> int:
         },
         "run_reports": [run["report_path"] for run in runs],
     }
-    accelerator_backends = [run["summary"].get("zig_manifest_backend", "").lower() for run in successful]
-    training_precisions = [run["summary"].get("zig_training_precision") for run in successful]
-    optimizer_precisions = [run["summary"].get("zig_optimizer_state_precision") for run in successful]
-    summary["accelerator_backend"] = accelerator_backends[0] if accelerator_backends else None
-    summary["training_precision"] = training_precisions[0] if training_precisions else None
-    summary["optimizer_state_precision"] = optimizer_precisions[0] if optimizer_precisions else None
+    accelerator_backends = [
+        run["summary"].get("zig_manifest_backend", "").lower() for run in successful
+    ]
+    training_precisions = [
+        run["summary"].get("zig_training_precision") for run in successful
+    ]
+    optimizer_precisions = [
+        run["summary"].get("zig_optimizer_state_precision") for run in successful
+    ]
+    summary["accelerator_backend"] = (
+        accelerator_backends[0] if accelerator_backends else None
+    )
+    summary["training_precision"] = (
+        training_precisions[0] if training_precisions else None
+    )
+    summary["optimizer_state_precision"] = (
+        optimizer_precisions[0] if optimizer_precisions else None
+    )
     summary["precision_consistent"] = bool(successful) and (
         len(set(accelerator_backends)) == 1
         and training_precisions == ["fp32"] * len(successful)
@@ -582,8 +701,14 @@ def main() -> int:
     failures: list[str] = []
     if len(successful) != args.runs:
         failures.append(f"only {len(successful)}/{args.runs} runs succeeded")
-    if python_oracle_expected and successful and summary["precision_consistent"] is not True:
-        failures.append("accelerator backend or FP32 training/optimizer precision was missing or inconsistent")
+    if (
+        python_oracle_expected
+        and successful
+        and summary["precision_consistent"] is not True
+    ):
+        failures.append(
+            "accelerator backend or FP32 training/optimizer precision was missing or inconsistent"
+        )
     valid_oracles = [
         oracle
         for oracle in oracle_rows
@@ -597,63 +722,130 @@ def main() -> int:
         and isinstance(oracle.get("imported_module"), str)
     ]
     summary["oracle"] = valid_oracles[0] if valid_oracles else None
-    summary["oracle_valid_in_every_run"] = (
-        not python_oracle_expected
-        or (
-            len(valid_oracles) == args.runs
-            and len({oracle["checkout"] for oracle in valid_oracles}) == 1
-            and len({oracle["imported_module"] for oracle in valid_oracles}) == 1
-        )
+    summary["oracle_valid_in_every_run"] = not python_oracle_expected or (
+        len(valid_oracles) == args.runs
+        and len({oracle["checkout"] for oracle in valid_oracles}) == 1
+        and len({oracle["imported_module"] for oracle in valid_oracles}) == 1
     )
     if python_oracle_expected and summary["oracle_valid_in_every_run"] is not True:
         failures.append(
             f"Python oracle source/runtime was not pinned to {UPSTREAM_COMMIT} and the canonical dependency set in every run"
         )
-    for fingerprint_key in ("model_fingerprint_sha256", "training_data_fingerprint_sha256"):
+    for fingerprint_key in (
+        "model_fingerprint_sha256",
+        "training_data_fingerprint_sha256",
+    ):
         values = [run["summary"].get(fingerprint_key) for run in successful]
         valid_values = [
             value
             for value in values
-            if isinstance(value, str) and value.startswith("sha256:") and len(value) == 71
+            if isinstance(value, str)
+            and value.startswith("sha256:")
+            and len(value) == 71
         ]
         summary[fingerprint_key] = valid_values[0] if valid_values else None
         summary[f"{fingerprint_key}_consistent"] = (
             not python_oracle_expected
-            or len(valid_values) == args.runs and len(set(valid_values)) == 1
+            or len(valid_values) == args.runs
+            and len(set(valid_values)) == 1
         )
-        if python_oracle_expected and summary[f"{fingerprint_key}_consistent"] is not True:
-            failures.append(f"{fingerprint_key} was missing or inconsistent across runs")
+        if (
+            python_oracle_expected
+            and summary[f"{fingerprint_key}_consistent"] is not True
+        ):
+            failures.append(
+                f"{fingerprint_key} was missing or inconsistent across runs"
+            )
     if step_count_mismatches:
         failures.append(
             "step-count mismatch invalidates performance ratios: "
             + "; ".join(
-                "run {run} requested={requested_step_count} python={python_step_count} zig={zig_step_count}".format(**row)
+                "run {run} requested={requested_step_count} python={python_step_count} zig={zig_step_count}".format(
+                    **row
+                )
                 for row in step_count_mismatches
             )
         )
     threshold_checks = [
         ("zig_avg_trainer_ms", args.max_zig_median_ms, "Zig median trainer ms"),
-        ("zig_graph_executor_command_dispatches_avg", args.max_command_dispatch_median, "command dispatch median"),
-        ("zig_graph_executor_host_outputs_avg", args.max_host_output_median, "aggregate host output median"),
-        ("zig_graph_executor_true_host_outputs_avg", args.max_true_host_output_median, "true host output median"),
-        ("zig_graph_executor_parameter_materializations_avg", args.max_parameter_materialization_median, "parameter materialization median"),
-        ("zig_graph_executor_interpreter_fallbacks_avg", args.max_fallback_median, "fallback median"),
-        ("zig_dot_general_command_count", args.max_dot_general_count_median, "dot_general command-count median"),
-        ("zig_dot_general_command_total_ms", args.max_dot_general_ms_median, "dot_general total-ms median"),
-        ("zig_gather_host_output_count", args.max_gather_host_output_median, "gather host-output median"),
-        ("zig_metal_tensor_device_owned_peak_live_bytes_avg", args.max_zig_metal_peak_live_bytes_median, "Zig Metal peak-live-bytes median"),
-        ("zig_metal_last_frame_planned_barriers_avg", args.max_zig_metal_planned_barriers_median, "Zig Metal planned-barriers median"),
-        ("zig_metal_last_frame_planned_scopes_avg", args.max_zig_metal_planned_scopes_median, "Zig Metal planned-scopes median"),
-        ("zig_metal_deberta_encoder_lora_layer_scaffold_regions_avg", args.max_zig_scaffold_region_median, "Zig scaffold-region median"),
-        ("zig_metal_deberta_encoder_lora_layer_fallbacks_avg", args.max_zig_encoder_lora_fallback_median, "Zig encoder-LoRA fallback median"),
-        ("zig_metal_low_rank_lora_backward_regions_avg", args.max_zig_low_rank_lora_backward_region_median, "Zig low-rank LoRA-backward region median"),
+        (
+            "zig_graph_executor_command_dispatches_avg",
+            args.max_command_dispatch_median,
+            "command dispatch median",
+        ),
+        (
+            "zig_graph_executor_host_outputs_avg",
+            args.max_host_output_median,
+            "aggregate host output median",
+        ),
+        (
+            "zig_graph_executor_true_host_outputs_avg",
+            args.max_true_host_output_median,
+            "true host output median",
+        ),
+        (
+            "zig_graph_executor_parameter_materializations_avg",
+            args.max_parameter_materialization_median,
+            "parameter materialization median",
+        ),
+        (
+            "zig_graph_executor_interpreter_fallbacks_avg",
+            args.max_fallback_median,
+            "fallback median",
+        ),
+        (
+            "zig_dot_general_command_count",
+            args.max_dot_general_count_median,
+            "dot_general command-count median",
+        ),
+        (
+            "zig_dot_general_command_total_ms",
+            args.max_dot_general_ms_median,
+            "dot_general total-ms median",
+        ),
+        (
+            "zig_gather_host_output_count",
+            args.max_gather_host_output_median,
+            "gather host-output median",
+        ),
+        (
+            "zig_metal_tensor_device_owned_peak_live_bytes_avg",
+            args.max_zig_metal_peak_live_bytes_median,
+            "Zig Metal peak-live-bytes median",
+        ),
+        (
+            "zig_metal_last_frame_planned_barriers_avg",
+            args.max_zig_metal_planned_barriers_median,
+            "Zig Metal planned-barriers median",
+        ),
+        (
+            "zig_metal_last_frame_planned_scopes_avg",
+            args.max_zig_metal_planned_scopes_median,
+            "Zig Metal planned-scopes median",
+        ),
+        (
+            "zig_metal_deberta_encoder_lora_layer_scaffold_regions_avg",
+            args.max_zig_scaffold_region_median,
+            "Zig scaffold-region median",
+        ),
+        (
+            "zig_metal_deberta_encoder_lora_layer_fallbacks_avg",
+            args.max_zig_encoder_lora_fallback_median,
+            "Zig encoder-LoRA fallback median",
+        ),
+        (
+            "zig_metal_low_rank_lora_backward_regions_avg",
+            args.max_zig_low_rank_lora_backward_region_median,
+            "Zig low-rank LoRA-backward region median",
+        ),
     ]
     for key, limit, label in threshold_checks:
         median = metrics[key]["median"]
         if limit is not None and (median is None or median > limit):
             failures.append(f"{label} {median} exceeds limit {limit}")
     if args.max_zig_python_step_ratio_median is not None and (
-        zig_python_step_ratio is None or zig_python_step_ratio > args.max_zig_python_step_ratio_median
+        zig_python_step_ratio is None
+        or zig_python_step_ratio > args.max_zig_python_step_ratio_median
     ):
         failures.append(
             f"Zig/Python median step ratio {zig_python_step_ratio} exceeds limit {args.max_zig_python_step_ratio_median}"
@@ -666,14 +858,19 @@ def main() -> int:
             "Zig/Python warm median step ratio "
             f"{zig_python_warm_step_ratio} exceeds limit {args.max_zig_python_warm_step_ratio_median}"
         )
-    zig_python_step_ratio_max = max(zig_python_step_ratios) if zig_python_step_ratios else None
+    zig_python_step_ratio_max = (
+        max(zig_python_step_ratios) if zig_python_step_ratios else None
+    )
     if args.max_zig_python_step_ratio_any_run is not None and (
-        zig_python_step_ratio_max is None or zig_python_step_ratio_max > args.max_zig_python_step_ratio_any_run
+        zig_python_step_ratio_max is None
+        or zig_python_step_ratio_max > args.max_zig_python_step_ratio_any_run
     ):
         failures.append(
             f"Zig/Python max per-run step ratio {zig_python_step_ratio_max} exceeds limit {args.max_zig_python_step_ratio_any_run}"
         )
-    zig_python_warm_step_ratio_max = max(zig_python_warm_step_ratios) if zig_python_warm_step_ratios else None
+    zig_python_warm_step_ratio_max = (
+        max(zig_python_warm_step_ratios) if zig_python_warm_step_ratios else None
+    )
     if args.max_zig_python_warm_step_ratio_any_run is not None and (
         zig_python_warm_step_ratio_max is None
         or zig_python_warm_step_ratio_max > args.max_zig_python_warm_step_ratio_any_run
@@ -684,11 +881,17 @@ def main() -> int:
         )
     valid_loss_values = [run["summary"].get("valid_loss_parity") for run in successful]
     if args.require_loss_parity and (
-        len(valid_loss_values) != args.runs or not all(value is True for value in valid_loss_values)
+        len(valid_loss_values) != args.runs
+        or not all(value is True for value in valid_loss_values)
     ):
-        failures.append("loss parity was required but not all successful runs reported valid_loss_parity=true")
+        failures.append(
+            "loss parity was required but not all successful runs reported valid_loss_parity=true"
+        )
     adapter_roundtrips = [
-        (run["summary"].get("adapter_roundtrip_ran"), run["summary"].get("adapter_roundtrip_ok"))
+        (
+            run["summary"].get("adapter_roundtrip_ran"),
+            run["summary"].get("adapter_roundtrip_ok"),
+        )
         for run in successful
     ]
     adapter_roundtrip_valid = len(adapter_roundtrips) == args.runs and all(
@@ -697,9 +900,14 @@ def main() -> int:
     summary["adapter_roundtrip_required"] = args.require_adapter_roundtrip
     summary["adapter_roundtrip_valid"] = adapter_roundtrip_valid
     if args.require_adapter_roundtrip and not adapter_roundtrip_valid:
-        failures.append("adapter round-trip was required but did not run and pass in every run")
+        failures.append(
+            "adapter round-trip was required but did not run and pass in every run"
+        )
     trained_adapter_parities = [
-        (run["summary"].get("trained_adapter_parity_ran"), run["summary"].get("trained_adapter_parity_ok"))
+        (
+            run["summary"].get("trained_adapter_parity_ran"),
+            run["summary"].get("trained_adapter_parity_ok"),
+        )
         for run in successful
     ]
     trained_adapter_parity_valid = len(trained_adapter_parities) == args.runs and all(
@@ -710,68 +918,105 @@ def main() -> int:
     summary["trained_adapter_tensor_equality_diagnostic"] = {
         "gating": False,
         "ran_count": sum(ran is True for ran, _ in trained_adapter_parities),
-        "within_diagnostic_tolerance_count": sum(ok is True for _, ok in trained_adapter_parities),
+        "within_diagnostic_tolerance_count": sum(
+            ok is True for _, ok in trained_adapter_parities
+        ),
         "requested_runs": args.runs,
     }
-    if args.require_zig_beats_python and summary["zig_beats_python_median_step_time"] is not True:
+    if (
+        args.require_zig_beats_python
+        and summary["zig_beats_python_median_step_time"] is not True
+    ):
         failures.append("Zig median step time did not beat Python median step time")
     warnings: list[str] = []
-    if args.warn_zig_median_ms is not None and zig_median is not None and zig_median > args.warn_zig_median_ms:
-        warnings.append(f"Zig median trainer ms {zig_median} exceeds warning threshold {args.warn_zig_median_ms}")
-    parameter_materialization_median = metrics["zig_graph_executor_parameter_materializations_avg"]["median"]
+    if (
+        args.warn_zig_median_ms is not None
+        and zig_median is not None
+        and zig_median > args.warn_zig_median_ms
+    ):
+        warnings.append(
+            f"Zig median trainer ms {zig_median} exceeds warning threshold {args.warn_zig_median_ms}"
+        )
+    parameter_materialization_median = metrics[
+        "zig_graph_executor_parameter_materializations_avg"
+    ]["median"]
     if (
         args.warn_parameter_materialization_median is not None
         and parameter_materialization_median is not None
-        and parameter_materialization_median > args.warn_parameter_materialization_median
+        and parameter_materialization_median
+        > args.warn_parameter_materialization_median
     ):
         warnings.append(
             f"parameter materialization median {parameter_materialization_median} exceeds warning threshold {args.warn_parameter_materialization_median}"
         )
-    residual_ln_median = metrics["zig_metal_deberta_encoder_lora_residual_layernorm_regions_avg"]["median"]
+    residual_ln_median = metrics[
+        "zig_metal_deberta_encoder_lora_residual_layernorm_regions_avg"
+    ]["median"]
     if args.min_zig_residual_layernorm_region_median is not None and (
-        residual_ln_median is None or residual_ln_median < args.min_zig_residual_layernorm_region_median
+        residual_ln_median is None
+        or residual_ln_median < args.min_zig_residual_layernorm_region_median
     ):
         failures.append(
             f"Zig residual+LayerNorm region median {residual_ln_median} below limit {args.min_zig_residual_layernorm_region_median}"
         )
-    lora_backward_median = metrics["zig_metal_lora_backward_total_regions_avg"]["median"]
+    lora_backward_median = metrics["zig_metal_lora_backward_total_regions_avg"][
+        "median"
+    ]
     if args.min_zig_lora_backward_region_median is not None and (
-        lora_backward_median is None or lora_backward_median < args.min_zig_lora_backward_region_median
+        lora_backward_median is None
+        or lora_backward_median < args.min_zig_lora_backward_region_median
     ):
         failures.append(
             f"Zig total LoRA-backward region median {lora_backward_median} below limit {args.min_zig_lora_backward_region_median}"
         )
-    low_rank_lora_backward_median = metrics["zig_metal_low_rank_lora_backward_regions_avg"]["median"]
+    low_rank_lora_backward_median = metrics[
+        "zig_metal_low_rank_lora_backward_regions_avg"
+    ]["median"]
     if args.min_zig_low_rank_lora_backward_region_median is not None and (
-        low_rank_lora_backward_median is None or low_rank_lora_backward_median < args.min_zig_low_rank_lora_backward_region_median
+        low_rank_lora_backward_median is None
+        or low_rank_lora_backward_median
+        < args.min_zig_low_rank_lora_backward_region_median
     ):
         failures.append(
             f"Zig low-rank LoRA-backward region median {low_rank_lora_backward_median} below limit {args.min_zig_low_rank_lora_backward_region_median}"
         )
-    rank_adapter_backward_median = metrics["zig_metal_rank_adapter_backward_regions_avg"]["median"]
+    rank_adapter_backward_median = metrics[
+        "zig_metal_rank_adapter_backward_regions_avg"
+    ]["median"]
     if args.min_zig_rank_adapter_backward_region_median is not None and (
-        rank_adapter_backward_median is None or rank_adapter_backward_median < args.min_zig_rank_adapter_backward_region_median
+        rank_adapter_backward_median is None
+        or rank_adapter_backward_median
+        < args.min_zig_rank_adapter_backward_region_median
     ):
         failures.append(
             f"Zig rank-adapter-backward region median {rank_adapter_backward_median} below limit {args.min_zig_rank_adapter_backward_region_median}"
         )
-    ffn_gelu_backward_median = metrics["zig_metal_ffn_gelu_backward_regions_avg"]["median"]
+    ffn_gelu_backward_median = metrics["zig_metal_ffn_gelu_backward_regions_avg"][
+        "median"
+    ]
     if args.min_zig_ffn_gelu_backward_region_median is not None and (
-        ffn_gelu_backward_median is None or ffn_gelu_backward_median < args.min_zig_ffn_gelu_backward_region_median
+        ffn_gelu_backward_median is None
+        or ffn_gelu_backward_median < args.min_zig_ffn_gelu_backward_region_median
     ):
         failures.append(
             f"Zig FFN GELU-backward region median {ffn_gelu_backward_median} below limit {args.min_zig_ffn_gelu_backward_region_median}"
         )
-    head_mlp_forward_median = metrics["zig_metal_head_mlp_forward_regions_avg"]["median"]
+    head_mlp_forward_median = metrics["zig_metal_head_mlp_forward_regions_avg"][
+        "median"
+    ]
     if args.min_zig_head_mlp_forward_region_median is not None and (
-        head_mlp_forward_median is None or head_mlp_forward_median < args.min_zig_head_mlp_forward_region_median
+        head_mlp_forward_median is None
+        or head_mlp_forward_median < args.min_zig_head_mlp_forward_region_median
     ):
         failures.append(
             f"Zig head-MLP forward region median {head_mlp_forward_median} below limit {args.min_zig_head_mlp_forward_region_median}"
         )
-    head_mlp_backward_median = metrics["zig_metal_head_mlp_backward_regions_avg"]["median"]
+    head_mlp_backward_median = metrics["zig_metal_head_mlp_backward_regions_avg"][
+        "median"
+    ]
     if args.min_zig_head_mlp_backward_region_median is not None and (
-        head_mlp_backward_median is None or head_mlp_backward_median < args.min_zig_head_mlp_backward_region_median
+        head_mlp_backward_median is None
+        or head_mlp_backward_median < args.min_zig_head_mlp_backward_region_median
     ):
         failures.append(
             f"Zig head-MLP backward region median {head_mlp_backward_median} below limit {args.min_zig_head_mlp_backward_region_median}"
@@ -780,7 +1025,9 @@ def main() -> int:
     summary["failures"] = failures
     summary["warnings"] = warnings
     out_path = args.out_dir / "perf_summary.json"
-    out_path.write_text(json.dumps({"summary": summary, "runs": runs}, indent=2), encoding="utf-8")
+    out_path.write_text(
+        json.dumps({"summary": summary, "runs": runs}, indent=2), encoding="utf-8"
+    )
     print(f"perf summary: {out_path}")
     print(json.dumps(summary, indent=2))
     return 0 if summary["pass"] or args.allow_failures else 1

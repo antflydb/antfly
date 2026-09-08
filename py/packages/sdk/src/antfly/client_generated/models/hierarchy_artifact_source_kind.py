@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class HierarchyArtifactSourceKind(str, Enum):
+class HierarchyArtifactSourceKind(StrEnum):
     ASSET = "asset"
     CHUNK = "chunk"
     EMBEDDING = "embedding"

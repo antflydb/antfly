@@ -267,11 +267,26 @@ pub const ProgressState = enum {
     replicate,
 };
 
+/// Immutable identity of the snapshot transfer currently owning a peer's
+/// probe. The generation is local-only: snapshot bytes travel on the dedicated
+/// transport, so this fence does not alter the replicated Raft wire format.
+pub const SnapshotAttempt = struct {
+    leader_term: Term,
+    snapshot_index: Index,
+    snapshot_term: Term,
+    generation: u64,
+    /// Transport delivery and Raft application acknowledgment are distinct.
+    /// Only a delivered attempt ages toward the bounded acknowledgment retry.
+    delivery_confirmed: bool = false,
+    acknowledgment_elapsed_ticks: u32 = 0,
+};
+
 pub const Progress = struct {
     match_index: Index = 0,
     next_index: Index = 1,
     state: ProgressState = .probe,
     probe_sent: bool = false,
+    pending_snapshot_attempt: ?SnapshotAttempt = null,
     recent_active: bool = false,
 };
 
@@ -337,23 +352,212 @@ pub const SnapshotMetadata = struct {
     }
 };
 
+/// Called exactly once when the final shared reference to snapshot data is
+/// released. This lets an ingress layer keep byte admission charged for the
+/// complete Raft persistence/apply lifetime instead of only while a message is
+/// waiting in its first queue.
+pub const SnapshotDataRelease = struct {
+    ptr: *anyopaque,
+    release: *const fn (ptr: *anyopaque, bytes: usize) void,
+};
+
+/// Releases externally owned immutable bytes such as a read-only file map.
+/// Resource ownership is separate from the optional byte-admission callback.
+pub const SnapshotDataOwner = struct {
+    ptr: *anyopaque,
+    release: *const fn (ptr: *anyopaque) void,
+};
+
+const SharedSnapshotData = struct {
+    alloc: Allocator,
+    bytes: []u8,
+    references: std.atomic.Value(usize) = .init(1),
+    external_owner: ?SnapshotDataOwner = null,
+    on_release: ?SnapshotDataRelease = null,
+
+    fn retain(self: *SharedSnapshotData) void {
+        const previous = self.references.fetchAdd(1, .monotonic);
+        if (previous == std.math.maxInt(usize)) @panic("snapshot data reference count overflow");
+    }
+
+    fn release(self: *SharedSnapshotData) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        const alloc = self.alloc;
+        const bytes = self.bytes;
+        const byte_len = bytes.len;
+        const external_owner = self.external_owner;
+        const on_release = self.on_release;
+        if (external_owner) |owner|
+            owner.release(owner.ptr)
+        else if (bytes.len > 0)
+            alloc.free(bytes);
+        alloc.destroy(self);
+        if (on_release) |hook| hook.release(hook.ptr, byte_len);
+    }
+
+    fn attachRelease(self: *SharedSnapshotData, on_release: ?SnapshotDataRelease) !void {
+        const hook = on_release orelse return;
+        if (self.on_release != null) return error.SnapshotDataReleaseAlreadyAttached;
+        self.on_release = hook;
+    }
+};
+
 pub const Snapshot = struct {
     metadata: SnapshotMetadata = .{},
     data: []u8 = &.{},
+    shared_data: ?*SharedSnapshotData = null,
+
+    /// Converts an allocator-owned payload into immutable reference-counted
+    /// storage. Cloning the snapshot after this call only clones its small
+    /// metadata; all stages share the same payload and the optional admission
+    /// lease remains live until the last stage releases it.
+    pub fn shareOwnedData(
+        self: *Snapshot,
+        alloc: Allocator,
+        on_release: ?SnapshotDataRelease,
+    ) !void {
+        if (self.shared_data) |shared| return shared.attachRelease(on_release);
+        if (self.data.len == 0) {
+            if (on_release) |hook| hook.release(hook.ptr, 0);
+            return;
+        }
+        const shared = try alloc.create(SharedSnapshotData);
+        shared.* = .{
+            .alloc = alloc,
+            .bytes = self.data,
+            .on_release = on_release,
+        };
+        self.shared_data = shared;
+    }
+
+    /// Transfers external byte ownership into the shared snapshot lifetime.
+    /// If this returns an error, ownership remains with the caller.
+    pub fn shareExternalData(
+        self: *Snapshot,
+        alloc: Allocator,
+        owner: SnapshotDataOwner,
+        on_release: ?SnapshotDataRelease,
+    ) !void {
+        if (self.shared_data != null) return error.SnapshotDataAlreadyShared;
+        if (self.data.len == 0) {
+            owner.release(owner.ptr);
+            if (on_release) |hook| hook.release(hook.ptr, 0);
+            return;
+        }
+        const shared = try alloc.create(SharedSnapshotData);
+        shared.* = .{
+            .alloc = alloc,
+            .bytes = self.data,
+            .external_owner = owner,
+            .on_release = on_release,
+        };
+        self.shared_data = shared;
+    }
 
     pub fn clone(self: Snapshot, alloc: Allocator) !Snapshot {
+        var metadata = try self.metadata.clone(alloc);
+        errdefer metadata.deinit(alloc);
+        if (self.shared_data) |shared| {
+            shared.retain();
+            return .{
+                .metadata = metadata,
+                .data = self.data,
+                .shared_data = shared,
+            };
+        }
         return .{
-            .metadata = try self.metadata.clone(alloc),
+            .metadata = metadata,
+            .data = try alloc.dupe(u8, self.data),
+        };
+    }
+
+    /// Creates an independent payload allocation. Long-lived in-memory storage
+    /// uses this when it intentionally retains snapshot bytes beyond the
+    /// ingress/apply lifetime represented by shared_data.
+    pub fn cloneDetached(self: Snapshot, alloc: Allocator) !Snapshot {
+        var metadata = try self.metadata.clone(alloc);
+        errdefer metadata.deinit(alloc);
+        return .{
+            .metadata = metadata,
             .data = try alloc.dupe(u8, self.data),
         };
     }
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         self.metadata.deinit(alloc);
-        if (self.data.len > 0) alloc.free(self.data);
+        if (self.shared_data) |shared|
+            shared.release()
+        else if (self.data.len > 0)
+            alloc.free(self.data);
         self.* = undefined;
     }
 };
+
+test "shared snapshot payload clones without copying and releases once" {
+    const ReleaseTracker = struct {
+        calls: usize = 0,
+        bytes: usize = 0,
+
+        fn release(ptr: *anyopaque, bytes: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.bytes += bytes;
+        }
+    };
+
+    var tracker: ReleaseTracker = .{};
+    var snapshot: Snapshot = .{
+        .data = try std.testing.allocator.dupe(u8, "shared-snapshot-payload"),
+    };
+    try snapshot.shareOwnedData(std.testing.allocator, .{
+        .ptr = &tracker,
+        .release = ReleaseTracker.release,
+    });
+    var clone = try snapshot.clone(std.testing.allocator);
+    try std.testing.expectEqual(snapshot.data.ptr, clone.data.ptr);
+
+    snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tracker.calls);
+    clone.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), tracker.calls);
+    try std.testing.expectEqual("shared-snapshot-payload".len, tracker.bytes);
+}
+
+test "external snapshot payload composes owner and admission release" {
+    const Tracker = struct {
+        owner_calls: usize = 0,
+        admission_calls: usize = 0,
+
+        fn releaseOwner(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.owner_calls += 1;
+        }
+
+        fn releaseAdmission(ptr: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.admission_calls += 1;
+        }
+    };
+    var tracker: Tracker = .{};
+    var backing = [_]u8{ 1, 2, 3 };
+    var snapshot: Snapshot = .{ .data = backing[0..] };
+    try snapshot.shareExternalData(std.testing.allocator, .{
+        .ptr = &tracker,
+        .release = Tracker.releaseOwner,
+    }, null);
+    try snapshot.shareOwnedData(std.testing.allocator, .{
+        .ptr = &tracker,
+        .release = Tracker.releaseAdmission,
+    });
+    var cloned = try snapshot.clone(std.testing.allocator);
+    snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tracker.owner_calls);
+    cloned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), tracker.owner_calls);
+    try std.testing.expectEqual(@as(usize, 1), tracker.admission_calls);
+}
 
 pub const Status = struct {
     id: NodeId,

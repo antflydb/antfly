@@ -32,6 +32,7 @@ pub fn configureModule(
     bloom_mod: *std.Build.Module,
     vector_mod: *std.Build.Module,
     vectorindex_mod: *std.Build.Module,
+    hash_mod: *std.Build.Module,
     vellum_mod: *std.Build.Module,
     regex_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
@@ -55,6 +56,7 @@ pub fn configureModule(
     mod.addImport("bloom", bloom_mod);
     mod.addImport("antfly_vector", vector_mod);
     mod.addImport("antfly_vectorindex", vectorindex_mod);
+    mod.addImport("antfly_hash", hash_mod);
     mod.addImport("antfly_vellum", vellum_mod);
     mod.addImport("antfly_regex", regex_mod);
     mod.addImport("antfly_image", image_mod);

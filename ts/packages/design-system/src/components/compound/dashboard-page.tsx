@@ -38,7 +38,10 @@ function DashboardPageDescription({ className, ...props }: React.ComponentProps<
   return (
     <p
       data-slot="dashboard-page-description"
-      className={cn("max-w-2xl text-sm leading-relaxed text-muted-foreground md:text-base", className)}
+      className={cn(
+        "max-w-2xl text-sm leading-relaxed text-muted-foreground md:text-base",
+        className
+      )}
       {...props}
     />
   );

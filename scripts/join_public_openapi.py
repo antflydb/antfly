@@ -125,21 +125,27 @@ def walk_refs(value: object, rename_schema) -> object:
         for key, child in value.items():
             if key == "$ref" and isinstance(child, str):
                 prefix = "#/components/schemas/"
-                shared_generating_prefix = "../shared/generating.yaml#/components/schemas/"
+                shared_generating_prefix = (
+                    "../shared/generating.yaml#/components/schemas/"
+                )
                 ai_extraction_prefix = "../ai/extraction.yaml#/components/schemas/"
                 if child.startswith(prefix):
                     out[key] = prefix + rename_schema(child[len(prefix) :])
                 elif child.startswith(shared_generating_prefix):
                     out[key] = prefix + child[len(shared_generating_prefix) :]
                 elif child.startswith(ai_extraction_prefix):
-                    out[key] = "specs/openapi/ai/extraction.yaml#/components/schemas/" + child[len(ai_extraction_prefix) :]
+                    out[key] = (
+                        "specs/openapi/ai/extraction.yaml#/components/schemas/"
+                        + child[len(ai_extraction_prefix) :]
+                    )
                 else:
                     out[key] = child
                 continue
             if key == "mapping" and isinstance(child, dict):
                 out[key] = {
                     mapping_key: (
-                        "#/components/schemas/" + rename_schema(mapping_value.rsplit("/", 1)[-1])
+                        "#/components/schemas/"
+                        + rename_schema(mapping_value.rsplit("/", 1)[-1])
                         if isinstance(mapping_value, str)
                         and mapping_value.startswith("#/components/schemas/")
                         else walk_refs(mapping_value, rename_schema)
@@ -195,9 +201,7 @@ def referenced_inference_schema_names(inference: dict) -> set[str]:
     # paths. A schema referenced only through a reusable response must still be
     # copied into the joined contract before refs are namespaced.
     component_roots = {
-        name: value
-        for name, value in components.items()
-        if name != "schemas"
+        name: value for name, value in components.items() if name != "schemas"
     }
     seen: set[str] = set()
     pending = list(
@@ -221,7 +225,9 @@ def referenced_inference_schema_names(inference: dict) -> set[str]:
     return seen
 
 
-def merge_components(antfly: dict, inference: dict, inference_schema_names: set[str]) -> dict:
+def merge_components(
+    antfly: dict, inference: dict, inference_schema_names: set[str]
+) -> dict:
     merged = copy.deepcopy(antfly.get("components", {}))
     inference_components = copy.deepcopy(inference.get("components", {}))
 
@@ -270,7 +276,9 @@ def join_specs() -> dict:
 
     tags = []
     seen_tags = set()
-    for item in antfly.get("tags", []) + inference.get("tags", []) + extensions.get("tags", []):
+    for item in (
+        antfly.get("tags", []) + inference.get("tags", []) + extensions.get("tags", [])
+    ):
         name = item.get("name") if isinstance(item, dict) else None
         if not name or name in seen_tags:
             continue
@@ -336,7 +344,9 @@ def join_specs() -> dict:
 
 def dump_yaml(data: dict, output: Path) -> None:
     with output.open("w", encoding="utf-8") as fh:
-        yaml.dump(data, fh, Dumper=Dumper, sort_keys=False, allow_unicode=True, width=100)
+        yaml.dump(
+            data, fh, Dumper=Dumper, sort_keys=False, allow_unicode=True, width=100
+        )
 
 
 def main(argv: list[str]) -> int:

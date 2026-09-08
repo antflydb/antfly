@@ -21,4 +21,3 @@ pub fn io() std.Io {
 pub fn cwd() std.Io.Dir {
     return std.Io.Dir.cwd();
 }
-

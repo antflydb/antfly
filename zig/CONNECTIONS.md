@@ -354,11 +354,16 @@ refresh in place, while rotating static primary keys requires a controlled
 restart. Connection capabilities and bucket/prefix scopes remain config-owned
 authorization and are never sourced from the secret store.
 
-Live probes use bounded fanout on the server's shared `std.Io` runtime. S3,
-GCS, and credential-refresh transports borrow that runtime rather than creating
-one threaded scheduler per connection. This keeps probe cost proportional to
-active network work and the configured worker bound, even when many buckets and
-credential domains are registered.
+Live probes use bounded fanout on the server's shared `std.Io` runtime.
+Backup, restore, and probe clients receive separate network and filesystem
+authorities: S3/GCS requests and credential refresh borrow `apiNetworkIo()`,
+while local repository paths, filesystem probes, Google credential files, and
+AWS profile/web-identity/container token files use `apiFilesystemIo()`.
+Remote clients retain their network authority at construction; choosing an I/O
+runtime later cannot replace that captured transport. Embedded callers that
+omit an authority use an owned fallback. This keeps server probe cost
+proportional to active network work and the configured worker bound, even when
+many buckets and credential domains are registered.
 
 ### CDC
 

@@ -23,7 +23,9 @@ from typing import List, Optional, Tuple
 
 def _archive_entries(source: Path) -> List[Tuple[Path, os.stat_result]]:
     entries: List[Tuple[Path, os.stat_result]] = []
-    for path in sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix()):
+    for path in sorted(
+        source.rglob("*"), key=lambda item: item.relative_to(source).as_posix()
+    ):
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode):
             raise ValueError(f"archive source contains a symlink: {path}")
@@ -74,8 +76,12 @@ def create_archive(source: Path, output: Path, mtime: int) -> None:
             delete=False,
         ) as raw:
             temporary_path = Path(raw.name)
-            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0) as compressed:
-                with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+            with gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0
+            ) as compressed:
+                with tarfile.open(
+                    fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT
+                ) as archive:
                     root_metadata = source.lstat()
                     archive.addfile(_tar_info(".", root_metadata, mtime))
                     for path, metadata in entries:

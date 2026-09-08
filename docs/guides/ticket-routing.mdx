@@ -16,7 +16,7 @@ order: 4
 Every ticket written to your Postgres `tickets` table arrives in Antfly on its own, and one call returns the team that should own it, chosen from the resolved tickets that look most like it. Postgres stays the system of record throughout, with no migration and no export job:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/agents/retrieval \
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -d '{
     "query": "Checkout fails with a 502 after entering card details",
@@ -29,8 +29,9 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
       "limit": 20,
       "reranker": {
         "provider": "antfly",
-        "model": "mixedbread-ai/mxbai-rerank-base-v1",
-        "field": "body"
+        "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+        "field": "body",
+        "candidate_count": 50
       },
       "pruner": {"min_score_ratio": 0.6}
     }],
@@ -74,7 +75,7 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
 Antfly running, a Postgres with `wal_level = logical`, and its connection string stored as a secret:
 
 ```bash
-curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
+curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
   -u admin:admin \
   -H "Content-Type: application/json" \
   -d '{"value": "postgres://antfly:secret@db.internal:5432/support?sslmode=require"}'
@@ -87,7 +88,7 @@ curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
 Antfly has built-in change data capture. A `replication_sources` block on the table subscribes it to Postgres logical replication, and a semantic index in the same call makes every ticket retrievable the moment it lands:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/tickets \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/tickets \
   -u admin:admin \
   -H "Content-Type: application/json" \
   -d '{
@@ -105,7 +106,7 @@ curl -X POST http://localhost:8080/db/v1/tables/tickets \
         "template": "{{subject}} {{body}}",
         "embedder": {
           "provider": "antfly",
-          "model": "BAAI/bge-small-en-v1.5"
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
         }
       }
     }
@@ -125,7 +126,7 @@ Cloud SQL, Supabase, Neon, RDS, and self-hosted Postgres each need a small amoun
 When a new ticket arrives, find its nearest neighbors among tickets that already have an outcome:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "tickets",
@@ -136,8 +137,9 @@ curl -X POST http://localhost:8080/db/v1/query \
     "limit": 20,
     "reranker": {
       "provider": "antfly",
-      "model": "mixedbread-ai/mxbai-rerank-base-v1",
-      "field": "body"
+      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+      "field": "body",
+      "candidate_count": 50
     },
     "pruner": {"min_score_ratio": 0.6}
   }'

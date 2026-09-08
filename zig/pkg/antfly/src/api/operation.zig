@@ -77,6 +77,10 @@ pub const RequestContext = struct {
     /// Credential identity that authorized durable background destinations.
     /// Workers re-resolve this principal against the live user/key store.
     destination_authorization_principal: []const u8 = "",
+    /// Borrowed, authenticated internal route capability. HTTP adapters keep
+    /// the encoded form borrowed and transport-neutral operations decode it
+    /// only when a group-local read is actually dispatched.
+    catalog_route_fence_json: []const u8 = "",
 
     pub fn ensureActive(self: RequestContext) ApiError!void {
         if (self.cancellation.isCancelled()) return error.Canceled;

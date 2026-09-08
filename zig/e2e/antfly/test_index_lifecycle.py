@@ -17,14 +17,16 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import struct
+import threading
 import time
 from urllib.parse import quote
+
 import pytest
 import requests
-
-from conftest import ready_index_status
+from conftest import IndexReadinessProtocolError, ready_index_status
 from helpers import assert_created_index, json_doc, upsert, wait_until
 
 pytestmark = pytest.mark.reuse_antfly_process
@@ -162,14 +164,21 @@ def _pack_f32_le(values: list[float]) -> str:
 
 
 def _ready_index(
-    stateful_api, table_name: str, index_name: str, *, expected_docs: int
+    stateful_api,
+    table_name: str,
+    index_name: str,
+    *,
+    expected_docs: int,
+    not_incarnation: str | None = None,
 ) -> dict | None:
     try:
         index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
         return None
-    stats = ready_index_status(index_info, require_query_fresh=True)
+    stats = ready_index_status(index_info, until="complete", require_query_fresh=True)
     if stats is None:
+        return None
+    if not_incarnation is not None and stats.get("incarnation") == not_incarnation:
         return None
     total_indexed = stats.get("total_indexed", stats.get("doc_count", 0))
     if total_indexed < expected_docs:
@@ -184,7 +193,7 @@ def _ready_algebraic_index(
         index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
         return None
-    return ready_index_status(index_info, require_query_fresh=True)
+    return ready_index_status(index_info, until="complete", require_query_fresh=True)
 
 
 def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
@@ -203,40 +212,159 @@ def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
     return responses[0].get("aggregations", {})
 
 
-def test_ready_index_status_requires_current_coverage_observation():
+def test_ready_index_status_uses_current_milestones_and_v020_fallback():
     ready_status = {
         "status": {
             "rebuilding": False,
             "dense_publish_pending": False,
             "replay_catch_up_required": False,
             "catch_up_active": False,
+            "readiness": {
+                "state": "queryable_partial",
+                "queryable": True,
+                "complete": False,
+                "pending_reasons": ["coverage"],
+            },
+            "milestones": {
+                "queryable": {"reached": True, "blockers": []},
+                "complete": {"reached": False, "blockers": ["source_coverage"]},
+            },
             "coverage": {
                 "observation_complete": True,
                 "config_mismatch_group_count": 0,
             },
         }
     }
-    assert ready_index_status(ready_status) is ready_status["status"]
+    # Current queryability remains authoritative while later work is active.
+    ready_status["status"]["rebuilding"] = True
+    ready_status["status"]["dense_publish_pending"] = True
+    ready_status["status"]["replay_catch_up_required"] = True
+    ready_status["status"]["catch_up_active"] = True
+    assert ready_index_status(ready_status, until="queryable") is ready_status["status"]
+    assert ready_index_status(ready_status, until="complete") is None
 
-    stale_incarnation = json.loads(json.dumps(ready_status))
+    serviceable_repair = json.loads(json.dumps(ready_status))
+    serviceable_repair["status"]["repair"] = {
+        "state": "rebuilding",
+        "action_required": False,
+        "blocks_queryable": False,
+        "blocks_complete": True,
+    }
+    assert (
+        ready_index_status(serviceable_repair, until="queryable")
+        is serviceable_repair["status"]
+    )
+
+    failed_current = json.loads(json.dumps(ready_status))
+    failed_current["status"]["readiness"]["state"] = "failed"
+    assert ready_index_status(failed_current, until="queryable") is None
+
+    complete_status = json.loads(json.dumps(ready_status))
+    complete_status["status"]["rebuilding"] = False
+    complete_status["status"]["dense_publish_pending"] = False
+    complete_status["status"]["replay_catch_up_required"] = False
+    complete_status["status"]["catch_up_active"] = False
+    complete_status["status"]["readiness"]["state"] = "ready"
+    complete_status["status"]["readiness"]["complete"] = True
+    complete_status["status"]["milestones"]["complete"] = {
+        "reached": True,
+        "blockers": [],
+    }
+    assert (
+        ready_index_status(complete_status, until="complete")
+        is complete_status["status"]
+    )
+
+    canonical_without_receipt = json.loads(json.dumps(complete_status))
+    assert (
+        ready_index_status(canonical_without_receipt, until="complete")
+        is canonical_without_receipt["status"]
+    )
+
+    canonical_with_receipt = json.loads(json.dumps(complete_status))
+    canonical_with_receipt["status"]["readiness"].update(
+        incarnation="g-0000000000000001",
+        published_revision=12,
+        target_revision=12,
+        pending_reasons=[],
+    )
+    assert (
+        ready_index_status(canonical_with_receipt, until="complete")
+        is canonical_with_receipt["status"]
+    )
+
+    stale_receipt = json.loads(json.dumps(canonical_with_receipt))
+    stale_receipt["status"]["readiness"]["published_revision"] = 11
+    assert ready_index_status(stale_receipt, until="complete") is None
+
+    for malformed in (None, "ready", [], True):
+        invalid = json.loads(json.dumps(complete_status))
+        invalid["status"]["readiness"] = malformed
+        with pytest.raises(IndexReadinessProtocolError, match="status.readiness"):
+            ready_index_status(invalid, until="complete")
+
+    for field, value in (
+        ("state", "future_state"),
+        ("queryable", 1),
+        ("complete", None),
+        ("pending_reasons", "none"),
+        ("published_revision", True),
+        ("target_revision", "12"),
+    ):
+        invalid = json.loads(json.dumps(canonical_with_receipt))
+        invalid["status"]["readiness"][field] = value
+        with pytest.raises(IndexReadinessProtocolError, match=field):
+            ready_index_status(invalid, until="complete")
+
+    for missing_field in ("published_revision", "target_revision"):
+        invalid = json.loads(json.dumps(canonical_with_receipt))
+        invalid["status"]["readiness"].pop(missing_field)
+        with pytest.raises(IndexReadinessProtocolError, match="provided together"):
+            ready_index_status(invalid, until="complete")
+
+    legacy_ready = json.loads(json.dumps(complete_status))
+    del legacy_ready["status"]["milestones"]
+    assert ready_index_status(legacy_ready, until="complete") is legacy_ready["status"]
+    assert ready_index_status(legacy_ready, until="queryable") is legacy_ready["status"]
+    v020_ready = json.loads(json.dumps(legacy_ready))
+    del v020_ready["status"]["readiness"]
+    v020_ready["status"]["backfill_state"] = "ready"
+    assert ready_index_status(v020_ready, until="complete") is v020_ready["status"]
+    assert ready_index_status(v020_ready, until="queryable") is v020_ready["status"]
+    legacy_not_queryable = json.loads(json.dumps(legacy_ready))
+    legacy_not_queryable["status"]["readiness"]["queryable"] = False
+    assert ready_index_status(legacy_not_queryable, until="queryable") is None
+
+    stale_incarnation = json.loads(json.dumps(legacy_ready))
     stale_incarnation["status"]["coverage"]["observation_complete"] = False
     stale_incarnation["status"]["coverage"]["config_mismatch_group_count"] = 1
-    assert ready_index_status(stale_incarnation) is None
+    assert ready_index_status(stale_incarnation, until="complete") is None
 
-    rebuilding = json.loads(json.dumps(ready_status))
+    rebuilding = json.loads(json.dumps(legacy_ready))
     rebuilding["status"]["repair"] = {"state": "rebuilding", "action_required": False}
-    assert ready_index_status(rebuilding) is None
+    assert ready_index_status(rebuilding, until="complete") is None
+
+    for backfill_state in ("running", "retrying", "degraded", "failed"):
+        incomplete = json.loads(json.dumps(legacy_ready))
+        incomplete["status"]["backfill_state"] = backfill_state
+        assert ready_index_status(incomplete, until="complete") is None
+
+    complete = json.loads(json.dumps(legacy_ready))
+    complete["status"]["backfill_state"] = "ready"
+    assert ready_index_status(complete, until="complete") is complete["status"]
 
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
         ("backfill_state", "failed"),
+        ("backfill_state", "running"),
+        ("backfill_state", "retrying"),
         ("repair_degraded", True),
         ("repair_summary_ready", False),
         ("repair_issue_count", 1),
     ):
-        terminal = json.loads(json.dumps(ready_status))
+        terminal = json.loads(json.dumps(legacy_ready))
         terminal["status"][field] = value
-        assert ready_index_status(terminal) is None
+        assert ready_index_status(terminal, until="complete") is None
 
 
 def _retrying_partial_index(
@@ -416,10 +544,14 @@ def test_stateful_managed_algebraic_generation_rebuild_catches_up_and_reopens(
         timeout_s=60.0,
         interval_s=0.25,
     )
-    assert ready is not None, json.dumps(
-        stateful_api.get_index(table_name, index_name),
-        indent=2,
-        sort_keys=True,
+    assert ready is not None, (
+        json.dumps(
+            stateful_api.get_index(table_name, index_name),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\nserver logs:\n"
+        + stateful_api.debug_logs()
     )
     aggregations = _algebraic_aggregations(stateful_api, table_name)
     assert aggregations["amount_sum"]["value"] == 15
@@ -538,7 +670,7 @@ def test_stateful_table_registers_public_artifact_enrichment_for_default_full_te
         stateful_api.delete(
             f"/tables/{table_name}/artifacts/document_units_v1/enrichment"
         )
-    assert exc_info.value.response.status_code == 400
+    assert exc_info.value.response.status_code == 409
 
     decoded_name = "document chunks v2"
     assert (
@@ -748,6 +880,124 @@ def test_stateful_external_embeddings_index_detail_supports_packed_ingest_and_qu
     hits = result["responses"][0]["hits"]["hits"]
     assert hits[0]["_id"] == "doc:a"
 
+    # Serving counts are monotonic only without reducing source mutations.
+    # Poll during async deletion, then require exact lower counts and matching
+    # query results in the same incarnation, including the valid empty index.
+    incarnation = ready["incarnation"]
+    for deleted, remaining in ((["doc:a", "doc:b"], {"doc:c"}), (["doc:c"], set())):
+        stateful_api.batch_write(table_name, deletes=deleted, sync_level="write")
+        latest = {}
+
+        def deletion_published():
+            nonlocal latest
+            latest = stateful_api.get_index(table_name, index_name)
+            status = ready_index_status(
+                latest, until="complete", require_query_fresh=True
+            )
+            if status is None or status.get("searchable_vectors") != len(remaining):
+                return None
+            assert status["incarnation"] == incarnation
+            return status
+
+        assert wait_until(deletion_published, timeout_s=30.0, interval_s=0.05), (
+            json.dumps(latest, indent=2, sort_keys=True)
+        )
+        after_delete = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: _pack_f32_le([1.0, 0.0, 0.0])},
+                "indexes": [index_name],
+                "limit": 3,
+            },
+        )
+        assert {
+            hit["_id"] for hit in after_delete["responses"][0]["hits"]["hits"]
+        } == remaining
+
+
+def test_concurrent_insert_delete_publications_match_search_results(stateful_api):
+    """Status must report reductions, not the maximum count ever observed."""
+    table = f"publication_ordering_{time.time_ns()}"
+    dense = "semantic"
+    text = "full_text_index_v0"
+    stateful_api.create_table(table, num_shards=1)
+    stateful_api.create_index(
+        table, dense, {"type": "embeddings", "external": True, "dimension": 3}
+    )
+    packed = _pack_f32_le([1.0, 0.0, 0.0])
+
+    def document():
+        return {"body": "publication regression", "_embeddings": {dense: packed}}
+
+    expected = {f"initial:{i}" for i in range(12)}
+    stateful_api.batch_write(
+        table, inserts={key: document() for key in expected}, sync_level="write"
+    )
+    incarnations = {}
+
+    def exact_publication():
+        statuses = {}
+        for name in (dense, text):
+            before = time.monotonic()
+            detail = stateful_api.get_index(table, name)
+            assert time.monotonic() - before < 5.0, detail
+            status = ready_index_status(
+                detail, until="complete", require_query_fresh=True
+            )
+            if status is None:
+                return None
+            if name in incarnations:
+                assert status["incarnation"] == incarnations[name]
+            count = status.get("total_indexed", status.get("doc_count"))
+            if count != len(expected):
+                return None
+            statuses[name] = status
+        return statuses
+
+    initial = wait_until(exact_publication, timeout_s=30, interval_s=0.05)
+    assert initial is not None
+    incarnations = {name: status["incarnation"] for name, status in initial.items()}
+    for iteration in range(3):
+        deleted = sorted(expected)[:3]
+        added = f"added:{iteration}"
+        barrier = threading.Barrier(2)
+
+        def commit(payload):
+            # Independent HTTP connections: the shared fixture intentionally
+            # serializes its Session and would hide concurrent commit delivery.
+            barrier.wait(timeout=10)
+            response = requests.post(
+                f"{stateful_api.url}/tables/{table}/batch",
+                json={**payload, "sync_level": "write"},
+                timeout=30,
+            )
+            assert response.ok, response.text
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writes = [
+                pool.submit(commit, {"deletes": deleted}),
+                pool.submit(commit, {"inserts": {added: document()}}),
+            ]
+            for write in writes:
+                write.result(timeout=35)
+        expected.difference_update(deleted)
+        expected.add(added)
+        assert wait_until(exact_publication, timeout_s=30, interval_s=0.05), {
+            name: stateful_api.get_index(table, name) for name in (dense, text)
+        }
+        for payload in (
+            {"indexes": [dense], "embeddings": {dense: packed}, "limit": 100},
+            {
+                "indexes": [text],
+                "full_text_search": {"field": "body", "match": "publication"},
+                "limit": 100,
+            },
+        ):
+            assert (
+                set(_response_hit_ids(stateful_api.query_table(table, payload)))
+                == expected
+            )
+
 
 def test_stateful_back_to_back_external_embedding_indexes_admit_immediate_batch(
     stateful_api,
@@ -889,12 +1139,14 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
         indexed = int(
             latest_status.get("total_indexed", latest_status.get("doc_count", 0))
         )
+        source_coverage = latest_status.get("source_coverage") or {}
         if (
             indexed < 6
             or applied < target
             or latest_status.get("replay_catch_up_required") is not False
             or latest_status.get("catch_up_active") is not False
             or latest_status.get("catch_up_phase") != "idle"
+            or source_coverage.get("observation_complete") is not True
         ):
             return None
         return latest_status
@@ -905,17 +1157,17 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     # The default strict policy reports the three field-less documents as
     # settled but uncovered. It must not rewrite the authoritative replay
     # ledger into fake pending work or imply that a worker is still active.
-    coverage = converged["coverage"]
-    assert coverage["policy"] == "strict"
-    assert coverage["complete"] is False
-    assert coverage["source_total"] == 9
-    assert coverage["produced"] == 6
-    assert coverage["skipped"] == 3
-    assert coverage["settled"] == 9
-    assert coverage["uncovered"] == 3
-    assert coverage["pending"] == 0
-    assert coverage["healthy"] is False
-    assert coverage["degraded"] is True
+    source_coverage = converged["source_coverage"]
+    assert source_coverage["policy"] == "strict"
+    assert source_coverage["observation_complete"] is True
+    assert source_coverage["complete"] is False
+    assert source_coverage["total"] == 9
+    assert source_coverage["covered"] == 6
+    assert source_coverage["skipped"] == 3
+    assert source_coverage["failed"] == 0
+    assert source_coverage["pending"] == 0
+    assert source_coverage["healthy"] is False
+    assert source_coverage["degraded"] is True
     assert converged["backfill_active"] is False
     assert converged["rebuilding"] is False
     assert converged["backfill_progress"] == pytest.approx(1.0)
@@ -950,7 +1202,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
         index_name,
         "embeddings",
     )
-    assert wait_until(
+    initial = wait_until(
         # A metadata snapshot can expose the index config before the table's
         # shard topology and runtime observation arrive. Do not begin the
         # rate-limit scenario from that config-only response: it has an empty
@@ -959,6 +1211,8 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
         timeout_s=30.0,
         interval_s=0.5,
     )
+    assert initial is not None
+    initial_incarnation = initial["incarnation"]
 
     batch = stateful_api.batch_write(
         table_name,
@@ -995,6 +1249,19 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
 
     rate_limited_openai_embedder.allow_all_requests()
 
+    # Make the dangerous predecessor state deterministic: the deleted
+    # incarnation is fully complete and therefore attractive to a status
+    # waiter if a late same-name publication is allowed to cross the recreate
+    # fence. Recovery must prove the newly created incarnation explicitly.
+    assert (
+        wait_until(
+            lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=3),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        is not None
+    )
+
     assert stateful_api.delete_index(table_name, index_name) == {}
     assert (
         wait_until(
@@ -1012,7 +1279,13 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
     )
 
     recovered = wait_until(
-        lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=3),
+        lambda: _ready_index(
+            stateful_api,
+            table_name,
+            index_name,
+            expected_docs=3,
+            not_incarnation=initial_incarnation,
+        ),
         timeout_s=120.0,
         interval_s=0.5,
     )
@@ -1022,25 +1295,36 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_rate_limited
     }
     assert recovered is not None, json.dumps(recovery_debug, indent=2, sort_keys=True)
 
-    alpha_query = stateful_api.query_table(
-        table_name,
-        {
-            "semantic_search": "alpha concept",
-            "indexes": [index_name],
-            "limit": 3,
-        },
+    def semantic_query(query: str) -> dict:
+        return stateful_api.query_table(
+            table_name,
+            {
+                "semantic_search": query,
+                "indexes": [index_name],
+                "limit": 3,
+            },
+        )
+
+    # Runtime readiness and query-serving publication are adjacent but
+    # deliberately distinct snapshots. Honor the API's structured retryable
+    # 503 contract at this final boundary. The first successful response is
+    # still asserted immediately so polling cannot hide missing or misranked
+    # results.
+    alpha_query = wait_until(
+        lambda: semantic_query("alpha concept"),
+        timeout_s=30.0,
+        interval_s=0.25,
     )
+    assert alpha_query is not None
     alpha_hits = alpha_query["responses"][0]["hits"]["hits"]
     assert alpha_hits[0]["_id"] == "doc:a"
 
-    beta_query = stateful_api.query_table(
-        table_name,
-        {
-            "semantic_search": "beta architecture",
-            "indexes": [index_name],
-            "limit": 3,
-        },
+    beta_query = wait_until(
+        lambda: semantic_query("beta architecture"),
+        timeout_s=30.0,
+        interval_s=0.25,
     )
+    assert beta_query is not None
     beta_hits = beta_query["responses"][0]["hits"]["hits"]
     assert beta_hits[0]["_id"] == "doc:b"
 
@@ -1115,9 +1399,18 @@ def test_stateful_drop_tables_with_pending_enrichment_preserves_unrelated_owner(
                 hot_tables
             ):
                 return None
-            if not all(
-                int(detail.get("status", {}).get("coverage", {}).get("pending", 0)) > 0
+            # Coverage counters are nullable until the runtime has published
+            # convergence authority. Treat that transitional state as "keep
+            # waiting"; it is not a zero count and must not abort the poll.
+            pending_counts = [
+                detail.get("status", {}).get("coverage", {}).get("pending")
                 for detail in pending_statuses.values()
+            ]
+            if not all(
+                isinstance(pending, int)
+                and not isinstance(pending, bool)
+                and pending > 0
+                for pending in pending_counts
             ):
                 return None
             return {"embedder": stats, "indexes": pending_statuses.copy()}
@@ -1205,6 +1498,11 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
+    ), json.dumps(
+        {
+            "index": stateful_api.get_index(table_name, index_name),
+            "logs": stateful_api.debug_logs(),
+        }
     )
 
     batch = stateful_api.batch_write(
@@ -1464,7 +1762,7 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert enrichment["fatal_error_count"] == 0
     assert enrichment["worker_failed"] is False
 
-    assert ready_index_status({"status": partial}) is None
+    assert ready_index_status({"status": partial}, until="complete") is None
 
     rate_limited_openai_embedder.allow_all_requests()
 
@@ -1482,9 +1780,18 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert recovered["backfill_progress"] == 1.0
 
 
+@pytest.mark.parametrize(
+    "pacing_config",
+    [
+        {"requests_per_minute": 6000, "burst": 1},
+        {"rate_limit": {"requests_per_minute": 6000, "pacing": "completion"}},
+    ],
+    ids=["legacy", "completion"],
+)
 def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
     stateful_api,
     pacing_sensitive_openai_embedder,
+    pacing_config,
 ):
     table_name = f"stateful_paced_managed_embeddings_{time.time_ns()}"
     index_name = "semantic_idx"
@@ -1501,8 +1808,7 @@ def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
             "provider": "openai",
             "model": "text-embedding-3-small",
             "url": pacing_sensitive_openai_embedder.url,
-            "requests_per_minute": 6000,
-            "burst": 1,
+            **pacing_config,
         },
     }
 
@@ -1546,7 +1852,7 @@ def test_stateful_managed_embeddings_provider_pacing_avoids_rate_limit_bursts(
 
     stats = pacing_sensitive_openai_embedder.stats()
     assert stats["successful_requests"] >= 3
-    assert stats["rate_limited_requests"] == 0
+    assert stats["rate_limited_requests"] == 0, stats
 
 
 def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
@@ -1581,6 +1887,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
         assert wait_until(
             lambda table_name=table_name: ready_index_status(
                 stateful_api.get_index(table_name, index_name),
+                until="complete",
                 require_query_fresh=True,
             ),
             timeout_s=30.0,
@@ -1703,6 +2010,8 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     stateful_api,
     openai_embedder,
 ):
+    # Poll promptly so a transient false-ready publication reaches the query
+    # assertion before the background repair can hide the admission race.
     table_name = f"stateful_corrupt_managed_embeddings_{time.time_ns()}"
     index_name = "semantic_idx"
 
@@ -1729,7 +2038,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     assert wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
 
     batch = stateful_api.batch_write(
@@ -1751,7 +2060,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     ready = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=2),
         timeout_s=30.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
     assert ready is not None
 
@@ -1772,7 +2081,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
         wait_until(
             lambda: _index_missing(stateful_api, table_name, index_name),
             timeout_s=30.0,
-            interval_s=0.5,
+            interval_s=0.01,
         )
         is not None
     )
@@ -1786,7 +2095,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     recovered = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=2),
         timeout_s=60.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
     assert recovered is not None
 
@@ -2504,9 +2813,9 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     semantic_b = serverless_api.get_index(table_name, "semantic_b")
     sparse_a = serverless_api.get_index(table_name, "sparse_a")
     sparse_b = serverless_api.get_index(table_name, "sparse_b")
-    assert ready_index_status(semantic_b) is not None
-    assert ready_index_status(sparse_a) is not None
-    assert ready_index_status(sparse_b) is not None
+    assert ready_index_status(semantic_b, until="complete") is not None
+    assert ready_index_status(sparse_a, until="complete") is not None
+    assert ready_index_status(sparse_b, until="complete") is not None
 
 
 def test_serverless_same_name_dense_index_update_republishes_head(serverless_api):
@@ -2585,27 +2894,9 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
         == {}
     )
 
-    planned = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get(
-                    "head_republish_recommended"
-                )
-                is True
-                and current.get("next_publish_reason") == "head_republish"
-                and _named_action(current, "vector_index_actions", "semantic_idx")
-                == "rebuild"
-            )
-            else None
-        ),
-        timeout_s=30.0,
-        interval_s=0.5,
-    )
-    assert planned is not None
-    assert planned["artifact_actions"]["dense_vector"] == "rebuild"
-    assert planned["published_wal_end_lsn"] == first_published_wal_end
-
+    # Automatic publication can finish before the first status read. Its
+    # committed head records the rebuild action, so assert that durable
+    # receipt below instead of requiring the transient planned-work state.
     rebuilt = _serverless_build_or_wait_for_publish(
         serverless_api,
         table_name,
@@ -2634,7 +2925,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
 
     detail = serverless_api.get_index(table_name, "semantic_idx")
     assert detail["status"]["head_publication_action"] == "rebuild"
-    assert ready_index_status(detail) is not None
+    assert ready_index_status(detail, until="complete") is not None
 
 
 def test_serverless_build_status_reports_head_actions_for_text_only_updates(
@@ -2892,5 +3183,5 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
     next_index = serverless_api.get_index(table_name, "full_text_index_v1")
     assert active_index["status"]["head_publication_action"] == "reuse"
     assert next_index["status"]["head_publication_action"] == "rebuild"
-    assert ready_index_status(active_index) is not None
-    assert ready_index_status(next_index) is not None
+    assert ready_index_status(active_index, until="complete") is not None
+    assert ready_index_status(next_index, until="complete") is not None

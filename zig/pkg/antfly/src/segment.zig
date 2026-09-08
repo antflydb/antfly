@@ -31,6 +31,7 @@
 //! Compatible with zapx v16/v17 section-based architecture.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const byte_copy = @import("common/byte_copy.zig");
 const platform_time = @import("antfly_platform").time;
@@ -356,7 +357,7 @@ pub const SegmentWriter = struct {
                 section.offset = sink.len();
                 try sink.appendSlice(section.data);
                 section.length = section.data.len;
-                section.checksum = std.hash.Crc32.hash(section.data);
+                section.checksum = Crc32.hash(section.data);
                 self.alloc.free(section.data);
                 section.data = &.{};
             }
@@ -483,7 +484,7 @@ pub const SegmentWriter = struct {
             try sink.appendSlice(compressed);
             try sink.writeAt(
                 block_checksums_start + @as(usize, block_idx) * 4,
-                &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, std.hash.Crc32.hash(compressed)))),
+                &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, Crc32.hash(compressed)))),
             );
 
             const block_end_offset: u64 = @intCast(sink.len() - data_start);
@@ -655,9 +656,9 @@ pub const SegmentReader = struct {
         if (index_offset > footer_start) return error.InvalidSegment;
         if (stored_start > index_offset or stored_len > index_offset - stored_start) return error.InvalidSegment;
         if (stored_metadata_len > stored_len) return error.InvalidSegment;
-        const expected_metadata_crc = std.hash.Crc32.hash(data[index_offset .. end - 8]);
+        const expected_metadata_crc = Crc32.hash(data[index_offset .. end - 8]);
         if (metadata_crc != expected_metadata_crc) return error.CrcMismatch;
-        if (std.hash.Crc32.hash(data[stored_start..][0..stored_metadata_len]) != stored_metadata_crc) return error.CrcMismatch;
+        if (Crc32.hash(data[stored_start..][0..stored_metadata_len]) != stored_metadata_crc) return error.CrcMismatch;
 
         if (stored_metadata_len < 5) return error.InvalidSegment;
         const stored_mode = data[stored_start];
@@ -806,7 +807,7 @@ pub const SegmentReader = struct {
                             integrity_invalid => return error.CrcMismatch,
                             else => {},
                         }
-                        if (std.hash.Crc32.hash(bytes) != section.checksum) {
+                        if (Crc32.hash(bytes) != section.checksum) {
                             validation.store(integrity_invalid, .release);
                             return error.CrcMismatch;
                         }
@@ -833,7 +834,7 @@ pub const SegmentReader = struct {
             integrity_invalid => return error.CrcMismatch,
             else => {},
         }
-        if (std.hash.Crc32.hash(bytes) != expected) {
+        if (Crc32.hash(bytes) != expected) {
             validation.store(integrity_invalid, .release);
             return error.CrcMismatch;
         }
@@ -1193,13 +1194,13 @@ pub const MemorySegmentSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *MemorySegmentSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidSegment;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *MemorySegmentSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidSegment;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 };
 
@@ -1924,7 +1925,7 @@ fn flushMergedStoredBlock(
     try sink.appendSlice(compressed);
     try sink.writeAt(
         block_checksums_start + @as(usize, block_idx) * 4,
-        &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, std.hash.Crc32.hash(compressed)))),
+        &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, Crc32.hash(compressed)))),
     );
     const block_end_offset: u64 = @intCast(sink.len() - data_start);
     try sink.writeAt(block_offsets_start + @as(usize, block_idx) * 8, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, block_end_offset))));
@@ -2007,7 +2008,7 @@ fn appendBuiltSection(
         .section_type = section_type,
         .offset = offset,
         .length = data.len,
-        .checksum = std.hash.Crc32.hash(data),
+        .checksum = Crc32.hash(data),
     });
 }
 
@@ -2947,13 +2948,13 @@ test "segment readers fail closed on checksummed malformed document offsets" {
     std.mem.writeInt(
         u32,
         malformed[end - 16 ..][0..4],
-        std.hash.Crc32.hash(malformed[stored_start..][0..stored_metadata_len]),
+        Crc32.hash(malformed[stored_start..][0..stored_metadata_len]),
         .big,
     );
     std.mem.writeInt(
         u32,
         malformed[end - 8 ..][0..4],
-        std.hash.Crc32.hash(malformed[sections_index_offset .. end - 8]),
+        Crc32.hash(malformed[sections_index_offset .. end - 8]),
         .big,
     );
 

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DistanceUnit(str, Enum):
+class DistanceUnit(StrEnum):
     FT = "ft"
     KM = "km"
     M = "m"

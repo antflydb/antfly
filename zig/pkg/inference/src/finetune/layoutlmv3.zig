@@ -883,6 +883,7 @@ pub fn trainLoRABundleOneStep(
     const b_before = l2Norm(layer.adapter_b);
     var graph_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var graph_compute = native_compute.NativeCompute.init(allocator, &graph_weight_store, null);
+    defer graph_compute.deinit();
     const graph_cb = graph_compute.computeBackend();
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);
     defer graph_optimizer_state.deinit();
@@ -2625,6 +2626,7 @@ fn trainSequenceEpoch(
     // Use provided backend, or fall back to internal native compute.
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var fallback_native = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer fallback_native.deinit();
     var native_cb = fallback_native.computeBackend();
     const graph_cb: *const ComputeBackend = provided_cb orelse &native_cb;
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);
@@ -2777,6 +2779,7 @@ fn trainTokenEpoch(
     // Use provided backend, or fall back to internal native compute.
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var fallback_native = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer fallback_native.deinit();
     var native_cb = fallback_native.computeBackend();
     const graph_cb: *const ComputeBackend = provided_cb orelse &native_cb;
     var graph_optimizer_state = optimizers.OptimizerState.init(allocator);

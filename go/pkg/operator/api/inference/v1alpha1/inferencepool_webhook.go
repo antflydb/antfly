@@ -21,7 +21,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -81,11 +83,50 @@ func (r *InferencePool) ValidateInferencePool() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateScaleToZeroConfig(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
+	if err := r.validateInferenceBackend(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if len(allErrors) > 0 {
 		return fmt.Errorf("InferencePool validation failed:\n  - %s",
 			strings.Join(allErrors, "\n  - "))
 	}
 
+	return nil
+}
+
+func (r *InferencePool) validateInferenceBackend() error {
+	backend := r.Spec.Hardware.InferenceBackend
+	if backend == "" || backend == InferenceRuntimeBackendAuto {
+		return nil
+	}
+	profile := ResolveInferenceBackendProfile(r)
+	hasGPU := HasGPUResources(r.Spec.Resources)
+	isTPU := IsTPUAccelerator(r.Spec.Hardware.Accelerator)
+	hasAccelerator := strings.TrimSpace(r.Spec.Hardware.Accelerator) != ""
+	switch backend {
+	case InferenceRuntimeBackendCPU:
+		if profile.ForbidsAccelerator && (hasGPU || hasAccelerator) {
+			return fmt.Errorf("spec.hardware.inferenceBackend=cpu cannot be combined with accelerator resources or spec.hardware.accelerator")
+		}
+	case InferenceRuntimeBackendCUDA:
+		if isTPU {
+			return fmt.Errorf("spec.hardware.inferenceBackend=cuda cannot use a TPU accelerator")
+		}
+		if profile.RequiresGPU && !hasGPU {
+			return fmt.Errorf("spec.hardware.inferenceBackend=cuda requires a positive GPU request or limit; spec.hardware.accelerator only selects the GPU type")
+		}
+	case InferenceRuntimeBackendPJRT:
+		if profile.RequiresTPU && !isTPU {
+			return fmt.Errorf("spec.hardware.inferenceBackend=pjrt requires a TPU accelerator")
+		}
+	default:
+		return fmt.Errorf("spec.hardware.inferenceBackend must be one of auto, cpu, cuda, or pjrt")
+	}
 	return nil
 }
 
@@ -96,6 +137,13 @@ func (r *InferencePool) validateGKEConfig() error {
 	}
 
 	gke := r.Spec.GKE
+	hasGPU := r.hasGPUResources()
+	if hasGPU && strings.TrimSpace(r.Spec.Hardware.Accelerator) == "" {
+		return fmt.Errorf("spec.hardware.accelerator is required for GKE GPU resources; for example, nvidia-l4")
+	}
+	if gke.Autopilot && hasGPU && gke.AutopilotComputeClass != "Accelerator" {
+		return fmt.Errorf("spec.gke.autopilotComputeClass must be 'Accelerator' for GKE Autopilot GPU resources")
+	}
 
 	// Check Autopilot requirement first — this gives the most helpful error
 	if gke.AutopilotComputeClass != "" && !gke.Autopilot {
@@ -120,8 +168,6 @@ Solution: Either:
 	// Validate Accelerator compute class requires GPU (NOT TPU)
 	// TPU workloads should NOT use Accelerator class - they use node selectors instead
 	if gke.AutopilotComputeClass == "Accelerator" {
-		hasGPU := r.hasGPUResources()
-
 		if !hasGPU {
 			return fmt.Errorf(`spec.gke.autopilotComputeClass='Accelerator' requires GPU resources
 
@@ -335,6 +381,58 @@ func (r *InferencePool) validateAutoscalingConfig() error {
 	return nil
 }
 
+func (r *InferencePool) validateScaleToZeroConfig() error {
+	config := r.Spec.ScaleToZero
+	if config == nil || !config.Enabled {
+		return nil
+	}
+
+	var allErrors []string
+	if r.Spec.Replicas.Min != 0 {
+		allErrors = append(allErrors, "spec.replicas.min must be 0 when spec.scaleToZero.enabled=true")
+	}
+	if r.Spec.Autoscaling != nil && r.Spec.Autoscaling.Enabled {
+		allErrors = append(allErrors, "spec.autoscaling.enabled must be false when spec.scaleToZero.enabled=true")
+	}
+	idleTimeout := 15 * time.Minute
+	if config.IdleTimeout != nil {
+		idleTimeout = config.IdleTimeout.Duration
+		if config.IdleTimeout.Duration <= 0 {
+			allErrors = append(allErrors, "spec.scaleToZero.idleTimeout must be greater than 0")
+		} else if config.IdleTimeout.Duration < time.Minute {
+			allErrors = append(allErrors, "spec.scaleToZero.idleTimeout must be at least 1m")
+		} else if config.IdleTimeout.Duration > 24*time.Hour {
+			allErrors = append(allErrors, "spec.scaleToZero.idleTimeout must be at most 24h")
+		}
+	}
+	activationTimeout := 5 * time.Minute
+	if config.ActivationTimeout != nil {
+		activationTimeout = config.ActivationTimeout.Duration
+		if config.ActivationTimeout.Duration <= 0 {
+			allErrors = append(allErrors, "spec.scaleToZero.activationTimeout must be greater than 0")
+		} else if config.ActivationTimeout.Duration < time.Second {
+			allErrors = append(allErrors, "spec.scaleToZero.activationTimeout must be at least 1s")
+		} else if config.ActivationTimeout.Duration > 30*time.Minute {
+			allErrors = append(allErrors, "spec.scaleToZero.activationTimeout must be at most 30m")
+		}
+	}
+	if idleTimeout > 0 && activationTimeout > 0 && idleTimeout <= activationTimeout {
+		allErrors = append(allErrors, "spec.scaleToZero.idleTimeout must be greater than activationTimeout")
+	}
+	if config.WakeReplicas != nil {
+		if *config.WakeReplicas < 1 {
+			allErrors = append(allErrors, "spec.scaleToZero.wakeReplicas must be at least 1")
+		} else if *config.WakeReplicas > r.Spec.Replicas.Max {
+			allErrors = append(allErrors, "spec.scaleToZero.wakeReplicas cannot exceed spec.replicas.max")
+		}
+	}
+
+	if len(allErrors) > 0 {
+		return fmt.Errorf("invalid scale-to-zero configuration:\n    %s", strings.Join(allErrors, "\n    "))
+	}
+	return nil
+}
+
 func validateResourceAutoscalingTarget(target string) error {
 	if target == "" {
 		return fmt.Errorf("target is required")
@@ -493,12 +591,24 @@ Solution: Delete and recreate the pool with GKE Autopilot configuration.`)
 	return nil
 }
 
-// hasGPUResources checks if GPU resources are present in spec.resources
-func (r *InferencePool) hasGPUResources() bool {
-	if r.Spec.Resources == nil || r.Spec.Resources.Limits == nil {
+// HasGPUResources reports whether resource requirements request or limit a GPU.
+// Admission and reconciliation share this helper so they apply the same backend
+// selection contract.
+func HasGPUResources(resources *corev1.ResourceRequirements) bool {
+	if resources == nil {
 		return false
 	}
-	_, hasNvidiaGPU := r.Spec.Resources.Limits["nvidia.com/gpu"]
-	_, hasGoogleGPU := r.Spec.Resources.Limits["cloud.google.com/gke-gpu"]
-	return hasNvidiaGPU || hasGoogleGPU
+	for _, resourceName := range []corev1.ResourceName{"nvidia.com/gpu", "cloud.google.com/gke-gpu"} {
+		if quantity, ok := resources.Limits[resourceName]; ok && quantity.Sign() > 0 {
+			return true
+		}
+		if quantity, ok := resources.Requests[resourceName]; ok && quantity.Sign() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *InferencePool) hasGPUResources() bool {
+	return HasGPUResources(r.Spec.Resources)
 }

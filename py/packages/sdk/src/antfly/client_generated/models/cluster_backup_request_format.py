@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ClusterBackupRequestFormat(str, Enum):
+class ClusterBackupRequestFormat(StrEnum):
     NATIVE = "native"
     PORTABLE = "portable"
 

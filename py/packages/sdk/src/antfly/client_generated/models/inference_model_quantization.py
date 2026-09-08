@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceModelQuantization(str, Enum):
+class InferenceModelQuantization(StrEnum):
     FP16 = "fp16"
     Q4_K = "q4_k"
     Q8 = "q8"

@@ -18,6 +18,8 @@ pub const Routes = struct {
     pub const raft_batch = "/raft/v1/batch";
     pub const snapshot_upload = "/raft/v1/snapshot/upload";
     pub const snapshot_fetch = "/raft/v1/snapshot/fetch";
+    pub const snapshot_upload_v2 = "/raft/v2/snapshot/upload";
+    pub const snapshot_fetch_v2 = "/raft/v2/snapshot/fetch";
     pub const health = "/raft/v1/health";
     pub const capabilities = "/internal/v1/capabilities";
 
@@ -73,6 +75,14 @@ pub const Routes = struct {
         return try appendSuffix(alloc, snapshot_fetch, snapshot_id);
     }
 
+    pub fn snapshotUploadPathV2(alloc: std.mem.Allocator, snapshot_id: []const u8) ![]u8 {
+        return try appendSuffix(alloc, snapshot_upload_v2, snapshot_id);
+    }
+
+    pub fn snapshotFetchPathV2(alloc: std.mem.Allocator, snapshot_id: []const u8) ![]u8 {
+        return try appendSuffix(alloc, snapshot_fetch_v2, snapshot_id);
+    }
+
     pub fn matchSnapshotUpload(path: []const u8) ?[]const u8 {
         if (!std.mem.startsWith(u8, path, snapshot_upload)) return null;
         const suffix = path[snapshot_upload.len..];
@@ -83,6 +93,20 @@ pub const Routes = struct {
     pub fn matchSnapshotFetch(path: []const u8) ?[]const u8 {
         if (!std.mem.startsWith(u8, path, snapshot_fetch)) return null;
         const suffix = path[snapshot_fetch.len..];
+        if (suffix.len < 2 or suffix[0] != '/') return null;
+        return suffix[1..];
+    }
+
+    pub fn matchSnapshotUploadV2(path: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, path, snapshot_upload_v2)) return null;
+        const suffix = path[snapshot_upload_v2.len..];
+        if (suffix.len < 2 or suffix[0] != '/') return null;
+        return suffix[1..];
+    }
+
+    pub fn matchSnapshotFetchV2(path: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, path, snapshot_fetch_v2)) return null;
+        const suffix = path[snapshot_fetch_v2.len..];
         if (suffix.len < 2 or suffix[0] != '/') return null;
         return suffix[1..];
     }
@@ -101,4 +125,13 @@ test "transport routes join and parse snapshot paths" {
     const fetch = try Routes.snapshotFetchPath(std.testing.allocator, "snap-2");
     defer std.testing.allocator.free(fetch);
     try std.testing.expectEqualStrings("snap-2", Routes.matchSnapshotFetch(fetch).?);
+
+    const upload_v2 = try Routes.snapshotUploadPathV2(std.testing.allocator, "snap-3");
+    defer std.testing.allocator.free(upload_v2);
+    try std.testing.expectEqualStrings("/raft/v2/snapshot/upload/snap-3", upload_v2);
+    try std.testing.expectEqualStrings("snap-3", Routes.matchSnapshotUploadV2(upload_v2).?);
+
+    const fetch_v2 = try Routes.snapshotFetchPathV2(std.testing.allocator, "snap-4");
+    defer std.testing.allocator.free(fetch_v2);
+    try std.testing.expectEqualStrings("snap-4", Routes.matchSnapshotFetchV2(fetch_v2).?);
 }

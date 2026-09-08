@@ -121,6 +121,7 @@ pub const AntflyConfig = struct {
 };
 
 pub const GeneratorConfig = struct {
+    rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
     model: []const u8,
     url: []const u8,
@@ -139,6 +140,7 @@ pub const GeneratorConfig = struct {
 
     pub fn clone(self: GeneratorConfig, alloc: std.mem.Allocator) !GeneratorConfig {
         return .{
+            .rate_limit = self.rate_limit,
             .provider = self.provider,
             .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
             .url = if (self.url.len > 0) try alloc.dupe(u8, self.url) else "",
@@ -292,6 +294,7 @@ pub fn stringifyChainLinkAlloc(alloc: std.mem.Allocator, link: ChainLink) ![]u8 
 
 pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorConfig) !GeneratorConfig {
     var cfg = GeneratorConfig{
+        .rate_limit = generated.rate_limit,
         .provider = try providerFromOpenApi(generated.provider),
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .url = if (generated.url) |url|
@@ -318,6 +321,7 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
 
 pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
     return .{
+        .rate_limit = cfg.rate_limit,
         .provider = providerToOpenApi(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
@@ -558,27 +562,18 @@ fn deinitChainAlloc(alloc: std.mem.Allocator, chain: []ChainLink) void {
     alloc.free(chain);
 }
 
-fn providerFromOpenApi(provider: openapi.GeneratorProvider) !Provider {
-    return switch (provider) {
-        .gemini => .gemini,
-        .vertex => .vertex,
-        .openai => .openai,
-        .ollama => .ollama,
-        .antfly => .antfly,
-        .mock => .mock,
-        else => error.UnsupportedGeneratorProvider,
-    };
+fn providerFromOpenApi(provider: ?[]const u8) !Provider {
+    const name = provider orelse return error.InvalidGeneratorConfig;
+    if (std.mem.eql(u8, name, "gemini")) return .gemini;
+    if (std.mem.eql(u8, name, "vertex")) return .vertex;
+    if (std.mem.eql(u8, name, "openai")) return .openai;
+    if (std.mem.eql(u8, name, "ollama")) return .ollama;
+    if (std.mem.eql(u8, name, "antfly")) return .antfly;
+    return error.UnsupportedGeneratorProvider;
 }
 
-fn providerToOpenApi(provider: Provider) openapi.GeneratorProvider {
-    return switch (provider) {
-        .gemini => .gemini,
-        .vertex => .vertex,
-        .openai => .openai,
-        .ollama => .ollama,
-        .antfly => .antfly,
-        .mock => .mock,
-    };
+fn providerToOpenApi(provider: Provider) []const u8 {
+    return @tagName(provider);
 }
 
 fn chainConditionFromOpenApi(condition: openapi.ChainCondition) !ChainCondition {
@@ -848,4 +843,21 @@ test "executeChain falls back on rate limit" {
     var result = try executeChain(alloc, &chain, factory, &.{.{ .role = .user, .content = .{ .text = "hello" } }});
     defer result.deinit();
     try std.testing.expectEqualStrings("rate-limit-fallback", result.content);
+}
+
+test "generating config preserves shared rate limits through cloning and JSON" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"model\":\"test\",\"rate_limit\":{\"requests_per_minute\":120,\"burst\":2,\"tokens_per_minute\":1000,\"max_concurrency\":4}}");
+    defer cfg.deinit(alloc);
+    cfg.rate_limit.?.pacing = .completion;
+    cfg.rate_limit.?.burst = 1;
+    var cloned = try cfg.clone(alloc);
+    defer cloned.deinit(alloc);
+    const encoded = try stringifyConfigAlloc(alloc, cloned);
+    defer alloc.free(encoded);
+    var reparsed = try parseConfigFromSlice(alloc, encoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectEqualDeep(cfg.rate_limit, reparsed.rate_limit);
+    try std.testing.expectEqual(.completion, reparsed.rate_limit.?.pacing.?);
+    try std.testing.expectEqual(@as(?i64, 4), reparsed.rate_limit.?.max_concurrency);
 }

@@ -27,6 +27,7 @@ const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
+const reranking = @import("../reranking/mod.zig");
 const restore_jobs = @import("../api/restore_jobs.zig");
 const raft = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
@@ -50,6 +51,23 @@ pub const MetadataServerDeps = struct {
     http: service.MetadataHttpServiceDeps = .{},
 };
 
+fn listMetadataRaftQuarantinesForAdmin(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+) ![]raft_host.GroupQuarantineStatus {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.listRaftQuarantinesForAdmin(alloc);
+}
+
+fn resumeMetadataRaftQuarantineForAdmin(
+    ptr: *anyopaque,
+    group_id: u64,
+    options: raft_host.ResumeQuarantineOptions,
+) !void {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.resumeRaftQuarantineForAdmin(group_id, options);
+}
+
 pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
@@ -59,6 +77,7 @@ pub const MetadataServer = struct {
     owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null,
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
     owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
+    owned_reranker_runtime: ?*reranking.Runtime = null,
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
@@ -135,6 +154,11 @@ pub const MetadataServer = struct {
         errdefer if (owned_admin_http_server) |admin_http_server| alloc.destroy(admin_http_server);
         var owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null;
         errdefer if (owned_public_read_source) |read_source| alloc.destroy(read_source);
+        var owned_reranker_runtime: ?*reranking.Runtime = null;
+        errdefer if (owned_reranker_runtime) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        };
         var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
         var owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null;
@@ -197,6 +221,12 @@ pub const MetadataServer = struct {
                 svc.raft.host.http_host.request_executor,
             );
             const backend_runtime = try svc.ensureBackendRuntime();
+            const reranker_io = backend_runtime.io() orelse return error.QueryRuntimeUnavailable;
+            const reranker_runtime = try alloc.create(reranking.Runtime);
+            reranker_runtime.* = reranking.Runtime.init(alloc, reranker_io);
+            _ = public_read_source.withRerankerRuntime(reranker_runtime);
+            _ = public_read_source.withSecretStore(cfg.api_server_cfg.secret_store);
+            owned_reranker_runtime = reranker_runtime;
             _ = public_write_source.withBackendRuntime(backend_runtime);
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
@@ -205,6 +235,7 @@ pub const MetadataServer = struct {
                 cfg.api_server_cfg.internal_service_secret,
                 cfg.api_server_cfg.internal_service_issuer,
             );
+            _ = public_write_source.withIndexActivationAdapter(owned_hosted_shard_db.?.adapter());
             _ = public_write_source.withDestinationAuthorization(.{
                 .manager = cfg.api_server_cfg.user_manager,
                 .auth_enabled = cfg.api_server_cfg.auth_enabled,
@@ -214,6 +245,11 @@ pub const MetadataServer = struct {
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
+            api_server_cfg.raft_quarantine_admin = .{
+                .ptr = svc,
+                .list_fn = listMetadataRaftQuarantinesForAdmin,
+                .resume_fn = resumeMetadataRaftQuarantineForAdmin,
+            };
             api_server_cfg.backend_runtime = backend_runtime;
             api_server_cfg.restore_execution_guard = .{
                 .ptr = svc,
@@ -268,6 +304,7 @@ pub const MetadataServer = struct {
             .owned_hosted_shard_db = owned_hosted_shard_db,
             .owned_admin_http_server = owned_admin_http_server,
             .owned_public_read_source = owned_public_read_source,
+            .owned_reranker_runtime = owned_reranker_runtime,
             .owned_public_write_source = owned_public_write_source,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
@@ -311,6 +348,10 @@ pub const MetadataServer = struct {
         }
         if (self.owned_public_read_source) |read_source| {
             self.alloc.destroy(read_source);
+        }
+        if (self.owned_reranker_runtime) |runtime| {
+            runtime.deinit();
+            self.alloc.destroy(runtime);
         }
         if (self.owned_admin_http_server) |admin_http_server| {
             self.alloc.destroy(admin_http_server);
@@ -480,12 +521,23 @@ pub const MetadataServer = struct {
         return try self.svc.adminSnapshot();
     }
 
+    pub fn catalogIdentity(self: *MetadataServer) !@import("api.zig").CatalogIdentity {
+        return try self.svc.catalogIdentity();
+    }
+
     pub fn validatePublication(self: *MetadataServer, contract: @import("api.zig").CatalogPublicationContract) !bool {
         return try self.svc.validatePublication(contract);
     }
 
     pub fn validateTablePublication(self: *MetadataServer, contract: @import("api.zig").CatalogTablePublicationContract) !bool {
         return try self.svc.validateTablePublication(contract);
+    }
+
+    pub fn validateGroupRetirement(
+        self: *MetadataServer,
+        contract: @import("api.zig").CatalogGroupRetirementContract,
+    ) !@import("api.zig").CatalogGroupRetirementValidation {
+        return try self.svc.validateGroupRetirement(contract);
     }
 
     pub fn freeAdminSnapshot(self: *MetadataServer, snapshot: *@import("api.zig").AdminSnapshot) void {
@@ -503,9 +555,7 @@ pub const MetadataServer = struct {
 
     fn runLifecycleReconcile(ptr: *anyopaque) !void {
         const self: *MetadataServer = @ptrCast(@alignCast(ptr));
-        try self.control_loop.stateRef().syncProjected(self.svc);
-        try self.control_loop.stateRef().seedDesiredFromProjected();
-        _ = try self.svc.reconcilePreparedIfLeaseHeld(&self.control_loop);
+        _ = try self.svc.reconcileSeededFromProjectedIfLeaseHeld(&self.control_loop);
     }
 };
 
@@ -807,6 +857,7 @@ fn metadataDataBearingStoreGroupRouter(svc: *service.MetadataHttpService) api_ta
             .node_status = metadataDataBearingStoreRouterNodeStatus,
             .node_base_uri = metadataStoreRouterNodeBaseUri,
             .node_base_uri_for_group = metadataStoreRouterNodeBaseUriForGroup,
+            .resolve_group_routes = metadataDataBearingStoreRouterGroupRoutes,
         },
     };
 }
@@ -871,6 +922,145 @@ fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Al
     errdefer alloc.free(out);
     for (candidates.items, 0..) |candidate, i| out[i] = candidate.node_id;
     return out;
+}
+
+fn metadataDataBearingStoreRouterGroupRoutes(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    group_ids: []const u64,
+    policy: api_table_router.RoutePolicy,
+) !?[]api_table_router.GroupRoute {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    // Metadata nodes never own data replicas, so both policies use the same
+    // remote ordering: the comparator prefers a leader and otherwise returns
+    // the strongest healthy data-bearing replica.
+    _ = policy;
+    var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
+    defer snapshot.deinit(svc, svc.alloc);
+    const local_node_id = svc.raft.host.http_host.host.cfg.local_node_id;
+
+    const GroupNodeKey = struct { group_id: u64, node_id: u64 };
+    const ServingSummary = struct { first_node_id: u64, has_other_node: bool = false };
+    const CandidateState = struct {
+        candidate: DataBearingStoreCandidate,
+        api_url: []const u8,
+        has_data: bool = false,
+    };
+
+    var requested_groups = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer requested_groups.deinit(alloc);
+    try requested_groups.ensureTotalCapacity(alloc, @intCast(group_ids.len));
+    for (group_ids) |group_id| requested_groups.putAssumeCapacity(group_id, {});
+
+    // Build readability once. In particular, a draining source remains
+    // readable only until another serving replica exists for that group.
+    var serving_by_group = std.AutoHashMapUnmanaged(u64, ServingSummary).empty;
+    defer serving_by_group.deinit(alloc);
+    try serving_by_group.ensureTotalCapacity(alloc, @intCast(group_ids.len));
+    for (snapshot.placements) |intent| {
+        if (intent.serving_state != .serving or !requested_groups.contains(intent.record.group_id)) continue;
+        const entry = serving_by_group.getOrPutAssumeCapacity(intent.record.group_id);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{ .first_node_id = intent.record.local_node_id };
+        } else if (entry.value_ptr.first_node_id != intent.record.local_node_id) {
+            entry.value_ptr.has_other_node = true;
+        }
+    }
+
+    var readable_replicas = std.AutoHashMapUnmanaged(GroupNodeKey, void).empty;
+    defer readable_replicas.deinit(alloc);
+    try readable_replicas.ensureTotalCapacity(alloc, @intCast(snapshot.placements.len));
+    for (snapshot.placements) |intent| {
+        if (!requested_groups.contains(intent.record.group_id)) continue;
+        const readable = switch (intent.serving_state) {
+            .serving => true,
+            .draining => if (serving_by_group.get(intent.record.group_id)) |summary|
+                summary.first_node_id == intent.record.local_node_id and !summary.has_other_node
+            else
+                true,
+            .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => false,
+        };
+        if (readable) readable_replicas.putAssumeCapacity(.{
+            .group_id = intent.record.group_id,
+            .node_id = intent.record.local_node_id,
+        }, {});
+    }
+
+    // Aggregate all requested store/group observations in one pass. Candidate
+    // count cannot exceed readable placement count, so this stays bounded by
+    // the routing snapshot rather than by groups × stores × placements.
+    var candidates = std.AutoHashMapUnmanaged(GroupNodeKey, CandidateState).empty;
+    defer candidates.deinit(alloc);
+    try candidates.ensureTotalCapacity(alloc, @intCast(snapshot.placements.len));
+    for (snapshot.stores) |store| {
+        if (store.node_id == local_node_id or store.api_url.len == 0 or
+            !store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
+
+        for (store.group_statuses) |status| {
+            const key = GroupNodeKey{ .group_id = status.group_id, .node_id = store.node_id };
+            if (!requested_groups.contains(status.group_id) or !readable_replicas.contains(key)) continue;
+            const entry = candidates.getOrPutAssumeCapacity(key);
+            if (!entry.found_existing) entry.value_ptr.* = .{
+                .candidate = .{ .node_id = store.node_id, .store_id = store.store_id },
+                .api_url = store.api_url,
+            };
+            const state = entry.value_ptr;
+            state.candidate.local_leader = state.candidate.local_leader or status.local_leader;
+            state.has_data = state.has_data or !status.empty or status.doc_count > 0 or status.disk_bytes > 1024;
+            state.candidate.doc_count = @max(state.candidate.doc_count, status.doc_count);
+            state.candidate.disk_bytes = @max(state.candidate.disk_bytes, status.disk_bytes);
+            state.candidate.updated_at_millis = @max(state.candidate.updated_at_millis, status.updated_at_millis);
+        }
+        for (store.runtime_statuses) |status| {
+            const key = GroupNodeKey{ .group_id = status.group_id, .node_id = store.node_id };
+            if (!requested_groups.contains(status.group_id) or !readable_replicas.contains(key)) continue;
+            const entry = candidates.getOrPutAssumeCapacity(key);
+            if (!entry.found_existing) entry.value_ptr.* = .{
+                .candidate = .{ .node_id = store.node_id, .store_id = store.store_id },
+                .api_url = store.api_url,
+            };
+            const state = entry.value_ptr;
+            state.has_data = state.has_data or status.doc_count > 0 or status.disk_bytes > 1024;
+            state.candidate.doc_count = @max(state.candidate.doc_count, status.doc_count);
+            state.candidate.disk_bytes = @max(state.candidate.disk_bytes, status.disk_bytes);
+            state.candidate.updated_at_millis = @max(
+                state.candidate.updated_at_millis,
+                @divTrunc(status.updated_at_ns, std.time.ns_per_ms),
+            );
+        }
+    }
+
+    var best_by_group = std.AutoHashMapUnmanaged(u64, CandidateState).empty;
+    defer best_by_group.deinit(alloc);
+    try best_by_group.ensureTotalCapacity(alloc, @intCast(group_ids.len));
+    var candidate_iterator = candidates.iterator();
+    while (candidate_iterator.next()) |entry| {
+        const candidate = entry.value_ptr.*;
+        if (!candidate.has_data and !candidate.candidate.local_leader) continue;
+        const best = best_by_group.getOrPutAssumeCapacity(entry.key_ptr.group_id);
+        if (!best.found_existing or dataBearingStoreCandidateLessThan(candidate.candidate, best.value_ptr.candidate))
+            best.value_ptr.* = candidate;
+    }
+
+    const routes = try alloc.alloc(api_table_router.GroupRoute, group_ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (routes[0..initialized]) |*route| route.deinit(alloc);
+        alloc.free(routes);
+    }
+    for (group_ids, 0..) |group_id, index| {
+        const best = best_by_group.get(group_id) orelse {
+            for (routes[0..initialized]) |*route| route.deinit(alloc);
+            alloc.free(routes);
+            return null;
+        };
+        routes[index] = .{ .remote = .{
+            .node_id = best.candidate.node_id,
+            .base_uri = try alloc.dupe(u8, best.api_url),
+        } };
+        initialized += 1;
+    }
+    return routes;
 }
 
 fn metadataStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
@@ -1053,8 +1243,19 @@ fn metadataLocalShardDbAdapter(svc: *service.MetadataHttpService) metadata_mod.S
         .vtable = &.{
             .fetch_median_key = fetchMedianKey,
             .schema_index_ready = schemaIndexReady,
+            .activate_index = activateIndex,
         },
     };
+}
+
+fn activateIndex(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    target: metadata_mod.IndexActivationTarget,
+) !metadata_mod.IndexActivationProgress {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const adapter = svc.local_shard_db_adapter orelse return error.GroupLeaderUnavailable;
+    return try adapter.activateIndex(alloc, target);
 }
 
 fn fetchMedianKey(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {

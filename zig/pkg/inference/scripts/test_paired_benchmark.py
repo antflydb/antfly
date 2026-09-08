@@ -49,10 +49,14 @@ class PairedBenchmarkTest(unittest.TestCase):
             self.assertEqual(manifest, stored)
             self.assertEqual(MANIFEST_SCHEMA, stored["schema"])
             self.assertEqual(2, stored["file_count"])
-            self.assertNotIn("evidence_manifest.json", [item["path"] for item in stored["files"]])
+            self.assertNotIn(
+                "evidence_manifest.json", [item["path"] for item in stored["files"]]
+            )
             self.assertEqual(
                 stored["files_sha256"],
-                build_evidence_manifest(root, exclude=("evidence_manifest.json",))["files_sha256"],
+                build_evidence_manifest(root, exclude=("evidence_manifest.json",))[
+                    "files_sha256"
+                ],
             )
 
 

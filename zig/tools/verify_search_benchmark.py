@@ -46,8 +46,10 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def score_close(left: float, right: float, abs_tol: float, rel_tol: float) -> bool:
-    return math.isfinite(left) and math.isfinite(right) and math.isclose(
-        left, right, abs_tol=abs_tol, rel_tol=rel_tol
+    return (
+        math.isfinite(left)
+        and math.isfinite(right)
+        and math.isclose(left, right, abs_tol=abs_tol, rel_tol=rel_tol)
     )
 
 
@@ -128,12 +130,12 @@ def compare_record(
     left_cutoff = float(left_hits[-1]["score"])
     right_cutoff = float(right_hits[-1]["score"])
     if not score_close(left_cutoff, right_cutoff, abs_tol, rel_tol):
-        errors.append(
-            f"query[{index}]: cutoff scores {left_cutoff} != {right_cutoff}"
-        )
+        errors.append(f"query[{index}]: cutoff scores {left_cutoff} != {right_cutoff}")
         return errors, False
 
-    def split_cutoff(hits: list[dict[str, Any]], cutoff: float) -> tuple[dict[int, float], set[int]]:
+    def split_cutoff(
+        hits: list[dict[str, Any]], cutoff: float
+    ) -> tuple[dict[int, float], set[int]]:
         definite: dict[int, float] = {}
         tied: set[int] = set()
         for hit in hits:

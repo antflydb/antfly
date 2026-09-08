@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IndexSourceReadinessStatusState(str, Enum):
+class IndexSourceReadinessStatusState(StrEnum):
     FAILED = "failed"
     PENDING = "pending"
     READY = "ready"

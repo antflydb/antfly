@@ -2492,7 +2492,10 @@ test "lite restore malformed backup leaves target untouched" {
         var malformed = std.ArrayList(u8).empty;
         defer malformed.deinit(allocator);
         try backup_codec.writeHeader(&malformed, allocator, .{
-            .format_version = backup_codec.format_version,
+            // Exercise malformed logical AFB1 payload validation. AFB2 must
+            // start with its bundle manifest and correctly rejects this shape
+            // earlier as InvalidBackupManifest.
+            .format_version = backup_codec.legacy_format_version,
             .flags = 0,
             .created_at_ns = 0,
             .backup_id = [_]u8{0} ** 16,

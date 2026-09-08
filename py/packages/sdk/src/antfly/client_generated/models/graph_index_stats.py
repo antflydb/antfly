@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
     from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
     from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+    from ..models.index_milestones import IndexMilestones
     from ..models.index_readiness_status import IndexReadinessStatus
     from ..models.index_repair_status import IndexRepairStatus
 
@@ -31,6 +32,11 @@ class GraphIndexStats:
     Attributes:
         index_type (GraphIndexStatsIndexType): Discriminator for the index stats variant.
         readiness (IndexReadinessStatus | Unset):
+        incarnation (str | Unset): Opaque identity of the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
+        target_revision (int | Unset):
+        published_revision (int | Unset):
+        milestones (IndexMilestones | Unset):
         error (str | Unset): Error message if stats could not be retrieved
         total_edges (int | Unset): Total number of edges in the graph
         edge_types (GraphIndexStatsEdgeTypes | Unset): Count of edges per edge type
@@ -88,6 +94,10 @@ class GraphIndexStats:
 
     index_type: GraphIndexStatsIndexType
     readiness: IndexReadinessStatus | Unset = UNSET
+    incarnation: str | Unset = UNSET
+    target_revision: int | Unset = UNSET
+    published_revision: int | Unset = UNSET
+    milestones: IndexMilestones | Unset = UNSET
     error: str | Unset = UNSET
     total_edges: int | Unset = UNSET
     edge_types: GraphIndexStatsEdgeTypes | Unset = UNSET
@@ -142,6 +152,16 @@ class GraphIndexStats:
         readiness: dict[str, Any] | Unset = UNSET
         if not isinstance(self.readiness, Unset):
             readiness = self.readiness.to_dict()
+
+        incarnation = self.incarnation
+
+        target_revision = self.target_revision
+
+        published_revision = self.published_revision
+
+        milestones: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.milestones, Unset):
+            milestones = self.milestones.to_dict()
 
         error = self.error
 
@@ -260,6 +280,14 @@ class GraphIndexStats:
         )
         if readiness is not UNSET:
             field_dict["readiness"] = readiness
+        if incarnation is not UNSET:
+            field_dict["incarnation"] = incarnation
+        if target_revision is not UNSET:
+            field_dict["target_revision"] = target_revision
+        if published_revision is not UNSET:
+            field_dict["published_revision"] = published_revision
+        if milestones is not UNSET:
+            field_dict["milestones"] = milestones
         if error is not UNSET:
             field_dict["error"] = error
         if total_edges is not UNSET:
@@ -364,6 +392,7 @@ class GraphIndexStats:
         from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
         from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
         from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+        from ..models.index_milestones import IndexMilestones
         from ..models.index_readiness_status import IndexReadinessStatus
         from ..models.index_repair_status import IndexRepairStatus
 
@@ -376,6 +405,19 @@ class GraphIndexStats:
             readiness = UNSET
         else:
             readiness = IndexReadinessStatus.from_dict(_readiness)
+
+        incarnation = d.pop("incarnation", UNSET)
+
+        target_revision = d.pop("target_revision", UNSET)
+
+        published_revision = d.pop("published_revision", UNSET)
+
+        _milestones = d.pop("milestones", UNSET)
+        milestones: IndexMilestones | Unset
+        if isinstance(_milestones, Unset):
+            milestones = UNSET
+        else:
+            milestones = IndexMilestones.from_dict(_milestones)
 
         error = d.pop("error", UNSET)
 
@@ -512,6 +554,10 @@ class GraphIndexStats:
         graph_index_stats = cls(
             index_type=index_type,
             readiness=readiness,
+            incarnation=incarnation,
+            target_revision=target_revision,
+            published_revision=published_revision,
+            milestones=milestones,
             error=error,
             total_edges=total_edges,
             edge_types=edge_types,

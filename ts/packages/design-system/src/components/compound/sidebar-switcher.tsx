@@ -32,14 +32,10 @@ function SidebarSwitcherTrigger({
         data-slot="sidebar-switcher-trigger"
         className={cn(
           "data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground",
-          className,
+          className
         )}
       >
-        {icon && (
-          <div className="flex items-center justify-center min-w-8 h-8">
-            {icon}
-          </div>
-        )}
+        {icon && <div className="flex items-center justify-center min-w-8 h-8">{icon}</div>}
         <div className="flex flex-1 items-center text-left text-sm leading-tight">
           <span className="truncate font-semibold">{label}</span>
         </div>
@@ -61,19 +57,12 @@ function SidebarSwitcherContent({
   return (
     <DropdownMenuContent
       data-slot="sidebar-switcher-content"
-      className={cn(
-        "w-[--radix-dropdown-menu-trigger-width] min-w-56 rounded-lg",
-        className,
-      )}
+      className={cn("w-[--radix-dropdown-menu-trigger-width] min-w-56 rounded-lg", className)}
       align="start"
       side="bottom"
       sideOffset={4}
     >
-      {label && (
-        <DropdownMenuLabel className="mono-label px-2 py-1.5">
-          {label}
-        </DropdownMenuLabel>
-      )}
+      {label && <DropdownMenuLabel className="mono-label px-2 py-1.5">{label}</DropdownMenuLabel>}
       {children}
     </DropdownMenuContent>
   );
@@ -100,17 +89,10 @@ function SidebarSwitcherItem({
     >
       <div className="flex flex-col">
         <span className="font-medium">{name}</span>
-        {description && (
-          <span className="text-xs text-muted-foreground">{description}</span>
-        )}
+        {description && <span className="text-xs text-muted-foreground">{description}</span>}
       </div>
     </DropdownMenuItem>
   );
 }
 
-export {
-  SidebarSwitcher,
-  SidebarSwitcherContent,
-  SidebarSwitcherItem,
-  SidebarSwitcherTrigger,
-};
+export { SidebarSwitcher, SidebarSwitcherContent, SidebarSwitcherItem, SidebarSwitcherTrigger };

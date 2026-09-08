@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class StatefulQueryRequestExpandStrategy(str, Enum):
+class StatefulQueryRequestExpandStrategy(StrEnum):
     INTERSECTION = "intersection"
     UNION = "union"
 

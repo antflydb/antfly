@@ -383,35 +383,56 @@ func (rm *RouteManager) SelectDestination(route *Route, req *RouteRequest, regis
 		totalWeight += dest.Weight
 	}
 
+	return selectWeightedDestination(route, req, eligible, totalWeight), nil
+}
+
+// SelectActivationDestination chooses a genuinely cold destination using the
+// same static eligibility and weighted selection contract as normal routing.
+// A destination with healthy endpoints is runtime-ineligible, not cold, and
+// must fall through without spending the activation timeout.
+func (rm *RouteManager) SelectActivationDestination(route *Route, req *RouteRequest, registry *ModelRegistry, enabled func(string) bool) *Destination {
+	eligible := make([]Destination, 0, len(route.Destinations))
+	totalWeight := int32(0)
+	for _, destination := range route.Destinations {
+		if !enabled(destination.Pool) ||
+			!staticDestinationEligible(&destination, req) ||
+			registry.PoolConditionStats(destination.Pool, req.Model).HealthyEndpoints != 0 {
+			continue
+		}
+		eligible = append(eligible, destination)
+		totalWeight += destination.Weight
+	}
+	return selectWeightedDestination(route, req, eligible, totalWeight)
+}
+
+func selectWeightedDestination(route *Route, req *RouteRequest, eligible []Destination, totalWeight int32) *Destination {
 	if len(eligible) == 0 {
-		return nil, nil // No eligible destinations
+		return nil
 	}
-
-	// Weighted random selection
-	if len(eligible) == 1 {
-		return &eligible[0], nil
+	if len(eligible) == 1 || totalWeight <= 0 {
+		return &eligible[0]
 	}
-
-	if totalWeight <= 0 {
-		return &eligible[0], nil
-	}
-
-	// Use a deterministic weighted selection so repeated traffic splits
-	// remain stable without shared mutable RNG state.
 	selection := weightedSelectionValue(route, req, totalWeight)
 	cumulative := int32(0)
 	for i := range eligible {
 		cumulative += eligible[i].Weight
 		if selection < cumulative {
-			return &eligible[i], nil
+			return &eligible[i]
 		}
 	}
 
-	return &eligible[len(eligible)-1], nil
+	return &eligible[len(eligible)-1]
+}
+
+func staticDestinationEligible(dest *Destination, req *RouteRequest) bool {
+	return dest.TimeCondition == nil || dest.TimeCondition.IsActive(req.Timestamp)
 }
 
 func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest, registry *ModelRegistry) bool {
-	stats := registry.PoolConditionStats(dest.Pool, req.Model)
+	return rm.evaluateConditionStats(dest, req, registry.PoolConditionStats(dest.Pool, req.Model))
+}
+
+func (rm *RouteManager) evaluateConditionStats(dest *Destination, req *RouteRequest, stats PoolConditionStats) bool {
 	if stats.HealthyEndpoints == 0 {
 		return false // Pool has no healthy endpoints
 	}
@@ -445,10 +466,8 @@ func (rm *RouteManager) evaluateConditions(dest *Destination, req *RouteRequest,
 	}
 
 	// Check time condition
-	if dest.TimeCondition != nil {
-		if !dest.TimeCondition.IsActive(req.Timestamp) {
-			return false
-		}
+	if !staticDestinationEligible(dest, req) {
+		return false
 	}
 
 	return true

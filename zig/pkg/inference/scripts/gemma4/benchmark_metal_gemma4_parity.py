@@ -138,7 +138,9 @@ def run_antfly(
             "--combined-budget-mb",
             str(args.budget_mb),
         ]
-        command[command.index("--raw-prompt"):command.index("--raw-prompt")] = budget_args
+        command[command.index("--raw-prompt") : command.index("--raw-prompt")] = (
+            budget_args
+        )
     with log_path.open("w") as output:
         completed = subprocess.run(
             command,
@@ -149,7 +151,9 @@ def run_antfly(
             check=False,
         )
     if completed.returncode != 0:
-        raise GateError(f"Antfly sample {label} exited {completed.returncode}: {log_path}")
+        raise GateError(
+            f"Antfly sample {label} exited {completed.returncode}: {log_path}"
+        )
     try:
         payload = json.loads(json_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -185,25 +189,35 @@ def run_antfly(
     if a4b and not specialized and "metal_a4b_specialized_id: enabled=1" in log:
         raise GateError(f"rollback sample used specialized A4B kernel: {log_path}")
     if a4b:
-        route_tg_disabled = env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_A4B_ROUTE_SELECT_TG")
+        route_tg_disabled = env_flag_enabled(
+            env_extra, "TERMITE_METAL_DISABLE_A4B_ROUTE_SELECT_TG"
+        )
         route_tg_marker = "metal_a4b_route_select_tg: enabled=1"
         if route_tg_disabled and route_tg_marker in log:
             raise GateError(f"route-select rollback used SIMD-group kernel: {log_path}")
         if not route_tg_disabled and route_tg_marker not in log:
             raise GateError(f"A4B SIMD-group route-select marker missing: {log_path}")
-        lm_head_nbodd_disabled = env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_A4B_LM_HEAD_NBODD")
+        lm_head_nbodd_disabled = env_flag_enabled(
+            env_extra, "TERMITE_METAL_DISABLE_A4B_LM_HEAD_NBODD"
+        )
         lm_head_nbodd_marker = "metal_a4b_lm_head_nbodd: enabled=1"
         if lm_head_nbodd_disabled and lm_head_nbodd_marker in log:
             raise GateError(f"LM-head rollback used nb-odd kernel: {log_path}")
         if not lm_head_nbodd_disabled and lm_head_nbodd_marker not in log:
             raise GateError(f"A4B LM-head nb-odd marker missing: {log_path}")
-        argmax_tg_disabled = env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_A4B_ARGMAX_TG")
+        argmax_tg_disabled = env_flag_enabled(
+            env_extra, "TERMITE_METAL_DISABLE_A4B_ARGMAX_TG"
+        )
         argmax_tg_marker = "metal_a4b_argmax_tg: enabled=1"
         if argmax_tg_disabled and argmax_tg_marker in log:
             raise GateError(f"argmax rollback used threadgroup reducer: {log_path}")
         if not argmax_tg_disabled and argmax_tg_marker not in log:
             raise GateError(f"A4B argmax threadgroup marker missing: {log_path}")
-    if exercise_a4b_feature and not a4b and "metal_a4b_specialized_id: enabled=1" in log:
+    if (
+        exercise_a4b_feature
+        and not a4b
+        and "metal_a4b_specialized_id: enabled=1" in log
+    ):
         raise GateError(f"dense control selected an A4B-only kernel: {log_path}")
     if a4b:
         metal = payload.get("metal")
@@ -216,37 +230,65 @@ def run_antfly(
         prepared_frame = metal.get("prepared_frame")
         if not all(
             isinstance(value, dict)
-            for value in (resident, residency, q4_policy, frame_fallbacks, prepared_frame)
+            for value in (
+                resident,
+                residency,
+                q4_policy,
+                frame_fallbacks,
+                prepared_frame,
+            )
         ):
             raise GateError(f"A4B route telemetry missing: {json_path}")
         dispatches = resident.get("dispatches")
         model_buffer = resident.get("model_buffer")
         residency_set = resident.get("residency_set")
-        if not all(isinstance(value, dict) for value in (dispatches, model_buffer, residency_set)):
+        if not all(
+            isinstance(value, dict)
+            for value in (dispatches, model_buffer, residency_set)
+        ):
             raise GateError(f"A4B resident telemetry incomplete: {json_path}")
         down = int(dispatches.get("down") or 0)
         reduce = int(dispatches.get("reduce") or 0)
         fused = int(dispatches.get("fused_gate_up") or 0)
         if down <= 0 or reduce != down or fused != down * 2:
             raise GateError(f"A4B mapped dispatch contract failed: {json_path}")
-        if int(model_buffer.get("prepare_successes") or 0) != 1 or int(model_buffer.get("prepare_failures") or 0):
-            raise GateError(f"A4B model-wide mapped buffer was not admitted: {json_path}")
+        if int(model_buffer.get("prepare_successes") or 0) != 1 or int(
+            model_buffer.get("prepare_failures") or 0
+        ):
+            raise GateError(
+                f"A4B model-wide mapped buffer was not admitted: {json_path}"
+            )
         if int(residency_set.get("allocated_bytes") or 0) < 14_000_000_000:
             raise GateError(f"A4B residency set is not model-wide: {json_path}")
-        if int(residency.get("runtime_mapped_fallbacks") or 0) or int(residency.get("runtime_mapped_failures") or 0):
+        if int(residency.get("runtime_mapped_fallbacks") or 0) or int(
+            residency.get("runtime_mapped_failures") or 0
+        ):
             raise GateError(f"A4B mapped weights fell back: {json_path}")
         if int(q4_policy.get("mmv_variant_fallbacks") or 0):
             raise GateError(f"Q4_0 schedule fell back: {json_path}")
-        high_memory_fast_path = (
-            env_flag_enabled(env_extra, "TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH")
-            and not env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH")
+        high_memory_fast_path = env_flag_enabled(
+            env_extra, "TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH"
+        ) and not env_flag_enabled(
+            env_extra, "TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH"
         )
-        pipelined_decode = prepared_a4b and (
-            high_memory_fast_path
-            or env_flag_enabled(env_extra, "TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME")
-        ) and not env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME")
+        pipelined_decode = (
+            prepared_a4b
+            and (
+                high_memory_fast_path
+                or env_flag_enabled(
+                    env_extra, "TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"
+                )
+            )
+            and not env_flag_enabled(
+                env_extra, "TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"
+            )
+        )
         expected_prepared_frames = (
-            output_tokens if pipelined_decode else output_tokens - 1 if prepared_a4b else 0
+            output_tokens
+            if pipelined_decode
+            else output_tokens - 1
+            if prepared_a4b
+            else 0
         )
         if int(prepared_frame.get("fast_path") or 0) != expected_prepared_frames:
             raise GateError(
@@ -256,7 +298,9 @@ def run_antfly(
         if int(prepared_frame.get("fallback") or 0):
             raise GateError(f"A4B prepared decode fell back: {json_path}")
         if int(frame_fallbacks.get("decode_success") or 0) != expected_prepared_frames:
-            raise GateError(f"A4B successful decode-frame count differs from coverage: {json_path}")
+            raise GateError(
+                f"A4B successful decode-frame count differs from coverage: {json_path}"
+            )
         pipelined_marker = "metal_pipelined_decode_frame: enabled=1 owner=executor"
         if pipelined_decode and pipelined_marker not in log:
             raise GateError(f"A4B pipelined decode marker missing: {log_path}")
@@ -264,56 +308,92 @@ def run_antfly(
             raise GateError(f"A4B non-pipelined lane used pipelined decode: {log_path}")
         register_selector = (
             high_memory_fast_path
-            or env_flag_enabled(env_extra, "TERMITE_METAL_ENABLE_A4B_ROUTE_SELECT_REGISTER")
-        ) and not env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_A4B_ROUTE_SELECT_REGISTER")
+            or env_flag_enabled(
+                env_extra, "TERMITE_METAL_ENABLE_A4B_ROUTE_SELECT_REGISTER"
+            )
+        ) and not env_flag_enabled(
+            env_extra, "TERMITE_METAL_DISABLE_A4B_ROUTE_SELECT_REGISTER"
+        )
         register_marker = "metal_a4b_route_select_register: enabled=1"
         if register_selector and register_marker not in log:
             raise GateError(f"A4B register route-selector marker missing: {log_path}")
         if not register_selector and register_marker in log:
-            raise GateError(f"A4B register route-selector rollback was not honored: {log_path}")
+            raise GateError(
+                f"A4B register route-selector rollback was not honored: {log_path}"
+            )
         lm_head_nr4_nsg1 = (
             high_memory_fast_path
             or env_flag_enabled(env_extra, "TERMITE_METAL_ENABLE_A4B_LM_HEAD_NR4_NSG1")
-        ) and not env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_A4B_LM_HEAD_NR4_NSG1")
+        ) and not env_flag_enabled(
+            env_extra, "TERMITE_METAL_DISABLE_A4B_LM_HEAD_NR4_NSG1"
+        )
         lm_head_nr4_marker = "metal_a4b_lm_head_nr4_nsg1: enabled=1"
         if lm_head_nr4_nsg1 and lm_head_nr4_marker not in log:
             raise GateError(f"A4B NR4/NSG1 LM-head marker missing: {log_path}")
         if not lm_head_nr4_nsg1 and lm_head_nr4_marker in log:
-            raise GateError(f"A4B NR4/NSG1 LM-head rollback was not honored: {log_path}")
-        concurrent_hazard = prepared_a4b and (
-            high_memory_fast_path
-            or env_flag_enabled(env_extra, "TERMITE_METAL_ENABLE_A4B_CONCURRENT_HAZARD")
-        ) and not env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_A4B_CONCURRENT_HAZARD")
+            raise GateError(
+                f"A4B NR4/NSG1 LM-head rollback was not honored: {log_path}"
+            )
+        concurrent_hazard = (
+            prepared_a4b
+            and (
+                high_memory_fast_path
+                or env_flag_enabled(
+                    env_extra, "TERMITE_METAL_ENABLE_A4B_CONCURRENT_HAZARD"
+                )
+            )
+            and not env_flag_enabled(
+                env_extra, "TERMITE_METAL_DISABLE_A4B_CONCURRENT_HAZARD"
+            )
+        )
         concurrent_marker = "metal_a4b_concurrent_hazard: enabled=1"
         if concurrent_hazard and concurrent_marker not in log:
             raise GateError(f"A4B concurrent-hazard marker missing: {log_path}")
         if not concurrent_hazard and concurrent_marker in log:
-            raise GateError(f"A4B concurrent-hazard rollback was not honored: {log_path}")
-        split_frame_scratch = (
-            high_memory_fast_path
-            or env_flag_enabled(
-                env_extra, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"
+            raise GateError(
+                f"A4B concurrent-hazard rollback was not honored: {log_path}"
             )
-        ) and not env_flag_enabled(
-            env_extra, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"
-        ) and not env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT")
+        split_frame_scratch = (
+            (
+                high_memory_fast_path
+                or env_flag_enabled(
+                    env_extra, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"
+                )
+            )
+            and not env_flag_enabled(
+                env_extra, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"
+            )
+            and not env_flag_enabled(
+                env_extra, "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT"
+            )
+        )
         split_frame_scratch_marker = (
             "metal_a4b_decode_gqa_split_frame_scratch: enabled=1 slots=2"
         )
         if split_frame_scratch and split_frame_scratch_marker not in log:
-            raise GateError(f"A4B frame-owned split-GQA scratch marker missing: {log_path}")
+            raise GateError(
+                f"A4B frame-owned split-GQA scratch marker missing: {log_path}"
+            )
         if not split_frame_scratch and split_frame_scratch_marker in log:
-            raise GateError(f"A4B frame-owned split-GQA scratch rollback was not honored: {log_path}")
-        flash_prefill_hd256 = env_flag_enabled(
-            env_extra, "TERMITE_METAL_ENABLE_A4B_FLASH_PREFILL_HD256"
-        ) and not env_flag_enabled(
-            env_extra, "TERMITE_METAL_DISABLE_A4B_FLASH_PREFILL_HD256"
-        ) and not env_flag_enabled(env_extra, "TERMITE_METAL_DISABLE_FLASH_PREFILL_GENERATED")
+            raise GateError(
+                f"A4B frame-owned split-GQA scratch rollback was not honored: {log_path}"
+            )
+        flash_prefill_hd256 = (
+            env_flag_enabled(env_extra, "TERMITE_METAL_ENABLE_A4B_FLASH_PREFILL_HD256")
+            and not env_flag_enabled(
+                env_extra, "TERMITE_METAL_DISABLE_A4B_FLASH_PREFILL_HD256"
+            )
+            and not env_flag_enabled(
+                env_extra, "TERMITE_METAL_DISABLE_FLASH_PREFILL_GENERATED"
+            )
+        )
         flash_prefill_marker = "metal_a4b_flash_prefill_hd256: enabled=1"
         if flash_prefill_hd256 and flash_prefill_marker not in log:
             raise GateError(f"A4B local HD256 flash-prefill marker missing: {log_path}")
         if not flash_prefill_hd256 and flash_prefill_marker in log:
-            raise GateError(f"A4B local HD256 flash-prefill rollback was not honored: {log_path}")
+            raise GateError(
+                f"A4B local HD256 flash-prefill rollback was not honored: {log_path}"
+            )
         attention_dispatch = metal.get("attention_dispatch")
         if not isinstance(attention_dispatch, dict):
             raise GateError(f"A4B attention-dispatch telemetry missing: {json_path}")
@@ -327,13 +407,18 @@ def run_antfly(
                 f"({generated_flash_calls} != {expected_flash_calls}): {json_path}"
             )
         if int(attention_dispatch.get("generated_flash_prefill_hd512") or 0) != 5:
-            raise GateError(f"A4B global HD512 flash-prefill coverage is not 5: {json_path}")
+            raise GateError(
+                f"A4B global HD512 flash-prefill coverage is not 5: {json_path}"
+            )
         split_calls = int(attention_dispatch.get("decode_gqa_split") or 0)
         if prepared_a4b and split_frame_scratch and split_calls > 0:
             expected_split_calls = output_tokens * 30
             expected_paged_calls = 0 if flash_prefill_hd256 else 25
             paged_calls = int(attention_dispatch.get("paged_1x") or 0)
-            if split_calls != expected_split_calls or paged_calls != expected_paged_calls:
+            if (
+                split_calls != expected_split_calls
+                or paged_calls != expected_paged_calls
+            ):
                 raise GateError(
                     "A4B frame-owned split-GQA coverage is incomplete "
                     f"(split/paged={split_calls}/{paged_calls}, expected "
@@ -346,7 +431,11 @@ def run_antfly(
         )
         if expected_executor_marker not in log:
             raise GateError(f"A4B executor marker missing: {log_path}")
-        if any(int(value or 0) for key, value in frame_fallbacks.items() if key.endswith("fallback")):
+        if any(
+            int(value or 0)
+            for key, value in frame_fallbacks.items()
+            if key.endswith("fallback")
+        ):
             raise GateError(f"Metal frame execution fell back: {json_path}")
     return {
         "engine": "antfly",
@@ -414,7 +503,9 @@ def run_llama(
             check=False,
         )
     if completed.returncode != 0:
-        raise GateError(f"llama.cpp sample {label} exited {completed.returncode}: {log_path}")
+        raise GateError(
+            f"llama.cpp sample {label} exited {completed.returncode}: {log_path}"
+        )
     log = log_path.read_text(errors="replace")
     matches = list(LLAMA_EVAL.finditer(log))
     if not matches:
@@ -455,7 +546,9 @@ def parse_policy_env(value: str) -> tuple[str, str]:
         r"(?:TERMITE|ANTFLY_GEMMA4|ANTFLY_INFERENCE)_[A-Za-z0-9_]+",
         name,
     ):
-        raise argparse.ArgumentTypeError("policy environment entries must be NAME=VALUE")
+        raise argparse.ArgumentTypeError(
+            "policy environment entries must be NAME=VALUE"
+        )
     if any(character in setting for character in "\n\r\0"):
         raise argparse.ArgumentTypeError(
             "policy environment values cannot contain control characters"
@@ -488,8 +581,12 @@ def main() -> int:
     parser.add_argument("--min-rollback-ratio", type=float, default=0.99)
     parser.add_argument("--min-control-parity", type=float, default=0.90)
     parser.add_argument("--min-control-rollback-ratio", type=float, default=0.99)
-    parser.add_argument("--candidate-env", action="append", type=parse_policy_env, default=[])
-    parser.add_argument("--rollback-env", action="append", type=parse_policy_env, default=[])
+    parser.add_argument(
+        "--candidate-env", action="append", type=parse_policy_env, default=[]
+    )
+    parser.add_argument(
+        "--rollback-env", action="append", type=parse_policy_env, default=[]
+    )
     parser.add_argument("--rollback-specialized", action="store_true")
     parser.add_argument("--min-target-wins", type=int, default=0)
     parser.add_argument("--max-cv", type=float, default=1.0)
@@ -546,7 +643,9 @@ def main() -> int:
                     extra_env=(
                         args.candidate_env
                         if variant == "candidate"
-                        else args.rollback_env if variant == "rollback" else None
+                        else args.rollback_env
+                        if variant == "rollback"
+                        else None
                     ),
                 )
             llama = run_llama(
@@ -582,9 +681,13 @@ def main() -> int:
         prompt_ratio = median(candidate_values) / median(llama_values)
         prompt_ratios.append(prompt_ratio)
         if median(candidate_values) / median(baseline_values) < args.min_prepared_ratio:
-            raise GateError(f"A4B prepared candidate regressed compiled baseline on prompt {prompt_index}")
+            raise GateError(
+                f"A4B prepared candidate regressed compiled baseline on prompt {prompt_index}"
+            )
         if median(candidate_values) / median(rollback_values) < args.min_rollback_ratio:
-            raise GateError(f"A4B candidate regressed rollback on prompt {prompt_index}")
+            raise GateError(
+                f"A4B candidate regressed rollback on prompt {prompt_index}"
+            )
 
     baseline_all = [sample["baseline"]["decode_tok_s"] for sample in a4b_samples]
     candidate_all = [sample["candidate"]["decode_tok_s"] for sample in a4b_samples]
@@ -608,7 +711,9 @@ def main() -> int:
         control_samples: list[dict[str, Any]] = []
         prompt = args.prompts[0]
         for run in range(1, args.runs + 1):
-            variants = ("rollback", "candidate") if run % 2 else ("candidate", "rollback")
+            variants = (
+                ("rollback", "candidate") if run % 2 else ("candidate", "rollback")
+            )
             pair: dict[str, dict[str, Any]] = {}
             for variant in variants:
                 pair[variant] = run_antfly(
@@ -627,8 +732,13 @@ def main() -> int:
                 prompt=prompt,
                 output_tokens=args.control_output_tokens,
             )
-            if pair["candidate"]["token_ids_sha256"] != pair["rollback"]["token_ids_sha256"]:
-                raise GateError(f"{name} candidate/rollback token mismatch on run {run}")
+            if (
+                pair["candidate"]["token_ids_sha256"]
+                != pair["rollback"]["token_ids_sha256"]
+            ):
+                raise GateError(
+                    f"{name} candidate/rollback token mismatch on run {run}"
+                )
             candidate_values.append(pair["candidate"]["decode_tok_s"])
             rollback_values.append(pair["rollback"]["decode_tok_s"])
             llama_values.append(llama["decode_tok_s"])
@@ -652,7 +762,8 @@ def main() -> int:
                 "parity": parity,
                 "rollback_ratio": rollback_ratio,
                 "parity_passed": parity >= args.min_control_parity,
-                "no_regression_passed": rollback_ratio >= args.min_control_rollback_ratio,
+                "no_regression_passed": rollback_ratio
+                >= args.min_control_rollback_ratio,
                 "passed": parity >= args.min_control_parity
                 and rollback_ratio >= args.min_control_rollback_ratio,
                 "samples": control_samples,

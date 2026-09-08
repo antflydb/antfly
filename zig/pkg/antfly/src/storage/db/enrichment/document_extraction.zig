@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform_time = @import("antfly_platform").time;
@@ -3324,7 +3325,7 @@ fn buildStoredZipAlloc(alloc: Allocator, entries: []const TestZipEntry) ![]u8 {
 
     for (entries) |entry| {
         const offset = out.items.len;
-        const crc = std.hash.crc.Crc32.hash(entry.data);
+        const crc = Crc32.hash(entry.data);
         try appendZipLe32(alloc, &out, 0x04034b50);
         try appendZipLe16(alloc, &out, 20);
         try appendZipLe16(alloc, &out, 0);

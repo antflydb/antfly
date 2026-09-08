@@ -51,7 +51,7 @@ pub const Cluster = struct {
 
 pub const Segment = struct {
     dims: u32,
-    metric: vector_types.DistanceMetric = .cosine,
+    metric: vector_types.DistanceMetric = vector_types.default_distance_metric,
     base_probe_count: u32 = 2,
     shortlist_multiplier: u32 = 2,
     clusters: []Cluster,

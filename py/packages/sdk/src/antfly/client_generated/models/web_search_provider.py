@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class WebSearchProvider(str, Enum):
+class WebSearchProvider(StrEnum):
     BRAVE = "brave"
     EXA = "exa"
     LINKUP = "linkup"

@@ -15,6 +15,9 @@ comptime {
     _ = @import("backend_types.zig");
     _ = @import("background_runtime.zig");
     _ = @import("backup_codec.zig");
+    _ = @import("backup_bundle.zig");
+    _ = @import("backup_bundle_io.zig");
+    _ = @import("backup_repository.zig");
     _ = @import("coverage_identity.zig");
     _ = @import("db/aggregations.zig");
     _ = @import("db/algebraic/adaptive.zig");
@@ -93,6 +96,7 @@ comptime {
     _ = @import("db/ownership.zig");
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
+    _ = @import("db/publication.zig");
     _ = @import("db/query/graph_exec.zig");
     _ = @import("db/query/projection.zig");
     _ = @import("db/query/result_shape.zig");

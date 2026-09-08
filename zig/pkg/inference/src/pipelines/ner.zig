@@ -51,6 +51,7 @@ pub const NerPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: NerConfig,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 
     pub fn usesDistributedGpuHosted(self: *const NerPipeline) bool {
         return self.config.distributed.enabled and
@@ -80,6 +81,7 @@ pub const NerPipeline = struct {
     pub fn recognize(self: *NerPipeline, text: []const u8) ![]Entity {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         var run_permit = try self.session.admit(.{
             .batch = 1,
             .sequence = max_len,
@@ -89,6 +91,7 @@ pub const NerPipeline = struct {
                 return error.ResourceLimitExceeded,
         });
         defer run_permit.deinit();
+        if (self.execution_control) |control| try control.check();
 
         // Tokenize
         var enc = try self.tok.encodeForModel(alloc, text, max_len);
@@ -132,7 +135,7 @@ pub const NerPipeline = struct {
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
         // Run inference
-        var outputs = try run_permit.run(inputs, alloc);
+        var outputs = try run_permit.runWithControl(inputs, alloc, self.execution_control);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);
@@ -205,6 +208,7 @@ pub const NerPipeline = struct {
         // Skip [CLS] (index 0) and process tokens
         var i: usize = 1;
         while (i < seq_len) : (i += 1) {
+            if (self.execution_control) |control| if (i % 32 == 0) try control.check();
             if (attention_mask[i] == 0) break; // padding
             // Skip [SEP] token (last real token)
             if (i + 1 < seq_len and attention_mask[i + 1] == 0) break;

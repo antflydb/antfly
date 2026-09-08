@@ -20,10 +20,12 @@ import threading
 import time
 from collections.abc import Callable
 from socketserver import BaseServer
+from typing import TypeVar
 
 import requests
 
 HTTP_SERVER_POLL_INTERVAL_S = 0.02
+T = TypeVar("T")
 
 
 def start_http_server(server: BaseServer) -> threading.Thread:
@@ -76,26 +78,53 @@ def query_hits_total_value(hits: dict) -> int:
 
 
 def wait_until(
-    fn: Callable[[], dict | None],
+    fn: Callable[[], T | None],
     *,
     timeout_s: float,
     interval_s: float = 1.0,
-) -> dict | None:
+    ready_when: Callable[[T | None], bool] | None = None,
+) -> T | None:
+    """Poll until the result is ready, with an explicit predicate when needed.
+
+    The default retains the historical truthiness contract. Callers whose
+    domain includes valid falsey values (node index 0, empty collections, zero
+    counters) must supply ``ready_when`` instead of encoding readiness into the
+    value.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        retry_delay_s = interval_s
         try:
             result = fn()
         except requests.HTTPError as err:
             response = err.response
-            if (
-                response is not None
-                and response.status_code == 503
-                and "doc identity unavailable" in response.text
-            ):
+            retryable = False
+            if response is not None and response.status_code == 503:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                retryable = (
+                    isinstance(payload, dict) and payload.get("retryable") is True
+                )
+                # Preserve compatibility with older servers that returned the
+                # original transient identity response as plain text.
+                retryable = retryable or "doc identity unavailable" in response.text
+                if retryable:
+                    try:
+                        retry_delay_s = max(
+                            interval_s,
+                            float(response.headers.get("Retry-After", interval_s)),
+                        )
+                    except ValueError:
+                        retry_delay_s = interval_s
+            if retryable:
                 result = None
             else:
                 raise
-        if result:
+        if ready_when(result) if ready_when is not None else bool(result):
             return result
-        time.sleep(interval_s)
+        remaining_s = deadline - time.monotonic()
+        if remaining_s > 0:
+            time.sleep(min(retry_delay_s, remaining_s))
     return None

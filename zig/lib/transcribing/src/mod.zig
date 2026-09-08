@@ -636,9 +636,7 @@ const VertexTranscriberState = struct {
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
     var cfg = if (credentials_path) |path| blk: {
-        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return error.MissingVertexCredentials;
-        errdefer service_account.deinit(alloc);
-        break :blk google_auth.configFromServiceAccountAlloc(alloc, service_account, vertex_auth_scope) catch return error.MissingVertexCredentials;
+        break :blk google_auth.configFromFileAlloc(alloc, path, vertex_auth_scope) catch return error.MissingVertexCredentials;
     } else google_auth.configFromEnvAlloc(alloc, vertex_auth_scope) catch return error.MissingVertexCredentials;
     errdefer cfg.deinit(alloc);
 
@@ -650,11 +648,9 @@ fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*goog
 
 fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u8) !?[]u8 {
     if (credentials_path) |path| {
-        var service_account = google_auth.serviceAccountFromFileAlloc(alloc, path) catch return null;
-        defer service_account.deinit(alloc);
-        return if (service_account.project_id) |value| try alloc.dupe(u8, value) else null;
+        return google_auth.projectIdFromFileAlloc(alloc, path) catch null;
     }
-    return try google_auth.serviceAccountEnvProjectIdAlloc(alloc);
+    return try google_auth.projectIdFromDefaultCredentialsAlloc(alloc);
 }
 
 const MultipartBody = struct {

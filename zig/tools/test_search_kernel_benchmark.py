@@ -48,13 +48,21 @@ class KernelBenchmarkTest(unittest.TestCase):
     def test_parse_ps_cpu_time(self):
         self.assertEqual(benchmark.parse_ps_cpu_time("0:01.25"), 1_250_000_000)
         self.assertEqual(benchmark.parse_ps_cpu_time("2:03:04.50"), 7_384_500_000_000)
-        self.assertEqual(benchmark.parse_ps_cpu_time("1-02:03:04.50"), 93_784_500_000_000)
+        self.assertEqual(
+            benchmark.parse_ps_cpu_time("1-02:03:04.50"), 93_784_500_000_000
+        )
 
     def test_positive_manifest_metric(self):
-        self.assertEqual(benchmark.positive_manifest_metric({"elapsed": 42}, "elapsed"), 42)
+        self.assertEqual(
+            benchmark.positive_manifest_metric({"elapsed": 42}, "elapsed"), 42
+        )
         self.assertIsNone(benchmark.positive_manifest_metric({"elapsed": 0}, "elapsed"))
-        self.assertIsNone(benchmark.positive_manifest_metric({"elapsed": True}, "elapsed"))
-        self.assertIsNone(benchmark.positive_manifest_metric({"elapsed": "42"}, "elapsed"))
+        self.assertIsNone(
+            benchmark.positive_manifest_metric({"elapsed": True}, "elapsed")
+        )
+        self.assertIsNone(
+            benchmark.positive_manifest_metric({"elapsed": "42"}, "elapsed")
+        )
         self.assertIsNone(benchmark.positive_manifest_metric({}, "elapsed"))
 
     def test_compatible_manifest_preflight_accepts_equal_contract(self):

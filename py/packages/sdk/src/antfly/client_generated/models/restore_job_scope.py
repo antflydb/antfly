@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RestoreJobScope(str, Enum):
+class RestoreJobScope(StrEnum):
     CLUSTER = "cluster"
     TABLE = "table"
 

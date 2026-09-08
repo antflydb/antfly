@@ -31,7 +31,11 @@ Hot standby requires an `AntflyCluster` with:
 - standby topology, including standby names, slots, and admin URLs;
 - durable runtime paths for the primary HA log, standby received-WAL log,
   progress WAL, fence WAL, and former-primary log where applicable;
-- `spec.highAvailability.admin.primaryURL` for primary-scoped actions;
+- `spec.highAvailability.admin.primaryURL` through the production route for
+  primary status and authority observations;
+- optional `spec.highAvailability.admin.primaryActionURL` for primary-scoped
+  slot and seed actions that must remain reachable while that route is
+  intentionally unready (actions fall back to `primaryURL` when omitted);
 - `spec.highAvailability.admin.executePlannedActions: true` when the operator
   is expected to execute typed admin actions;
 - matching admin bearer-token environment injection for the operator and
@@ -165,6 +169,13 @@ unbounded retention.
 
 Configure `standbys[*].seedArtifact` when the source backup and the standby do
 not share a filesystem. The same path is used for initial bootstrap and reseed:
+
+The object-store credentials must permit `ListBucketVersions` and
+`DeleteObjectVersion` in addition to ordinary list/get/put/delete operations.
+When HA is disabled or an instance is deleted, Antfly inventories and deletes
+every version and delete marker below the exact instance seed prefix before it
+publishes a successful cleanup receipt. This remains required for unversioned
+buckets because S3-compatible providers expose the same version-list contract.
 
 1. capture the base backup in the primary runtime and freeze its manifest boundary;
 2. publish every file and bounded chunk to an immutable object-store generation, then publish `COMPLETE.json` last;

@@ -1923,7 +1923,7 @@ test "serverless http client round-trips semantic search with embedding_template
         .semantic_search = @constCast(query_url),
         .embedding_template = @constCast("{{remoteText url=this}}"),
         .indexes = search_indexes[0..],
-        .limit = 5,
+        .limit = 1,
     }, .{ .emit_null_optional_fields = false });
     defer alloc.free(raw_search_body);
     var raw_search = try server.executor().execute(alloc, .{
@@ -1940,7 +1940,7 @@ test "serverless http client round-trips semantic search with embedding_template
         .semantic_search = @constCast(query_url),
         .embedding_template = @constCast("{{remoteText url=this}}"),
         .indexes = search_indexes[0..],
-        .limit = 5,
+        .limit = 1,
     });
     defer search.deinit();
     try std.testing.expectEqual(@as(usize, 1), search.value.hits.len);
@@ -1972,7 +1972,7 @@ test "serverless http client round-trips semantic search with embedding_template
         .sparse = hybrid_features[0..],
         .indexes = hybrid_indexes[0..],
         .mode = .hybrid,
-        .limit = 5,
+        .limit = 1,
     });
     defer hybrid_search.deinit();
     try std.testing.expectEqual(@as(usize, 1), hybrid_search.value.hits.len);

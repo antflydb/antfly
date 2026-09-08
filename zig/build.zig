@@ -166,6 +166,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/inference/api.yaml",
     "../specs/openapi/inference/config.yaml",
     "../specs/openapi/shared/generating.yaml",
+    "../specs/openapi/shared/provider.yaml",
     "../specs/openapi/antfly/schema.yaml",
     "../specs/openapi/antfly/indexes.yaml",
     "../specs/openapi/antfly/generated/graph_identifier.yaml",
@@ -187,6 +188,7 @@ const inference_delegated_steps = [_][]const u8{
     "bench-gliner2-native",
     "gliner2-entity-training-readiness",
     "test-finetune",
+    "test-cancellation-e2e",
     "test",
     "wasm",
 };
@@ -314,6 +316,18 @@ fn compileFiltersWithAnchors(
     return filters[0..count];
 }
 
+fn addAntflyTestRunArtifact(
+    b: *std.Build,
+    tests: *std.Build.Step.Compile,
+) *std.Build.Step.Run {
+    if (tests.test_runner == null) {
+        const runner_path = b.path("pkg/antfly/src/test_runner.zig");
+        tests.test_runner = .{ .path = runner_path, .mode = .simple };
+        runner_path.addStepDependencies(&tests.step);
+    }
+    return b.addRunArtifact(tests);
+}
+
 /// Zig's compile-time filters can retain imported anonymous tests needed for
 /// semantic analysis. Give every filtered artifact the exact-filter runner and
 /// apply the caller's independently selected runtime filters so compile-only
@@ -323,12 +337,7 @@ fn addFilteredTestRunArtifactWithRuntimeFilters(
     tests: *std.Build.Step.Compile,
     runtime_filters: []const []const u8,
 ) *std.Build.Step.Run {
-    if (tests.test_runner == null) {
-        const runner_path = b.path("pkg/antfly/src/test_runner.zig");
-        tests.test_runner = .{ .path = runner_path, .mode = .simple };
-        runner_path.addStepDependencies(&tests.step);
-    }
-    const run = b.addRunArtifact(tests);
+    const run = addAntflyTestRunArtifact(b, tests);
     addRuntimeTestFilters(b, run, runtime_filters);
     return run;
 }
@@ -743,11 +752,13 @@ const AntflyRootImports = struct {
     extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
     httpx: *std.Build.Module,
+    credentials: *std.Build.Module,
     google: *std.Build.Module,
     objectstore: *std.Build.Module,
     bloom: *std.Build.Module,
     vector: *std.Build.Module,
     vectorindex: *std.Build.Module,
+    hash: *std.Build.Module,
     matcher: *std.Build.Module,
     resolver: *std.Build.Module,
     casbin: *std.Build.Module,
@@ -813,11 +824,13 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
         .{ .name = "httpx", .field = "httpx" },
+        .{ .name = "antfly_credentials", .field = "credentials" },
         .{ .name = "antfly_google", .field = "google" },
         .{ .name = "objectstore", .field = "objectstore" },
         .{ .name = "bloom", .field = "bloom" },
         .{ .name = "antfly_vector", .field = "vector" },
         .{ .name = "antfly_vectorindex", .field = "vectorindex" },
+        .{ .name = "antfly_hash", .field = "hash" },
         .{ .name = "antfly_matcher", .field = "matcher" },
         .{ .name = "antfly_resolver", .field = "resolver" },
         .{ .name = "antfly_casbin", .field = "casbin" },
@@ -1131,6 +1144,7 @@ fn addPublicOpenApiModule(
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
+            .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -1281,6 +1295,7 @@ fn addOpenApiRegenRun(
     codegen.addFileArg(json_spec);
     codegen.addArgs(&.{ "--package", package_name });
     codegen.addArgs(&.{ "--generate", generate_what });
+    codegen.addArgs(&.{ "--import-mapping", "../shared/provider.yaml=antfly_provider_openapi", "--import-mapping", "./provider.yaml=antfly_provider_openapi", "--import-mapping", "specs/openapi/shared/provider.yaml=antfly_provider_openapi" });
     for (import_mappings) |mapping| {
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
@@ -1299,10 +1314,12 @@ fn addOpenApiRegenStep(
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const inference_generated_root = "pkg/inference/src/api/generated";
     const runs = [_]*std.Build.Step.Run{
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/provider.yaml"), "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
             .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
             .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
             .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
+            .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
             .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
             .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
@@ -1344,6 +1361,7 @@ fn addOpenApiRegenStep(
             .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
             .{ "indexes.yaml", "antfly_indexes_openapi" },
             .{ "sort.yaml", "antfly_sort_openapi" },
+            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "schema.yaml", "antfly_schema_openapi" },
             .{ "generating.yaml", "antfly_generating_api_openapi" },
             .{ "eval.yaml", "antfly_eval_openapi" },
@@ -1499,6 +1517,8 @@ pub fn build(b: *std.Build) void {
         inference_enable_system_blas,
         inference_blas_root,
     );
+    const platform_tests = addDelegatedPackageStep(b, "platform", "lib/platform", "test", "lib/platform");
+    delegated_inference_steps.inference_test.dependOn(platform_tests.step);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true, antfly_version);
@@ -1551,9 +1571,15 @@ pub fn build(b: *std.Build) void {
     const chunking_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi");
     const chunking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi");
     const embeddings_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi");
+    const provider_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi");
     const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
     const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
     const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
+    embeddings_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    generating_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    reranking_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    public_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    client_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     const generating_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi");
     const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
     extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1570,6 +1596,7 @@ pub fn build(b: *std.Build) void {
     public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     public_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    public_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
     public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
@@ -1586,6 +1613,7 @@ pub fn build(b: *std.Build) void {
     metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
     metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
     metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
@@ -1637,12 +1665,23 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wasm_credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const google_mod = b.createModule(.{
         .root_source_file = b.path("lib/google/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     google_mod.addImport("httpx", httpx_mod);
+    google_mod.addImport("antfly_credentials", credentials_mod);
     google_mod.addImport("antfly_platform", platform_mod);
     objectstore_mod.addImport("httpx", httpx_mod);
     objectstore_mod.addImport("antfly_platform", platform_mod);
@@ -1658,6 +1697,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm_google_mod.addImport("httpx", httpx_mod);
+    wasm_google_mod.addImport("antfly_credentials", wasm_credentials_mod);
     wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("httpx", httpx_mod);
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
@@ -1679,6 +1719,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm_vector_mod.addImport("protobuf", protobuf_mod);
+    const hash_mod = b.createModule(.{
+        .root_source_file = b.path("lib/hash/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const wasm_hash_mod = b.createModule(.{
+        .root_source_file = b.path("lib/hash/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    // Standalone benchmark roots force ReleaseFast even when the root build
+    // defaults to Debug. Keep their checksum dependency equally optimized.
+    const hash_bench_mod = if (optimize == .ReleaseFast) hash_mod else b.createModule(.{
+        .root_source_file = b.path("lib/hash/src/mod.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     const vectorindex_mod = b.createModule(.{
         .root_source_file = b.path("lib/vectorindex/src/mod.zig"),
         .target = target,
@@ -1711,6 +1768,7 @@ pub fn build(b: *std.Build) void {
     });
     storage_mod.addImport("bloom", bloom_mod);
     storage_mod.addImport("antfly_platform", platform_mod);
+    storage_mod.addImport("antfly_hash", hash_mod);
     const usermgr_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/mod.zig"),
         .target = target,
@@ -1835,8 +1893,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    image_mod.addImport("antfly_hash", hash_mod);
     const pdf_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pdf_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1847,6 +1911,7 @@ pub fn build(b: *std.Build) void {
     });
     pdf_mod.addImport("antfly_image", image_mod);
     pdf_mod.addImport("antfly_font", font_mod);
+    pdf_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_mod, target);
         pdf_mod.linkFramework("CoreFoundation", .{});
@@ -1857,8 +1922,14 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = optimize,
     });
+    wasm_image_mod.addImport("antfly_hash", wasm_hash_mod);
     const wasm_pdf_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_pdf_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
@@ -1869,6 +1940,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm_pdf_mod.addImport("antfly_image", wasm_image_mod);
     wasm_pdf_mod.addImport("antfly_font", wasm_font_mod);
+    wasm_pdf_mod.addImport("pdf_standard_fonts", wasm_pdf_standard_fonts_mod);
 
     const sentencepiece_proto_mod = addLocalSentencePieceProtoModule(b, protobuf_dep);
     const inference_jinja_mod = b.createModule(.{
@@ -1947,6 +2019,7 @@ pub fn build(b: *std.Build) void {
             .regex = regex_mod,
             .jsonschema = jsonschema_mod,
             .image = image_mod,
+            .hash = hash_mod,
             .prometheus = prometheus_mod,
             .structlog = structlog_mod,
             .jinja = inference_jinja_mod,
@@ -2062,11 +2135,13 @@ pub fn build(b: *std.Build) void {
         .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
         .httpx = httpx_mod,
+        .credentials = credentials_mod,
         .google = google_mod,
         .objectstore = objectstore_mod,
         .bloom = bloom_mod,
         .vector = vector_mod,
         .vectorindex = vectorindex_mod,
+        .hash = hash_mod,
         .matcher = matcher_mod,
         .resolver = resolver_mod,
         .casbin = casbin_mod,
@@ -2248,6 +2323,7 @@ pub fn build(b: *std.Build) void {
         bloom_mod,
         vector_mod,
         vectorindex_mod,
+        hash_mod,
         vellum_mod,
         regex_mod,
         image_mod,
@@ -2263,6 +2339,10 @@ pub fn build(b: *std.Build) void {
     });
     @call(.auto, configureEmbeddedModule, .{ b, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
     embedded_support_mod.addImport("antfly_scraping", scraping_mod);
+    embedded_support_mod.addImport("antfly_resolver", resolver_mod);
+    embedded_support_mod.addImport("antfly_matcher", matcher_mod);
+    embedded_support_mod.addImport("antfly_reader_config", reader_config_mod);
+    embedded_support_mod.addImport("antfly_transcribing", transcribing_mod);
 
     const embedded_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
@@ -2333,6 +2413,7 @@ pub fn build(b: *std.Build) void {
         wasm_bloom_mod,
         wasm_vector_mod,
         wasm_vectorindex_mod,
+        wasm_hash_mod,
         vellum_mod,
         regex_mod,
         wasm_image_mod,
@@ -2534,28 +2615,26 @@ pub fn build(b: *std.Build) void {
         install_shader_steps[i] = &install_shader.step;
     }
 
-    const install_wasm_step = b.step("install-wasm", "Build and install the unified antfly wasm target (antfly-embedded + inference runtime)");
-    install_wasm_step.dependOn(&install_antfly_wasm.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_smoke_run.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_client.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_browser.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_index.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_readme.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_webgpu_ops.step);
+    const wasm_step = b.step("wasm", "Build and install the unified antfly wasm target (antfly-embedded + inference runtime)");
+    wasm_step.dependOn(&install_antfly_wasm.step);
+    wasm_step.dependOn(&install_antfly_wasm_smoke_run.step);
+    wasm_step.dependOn(&install_antfly_wasm_client.step);
+    wasm_step.dependOn(&install_antfly_wasm_browser.step);
+    wasm_step.dependOn(&install_antfly_wasm_index.step);
+    wasm_step.dependOn(&install_antfly_wasm_readme.step);
+    wasm_step.dependOn(&install_antfly_wasm_webgpu_ops.step);
     for (&install_shader_steps) |step| {
-        install_wasm_step.dependOn(step);
+        wasm_step.dependOn(step);
     }
 
     const run_antfly_wasm_smoke = b.addSystemCommand(&.{
         "node",
         b.getInstallPath(.prefix, "antfly-wasm/run.mjs"),
     });
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm.step);
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm_smoke_run.step);
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm_client.step);
+    run_antfly_wasm_smoke.step.dependOn(wasm_step);
 
-    const wasm_step = b.step("wasm", "Build and run the antfly wasm smoke test under Node");
-    wasm_step.dependOn(&run_antfly_wasm_smoke.step);
+    const wasm_test_step = b.step("wasm-test", "Build the Antfly WASM bundle and run its Node smoke test");
+    wasm_test_step.dependOn(&run_antfly_wasm_smoke.step);
 
     // Static library
     const lib = b.addLibrary(.{
@@ -2897,6 +2976,7 @@ pub fn build(b: *std.Build) void {
     });
     common_http_test_mod.addImport("raft_engine", raft_engine_mod);
     common_http_test_mod.addImport("antfly_platform", platform_mod);
+    common_http_test_mod.addImport("antfly_hash", hash_mod);
     common_http_test_mod.addImport("httpx", httpx_mod);
     const common_http_tests = b.addTest(.{
         .root_module = common_http_test_mod,
@@ -2912,7 +2992,10 @@ pub fn build(b: *std.Build) void {
 
     const httpx_transport_regression_tests = b.addTest(.{
         .root_module = httpx_mod,
-        .filters = &.{"H2 response serialization strips connection-specific headers"},
+        .filters = &.{
+            "H2 response serialization strips connection-specific headers",
+            "HTTP streaming headers and automatic preflight preserve middleware policy",
+        },
     });
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
 
@@ -3023,11 +3106,33 @@ pub fn build(b: *std.Build) void {
         .root_module = portable_backup_test_mod,
         .filters = &.{
             "export and import documents round trip",
+            "portable AFB2 delta resolves exact base and deduplicates physical blobs",
             "file import restores Go cross-backend portable fixture",
             "file import restores production Go portable fixture",
             "file import rejects oversized portable blocks before allocation",
+            "import preflights full portable envelope before mutating destination",
+            "export and import documents preserve timestamps",
+            "export and import chunk artifacts round trip with public artifact ids",
+            "export and import asset artifacts round trip with public artifact ids",
+            "export and import resolution artifacts round trip with public artifact ids",
             "portable graph conversion accepts generation-less v1 edge artifacts",
             "document batch round-trip",
+            "AFB2 manifest separates representation from snapshot mode",
+            "AFB2 manifest rejects ambiguous delta and traversal paths",
+            "AFB2 delta base binds inventory and identity to one canonical manifest",
+            "AFB2 readers fail closed on declared unsupported payload features",
+            "AFB2 trailer locates the footer without scanning payloads",
+            "AFB2 native directory round trips through staged extraction",
+            "AFB2 native delta requires and resolves the exact parent manifest",
+            "repository manifest is a complete canonical materialized inventory",
+            "repository inventory preserves logical paths while deduplicating bytes",
+            "repository manifest parsing is bounded before allocation",
+            "repository ref publication is compare and swap",
+            "incremental plan uploads only blobs absent from complete parent",
+            "repository incremental upload streams only blobs absent from exact parent",
+            "repository publishes resolves and materializes one complete deduplicated snapshot",
+            "repository epoch fences GC and active publication leases retain candidates",
+            "repository reachability fails closed while an active lease manifest is missing",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3051,6 +3156,14 @@ pub fn build(b: *std.Build) void {
     const run_lib_embeddings_tests = b.addRunArtifact(lib_embeddings_tests);
     const lib_embeddings_test_step = b.step("lib-embeddings-test", "Run standalone lib/embeddings tests");
     lib_embeddings_test_step.dependOn(&run_lib_embeddings_tests.step);
+
+    const lib_hash_tests = b.addTest(.{
+        .root_module = hash_mod,
+        .filters = b.args orelse &.{},
+    });
+    const run_lib_hash_tests = b.addRunArtifact(lib_hash_tests);
+    const lib_hash_test_step = b.step("lib-hash-test", "Run standalone lib/hash tests");
+    lib_hash_test_step.dependOn(&run_lib_hash_tests.step);
 
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
@@ -3098,6 +3211,18 @@ pub fn build(b: *std.Build) void {
         .root_module = image_test_mod,
     });
     const run_lib_image_tests = b.addRunArtifact(lib_image_tests);
+    // A named image dependency does not discover its internal PNG tests.
+    // Compile PNG as a test root to verify its checksum/container integration.
+    const png_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/png.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    png_test_mod.addImport("antfly_hash", hash_mod);
+    const png_tests = b.addTest(.{ .root_module = png_test_mod });
+    const run_png_tests = b.addRunArtifact(png_tests);
+    b.step("lib-image-png-test", "Run PNG codec and checksum compatibility tests").dependOn(&run_png_tests.step);
+
     const jpeg2000_decode_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/jpeg2000/decode.zig"),
         .target = target,
@@ -3114,6 +3239,7 @@ pub fn build(b: *std.Build) void {
     jpeg2000_decode_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
     lib_image_test_step.dependOn(&run_lib_image_tests.step);
+    lib_image_test_step.dependOn(&run_png_tests.step);
     lib_image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_test_mod = b.createModule(.{
@@ -3123,6 +3249,7 @@ pub fn build(b: *std.Build) void {
     });
     pdf_test_mod.addImport("antfly_image", image_mod);
     pdf_test_mod.addImport("antfly_font", font_mod);
+    pdf_test_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_test_mod, target);
         pdf_test_mod.linkFramework("CoreFoundation", .{});
@@ -3145,6 +3272,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    lib_image_bench_mod.addImport("antfly_hash", hash_bench_mod);
     lib_image_bench_mod.addOptions("build_options", lib_image_bench_build_options);
     if (lib_image_spng_paths) |spng_paths| {
         lib_image_bench_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
@@ -3179,6 +3307,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    pdf_bench_image_mod.addImport("antfly_hash", hash_bench_mod);
     const pdf_bench_font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = target,
@@ -3189,8 +3318,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const pdf_bench_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
+    pdf_bench_pdf_mod.addImport("pdf_standard_fonts", pdf_bench_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_bench_pdf_mod, target);
         pdf_bench_pdf_mod.linkFramework("CoreFoundation", .{});
@@ -3239,6 +3374,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_image_conformance_test_mod.addImport("antfly_hash", hash_mod);
     const lib_image_conformance_tests = b.addTest(.{
         .root_module = lib_image_conformance_test_mod,
         .filters = &.{"conformance corpus"},
@@ -3254,6 +3390,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_image_corpus_mod.addImport("antfly_hash", hash_mod);
     lib_image_corpus_mod.addOptions("build_options", lib_image_corpus_build_options);
     if (lib_image_spng_paths) |spng_paths| {
         lib_image_corpus_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
@@ -3414,11 +3551,24 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
+        .filters = &.{ "generating backend", "local generation budgets", "local generation bridge", "asset producer runtime", "provider quotas", "vertex provider" },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
     lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+
+    const lib_google_tests = b.addTest(.{ .root_module = google_mod });
+    const run_lib_google_tests = addFilteredTestRunArtifact(b, lib_google_tests);
+    const lib_google_test_step = b.step("lib-google-test", "Run Google credential cache and transport tests");
+    lib_google_test_step.dependOn(&run_lib_google_tests.step);
+
+    const lib_managed_embedder_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"managed embedder"},
+    });
+    const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
+    const lib_managed_embedder_test_step = b.step("lib-managed-embedder-test", "Run managed embedder contract and provider tests");
+    lib_managed_embedder_test_step.dependOn(&run_lib_managed_embedder_tests.step);
 
     const lib_reranking_tests = b.addTest(.{
         .root_module = reranking_mod,
@@ -3471,6 +3621,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "preload model spec parser categorizes registry variants and backends",
             "inference runtime preload parser preserves registry variants and explicit backends",
+            "inference list accepts models directory before or after flags",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3527,6 +3678,18 @@ pub fn build(b: *std.Build) void {
     const run_embedded_tests = addFilteredTestRunArtifact(b, embedded_tests);
     const embedded_test_step = b.step("embedded-test", "Run embedded API tests");
     embedded_test_step.dependOn(&run_embedded_tests.step);
+    // Imported module roots do not collect their own tests through the package
+    // surface test, so run the API fixtures in their owning module as well.
+    const embedded_api_tests = b.addTest(.{
+        .root_module = embedded_api_mod,
+        .filters = &.{
+            "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
+            "embedded api hosted profile drains derived indexing without native runtimes",
+            "embedded api hosted profile persists text index across reopen over storage",
+        },
+    });
+    const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
+    embedded_test_step.dependOn(&run_embedded_api_tests.step);
 
     const antfly_embedded_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_pkg_mod,
@@ -3593,7 +3756,9 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "boundary dispatcher preserves local calls and maps cross-unit calls",
         "bedrock provider request helpers",
+        "embedding provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
         "restore runtime store persists checkpoints and requeues interrupted work",
@@ -3624,6 +3789,16 @@ pub fn build(b: *std.Build) void {
         "managed embedder deadlines bound provider pacing and transport",
         "managed embedder dimension probe validation modes",
         "managed embedder rejects malformed provider vectors",
+        "managed embedder rejects unsupported execution namespaces",
+        "managed embedder separates index and artifact lookup namespaces",
+        "managed embedder validates sparse config with probe during normalization",
+        "managed embedder routes antfly without api_url to local provider",
+        "managed embedder artifact backed embedding translation",
+        "managed embedder binds execution to catalog semantic producer identity",
+        "managed embedder reuses an executable owner for producerless artifact consumers",
+        "managed embedder catalog ownership rejects orphaned semantic producers",
+        "catalog ownership rejects duplicate executable owners and endpoint mismatches",
+        "metadata http client preserves artifact dependency conflicts",
         "managed embedder preserves coverage policy in storage config",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
@@ -3646,6 +3821,18 @@ pub fn build(b: *std.Build) void {
         "compact index repair status keeps corrupt terminal state actionable",
         "data runtime report preserves compact managed repair admission state",
         "metadata status JSON preserves compact managed repair admission state",
+        "catalog sources without compact routing fail closed",
+        "span routing uses compact catalog snapshot when available",
+        "span routing confirms eventual misses with a linearizable compact snapshot",
+        "route resolver confirms a table-present range miss linearly",
+        "eventual span routing distinguishes snapshot timeout",
+        "await route observes delayed publication without a polling sleep",
+        "await route distinguishes persistent absence from capture timeout",
+        "await route reports an expired pre-capture deadline as timed out",
+        "route projection preserves order and remains bounded after capture",
+        "pinned fanout rejects mismatched fence identity",
+        "metadata routing server converts relative budget to local deadline",
+        "metadata routing change client forwards an authority-scoped long poll",
         "remote runtime status reports replay debt separately from active catch-up",
         "table storage status sums complete fresh shard disk usage",
         "metadata.table status encoder honors storage status overrides",
@@ -3664,11 +3851,20 @@ pub fn build(b: *std.Build) void {
         "backend runtime rejects API lane leases after shutdown begins",
         "backend runtime control lane leases are isolated from API leases",
         "backend runtime inference lane has an isolated bounded executor",
+        "backend runtime separates native operation IO from outbound network IO",
+        "backend runtime native API lane preserves filesystem errors across executors",
+        "backend runtime exposes native API filesystem IO separately",
         "backend runtime rejects control lane leases after shutdown begins",
         "provisioned table write cache retires stale db when index metadata changes",
         "table runtime snapshot cache preserves active managed admission proof",
         "managed startup catch-up advances counterless incomplete dense repair",
         "db completed partial managed admission serves and retires redundant repair",
+        "db status cannot reopen a quarantined generation from an older publication certificate",
+        "db status cannot reopen managed admission after shadow build handoff",
+        "db initial replay repair cannot reopen admission during shadow reconstruction",
+        "db empty managed index does not invent generated coverage recovery debt",
+        "db repair preflight retains a canonical generation completed after scheduler selection",
+        "db coverage recovery admits a published generation after its admission marker retires",
         "provisioned leader admission rejects uncommitted writes under dense repair pressure",
         "api maintenance resumes recovered durable named index cancellation without client advance",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
@@ -3681,6 +3877,9 @@ pub fn build(b: *std.Build) void {
         "actionable repair remains visible while retained generation stays queryable",
         "serviceable full text replacement remains queryable while rebuilding",
         "progressive embeddings readiness exposes a queryable partial generation",
+        "readiness evaluation cannot complete while convergence work remains",
+        "readiness completion fences include every observation dimension",
+        "missing target observation preserves serving snapshot and blocks only completion",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "table contract rejects unsupported index kinds before admission",
@@ -3691,6 +3890,14 @@ pub fn build(b: *std.Build) void {
         "table contract treats nullable nested index fields as omitted",
         "table contract preserves artifact-backed public full text indexes",
         "table contract rejects invalid inline artifact enrichments before admission",
+        "table contract normalizes public artifact enrichment request",
+        "restore admission rejects an embedding artifact catalog without an executable producer",
+        "extension lifecycle rejects artifact embedding consumers without executable producers",
+        "extension lifecycle rejects duplicate executable artifact owners",
+        "extension lifecycle requires stable identity for executable artifact owners",
+        "managed embedding catalog normalization persists stable producer identity",
+        "exact replacement protects only changed extension-owned state",
+        "authoritative catalog mutation boundaries reject orphaned semantic producers",
         "public enrichment validation rejects invalid execution and producer config",
         "provisioned primary lookup lease fails on identity namespace mismatch",
         "inference pull recognizes help before model resolution",
@@ -3735,6 +3942,8 @@ pub fn build(b: *std.Build) void {
         "schema rejects sortable non-scalar document field mappings",
         "parse rejects document field mappings incompatible with their schema value domain",
         "write validation rejects values that cannot populate explicit physical mappings",
+        "table schema parses canonical ttl policy and explicit removal",
+        "schema merge patch preserves unrelated fields and removes ttl",
         "runtime schema field capability helpers classify mapped sortability",
         "schema serialization rejects unsorted or duplicate exact fields",
         "sorted exact fields resolve before wildcard templates and find subfields without allocation",
@@ -3832,11 +4041,20 @@ pub fn build(b: *std.Build) void {
         "annotate tree document prefers graph path branch metadata",
         "retrieval agent isolates query predicates while applying accumulated filters",
         "retrieval agent installs canonical mandatory predicates once",
+        "retrieval agent generation uses the canonical generator and chain contract",
+        "retrieval agent generation preserves canonical chain order and retry policy",
+        "retrieval agent generation requires a canonical generator when the step is present",
         "retrieval agent authenticated row filter conjoins generated filter",
         "query builder infers graph multi hop pattern from intent",
         "query builder maps canonical graph queries and ignores legacy expansion",
         "retrieval root scan pushes row inclusion and exclusion predicates into one filter",
         "retrieval contains filter treats wildcard operators as literals",
+        "distributed reranking widens retrieval and stays coordinator owned",
+        "reranker candidate and output windows have distinct bounds",
+        "reranker admission precedes candidate rendering",
+        "reranker component paging includes the post-rerank offset",
+        "reranker paging preserves the underlying retrieval total",
+        "query dependency errors expose a stable JSON retry contract",
         "wildcard matching distinguishes operators from escaped literals",
         "wildcard literal escaping round trips metacharacters",
         "wildcard search plans preserve escaped exact literals and prefixes",
@@ -4017,6 +4235,10 @@ pub fn build(b: *std.Build) void {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "model-directed",
+        "tool query builder",
+        "agent conversation",
+        "embedded canonical generation",
         "table contract admits and preserves multi-source index requests",
         "table contract enforces stable graph source identities and numeric targets",
         "table contract admits and projects explicit embedding vector space",
@@ -4030,8 +4252,11 @@ pub fn build(b: *std.Build) void {
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",
         "api http client round-trips public status and internal capability routes",
+        "index activation client preserves progress and transport classifications",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
+        "api http query budget rejection response exposes stable sort reason",
+        "api query contract enforces provider-specific reranker candidate limits",
         "api query contract targets named full text retrieval without changing primary filters",
         "metadata.query routing validates named full text retrieval and keeps schema filters separate",
         "encode query request preserves the singular named full text selector across shard forwarding",
@@ -4044,8 +4269,19 @@ pub fn build(b: *std.Build) void {
         "api http public sort capability gate validates mapped sortable fields",
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "api http server create table with local writes waits for projected presence without lifecycle",
+        "api http server rejects oversized table definitions before parsing across public and MCP",
+        "api http server reports exhausted table mutation authority consistently",
+        "api http server marks every proven table mutation pre-admission failure",
+        "api http server retries only pre-admission public table drop failures",
+        "ambiguous mutation response is explicitly non-retryable",
+        "authoritative catalog mutation boundaries reject orphaned semantic producers",
+        "stamped catalog mutations retain their commit stamp when the post-commit round fails",
+        "public index mutations preserve an explicit outcome-unknown contract",
+        "api http server exposes ambiguous index mutations without a replay signal",
+        "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
         "status source reports an absent linearizable read capability without failing",
+        "status source rejects every partial routing capability",
         "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
         "linked API dispatch preserves kernel-owned ingress policy",
@@ -4064,6 +4300,9 @@ pub fn build(b: *std.Build) void {
         "local inference connection admission is owned exactly once by its target",
         "httpx inference connection requires inference write permission",
         "httpx inference connection propagates failures after stream commit",
+        "httpx retrieval SSE",
+        "retrieval agent sse",
+        "retrieval agent streaming emits go-shaped tree",
         "inference connection invocation forwards streaming and deadline through stable target ABI",
         "inference invocation remaining deadline rounds up and expires",
         "inference connection ABI reclaims partial responses on target failure",
@@ -4076,7 +4315,9 @@ pub fn build(b: *std.Build) void {
         "internal transaction HTTP responses prove not-proposed only before decision",
         "internal transaction ingress establishes and validates pre-decision deadline",
         "request admission bounds positive capacity and preserves unlimited mode",
+        "request admission lease releases exactly once",
         "request admission metrics use the shared admission namespace",
+        "gzip request completes with combined encoded and decoded budget",
         "shared application admission covers MCP query and write operations",
         "API kernel ABI rejects mismatched context and function-table prefixes",
         "runtime HTTP values retain C layout",
@@ -4153,6 +4394,7 @@ pub fn build(b: *std.Build) void {
             "cmd.cli.backup",
             "cmd.cli.index",
             "cmd.cli.query",
+            "cmd.cli.agents",
             "cmd.cli.table",
             "cmd.cli.mod",
             "cmd.cli.data.test.mutation parser",
@@ -4163,9 +4405,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        // Mach-O debug codegen retained 10.3 GiB for this intentionally broad
-        // command root. Linux remains within the aggregate's 7 GiB claim.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        // Mach-O debug codegen currently peaks a little above 12 GiB for this
+        // intentionally broad command root. Linux remains within the
+        // aggregate's 7 GiB claim.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
     const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
@@ -4189,7 +4432,7 @@ pub fn build(b: *std.Build) void {
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const lite_cmd_tests = b.addTest(.{
         .root_module = lite_cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.table", "cmd.cli.mod" },
+        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.agents", "cmd.cli.table", "cmd.cli.mod" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4257,7 +4500,7 @@ pub fn build(b: *std.Build) void {
             "replica catalog rejects invalid backup restore authority and integrity bindings",
             "restore binding pins the authenticated native generation manifest",
             "prepared native restore repair reuses target backend admission",
-            "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
+            "backup restore bootstrap adopts an exact imported generation while repair holds a reader",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4272,7 +4515,9 @@ pub fn build(b: *std.Build) void {
             "multi raft drainReady continues async pipeline without starving peer",
             "multi raft drainReady does not retry a no-progress frontier",
             "multi raft drainReady reserves continuations for productive groups",
+            "multi raft empty drain remains allocation free after group admission",
             "multi raft backpressure rejects async ready before cloning messages",
+            "multi raft routes outbound snapshots through snapshot transport",
         },
     });
     const run_raft_ready_continuation_tests = addFilteredTestRunArtifact(b, raft_ready_continuation_tests);
@@ -4282,6 +4527,26 @@ pub fn build(b: *std.Build) void {
         .filters = &.{ "raft integration module compiles", "raft.transport." },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+
+    // Snapshot artifact storage has its own root because Zig does not collect
+    // tests from the implementation behind the transport compatibility alias.
+    // Keep the target component-wide rather than naming an individual policy
+    // regression so new storage contracts are discovered automatically.
+    const raft_storage_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_storage_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_storage_test_mod, true, true);
+    const raft_storage_tests = b.addTest(.{
+        .root_module = raft_storage_test_mod,
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_raft_storage_tests = addFilteredTestRunArtifact(b, raft_storage_tests);
 
     // Keep this as the stable behavioral suffix of the declaration rather
     // than duplicating its descriptive worker-model prefix. The exact-filter
@@ -4529,6 +4794,7 @@ pub fn build(b: *std.Build) void {
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
+        "data runtime retries storage ownership invalidation before publishing fingerprint",
         "data descriptor factory separates bootstrap voters from transport peers",
         "data descriptor factory restores persisted voters before metadata peer discovery",
         "data runtime remote admin snapshot clone owns parser-backed slices",
@@ -4555,6 +4821,10 @@ pub fn build(b: *std.Build) void {
         "data runtime repair failures preserve durable backoff and increase retry delay",
         "index repair fallback backoff never blocks an exact durable wake",
         "data runtime preserves tagged aggregate index repair wake semantics",
+        "index repair no-op audit stays below operator log level",
+        "index repair terminal operator events are transition based",
+        "repair activity without a final audit cannot clear terminal log state",
+        "index repair terminal log state survives metadata churn for local groups",
         "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
@@ -4573,19 +4843,31 @@ pub fn build(b: *std.Build) void {
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
-        "data runtime startup catch-up clears no-debt busy writer groups",
+        "data runtime startup catch-up retains deferred inspection despite clean cached status",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
+        "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
+        "remote metadata mutation discovery preserves forwarding budget for the configured leader",
         "remote metadata source retains mutation authority across cache invalidation",
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
         "remote metadata source treats superseded concurrent fenced snapshot as success",
+        "remote metadata source retries fenced snapshot generations until success",
+        "remote metadata source bounds repeated fenced snapshot generations",
         "remote metadata source bounds unsupported linearizable snapshot probes",
         "remote metadata source shares backend runtime io across a bounded executor pool",
-        "data runtime treats metadata leadership churn as retryable bootstrap failure",
+        "remote routing cache entries retain immutable snapshots outside the cache lock",
+        "remote routing never publishes a cache entry after its deadline",
+        "remote routing normalizes every timeout class at the source boundary",
+        "remote await route plan cloning preserves its absolute deadline",
+        "remote metadata catalog source provides compact routing",
+        "remote metadata routing negotiation upgrades the N-1 adapter",
+        "data runtime treats transient metadata failures as retryable bootstrap failures",
+        "data runtime retries incomplete split provisioning projections",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",
+        "data runtime activity-only snapshots reuse the durable status generation",
         "idle cached runtime status stays fresh only for the published root generation",
         "runtime status disk usage cache is scoped to one root generation",
         "runtime status disk scan retries across a reallocation fence and group invalidation remains scoped",
@@ -4621,6 +4903,7 @@ pub fn build(b: *std.Build) void {
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
         "internal batch forwarding headers are all-or-none and strictly parsed",
         "metadata http client shares deadline and cancellation across retries",
+        "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",
         "data server mirrors managed primary writes into HA replication log",
         "data server fail-closed sync policy rejects primary writes before local commit",
@@ -4636,6 +4919,8 @@ pub fn build(b: *std.Build) void {
         "data server resumes HA standby replication from durable progress after restart",
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
+        "data runtime HA apply window remains bounded for control-plane liveness",
+        "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
     };
@@ -4646,10 +4931,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        // The broad macOS ReleaseFast runtime root has measured at 11.37 GiB.
+        // The broad macOS ReleaseFast runtime root has measured at 12.12 GiB.
         // Keep normal aggregate parallelism while giving the scheduler an
         // honest reservation instead of forcing this root through -j1.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
     const run_lib_data_runtime_tests = addFilteredTestRunArtifact(b, lib_data_runtime_tests);
     const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
@@ -4758,6 +5043,9 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db terminal enrichment marker retirement is bounded and fences stale generations",
             "storage.db.db.test.db enrichment reconfigure refreshes durable state after old worker joins",
             "storage.db.db.test.db enrichment retry makes monotonic progress across provider batches",
+            "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
+            "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
+            "asset preparation is lazy and byte bounded across retryable provider batches",
             "storage.db.db.test.db io_threaded executor processes indexed writes",
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",
@@ -4772,7 +5060,8 @@ pub fn build(b: *std.Build) void {
             "alternating pipeline errors exhaust one durable retry budget",
             "pipeline failures retain their retry budget across replay pass reset",
             "pipeline failure replaces stale request retry identity",
-            "mixed request and pipeline failures exhaust one no-progress budget",
+            "request-owned retries do not inherit unrelated pipeline debt",
+            "idle generated coverage gap becomes durable paged recovery debt",
             "durable enrichment retry progress preserves unrelated request debt across restart",
             "ordinary startup target preserves restored retry debt",
             "enrichment terminal failure envelope remains conservative across sparse durable debt",
@@ -4787,6 +5076,11 @@ pub fn build(b: *std.Build) void {
             "enrichment visibility wait is cancelable",
             "enrichment visibility wait observes borrowed request cancellation",
             "foreground enrichment rejects providers without a bounded-operation contract",
+            "context-aware embedder receives the request lifetime and fails closed when absent",
+            "inference timeout policy avoids inline retry storms",
+            "inference recovery is scoped by model and backend",
+            "asset inference recovery uses one identity from plan through provider call",
+            "post-provider deadline records timeout recovery before returning",
             "document extraction reserves PDF decoder peak memory atomically",
             "PDF decoder reservation composes with every live slice owner",
             "PDF decoder credit and OCR transient allocations compose without double charging",
@@ -4832,6 +5126,8 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db computeEnrichments",
             "storage.db.db.test.db leased enrichment worker",
             "storage.db.db.test.db shared embedding enrichment",
+            "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
+            "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
             "storage.db.db.test.db dense index can reference existing",
             "storage.db.db.test.db persists shorthand chunk enrichment",
             "storage.db.db.test.db listEnrichments",
@@ -4909,6 +5205,8 @@ pub fn build(b: *std.Build) void {
     lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "composed fusion preserves the coordinator reranker window",
+        "fuseNamedSets applies offset after fusion and pruning",
         "grouped candidate budget parses disabled and fallback values",
         "adaptive candidate window covers requested offset page and grows bounded",
         "grouped result page satisfaction treats nested match count as a maximum",
@@ -5059,8 +5357,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_db_result_shape_tests = addFilteredTestRunArtifact(b, lib_db_result_shape_tests);
-    const lib_db_result_shape_step = b.step("lib-db-result-shape-test", "Run focused DB query doc id boundary tests");
-    lib_db_result_shape_step.dependOn(&run_lib_db_result_shape_tests.step);
+    lib_db_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    lib_db_query_step.dependOn(&run_lib_db_result_shape_tests.step);
 
     const lib_db_reopen_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5324,6 +5622,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table query response envelope",
         "api http server executes public Query filter roots and compositions",
         "public table query handler preserves structured filter and hierarchy diagnostics",
+        "query dependency errors expose a stable JSON retry contract",
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
         "api http server routes table batches through the batch commit hook",
@@ -5335,6 +5634,7 @@ pub fn build(b: *std.Build) void {
         "managed startup catch-up uses provided indexes json without catalog fetch",
         "managed startup catch-up marks FileNotFound index open terminal degraded",
         "managed startup catch-up preserves restore repair debt while index load is terminal",
+        "managed startup catch-up defers while shared bulk ingest state is active",
         "idle startup runtime status preserves live empty cached status",
         "idle startup completion cannot downgrade a superseding live index status",
         "api http server serves table batch transforms",
@@ -5377,14 +5677,13 @@ pub fn build(b: *std.Build) void {
         "api http server rejects restore before persistence without an asynchronous worker",
         "configured api http server attaches durable restore job persistence",
         "restore job list paginates after authorization filtering",
-        "restore metadata intent topology accepts interrupted prefixes and rejects foreign ranges",
         "restore job list bounds authorization scans with an empty continuation page",
         "api http server backs up and restores a table through public routes",
         "api http server cluster overwrite restores from read-only repository without dropping live table",
         "api http server durability-pending restore preserves committed metadata",
         "api http server cluster restore rehydrates extension metadata",
         "api http server prefers metadata-owned restore over inline write-source restore",
-        "api http server retries stale metadata table-exists restore race",
+        "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
         "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
@@ -5440,6 +5739,11 @@ pub fn build(b: *std.Build) void {
         "encode query request rejects invalid public phrase geo and ip values",
         "optional pure should preserves zero baseline and text scores",
         "remote query preserves optional should and named filter bindings",
+        "distributed reranking widens retrieval and stays coordinator owned",
+        "reranker candidate and output windows have distinct bounds",
+        "reranker admission precedes candidate rendering",
+        "reranker component paging includes the post-rerank offset",
+        "reranker paging preserves the underlying retrieval total",
         "distributed join context forwards one absolute deadline to every query callback",
         "distributed join search hit JSON normalizes non-finite scores",
         "distributed join unmatched worker returns only unmatched synthetic hits",
@@ -5473,6 +5777,7 @@ pub fn build(b: *std.Build) void {
         "stored term filters preserve JSON scalar kinds",
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
+        "api http server drop table observes metadata absence before local cleanup",
         "public api smoke e2e creates table inserts and queries documents",
         "provisioned table write source routes batch writes across ranges",
         "public api e2e recreates managed embeddings index after corrupt artifact",
@@ -5526,7 +5831,7 @@ pub fn build(b: *std.Build) void {
         "continuous HA freezes pre-existing restore workers and resumption",
         "continuous HA allows a configured RemoteApply batch write",
         "api http server document scan requires table read permission",
-        "api http server returns retryable not leader when local reconcile lease is lost",
+        "api http server does not replay create when local reconcile lease is lost",
         "api http server returns retryable not leader when metadata proposal is dropped",
         "api http server returns retryable not leader through public table adapter mutation",
         "api http server returns retryable not leader when cluster backup read barrier times out",
@@ -5696,6 +6001,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_connections_test_mod,
         .filters = &.{
             "object probe cache identity covers every bucket and credential source",
+            "connection filesystem probes use the explicit filesystem authority",
             "connection cache remains valid across every allocation failure",
             "build response exposes embedded inference as a local connection",
             "inference connection operations are allowlisted",
@@ -5736,7 +6042,6 @@ pub fn build(b: *std.Build) void {
             "cluster backup and restore reject duplicate table selectors",
             "backup API requests reject unknown operational fields",
             "backup manifest round trips through metadata path",
-            "backup manifest round trips through remote objectstore location",
             "current Go portable metadata envelope materializes into a verified Zig manifest",
             "current Go portable metadata parsing is allocation failure safe",
             "current Go portable cluster envelope resolves table metadata ids",
@@ -5770,6 +6075,7 @@ pub fn build(b: *std.Build) void {
             "table backup cleanup removes the forwarded artifact envelope before payload",
             "cluster backup retains its fenced attempt after an ambiguous table outcome",
             "table backup retry preserves the retained ambiguous generation",
+            "table backup retry reclaims an eligible reservation and admits the new generation",
             "cluster backup attempt markers reject overlapping cleanup identities",
             "stale owned cluster backup attempt retains generation fences and retires authoritative head",
             "expired recovery preserves an oversized remote commit record",
@@ -5798,7 +6104,11 @@ pub fn build(b: *std.Build) void {
             "restore repository contention backoff is bounded and increasing",
             "restore retry deadline wakeup is interruptible without polling",
             "owned backup runtime has a finite worker ceiling",
+            "remote backup connection retains network io instead of filesystem io",
+            "dynamic gcs credentials borrow distinct network and filesystem authorities",
+            "dynamic s3 profile and web identity retain explicit credential authorities",
             "backup staging uses configured storage authority and exclusive generations",
+            "remote backup staging keeps native filesystem io separate from repository transport",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",
         },
@@ -6099,6 +6409,9 @@ pub fn build(b: *std.Build) void {
             "hosted participant attempt deadline preserves the server outcome window",
             "hosted participant rediscovery retries only pre-decision leader unavailability",
             "distributed txn coordinator aborts only participants that may have begun",
+            "DistributedEntitySink atomic promotion batch prefers stateless batch commit",
+            "DistributedEntitySink batch commit remains compatible with transaction-only sources",
+            "DistributedEntitySink atomic mode fails closed when unsupported",
             "api http client preserves retryable group transaction unavailability",
             "internal transaction operations preserve pre-decision leader unavailability",
         },
@@ -6114,6 +6427,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source has a finite worker ceiling",
             "provisioned native storage metrics bypass an empty busy write cache",
             "provisioned table write source rejects stale doc identity namespace before write",
+            "writer identity resolution rejects stale eventual routes",
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",
             "internal batch parser requires source acknowledgements to be metadata-only",
@@ -6126,6 +6440,7 @@ pub fn build(b: *std.Build) void {
             "stable distributed transaction retry resumes a durable commit decision",
             "distributed txn retries an ambiguous coordinator decision under the same id",
             "distributed txn bounds unresolved coordinator decision retries",
+            "distributed txn propagates one absolute deadline through ambiguous decision recovery",
             "distributed txn participant fanout is bounded and concurrent",
             "distributed txn coordinator never aborts after durable commit decision",
             "distributed txn coordinator never restarts a transaction id on topology change",
@@ -6140,6 +6455,7 @@ pub fn build(b: *std.Build) void {
             "resident writer repair state distinguishes clean and metadata-pending writers",
             "api http client preserves group doc identity conflicts",
             "api http client transports txn resolve cancellation and visibility reason",
+            "resolve group routes uses one router-owned snapshot callback for fanout",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
             "api http client preserves committed visibility outcomes for forwarded raft batches",
@@ -6165,13 +6481,14 @@ pub fn build(b: *std.Build) void {
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned transition writer fences exact supplied table metadata",
-            "provisioned create index updates cached writer in place",
+            "provisioned create index enqueues target-fenced cached-writer activation",
             "write cache metadata refresh preserves inactive adoptable seed",
             "write cache adopts active just-created db across generation bump",
             "write cache local mutation reuses live stale-generation writer",
             "write cache structural local mutation finishes auto bulk before reuse",
             "write cache local mutation preempts stale startup writer",
-            "hosted runtime status prefers live writer over stale hosted snapshot",
+            "hosted runtime status reads owner snapshot without inspecting live writer",
+            "HA seed preflight drains writer released after promotion cache clear before capture freeze",
             "runtime status collection leaves active stale write lease live",
             "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
@@ -6192,7 +6509,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source drop table waits for active read cache lease",
             "provisioned table write source drop table closes schema-bearing cached writer once",
             "provisioned table write source backup releases read cache exclusive before native snapshot copy",
-            "live managed repair upgrades broad recovery alongside status before bounded index repair",
+            "live managed repair leaves resident replay and status reads nonblocking",
             "managed startup catch-up open constructs bounded enrichment runtime without workers",
             "provisioned group storage wires remote content to writer caches",
             "startup runtime status snapshot publishes live db when active cache is empty",
@@ -6203,15 +6520,17 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up uses provided indexes json without catalog fetch",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
+            "managed startup catch-up defers while shared bulk ingest state is active",
+            "clean generated startup inspection does not retain a resident writer",
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache rejects a late stale live observation",
             "table runtime snapshot cache replacement preserves a newer live observation",
             "structural reconcile reconfigures retained writer before managed dense writes",
             "provisioned managed replay tails converge and publish without later traffic",
-            "provisioned runtime status overlays live writer replay target without republishing stats",
-            "provisioned runtime status live replay overlay preserves cold dense visibility refresh",
-            "provisioned runtime status live replay overlay clears ambiguous replay-only backfill",
-            "provisioned runtime status live replay overlay preserves non-replay backfill",
+            "provisioned owner publication advances exact index replay target",
+            "provisioned owner publication fills cold dense visibility",
+            "provisioned owner publication clears ambiguous replay-only backfill",
+            "provisioned owner publication replaces stale cached backfill",
             "managed source status-only open drains stale pending close before retry",
             "hosted status-only open drains stale pending close before retry",
             "write cache HA gate clear drains inactive pending closes before returning",
@@ -6225,6 +6544,10 @@ pub fn build(b: *std.Build) void {
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "distributed reranking widens retrieval and stays coordinator owned",
+            "reranker candidate and output windows have distinct bounds",
+            "reranker paging preserves the underlying retrieval total",
+            "coordinator prunes the final score domain before paging",
             "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
             "aggregation context rejects non-current identity generation",
@@ -6253,6 +6576,8 @@ pub fn build(b: *std.Build) void {
             "encode query request preserves hierarchy unit navigation contract",
             "hierarchy navigation hydration validates the planned unit fingerprint",
             "hosted hierarchy navigation routes projection-safe hydration and advances cursors",
+            "routed internal reads require an explicit peer fence acknowledgement",
+            "routing sessions reserve authoritative snapshots for cross-table plans",
             "encode query request preserves unit grouping ancestor projections",
             "parseRemoteSearchResult preserves grouped hierarchy matches",
             "remote query returns the shard-selected identity generation",
@@ -6284,6 +6609,11 @@ pub fn build(b: *std.Build) void {
             "provisioned auxiliary reads publish resident databases outside read admission",
             "provisioned graph hydrate completes consistency before resident read admission",
             "provisioned consistency read reroutes after topology changes before admission",
+            "route-pinned catalog prevents a stale admin namespace from replacing routing identity",
+            "routing session validates a pinned selection against current topology",
+            "routing topology epoch fences identity-only changes",
+            "authoritative write routing pins keys and identity in one compact snapshot",
+            "catalog route fence dispatch is strict and fail closed",
             "provisioned stale read admits before routing without a redundant catalog validation",
             "distributed graph source read rejects topology change before aggregation",
             "hosted cross-range graph query expands explicit local start keys",
@@ -6310,6 +6640,7 @@ pub fn build(b: *std.Build) void {
             "public create index exposes unsupported deployment capability",
             "public create index returns normalized created resource",
             "public table query handler maps doc identity unavailable errors",
+            "public table query reports the selected reranker candidate ceiling",
             "public table query handler maps exact graph execution failures",
             "graph path weight error body fails closed without its diagnostic",
             "public table query handler preserves structured filter and hierarchy diagnostics",
@@ -6394,6 +6725,7 @@ pub fn build(b: *std.Build) void {
     const lib_api_derived_coverage_tests = b.addTest(.{
         .root_module = api_derived_coverage_test_mod,
         .filters = &.{
+            "live repair admission supersedes cached vector serviceability",
             "coverage policy accepts only the public embeddings contract",
             "index configs receive persistent private incarnations across index kinds",
             "create table parser preserves supported metadata fields",
@@ -6409,7 +6741,24 @@ pub fn build(b: *std.Build) void {
             "derived coverage evaluation is policy exact and observation gated",
             "settled terminal enrichment debt is degraded rather than rebuilding",
             "derived coverage source totals ignore derived index fan out",
+            "dense publication target requires every expected shard observation",
             "derived coverage aggregation rejects mixed config observations",
+            "derived coverage embedding activity aggregation is order independent and phase authoritative",
+            "derived coverage ready full text status reports complete progress",
+            "readiness observation completion requires convergence and full topology",
+            "readiness evaluation cannot complete while convergence work remains",
+            "readiness completion fences include every observation dimension",
+            "chunked dense completion follows the physical publication target",
+            "runtime status best effort overlay cannot clear readiness under apply contention",
+            "db source commit publishes exact target observation sequence",
+            "db generated downstream indexes are exact convergence targets at source commit",
+            "db chunked dense enrichment skips unchanged chunks and deletes stale chunk artifacts",
+            "db chunk deletion replay targets only matching vector sources",
+            "db chunk retirement removes dense and sparse members from generated and artifact projections",
+            "db reopened chunked dense HBC deletes stale vectors through artifact loader",
+            "embedding artifact replay deletes only the consuming vector projection",
+            "collectManagedSyncTargets includes graph index for graph artifact journal changes",
+            "visibility targets include graph replay blocked by a missing dependency",
             "index status exposes compact repair state without internal diagnostics",
             "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
             "rebuild quarantine remains an explicit failed public index status",
@@ -6419,37 +6768,91 @@ pub fn build(b: *std.Build) void {
             "derived coverage rejects unknown freshness for aggregate and shard views",
             "cached all-skipped coverage observation is a runtime fact",
             "live writer artifact regression keeps authoritative source deletions",
+            "same owner stale serving revision cannot regress an exact incarnation",
+            "owner replacement cannot regress serving facts at the same accepted source target",
+            "owner replacement cannot regress serving facts but a new non-vector incarnation may reset them",
+            "irrelevant broad replay cursor cannot regress exact index serving or coverage facts",
+            "exact additive target advance preserves serving facts while delete authority permits reduction",
+            "publication stamps order revisions and require recovery across owners",
+            "db vector status revalidates stale repair admission without a query",
+            "owner publication stamps order all index kinds independently of counts and callbacks",
+            "target and reducing watermarks commute across every callback permutation",
+            "runtime status group batches reject duplicate group ids before publication",
             "table runtime snapshot cache clones stored status",
             "table runtime snapshot cache batch publication is table epoch atomic",
             "table runtime snapshot cache publication fence preserves the last snapshot",
             "targeted publication fence preserves only untouched siblings during catch up",
-            "targeted publication fence waits for every overlapping owner",
+            "new targeted transition supersedes delayed controls from an older owner",
+            "targeted catch up hands off same incarnation serving authority",
+            "target authority settles only after every group acknowledges the exact incarnation",
+            "target authority uses bound catalog groups instead of cached group count",
+            "resident serving acknowledgement hands off a separate coordinator cache",
+            "failed exact handoff accepts identity without fabricating serving authority",
+            "targeted publication rejects a completed stale incarnation until structural acknowledgement",
+            "settled target authority preserves the accepted incarnation against late publishers",
+            "accepted authority requires identity containment not equal cardinality",
+            "accepted group identity survives late predecessor before global handoff",
+            "catalog identity rejects a wrong first structural observation",
+            "exact target advances fence only their index incarnation",
+            "exact target advance before first status remains index scoped",
+            "exact target advance allocation failure remains fail closed",
+            "batched target advance stops after fallback invalidates cached state",
+            "per-index delta merge stays bounded across many accepted authorities",
+            "bulk target handoff reduces per-group acknowledgements linearly",
+            "incremental group acknowledgement sync is linear with one global handoff",
+            "multi-group delta allocation failure is atomic and leak free",
+            "multi-group commit uses preflight group capacity without allocation",
+            "prepared index delta commit performs no allocation",
+            "targeted authority binding is monotonic under reversed publication order",
+            "wholly stale targeted publication cannot bind unknown authority",
+            "targeted deletion hands off only after authoritative absence",
+            "synthetic refresh cannot outrank targeted structural owner observation",
+            "background refresh completes exact multi-group target handoff incrementally",
+            "background refresh exact target allocation failure is atomic and leak free",
+            "background refresh completes absent multi-group target handoff incrementally",
+            "synthetic refresh preserves post-fence target facts before serving handoff",
             "table runtime snapshot cache lifecycle transition replaces and fences observations",
             "table runtime snapshot cache batch preserves newer group observations",
             "runtime status cache stable absence removal retires the old table epoch",
+            "runtime status snapshots never wait for mutable cache ownership",
+            "group read payload preparation and retirement stay off the global cache mutex",
+            "blocked read payload preparation does not convoy an unrelated table",
+            "blocked table refresh preparation does not convoy unrelated publication",
+            "activation failure projection preserves every stable failure code",
+            "terminal activation failure precedes and binds its exact catalog row",
+            "terminal drop failure never acknowledges absence and remains actionable",
+            "terminal failure result distinguishes supersession and reserved storage",
+            "target invalidation retires only its table read view",
+            "lifecycle mirror failure cannot expose the retired generation",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
             "complete partial embeddings coverage is ready after active generation proof",
+            "runnable repair owns its load error without becoming a terminal aggregate failure",
             "actionable repair remains visible while retained generation stays queryable",
             "serviceable full text replacement remains queryable while rebuilding",
             "progressive embeddings readiness exposes a queryable partial generation",
+            "missing target observation preserves serving snapshot and blocks only completion",
             "stale in-place status preserves an incarnation-scoped serviceability proof",
             "identity-proven embeddings stay current during sibling startup catch-up",
-            "opening embeddings observation cannot publish cached queryability",
-            "stale embeddings observation cannot publish cached queryability",
+            "opening embeddings observation requires explicit serviceability authority",
+            "cached owner observation preserves serving authority without convergence authority",
+            "index-local convergence fence does not revoke a completed sibling",
+            "single group synthetic publication preserves owner runtime authority",
             "target-scoped stale full text observation cannot publish old readiness",
             "targeted full text sibling remains authoritative during table catch up",
             "managed embedder preserves atomic publication policy",
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
+            "single embeddings index encoder scopes isolated enrichment failure to one index",
+            "published embeddings snapshot remains queryable after isolated source failure",
             "multi-source embedding enrichments receive a shared semantic producer identity",
             "source readiness isolates terminal enrichment failures",
             "source readiness distinguishes durable repair debt from runtime enrichment failure",
             "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",
             "repair-free embeddings aggregate retains live dense catch-up",
             "serviceable repair preserves sibling shard dense catch-up fallback",
-            "serviceable repair cannot mask sibling shard serving failures",
+            "serviceable repair cannot mask sibling shard load failure",
             "index encoders preserve sibling replay debt during serviceable repair",
             "enrichment aggregation preserves telemetry and fences mixed checkpoint identity",
             "table storage status indexes one distributed snapshot by table and owner",
@@ -6459,11 +6862,38 @@ pub fn build(b: *std.Build) void {
             "external embeddings index readiness does not require table doc coverage",
             "api http server preserves public query availability errors",
             "api http maps missing physical index only for rebuilding lifecycle",
-            "api http missing index classification requires active rebuild evidence",
-            "api http lifecycle classification preserves catching-up writer beside fresh read snapshot",
+            "api http classifies catalog-to-serving index convergence without runtime status",
             "remote rebuild quarantine preserves its source and index failure",
             "api http server create index installs exact visible config and defers lagging projection",
             "api http server create index expands schema-derived algebraic config",
+            "hosted index lifecycle callback hands exact target to persistent control plane",
+            "committed activation receipt rejects delayed drop after newer create",
+            "committed activation receipt rejects delayed create after newer drop and coalesces exact duplicate",
+            "committed activation watermark stays bounded across completed scope churn",
+            "index activation client preserves progress and transport classifications",
+            "resident activation journal rejects a delayed lower metadata epoch",
+            "resident activation requeue cannot displace a newer queued epoch",
+            "activation scheduler key includes complete storage identity",
+            "whole table reconcile cannot absorb exact resident activation",
+            "active structural key coalesces duplicate and requeues allocation free",
+            "all structural workers retain allocation-free requeue capacity during admission bursts",
+            "structural scheduler burst uses keyed coalescing and FIFO deadlines",
+            "structural scheduler capacity includes active ownership",
+            "yielded structural work advances under sustained new admission",
+            "exact activation dual worker admission failure leaves no orphan",
+            "duplicate activation cannot observe accepted before admission commits",
+            "completed activation ring evicts oldest and records completion once",
+            "discard retires unreferenced scope revisions under churn",
+            "newer completed activation makes retained older result stale",
+            "discarded newer activation cannot resurrect an older terminal result",
+            "activation progress preserves every terminal failure class",
+            "hosted index lifecycle owner retries transient activation failure",
+            "structural activation dispatch does not convoy unrelated groups",
+            "hosted index lifecycle backs off repeated stale resident observation",
+            "hosted activation revalidates topology after final resident RPC",
+            "hosted index lifecycle durable wake repairs worker admission failure",
+            "structural reconcile retains ordered constant-time repair wake membership across plan resets",
+            "startup configured indexes separate physical indexes from reserved metadata",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6484,24 +6914,23 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
-    const api_transactions_docid_test_step = b.step("api-transactions-docid-test", "Run focused API transaction tests");
-    api_transactions_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
-    api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
+            "native backup coordinator quiescence retry is bounded",
             "native backup reclaims crash-left snapshot attempts from durable markers",
             "native backup reclaims a crash marker before snapshot root creation",
             "native backup never reclaims an old attempt with a live lease",
             "provisioned create succeeds when post-commit runtime status is fenced",
+            "provisioned create retries a retired cache lease before structural publication",
             "provisioned create reuses a generation opened by startup reconciliation",
             "provisioned owner clone snapshot preserves retired runtime counters",
             "provisioned create installs managed enrichment despite a matching stale fingerprint",
-            "runtime status refreshes aged live writer publications",
+            "provisioned create index enqueues target-fenced cached-writer activation",
+            "cached runtime status is independent of writer lock and target observation",
             "provisioned table write source runtime status serves cached snapshot during active same-table work",
             "provisioned table write source runtime status still serves unrelated table snapshot while source mutex is busy",
             "provisioned table write source best effort publish does not advertise lock contention as an empty table",
@@ -6510,13 +6939,28 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
+            "resident group write releases queued reads before remote completion",
             "provisioned table transition activity excludes writers but preserves reads",
             "provisioned table transition waiter queues ahead of later writers",
             "provisioned table transition waiter queues ahead of later readers",
             "provisioned table write source read request permits replicated apply activity",
             "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write source drop table cancels index repair before structural admission",
+            "dropped table quarantine path keeps valid API names in one portable component",
+            "malformed recovery intent is durably removed from the active queue and counted",
+            "transient recovery intent read failure retains active work and retries successfully",
+            "dropped table recovery drains a wake coalesced during the active scan",
+            "dropped table recovery watchdog repairs a failed durable enqueue",
+            "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart",
+            "provisioned table drop retains repair intent until catalog ownership clears",
+            "replica retirement journal distinguishes active retained and committed removal",
+            "replica retirement journal batches preserve every group phase",
+            "replica retirement batch identity is canonical and rejects duplicate groups",
+            "replica retirement recovery discards a legacy orphan whose catalog removal aborted",
+            "hosted source publication recovers durable dropped-table intent",
+            "hosted background writes carry the selected catalog fence through routed Raft admission",
             "provisioned table write source drop table retires old publication authority",
+            "provisioned table write source drop table does not hold local db mutex during background delete",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
             "queued structural reconcile reserves write admission before its worker starts",
@@ -6524,7 +6968,10 @@ pub fn build(b: *std.Build) void {
             "targeted index reconciliation stales only the named cached index",
             "targeted repair visibility edge preserves exact sibling cache authority",
             "unrelated repair visibility edge invalidates during targeted reconciliation",
-            "repair edge after target authority release fails closed",
+            "repair edge after target release retains target authority until handoff",
+            "initial build edge after target authority release preserves runtime observation",
+            "fenced blocking status publication preserves accepted serving snapshot",
+            "ownerless blocking publication preserves serving facts and fences convergence",
             "targeted index cache update retains the published sibling snapshot through handoff",
             "index reconciliation request enqueues a catalog-deleted target without create admission",
             "structural reconcile retry backoff is bounded",
@@ -6536,9 +6983,35 @@ pub fn build(b: *std.Build) void {
             "structural repair handoff keeps status fenced through final shard visibility",
             "repair handoff status settles after authoritative cached publication",
             "live repair final audit excludes concurrent group mutation through publication",
+            "live repair validates resident writer against current catalog not queued metadata",
             "terminal repair publication settles handoff or retains one fenced retry",
             "managed create publication handoff releases on converged owner publication",
             "managed dense publication handoff releases when its incarnation is superseded",
+            "hosted index lifecycle callback hands exact target to persistent control plane",
+            "committed activation receipt rejects delayed drop after newer create",
+            "committed activation receipt rejects delayed create after newer drop and coalesces exact duplicate",
+            "committed activation watermark stays bounded across completed scope churn",
+            "resident activation journal rejects a delayed lower metadata epoch",
+            "resident activation requeue cannot displace a newer queued epoch",
+            "activation scheduler key includes complete storage identity",
+            "whole table reconcile cannot absorb exact resident activation",
+            "active structural key coalesces duplicate and requeues allocation free",
+            "structural scheduler burst uses keyed coalescing and FIFO deadlines",
+            "structural scheduler capacity includes active ownership",
+            "yielded structural work advances under sustained new admission",
+            "exact activation dual worker admission failure leaves no orphan",
+            "duplicate activation cannot observe accepted before admission commits",
+            "completed activation ring evicts oldest and records completion once",
+            "discard retires unreferenced scope revisions under churn",
+            "newer completed activation makes retained older result stale",
+            "discarded newer activation cannot resurrect an older terminal result",
+            "activation progress preserves every terminal failure class",
+            "hosted index lifecycle owner retries transient activation failure",
+            "structural activation dispatch does not convoy unrelated groups",
+            "hosted index lifecycle backs off repeated stale resident observation",
+            "hosted activation revalidates topology after final resident RPC",
+            "hosted index lifecycle durable wake repairs worker admission failure",
+            "structural reconcile retains ordered constant-time repair wake membership across plan resets",
             "resident DB retry preparation waits outside admission for writer publication",
             "admitted resident DB lease never waits for an in-flight writer publication",
             "write cache local mutation preempts stale startup writer",
@@ -6548,10 +7021,13 @@ pub fn build(b: *std.Build) void {
             "structural reconcile production catalog fails closed without table publication fence",
             "structural reconcile fences incarnation initialization and discards empty topology",
             "provisioned structural reconcile blocks table write admission",
+            "provisioned source quiesce closes cleanup admission and drains accepted owner jobs",
             "provisioned schema reconcile keeps reads and status available",
             "busy startup open preserves fresh writer runtime status",
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
+            "managed startup catch-up defers while shared bulk ingest state is active",
+            "clean generated startup inspection does not retain a resident writer",
             "managed startup catch-up allocation failure preserves bounded retry",
             "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "standby HA replay reconciles managed indexes without opening the public write gate",
@@ -6559,9 +7035,11 @@ pub fn build(b: *std.Build) void {
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
             "managed structural catch-up does not delegate an empty producer handoff",
+            "standalone managed structural catch-up owns admitted enrichment progress",
             "managed catch-up reaches durable generation repair when dense replay needs an artifact rebuild",
             "managed create publication handoff ignores unrelated index debt",
             "db managed vector admission captures writes while durable repair is pending",
+            "db managed repair scheduler defers canonical worker until shadow activation",
             "index repair inspection window is bounded and rotates fairly",
             "resident index repair scheduler skips deferred prefixes with bounded fair quanta",
             "resident index repair scheduler maintains exact aggregate wake precedence",
@@ -6574,6 +7052,7 @@ pub fn build(b: *std.Build) void {
             "db failed activated dense generation rolls back to retained predecessor",
             "repair admission revisions stay fail closed and reject delayed publishers",
             "db progressive managed admission serves a checkpointed partial generation",
+            "db completed managed admission emits an initial build clear edge",
             "db removing one repair pin preserves pressure gate for another index",
             "db dense replay failure upgrades a preflight validation intent",
             "db durable repair classification emits exact admission and action edges",
@@ -6589,10 +7068,21 @@ pub fn build(b: *std.Build) void {
             "managed repair visibility edges retire cached readers and runtime status",
             "repair visibility progress does not churn readers without an admission edge",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
+            "targeted structural publication cannot regress an untouched sibling generation",
             "runtime status hook orders completed observation without crossing invalidation",
+            "provisioned owner publication advances exact index replay target",
             "structural repair publication advances the table lifecycle epoch",
             "targeted repair publication preserves sibling authority fence",
+            "status publication fence does not suppress structural work re-drive",
             "table runtime snapshot cache live publication does not starve structural refresh",
+            "runtime owner retirement preserves serving snapshot and fences convergence",
+            "failed exact handoff accepts identity without fabricating serving authority",
+            "target authority uses bound catalog groups instead of cached group count",
+            "synthetic refresh preserves post-fence target facts before serving handoff",
+            "read mirror allocation failure cannot attach replacement authority to predecessor identity",
+            "background refresh completes exact multi-group target handoff incrementally",
+            "background refresh exact target allocation failure is atomic and leak free",
+            "background refresh completes absent multi-group target handoff incrementally",
             "table runtime snapshot cache preserves live completion over regressing persisted projection",
             "catching up observation preserves same-incarnation published visibility",
             "catching up observation cannot preserve a same-config replacement incarnation",
@@ -6604,6 +7094,14 @@ pub fn build(b: *std.Build) void {
             "table runtime snapshot cache table fences isolate unrelated invalidations",
             "runtime status cache publishes unaffected tables and retries only invalidated tables",
             "runtime status cache stable absence removal retires the old table epoch",
+            "group read payload preparation and retirement stay off the global cache mutex",
+            "blocked read payload preparation does not convoy an unrelated table",
+            "blocked table refresh preparation does not convoy unrelated publication",
+            "activation failure projection preserves every stable failure code",
+            "terminal activation failure precedes and binds its exact catalog row",
+            "terminal drop failure never acknowledges absence and remains actionable",
+            "terminal failure result distinguishes supersession and reserved storage",
+            "incremental group acknowledgement sync is linear with one global handoff",
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
@@ -6612,11 +7110,14 @@ pub fn build(b: *std.Build) void {
             "forwarded write sources use the local writer owner dirty lifecycle",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",
+            "HA seed request admission drains accepted writes and closes the preflight race",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
             "split transition auto bulk publication retries while a writer lease is active",
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
+            "provider shutdown barrier closes cached dbs and remains idempotent",
+            "provider shutdown barrier joins an in-flight generated embedding call",
             "writer cache metric pin batch release compacts retired entries once",
             "writer cache bulk transition fences only its table",
             "db runtime relabel cannot reuse cached index serviceability",
@@ -6631,6 +7132,11 @@ pub fn build(b: *std.Build) void {
             "generation publication marker parsing preserves allocator exhaustion",
             "manual generation runtime uses an explicit filesystem io authority",
         },
+        // This intentionally broad lifecycle root compiles the storage,
+        // provider, and public-write surfaces together and peaks near 10.6
+        // GiB on macOS. The claim is scheduler capacity, not a product runtime
+        // budget; Linux retains the measured aggregate default.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
     const run_api_table_writes_production_regression_unit_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
@@ -6641,6 +7147,20 @@ pub fn build(b: *std.Build) void {
     run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_aggregate_tests.step);
     const api_table_writes_production_regression_step = b.step("api-table-writes-production-regression-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
+    const api_create_structural_retry_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"provisioned create retries a retired cache lease before structural publication"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_api_create_structural_retry_tests = addFilteredTestRunArtifact(b, api_create_structural_retry_tests);
+    const api_create_structural_retry_step = b.step(
+        "api-create-structural-retry-test",
+        "Run the isolated create structural-publication cache race regression",
+    );
+    api_create_structural_retry_step.dependOn(&run_api_create_structural_retry_tests.step);
     const api_table_writes_restore_repeat_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
@@ -6661,89 +7181,61 @@ pub fn build(b: *std.Build) void {
     api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_restore_repeat_tests.step);
     const api_table_writes_cache_lifecycle_step = b.step("api-table-writes-cache-lifecycle-test", "Run focused writer-cache dirty ownership regressions");
     api_table_writes_cache_lifecycle_step.dependOn(&run_api_table_writes_production_regression_tests.step);
-    const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
-    api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
-    api_public_table_http_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
+    const lib_docid_lifecycle_runtime_filters: []const []const u8 = &.{
+        "metadata reconciler does not automatically split ordinal exhausted doc identity",
+        "metadata state classifies mixed-version doc identity lifecycle reports",
+        "metadata state marks doc identity rebuild required on range namespace mismatch",
+        "metadata merge validation handles rolling mixed-version doc identity status fixtures",
+        "metadata split request validation rejects stale doc identity namespace",
+        "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
+        "table workflow doc identity guards reject active transition intents",
+        "metadata reconciler doc identity guards block new planning during active reassignment",
+        "metadata reconciler does not upsert desired split with stale doc identity namespace",
+        "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
+        "distributed join follow-up pagination requires stamped identity request",
+        "distributed join group-local hit pagination reuses structured search generation",
+        "distributed join rejects doc identity rebuild before right-table fanout",
+        "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
+        "distributed graph rejects doc identity rebuild before cross-range fanout",
+        "distributed graph rejects unstamped result refs before cross-range fanout",
+        "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
+        "internal worker doc identity exchange audit covers every boundary",
+        "aggregation context rejects non-current identity generation",
+        "aggregation full-result rerun can reuse snapped result identity generation",
+        "explicit text stats requests preserve identity generation",
+        "explicit text stats requests reject stale identity generation",
+        "structured filter doc set cache separates shared namespace generation keys",
+        "cache invalidates ownership move prefix without reviving pinned generations",
+        "db text compaction preserves ordinal filters across reopen",
+        "db lsm primary compaction preserves doc identity ordinals",
+        "db allocates final document ordinal with all index families present",
+        "identity namespace reassignment preserves snapshot generations and rejects stale writers",
+        "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
+        "index manager split handoff preserves interleaved write and query summaries",
+        "db stats flag document identity ordinal capacity exhaustion",
+        "db rejects new document writes at ordinal exhaustion for every sync level",
+        "db transaction intent writes reject new documents at ordinal exhaustion",
+        "db search requests default to current identity generation snapshot",
+        "db validates internal resolved doc filter wire namespace and generation",
+        "db resolved doc-set projection honors identity read generation",
+        "doc filter wire rejects old required-field fixtures but tolerates additive fields",
+        "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
+    };
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata reconciler does not automatically split ordinal exhausted doc identity",
-            "metadata state classifies mixed-version doc identity lifecycle reports",
-            "metadata state marks doc identity rebuild required on range namespace mismatch",
-            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
-            "metadata split request validation rejects stale doc identity namespace",
-            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
-            "table workflow doc identity guards reject active transition intents",
-            "metadata reconciler doc identity guards block new planning during active reassignment",
-            "metadata reconciler does not upsert desired split with stale doc identity namespace",
-            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
-            "distributed join follow-up pagination requires stamped identity request",
-            "distributed join group-local hit pagination reuses structured search generation",
-            "distributed join rejects doc identity rebuild before right-table fanout",
-            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
-            "distributed graph rejects doc identity rebuild before cross-range fanout",
-            "distributed graph rejects unstamped result refs before cross-range fanout",
-            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
-            "internal worker doc identity exchange audit covers every boundary",
-            "aggregation context rejects non-current identity generation",
-            "aggregation full-result rerun can reuse snapped result identity generation",
-            "explicit text stats requests preserve identity generation",
-            "explicit text stats requests reject stale identity generation",
-            "structured filter doc set cache separates shared namespace generation keys",
-            "cache invalidates ownership move prefix without reviving pinned generations",
-            "db text compaction preserves ordinal filters across reopen",
-            "db lsm primary compaction preserves doc identity ordinals",
-            "db allocates final document ordinal with all index families present",
-            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
-            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
-            "index manager split handoff preserves interleaved write and query summaries",
-            "db stats flag document identity ordinal capacity exhaustion",
-            "db rejects new document writes at ordinal exhaustion for every sync level",
-            "db transaction intent writes reject new documents at ordinal exhaustion",
-            "db search requests default to current identity generation snapshot",
-            "db validates internal resolved doc filter wire namespace and generation",
-            "db resolved doc-set projection honors identity read generation",
-            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
-            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
-        },
+        // The API anchor exposes lazily imported join and table-read tests.
+        // Keep it compile-only so the lifecycle selection remains unchanged.
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, lib_docid_lifecycle_runtime_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_docid_lifecycle_tests = addFilteredTestRunArtifact(b, lib_docid_lifecycle_tests);
-    const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
-    docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.step);
-
-    const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
-    docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_metadata_transition_chaos_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
-
-    const lib_api_docid_test_step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
-    lib_api_docid_test_step.dependOn(&run_lib_api_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_serverless_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_data_runtime_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
-    lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    const run_lib_docid_lifecycle_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_docid_lifecycle_tests,
+        lib_docid_lifecycle_runtime_filters,
+    );
 
     const api_backup_restore_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_backup_restore_test_root.zig"),
@@ -6755,12 +7247,31 @@ pub fn build(b: *std.Build) void {
         .root_module = api_backup_restore_test_mod,
         .filters = &.{
             "public api standalone-like e2e backs up drops and restores a table",
+            "public table backup handler exposes non-retryable fenced outcomes",
             "api restore rollback preserves a concurrently replaced table definition",
             "api http server cluster overwrite restores from read-only repository without dropping live table",
             "api http server rejects an empty cluster backup without publishing a manifest",
             "backup manifest validation rejects ambiguous or unbound artifacts",
+            "canonical repository file adapter streams blobs and compare-and-swaps refs",
+            "remote repository coordinator fences a resumed stale owner",
+            "repository remote verification accepts only full-object SHA-256 proofs",
+            "backup manifest cancellation prevents late publication",
+            "backup root publication cancellation leaves no visible control record",
+            "unpublished table cleanup retains its retry address until writer state retires",
+            "unpublished table cleanup preserves its reservation on writer owner mismatch",
+            "unpublished table cleanup exposes bounded resumable progress",
+            "stale table reclaim reports a concurrently replaced generation",
+            "stale table reclaim honors cancellation before storage mutation",
+            "table backup collision commit check is bounded and exact",
+            "standalone stale reclaim bounds foreground native artifact deletion",
+            "table backup retry preserves the retained ambiguous generation",
+            "table backup retry reclaims an eligible reservation and admits the new generation",
+            "table backup lease conflict retains the retry address and live writer fence",
+            "backup maintenance target coalesces exact table reclaim intent",
+            "table backup reclaim retry uses exact future eligibility",
             "cluster backup manifest rejects incomplete coverage",
             "restore source identities are bounded and canonical",
+            "filesystem backup location returns the canonical authorized identity",
             "portable backup integrity rejects changed staged bytes",
             "native artifact copy observes cancellation between io chunks",
             "native backup directory copy preserves nested files",
@@ -6799,10 +7310,34 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "metadata service ",
+            "cdc work permit ",
             "metadata proposal receipt ",
+            "metadata reconciliation plan uses one terminal receipt for ordered apply",
+            "table workflow cancellation stops before reconciliation lease work",
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",
+            "lifecycle listener detach drains callbacks and preserves unrelated listeners",
+            "metadata.table mutation routing forwards only to a routable remote leader",
+            "metadata http client forwards table create and drop to the internal route",
+            "metadata http client rejects invalid forwarded table names before I/O",
+            "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof",
+            "metadata http client preserves transport ambiguity for forwarded table mutations",
+            "metadata http client preserves extension ownership across forwarding",
+            "metadata http client preserves unrecognized server outcomes for forwarded table mutations",
+            "metadata http client does not replay unmarked table mutation rejection proof",
+            "metadata http client round-trips server endpoints",
+            "stamped definition replacement falls back to v0.2 text route",
+            "definition replacement does not replay an ambiguous admitted request",
+            "routed table mutation",
+            "forwarded create body limit",
+            "table mutation names preserve the public contract",
+            "stored create table encoding",
+            "raft mutation ",
+            "table topology mutation ",
+            "metadata http server preserves extension-owned table drop conflicts",
+            "metadata http server replaces a table definition through compare-and-swap",
+            "extension lifecycle proposal",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6849,6 +7384,7 @@ pub fn build(b: *std.Build) void {
         "table provisioner accepts target schema index when retained read index has inflated doc count",
         "table provisioner runtime schema progress requires authoritative O(1) identity coverage",
         "catalog table topology is order independent and detects range mutation",
+        "metadata route wire conversion preserves its absolute deadline",
         "metadata http server serves status and filtered admin routes",
         "metadata admin linearizable snapshot propagates request context",
         "metadata linearizable snapshot fences and frees one owned response",
@@ -6856,6 +7392,8 @@ pub fn build(b: *std.Build) void {
         "coherent linearizable snapshot retries a torn capture and preserves request context",
         "metadata http client signs internal routes without leaking authority to public routes",
         "metadata http client fetches one bounded linearizable snapshot",
+        "stamped definition replacement falls back to v0.2 text route",
+        "definition replacement does not replay an ambiguous admitted request",
         "metadata http client treats missing linearizable snapshot route as unsupported",
         "metadata http server accepts internal reallocate and split merge routes",
         "metadata http server returns 400 for invalid internal restore backup locations",
@@ -6976,6 +7514,7 @@ pub fn build(b: *std.Build) void {
         "derived backlog tracker fails closed when sequence accounting allocation fails",
         "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
+        "hbc index reports shared cache ownership",
         "hbc shared cache evicts across namespaces under one resource budget",
         "hbc shared cache CLOCK refreshes recency on borrowed vector hits",
         "hbc shared vector replacement cannot return an older external value",
@@ -7098,6 +7637,12 @@ pub fn build(b: *std.Build) void {
             "db dense artifact counter bootstrap fences stale concurrent attempt",
             "db malformed quarantined dense config does not block healthy artifact counters",
             "db query repair gate revalidates stale debt",
+            "db status cannot reopen a quarantined generation from an older publication certificate",
+            "db status cannot reopen managed admission after shadow build handoff",
+            "db initial replay repair cannot reopen admission during shadow reconstruction",
+            "db empty managed index does not invent generated coverage recovery debt",
+            "db repair preflight retains a canonical generation completed after scheduler selection",
+            "db coverage recovery admits a published generation after its admission marker retires",
             "db dense repair working set scales batch to resource budget",
             "db dense counter bootstrap admission respects soft background budget",
             "managed startup catch-up advances counterless incomplete dense repair",
@@ -7176,6 +7721,15 @@ pub fn build(b: *std.Build) void {
     // Both aggregates share this run node, so the default test DAG executes
     // the stateful parity suite once. The focused alias remains independent.
     integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    // Keep document-identity regressions in the owning integration suite.
+    // The mixed lifecycle artifact remains intact so removing its public
+    // shortcut does not discard metadata, cache, or distributed-query cases.
+    integration_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
+    integration_test_step.dependOn(&run_lib_serverless_docid_tests.step);
+    integration_test_step.dependOn(&run_api_transactions_docid_tests.step);
+    integration_test_step.dependOn(&run_api_table_reads_docid_tests.step);
+    integration_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+    integration_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
 
     const chaos_test_step = b.step("chaos-test", "Run bounded generated chaos campaigns with labeled progress");
     var chaos_progress_tail: ?*std.Build.Step = null;
@@ -7202,7 +7756,9 @@ pub fn build(b: *std.Build) void {
     const lib_template_tests = b.addTest(.{
         .root_module = template_test_mod,
     });
-    const run_lib_template_tests = b.addRunArtifact(lib_template_tests);
+    // template_remote imports Antfly runtime ABI tests, whose intentional
+    // error paths use the repository runner's expected-log accounting.
+    const run_lib_template_tests = addAntflyTestRunArtifact(b, lib_template_tests);
     const lib_template_test_step = b.step("lib-template-test", "Run template rendering tests");
     lib_template_test_step.dependOn(&run_lib_template_tests.step);
 
@@ -7341,15 +7897,18 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "standalone runtime module compiles",
             "standalone runtime local generator accepts media url data uris",
+            "local generate message conversion preserves tool history and admission",
+            "inference worker",
             "standalone runtime local dense embed preserves borrowed binary media",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
             "standalone inference middleware reuses public API authentication",
-            "standalone CORS middleware enforces dynamic configuration",
+            "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
             "standalone runtime parses experimental flag",
             "standalone runtime antfarm path guards keep api routes reserved",
             "standalone startup checkpoint readiness requires applied and safe-read progress",
+            "standalone activated seed bootstraps exact standby checkpoint and rejects older progress",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -7357,6 +7916,7 @@ pub fn build(b: *std.Build) void {
             "parse cli preserves registry variants and recognizes explicit preload backends",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
+            "promoted HA primary retains exact predecessor startup provenance",
             "parse cli accepts HA standby runtime flags",
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
@@ -7387,6 +7947,8 @@ pub fn build(b: *std.Build) void {
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
+            "standalone resolves the default secret store before full config parsing",
+            "embedded provider lifetime rejects new calls and joins admitted calls",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
@@ -7394,9 +7956,13 @@ pub fn build(b: *std.Build) void {
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone metadata advertises a linearizable owned snapshot",
+            "standalone schema mutation supports atomic merge patch and version CAS",
+            "standalone routing watch does not report absence after one probe",
+            "standalone metadata catalog source provides compact routing",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone unified server lifecycle propagates startup failure",
+            "runtime lease watchdog publishes active self-fenced proof from exact expired lease",
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
             "runtime lease watchdog retains a bounded Kubernetes response budget",
             "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
@@ -7420,6 +7986,8 @@ pub fn build(b: *std.Build) void {
     raft_test_step.dependOn(&run_raft_restore_tests.step);
     raft_test_step.dependOn(&run_raft_library_tests.step);
     raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+    raft_test_step.dependOn(&run_raft_storage_tests.step);
+    raft_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
@@ -7431,15 +7999,20 @@ pub fn build(b: *std.Build) void {
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
 
+    const raft_storage_test_step = b.step("raft-storage-test", "Run Raft snapshot artifact storage tests");
+    raft_storage_test_step.dependOn(&run_raft_storage_tests.step);
+
     unit_test_step.dependOn(&run_lib_regex_tests.step);
     unit_test_step.dependOn(&run_raft_library_tests.step);
     unit_test_step.dependOn(&run_lib_jsonschema_tests.step);
     unit_test_step.dependOn(&run_lib_generating_tests.step);
     unit_test_step.dependOn(&run_lib_embeddings_tests.step);
     unit_test_step.dependOn(&run_lib_vectorindex_tests.step);
+    unit_test_step.dependOn(&run_lib_hash_tests.step);
     unit_test_step.dependOn(&run_vector_cancellation_tests.step);
     unit_test_step.dependOn(&run_lib_chunking_tests.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
+    unit_test_step.dependOn(&run_lib_google_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_tests.step);
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
@@ -7463,6 +8036,8 @@ pub fn build(b: *std.Build) void {
     // the focused artifact with the aggregate to run the curated bucket once.
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
+    unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    unit_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
@@ -7474,6 +8049,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&run_png_tests.step);
     unit_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
     unit_test_step.dependOn(&run_lib_scraping_tests.step);
@@ -7531,7 +8107,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_test_step = b.step("lmdb-test", "Run Zig LMDB port unit tests");
     lmdb_test_step.dependOn(&run_lmdb_unit_tests.step);
 
-    const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_unit_tests = b.addTest(.{
         .root_module = storage_lmdb_test_mod,
     });
@@ -7562,7 +8138,7 @@ pub fn build(b: *std.Build) void {
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
-    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod);
+    const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_soak_tests = b.addTest(.{
         .root_module = storage_lmdb_soak_test_mod,
         .filters = &.{"LMDB sim soak stays green"},
@@ -7571,7 +8147,7 @@ pub fn build(b: *std.Build) void {
     const storage_lmdb_soak_step = b.step("lmdb-sim-soak", "Run only the LMDB simulation soak test");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
 
-    const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
@@ -7581,7 +8157,7 @@ pub fn build(b: *std.Build) void {
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
-    const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
     const shard_unit_tests = b.addTest(.{
         .root_module = shard_test_mod,
@@ -7591,7 +8167,7 @@ pub fn build(b: *std.Build) void {
     const shard_test_step = b.step("shard-test", "Run storage/shard unit tests");
     shard_test_step.dependOn(&run_shard_unit_tests.step);
 
-    const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
     const wal_unit_tests = b.addTest(.{
@@ -7643,7 +8219,7 @@ pub fn build(b: *std.Build) void {
 
     const wal_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options);
-    const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod);
+    const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod, hash_mod);
     wal_soak_test_mod.addImport("bloom", bloom_mod);
     const wal_soak_tests = b.addTest(.{
         .root_module = wal_soak_test_mod,
@@ -7658,7 +8234,7 @@ pub fn build(b: *std.Build) void {
     storage_sim_soak_step.dependOn(&run_wal_soak_tests.step);
     soak_test_step.dependOn(storage_sim_soak_step);
 
-    const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
     persistent_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_test_mod.addImport("antfly_regex", regex_mod);
@@ -7720,7 +8296,7 @@ pub fn build(b: *std.Build) void {
 
     const persistent_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
-    const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod);
+    const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod, hash_mod);
     persistent_soak_test_mod.addImport("bloom", bloom_mod);
     persistent_soak_test_mod.addImport("antfly_vellum", vellum_mod);
     persistent_soak_test_mod.addImport("antfly_regex", regex_mod);
@@ -7737,7 +8313,7 @@ pub fn build(b: *std.Build) void {
 
     storage_sim_soak_step.dependOn(&run_persistent_soak_tests.step);
 
-    const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     addSnowballModule(b, index_manager_test_mod);
     index_manager_test_mod.addImport("bloom", bloom_mod);
     index_manager_test_mod.addImport("antfly_vellum", vellum_mod);
@@ -7746,6 +8322,7 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
+    index_manager_test_mod.addImport("antfly-json", json_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
@@ -7797,7 +8374,7 @@ pub fn build(b: *std.Build) void {
     const index_manager_vopr_step = b.step("index-manager-vopr-test", "Run index manager modeled-storage VOPR smoke tests");
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
-    const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
@@ -7947,6 +8524,8 @@ pub fn build(b: *std.Build) void {
     // branch. Keep them in the PR/base gate instead of defining orphan steps
     // that run only when invoked manually.
     unit_test_step.dependOn(&run_lib_api_derived_coverage_tests.step);
+    unit_test_step.dependOn(&run_lib_api_storage_authority_tests.step);
+    unit_test_step.dependOn(&run_lib_api_connections_tests.step);
     unit_test_step.dependOn(&run_api_table_writes_production_regression_unit_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
@@ -8057,7 +8636,7 @@ pub fn build(b: *std.Build) void {
     const db_split_replay_step = b.step("db-split-replay-fixtures", "Run only the DB split replay fixture tests");
     db_split_replay_step.dependOn(&run_db_split_replay_tests.step);
 
-    const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
@@ -8070,7 +8649,7 @@ pub fn build(b: *std.Build) void {
     const sparse_test_step = b.step("sparse-test", "Run sparse index unit tests");
     sparse_test_step.dependOn(&run_sparse_unit_tests.step);
 
-    const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
+    const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     derived_log_test_mod.addImport("bloom", bloom_mod);
     const derived_log_unit_tests = b.addTest(.{
         .root_module = derived_log_test_mod,
@@ -8121,6 +8700,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.ownership.",
             "storage.db.planning_stats.",
             "storage.db.promotion_runtime.",
+            "storage.db.publication.",
             "storage.db.query_metrics.",
             "storage.db.range_state.",
             "storage.db.resolution_handoff.",
@@ -8146,7 +8726,10 @@ pub fn build(b: *std.Build) void {
             "storage.backend_erased.",
             "storage.backend_types.",
             "storage.background_runtime.",
+            "storage.backup_bundle.",
+            "storage.backup_bundle_io.",
             "storage.backup_codec.",
+            "storage.backup_repository.",
             "storage.coverage_identity.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
@@ -8452,6 +9035,7 @@ pub fn build(b: *std.Build) void {
         &.{"metadata.reconciler."},
         &.{
             "metadata.service.",
+            "metadata.catalog_projection_reader.",
             "metadata.admin_read_operations.",
             "metadata.admin_mutation_operations.",
             "metadata.extension_operations.",
@@ -8729,7 +9313,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
     const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_c);
-    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod);
+    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod, hash_bench_mod);
     const lmdb_bench_mod_c = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
@@ -8746,7 +9330,7 @@ pub fn build(b: *std.Build) void {
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
     const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_zig);
-    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod);
+    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod, hash_bench_mod);
     const lmdb_bench_mod_zig = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
@@ -8804,7 +9388,7 @@ pub fn build(b: *std.Build) void {
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const split_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, split_bench_engine_options);
-    const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod);
+    const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod, hash_bench_mod);
     const split_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/split_bench.zig"),
         .target = target,
@@ -9001,6 +9585,7 @@ pub fn build(b: *std.Build) void {
     });
     lsm_write_bench_root_mod.addImport("bloom", bloom_mod);
     lsm_write_bench_root_mod.addImport("antfly_platform", platform_mod);
+    lsm_write_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     lsm_write_bench_mod.addImport("antfly_zig", lsm_write_bench_root_mod);
     const lsm_write_bench = b.addExecutable(.{
         .name = "lsm_write_bench",
@@ -9062,6 +9647,7 @@ pub fn build(b: *std.Build) void {
     text_segment_bench_root_mod.addImport("bloom", bloom_mod);
     text_segment_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     text_segment_bench_root_mod.addImport("antfly_platform", platform_mod);
+    text_segment_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     text_segment_write_bench_mod.addImport("antfly_text_bench", text_segment_bench_root_mod);
     const text_segment_write_bench = b.addExecutable(.{
         .name = "text_segment_write_bench",
@@ -9130,7 +9716,7 @@ pub fn build(b: *std.Build) void {
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const wal_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, wal_bench_engine_options);
-    const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod);
+    const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod, hash_bench_mod);
     const wal_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/wal_bench.zig"),
         .target = target,
@@ -9230,6 +9816,7 @@ pub fn build(b: *std.Build) void {
     derived_log_bench_root_mod.addImport("lmdb_engine", derived_log_bench_engine_mod);
     derived_log_bench_root_mod.addImport("bloom", bloom_mod);
     derived_log_bench_root_mod.addImport("antfly_platform", platform_mod);
+    derived_log_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     derived_log_bench_root_mod.link_libc = true;
     const derived_log_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/derived_log_bench.zig"),
@@ -9389,6 +9976,8 @@ pub fn build(b: *std.Build) void {
     });
     quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     quickstart_bench_root_mod.addImport("bloom", bloom_mod);
+    quickstart_bench_root_mod.addImport("antfly_platform", platform_mod);
+    quickstart_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     addSnowballModule(b, quickstart_bench_root_mod);
 
     const quickstart_bench_mod = b.createModule(.{
@@ -9410,6 +9999,38 @@ pub fn build(b: *std.Build) void {
     }
     const quickstart_bench_step = b.step("quickstart-bench", "Run the quickstart-shaped end-to-end benchmark");
     quickstart_bench_step.dependOn(&run_quickstart_bench.step);
+
+    const run_bge_m3_native_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_native_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "native",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_native_managed.addArgs(args);
+    const bge_m3_native_managed_step = b.step(
+        "bench-bge-m3-native-managed-e2e",
+        "Benchmark BGE-M3 native through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_native_managed_step.dependOn(&run_bge_m3_native_managed.step);
+
+    const run_bge_m3_metal_managed = b.addRunArtifact(quickstart_bench);
+    run_bge_m3_metal_managed.addArgs(&.{
+        "--mode",         "standalone-wiki",
+        "--model",        "BAAI/bge-m3",
+        "--dims",         "1024",
+        "--backend",      "metal",
+        "--chunk-tokens", "200",
+        "--batch-size",   "8",
+    });
+    if (b.args) |args| run_bge_m3_metal_managed.addArgs(args);
+    const bge_m3_metal_managed_step = b.step(
+        "bench-bge-m3-metal-managed-e2e",
+        "Benchmark BGE-M3 Metal through HTTP, managed enrichment, and publication",
+    );
+    bge_m3_metal_managed_step.dependOn(&run_bge_m3_metal_managed.step);
 
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("bench/compat_runner.zig"),
@@ -9796,6 +10417,7 @@ pub fn build(b: *std.Build) void {
     hbc_isolate_root_mod.addImport("antfly_vector", vector_mod);
     hbc_isolate_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
     hbc_isolate_root_mod.addImport("antfly_platform", platform_mod);
+    hbc_isolate_root_mod.addImport("antfly_hash", hash_bench_mod);
     hbc_isolate_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
 
     const hbc_isolate = b.addExecutable(.{
@@ -9871,6 +10493,7 @@ pub fn build(b: *std.Build) void {
     replay_bench_root_mod.addImport("antfly_reranking", reranking_mod);
     replay_bench_root_mod.addImport("antfly_scraping", scraping_mod);
     replay_bench_root_mod.addImport("antfly_platform", platform_mod);
+    replay_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     addSnowballModule(b, replay_bench_root_mod);
     replay_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
 
@@ -10010,6 +10633,7 @@ pub fn build(b: *std.Build) void {
     algebraic_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     algebraic_bench_root_mod.addImport("antfly_regex", regex_mod);
     algebraic_bench_root_mod.addImport("antfly_platform", platform_mod);
+    algebraic_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
     algebraic_bench_root_mod.addImport("antfly_reranking", reranking_mod);
     algebraic_bench_root_mod.addImport("antfly_resolver", resolver_mod);
     algebraic_bench_root_mod.addImport("antfly_reader_config", reader_config_mod);
@@ -10268,6 +10892,7 @@ pub fn build(b: *std.Build) void {
     });
     provisioned_dense_ingest_guardrail_mod.addImport("antfly-zig", lib_mod);
     provisioned_dense_ingest_guardrail_mod.addImport("antfly_platform", platform_mod);
+    provisioned_dense_ingest_guardrail_mod.addImport("antfly_hash", hash_mod);
 
     const provisioned_dense_ingest_guardrail = b.addExecutable(.{
         .name = "provisioned_dense_ingest_guardrail",
@@ -10572,6 +11197,7 @@ pub fn build(b: *std.Build) void {
     antfly_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
     antfly_main_mod.addImport("structlog", structlog_mod);
     antfly_main_mod.addImport("antfly_platform", platform_mod);
+    antfly_main_mod.addImport("antfly_hash", hash_mod);
     antfly_main_mod.addOptions("build_options", production_build_options);
     addMacosSdkPaths(b, antfly_main_mod, target);
 
@@ -10630,16 +11256,22 @@ pub fn build(b: *std.Build) void {
                 // automatically schedules only the subset that fits.
                 // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
                 // platform frameworks. Linux ARM64 reached 4.99 GB in the
-                // v0.2.1-rc0 release build, so reserve 6 GiB rather than
-                // forcing the scheduler to discard a completed 4 GiB claim.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 6) * 1024 * 1024 * 1024,
-                // Before the serverless split, clean aarch64-macOS ReleaseFast
-                // storage codegen reached 17.42 GB (16.23 GiB). Keep the old
-                // conservative reservations until both release runners have
-                // measured the smaller storage-only closure.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // v0.2.1-rc0 release build, while the integrated HA API kernel
+                // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
+                // build. Reserve 10 GiB so the scheduler serializes competing
+                // roots instead of discarding a successful production build.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast storage codegen reached
+                // 19.51 GB (18.17 GiB) with the platform frameworks enabled.
+                // A clean native aarch64-linux-musl production container build
+                // reached 19.89 GB (18.52 GiB) for the current production
+                // graph. Reserve 20 GiB on both targets so Zig's scheduler does
+                // not discard a successfully compiled production artifact.
+                // Use the same Linux-target claim for native and cross builds;
+                // the target artifact determines the dominant codegen shape.
+                .distributed => 20 * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
-                // Its cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
+                // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS
                 // storage kernel until both release runners confirm that.
                 .serverless => 10 * 1024 * 1024 * 1024,
@@ -10698,6 +11330,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
         });
         role_mod.addImport("structlog", structlog_mod);
+        role_mod.addImport("antfly_platform", platform_mod);
         role_mod.link_libc = link_libc;
         addMacosSdkPaths(b, role_mod, target);
         role_mod.addOptions("runtime_artifact_options", role_options);
@@ -10777,23 +11410,23 @@ pub fn build(b: *std.Build) void {
     antfly_step.dependOn(&install_antfly.step);
     antfly_step.dependOn(&install_antfarm_assets.step);
 
-    const lite_core_main_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_core_main.zig"),
+    const lite_main_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    lite_core_main_mod.addImport("antfly-zig", lib_mod);
-    lite_core_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_core_main_mod.addImport("httpx", httpx_mod);
-    lite_core_main_mod.addImport("antfly_vellum", vellum_mod);
-    lite_core_main_mod.addImport("raft_engine", raft_engine_mod);
-    lite_core_main_mod.addImport("structlog", structlog_mod);
-    lite_core_main_mod.addImport("antfly_platform", platform_mod);
-    lite_core_main_mod.addImport("handlebars", handlebars_mod);
-    const lite_core_main = b.addExecutable(.{
-        .name = "antfly-lite-core",
-        .root_module = lite_core_main_mod,
+    lite_main_mod.addOptions("build_options", build_options);
+    lite_main_mod.addImport("structlog", structlog_mod);
+    lite_main_mod.addImport("antfly_platform", platform_mod);
+    lite_main_mod.addImport("antfly_hash", hash_mod);
+    const lite_main = b.addExecutable(.{
+        .name = "antfly-lite",
+        .root_module = lite_main_mod,
     });
+    // Lite commands are owned by the standalone runtime, including lite serve.
+    for ([_]RuntimeLibraryUnit{ .distributed, .api_kernel, .inference }) |unit| {
+        lite_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
+    }
     const lite_cli_smoke = b.addExecutable(.{
         .name = "antfly-lite-cli-smoke",
         .root_module = b.createModule(.{
@@ -10802,111 +11435,40 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const run_lite_core_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_core_cli_smoke.addArtifactArg(lite_core_main);
-    const run_lite_full_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_full_cli_smoke.addArtifactArg(antfly_main);
-    const lite_cli_smoke_step = b.step("lite-cli-smoke", "Run black-box Antfly Lite CLI smoke tests");
-    lite_cli_smoke_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);
-    const lite_core_main_tests = b.addTest(.{
-        .root_module = lite_core_main_mod,
-        .filters = &.{"lite core main compiles"},
+    const run_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
+    run_lite_cli_smoke.addArtifactArg(lite_main);
+    const run_antfly_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
+    run_antfly_lite_cli_smoke.addArtifactArg(antfly_main);
+    const lite_main_tests = b.addTest(.{
+        .root_module = lite_main_mod,
+        .filters = &.{"lite main compiles"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lite_core_main_tests = addFilteredTestRunArtifact(b, lite_core_main_tests);
-    const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
-    lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_test_step.dependOn(&run_lite_cmd_tests.step);
-    lite_core_test_step.dependOn(&run_lite_native_tests.step);
-    lite_core_test_step.dependOn(&run_capi_smoke.step);
-    lite_core_test_step.dependOn(&run_lite_go_tests.step);
-    lite_core_test_step.dependOn(&run_lite_go_example.step);
-    lite_core_test_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_core_test_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-    const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
+    const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
+    const install_lite_main = b.addInstallArtifact(lite_main, .{ .dest_sub_path = antfly_bin_name });
 
-    const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantfly C ABI");
-    lite_core_step.dependOn(&install_lite_core_main.step);
-    lite_core_step.dependOn(&install_libantfly.step);
-    lite_core_step.dependOn(&install_capi_header.step);
-    lite_core_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_step.dependOn(&run_capi_smoke.step);
-    lite_core_step.dependOn(&run_lite_go_tests.step);
-    lite_core_step.dependOn(&run_lite_go_example.step);
-    lite_core_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
+    const lite_step = b.step("lite", "Build and install the Antfly Lite CLI and libantfly C ABI");
+    lite_step.dependOn(&install_lite_main.step);
+    lite_step.dependOn(&install_libantfly.step);
+    lite_step.dependOn(&install_capi_header.step);
 
-    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, local inference runtime capability, embedded package check, and libantfly C ABI");
-    if (!lite_local_inference_runtime) {
-        lite_full_step.dependOn(&b.addFail("lite-full requires -Dlite-local-inference-runtime=true so Lite status and bindings advertise the local inference runtime").step);
-    }
-    lite_full_step.dependOn(&install_antfly.step);
-    lite_full_step.dependOn(&install_libantfly.step);
-    lite_full_step.dependOn(&install_capi_header.step);
-    lite_full_step.dependOn(&run_antfly_main_tests.step);
-    lite_full_step.dependOn(&run_lite_cmd_tests.step);
-    lite_full_step.dependOn(&run_lite_native_tests.step);
-    lite_full_step.dependOn(&run_capi_smoke.step);
-    lite_full_step.dependOn(&run_lite_go_tests.step);
-    lite_full_step.dependOn(&run_lite_go_example.step);
-    lite_full_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
-    lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-
-    const lite_wasm_profile_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    lite_wasm_profile_mod.addOptions("build_options", build_options);
-    const lite_wasm_profile = b.addExecutable(.{
-        .name = "antfly_lite_wasm_profile",
-        .root_module = lite_wasm_profile_mod,
-    });
-    lite_wasm_profile.entry = .disabled;
-    lite_wasm_profile.rdynamic = true;
-    lite_wasm_profile.export_memory = true;
-    const install_lite_wasm_profile = b.addInstallArtifact(lite_wasm_profile, .{
-        .dest_sub_path = "antfly-lite-wasm/antfly_lite_wasm_profile.wasm",
-    });
-    const lite_wasm_profile_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    lite_wasm_profile_tests.root_module.addOptions("build_options", build_options);
-    const run_lite_wasm_profile_tests = b.addRunArtifact(lite_wasm_profile_tests);
-    const lite_wasm_step = b.step("lite-wasm", "Build the Antfly Lite hosted/manual-maintenance WASM profile");
-    lite_wasm_step.dependOn(&install_lite_wasm_profile.step);
-    lite_wasm_step.dependOn(&run_lite_wasm_profile_tests.step);
-
-    const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
-    lite_dev_step.dependOn(&install_antfly.step);
-    lite_dev_step.dependOn(&install_libantfly.step);
-    lite_dev_step.dependOn(&install_capi_header.step);
-    lite_dev_step.dependOn(&run_antfly_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_core_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_cmd_tests.step);
-    lite_dev_step.dependOn(&run_lite_native_tests.step);
-    lite_dev_step.dependOn(&run_capi_smoke.step);
-    lite_dev_step.dependOn(&run_lite_go_tests.step);
-    lite_dev_step.dependOn(&run_lite_go_example.step);
-    lite_dev_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_dev_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
-    lite_dev_step.dependOn(&install_lite_wasm_profile.step);
-    lite_dev_step.dependOn(&run_lite_wasm_profile_tests.step);
-    lite_dev_step.dependOn(&run_cabi_packaging_tests.step);
-    lite_dev_step.dependOn(&run_capi_tests.step);
-    lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
+    const lite_test_step = b.step("lite-test", "Run Lite backend, CLI, bindings, examples, and C ABI packaging checks");
+    lite_test_step.dependOn(&run_antfly_main_tests.step);
+    lite_test_step.dependOn(&run_lite_main_tests.step);
+    lite_test_step.dependOn(&run_lite_cmd_tests.step);
+    lite_test_step.dependOn(&run_lite_native_tests.step);
+    lite_test_step.dependOn(&run_capi_smoke.step);
+    lite_test_step.dependOn(&run_lite_go_tests.step);
+    lite_test_step.dependOn(&run_lite_go_example.step);
+    lite_test_step.dependOn(&run_lite_go_retrieval_template.step);
+    lite_test_step.dependOn(&run_lite_cli_smoke.step);
+    lite_test_step.dependOn(&run_antfly_lite_cli_smoke.step);
+    lite_test_step.dependOn(&run_cabi_packaging_tests.step);
+    lite_test_step.dependOn(&run_capi_tests.step);
+    lite_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     dependOnAll(antfly_test_step, &.{
         unit_test_step,

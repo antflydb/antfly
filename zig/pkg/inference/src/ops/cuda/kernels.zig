@@ -25,6 +25,7 @@ const quant_kernel_compiler = @import("../../graph/quant_kernel_compiler.zig");
 const quant_matmul = @import("../../graph/quant_matmul.zig");
 const cuda_kernel_renderer = @import("../../graph/quant_kernel_cuda_renderer.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
+const a4b_qualification = @import("../../runtime/moe/a4b_qualification.zig");
 const platform = @import("antfly_platform");
 
 const turboquant = @import("../../runtime/kv/turboquant.zig");
@@ -793,7 +794,11 @@ const GqaPrefillProfile = enum {
     }
 
     fn selectsFast(self: GqaPrefillProfile) bool {
-        return self == .fast or self == .required_fast;
+        // Automatic first attempts the qualified paged-F16 Flash route. Dense
+        // F32 attention cannot use that storage-specific kernel, so use the
+        // cooperative dense prefill kernel instead of the scalar fallback
+        // that recomputes Q.K once per output dimension.
+        return self == .automatic or self == .fast or self == .required_fast;
     }
 
     fn failClosed(self: GqaPrefillProfile) bool {
@@ -920,7 +925,7 @@ fn fastGqaDecodeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_k
 }
 
 fn gqaPrefillShapeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
-    return batch == 1 and
+    return batch > 0 and
         q_seq_len > 1 and
         mask_len == 0 and
         bias_mode == 0 and
@@ -928,6 +933,30 @@ fn gqaPrefillShapeEligible(batch: usize, q_seq_len: usize, num_heads: usize, num
         num_heads % num_kv_heads == 0 and
         head_dim <= 512 and
         head_dim % 32 == 0;
+}
+
+/// Production-qualified automatic tensor-core route for the Qwen3-VL-2B
+/// decoder on NVIDIA L4.  Other shapes and architectures retain the existing
+/// automatic Flash/fallback policy; the explicit `mma` profile remains
+/// available for broader experimentation.
+fn qwen3VlAutomaticM32GqaPrefillEligible(
+    compute_major: i32,
+    compute_minor: i32,
+    batch: usize,
+    q_seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    mask_len: usize,
+    bias_mode: u32,
+) bool {
+    return compute_major == 8 and
+        compute_minor == 9 and
+        batch == 1 and
+        num_heads == 16 and
+        num_kv_heads == 8 and
+        head_dim == 128 and
+        gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
 }
 
 fn fastGqaPrefillEligible(profile: GqaPrefillProfile, batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
@@ -1587,6 +1616,8 @@ pub const JitModelProfile = enum {
     gliner2,
     florence2,
     gemma4,
+    qwen3_embedding,
+    qwen3_vl_generation,
 };
 
 pub const JitRouteScope = struct {
@@ -1608,7 +1639,14 @@ pub const JitRouteScope = struct {
         return switch (profile) {
             // Current production CUDA JIT evidence is exclusively Gemma4
             // E2B/E4B Q4_0. Encoder models keep the bundled runtime.
-            .clipclap, .bert_encoder, .deberta_reranker, .gliner2, .florence2 => .{},
+            .clipclap,
+            .bert_encoder,
+            .deberta_reranker,
+            .gliner2,
+            .florence2,
+            .qwen3_embedding,
+            .qwen3_vl_generation,
+            => .{},
             .gemma4 => .{ .production = .{
                 .mmv = true,
                 .mm = true,
@@ -2143,6 +2181,7 @@ pub const KernelModule = struct {
     f32_to_i32: driver_mod.CUfunction = null,
     round_f32: driver_mod.CUfunction = null,
     dequant_q4_0_bf16: driver_mod.CUfunction = null,
+    pack_q8_0_tensor_core: driver_mod.CUfunction = null,
     scale_f32: driver_mod.CUfunction = null,
     add_scalar_f32: driver_mod.CUfunction = null,
     binary_scalar_f32: driver_mod.CUfunction = null,
@@ -2168,6 +2207,7 @@ pub const KernelModule = struct {
     linear_q6_k_argmax_rows_stage1_tile8: driver_mod.CUfunction = null,
     linear_q6_k_argmax_rows_stage1_tile16: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile8: driver_mod.CUfunction = null,
+    linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_generated_k2560: driver_mod.CUfunction = null,
     linear_q6_k_q8_1_argmax_generated_k3840: driver_mod.CUfunction = null,
@@ -2199,6 +2239,8 @@ pub const KernelModule = struct {
     rms_norm_add_mul_scalar_f32: driver_mod.CUfunction = null,
     rms_norm_add_output_scale_f32: driver_mod.CUfunction = null,
     rms_norm_bare_f32: driver_mod.CUfunction = null,
+    gemma4_a4b_rms_norm_triple_f32: driver_mod.CUfunction = null,
+    gemma4_a4b_parallel_ffn_post_residual_f32: driver_mod.CUfunction = null,
     layer_norm_f32: driver_mod.CUfunction = null,
     add_layer_norm_f32: driver_mod.CUfunction = null,
     elementwise_f32: driver_mod.CUfunction = null,
@@ -2214,6 +2256,11 @@ pub const KernelModule = struct {
     embedding_lookup_i32_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_f16_weight_f32: driver_mod.CUfunction = null,
     take_rows_f32: driver_mod.CUfunction = null,
+    gemma4_a4b_topk_rows_f32: driver_mod.CUfunction = null,
+    gemma4_a4b_q4_0_gate_up_rows_q8_1_f32: driver_mod.CUfunction = null,
+    gemma4_a4b_q4_0_down_rows_q8_1_f32: driver_mod.CUfunction = null,
+    gemma4_a4b_q4_0_down_rows_q8_1_f32_compact: driver_mod.CUfunction = null,
+    gemma4_a4b_combine_rows_f32: driver_mod.CUfunction = null,
     gliner_gather_concat_relu_f32: driver_mod.CUfunction = null,
     gliner_word_embeddings_f32: driver_mod.CUfunction = null,
     repeat_first_row_f32: driver_mod.CUfunction = null,
@@ -2222,6 +2269,10 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    // BF16 tensor-core full attention for Qwen3-VL's token-major D=64 vision
+    // tower.  Kept separate from the general attention dispatcher so only the
+    // architecture with the qualified layout/semantics can select it.
+    qwen3vl_vision_attention_tc_bf16_m32n16: driver_mod.CUfunction = null,
     // Generated-shape BERT prefill attention: full, head-major [B,H,256,64].
     // It replaces the legacy block-wide reduction performed once per key.
     attention_f32_bert_prefill_s256_hd64: driver_mod.CUfunction = null,
@@ -2242,6 +2293,8 @@ pub const KernelModule = struct {
     channel_apply_f32: driver_mod.CUfunction = null,
     florence_vision_tail_sources_f32: driver_mod.CUfunction = null,
     rope_f32: driver_mod.CUfunction = null,
+    qwen3vl_mrope_f32: driver_mod.CUfunction = null,
+    qwen3vl_vision_rope_f32: driver_mod.CUfunction = null,
     rope_decode_scalars_f32: driver_mod.CUfunction = null,
     decode_scalars_advance: driver_mod.CUfunction = null,
     rope_scaled_f32: driver_mod.CUfunction = null,
@@ -2279,6 +2332,9 @@ pub const KernelModule = struct {
     gqa_attention_decode_splitk_online_sm89_hd512_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_splitk_online_workspace: buffer_mod.DeviceBuffer = .{},
     gqa_decode_profile: GqaDecodeProfile = .off,
+    /// Model-scoped opt-in for Qwen3-VL automatic prefill routes. Explicit
+    /// operator-selected profiles remain available to every architecture.
+    qwen3vl_automatic_prefill: bool = false,
     gqa_splitk_online_decode_telemetry_word: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
@@ -3185,6 +3241,7 @@ pub const KernelModule = struct {
         const f32_to_i32 = loadOptionalFunction(ctx, module, "termite_f32_to_i32");
         const round_f32 = loadOptionalFunction(ctx, module, "termite_round_f32");
         const dequant_q4_0_bf16 = loadOptionalFunction(ctx, module, "termite_dequant_q4_0_bf16");
+        const pack_q8_0_tensor_core = loadOptionalFunction(ctx, module, "termite_pack_q8_0_tensor_core");
         var scale_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scale_f32, module, "termite_scale_f32"));
         var add_scalar_f32: driver_mod.CUfunction = null;
@@ -3221,6 +3278,7 @@ pub const KernelModule = struct {
         const linear_q6_k_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile8");
         const linear_q6_k_argmax_rows_stage1_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile16");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8");
+        const linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b");
         const linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b");
         const linear_q6_k_q8_1_argmax_generated_k2560 = loadOptionalFunction(
             ctx,
@@ -3274,6 +3332,8 @@ pub const KernelModule = struct {
         const rms_norm_add_output_scale_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_output_scale_f32");
         var rms_norm_bare_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_bare_f32, module, "termite_rms_norm_bare_f32"));
+        const gemma4_a4b_rms_norm_triple_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_rms_norm_triple_f32");
+        const gemma4_a4b_parallel_ffn_post_residual_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_parallel_ffn_post_residual_f32");
         var layer_norm_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&layer_norm_f32, module, "termite_layer_norm_f32"));
         var add_layer_norm_f32: driver_mod.CUfunction = null;
@@ -3297,6 +3357,11 @@ pub const KernelModule = struct {
         const embedding_lookup_i32_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_f16_weight_f32");
         var take_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&take_rows_f32, module, "termite_take_rows_f32"));
+        const gemma4_a4b_topk_rows_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_topk_rows_f32");
+        const gemma4_a4b_q4_0_gate_up_rows_q8_1_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32");
+        const gemma4_a4b_q4_0_down_rows_q8_1_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_q4_0_down_rows_q8_1_f32");
+        const gemma4_a4b_q4_0_down_rows_q8_1_f32_compact = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_q4_0_down_rows_q8_1_f32_compact");
+        const gemma4_a4b_combine_rows_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_combine_rows_f32");
         const gliner_gather_concat_relu_f32 = loadOptionalFunction(ctx, module, "termite_gliner_gather_concat_relu_f32");
         var gliner_word_embeddings_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&gliner_word_embeddings_f32, module, "termite_gliner_word_embeddings_f32"));
@@ -3312,6 +3377,7 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const qwen3vl_vision_attention_tc_bf16_m32n16 = loadOptionalFunction(ctx, module, "termite_qwen3vl_vision_attention_tc_bf16_m32n16");
         const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
         const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
         const attention_f32_bert_prefill_s256_hd64_q16 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q16");
@@ -3326,6 +3392,8 @@ pub const KernelModule = struct {
         const channel_apply_f32 = loadOptionalFunction(ctx, module, "termite_channel_apply_f32");
         const florence_vision_tail_sources_f32 = loadOptionalFunction(ctx, module, "termite_florence_vision_tail_sources_f32");
         const rope_f32 = loadOptionalFunction(ctx, module, "termite_rope_f32");
+        const qwen3vl_mrope_f32 = loadOptionalFunction(ctx, module, "termite_qwen3vl_mrope_f32");
+        const qwen3vl_vision_rope_f32 = loadOptionalFunction(ctx, module, "termite_qwen3vl_vision_rope_f32");
         const rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rope_decode_scalars_f32");
         const decode_scalars_advance = loadOptionalFunction(ctx, module, "termite_decode_scalars_advance");
         const rope_scaled_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_f32");
@@ -3716,6 +3784,7 @@ pub const KernelModule = struct {
             .f32_to_i32 = f32_to_i32,
             .round_f32 = round_f32,
             .dequant_q4_0_bf16 = dequant_q4_0_bf16,
+            .pack_q8_0_tensor_core = pack_q8_0_tensor_core,
             .scale_f32 = scale_f32,
             .add_scalar_f32 = add_scalar_f32,
             .binary_scalar_f32 = binary_scalar_f32,
@@ -3741,6 +3810,7 @@ pub const KernelModule = struct {
             .linear_q6_k_argmax_rows_stage1_tile8 = linear_q6_k_argmax_rows_stage1_tile8,
             .linear_q6_k_argmax_rows_stage1_tile16 = linear_q6_k_argmax_rows_stage1_tile16,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile8 = linear_q6_k_q8_1_argmax_rows_stage1_tile8,
+            .linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b = linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b,
             .linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b,
             .linear_q6_k_q8_1_argmax_generated_k2560 = linear_q6_k_q8_1_argmax_generated_k2560,
             .linear_q6_k_q8_1_argmax_generated_k3840 = linear_q6_k_q8_1_argmax_generated_k3840,
@@ -3772,6 +3842,8 @@ pub const KernelModule = struct {
             .rms_norm_add_mul_scalar_f32 = rms_norm_add_mul_scalar_f32,
             .rms_norm_add_output_scale_f32 = rms_norm_add_output_scale_f32,
             .rms_norm_bare_f32 = rms_norm_bare_f32,
+            .gemma4_a4b_rms_norm_triple_f32 = gemma4_a4b_rms_norm_triple_f32,
+            .gemma4_a4b_parallel_ffn_post_residual_f32 = gemma4_a4b_parallel_ffn_post_residual_f32,
             .layer_norm_f32 = layer_norm_f32,
             .add_layer_norm_f32 = add_layer_norm_f32,
             .elementwise_f32 = elementwise_f32,
@@ -3787,6 +3859,11 @@ pub const KernelModule = struct {
             .embedding_lookup_i32_f32 = embedding_lookup_i32_f32,
             .embedding_lookup_i32_f16_weight_f32 = embedding_lookup_i32_f16_weight_f32,
             .take_rows_f32 = take_rows_f32,
+            .gemma4_a4b_topk_rows_f32 = gemma4_a4b_topk_rows_f32,
+            .gemma4_a4b_q4_0_gate_up_rows_q8_1_f32 = gemma4_a4b_q4_0_gate_up_rows_q8_1_f32,
+            .gemma4_a4b_q4_0_down_rows_q8_1_f32 = gemma4_a4b_q4_0_down_rows_q8_1_f32,
+            .gemma4_a4b_q4_0_down_rows_q8_1_f32_compact = gemma4_a4b_q4_0_down_rows_q8_1_f32_compact,
+            .gemma4_a4b_combine_rows_f32 = gemma4_a4b_combine_rows_f32,
             .gliner_gather_concat_relu_f32 = gliner_gather_concat_relu_f32,
             .gliner_word_embeddings_f32 = gliner_word_embeddings_f32,
             .repeat_first_row_f32 = repeat_first_row_f32,
@@ -3795,6 +3872,7 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .qwen3vl_vision_attention_tc_bf16_m32n16 = qwen3vl_vision_attention_tc_bf16_m32n16,
             .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
             .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
             .attention_f32_bert_prefill_s256_hd64_q16 = attention_f32_bert_prefill_s256_hd64_q16,
@@ -3809,6 +3887,8 @@ pub const KernelModule = struct {
             .channel_apply_f32 = channel_apply_f32,
             .florence_vision_tail_sources_f32 = florence_vision_tail_sources_f32,
             .rope_f32 = rope_f32,
+            .qwen3vl_mrope_f32 = qwen3vl_mrope_f32,
+            .qwen3vl_vision_rope_f32 = qwen3vl_vision_rope_f32,
             .rope_decode_scalars_f32 = rope_decode_scalars_f32,
             .decode_scalars_advance = decode_scalars_advance,
             .rope_scaled_f32 = rope_scaled_f32,
@@ -4071,6 +4151,7 @@ pub const KernelModule = struct {
             self.f32_to_i32 = null;
             self.round_f32 = null;
             self.dequant_q4_0_bf16 = null;
+            self.pack_q8_0_tensor_core = null;
             self.scale_f32 = null;
             self.add_scalar_f32 = null;
             self.binary_scalar_f32 = null;
@@ -4096,6 +4177,7 @@ pub const KernelModule = struct {
             self.linear_q6_k_argmax_rows_stage1_tile8 = null;
             self.linear_q6_k_argmax_rows_stage1_tile16 = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 = null;
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b = null;
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = null;
             self.linear_q6_k_q8_1_argmax_generated_k2560 = null;
             self.linear_q6_k_q8_1_argmax_generated_k3840 = null;
@@ -4126,6 +4208,8 @@ pub const KernelModule = struct {
             self.rms_norm_add_mul_scalar_f32 = null;
             self.rms_norm_add_output_scale_f32 = null;
             self.rms_norm_bare_f32 = null;
+            self.gemma4_a4b_rms_norm_triple_f32 = null;
+            self.gemma4_a4b_parallel_ffn_post_residual_f32 = null;
             self.layer_norm_f32 = null;
             self.add_layer_norm_f32 = null;
             self.elementwise_f32 = null;
@@ -4141,6 +4225,11 @@ pub const KernelModule = struct {
             self.embedding_lookup_i32_f32 = null;
             self.embedding_lookup_i32_f16_weight_f32 = null;
             self.take_rows_f32 = null;
+            self.gemma4_a4b_topk_rows_f32 = null;
+            self.gemma4_a4b_q4_0_gate_up_rows_q8_1_f32 = null;
+            self.gemma4_a4b_q4_0_down_rows_q8_1_f32 = null;
+            self.gemma4_a4b_q4_0_down_rows_q8_1_f32_compact = null;
+            self.gemma4_a4b_combine_rows_f32 = null;
             self.gliner_gather_concat_relu_f32 = null;
             self.gliner_word_embeddings_f32 = null;
             self.repeat_first_row_f32 = null;
@@ -4149,6 +4238,7 @@ pub const KernelModule = struct {
             self.conv2d_f32 = null;
             self.attention_f32 = null;
             self.attention_f32_block = null;
+            self.qwen3vl_vision_attention_tc_bf16_m32n16 = null;
             self.attention_f32_bert_prefill_s256_hd64 = null;
             self.attention_f32_bert_prefill_s256_hd64_q8 = null;
             self.attention_f32_bert_prefill_s256_hd64_q16 = null;
@@ -4163,6 +4253,8 @@ pub const KernelModule = struct {
             self.channel_apply_f32 = null;
             self.florence_vision_tail_sources_f32 = null;
             self.rope_f32 = null;
+            self.qwen3vl_mrope_f32 = null;
+            self.qwen3vl_vision_rope_f32 = null;
             self.rope_decode_scalars_f32 = null;
             self.rope_scaled_f32 = null;
             self.rope_scaled_decode_scalars_f32 = null;
@@ -4209,6 +4301,7 @@ pub const KernelModule = struct {
             self.gqa_attention_prefill_flash_sm89_hd256_f32 = null;
             self.gqa_attention_prefill_flash_sm89_hd512_f32 = null;
             self.gqa_prefill_profile = .automatic;
+            self.qwen3vl_automatic_prefill = false;
             self.gqa_score_prework_mode = .automatic;
             self.gqa_score_prework_consumer_mode = .serial;
             for (&self.gqa_prefill_route_log_words) |*word| word.store(0, .monotonic);
@@ -4414,6 +4507,24 @@ pub const KernelModule = struct {
             self.gemma4_mtp_masked_argmax_f32 != null;
     }
 
+    pub fn hasQwen3EmbeddingPrimitives(self: *const KernelModule) bool {
+        return self.hasQuantMatmulMvpPrimitives() and
+            self.hasBf16WeightPrimitives() and
+            self.rope_f32 != null and
+            self.gqa_attention_f32 != null and
+            self.rms_norm_f32 != null and
+            self.elementwise_f32 != null;
+    }
+
+    pub fn hasQwen3VlGenerationPrimitives(self: *const KernelModule) bool {
+        return self.hasQwen3EmbeddingPrimitives() and
+            self.qwen3vl_mrope_f32 != null and
+            self.qwen3vl_vision_rope_f32 != null and
+            self.attention_f32 != null and
+            self.attention_f32_block != null and
+            self.layer_norm_f32 != null;
+    }
+
     pub fn hasBf16WeightPrimitives(self: *const KernelModule) bool {
         return self.linear_bf16_weight_f32_tiled != null and
             self.embedding_lookup_bf16_weight_f32 != null and
@@ -4434,6 +4545,25 @@ pub const KernelModule = struct {
             self.conv2d_f32 != null and
             self.attention_f32 != null and
             self.attention_f32_block != null;
+    }
+
+    pub fn hasGemma4A4BResidentQ4_0Primitives(self: *const KernelModule) bool {
+        // Exact-shape performance kernels remain optional: every call site has
+        // a baseline fallback, so their absence must not disable A4B residency.
+        return self.quantize_f32_q8_1_rows != null and
+            self.gemma4_a4b_topk_rows_f32 != null and
+            self.gemma4_a4b_q4_0_gate_up_rows_q8_1_f32 != null and
+            self.gemma4_a4b_q4_0_down_rows_q8_1_f32 != null and
+            self.gemma4_a4b_combine_rows_f32 != null;
+    }
+
+    pub fn hasGemma4A4BNormFusionPrimitives(self: *const KernelModule) bool {
+        return self.gemma4_a4b_rms_norm_triple_f32 != null and
+            self.gemma4_a4b_parallel_ffn_post_residual_f32 != null;
+    }
+
+    pub fn hasGemma4A4BExactLmHeadPrimitive(self: *const KernelModule) bool {
+        return self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b != null;
     }
 
     pub fn hasDebertaRerankerPrimitives(self: *const KernelModule) bool {
@@ -4747,6 +4877,34 @@ pub const KernelModule = struct {
         const threads: usize = 256;
         const max_grid: usize = 65535;
         const blocks = @min((block_count + threads - 1) / threads, max_grid);
+        try launchBlocks(function, ctx, blocks, threads, &params);
+    }
+
+    pub fn launchPackQ8_0TensorCore(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        block_count: usize,
+    ) driver_mod.Error!void {
+        const function = self.pack_q8_0_tensor_core orelse return error.CudaKernelUnavailable;
+        const packed_bytes = try checkedTensorElements(block_count, 34);
+        try checkRawBytes(dst, packed_bytes);
+        try checkRawBytes(src, packed_bytes);
+        if (block_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var block_count_u32 = try toU32(block_count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&block_count_u32),
+        };
+        const threads: usize = 256;
+        const byte_count = try checkedTensorElements(block_count, 34);
+        const max_grid: usize = 65535;
+        const blocks = @min((byte_count + threads - 1) / threads, max_grid);
         try launchBlocks(function, ctx, blocks, threads, &params);
     }
 
@@ -5967,11 +6125,17 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
         suppress_count: usize,
+        prefer_a4b_exact: bool,
     ) driver_mod.Error!void {
+        const use_a4b_stage1 =
+            prefer_a4b_exact and rows == 1 and in_dim == a4b_qualification.hidden_size and out_dim % 8 == 0 and suppress_count == 0 and
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b != null;
         const use_e4b_stage1 =
-            rows == 1 and in_dim == 2560 and out_dim == 262144 and suppress_count == 0 and
+            !use_a4b_stage1 and rows == 1 and in_dim == 2560 and out_dim == 262144 and suppress_count == 0 and
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b != null;
-        const stage1 = if (use_e4b_stage1)
+        const stage1 = if (use_a4b_stage1)
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b orelse return error.CudaKernelUnavailable
+        else if (use_e4b_stage1)
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b orelse return error.CudaKernelUnavailable
         else
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
@@ -6008,7 +6172,7 @@ pub const KernelModule = struct {
             @ptrCast(&out_dim_u32),
             @ptrCast(&suppress_count_u32),
         };
-        const stage1_threads: usize = if (use_e4b_stage1) 160 else q6KQ8_1Tile8Stage1Threads(row_blocks);
+        const stage1_threads: usize = if (use_a4b_stage1) 192 else if (use_e4b_stage1) 160 else q6KQ8_1Tile8Stage1Threads(row_blocks);
         try launchBlocks(stage1, ctx, partial_count, stage1_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
@@ -7006,6 +7170,94 @@ pub const KernelModule = struct {
         try launchRows(self.rms_norm_bare_f32, ctx, total_rows, &params);
     }
 
+    pub fn launchGemma4A4BRmsNormTripleF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        first: buffer_mod.DeviceBuffer,
+        second: buffer_mod.DeviceBuffer,
+        third: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        first_weight: buffer_mod.DeviceBuffer,
+        second_weight: buffer_mod.DeviceBuffer,
+        third_weight: buffer_mod.DeviceBuffer,
+        total_rows: usize,
+        dim: usize,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(total_rows, dim);
+        try checkBytes(first, count);
+        try checkBytes(second, count);
+        try checkBytes(third, count);
+        try checkBytes(input, count);
+        try checkBytes(first_weight, dim);
+        try checkBytes(second_weight, dim);
+        try checkBytes(third_weight, dim);
+        if (count == 0) return;
+
+        const function = self.gemma4_a4b_rms_norm_triple_f32 orelse return error.CudaKernelUnavailable;
+        var first_ptr = first.ptr;
+        var second_ptr = second.ptr;
+        var third_ptr = third.ptr;
+        var input_ptr = input.ptr;
+        var first_weight_ptr = first_weight.ptr;
+        var second_weight_ptr = second_weight.ptr;
+        var third_weight_ptr = third_weight.ptr;
+        var rows_u32 = try toU32(total_rows);
+        var dim_u32 = try toU32(dim);
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&first_ptr),        @ptrCast(&second_ptr),       @ptrCast(&third_ptr),
+            @ptrCast(&input_ptr),        @ptrCast(&first_weight_ptr), @ptrCast(&second_weight_ptr),
+            @ptrCast(&third_weight_ptr), @ptrCast(&rows_u32),         @ptrCast(&dim_u32),
+            @ptrCast(&eps_value),
+        };
+        try launchRows(function, ctx, total_rows, &params);
+    }
+
+    pub fn launchGemma4A4BParallelFfnPostResidualF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        shared: buffer_mod.DeviceBuffer,
+        shared_weight: buffer_mod.DeviceBuffer,
+        routed: buffer_mod.DeviceBuffer,
+        routed_weight: buffer_mod.DeviceBuffer,
+        combined_weight: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        total_rows: usize,
+        dim: usize,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const count = try checkedTensorElements(total_rows, dim);
+        try checkBytes(dst, count);
+        try checkBytes(shared, count);
+        try checkBytes(shared_weight, dim);
+        try checkBytes(routed, count);
+        try checkBytes(routed_weight, dim);
+        try checkBytes(combined_weight, dim);
+        try checkBytes(residual, count);
+        if (count == 0) return;
+
+        const function = self.gemma4_a4b_parallel_ffn_post_residual_f32 orelse return error.CudaKernelUnavailable;
+        var dst_ptr = dst.ptr;
+        var shared_ptr = shared.ptr;
+        var shared_weight_ptr = shared_weight.ptr;
+        var routed_ptr = routed.ptr;
+        var routed_weight_ptr = routed_weight.ptr;
+        var combined_weight_ptr = combined_weight.ptr;
+        var residual_ptr = residual.ptr;
+        var rows_u32 = try toU32(total_rows);
+        var dim_u32 = try toU32(dim);
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),      @ptrCast(&shared_ptr),        @ptrCast(&shared_weight_ptr),
+            @ptrCast(&routed_ptr),   @ptrCast(&routed_weight_ptr), @ptrCast(&combined_weight_ptr),
+            @ptrCast(&residual_ptr), @ptrCast(&rows_u32),          @ptrCast(&dim_u32),
+            @ptrCast(&eps_value),
+        };
+        try launchRows(function, ctx, total_rows, &params);
+    }
+
     pub fn launchElementwiseF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -7429,6 +7681,186 @@ pub const KernelModule = struct {
             @ptrCast(&dim_u32),
         };
         try launch1d(self.take_rows_f32, ctx, count, &params);
+    }
+
+    pub fn launchGemma4A4BTopKRowsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        route_ids: buffer_mod.DeviceBuffer,
+        route_weights: buffer_mod.DeviceBuffer,
+        logits: buffer_mod.DeviceBuffer,
+        expert_scale: ?buffer_mod.DeviceBuffer,
+        rows: usize,
+        num_experts: usize,
+        top_k: usize,
+        logit_scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.gemma4_a4b_topk_rows_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or num_experts == 0 or num_experts > 128 or top_k == 0 or top_k > 8 or top_k > num_experts)
+            return error.InvalidCudaState;
+        const routes = try checkedTensorElements(rows, top_k);
+        try checkRawBytes(route_ids, try checkedTensorElements(routes, @sizeOf(u32)));
+        try checkRawBytes(route_weights, try checkedTensorElements(routes, @sizeOf(f32)));
+        try checkBytes(logits, try checkedTensorElements(rows, num_experts));
+        if (expert_scale) |scale| try checkBytes(scale, num_experts);
+        var ids_ptr = route_ids.ptr;
+        var weights_ptr = route_weights.ptr;
+        var logits_ptr = logits.ptr;
+        var scale_ptr: driver_mod.CUdeviceptr = if (expert_scale) |scale| scale.ptr else 0;
+        var rows_u32 = try toU32(rows);
+        var num_experts_u32 = try toU32(num_experts);
+        var top_k_u32 = try toU32(top_k);
+        var scale_value = logit_scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&ids_ptr),  @ptrCast(&weights_ptr),     @ptrCast(&logits_ptr), @ptrCast(&scale_ptr),
+            @ptrCast(&rows_u32), @ptrCast(&num_experts_u32), @ptrCast(&top_k_u32),  @ptrCast(&scale_value),
+        };
+        try launchBlocks(function, ctx, rows, 128, &params);
+    }
+
+    pub fn launchGemma4A4BGateUpRowsQ4_0Q8_1F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q8_input: buffer_mod.DeviceBuffer,
+        gate: buffer_mod.DeviceBuffer,
+        up: buffer_mod.DeviceBuffer,
+        route_ids: buffer_mod.DeviceBuffer,
+        gate_expert_stride: usize,
+        up_expert_stride: usize,
+        rows: usize,
+        top_k: usize,
+        in_dim: usize,
+        out_dim: usize,
+        activation: u8,
+    ) driver_mod.Error!void {
+        const function = self.gemma4_a4b_q4_0_gate_up_rows_q8_1_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or top_k == 0 or top_k > 8 or in_dim == 0 or in_dim % 32 != 0 or out_dim == 0)
+            return error.InvalidCudaState;
+        const routes = try checkedTensorElements(rows, top_k);
+        try checkBytes(dst, try checkedTensorElements(routes, out_dim));
+        try checkRawBytes(q8_input, try checkedTensorElements(try checkedTensorElements(rows, in_dim / 32), 36));
+        try checkRawBytes(route_ids, try checkedTensorElements(routes, @sizeOf(u32)));
+        var dst_ptr = dst.ptr;
+        var input_ptr = q8_input.ptr;
+        var gate_ptr = gate.ptr;
+        var up_ptr = up.ptr;
+        var ids_ptr = route_ids.ptr;
+        var gate_stride_u64: u64 = gate_expert_stride;
+        var up_stride_u64: u64 = up_expert_stride;
+        var rows_u32 = try toU32(rows);
+        var top_k_u32 = try toU32(top_k);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var activation_u32: u32 = activation;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),         @ptrCast(&input_ptr),      @ptrCast(&gate_ptr), @ptrCast(&up_ptr),    @ptrCast(&ids_ptr),
+            @ptrCast(&gate_stride_u64), @ptrCast(&up_stride_u64),  @ptrCast(&rows_u32), @ptrCast(&top_k_u32), @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),     @ptrCast(&activation_u32),
+        };
+        try launchBlocks(function, ctx, try checkedTensorElements(routes, (out_dim + 3) / 4), 256, &params);
+    }
+
+    pub fn launchGemma4A4BDownRowsQ4_0Q8_1F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q8_input: buffer_mod.DeviceBuffer,
+        down: buffer_mod.DeviceBuffer,
+        route_ids: buffer_mod.DeviceBuffer,
+        down_expert_stride: usize,
+        rows: usize,
+        top_k: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.gemma4_a4b_q4_0_down_rows_q8_1_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or top_k == 0 or top_k > 8 or in_dim == 0 or in_dim % 32 != 0 or out_dim == 0)
+            return error.InvalidCudaState;
+        const routes = try checkedTensorElements(rows, top_k);
+        try checkBytes(dst, try checkedTensorElements(routes, out_dim));
+        try checkRawBytes(q8_input, try checkedTensorElements(try checkedTensorElements(routes, in_dim / 32), 36));
+        try checkRawBytes(route_ids, try checkedTensorElements(routes, @sizeOf(u32)));
+        var dst_ptr = dst.ptr;
+        var input_ptr = q8_input.ptr;
+        var down_ptr = down.ptr;
+        var ids_ptr = route_ids.ptr;
+        var down_stride_u64: u64 = down_expert_stride;
+        var rows_u32 = try toU32(rows);
+        var top_k_u32 = try toU32(top_k);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),         @ptrCast(&input_ptr), @ptrCast(&down_ptr),  @ptrCast(&ids_ptr),
+            @ptrCast(&down_stride_u64), @ptrCast(&rows_u32),  @ptrCast(&top_k_u32), @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + 7) / 8, routes, 128, &params);
+    }
+
+    pub fn launchGemma4A4BDownRowsQ4_0Q8_1F32Compact(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q8_input: buffer_mod.DeviceBuffer,
+        down: buffer_mod.DeviceBuffer,
+        route_ids: buffer_mod.DeviceBuffer,
+        down_expert_stride: usize,
+        rows: usize,
+        top_k: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.gemma4_a4b_q4_0_down_rows_q8_1_f32_compact orelse return error.CudaKernelUnavailable;
+        if (rows != 1 or top_k != 8 or in_dim != 704 or out_dim != 2816) return error.InvalidCudaState;
+        const routes = try checkedTensorElements(rows, top_k);
+        try checkBytes(dst, try checkedTensorElements(routes, out_dim));
+        try checkRawBytes(q8_input, try checkedTensorElements(try checkedTensorElements(routes, in_dim / 32), 36));
+        try checkRawBytes(route_ids, try checkedTensorElements(routes, @sizeOf(u32)));
+        var dst_ptr = dst.ptr;
+        var input_ptr = q8_input.ptr;
+        var down_ptr = down.ptr;
+        var ids_ptr = route_ids.ptr;
+        var down_stride_u64: u64 = down_expert_stride;
+        var rows_u32 = try toU32(rows);
+        var top_k_u32 = try toU32(top_k);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),         @ptrCast(&input_ptr), @ptrCast(&down_ptr),  @ptrCast(&ids_ptr),
+            @ptrCast(&down_stride_u64), @ptrCast(&rows_u32),  @ptrCast(&top_k_u32), @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, 352, routes, 64, &params);
+    }
+
+    pub fn launchGemma4A4BCombineRowsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        expert_output: buffer_mod.DeviceBuffer,
+        route_weights: buffer_mod.DeviceBuffer,
+        rows: usize,
+        top_k: usize,
+        dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.gemma4_a4b_combine_rows_f32 orelse return error.CudaKernelUnavailable;
+        if (rows == 0 or top_k == 0 or top_k > 8 or dim == 0) return error.InvalidCudaState;
+        const routes = try checkedTensorElements(rows, top_k);
+        try checkBytes(dst, try checkedTensorElements(rows, dim));
+        try checkBytes(expert_output, try checkedTensorElements(routes, dim));
+        try checkRawBytes(route_weights, try checkedTensorElements(routes, @sizeOf(f32)));
+        var dst_ptr = dst.ptr;
+        var output_ptr = expert_output.ptr;
+        var weights_ptr = route_weights.ptr;
+        var rows_u32 = try toU32(rows);
+        var top_k_u32 = try toU32(top_k);
+        var dim_u32 = try toU32(dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),  @ptrCast(&output_ptr), @ptrCast(&weights_ptr),
+            @ptrCast(&rows_u32), @ptrCast(&top_k_u32),  @ptrCast(&dim_u32),
+        };
+        try launch1d(function, ctx, try checkedTensorElements(rows, dim), &params);
     }
 
     pub fn launchGlinerGatherConcatReluF32(
@@ -8088,6 +8520,51 @@ pub const KernelModule = struct {
     /// token-major [batch, sequence, heads * head_dim]. Keeping this entry
     /// point separate prevents ComputeBackend callers from accidentally opting
     /// into the low-level head-major layout used by specialized kernels.
+    pub fn launchQwen3VlVisionAttentionTcBf16M32N16(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.qwen3vl_vision_attention_tc_bf16_m32n16 orelse return false;
+        if (ctx.info.compute_major < 8 or batch == 0 or seq_len == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const query_tiles = (seq_len + 31) / 32;
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
     pub fn launchTokenMajorAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -8654,6 +9131,94 @@ pub const KernelModule = struct {
                 consecutive_pairs_u32,
             });
         }
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchQwen3VlMropeF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        positions: buffer_mod.DeviceBuffer,
+        total_chunks: usize,
+        token_count: usize,
+        chunks_per_token: usize,
+        head_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        sections: [3]u32,
+    ) driver_mod.Error!void {
+        const function = self.qwen3vl_mrope_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total_chunks, head_dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkRawBytes(positions, try checkedTensorElements(try checkedTensorElements(3, token_count), @sizeOf(u32)));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var positions_ptr = positions.ptr;
+        var total_chunks_u32 = try toU32(total_chunks);
+        var token_count_u32 = try toU32(token_count);
+        var chunks_per_token_u32 = try toU32(chunks_per_token);
+        var head_dim_u32 = try toU32(head_dim);
+        var theta_f32 = theta;
+        var freq_scale_f32 = freq_scale;
+        var section_height_u32 = sections[1];
+        var section_width_u32 = sections[2];
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&positions_ptr),
+            @ptrCast(&total_chunks_u32),
+            @ptrCast(&token_count_u32),
+            @ptrCast(&chunks_per_token_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&theta_f32),
+            @ptrCast(&freq_scale_f32),
+            @ptrCast(&section_height_u32),
+            @ptrCast(&section_width_u32),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchQwen3VlVisionRopeF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        positions: buffer_mod.DeviceBuffer,
+        total_chunks: usize,
+        token_count: usize,
+        heads_per_token: usize,
+        head_dim: usize,
+        theta: f32,
+    ) driver_mod.Error!void {
+        const function = self.qwen3vl_vision_rope_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total_chunks, head_dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkRawBytes(positions, try checkedTensorElements(try checkedTensorElements(2, token_count), @sizeOf(u32)));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var positions_ptr = positions.ptr;
+        var total_chunks_u32 = try toU32(total_chunks);
+        var token_count_u32 = try toU32(token_count);
+        var heads_per_token_u32 = try toU32(heads_per_token);
+        var head_dim_u32 = try toU32(head_dim);
+        var theta_f32 = theta;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&positions_ptr),
+            @ptrCast(&total_chunks_u32),
+            @ptrCast(&token_count_u32),
+            @ptrCast(&heads_per_token_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&theta_f32),
+        };
         try launch1d(function, ctx, count, &params);
     }
 
@@ -9599,7 +10164,9 @@ pub const KernelModule = struct {
         // intentionally reachable only from launchGqaAttentionDecodeScalarsF32.
         // This host-scalar entry point must keep its normal decode topology.
         if (self.gqa_attention_prefill_fast_f32) |prefill_function| {
-            if (fastGqaPrefillEligible(self.gqa_prefill_profile, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
+            if ((self.gqa_prefill_profile != .automatic or self.qwen3vl_automatic_prefill) and
+                fastGqaPrefillEligible(self.gqa_prefill_profile, batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode))
+            {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
                 const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
                 try ctx.makeCurrent();
@@ -9634,7 +10201,11 @@ pub const KernelModule = struct {
             return error.CudaKernelUnavailable;
         }
         if (self.gqa_attention_decode_f32) |decode_function| {
-            if (head_dim <= 512) {
+            // The block-cooperative decode kernel has an exact one-token,
+            // one-item ABI. Batched or multi-token shapes must reach the
+            // general scalar kernel below; the decode kernel rejects those
+            // shapes device-side without writing `dst`.
+            if (fastGqaDecodeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode)) {
                 const block: c_uint = if (head_dim <= 256) 256 else 512;
                 const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
                 try ctx.makeCurrent();
@@ -10502,7 +11073,29 @@ pub const KernelModule = struct {
                         launch_kind = .prefill_tiled_f16_warp;
                     }
                 },
-                .automatic, .flash_f16_sm89, .required_flash_f16_sm89 => {},
+                .automatic => {
+                    if (self.qwen3vl_automatic_prefill and
+                        ctx.driver.fns.cuFuncSetAttribute != null and
+                        mmaM32GqaPrefillEnabled() and
+                        qwen3VlAutomaticM32GqaPrefillEligible(
+                            ctx.info.compute_major,
+                            ctx.info.compute_minor,
+                            batch,
+                            q_seq_len,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            mask_len,
+                            bias_mode,
+                        ))
+                    {
+                        if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
+                            function = mma_m32_function;
+                            launch_kind = .prefill_mma_m32;
+                        }
+                    }
+                },
+                .flash_f16_sm89, .required_flash_f16_sm89 => {},
             }
         }
         if (requiredGqaPrefillLaunch(self.gqa_prefill_profile)) |required_launch| {
@@ -18819,6 +19412,8 @@ test "CUDA runtime JIT profile scope covers only Gemma4 production routes" {
         JitModelProfile.deberta_reranker,
         JitModelProfile.gliner2,
         JitModelProfile.florence2,
+        JitModelProfile.qwen3_embedding,
+        JitModelProfile.qwen3_vl_generation,
     }) |profile| {
         try std.testing.expect(!JitRouteScope.maximumForProfile(profile).enabled());
     }
@@ -19680,6 +20275,530 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     try smokeArgmaxLastRowSuppressF32(&ctx, &module);
     try smokeGemma4MtpMaskedArgmaxF32(&ctx, &module);
     try smokeGemma4MtpVerifyCommitU32(&ctx, &module);
+    try smokeGemma4A4BResidentQ4_0(allocator, &ctx, &module);
+    try smokeGemma4A4BExactDown(allocator, &ctx, &module);
+    try smokeGemma4A4BExactLmHead(allocator, &ctx, &module);
+    try smokeGemma4A4BNormFusion(allocator, &ctx, &module);
+}
+
+pub fn smokeQwen3VlPrimitives(allocator: std.mem.Allocator) !void {
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+
+    if (module.qwen3vl_mrope_f32 == null or
+        module.qwen3vl_vision_rope_f32 == null or
+        module.pack_q8_0_tensor_core == null)
+    {
+        return error.CudaKernelUnavailable;
+    }
+    try smokeQ8TensorCorePack(&ctx, &module);
+    try smokeQwen3VlMropeF32(allocator, &ctx, &module);
+    try smokeQwen3VlVisionRopeF32(allocator, &ctx, &module);
+    try smokeQwen3VlVisionAttention(allocator, &ctx, &module);
+}
+
+fn smokeQ8TensorCorePack(ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const block_count: usize = 3;
+    var source: [block_count * 34]u8 = undefined;
+    for (&source, 0..) |*byte, index| byte.* = @truncate(index * 13 + 7);
+    var expected: [source.len]u8 = undefined;
+    for (0..block_count) |block| {
+        @memcpy(expected[block * 2 ..][0..2], source[block * 34 ..][0..2]);
+        @memcpy(expected[block_count * 2 + block * 32 ..][0..32], source[block * 34 + 2 ..][0..32]);
+    }
+
+    var source_device = try buffer_mod.DeviceBuffer.alloc(ctx, source.len);
+    defer source_device.free(ctx);
+    var output_device = try buffer_mod.DeviceBuffer.alloc(ctx, expected.len);
+    defer output_device.free(ctx);
+    try source_device.copyFromHost(ctx, &source);
+    try module.launchPackQ8_0TensorCore(ctx, output_device, source_device, block_count);
+    try ctx.synchronize();
+
+    var actual: [expected.len]u8 = undefined;
+    try output_device.copyToHost(ctx, &actual);
+    try ctx.synchronize();
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+fn roundToBf16F32(value: f32) f32 {
+    const bits: u32 = @bitCast(value);
+    const rounded = bits + 0x7fff + ((bits >> 16) & 1);
+    return @bitCast(rounded & 0xffff0000);
+}
+
+fn smokeQwen3VlVisionAttention(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    // The tensor-core implementation is selected only on SM80+. Older
+    // devices exercise the generic attention fallback instead.
+    if (ctx.info.compute_major < 8) return;
+    if (module.qwen3vl_vision_attention_tc_bf16_m32n16 == null)
+        return error.CudaKernelUnavailable;
+
+    const batch: usize = 2;
+    // Cross both the 16-key and 32-query tile boundaries so the smoke checks
+    // online-softmax accumulation as well as partial-tile indexing.
+    const seq_len: usize = 33;
+    const num_heads: usize = 2;
+    const head_dim: usize = 64;
+    const hidden = num_heads * head_dim;
+    const count = batch * seq_len * hidden;
+    const q = try allocator.alloc(f32, count);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, count);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, count);
+    defer allocator.free(v);
+    const expected = try allocator.alloc(f32, count);
+    defer allocator.free(expected);
+    for (0..count) |index| {
+        const q_value: i32 = @intCast(index % 13);
+        const k_value: i32 = @intCast((index * 3 + 1) % 17);
+        const v_value: i32 = @intCast((index * 5 + 2) % 19);
+        q[index] = roundToBf16F32(@as(f32, @floatFromInt(q_value - 6)) / 16.0);
+        k[index] = roundToBf16F32(@as(f32, @floatFromInt(k_value - 8)) / 16.0);
+        v[index] = roundToBf16F32(@as(f32, @floatFromInt(v_value - 9)) / 8.0);
+    }
+
+    for (0..batch) |batch_index| {
+        for (0..num_heads) |head| {
+            for (0..seq_len) |query| {
+                var scores: [seq_len]f32 = undefined;
+                var max_score = -std.math.inf(f32);
+                for (0..seq_len) |key| {
+                    var dot: f32 = 0;
+                    for (0..head_dim) |dimension| {
+                        const query_index = (batch_index * seq_len + query) * hidden + head * head_dim + dimension;
+                        const key_index = (batch_index * seq_len + key) * hidden + head * head_dim + dimension;
+                        dot += q[query_index] * k[key_index];
+                    }
+                    scores[key] = dot * 0.125;
+                    max_score = @max(max_score, scores[key]);
+                }
+                var denominator: f32 = 0;
+                var probabilities: [seq_len]f32 = undefined;
+                for (0..seq_len) |key| {
+                    const probability = @exp(scores[key] - max_score);
+                    denominator += probability;
+                    probabilities[key] = roundToBf16F32(probability);
+                }
+                for (0..head_dim) |dimension| {
+                    var sum: f32 = 0;
+                    for (0..seq_len) |key| {
+                        const value_index = (batch_index * seq_len + key) * hidden + head * head_dim + dimension;
+                        sum += probabilities[key] * v[value_index];
+                    }
+                    const output_index = (batch_index * seq_len + query) * hidden + head * head_dim + dimension;
+                    expected[output_index] = sum / denominator;
+                }
+            }
+        }
+    }
+
+    var q_device = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer q_device.free(ctx);
+    var k_device = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer k_device.free(ctx);
+    var v_device = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer v_device.free(ctx);
+    var output_device = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer output_device.free(ctx);
+    try q_device.copyFromHost(ctx, std.mem.sliceAsBytes(q));
+    try k_device.copyFromHost(ctx, std.mem.sliceAsBytes(k));
+    try v_device.copyFromHost(ctx, std.mem.sliceAsBytes(v));
+    const launched = try module.launchQwen3VlVisionAttentionTcBf16M32N16(
+        ctx,
+        output_device,
+        q_device,
+        k_device,
+        v_device,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    if (!launched) return error.CudaKernelUnavailable;
+    try ctx.synchronize();
+
+    const actual = try allocator.alloc(f32, count);
+    defer allocator.free(actual);
+    try output_device.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+    try ctx.synchronize();
+    try expectApproxSlice(actual, expected, 0.005);
+}
+
+fn smokeGemma4A4BResidentQ4_0(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    if (!module.hasGemma4A4BResidentQ4_0Primitives()) return error.CudaKernelUnavailable;
+    const rows: usize = 2;
+    const experts: usize = 2;
+    const top_k: usize = 1;
+    const hidden: usize = 32;
+    const intermediate: usize = 32;
+    const routes = rows * top_k;
+    const max_routes = rows * experts;
+    const expert_stride = intermediate * q4_0_block_bytes;
+
+    const input_host = [_]f32{1.0 / 32.0} ** (rows * hidden);
+    const logits_host = [_]f32{ 0.0, 2.0, 3.0, -1.0 };
+    var weight_host = [_]u8{0} ** (experts * expert_stride);
+    for (0..experts) |expert| {
+        const value: i4 = if (expert == 0) 2 else 1;
+        for (0..intermediate) |out| {
+            const offset = expert * expert_stride + out * q4_0_block_bytes;
+            writeQ4_0SmokeRow(weight_host[offset .. offset + q4_0_block_bytes], 1.0, value);
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, @sizeOf(@TypeOf(input_host)));
+    defer input.free(ctx);
+    var logits = try buffer_mod.DeviceBuffer.alloc(ctx, @sizeOf(@TypeOf(logits_host)));
+    defer logits.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, weight_host.len);
+    defer weight.free(ctx);
+    var route_ids = try buffer_mod.DeviceBuffer.alloc(ctx, max_routes * @sizeOf(u32));
+    defer route_ids.free(ctx);
+    var route_weights = try buffer_mod.DeviceBuffer.alloc(ctx, max_routes * @sizeOf(f32));
+    defer route_weights.free(ctx);
+    var input_q8 = try buffer_mod.DeviceBuffer.alloc(ctx, rows * q8_1_block_bytes);
+    defer input_q8.free(ctx);
+    var activated = try buffer_mod.DeviceBuffer.alloc(ctx, routes * intermediate * @sizeOf(f32));
+    defer activated.free(ctx);
+    var activated_q8 = try buffer_mod.DeviceBuffer.alloc(ctx, routes * q8_1_block_bytes);
+    defer activated_q8.free(ctx);
+    var expert_output = try buffer_mod.DeviceBuffer.alloc(ctx, routes * hidden * @sizeOf(f32));
+    defer expert_output.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, rows * hidden * @sizeOf(f32));
+    defer output.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_host));
+    try logits.copyFromHost(ctx, std.mem.sliceAsBytes(&logits_host));
+    try weight.copyFromHost(ctx, &weight_host);
+    try module.launchGemma4A4BTopKRowsF32(ctx, route_ids, route_weights, logits, null, rows, experts, top_k, 1.0);
+    try module.launchQuantizeF32Q8_1Rows(ctx, input_q8, input, rows, hidden);
+    try module.launchGemma4A4BGateUpRowsQ4_0Q8_1F32(
+        ctx,
+        activated,
+        input_q8,
+        weight,
+        weight,
+        route_ids,
+        expert_stride,
+        expert_stride,
+        rows,
+        top_k,
+        hidden,
+        intermediate,
+        1,
+    );
+    try module.launchQuantizeF32Q8_1Rows(ctx, activated_q8, activated, routes, intermediate);
+    try module.launchGemma4A4BDownRowsQ4_0Q8_1F32(
+        ctx,
+        expert_output,
+        activated_q8,
+        weight,
+        route_ids,
+        expert_stride,
+        rows,
+        top_k,
+        intermediate,
+        hidden,
+    );
+    try module.launchGemma4A4BCombineRowsF32(ctx, output, expert_output, route_weights, rows, top_k, hidden);
+    try ctx.synchronize();
+
+    var ids_host: [routes]u32 = undefined;
+    var weights_host: [routes]f32 = undefined;
+    const output_host = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(output_host);
+    try route_ids.copyToHost(ctx, std.mem.sliceAsBytes(&ids_host));
+    try route_weights.copyToHost(ctx, std.mem.sliceAsBytes(&weights_host));
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(output_host));
+    try ctx.synchronize();
+    if (ids_host[0] != 1 or ids_host[1] != 0) return error.CudaSmokeMismatch;
+    if (@abs(weights_host[0] - 1.0) > 0.0001 or @abs(weights_host[1] - 1.0) > 0.0001)
+        return error.CudaSmokeMismatch;
+    const expected = [_]f32{
+        26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778,
+        26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778,
+        26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778,
+        26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778, 26.92778,
+        250.193,  250.193,  250.193,  250.193,  250.193,  250.193,  250.193,  250.193,
+        250.193,  250.193,  250.193,  250.193,  250.193,  250.193,  250.193,  250.193,
+        250.193,  250.193,  250.193,  250.193,  250.193,  250.193,  250.193,  250.193,
+        250.193,  250.193,  250.193,  250.193,  250.193,  250.193,  250.193,  250.193,
+    };
+    try expectApproxSlice(output_host, &expected, 2.0);
+
+    try module.launchGemma4A4BTopKRowsF32(ctx, route_ids, route_weights, logits, null, rows, experts, experts, 1.0);
+    try ctx.synchronize();
+    var top2_ids: [max_routes]u32 = undefined;
+    var top2_weights: [max_routes]f32 = undefined;
+    try route_ids.copyToHost(ctx, std.mem.sliceAsBytes(&top2_ids));
+    try route_weights.copyToHost(ctx, std.mem.sliceAsBytes(&top2_weights));
+    try ctx.synchronize();
+    if (!std.mem.eql(u32, &top2_ids, &.{ 1, 0, 0, 1 })) return error.CudaSmokeMismatch;
+    for (0..rows) |row| {
+        const base = row * experts;
+        if (@abs(top2_weights[base] + top2_weights[base + 1] - 1.0) > 0.0001)
+            return error.CudaSmokeMismatch;
+        if (top2_weights[base] <= top2_weights[base + 1]) return error.CudaSmokeMismatch;
+    }
+}
+
+fn smokeGemma4A4BNormFusion(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    if (!module.hasGemma4A4BNormFusionPrimitives()) return error.CudaKernelUnavailable;
+    const rows: usize = 2;
+    const dim: usize = 32;
+    const count = rows * dim;
+    var input_host: [count]f32 = undefined;
+    var first_weight_host: [dim]f32 = undefined;
+    var second_weight_host: [dim]f32 = undefined;
+    var third_weight_host: [dim]f32 = undefined;
+    for (&input_host, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.125;
+    for (0..dim) |i| {
+        first_weight_host[i] = 0.75 + @as(f32, @floatFromInt(i)) * 0.002;
+        second_weight_host[i] = 1.25 - @as(f32, @floatFromInt(i)) * 0.003;
+        third_weight_host[i] = 0.5 + @as(f32, @floatFromInt(i)) * 0.004;
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer input.free(ctx);
+    var first_weight = try buffer_mod.DeviceBuffer.alloc(ctx, dim * @sizeOf(f32));
+    defer first_weight.free(ctx);
+    var second_weight = try buffer_mod.DeviceBuffer.alloc(ctx, dim * @sizeOf(f32));
+    defer second_weight.free(ctx);
+    var third_weight = try buffer_mod.DeviceBuffer.alloc(ctx, dim * @sizeOf(f32));
+    defer third_weight.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_host));
+    try first_weight.copyFromHost(ctx, std.mem.sliceAsBytes(&first_weight_host));
+    try second_weight.copyFromHost(ctx, std.mem.sliceAsBytes(&second_weight_host));
+    try third_weight.copyFromHost(ctx, std.mem.sliceAsBytes(&third_weight_host));
+
+    var first = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer first.free(ctx);
+    var second = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer second.free(ctx);
+    var third = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer third.free(ctx);
+    var ref_first = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer ref_first.free(ctx);
+    var ref_second = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer ref_second.free(ctx);
+    var ref_third = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer ref_third.free(ctx);
+    const eps: f32 = 1.0e-6;
+    try module.launchGemma4A4BRmsNormTripleF32(ctx, first, second, third, input, first_weight, second_weight, third_weight, rows, dim, eps);
+    try module.launchRmsNormF32(ctx, ref_first, input, first_weight, rows, dim, eps);
+    try module.launchRmsNormF32(ctx, ref_second, input, second_weight, rows, dim, eps);
+    try module.launchRmsNormF32(ctx, ref_third, input, third_weight, rows, dim, eps);
+
+    var fused_post = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer fused_post.free(ctx);
+    var ref_shared = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer ref_shared.free(ctx);
+    var ref_routed = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer ref_routed.free(ctx);
+    var ref_combined = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer ref_combined.free(ctx);
+    var ref_combined_norm = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer ref_combined_norm.free(ctx);
+    var ref_post = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer ref_post.free(ctx);
+    try module.launchGemma4A4BParallelFfnPostResidualF32(ctx, fused_post, first, first_weight, second, second_weight, third_weight, input, rows, dim, eps);
+    try module.launchRmsNormF32(ctx, ref_shared, first, first_weight, rows, dim, eps);
+    try module.launchRmsNormF32(ctx, ref_routed, second, second_weight, rows, dim, eps);
+    try module.launchElementwiseF32(ctx, ref_combined, ref_shared, ref_routed, count, .add);
+    try module.launchRmsNormF32(ctx, ref_combined_norm, ref_combined, third_weight, rows, dim, eps);
+    try module.launchElementwiseF32(ctx, ref_post, ref_combined_norm, input, count, .add);
+    try ctx.synchronize();
+
+    const actual = try allocator.alloc(f32, count);
+    defer allocator.free(actual);
+    const expected = try allocator.alloc(f32, count);
+    defer allocator.free(expected);
+    inline for (.{ .{ first, ref_first }, .{ second, ref_second }, .{ third, ref_third }, .{ fused_post, ref_post } }) |pair| {
+        try pair[0].copyToHost(ctx, std.mem.sliceAsBytes(actual));
+        try pair[1].copyToHost(ctx, std.mem.sliceAsBytes(expected));
+        try ctx.synchronize();
+        try expectApproxSlice(actual, expected, 0.0001);
+    }
+}
+
+fn smokeGemma4A4BExactDown(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    const rows: usize = 1;
+    const top_k: usize = 8;
+    const routes = rows * top_k;
+    const in_dim: usize = 704;
+    const out_dim: usize = 2816;
+    const row_blocks = in_dim / q4_0_values_per_block;
+    const expert_stride = out_dim * row_blocks * q4_0_block_bytes;
+
+    const input_host = try allocator.alloc(f32, routes * in_dim);
+    defer allocator.free(input_host);
+    for (input_host, 0..) |*value, i| {
+        const centered: i32 = @as(i32, @intCast(i % 17)) - 8;
+        value.* = @as(f32, @floatFromInt(centered)) * 0.03125;
+    }
+    const weight_host = try allocator.alloc(u8, expert_stride);
+    defer allocator.free(weight_host);
+    for (0..out_dim * row_blocks) |block| {
+        const value: i4 = @intCast(@as(i32, @intCast(block % 7)) - 3);
+        const offset = block * q4_0_block_bytes;
+        writeQ4_0SmokeRow(weight_host[offset .. offset + q4_0_block_bytes], 0.125, value);
+    }
+    const route_ids_host = [_]u32{0} ** routes;
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_host.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var input_q8 = try buffer_mod.DeviceBuffer.alloc(ctx, routes * (in_dim / q8_1_values_per_block) * q8_1_block_bytes);
+    defer input_q8.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, weight_host.len);
+    defer weight.free(ctx);
+    var route_ids = try buffer_mod.DeviceBuffer.alloc(ctx, route_ids_host.len * @sizeOf(u32));
+    defer route_ids.free(ctx);
+    var generic = try buffer_mod.DeviceBuffer.alloc(ctx, routes * out_dim * @sizeOf(f32));
+    defer generic.free(ctx);
+    var exact = try buffer_mod.DeviceBuffer.alloc(ctx, routes * out_dim * @sizeOf(f32));
+    defer exact.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(input_host));
+    try weight.copyFromHost(ctx, weight_host);
+    try route_ids.copyFromHost(ctx, std.mem.sliceAsBytes(&route_ids_host));
+    try module.launchQuantizeF32Q8_1Rows(ctx, input_q8, input, routes, in_dim);
+    try module.launchGemma4A4BDownRowsQ4_0Q8_1F32(
+        ctx,
+        generic,
+        input_q8,
+        weight,
+        route_ids,
+        expert_stride,
+        rows,
+        top_k,
+        in_dim,
+        out_dim,
+    );
+    try module.launchGemma4A4BDownRowsQ4_0Q8_1F32Compact(
+        ctx,
+        exact,
+        input_q8,
+        weight,
+        route_ids,
+        expert_stride,
+        rows,
+        top_k,
+        in_dim,
+        out_dim,
+    );
+    try ctx.synchronize();
+
+    const generic_host = try allocator.alloc(f32, routes * out_dim);
+    defer allocator.free(generic_host);
+    const exact_host = try allocator.alloc(f32, routes * out_dim);
+    defer allocator.free(exact_host);
+    try generic.copyToHost(ctx, std.mem.sliceAsBytes(generic_host));
+    try exact.copyToHost(ctx, std.mem.sliceAsBytes(exact_host));
+    try ctx.synchronize();
+    try expectApproxSlice(exact_host, generic_host, 0.0001);
+}
+
+fn smokeGemma4A4BExactLmHead(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    const rows: usize = 1;
+    const in_dim: usize = 2816;
+    const out_dim: usize = 16;
+    const q6_row_blocks = in_dim / q6_k_values_per_block;
+    const q8_row_blocks = in_dim / q8_1_values_per_block;
+    const col_tiles = out_dim / q6_k_col_tile8;
+
+    const input_host = [_]f32{0.25} ** in_dim;
+    const weight_host = try allocator.alloc(u8, out_dim * q6_row_blocks * q6_k_block_bytes);
+    defer allocator.free(weight_host);
+    for (0..out_dim) |col| {
+        const value: i8 = @intCast(@as(i32, @intCast(col)) - 8);
+        for (0..q6_row_blocks) |block| {
+            const offset = (col * q6_row_blocks + block) * q6_k_block_bytes;
+            writeQ6_KSmokeRow(weight_host[offset .. offset + q6_k_block_bytes], 0.125, value);
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_host.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var input_q8 = try buffer_mod.DeviceBuffer.alloc(ctx, rows * q8_row_blocks * q8_1_block_bytes);
+    defer input_q8.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, weight_host.len);
+    defer weight.free(ctx);
+    var generic_dst = try buffer_mod.DeviceBuffer.alloc(ctx, rows * @sizeOf(u32));
+    defer generic_dst.free(ctx);
+    var exact_dst = try buffer_mod.DeviceBuffer.alloc(ctx, rows * @sizeOf(u32));
+    defer exact_dst.free(ctx);
+    var generic_values = try buffer_mod.DeviceBuffer.alloc(ctx, rows * col_tiles * @sizeOf(f32));
+    defer generic_values.free(ctx);
+    var generic_indices = try buffer_mod.DeviceBuffer.alloc(ctx, rows * col_tiles * @sizeOf(u32));
+    defer generic_indices.free(ctx);
+    var exact_values = try buffer_mod.DeviceBuffer.alloc(ctx, rows * col_tiles * @sizeOf(f32));
+    defer exact_values.free(ctx);
+    var exact_indices = try buffer_mod.DeviceBuffer.alloc(ctx, rows * col_tiles * @sizeOf(u32));
+    defer exact_indices.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_host));
+    try weight.copyFromHost(ctx, weight_host);
+    try module.launchQuantizeF32Q8_1Rows(ctx, input_q8, input, rows, in_dim);
+    const no_suppression: buffer_mod.DeviceBuffer = .{};
+    try module.launchLinearQ6KQ8_1ArgmaxRowsTile8F32(
+        ctx,
+        generic_dst,
+        generic_values,
+        generic_indices,
+        input_q8,
+        weight,
+        no_suppression,
+        rows,
+        in_dim,
+        out_dim,
+        0,
+        false,
+    );
+    try module.launchLinearQ6KQ8_1ArgmaxRowsTile8F32(
+        ctx,
+        exact_dst,
+        exact_values,
+        exact_indices,
+        input_q8,
+        weight,
+        no_suppression,
+        rows,
+        in_dim,
+        out_dim,
+        0,
+        true,
+    );
+    try ctx.synchronize();
+
+    var generic_host: [rows]u32 = undefined;
+    var exact_host: [rows]u32 = undefined;
+    try generic_dst.copyToHost(ctx, std.mem.sliceAsBytes(&generic_host));
+    try exact_dst.copyToHost(ctx, std.mem.sliceAsBytes(&exact_host));
+    try ctx.synchronize();
+    if (generic_host[0] != out_dim - 1 or exact_host[0] != generic_host[0])
+        return error.CudaSmokeMismatch;
 }
 
 pub fn smokeFlorence2Primitives(allocator: std.mem.Allocator) !void {
@@ -20967,6 +22086,129 @@ fn smokeRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, mod
     }
 }
 
+fn smokeQwen3VlMropeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const token_count: usize = 2;
+    const heads: usize = 2;
+    const head_dim: usize = 8;
+    const total_chunks = token_count * heads;
+    const theta: f32 = 10000.0;
+    const freq_scale: f32 = 1.0;
+    const sections = [3]u32{ 2, 1, 1 };
+    const positions = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    var input_data: [total_chunks * head_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, index| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) / 7.0;
+    }
+    var expected: [input_data.len]f32 = undefined;
+    for (0..total_chunks) |chunk| {
+        const token = chunk / heads;
+        const base = chunk * head_dim;
+        for (0..head_dim / 2) |pair| {
+            const axis: usize = if (pair % 3 == 1 and pair < @as(usize, sections[1]) * 3)
+                1
+            else if (pair % 3 == 2 and pair < @as(usize, sections[2]) * 3)
+                2
+            else
+                0;
+            const exponent = @as(f32, @floatFromInt(2 * pair)) / @as(f32, @floatFromInt(head_dim));
+            const angle = @as(f32, @floatFromInt(positions[axis * token_count + token])) *
+                freq_scale / std.math.pow(f32, theta, exponent);
+            const left = input_data[base + pair];
+            const right = input_data[base + head_dim / 2 + pair];
+            expected[base + pair] = left * @cos(angle) - right * @sin(angle);
+            expected[base + head_dim / 2 + pair] = left * @sin(angle) + right * @cos(angle);
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var positions_device = try buffer_mod.DeviceBuffer.alloc(ctx, positions.len * @sizeOf(u32));
+    defer positions_device.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try positions_device.copyFromHost(ctx, std.mem.sliceAsBytes(&positions));
+    try module.launchQwen3VlMropeF32(
+        ctx,
+        output,
+        input,
+        positions_device,
+        total_chunks,
+        token_count,
+        heads,
+        head_dim,
+        theta,
+        freq_scale,
+        sections,
+    );
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0002);
+}
+
+fn smokeQwen3VlVisionRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const token_count: usize = 2;
+    const heads: usize = 2;
+    const head_dim: usize = 8;
+    const total_chunks = token_count * heads;
+    const theta: f32 = 10000.0;
+    const positions = [_]u32{ 1, 3, 2, 4 };
+    var input_data: [total_chunks * head_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, index| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) / 8.0;
+    }
+    var expected: [input_data.len]f32 = undefined;
+    const rotary_pairs = head_dim / 2;
+    const pairs_per_axis = rotary_pairs / 2;
+    for (0..total_chunks) |chunk| {
+        const token = chunk / heads;
+        const base = chunk * head_dim;
+        for (0..rotary_pairs) |pair| {
+            const axis: usize = if (pair < pairs_per_axis) 0 else 1;
+            const local_pair = pair % pairs_per_axis;
+            const exponent = @as(f32, @floatFromInt(2 * local_pair)) /
+                @as(f32, @floatFromInt(head_dim / 2));
+            const angle = @as(f32, @floatFromInt(positions[axis * token_count + token])) /
+                std.math.pow(f32, theta, exponent);
+            const left = input_data[base + pair];
+            const right = input_data[base + rotary_pairs + pair];
+            expected[base + pair] = left * @cos(angle) - right * @sin(angle);
+            expected[base + rotary_pairs + pair] = left * @sin(angle) + right * @cos(angle);
+        }
+    }
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var positions_device = try buffer_mod.DeviceBuffer.alloc(ctx, positions.len * @sizeOf(u32));
+    defer positions_device.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try positions_device.copyFromHost(ctx, std.mem.sliceAsBytes(&positions));
+    try module.launchQwen3VlVisionRopeF32(
+        ctx,
+        output,
+        input,
+        positions_device,
+        total_chunks,
+        token_count,
+        heads,
+        head_dim,
+        theta,
+    );
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0002);
+}
+
 fn smokeRopePerItemF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
     const batch: usize = 2;
     const max_seq_len: usize = 2;
@@ -21011,16 +22253,16 @@ fn smokeRopePerItemF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaConte
 }
 
 fn smokeGqaAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
-    const batch: usize = 1;
+    const batch: usize = 2;
     const q_seq_len: usize = 2;
     const kv_seq_len: usize = 2;
     const num_heads: usize = 2;
     const num_kv_heads: usize = 1;
     const head_dim: usize = 1;
-    const q_data = [_]f32{ 1, 1, 1, 1 };
-    const k_data = [_]f32{ 0, 0 };
-    const v_data = [_]f32{ 10, 20 };
-    const expected = [_]f32{ 10, 10, 15, 15 };
+    const q_data = [_]f32{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    const k_data = [_]f32{ 0, 0, 0, 0 };
+    const v_data = [_]f32{ 10, 20, 30, 50 };
+    const expected = [_]f32{ 10, 10, 15, 15, 30, 30, 40, 40 };
 
     var q = try buffer_mod.DeviceBuffer.alloc(ctx, q_data.len * @sizeOf(f32));
     defer q.free(ctx);
@@ -21954,6 +23196,14 @@ test "generated CUDA GQA decode shape supports bounded ratios" {
     try std.testing.expect(!generatedGqaDecodeShapeEligible(1, 1, 512, 40, 5));
 }
 
+test "CUDA fallback GQA decode shape excludes batches and prefill" {
+    try std.testing.expect(fastGqaDecodeEligible(1, 1, 8, 1, 256, 0, 0));
+    try std.testing.expect(!fastGqaDecodeEligible(2, 1, 8, 1, 256, 0, 0));
+    try std.testing.expect(!fastGqaDecodeEligible(1, 2, 8, 1, 256, 0, 0));
+    try std.testing.expect(!fastGqaDecodeEligible(1, 1, 8, 1, 256, 1, 0));
+    try std.testing.expect(!fastGqaDecodeEligible(1, 1, 8, 1, 256, 0, 1));
+}
+
 test "CUDA SM89 split-K online decode profile and telemetry are typed and bounded" {
     try std.testing.expectEqual(GqaDecodeProfile.off, parseGqaDecodeProfile("off").?);
     try std.testing.expectEqual(
@@ -22122,12 +23372,24 @@ test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous
     const defaults = try resolveGqaPrefillProfile(null, false, false, false);
     try std.testing.expectEqual(GqaPrefillProfile.automatic, defaults.profile);
     try std.testing.expectEqual(GqaPrefillProfileSource.default, defaults.source);
-    // The promoted automatic default attempts flash and never fails closed;
-    // explicit `off` remains the rollback with no flash selection.
+    // The promoted automatic default attempts paged-F16 Flash first, uses
+    // cooperative dense prefill for F32 attention, and selects the qualified
+    // SM89 Qwen3-VL-2B M32 tensor-core route. It never fails closed; explicit
+    // `off` remains the rollback with neither selection.
     try std.testing.expect(defaults.profile.selectsFlashF16Sm89());
     try std.testing.expect(!defaults.profile.failClosed());
-    try std.testing.expect(!defaults.profile.selectsFast());
+    try std.testing.expect(defaults.profile.selectsFast());
     try std.testing.expect(!GqaPrefillProfile.off.selectsFlashF16Sm89());
+    try std.testing.expect(!GqaPrefillProfile.off.selectsFast());
+    try std.testing.expect(fastGqaPrefillEligible(.automatic, 4, 511, 16, 8, 128, 0, 0));
+    try std.testing.expect(!fastGqaPrefillEligible(.automatic, 0, 511, 16, 8, 128, 0, 0));
+    try std.testing.expect(!fastGqaPrefillEligible(.automatic, 4, 511, 16, 8, 128, 1, 0));
+    try std.testing.expect(qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 16, 8, 128, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 0, 1, 159, 16, 8, 128, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 2, 159, 16, 8, 128, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 8, 1, 256, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 1, 16, 8, 128, 0, 0));
+    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 16, 8, 128, 1, 0));
     try std.testing.expectEqual(
         GqaAttentionLaunchKind.prefill_flash_f16_sm89,
         selectGqaFlashPrefillLaunch(.automatic, .eligible, true),

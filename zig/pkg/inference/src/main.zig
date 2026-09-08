@@ -47,6 +47,12 @@ const RunConfig = struct {
         quantization: ?[]const u8 = null,
         residency_mode: ?inference.ops.A4bResidencyMode = null,
         memory_budget_mb: ?u32 = null,
+        load_strategy: ?inference.ops.A4bLoadStrategy = null,
+        load_workers: ?u8 = null,
+        load_staging_mb: ?u32 = null,
+        prepared_pack: ?inference.ops.A4bPreparedPackMode = null,
+        drop_host_cache_after_load: bool = false,
+        startup_strategy: inference.server.WarmModelStartupStrategy = .eager,
     };
 
     const PromptCacheConfig = struct {
@@ -249,12 +255,21 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
             .quantization = value.quantization,
             .residency_mode = value.residency_mode,
             .memory_budget_mb = value.memory_budget_mb,
+            .load_strategy = value.load_strategy,
+            .load_workers = value.load_workers,
+            .load_staging_mb = value.load_staging_mb,
+            .prepared_pack = value.prepared_pack,
+            .drop_host_cache_after_load = value.drop_host_cache_after_load,
+            .startup_strategy = value.startup_strategy,
         };
     }
     return out;
 }
 
 pub fn main(init: std.process.Init) !void {
+    var worker_lifetime = platform.inference_process_supervisor.WorkerLifetime{};
+    defer worker_lifetime.deinit(init.io);
+    if (try platform.inference_process_supervisor.runIfNeeded(init, 1, &worker_lifetime)) return;
     const allocator = platform.allocator.processAllocator(std.heap.smp_allocator);
 
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
@@ -309,6 +324,8 @@ pub fn runFromArgs(
         try inference.native_rerank.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "generate")) {
         try inference.native_generate.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "a4b-pack")) {
+        try inference.native_a4b_pack.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "chat")) {
         try inference.native_chat.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
@@ -353,24 +370,44 @@ pub fn runFromArgs(
     }
 }
 
+const run_usage_options =
+    \\options:
+    \\  --host <address>                    Listen address (default: 127.0.0.1)
+    \\  --port <port>                       Listen port (default: 8090)
+    \\  --models-dir <path>                 AI model directory
+    \\  --ml-dir <path>                     Predictor model directory
+    \\  --config <path>                     JSON run configuration
+    \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
+    \\  --max-concurrent-requests <count>    Request concurrency limit
+    \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
+    \\  --host-budget-mb <n>                 Host-memory admission override (MiB)
+    \\  --backend-budget-mb <n>              Device-memory admission override (MiB)
+    \\  --combined-budget-mb <n>             Combined-memory admission override (MiB)
+    \\  --kv-budget-mb <n>                   KV-cache admission override (MiB)
+    \\  --scratch-budget-mb <n>              Scratch-memory admission override (MiB)
+    \\  --kernel-jit-mode <mode>             off, shadow, on, or required
+    \\  --preload-model <spec>               Warm a model at startup; repeatable
+    \\  --allow-insecure-public-bind         Permit a non-loopback listener without built-in auth/TLS
+    \\  --allow-unknown-models               Accepted for compatibility; unknown architectures are attempted by default
+    \\  -h, --help                           Show this help and exit
+    \\
+;
+
 fn printRunUsage(usage_name: []const u8) void {
-    print(
-        \\usage: {s} run [options]
-        \\
-        \\options:
-        \\  --host <address>                    Listen address (default: 127.0.0.1)
-        \\  --port <port>                       Listen port (default: 8090)
-        \\  --models-dir <path>                 AI model directory
-        \\  --ml-dir <path>                     Predictor model directory
-        \\  --config <path>                     JSON run configuration
-        \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
-        \\  --max-concurrent-requests <count>    Request concurrency limit
-        \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
-        \\  --preload-model <spec>               Warm a model at startup; repeatable
-        \\  --allow-unknown-models               Allow models absent from the registry
-        \\  -h, --help                           Show this help and exit
-        \\
-    , .{usage_name});
+    print("usage: {s} run [options]\n\n{s}", .{ usage_name, run_usage_options });
+}
+
+test "run help documents every accepted memory budget override" {
+    for ([_][]const u8{
+        "--process-memory-budget-mb",
+        "--host-budget-mb",
+        "--backend-budget-mb",
+        "--combined-budget-mb",
+        "--kv-budget-mb",
+        "--scratch-budget-mb",
+    }) |option| {
+        try std.testing.expect(std.mem.indexOf(u8, run_usage_options, option) != null);
+    }
 }
 
 const ProcessMemoryBudgetSource = enum {
@@ -405,6 +442,16 @@ fn resolveProcessMemoryBudgetMib(
     return .{ .value_mib = null, .source = .automatic };
 }
 
+/// `parseMaxLoadedModelsOverride` validates and resolves this option before the
+/// server loop. The loop must still consume the option and its value so they do
+/// not fall through to `InvalidArguments`.
+fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) bool {
+    if (!std.mem.eql(u8, args[index.*], "--max-loaded-models")) return false;
+    if (index.* + 1 >= args.len) return false;
+    index.* += 1;
+    return true;
+}
+
 fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
@@ -419,7 +466,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
-    var allow_unknown_models = false;
+    var allow_unknown_models = true;
     var models_overridden = false;
     var ml_overridden = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -444,6 +491,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
             i += 1;
+        } else if (consumeParsedMaxLoadedModelsOption(args, &i)) {
+            // Parsed once above so duplicate flags retain the documented
+            // last-value-wins behavior without a second conversion path.
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
             i += 1;
@@ -544,6 +594,11 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .automatic,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
+        // Only the replaceable worker advertises process termination. The
+        // stable parent owns restart after a hard cancellation boundary fires.
+        .process_termination_available = platform.env.getenvBool(
+            platform.inference_process_supervisor.worker_env,
+        ),
     };
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;
@@ -584,7 +639,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
-    node.attachIo(io);
+    try node.attachIo(io);
 
     try node.warmConfiguredModelsBeforeServing(allocator);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
@@ -592,6 +647,19 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     try node.serve(allocator, io, host, port);
 
     print("server stopped.\n", .{});
+}
+
+test "run server option loop consumes max loaded models override" {
+    var index: usize = 0;
+    try std.testing.expect(consumeParsedMaxLoadedModelsOption(
+        &.{ "--max-loaded-models", "1" },
+        &index,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), index);
+
+    index = 0;
+    try std.testing.expect(!consumeParsedMaxLoadedModelsOption(&.{"--host"}, &index));
+    try std.testing.expectEqual(@as(usize, 0), index);
 }
 
 fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -616,7 +684,7 @@ fn pullModel(allocator: std.mem.Allocator, io: std.Io, usage_name: []const u8, a
         print("usage: {s} pull <owner/name|hf:owner/name>[:gguf|:gguf:Q4_K_M|:mmproj] [--token <hf-token>] [--models-dir <dir>] [--tasks <task1,task2>] [--capabilities <cap1,cap2>] [--projector <auto|none|Q8_0|filename>] [--max-artifact-bytes <n>] [--max-model-bytes <n>]\n", .{usage_name});
         print("       {s} pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{usage_name});
         print("       {s} pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{usage_name});
-        print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
+        print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors[@<40-hex-commit>]\n", .{});
         print("CLIP/CLAP v0.2 example: {s} pull antflydb/clipclap:gguf:Q4_K\n", .{usage_name});
         return;
     }
@@ -719,6 +787,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  classify  Run native text classification from the command line
         \\  rerank    Run native text reranking from the command line
         \\  generate  Run native text generation from the command line
+        \\  a4b-pack  Create a pre-sharded Gemma 4 A4B CUDA expert pack
         \\  chat      Interactive chat with a local model (pulls known models on first use)
         \\  compile-artifact Compile one or more traced generation artifacts
         \\  export    Convert a model artifact to ONNX, GGUF, or safetensors
@@ -755,7 +824,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --scratch-budget-mb <n> Process-wide inference scratch-memory admission override (MiB)
         \\  --kernel-jit-mode <off|shadow|on|required> JIT startup-preloaded Metal/CUDA models
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
-        \\  --allow-unknown-models Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
+        \\  --allow-unknown-models Accepted for compatibility; unknown architectures are attempted by default
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)
@@ -767,7 +836,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --max-model-bytes <n> Maximum aggregate bytes accepted for one pull (default: 137438953472)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
-        \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors
+        \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors[@<40-hex-commit>]
         \\                    default :gguf now prefers smaller GGUF quants; use :gguf:Q... for larger files
         \\  CLIP/CLAP v0.2    {s} pull antflydb/clipclap:gguf:Q4_K
         \\
@@ -860,6 +929,23 @@ test "run config accepts canonical and legacy inference admission spellings" {
         error.InvalidInferenceConfig,
         parseRunConfig(std.testing.allocator, "{\"admission\":{\"infer\":{\"max_concurrent_requests\":1}}}"),
     );
+}
+
+test "run config preserves A4B CUDA load and prefetch policy" {
+    const parsed = try parseRunConfig(std.testing.allocator,
+        \\{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","residency_mode":"resident","memory_budget_mb":16384,"load_strategy":"pipeline","load_workers":6,"load_staging_mb":384,"prepared_pack":"required","drop_host_cache_after_load":true,"startup_strategy":"prefetch"}]}
+    );
+    defer parsed.deinit();
+    const models = try preloadModelsFromConfig(std.testing.allocator, parsed.value.preload);
+    defer std.testing.allocator.free(models);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqual(inference.backends.BackendType.cuda, models[0].backend.?);
+    try std.testing.expectEqual(inference.ops.A4bLoadStrategy.pipeline, models[0].load_strategy.?);
+    try std.testing.expectEqual(@as(?u8, 6), models[0].load_workers);
+    try std.testing.expectEqual(@as(?u32, 384), models[0].load_staging_mb);
+    try std.testing.expectEqual(inference.ops.A4bPreparedPackMode.required, models[0].prepared_pack.?);
+    try std.testing.expect(models[0].drop_host_cache_after_load);
+    try std.testing.expectEqual(inference.server.WarmModelStartupStrategy.prefetch, models[0].startup_strategy);
 }
 
 test "run config rejects unrepresentable prompt cache values" {

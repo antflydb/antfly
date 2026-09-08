@@ -3,24 +3,29 @@ title: Antfly Inference
 sidebar: concepts
 order: 3
 description: The model runtime inside Antfly, what it runs, and how to pull and configure models for it
+prerequisites:
+  - Antfly installed and running
+difficulty: beginner
+estimatedTime: "10 min"
+tags: [inference, embeddings, reranking, models]
 ---
 
 <Questions>
 - What is Antfly Inference?
 - How do I download models for Antfly Inference?
 - What models are available?
-- How do I use Antfly Inference for embeddings, chunking, and reranking?
+- How do I use Antfly Inference for embeddings, chunking, reranking, and generation?
 - Why is my index stuck with pending enrichments?
 </Questions>
 
-Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, transcription, reading, and generation models in the same process as the database, so index enrichers and query processors call it without a network hop and nothing leaves the machine. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
+Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, transcription, reading, and generation models (text generation from text, image, and audio prompts) in the same process as the database, so index enrichers and query processors call it without a network hop and nothing leaves the machine. It executes optimized ONNX and native GGUF artifacts without external API dependencies. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
 
 Pull a model, then embed a sentence through the running engine:
 
 ```bash
 antfly inference pull antflydb/clipclap:gguf:Q4_K
 
-curl -X POST http://localhost:8080/ai/v1/embed \
+curl -X POST http://127.0.0.1:8080/ai/v1/embed \
   -H "Content-Type: application/json" \
   -d '{"model":"antflydb/clipclap","input":["a photograph of a lighthouse"]}'
 ```
@@ -37,11 +42,13 @@ Models come from HuggingFace by their full `owner/name` reference; a bare name w
 
 ```bash
 antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
-antfly inference pull hf:mixedbread-ai/mxbai-rerank-base-v1 --tasks rerank
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
 `--tasks` records what the model is for, which decides where it is discovered and which endpoints serve it. Text generation supports a specific set of decoder architectures, so check [Local Model Compatibility](/docs/guides/supported-models) before pulling a generator.
+
+`--projector auto` is the default. Gemma 4's unified projector enables image and audio inputs and is recorded in the generated model manifest. Use `--projector none` for a text-only installation.
 
 Verified starting points, one per job:
 
@@ -49,7 +56,7 @@ Verified starting points, one per job:
 |-----|-------|
 | Text embedding | `BAAI/bge-small-en-v1.5` |
 | Multimodal embedding (text, image, audio) | `antflydb/clipclap` |
-| Reranking | `mixedbread-ai/mxbai-rerank-base-v1` |
+| Reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` |
 | Generation | `ggml-org/gemma-4-E4B-it-GGUF` |
 | Transcription | `openai/whisper-tiny` |
 | Reading and OCR | `antflydb/Florence-2-base` |
@@ -75,15 +82,16 @@ With no variant the pull is `auto`. Keep one variant per model directory: a seco
 
 ## Model Storage
 
-Models live under `$ANTFLY_INFERENCE_MODELS_DIR`, else `~/.antfly/inference/models`; `--models-dir` overrides both. Discovery is independent of the database data root, so `--data-dir` never moves it. A variant-less pull installs flat at `owner/name`:
+Models live under `$ANTFLY_INFERENCE_MODELS_DIR`, else `~/.antfly/inference/models`; `--models-dir` overrides both. A variant-less pull installs flat under the HuggingFace owner and repository name:
 
 ```text
 ~/.antfly/inference/models/
   BAAI/bge-small-en-v1.5/
-  mixedbread-ai/mxbai-rerank-base-v1/
 ```
 
-An explicit variant gets its own leaf directory beside the plain one. Older per-task subdirectories (`embedders/`, `chunkers/`, `rerankers/`, `generators/`) are still discovered. Antfly Inference loads what it finds there when standalone mode starts.
+An explicit variant gets its own distinct leaf directory beside the plain one, so quantizations cannot be mixed accidentally. Older per-task subdirectories (`embedders/`, `chunkers/`, `rerankers/`, `generators/`) are still discovered. Antfly Inference loads what it finds there when standalone mode starts.
+
+Traditional ML predictors use the parallel `~/.antfly/inference/ml/` directory; `--ml-dir` overrides it. Neither inference asset directory follows the database `--data-dir` implicitly.
 
 ## Naming a Model in an Index or Query
 
@@ -93,9 +101,13 @@ The provider name is `antfly`. The same three shapes appear in table, index, and
 { "provider": "antfly", "model": "BAAI/bge-small-en-v1.5" }
 ```
 
+The API uses one `EmbedderProvider` and one canonical `EmbedderConfig` across inference features. Index creation accepts the purpose-specific `IndexEmbedderConfig` subset (`antfly`, `ollama`, `openai`, or `bedrock`), so generated clients cannot advertise providers that the indexing runtime cannot execute.
+
 ```json
-{ "provider": "antfly", "model": "mixedbread-ai/mxbai-rerank-base-v1", "field": "body" }
+{ "provider": "antfly", "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0", "field": "body" }
 ```
+
+Reranking supports `antfly`, `cohere`, and `vertex`. Ollama reranking is not advertised because Antfly does not implement a compatible Ollama rerank API.
 
 ```json
 { "provider": "antfly", "model": "fixed_bert", "text": { "target_tokens": 512, "overlap_tokens": 50 } }
@@ -108,7 +120,7 @@ The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chu
 An embeddings index reports its own backlog. Inspect it while enrichment is pending:
 
 ```bash
-curl http://localhost:8080/db/v1/tables/TABLE/indexes/INDEX
+curl http://127.0.0.1:8080/db/v1/tables/TABLE/indexes/INDEX
 ```
 
 The `enrichment_runtime` object carries sequence progress, retry and failure counters, the active batch, and worker lifecycle state. `worker_started` says whether the background worker is running. `stalled` is the narrower condition: work is pending, no worker is running, and no retry or terminal failure already explains the backlog.
@@ -116,7 +128,7 @@ The `enrichment_runtime` object carries sequence progress, retry and failure cou
 For keys that have reached the durable repair queues, ask the bounded operator endpoint:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/TABLE/repair/issues \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/TABLE/repair/issues \
   -H 'Content-Type: application/json' \
   -d '{"target":"artifact","limit":100}'
 ```

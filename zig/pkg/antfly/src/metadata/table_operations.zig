@@ -10,6 +10,7 @@ const operation = @import("../api/operation.zig");
 const backups_api = @import("../api/backups.zig");
 const tables_api = @import("../api/tables.zig");
 const table_manager = @import("table_manager.zig");
+const metadata_api = @import("api.zig");
 
 pub const RestoreRequest = struct {
     backup_id: []const u8,
@@ -50,10 +51,15 @@ pub const Source = struct {
 
     pub const VTable = struct {
         create_table: *const fn (*anyopaque, std.mem.Allocator, []const u8, tables_api.CreateTableRequest) anyerror!void,
+        create_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8, tables_api.CreateTableRequest) anyerror!void = null,
         replace_definition: *const fn (*anyopaque, table_manager.TableRecord, table_manager.TableRecord) anyerror!void,
+        replace_definition_stamped: ?*const fn (*anyopaque, table_manager.TableRecord, table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp = null,
         restore_table: *const fn (*anyopaque, std.mem.Allocator, []const u8, RestoreRequest) anyerror!void,
+        restore_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8, RestoreRequest) anyerror!void = null,
         drop_table: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!void,
+        drop_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8) anyerror!void = null,
         update_schema: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!void,
+        mutate_schema: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, tables_api.SchemaMutationMode, []const u8, ?u32) anyerror!tables_api.SchemaMutationResult = null,
         create_index: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!void,
         drop_index: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!void,
         put_enrichment: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!void,
@@ -71,14 +77,23 @@ pub const Operations = struct {
 
     pub fn create(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, table_name: []const u8, request: tables_api.CreateTableRequest) !void {
         try validateNameAndContext(ctx, table_name);
+        if (self.source.vtable.create_table_with_context) |create_fn|
+            return try create_fn(self.source.ptr, alloc, ctx, table_name, request);
         try self.source.vtable.create_table(self.source.ptr, alloc, table_name, request);
     }
 
     pub fn replaceDefinition(self: Operations, ctx: operation.RequestContext, table_name: []const u8, expected: table_manager.TableRecord, replacement: table_manager.TableRecord) !void {
+        _ = try self.replaceDefinitionStamped(ctx, table_name, expected, replacement);
+    }
+
+    pub fn replaceDefinitionStamped(self: Operations, ctx: operation.RequestContext, table_name: []const u8, expected: table_manager.TableRecord, replacement: table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
         try validateNameAndContext(ctx, table_name);
         if (!std.mem.eql(u8, expected.name, table_name)) return error.ExpectedTableNameMismatch;
         if (!std.mem.eql(u8, replacement.name, table_name)) return error.TableNameMismatch;
+        if (self.source.vtable.replace_definition_stamped) |replace_fn|
+            return try replace_fn(self.source.ptr, expected, replacement);
         try self.source.vtable.replace_definition(self.source.ptr, expected, replacement);
+        return null;
     }
 
     pub fn restore(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, table_name: []const u8, request: RestoreRequest) !void {
@@ -89,17 +104,35 @@ pub const Operations = struct {
         if (request.connection.len == 0 or request.connection.len > 256) return error.InvalidBackupRequest;
         if (!std.mem.eql(u8, request.backup_id, request.manifest.backup_id)) return error.InvalidBackupRequest;
         try backups_api.validateTableManifest(alloc, &request.manifest, request.backup_id);
+        if (self.source.vtable.restore_table_with_context) |restore_fn|
+            return try restore_fn(self.source.ptr, alloc, ctx, table_name, request);
         try self.source.vtable.restore_table(self.source.ptr, alloc, table_name, request);
     }
 
     pub fn drop(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, table_name: []const u8) !void {
         try validateNameAndContext(ctx, table_name);
+        if (self.source.vtable.drop_table_with_context) |drop_fn|
+            return try drop_fn(self.source.ptr, alloc, ctx, table_name);
         try self.source.vtable.drop_table(self.source.ptr, alloc, table_name);
     }
 
     pub fn updateSchema(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, table_name: []const u8, schema_json: []const u8) !void {
         try validateNameAndContext(ctx, table_name);
         try self.source.vtable.update_schema(self.source.ptr, alloc, table_name, schema_json);
+    }
+
+    pub fn mutateSchema(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        ctx: operation.RequestContext,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        try validateNameAndContext(ctx, table_name);
+        const mutate = self.source.vtable.mutate_schema orelse return error.UnsupportedOperation;
+        return try mutate(self.source.ptr, alloc, table_name, mode, body, expected_version);
     }
 
     pub fn createIndex(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -214,4 +247,71 @@ test "metadata table operations enforce cancellation before source calls" {
         .cancellation = operation.CancellationToken.fromAtomic(&canceled),
     }, "docs"));
     try std.testing.expectEqual(@as(usize, 0), source.calls);
+}
+
+test "metadata table operations preserve deadlines through contextual sources" {
+    const Fake = struct {
+        observed_deadline_ns: ?u64 = null,
+
+        fn unsupportedCreate(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn createWithContext(ptr: *anyopaque, _: std.mem.Allocator, ctx: operation.RequestContext, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observed_deadline_ns = ctx.deadline_ns;
+        }
+        fn unsupportedReplace(_: *anyopaque, _: table_manager.TableRecord, _: table_manager.TableRecord) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedRestore(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: RestoreRequest) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedDrop(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedSchema(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedDropIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedValidateSplit(_: *anyopaque, _: []const u8, _: SplitRequest) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedSplit(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: SplitRequest) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedValidateMerge(_: *anyopaque, _: []const u8, _: MergeRequest) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedMerge(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: MergeRequest) !void {
+            return error.UnsupportedOperation;
+        }
+        fn unsupportedReseed(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) !ReseedExactCutoverResult {
+            return error.UnsupportedOperation;
+        }
+    };
+    var source = Fake{};
+    const ops = Operations{ .source = .{ .ptr = &source, .vtable = &.{
+        .create_table = Fake.unsupportedCreate,
+        .create_table_with_context = Fake.createWithContext,
+        .replace_definition = Fake.unsupportedReplace,
+        .restore_table = Fake.unsupportedRestore,
+        .drop_table = Fake.unsupportedDrop,
+        .update_schema = Fake.unsupportedSchema,
+        .create_index = Fake.unsupportedIndex,
+        .drop_index = Fake.unsupportedDropIndex,
+        .put_enrichment = Fake.unsupportedIndex,
+        .delete_enrichment = Fake.unsupportedDropIndex,
+        .validate_split = Fake.unsupportedValidateSplit,
+        .request_split = Fake.unsupportedSplit,
+        .validate_merge = Fake.unsupportedValidateMerge,
+        .request_merge = Fake.unsupportedMerge,
+        .reseed_exact_cutover = Fake.unsupportedReseed,
+    } } };
+    try ops.create(std.testing.allocator, .{ .deadline_ns = std.math.maxInt(u64) }, "docs", .{});
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), source.observed_deadline_ns);
 }

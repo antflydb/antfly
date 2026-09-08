@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ExaSearchConfigSearchType(str, Enum):
+class ExaSearchConfigSearchType(StrEnum):
     AUTO = "auto"
     KEYWORD = "keyword"
     NEURAL = "neural"

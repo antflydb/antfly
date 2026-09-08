@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "environments": {
+    "container-publish": {
+      "reviewers_from": "npm",
+      "prevent_self_review": true,
+      "wait_timer": 0,
+      "deployment_branch_policy": {
+        "protected_branches": false,
+        "custom_branch_policies": true
+      },
+      "branch_policies": [
+        {"name": "go/pkg/operator/v*", "type": "tag"},
+        {"name": "pkg/operator/v*", "type": "tag"},
+        {"name": "v*", "type": "tag"}
+      ]
+    },
+    "release-promotion": {
+      "reviewers_from": "npm",
+      "prevent_self_review": true,
+      "wait_timer": 0,
+      "deployment_branch_policy": {
+        "protected_branches": false,
+        "custom_branch_policies": true
+      },
+      "branch_policies": [
+        {"name": "main", "type": "branch"}
+      ]
+    }
+  }
+}

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class UnsupportedIndexCapabilityErrorMessage(str, Enum):
+class UnsupportedIndexCapabilityErrorMessage(StrEnum):
     ARTIFACT_BACKED_INDEX_SOURCES_ARE_NOT_SUPPORTED_BY_THIS_DEPLOYMENT = (
         "artifact-backed index sources are not supported by this deployment"
     )

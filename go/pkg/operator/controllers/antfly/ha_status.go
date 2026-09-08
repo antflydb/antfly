@@ -122,6 +122,7 @@ const (
 	haFencingLeaseAnnotationTransferOriginUID   = "antfly.io/ha-fence-transfer-origin-uid"
 	haFencingLeaseAnnotationCommittedTransition = "antfly.io/ha-fence-committed-transition"
 	haFencingLeaseAnnotationBootstrapReceipt    = "antfly.io/ha-fence-bootstrap-receipt"
+	haFencingLeaseAnnotationActivationReceipt   = "antfly.io/ha-fence-activation-receipt"
 	haFencingLeaseAnnotationProcessBootID       = "antfly.io/ha-fence-process-boot-id"
 )
 
@@ -133,24 +134,14 @@ type haProcessIncarnationGraceKey struct {
 	candidate      string
 }
 
-func haFencingLeaseRenewalRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
-	graceSeconds := int32(10)
-	if cluster != nil && cluster.Spec.HighAvailability != nil && cluster.Spec.HighAvailability.Runtime != nil &&
-		cluster.Spec.HighAvailability.Runtime.FencingLease != nil &&
-		cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds > 0 {
-		graceSeconds = cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds
-	}
-	// A healthy controller must create several strictly newer Lease renewals
-	// inside the runtime's local authority window. This leaves margin for API
-	// latency, reconcile queue jitter, and controller leader handoff.
-	return time.Duration(graceSeconds) * time.Second / 3
-}
-
 func haKubernetesLeaseRenewalEnabled(cluster *antflyv1.AntflyCluster) bool {
-	// Renewal, pod watchdog configuration, and least-privilege RBAC must be
-	// controlled by exactly the same ownership predicate. Divergence here can
-	// make a healthy primary fence itself after the operator stops renewing.
-	return haRuntimeLeaseWatchdogEnabled(cluster)
+	// Every promotion candidate must observe the exact Lease and publish a
+	// process-bound watchdog capability proof, but only the declarative primary
+	// owns renewal. Keeping standby observation read-only avoids duplicate
+	// renewal traffic while allowing an in-place promotion to prove that the
+	// candidate was already fail-closed before authority transferred.
+	return haRuntimeLeaseWatchdogEnabled(cluster) &&
+		cluster.Spec.HighAvailability.Runtime.Role == antflyv1.HARuntimeRolePrimary
 }
 
 type haPlannedAction struct {
@@ -290,15 +281,11 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		cluster.Status.HAStatus.PrimaryWatchdogProof.Active &&
 		!cluster.Status.HAStatus.PrimaryWatchdogProof.AuthorityGranted
 	holder := haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus)
+	inactivePrimaryWatchdog := false
 	if holder == "" {
-		if !cluster.Status.HAStatus.PrimaryAdminReachable &&
+		inactivePrimaryWatchdog = !cluster.Status.HAStatus.PrimaryAdminReachable &&
 			strings.Contains(cluster.Status.HAStatus.PrimaryAdminLastError, "HA Lease watchdog") &&
-			!pendingWatchdogAuthority {
-			// Never renew authority for an authenticated runtime that reports
-			// itself inactive (or cannot prove the capability). Let the old
-			// generation remain fenced while failover debounce selects a candidate.
-			return nil
-		}
+			!pendingWatchdogAuthority
 		identity := haReplicationIdentity(ha)
 		if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
 			return nil
@@ -389,6 +376,20 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
 		return nil
 	}
+	committedHandoffRenewal := lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+		currentHolder != localNodeID &&
+		lease.Annotations[haFencingLeaseAnnotationFormerHolder] == localNodeID &&
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] == string(cluster.UID) &&
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10)
+	if inactivePrimaryWatchdog && !committedHandoffRenewal {
+		// Never renew authority for an authenticated runtime that reports
+		// itself inactive (or cannot prove the capability). The sole exception
+		// is the exact, durable former-controller bridge created by the atomic
+		// holder transfer above: it renews the already-selected successor while
+		// Colony publishes that successor's declarative CR, and cannot be reused
+		// by a stale controller or a different Lease generation.
+		return nil
+	}
 	if bootstrapUnknownBoundary {
 		persistedBoundary, parseErr := strconv.ParseUint(
 			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]), 10, 64,
@@ -399,10 +400,19 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		if persistedBoundary > 0 {
 			scope.primaryLSN = persistedBoundary
 		}
-		if !haLeaseFenceScopeMatches(lease, scope) {
+		if !haLeaseFenceScopeMatches(lease, scope) &&
+			(!pendingWatchdogAuthority || !haCommittedTransferSuccessorScopeMatches(cluster, lease, scope, currentHolder, transitions)) {
 			return nil
 		}
 	}
+	// Capture an exact parent->child handoff before the ordinary owner-renewal
+	// branch can atomically close its transfer receipt. A successor runtime may
+	// already report full watchdog authority on its first controller observation,
+	// skipping the pending-authority branch below; its standby-era status LSN is
+	// still not allowed to replace the committed promotion boundary.
+	committedSuccessorBoundary, committedSuccessor := haCommittedTransferSuccessorBoundary(
+		cluster, lease, scope, currentHolder, transitions,
+	)
 
 	// Pending authority is an explicit, terminal branch before holder changes
 	// or ordinary owner renewal. It can advance only the exact configured
@@ -412,14 +422,32 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		identity := haReplicationIdentity(ha)
 		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
 		currentReceipt := haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID)
+		// A replacement successor process can observe a lower cached runtime LSN
+		// than the already-authoritative child Lease. Normalize only an unchanged
+		// identity before the exact comparison so process rebinding preserves that
+		// durable boundary instead of deadlocking until the Lease expires.
+		scope = haFencingLeaseScopeWithMonotonicBoundary(lease, scope)
 		if identity == nil || holder != currentHolder || currentHolder != localNodeID ||
 			currentHolder != strings.TrimSpace(identity.CurrentPrimaryID) ||
-			lease.Spec.RenewTime == nil || !haLeaseFenceScopeMatches(lease, scope) ||
+			lease.Spec.RenewTime == nil || (!haLeaseFenceScopeMatches(lease, scope) && !committedSuccessor) ||
 			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt]) == currentReceipt {
 			return nil
 		}
+		proofBoundary := lease.Spec.RenewTime.Time
+		incarnationBoundary := lease
+		if committedSuccessor && lease.Spec.AcquireTime != nil {
+			// The former holder may keep a committed transfer alive while Colony
+			// publishes the successor CR or finishes physical isolation. Those
+			// handoff renewals do not change the holder or Lease generation and must
+			// not continually invalidate the successor's proof or restart its
+			// process-incarnation grace. AcquireTime is the immutable transfer
+			// boundary at which this successor first became the exact holder.
+			proofBoundary = lease.Spec.AcquireTime.Time
+			incarnationBoundary = lease.DeepCopy()
+			incarnationBoundary.Spec.RenewTime = lease.Spec.AcquireTime.DeepCopy()
+		}
 		ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
-			ctx, cluster, currentHolder, uint64(transitions), lease.Spec.RenewTime.Time, false,
+			ctx, cluster, currentHolder, uint64(transitions), proofBoundary, false,
 		)
 		if err != nil || !ready {
 			return err
@@ -430,11 +458,28 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		}
 		unboundInitialBootstrap := currentProcess == "" && bootstrapUnknownBoundary && scope.primaryLSN == 0
 		if !unboundInitialBootstrap && currentProcess != proof.ProcessBootID && currentProcess != currentReceipt &&
-			!r.haProcessIncarnationBarrierElapsed(cluster, lease, currentProcess, proof.ProcessBootID) {
+			!r.haProcessIncarnationBarrierElapsed(cluster, incarnationBoundary, currentProcess, proof.ProcessBootID) {
 			return nil
 		}
 		lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = currentReceipt
+		// A process binding and the renewal that carries it are one observation
+		// to the runtime. If this process had already observed the unbound Lease,
+		// that write is sufficient for authority; otherwise the dedicated renewal
+		// controller must publish one strictly newer activation renewal. Reset the
+		// durable one-shot marker whenever a different process is bound.
+		delete(lease.Annotations, haFencingLeaseAnnotationActivationReceipt)
 		lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+		if committedSuccessor {
+			// The holder transfer is committed on the parent timeline before Colony
+			// publishes the promoted CR's successor identity. Advance the durable
+			// Lease scope and bind the already fail-closed successor process in one
+			// write; publishing either half alone would let the runtime and Lease
+			// controller wait indefinitely for each other.
+			scope.primaryLSN = committedSuccessorBoundary
+			for key, value := range scope.annotations() {
+				lease.Annotations[key] = value
+			}
+		}
 		lease.Spec.RenewTime = &now
 		if err := r.Update(ctx, lease); err != nil {
 			return err
@@ -445,19 +490,52 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 
 	clearBootstrapReceipt := false
 	bootstrapReceipt := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt])
-	if bootstrapReceipt != "" || (bootstrapUnknownBoundary && scope.primaryLSN == 0) {
-		if lease.Spec.RenewTime == nil || !haLeaseFenceScopeMatches(lease, scope) {
+	activationReceipt := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationActivationReceipt])
+	if activationReceipt != "" && activationReceipt != bootstrapReceipt {
+		return nil
+	}
+	boundHandoffReceipt := committedHandoffRenewal &&
+		haWatchdogProcessBootIDValid(strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])) &&
+		bootstrapReceipt == haFencingLeaseBootstrapReceipt(
+			currentHolder, transitions, lease.Annotations[haFencingLeaseAnnotationProcessBootID],
+		)
+	boundSuccessorReceipt := cluster.UID != "" &&
+		currentHolder == localNodeID && holder == currentHolder &&
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != "" &&
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != currentHolder &&
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) != "" &&
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] != string(cluster.UID) &&
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10) &&
+		haWatchdogProcessBootIDValid(strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])) &&
+		bootstrapReceipt == haFencingLeaseBootstrapReceipt(
+			currentHolder, transitions, lease.Annotations[haFencingLeaseAnnotationProcessBootID],
+		) &&
+		haLeaseFenceBoundSuccessorScopeMatches(lease, scope)
+	if (bootstrapReceipt != "" || (bootstrapUnknownBoundary && scope.primaryLSN == 0)) && !boundHandoffReceipt {
+		if lease.Spec.RenewTime == nil ||
+			(!haLeaseFenceScopeMatches(lease, scope) && !boundSuccessorReceipt) {
 			return nil
 		}
+		proofBoundary := lease.Spec.RenewTime.Time
+		if activationReceipt == "" && (committedSuccessor || boundSuccessorReceipt) && lease.Spec.AcquireTime != nil {
+			// The exact former controller may continue renewing after the successor
+			// process receipt is bound. Compare the successor's full-authority proof
+			// to the immutable holder-transfer boundary so those safety renewals
+			// cannot continually outrun proof publication.
+			proofBoundary = lease.Spec.AcquireTime.Time
+		}
 		ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
-			ctx, cluster, currentHolder, uint64(transitions), lease.Spec.RenewTime.Time, true,
+			ctx, cluster, currentHolder, uint64(transitions), proofBoundary, true,
 		)
 		if err != nil || !ready {
 			return err
 		}
 		clearBootstrapReceipt = bootstrapReceipt != ""
 	}
-	preserveTransferredScope := false
+	// A former-controller bridge advances time only. It never edits the
+	// committed holder, generation, process binding, or child topology scope.
+	preserveTransferredScope := boundHandoffReceipt
 	if lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" && currentHolder != "" &&
 		haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus) == "" && holder != currentHolder {
 		// Status loss or controller restart must never hand authority back to the
@@ -527,6 +605,15 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if lease.Annotations == nil {
 		lease.Annotations = map[string]string{}
 	}
+	// Runtime status can briefly lag after a role/topology transition. Once the
+	// Lease carries a positive boundary for an unchanged fencing identity, an
+	// ordinary renewal may advance that lower bound but must never regress it.
+	// Successor bootstrap still performs its exact boundary comparison above;
+	// this normalization is deliberately limited to the final renewal write.
+	if committedSuccessor && committedSuccessorBoundary > scope.primaryLSN {
+		scope.primaryLSN = committedSuccessorBoundary
+	}
+	scope = haFencingLeaseScopeWithMonotonicBoundary(lease, scope)
 	if !preserveTransferredScope {
 		for key, value := range scope.annotations() {
 			lease.Annotations[key] = value
@@ -534,6 +621,7 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	}
 	if clearBootstrapReceipt {
 		delete(lease.Annotations, haFencingLeaseAnnotationBootstrapReceipt)
+		delete(lease.Annotations, haFencingLeaseAnnotationActivationReceipt)
 	}
 	if proof := cluster.Status.HAStatus.PrimaryWatchdogProof; proof != nil && proof.AuthorityGranted &&
 		strings.TrimSpace(proof.ProcessBootID) != "" && holder == localNodeID {
@@ -560,7 +648,6 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 	ha := cluster.Spec.HighAvailability
 	if ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil ||
 		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
-		!haAutomaticFailoverExecutionEnabled(ha) ||
 		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease {
 		return nil
 	}
@@ -578,10 +665,143 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		}
 		return err
 	}
-	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != localNodeID ||
+	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) == "" ||
 		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 || lease.Spec.RenewTime == nil ||
 		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
 		return nil
+	}
+	currentHolder := strings.TrimSpace(*lease.Spec.HolderIdentity)
+	transitions := *lease.Spec.LeaseTransitions
+	handoffRenewal := currentHolder != localNodeID &&
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+		lease.Annotations[haFencingLeaseAnnotationFormerHolder] == localNodeID &&
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] == string(cluster.UID) &&
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10)
+	if !haAutomaticFailoverExecutionEnabled(ha) && !handoffRenewal {
+		// Colony demotes the former controller as part of adopting the promoted
+		// topology. That correctly revokes every ordinary action, but the exact
+		// committed handoff receipt must remain a time-only renewal capability
+		// until the successor binds and clears it. Otherwise declarative adoption
+		// itself opens a watchdog-expiry gap between the two controllers.
+		return nil
+	}
+	if currentHolder != localNodeID && !handoffRenewal {
+		return nil
+	}
+	bootstrapReceipt := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt])
+	if handoffRenewal {
+		// The periodic path keeps an already-committed successor alive even when
+		// no further CR or runtime event queues the full reconciler. An optional
+		// process receipt must be exact; this path advances time only and loses
+		// permission as soon as the successor clears the transfer annotations.
+		if bootstrapReceipt != "" {
+			processBootID := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])
+			if !haWatchdogProcessBootIDValid(processBootID) ||
+				bootstrapReceipt != haFencingLeaseBootstrapReceipt(currentHolder, transitions, processBootID) {
+				return nil
+			}
+			activationReceipt := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationActivationReceipt])
+			if activationReceipt != "" {
+				// Once the successor has spent its one-shot activation renewal,
+				// continuing the former-controller bridge would both extend an
+				// unacknowledged process indefinitely and move the proof boundary
+				// that the successor must overtake.
+				return nil
+			}
+		}
+		now := metav1.NewMicroTime(r.haNow())
+		lease.Spec.RenewTime = &now
+		return r.Update(ctx, lease)
+	}
+	if bootstrapReceipt != "" {
+		// Process activation and successor takeover are Lease-safety transitions,
+		// not topology actions.
+		// It must not wait behind an unrelated failed seed, slot, or repair action
+		// in the full reconciler. Close only an exact cross-controller handoff:
+		// unchanged holder/generation/scope, exact bound process receipt, a fresh
+		// authoritative proof after the immutable transfer boundary, and the one
+		// live Pod incarnation authenticated by that proof.
+		identity := haReplicationIdentity(ha)
+		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
+		successorScope := haFencingLeaseScope{}
+		if identity != nil {
+			successorScope = haFencingLeaseScopeWithMonotonicBoundary(
+				lease, haFencingLeaseScopeForIdentity(identity, cluster.Status.HAStatus.PrimaryLSN),
+			)
+		}
+		boundProcess := identity != nil && currentHolder == localNodeID &&
+			strings.TrimSpace(identity.CurrentPrimaryID) == localNodeID &&
+			proof != nil && haWatchdogProcessBootIDValid(strings.TrimSpace(proof.ProcessBootID)) &&
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID]) == strings.TrimSpace(proof.ProcessBootID) &&
+			bootstrapReceipt == haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID) &&
+			haLeaseFenceBoundSuccessorScopeMatches(lease, successorScope) &&
+			lease.Spec.AcquireTime != nil
+		boundSuccessor := boundProcess && cluster.UID != "" &&
+			lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != "" &&
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != localNodeID &&
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) != "" &&
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] != string(cluster.UID) &&
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10)
+		if !boundProcess {
+			// Initial bootstrap and any incomplete or mismatched handoff remain on
+			// the full compare-and-swap path and cannot gain authority here.
+			return nil
+		}
+		transferRecorded := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferCommitted]) != "" ||
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != "" ||
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) != "" ||
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationCommittedTransition]) != ""
+		if transferRecorded && !boundSuccessor {
+			// A malformed or stale cross-controller handoff cannot fall back to
+			// the same-holder restart path merely because its process proof is live.
+			return nil
+		}
+		activationReceipt := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationActivationReceipt])
+		if activationReceipt != "" && activationReceipt != bootstrapReceipt {
+			return nil
+		}
+		if !proof.AuthorityGranted {
+			// Binding a process receipt is not itself proof that this runtime saw
+			// the binding. Publish exactly one newer renewal after an authenticated
+			// pending proof. The durable activation receipt prevents a process that
+			// never acquires authority from being kept alive by repeated renewals.
+			if activationReceipt != "" {
+				return nil
+			}
+			ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
+				ctx, cluster, currentHolder, uint64(transitions), lease.Spec.RenewTime.Time, false,
+			)
+			if err != nil || !ready {
+				return err
+			}
+			now := metav1.NewMicroTime(r.haNow())
+			lease.Spec.RenewTime = &now
+			lease.Annotations[haFencingLeaseAnnotationActivationReceipt] = bootstrapReceipt
+			return r.Update(ctx, lease)
+		}
+		proofBoundary := lease.Spec.RenewTime.Time
+		if activationReceipt == "" && boundSuccessor {
+			proofBoundary = lease.Spec.AcquireTime.Time
+		}
+		ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
+			ctx, cluster, currentHolder, uint64(transitions), proofBoundary, true,
+		)
+		if err != nil || !ready {
+			return err
+		}
+		now := metav1.NewMicroTime(r.haNow())
+		lease.Spec.RenewTime = &now
+		for key, value := range successorScope.annotations() {
+			lease.Annotations[key] = value
+		}
+		delete(lease.Annotations, haFencingLeaseAnnotationBootstrapReceipt)
+		delete(lease.Annotations, haFencingLeaseAnnotationActivationReceipt)
+		delete(lease.Annotations, haFencingLeaseAnnotationTransferCommitted)
+		delete(lease.Annotations, haFencingLeaseAnnotationFormerHolder)
+		delete(lease.Annotations, haFencingLeaseAnnotationTransferOriginUID)
+		delete(lease.Annotations, haFencingLeaseAnnotationCommittedTransition)
+		return r.Update(ctx, lease)
 	}
 	identity := haReplicationIdentity(ha)
 	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != localNodeID {
@@ -606,7 +826,7 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		ctx,
 		cluster,
 		localNodeID,
-		uint64(*lease.Spec.LeaseTransitions),
+		uint64(transitions),
 		lease.Spec.RenewTime.Time,
 		true,
 	)
@@ -686,7 +906,7 @@ func (r *AntflyClusterReconciler) haCurrentPrimaryRuntimeWatchdogReady(
 	}
 	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != holder ||
 		strings.TrimSpace(cluster.Spec.HighAvailability.Runtime.NodeID) != holder ||
-		proof.ObservedAt.IsZero() || !proof.ObservedAt.Time.After(leaseRenewTime) || now.Before(proof.ObservedAt.Time) ||
+		proof.ObservedAt.IsZero() || !proof.ObservedAt.After(leaseRenewTime) || now.Before(proof.ObservedAt.Time) ||
 		now.Sub(proof.ObservedAt.Time) >= time.Duration(proof.MaxFenceLatencyMS)*time.Millisecond ||
 		proof.CapabilityVersion != 1 || !proof.Active || !authorityReady ||
 		proof.MaxFenceLatencyMS != expectedMaxFenceLatencyMS ||
@@ -1028,7 +1248,7 @@ func haCommittedFencingLeaseScope(cluster *antflyv1.AntflyCluster, holder string
 		return haFencingLeaseScope{}, false
 	}
 	ha := cluster.Spec.HighAvailability
-	action := haCommittedFormerPrimaryFenceAction(ha, cluster.Status.HAStatus, holder, generation)
+	action := haCommittedFormerPrimaryBoundaryAction(ha, cluster.Status.HAStatus, holder, generation)
 	identity := haReplicationIdentity(ha)
 	if action == nil || identity == nil {
 		return haFencingLeaseScope{}, false
@@ -1045,12 +1265,31 @@ func haCommittedFencingLeaseLowerBoundScope(cluster *antflyv1.AntflyCluster, hol
 		return haFencingLeaseScope{}, false
 	}
 	ha := cluster.Spec.HighAvailability
-	action := haCommittedFormerPrimaryFenceAction(ha, cluster.Status.HAStatus, holder, generation)
+	action := haCommittedFormerPrimaryBoundaryAction(ha, cluster.Status.HAStatus, holder, generation)
 	identity := haReplicationIdentity(ha)
 	if action == nil || identity == nil || action.TargetLSN == 0 {
 		return haFencingLeaseScope{}, false
 	}
+	// Physical isolation is initiated against the election-time Lease scope,
+	// then freezes the old writer at its actual durable tail. Preserve that
+	// original scope as the temporary lower bound so observation does not revoke
+	// an in-flight handoff before the former holder can publish the stronger
+	// frozen boundary. Promotion is separately gated on the exact frozen scope.
+	if haActionKind(action.Kind) == haActionIsolateFormerPrimary {
+		if scope, ok := haPhysicalIsolationReceiptScope(action.PhysicalIsolationReceipt); ok {
+			return scope, true
+		}
+	}
 	return haFencingLeaseScopeForIdentity(identity, action.TargetLSN), true
+}
+
+func haCommittedFormerPrimaryBoundaryAction(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, holder string, generation uint64) *antflyv1.HAPlannedActionStatus {
+	// A physical-isolation receipt supersedes the election-time action because
+	// its target is the only boundary proven after the old process stopped.
+	if action := haCommittedFormerPrimaryIsolationAction(ha, status, holder, generation); action != nil {
+		return action
+	}
+	return haCommittedFormerPrimaryFenceAction(ha, status, holder, generation)
 }
 
 func haFencingLeaseScopeForIdentity(identity *antflyv1.HAReplicationIdentitySpec, boundary uint64) haFencingLeaseScope {
@@ -1077,6 +1316,30 @@ func (scope haFencingLeaseScope) annotations() map[string]string {
 	}
 }
 
+func haFencingLeaseScopeWithMonotonicBoundary(lease *coordinationv1.Lease, scope haFencingLeaseScope) haFencingLeaseScope {
+	if lease == nil || lease.Annotations == nil {
+		return scope
+	}
+	identityAnnotations := scope.annotations()
+	for _, key := range []string{
+		haFencingLeaseAnnotationClusterID,
+		haFencingLeaseAnnotationShardID,
+		haFencingLeaseAnnotationTableID,
+		haFencingLeaseAnnotationTimelineID,
+		haFencingLeaseAnnotationEpoch,
+		haFencingLeaseAnnotationCurrentPrimaryID,
+	} {
+		if lease.Annotations[key] != identityAnnotations[key] {
+			return scope
+		}
+	}
+	persisted, err := strconv.ParseUint(strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]), 10, 64)
+	if err == nil && persisted > scope.primaryLSN {
+		scope.primaryLSN = persisted
+	}
+	return scope
+}
+
 func haLeaseFenceScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseScope) bool {
 	if lease == nil {
 		return false
@@ -1091,6 +1354,105 @@ func haLeaseFenceScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseS
 		}
 	}
 	return true
+}
+
+// haLeaseFenceBoundSuccessorScopeMatches is only for closing an already-bound
+// successor handoff. Once the exact successor process has acquired runtime
+// authority, accepted-but-unacknowledged writes may advance its local HA tail
+// before the controller consumes the bootstrap receipt. Identity must remain
+// exact and the observed boundary may only advance the durable Lease boundary.
+func haLeaseFenceBoundSuccessorScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseScope) bool {
+	if lease == nil || lease.Annotations == nil || scope.primaryLSN == 0 {
+		return false
+	}
+	annotations := scope.annotations()
+	for _, key := range []string{
+		haFencingLeaseAnnotationClusterID,
+		haFencingLeaseAnnotationShardID,
+		haFencingLeaseAnnotationTableID,
+		haFencingLeaseAnnotationTimelineID,
+		haFencingLeaseAnnotationEpoch,
+		haFencingLeaseAnnotationCurrentPrimaryID,
+	} {
+		if lease.Annotations[key] != annotations[key] {
+			return false
+		}
+	}
+	persisted, err := strconv.ParseUint(
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]), 10, 64,
+	)
+	return err == nil && persisted > 0 && scope.primaryLSN >= persisted
+}
+
+// haCommittedTransferSuccessorScopeMatches recognizes the one safe scope
+// mismatch that exists between a committed Lease handoff and the promoted
+// runtime's first authoritative observation. The transfer is committed on the
+// parent identity; Colony then publishes the exact next timeline/epoch on a
+// different AntflyCluster CR. Until the new process is bound, that runtime must
+// remain fail-closed and can retain a lower standby-era LSN. The committed
+// Lease boundary is authoritative; the successor may adopt it but may neither
+// replace it with the lower cached value nor claim a value above it.
+//
+// Every durable transfer dimension must agree, the identity may advance by
+// exactly one timeline and one epoch, and the positive promotion boundary may
+// not change. This deliberately rejects arbitrary identity edits, same-CR
+// renewal, skipped generations, and incomplete transfer receipts.
+func haCommittedTransferSuccessorScopeMatches(
+	cluster *antflyv1.AntflyCluster,
+	lease *coordinationv1.Lease,
+	successor haFencingLeaseScope,
+	holder string,
+	transition int32,
+) bool {
+	_, ok := haCommittedTransferSuccessorBoundary(cluster, lease, successor, holder, transition)
+	return ok
+}
+
+func haCommittedTransferSuccessorBoundary(
+	cluster *antflyv1.AntflyCluster,
+	lease *coordinationv1.Lease,
+	successor haFencingLeaseScope,
+	holder string,
+	transition int32,
+) (uint64, bool) {
+	if cluster == nil || cluster.UID == "" || lease == nil || lease.Annotations == nil ||
+		transition <= 1 || successor.primaryLSN == 0 || strings.TrimSpace(holder) == "" ||
+		strings.TrimSpace(holder) != strings.TrimSpace(successor.currentPrimaryID) ||
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) == "" ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) == strings.TrimSpace(holder) ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) !=
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationCurrentPrimaryID]) ||
+		!haWatchdogProcessBootIDValid(strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])) ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) == "" ||
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) == string(cluster.UID) ||
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] != strconv.FormatInt(int64(transition), 10) {
+		return 0, false
+	}
+	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != strings.TrimSpace(holder) ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions != transition {
+		return 0, false
+	}
+
+	parse := func(key string) (uint64, bool) {
+		value, err := strconv.ParseUint(strings.TrimSpace(lease.Annotations[key]), 10, 64)
+		return value, err == nil
+	}
+	clusterID, clusterOK := parse(haFencingLeaseAnnotationClusterID)
+	shardID, shardOK := parse(haFencingLeaseAnnotationShardID)
+	tableID, tableOK := parse(haFencingLeaseAnnotationTableID)
+	parentTimelineID, timelineOK := parse(haFencingLeaseAnnotationTimelineID)
+	parentEpoch, epochOK := parse(haFencingLeaseAnnotationEpoch)
+	boundary, boundaryOK := parse(haFencingLeaseAnnotationPrimaryLSN)
+	ok := clusterOK && shardOK && tableOK && timelineOK && epochOK && boundaryOK && boundary > 0 &&
+		clusterID == successor.clusterID && shardID == successor.shardID && tableID == successor.tableID &&
+		successor.timelineID > 0 && parentTimelineID == successor.timelineID-1 &&
+		successor.epoch > 0 && parentEpoch == successor.epoch-1 &&
+		successor.primaryLSN <= boundary
+	if !ok {
+		return 0, false
+	}
+	return boundary, true
 }
 
 func haLeaseFenceReady(lease *coordinationv1.Lease, generation uint64, now time.Time) (bool, string) {
@@ -1211,7 +1573,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			if runtimeOwnedSeed {
 				seedTargetLSN = runtimeOwnedSeedTargetLSN
 				if seedTargetLSN == 0 {
-					seedTargetLSN = haRuntimeOwnedInitialSeedTargetLSN(status)
+					seedTargetLSN = initialStandbyLSN(standby, haRuntimeOwnedInitialSeedTargetLSN(status))
 				}
 			}
 			if seedTargetLSN == 0 {
@@ -1382,13 +1744,35 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		plan.Actions = append(plan.Actions, action)
 	}
 	plan.FormerPrimary = haEvaluateFormerPrimary(status)
+	physicalIsolationRequiresPortableReseed := false
+	if promotion := haPromotionReceipt(status); promotion != nil &&
+		haSucceededFormerPrimaryIsolation(cluster, status, promotion) != nil &&
+		plan.FormerPrimary.RejoinRequired {
+		// A successful Kubernetes physical fence proves the former-primary
+		// process is gone (or has crossed the exact watchdog barrier) and the
+		// StatefulSet remains held at zero. Its pod-local replication log is
+		// therefore deliberately unavailable to the direct rewind API. Do not
+		// send an in-place rewind/reseed command to the promoted primary and
+		// pretend that it owns the old process's log. Publish the fail-closed
+		// portable-reseed disposition for the topology controller instead; it
+		// will bind a fresh seed artifact to the retained former-primary PVC.
+		plan.FormerPrimary.RewindPossible = false
+		plan.FormerPrimary.ReseedRequired = true
+		plan.FormerPrimary.Action = string(haActionReseedFormerPrimary)
+		plan.FormerPrimary.Reason = "FormerPrimaryPhysicallyIsolatedRequiresReseed"
+		physicalIsolationRequiresPortableReseed = true
+	}
 	formerPrimaryFenceDependency := haActionFenceFormerPrimary
 	if action := haFormerPrimaryFencePlannedAction(cluster, status); action.Kind != "" {
 		formerPrimaryFenceDependency = action.Kind
 		plan.Actions = append(plan.Actions, action)
 	}
-	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" {
-		action.DependsOn = formerPrimaryFenceDependency
+	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" &&
+		(!physicalIsolationRequiresPortableReseed || action.Kind != haActionReseedFormerPrimary) {
+		// Assessment is meaningful only after the promotion receipt exists. The
+		// subsequent mutating rewind/reseed remains ordered behind the concrete
+		// former-primary fence so no old-timeline writer can race repair.
+		action.DependsOn = haFormerPrimaryActionDependency(action.Kind, formerPrimaryFenceDependency)
 		plan.Actions = append(plan.Actions, action)
 		if action.Kind == haActionReseedFormerPrimary {
 			if standby, ok := haStandbySpecByName(ha, action.StandbyName); ok {
@@ -1422,6 +1806,13 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	}
 
 	return plan
+}
+
+func haFormerPrimaryActionDependency(kind, fenceDependency haActionKind) haActionKind {
+	if kind == haActionDemoteFormerPrimary {
+		return haActionPromoteStandby
+	}
+	return fenceDependency
 }
 
 func haFormerPrimaryFencePlannedAction(cluster *antflyv1.AntflyCluster, status *antflyv1.HAStatus) haPlannedAction {
@@ -1641,10 +2032,11 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			break
 		}
 	}
-	if len(actions) == 0 && completedRewind == nil {
+	retainedSeedActions := haRetainedCompletedSeedActions(actions, ha, status)
+	retainedAssessment := haRetainedFormerPrimaryAssessment(actions, status)
+	if len(actions) == 0 && completedRewind == nil && retainedAssessment == nil && len(retainedSeedActions) == 0 {
 		return nil
 	}
-	retainedAssessment := haRetainedFormerPrimaryAssessment(actions, status)
 	outCapacity := len(actions)
 	if completedRewind != nil {
 		outCapacity++
@@ -1652,6 +2044,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	if retainedAssessment != nil {
 		outCapacity++
 	}
+	outCapacity += len(retainedSeedActions)
 	out := make([]antflyv1.HAPlannedActionStatus, 0, outCapacity)
 	if completedRewind != nil {
 		if retainedAssessment != nil {
@@ -1659,6 +2052,10 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			retainedAssessment = nil
 		}
 		out = append(out, *completedRewind)
+	}
+	if len(actions) == 0 && retainedAssessment != nil {
+		out = append(out, *retainedAssessment)
+		retainedAssessment = nil
 	}
 	for _, action := range actions {
 		if retainedAssessment != nil &&
@@ -1721,7 +2118,97 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		statusAction = haPreservePlannedActionExecution(statusAction, status, clusters...)
 		out = append(out, statusAction)
 	}
+	out = append(out, retainedSeedActions...)
 	return out
+}
+
+// haRetainedCompletedSeedActions keeps the operator-observed portable-seed
+// receipt chain available after the primary slot becomes active. That receipt
+// is the cross-CR authority used to open the target runtime's startup gate; if
+// the planner discarded it as soon as the slot activated, the primary and
+// target controllers could each wait forever for evidence owned by the other.
+//
+// Retention is deliberately bounded to one completed runtime-owned chain per
+// currently desired standby and is tied to the exact declared generation,
+// topology, node, and PVC incarnation. Any topology/PVC/generation change
+// drops the old evidence rather than allowing it to authorize a replacement.
+func haRetainedCompletedSeedActions(
+	planned []haPlannedAction,
+	ha *antflyv1.HighAvailabilitySpec,
+	status *antflyv1.HAStatus,
+) []antflyv1.HAPlannedActionStatus {
+	if ha == nil || status == nil || len(status.PlannedActions) == 0 {
+		return nil
+	}
+	expectedKinds := [...]haActionKind{
+		haActionCaptureSeedArtifact,
+		haActionPublishSeedArtifact,
+		haActionGCSourceSeedGenerations,
+		haActionRestoreSeedArtifact,
+		haActionActivateSeedArtifact,
+		haActionActivateSeededSlot,
+		haActionGCTargetSeedGenerations,
+		haActionPruneSeedArtifacts,
+	}
+	retained := make([]antflyv1.HAPlannedActionStatus, 0, len(expectedKinds))
+	for _, standby := range ha.Standbys {
+		if !standbyDesired(standby) || !haStandbyUsesRuntimeOwnedSeedCapture(standby) || standby.SeedArtifact == nil {
+			continue
+		}
+		artifact := standby.SeedArtifact
+		slotName := standbySlotName(standby)
+		generation := strings.TrimSpace(artifact.Generation)
+		if generation == "" || strings.TrimSpace(artifact.TopologyID) == "" || artifact.TopologyGeneration <= 0 ||
+			strings.TrimSpace(artifact.NodeID) != strings.TrimSpace(standby.Name) || artifact.TargetPVC == nil ||
+			strings.TrimSpace(artifact.TargetPVC.ClaimName) == "" || strings.TrimSpace(artifact.TargetPVCUID) == "" {
+			continue
+		}
+		// A live plan for this exact generation already preserves execution
+		// state through haPreservePlannedActionExecution; do not duplicate it.
+		alreadyPlanned := false
+		for _, action := range planned {
+			if strings.TrimSpace(action.StandbyName) == strings.TrimSpace(standby.Name) &&
+				strings.TrimSpace(action.SlotName) == strings.TrimSpace(slotName) &&
+				strings.TrimSpace(action.SeedArtifactGeneration) == generation {
+				alreadyPlanned = true
+				break
+			}
+		}
+		if alreadyPlanned {
+			continue
+		}
+
+		chain := make([]antflyv1.HAPlannedActionStatus, 0, len(expectedKinds))
+		for _, kind := range expectedKinds {
+			found := false
+			for i := range status.PlannedActions {
+				action := status.PlannedActions[i]
+				if haActionKind(action.Kind) != kind || action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+					strings.TrimSpace(action.StandbyName) != strings.TrimSpace(standby.Name) ||
+					strings.TrimSpace(action.SlotName) != strings.TrimSpace(slotName) ||
+					strings.TrimSpace(action.SeedArtifactGeneration) != generation ||
+					strings.TrimSpace(action.TopologyID) != strings.TrimSpace(artifact.TopologyID) ||
+					action.TopologyGeneration != artifact.TopologyGeneration ||
+					strings.TrimSpace(action.TopologyNodeID) != strings.TrimSpace(artifact.NodeID) ||
+					strings.TrimSpace(action.TargetPVCName) != strings.TrimSpace(artifact.TargetPVC.ClaimName) ||
+					strings.TrimSpace(action.TargetPVCUID) != strings.TrimSpace(artifact.TargetPVCUID) {
+					continue
+				}
+				chain = append(chain, *action.DeepCopy())
+				found = true
+				break
+			}
+			if !found {
+				chain = nil
+				break
+			}
+		}
+		if len(chain) != len(expectedKinds) || !haAdminActionSucceededWithEvidence(chain[len(chain)-1]) {
+			continue
+		}
+		retained = append(retained, chain...)
+	}
+	return retained
 }
 
 func haBindFormerPrimaryTopology(action *haPlannedAction, ha *antflyv1.HighAvailabilitySpec) {
@@ -1889,15 +2376,23 @@ func haRetainedFormerPrimaryAssessment(actions []haPlannedAction, status *antfly
 			hasDisposition = true
 		}
 	}
-	if !hasDisposition {
-		return nil
-	}
 	for i := range status.PlannedActions {
 		previous := status.PlannedActions[i]
 		if haActionKind(previous.Kind) != haActionDemoteFormerPrimary ||
 			previous.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			!haFormerPrimaryDemotePreserveAllowed(status, previous) ||
 			!haAdminActionSucceededWithStatusEvidence(status, previous) {
+			continue
+		}
+		// already_current is a terminal, typed disposition produced by the
+		// assessment itself, so there is intentionally no rewind or reseed plan
+		// to keep this receipt alive. Retain the exact completed action while it
+		// remains bound to the promotion fence; Colony consumes it as the durable
+		// authority for advancing the former-primary topology state.
+		if previous.AdminResult != nil && previous.AdminResult.RejoinAction == "already_current" {
+			return previous.DeepCopy()
+		}
+		if !hasDisposition {
 			continue
 		}
 		return previous.DeepCopy()
@@ -2026,7 +2521,12 @@ func haPlannedActionExecutionStarted(action antflyv1.HAPlannedActionStatus) bool
 // only while its declarative claim name remains unchanged and is revalidated at
 // the execution boundary.
 func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
-	if strings.TrimSpace(action.SeedArtifactCaptureRoot) == "" && strings.TrimSpace(action.TopologyID) == "" &&
+	generationBoundAssessment := haActionKind(action.Kind) == haActionDemoteFormerPrimary &&
+		action.FenceGeneration > 0 &&
+		action.FenceAuthority != "" &&
+		strings.TrimSpace(action.FenceHolder) != ""
+	if !generationBoundAssessment &&
+		strings.TrimSpace(action.SeedArtifactCaptureRoot) == "" && strings.TrimSpace(action.TopologyID) == "" &&
 		action.TopologyGeneration == 0 && strings.TrimSpace(action.TopologyNodeID) == "" &&
 		strings.TrimSpace(action.TargetPVCName) == "" && strings.TrimSpace(action.TargetPVCUID) == "" &&
 		strings.TrimSpace(action.SeedCaptureReceiptPath) == "" && strings.TrimSpace(action.SeedCaptureReceiptSHA256) == "" &&
@@ -2659,6 +3159,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--promoted-node-id", action.StandbyName,
 			"--new-timeline-id", strconv.FormatUint(identity.TimelineID+1, 10),
 			"--new-epoch", strconv.FormatUint(identity.Epoch+1, 10),
+			"--generation", strconv.FormatUint(action.FenceGeneration, 10),
 			"--required-lsn", strconv.FormatUint(action.TargetLSN, 10),
 			"--observed-lsn", strconv.FormatUint(action.TargetLSN, 10),
 			"--reason", reason,
@@ -2689,6 +3190,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 				"--promoted-node-id", promotedNodeID,
 				"--new-timeline-id", strconv.FormatUint(identity.TimelineID+1, 10),
 				"--new-epoch", strconv.FormatUint(identity.Epoch+1, 10),
+				"--generation", strconv.FormatUint(action.FenceGeneration, 10),
 				"--required-lsn", strconv.FormatUint(action.TargetLSN, 10),
 				"--observed-lsn", strconv.FormatUint(action.TargetLSN, 10),
 				"--reason", reason,
@@ -2705,6 +3207,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--promoted-node-id", promotion.PromotedStandbyID,
 			"--new-timeline-id", strconv.FormatUint(promotion.NewTimelineID, 10),
 			"--new-epoch", strconv.FormatUint(promotion.NewEpoch, 10),
+			"--generation", strconv.FormatUint(promotion.FenceGeneration, 10),
 			"--required-lsn", strconv.FormatUint(haPromotionRequiredLSN(promotion), 10),
 			"--observed-lsn", strconv.FormatUint(haPromotionObservedLSN(promotion), 10),
 			"--reason", promotion.FenceReason,
@@ -2744,6 +3247,20 @@ func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HARe
 	if identity == nil || action.StandbyName == "" {
 		return nil
 	}
+	requestTimelineID := identity.TimelineID
+	requestEpoch := identity.Epoch
+	promotion := haPromotionReceipt(status)
+	if promotion != nil {
+		if !haIdentityMatchesPromotionParentOrChild(identity, promotion) {
+			return nil
+		}
+		// The request describes the former primary, not the newly adopted
+		// primary. After Colony advances the declarative spec to the child
+		// timeline, the immutable promotion receipt is the only authoritative
+		// source for the former node's parent identity.
+		requestTimelineID = promotion.ParentTimelineID
+		requestEpoch = promotion.ParentEpoch
+	}
 	lastLSN := action.ObservedLSN
 	if lastLSN == 0 {
 		lastLSN = action.TargetLSN
@@ -2754,8 +3271,8 @@ func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HARe
 		"--cluster-id", strconv.FormatUint(identity.ClusterID, 10),
 		"--shard-id", strconv.FormatUint(identity.ShardID, 10),
 		"--table-id", strconv.FormatUint(identity.TableID, 10),
-		"--timeline-id", strconv.FormatUint(identity.TimelineID, 10),
-		"--epoch", strconv.FormatUint(identity.Epoch, 10),
+		"--timeline-id", strconv.FormatUint(requestTimelineID, 10),
+		"--epoch", strconv.FormatUint(requestEpoch, 10),
 		"--last-lsn", strconv.FormatUint(lastLSN, 10),
 		"--retained-from-lsn", strconv.FormatUint(action.RetainedFromLSN, 10),
 	}
@@ -2763,7 +3280,6 @@ func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HARe
 		return args
 	}
 
-	promotion := haPromotionReceipt(status)
 	if promotion == nil {
 		return nil
 	}
@@ -2835,7 +3351,7 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 	}
 	switch action.Kind {
 	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionCaptureSeedArtifact, haActionActivateSeededSlot, haActionMarkReseed:
-		return haCurrentPrimaryAdminURL(ha, status)
+		return haCurrentPrimaryActionURL(ha, status)
 	case haActionAcquireFence:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionFenceFormerPrimary:
@@ -2850,7 +3366,7 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 		// Reseed is a current-primary operation: it marks the old primary's
 		// replication slot as needing a fresh base backup. The following
 		// SeedStandby/BootstrapStandby actions rebuild the former primary.
-		return haCurrentPrimaryAdminURL(ha, status)
+		return haCurrentPrimaryActionURL(ha, status)
 	default:
 		return ""
 	}
@@ -2864,7 +3380,7 @@ func haFormerPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, action haPlanned
 		return ""
 	}
 	if ha != nil && ha.Admin != nil {
-		return ha.Admin.PrimaryURL
+		return haPrimaryActionURL(ha.Admin)
 	}
 	return ""
 }
@@ -2880,6 +3396,29 @@ func haCurrentPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv
 		return ha.Admin.PrimaryURL
 	}
 	return ""
+}
+
+func haCurrentPrimaryActionURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
+	if promoted := haPromotedPrimaryNodeID(status); promoted != "" {
+		if url := haStandbyAdminURL(ha, promoted); url != "" {
+			return url
+		}
+		return ""
+	}
+	if ha != nil && ha.Admin != nil {
+		return haPrimaryActionURL(ha.Admin)
+	}
+	return ""
+}
+
+func haPrimaryActionURL(admin *antflyv1.HAAdminSpec) string {
+	if admin == nil {
+		return ""
+	}
+	if actionURL := strings.TrimSpace(admin.PrimaryActionURL); actionURL != "" {
+		return actionURL
+	}
+	return admin.PrimaryURL
 }
 
 func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
@@ -3240,7 +3779,7 @@ func haPrimaryRoutePlannedAction(evaluation haPrimaryRouteEvaluation, status *an
 		Reason:          evaluation.Reason,
 	}
 	if status != nil {
-		action.TargetLSN = status.PrimaryLSN
+		action.TargetLSN = haPrimaryRouteTargetLSN(status, evaluation.DesiredTarget)
 		if action.FenceAuthority == "" {
 			action.FenceAuthority = status.Fencing.Authority
 		}
@@ -3251,6 +3790,18 @@ func haPrimaryRoutePlannedAction(evaluation haPrimaryRouteEvaluation, status *an
 		action.StandbyName = evaluation.DesiredTarget
 	}
 	return action
+}
+
+// haPrimaryRouteTargetLSN keeps route publication bound to the immutable
+// promotion transaction. The promoted primary may advance immediately after
+// takeover; using its current LSN would make the regenerated route action stop
+// matching the durable promotion receipt and permanently fail closed.
+func haPrimaryRouteTargetLSN(status *antflyv1.HAStatus, desiredTarget string) uint64 {
+	if promotion := haPromotionReceipt(status); promotion != nil &&
+		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(desiredTarget) {
+		return haPromotionRequiredLSN(promotion)
+	}
+	return status.PrimaryLSN
 }
 
 func haHasPlannedAction(actions []haPlannedAction, kind haActionKind) bool {
@@ -3703,7 +4254,48 @@ func standbyRemoteApplyReady(status *antflyv1.HAStatus, standby antflyv1.HAStand
 }
 
 func standbyPromotionEligible(standby antflyv1.HAStandbyStatus) bool {
-	return standby.Active && !standby.ReseedRequired && strings.TrimSpace(standby.LastError) == ""
+	if !standby.Active || standby.ReseedRequired {
+		return false
+	}
+	errName := strings.TrimSpace(standby.LastError)
+	if errName == "" {
+		return true
+	}
+	// Losing the old primary is the event automatic failover is designed to
+	// survive. A standby that has durably applied everything it received and can
+	// still serve that boundary remains a valid candidate when its only error is
+	// that the upstream transport disappeared. Semantic replication failures
+	// (identity, timeline, decoding, storage, etc.) continue to fail closed.
+	if !standby.CaughtUpToReceived || !standby.CanServeSafeReads {
+		return false
+	}
+	if standbyUpstreamTransportUnavailable(errName) {
+		return true
+	}
+	return false
+}
+
+func standbyUpstreamTransportUnavailable(errName string) bool {
+	switch errName {
+	case "HttpConnectionClosing",
+		"ConnectionResetByPeer",
+		"ConnectionRefused",
+		"BrokenPipe",
+		"EndOfStream",
+		"NoAddressReturned",
+		"Timeout",
+		"ConnectionTimedOut",
+		"NetworkUnreachable",
+		"HostUnreachable",
+		"NetworkDown",
+		"AddressUnavailable",
+		"TemporaryNameServerFailure",
+		"NameServerFailure",
+		"NotListening":
+		return true
+	default:
+		return false
+	}
 }
 
 func standbySafeReadLSN(standby antflyv1.HAStandbyStatus) uint64 {
@@ -3857,9 +4449,25 @@ func haPromotionAlreadyRecorded(ha *antflyv1.HighAvailabilitySpec, status *antfl
 	if identity == nil {
 		return false
 	}
-	return promotion.OldPrimaryID == identity.CurrentPrimaryID &&
-		promotion.ParentTimelineID == identity.TimelineID &&
-		promotion.ParentEpoch == identity.Epoch
+	return haIdentityMatchesPromotionParentOrChild(identity, promotion)
+}
+
+// haIdentityMatchesPromotionParentOrChild keeps a durable promotion receipt
+// valid across the spec update that adopts its new primary and timeline. The
+// receipt may be observed immediately before or immediately after that update;
+// accepting any unrelated identity would permit stale topology evidence.
+func haIdentityMatchesPromotionParentOrChild(identity *antflyv1.HAReplicationIdentitySpec, promotion *antflyv1.HAPromotionStatus) bool {
+	if identity == nil || promotion == nil ||
+		(promotion.ClusterID != 0 && promotion.ClusterID != identity.ClusterID) ||
+		(promotion.ShardID != 0 && promotion.ShardID != identity.ShardID) ||
+		(promotion.TableID != 0 && promotion.TableID != identity.TableID) {
+		return false
+	}
+	parent := strings.TrimSpace(identity.CurrentPrimaryID) == strings.TrimSpace(promotion.OldPrimaryID) &&
+		identity.TimelineID == promotion.ParentTimelineID && identity.Epoch == promotion.ParentEpoch
+	child := strings.TrimSpace(identity.CurrentPrimaryID) == strings.TrimSpace(promotion.PromotedStandbyID) &&
+		identity.TimelineID == promotion.NewTimelineID && identity.Epoch == promotion.NewEpoch
+	return parent || child
 }
 
 func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ImageURLContentPartType(str, Enum):
+class ImageURLContentPartType(StrEnum):
     IMAGE_URL = "image_url"
 
     def __str__(self) -> str:

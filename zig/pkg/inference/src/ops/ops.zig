@@ -21,6 +21,7 @@
 // Inspired by llama.cpp's GGML: models build computation, backends execute.
 
 const std = @import("std");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const runtime = @import("../runtime/root.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const quant_matmul = @import("../graph/quant_matmul.zig");
@@ -509,6 +510,8 @@ pub const A4bMappedLayer0PrewarmResult = struct {
 };
 
 pub const A4bResidencyMode = backend_contracts.A4bResidencyMode;
+pub const A4bLoadStrategy = backend_contracts.A4bLoadStrategy;
+pub const A4bPreparedPackMode = backend_contracts.A4bPreparedPackMode;
 pub const A4bInferenceRequest = backend_contracts.A4bInferenceRequest;
 pub const A4bExpertGeometry = backend_contracts.A4bExpertGeometry;
 pub const A4bInferenceConfig = backend_contracts.A4bInferenceConfig;
@@ -647,6 +650,11 @@ pub const NativeQuantTimingStats = struct {
     a4b_moe_route_select_attempts: u64 = 0,
     a4b_moe_route_select_successes: u64 = 0,
     a4b_moe_route_select_fallbacks: u64 = 0,
+    a4b_cuda_resident_source_bytes: u64 = 0,
+    a4b_cuda_resident_source_count: u64 = 0,
+    a4b_cuda_route_calls: u64 = 0,
+    a4b_cuda_decode_calls: u64 = 0,
+    a4b_cuda_prefill_calls: u64 = 0,
     a4b_moe_slot_lookup_attempts: u64 = 0,
     a4b_moe_slot_route_hits: u64 = 0,
     a4b_moe_slot_route_misses: u64 = 0,
@@ -830,6 +838,25 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_encoder_layer_attempts: u64 = 0,
     metal_runtime_deberta_encoder_layer_successes: u64 = 0,
     metal_runtime_deberta_encoder_layer_fallbacks: u64 = 0,
+    metal_runtime_nomic_bert_encoder_layer_attempts: u64 = 0,
+    metal_runtime_nomic_bert_encoder_layer_successes: u64 = 0,
+    metal_runtime_nomic_bert_encoder_layer_fallbacks: u64 = 0,
+    metal_runtime_nomic_bert_encoder_layer_nanos: u128 = 0,
+    metal_runtime_nomic_bert_borrowed_f32_weight_hits: u64 = 0,
+    metal_runtime_nomic_bert_pool_normalize_attempts: u64 = 0,
+    metal_runtime_nomic_bert_pool_normalize_successes: u64 = 0,
+    metal_runtime_nomic_bert_pool_normalize_failures: u64 = 0,
+    metal_runtime_nomic_bert_qkv_rope_calls: u64 = 0,
+    metal_runtime_nomic_bert_rope_pair_calls: u64 = 0,
+    metal_runtime_nomic_bert_rope_pair_fallbacks: u64 = 0,
+    metal_runtime_nomic_bert_sdpa_q8_calls: u64 = 0,
+    metal_runtime_nomic_bert_attention_calls: u64 = 0,
+    metal_runtime_nomic_bert_attention_post_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_pair_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_activation_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_output_norm_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_fused_calls: u64 = 0,
+    metal_runtime_nomic_bert_ffn_fused_failures: u64 = 0,
     metal_runtime_deberta_relative_qk_pair_calls: u64 = 0,
     metal_runtime_deberta_relative_qk_pair_fallbacks: u64 = 0,
     metal_runtime_dense_qkv_packed_calls: u64 = 0,
@@ -850,6 +877,8 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
     metal_runtime_paged_attention_1x_calls: u64 = 0,
     metal_runtime_decode_gqa_split_calls: u64 = 0,
+    metal_runtime_decode_gqa_split_min_kv_tokens: u64 = 0,
+    metal_runtime_decode_gqa_split_below_min_kv_calls: u64 = 0,
     metal_runtime_decode_gqa_split_fallback_calls: u64 = 0,
     metal_runtime_generated_attention_decode_1x_calls: u64 = 0,
     metal_runtime_generated_attention_flash_prefill_calls: u64 = 0,
@@ -966,6 +995,9 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q6_k_linear_reduce_rows_9_64: u64 = 0,
     metal_runtime_q6_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_q6_k_high_row_mm_matrix_dispatches: u64 = 0,
+    metal_runtime_lm_head_q4_q6_refine_dispatches: u64 = 0,
+    metal_runtime_lm_head_q4_resident_sampling_rejections: u64 = 0,
     /// Generated small-batch quant kernel dispatch counters indexed by
     /// [quant_matmul.GeneratedQuantFormatIndex][quant_matmul.GeneratedQuantEpilogueIndex].
     metal_runtime_antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,
@@ -1264,6 +1296,9 @@ pub const DebertaEncoderLayerSpec = backend_contracts.DebertaEncoderLayerSpec;
 pub const DebertaRelativeEmbeddingRequest = backend_contracts.DebertaRelativeEmbeddingRequest;
 pub const DebertaEncoderFramePlanRequest = backend_contracts.DebertaEncoderFramePlanRequest;
 pub const DebertaEncoderLayerRequest = backend_contracts.DebertaEncoderLayerRequest;
+pub const NomicBertEncoderLayerSpec = backend_contracts.NomicBertEncoderLayerSpec;
+pub const NomicBertEncoderLayerRequest = backend_contracts.NomicBertEncoderLayerRequest;
+pub const NomicBertPoolNormalizeRequest = backend_contracts.NomicBertPoolNormalizeRequest;
 
 pub const GraphPlanSlot = struct {
     slot: usize,
@@ -1286,6 +1321,15 @@ pub const WorkloadRegime = enum(u8) {
 pub const ComputeBackend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Borrowed for one synchronous request. Architecture sessions install it
+    /// on their request-local backend wrapper, making weight acquisition a
+    /// universal bounded checkpoint even for architectures without a bespoke
+    /// `forwardWithControl` entry point.
+    execution_control: ?InferenceExecutionControl = null,
+
+    pub fn checkExecutionControl(self: *const ComputeBackend) !void {
+        if (self.execution_control) |control| try control.check();
+    }
 
     pub fn kind(self: *const ComputeBackend) BackendKind {
         return self.vtable.backendKind(self.ptr);
@@ -1307,6 +1351,7 @@ pub const ComputeBackend = struct {
     /// request-local execution plans use this boundary to discard captured
     /// addresses and other state that must never leak between requests.
     pub fn beginRequest(self: *const ComputeBackend) anyerror!void {
+        try self.checkExecutionControl();
         const op = self.vtable.beginRequest orelse return;
         return op(self.ptr);
     }
@@ -1460,8 +1505,17 @@ pub const ComputeBackend = struct {
         debugCudaGraphCaptureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
         debugCudaDeviceWarmup: ?*const fn (ctx: *anyopaque, bytes: usize, iterations: usize) anyerror!bool = null,
 
-        /// Look up a named weight tensor. Returned tensor is borrowed (do NOT free).
+        /// Look up an immutable, backend-owned weight tensor. Repeated lookups
+        /// share a handle; unreleased handles are reclaimed at backend teardown.
+        /// A caller may release its lookup early with free (once per lookup),
+        /// but must not consume/mutate the weight or use that reference afterward.
+        /// CUDA may retain resident handles until backend teardown regardless.
         getWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
+        /// Acquire a distinct, caller-owned handle to an immutable weight.
+        /// Unlike getWeight, handle identity is never shared with another live
+        /// acquisition. Free exactly once; the backend must outlive the handle.
+        /// Storage may still be borrowed from the model or backend cache.
+        acquireWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
         prefetchWeightHint: *const fn (ctx: *anyopaque, name: []const u8, hint: u32) void,
         drainPrefetchBudget: *const fn (ctx: *anyopaque, max_items: usize) void,
         debugProfileCheckpoint: ?*const fn (ctx: *anyopaque, label: []const u8, layer: usize) void = null,
@@ -1924,6 +1978,12 @@ pub const ComputeBackend = struct {
         /// Returns: [batch*seq_len, num_heads*head_dim].
         scaledDotProductAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
+        /// Optional Qwen3-VL vision-attention route. It has the same unmasked,
+        /// unbiased semantics as scaledDotProductAttention with an empty mask,
+        /// but lets a backend select a model-scoped kernel without changing
+        /// unrelated vision encoders that happen to share a tensor shape.
+        scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+
         /// Optional bidirectional attention with no mask. This is equivalent
         /// to scaledDotProductAttention with an all-ones mask, but lets
         /// backends avoid a host mask allocation/upload.
@@ -2058,6 +2118,15 @@ pub const ComputeBackend = struct {
         /// input: [total, dim] where total = batch*seq_len.
         /// Rotates pairs of dimensions using sin/cos of position-dependent angles.
         rope: *const fn (ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT,
+
+        /// Qwen3-VL interleaved multi-axis RoPE. `positions` is axis-major
+        /// [temporal][height][width], with `token_count` entries per axis.
+        /// Returns null when the backend has no strict device implementation.
+        mrope: ?*const fn (ctx: *anyopaque, input: CT, token_count: usize, head_dim: usize, theta: f32, freq_scale: f32, positions: []const u32, sections: [3]u32) anyerror!?CT = null,
+
+        /// Qwen3-VL vision RoPE. `positions` is axis-major [height][width].
+        /// Each axis owns half of the rotary frequencies in every head.
+        visionRope: ?*const fn (ctx: *anyopaque, input: CT, token_count: usize, head_dim: usize, theta: f32, positions: []const u32) anyerror!?CT = null,
 
         /// Apply scalar multiply and RoPE in one backend op. Used by Gemma
         /// variants that pre-scale Q before attention.
@@ -2249,6 +2318,12 @@ pub const ComputeBackend = struct {
         /// prepared backend-owned slot layout. Backends return null when the
         /// shape/path should use the ordinary eager ops.
         debertaEncoderLayer: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderLayerRequest) anyerror!?CT = null,
+
+        /// Execute one NomicBERT encoder layer from a previously prepared
+        /// backend-owned slot layout. Backends return null when the shape/path
+        /// should use the ordinary eager attention + SwiGLU sequence.
+        nomicBertEncoderLayer: ?*const fn (ctx: *anyopaque, request: *const NomicBertEncoderLayerRequest) anyerror!?CT = null,
+        nomicBertPoolNormalize: ?*const fn (ctx: *anyopaque, request: *const NomicBertPoolNormalizeRequest) anyerror!?CT = null,
 
         /// Begin a backend-owned decoder frame. Backends that support this
         /// encode subsequent runtime operations into one command submission
@@ -2642,7 +2717,13 @@ pub const ComputeBackend = struct {
     }
 
     pub fn getWeight(self: *const ComputeBackend, name: []const u8) !CT {
+        try self.checkExecutionControl();
         return self.vtable.getWeight(self.ptr, name);
+    }
+
+    pub fn acquireWeight(self: *const ComputeBackend, name: []const u8) !CT {
+        try self.checkExecutionControl();
+        return self.vtable.acquireWeight(self.ptr, name);
     }
 
     pub fn prefetchWeight(self: *const ComputeBackend, name: []const u8) void {
@@ -3522,6 +3603,15 @@ pub const ComputeBackend = struct {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
     }
 
+    /// Runs Qwen3-VL's unmasked vision attention. Backends that do not expose
+    /// a model-scoped route retain the regular portable implementation.
+    pub fn scaledDotProductAttentionQwen3VlVision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        if (self.vtable.scaledDotProductAttentionQwen3VlVision) |f| {
+            return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
+        }
+        return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
+    }
+
     pub fn scaledDotProductAttentionFull(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
         if (self.vtable.scaledDotProductAttentionFull) |f| {
             return f(self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, head_dim);
@@ -3745,6 +3835,16 @@ pub const ComputeBackend = struct {
 
     pub fn rope(self: *const ComputeBackend, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !CT {
         return self.vtable.rope(self.ptr, input, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
+    }
+
+    pub fn mrope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, freq_scale: f32, positions: []const u32, sections: [3]u32) !?CT {
+        const op = self.vtable.mrope orelse return null;
+        return op(self.ptr, input, token_count, head_dim, theta, freq_scale, positions, sections);
+    }
+
+    pub fn visionRope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, positions: []const u32) !?CT {
+        const op = self.vtable.visionRope orelse return null;
+        return op(self.ptr, input, token_count, head_dim, theta, positions);
     }
 
     pub fn ropeScaled(self: *const ComputeBackend, input: CT, scale: f32, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) !?CT {
@@ -4085,6 +4185,20 @@ pub const ComputeBackend = struct {
 
     pub fn debertaEncoderLayer(self: *const ComputeBackend, request: *const DebertaEncoderLayerRequest) !?CT {
         if (self.vtable.debertaEncoderLayer) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn nomicBertEncoderLayer(self: *const ComputeBackend, request: *const NomicBertEncoderLayerRequest) !?CT {
+        if (self.vtable.nomicBertEncoderLayer) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn nomicBertPoolNormalize(self: *const ComputeBackend, request: *const NomicBertPoolNormalizeRequest) !?CT {
+        if (self.vtable.nomicBertPoolNormalize) |op| {
             return op(self.ptr, request);
         }
         return null;

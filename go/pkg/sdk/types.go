@@ -83,23 +83,25 @@ type (
 	EmbedderProvider         = oapi.EmbedderProvider
 	GeneratorProvider        = oapi.GeneratorProvider
 	EmbedderConfig           = oapi.EmbedderConfig
+	IndexEmbedderConfig      = oapi.IndexEmbedderConfig
 	GeneratorConfig          = oapi.GeneratorConfig
 	OllamaEmbedderConfig     = oapi.OllamaEmbedderConfig
 	OpenAIEmbedderConfig     = oapi.OpenAIEmbedderConfig
-	GoogleEmbedderConfig     = oapi.GoogleEmbedderConfig
+	OpenRouterEmbedderConfig = oapi.OpenRouterEmbedderConfig
 	BedrockEmbedderConfig    = oapi.BedrockEmbedderConfig
+	CohereEmbedderConfig     = oapi.CohereEmbedderConfig
+	GoogleEmbedderConfig     = oapi.GoogleEmbedderConfig
 	VertexEmbedderConfig     = oapi.VertexEmbedderConfig
 	AntflyEmbedderConfig     = oapi.AntflyEmbedderConfig
 	OllamaGeneratorConfig    = oapi.OllamaGeneratorConfig
 	OpenAIGeneratorConfig    = oapi.OpenAIGeneratorConfig
 	GoogleGeneratorConfig    = oapi.GoogleGeneratorConfig
-	BedrockGeneratorConfig   = oapi.BedrockGeneratorConfig
 	VertexGeneratorConfig    = oapi.VertexGeneratorConfig
-	AnthropicGeneratorConfig = oapi.AnthropicGeneratorConfig
 	AntflyGeneratorConfig    = oapi.AntflyGeneratorConfig
 	RerankerConfig           = oapi.RerankerConfig
 	AntflyRerankerConfig     = oapi.AntflyRerankerConfig
-	OllamaRerankerConfig     = oapi.OllamaRerankerConfig
+	CohereRerankerConfig     = oapi.CohereRerankerConfig
+	VertexRerankerConfig     = oapi.VertexRerankerConfig
 	RerankerProvider         = oapi.RerankerProvider
 	Pruner                   = oapi.Pruner
 
@@ -638,28 +640,24 @@ const (
 	EmbedderProviderGemini     = oapi.EmbedderProviderGemini
 	EmbedderProviderBedrock    = oapi.EmbedderProviderBedrock
 	EmbedderProviderVertex     = oapi.EmbedderProviderVertex
-	EmbedderProviderMock       = oapi.EmbedderProviderMock
+	EmbedderProviderCohere     = oapi.EmbedderProviderCohere
+	EmbedderProviderOpenrouter = oapi.EmbedderProviderOpenrouter
 	GeneratorProviderAntfly    = oapi.GeneratorProviderAntfly
 	GeneratorProviderOllama    = oapi.GeneratorProviderOllama
 	GeneratorProviderOpenai    = oapi.GeneratorProviderOpenai
 	GeneratorProviderGemini    = oapi.GeneratorProviderGemini
-	GeneratorProviderBedrock   = oapi.GeneratorProviderBedrock
 	GeneratorProviderVertex    = oapi.GeneratorProviderVertex
-	GeneratorProviderAnthropic = oapi.GeneratorProviderAnthropic
-	GeneratorProviderMock      = oapi.GeneratorProviderMock
 	RerankerProviderAntfly     = oapi.RerankerProviderAntfly
-	RerankerProviderOllama     = oapi.RerankerProviderOllama
+	RerankerProviderCohere     = oapi.RerankerProviderCohere
+	RerankerProviderVertex     = oapi.RerankerProviderVertex
 	ChunkerProviderAntfly      = oapi.ChunkerProviderAntfly
 
 	// MergeStrategy values
-	MergeStrategyRrf      = oapi.MergeStrategyRrf
-	MergeStrategyRsf      = oapi.MergeStrategyRsf
-	MergeStrategyFailover = oapi.MergeStrategyFailover
+	MergeStrategyRrf = oapi.MergeStrategyRrf
+	MergeStrategyRsf = oapi.MergeStrategyRsf
 
 	// LinearMergePageStatus values
 	LinearMergePageStatusSuccess = oapi.LinearMergePageStatusSuccess
-	LinearMergePageStatusPartial = oapi.LinearMergePageStatusPartial
-	LinearMergePageStatusError   = oapi.LinearMergePageStatusError
 
 	// SyncLevel values
 	SyncLevelPropose     = oapi.SyncLevelPropose

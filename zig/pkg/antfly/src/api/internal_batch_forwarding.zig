@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const data_raft_protocol = @import("../common/data_raft_protocol.zig");
+const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 
 pub const raft_batch_protocol_version = data_raft_protocol.batch_protocol_version;
 pub const raft_batch_timestamp_protocol_version = data_raft_protocol.batch_timestamp_protocol_version;
@@ -35,11 +36,7 @@ pub const max_remaining_ms: u32 = 5_000;
 /// Routing state carried only between trusted internal group-write endpoints.
 /// The remaining budget is relative because monotonic clocks are process-local.
 /// Each sender reserves response time before publishing the next budget.
-pub const Context = struct {
-    remaining_ms: u32,
-    forwards_remaining: u8,
-    campaign_allowed: bool,
-};
+pub const Context = raft_mutation_forwarding.Context;
 
 pub fn parse(req: http_common.HttpRequest) !?Context {
     return parseValues(
@@ -54,30 +51,12 @@ pub fn parseValues(
     forwards_raw: ?[]const u8,
     campaign_raw: ?[]const u8,
 ) !?Context {
-    if (remaining_raw == null and forwards_raw == null and campaign_raw == null) return null;
-    if (remaining_raw == null or forwards_raw == null or campaign_raw == null) {
-        return error.InvalidRaftBatchForwardingHeaders;
-    }
-
-    const remaining_ms = std.fmt.parseUnsigned(u32, remaining_raw.?, 10) catch
-        return error.InvalidRaftBatchForwardingHeaders;
-    const forwards_remaining = std.fmt.parseUnsigned(u8, forwards_raw.?, 10) catch
-        return error.InvalidRaftBatchForwardingHeaders;
-    const campaign_allowed = if (std.mem.eql(u8, campaign_raw.?, "true"))
-        true
-    else if (std.mem.eql(u8, campaign_raw.?, "false"))
-        false
-    else
-        return error.InvalidRaftBatchForwardingHeaders;
-    if (remaining_ms == 0 or remaining_ms > max_remaining_ms or forwards_remaining > max_forwards) {
-        return error.InvalidRaftBatchForwardingHeaders;
-    }
-
-    return .{
-        .remaining_ms = remaining_ms,
-        .forwards_remaining = forwards_remaining,
-        .campaign_allowed = campaign_allowed,
-    };
+    return raft_mutation_forwarding.parseValues(
+        remaining_raw,
+        forwards_raw,
+        campaign_raw,
+        .{ .max_remaining_ms = max_remaining_ms, .max_forwards = max_forwards },
+    ) catch return error.InvalidRaftBatchForwardingHeaders;
 }
 
 test "internal batch forwarding headers are all-or-none and strictly parsed" {

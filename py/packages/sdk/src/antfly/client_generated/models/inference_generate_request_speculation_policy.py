@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceGenerateRequestSpeculationPolicy(str, Enum):
+class InferenceGenerateRequestSpeculationPolicy(StrEnum):
     AUTO = "auto"
     FORCE = "force"
     OFF = "off"

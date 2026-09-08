@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class QueryHitHierarchyLevel(str, Enum):
+class QueryHitHierarchyLevel(StrEnum):
     ARTIFACT = "artifact"
     CHUNK = "chunk"
     EMBEDDING = "embedding"

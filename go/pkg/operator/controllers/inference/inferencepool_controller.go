@@ -32,6 +32,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -95,6 +96,7 @@ type InferencePoolReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch
 
 // Reconcile handles InferencePool reconciliation
 func (r *InferencePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -267,8 +269,12 @@ func (r *InferencePoolReconciler) reconcileConfigMap(ctx context.Context, pool *
 	if pool.Spec.Models.RegistryURL != "" {
 		cm.Data["ANTFLY_REGISTRY_URL"] = pool.Spec.Models.RegistryURL
 	}
-	if backend := inferencePreferredBackend(pool); backend != "" {
-		cm.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"] = backend
+	backendProfile := antflyaiv1alpha1.ResolveInferenceBackendProfile(pool)
+	if backendProfile.PreferredRuntime != "" {
+		cm.Data["ANTFLY_INFERENCE_PREFERRED_BACKEND"] = backendProfile.PreferredRuntime
+	}
+	if backendProfile.RequiredRuntime != "" {
+		cm.Data["ANTFLY_INFERENCE_REQUIRED_BACKEND"] = backendProfile.RequiredRuntime
 	}
 	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
 		cm.Data["ANTFLY_INFERENCE_PJRT_PLUGIN"] = pjrtPluginPath
@@ -404,32 +410,7 @@ func effectiveInferenceLoadingStrategy(modelStrategy, poolStrategy antflyaiv1alp
 }
 
 func isTPUAccelerator(accelerator string) bool {
-	return strings.Contains(strings.ToLower(accelerator), "tpu")
-}
-
-func inferencePreferredBackend(pool *antflyaiv1alpha1.InferencePool) string {
-	if isTPUAccelerator(pool.Spec.Hardware.Accelerator) {
-		return "pjrt"
-	}
-	if pool.Spec.Hardware.Accelerator != "" || hasInferenceGPUResources(pool.Spec.Resources) {
-		return "cuda"
-	}
-	return ""
-}
-
-func hasInferenceGPUResources(resources *corev1.ResourceRequirements) bool {
-	if resources == nil {
-		return false
-	}
-	for _, resourceName := range []corev1.ResourceName{"nvidia.com/gpu", "cloud.google.com/gke-gpu"} {
-		if _, ok := resources.Limits[resourceName]; ok {
-			return true
-		}
-		if _, ok := resources.Requests[resourceName]; ok {
-			return true
-		}
-	}
-	return false
+	return antflyaiv1alpha1.IsTPUAccelerator(accelerator)
 }
 
 func zigWarmModelKind(tasks []string) string {
@@ -493,7 +474,18 @@ func inferenceArtifactSelection(modelRef string) (format, quantization string, o
 }
 
 func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.InferencePool) error {
-	replicas := initialInferenceReplicas(pool)
+	var activationLease *coordinationv1.Lease
+	if pool.Spec.ScaleToZero != nil && pool.Spec.ScaleToZero.Enabled {
+		activationLease = &coordinationv1.Lease{}
+		leaseKey := types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}
+		if err := r.Get(ctx, leaseKey, activationLease); err != nil {
+			if !errors.IsNotFound(err) {
+				return fmt.Errorf("get activation Lease: %w", err)
+			}
+			activationLease = nil
+		}
+	}
+	replicas := desiredInferenceReplicasAt(pool, activationLease, time.Now())
 
 	// Determine image
 	image := r.AntflyImage
@@ -702,8 +694,16 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 	return nil
 }
 
-func initialInferenceReplicas(pool *antflyaiv1alpha1.InferencePool) int32 {
+const defaultInferenceIdleTimeout = 15 * time.Minute
+
+func desiredInferenceReplicasAt(pool *antflyaiv1alpha1.InferencePool, activationLease *coordinationv1.Lease, now time.Time) int32 {
 	replicas := pool.Spec.Replicas.Min
+	if scaleToZeroActiveAt(pool, activationLease, now) {
+		replicas = 1
+		if pool.Spec.ScaleToZero.WakeReplicas != nil {
+			replicas = *pool.Spec.ScaleToZero.WakeReplicas
+		}
+	}
 	if inferenceAutoscalingEnabled(pool) && pool.Spec.Autoscaling.WarmupReplicas != nil && *pool.Spec.Autoscaling.WarmupReplicas > replicas {
 		replicas = *pool.Spec.Autoscaling.WarmupReplicas
 		if pool.Spec.Replicas.Max > 0 && replicas > pool.Spec.Replicas.Max {
@@ -711,6 +711,33 @@ func initialInferenceReplicas(pool *antflyaiv1alpha1.InferencePool) int32 {
 		}
 	}
 	return replicas
+}
+
+func scaleToZeroActiveAt(pool *antflyaiv1alpha1.InferencePool, activationLease *coordinationv1.Lease, now time.Time) bool {
+	if pool.Spec.ScaleToZero == nil || !pool.Spec.ScaleToZero.Enabled {
+		return false
+	}
+	if activationLease == nil || activationLease.Name != pool.Name || activationLease.Namespace != pool.Namespace {
+		return false
+	}
+	if activationLease.Labels[antflyaiv1alpha1.ActivationLeasePoolLabel] != pool.Name ||
+		activationLease.Spec.HolderIdentity == nil || *activationLease.Spec.HolderIdentity != string(pool.UID) ||
+		activationLease.Spec.RenewTime == nil || activationLease.Spec.LeaseDurationSeconds == nil ||
+		*activationLease.Spec.LeaseDurationSeconds <= 0 {
+		return false
+	}
+	renewedAt := activationLease.Spec.RenewTime.Time
+	if renewedAt.After(now.Add(time.Minute)) {
+		return false
+	}
+	if renewedAt.After(now) {
+		renewedAt = now
+	}
+	idleTimeout := defaultInferenceIdleTimeout
+	if pool.Spec.ScaleToZero.IdleTimeout != nil {
+		idleTimeout = pool.Spec.ScaleToZero.IdleTimeout.Duration
+	}
+	return now.Before(renewedAt.Add(idleTimeout))
 }
 
 func inferenceAutoscalingEnabled(pool *antflyaiv1alpha1.InferencePool) bool {
@@ -1143,8 +1170,20 @@ func (r *InferencePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplat
 			computeClass = "Balanced"
 		}
 
-		// Apply compute class annotation (required for GKE Autopilot non-TPU workloads)
-		podTemplate.Annotations["cloud.google.com/compute-class"] = computeClass
+		// GPU workloads must select both the Accelerator compute class and the
+		// concrete GPU type. GKE reads these as node labels; annotations alone do
+		// not trigger L4 provisioning.
+		if pool.Spec.Hardware.Accelerator != "" && antflyaiv1alpha1.HasGPUResources(pool.Spec.Resources) {
+			if podTemplate.Spec.NodeSelector == nil {
+				podTemplate.Spec.NodeSelector = make(map[string]string)
+			}
+			podTemplate.Spec.NodeSelector["cloud.google.com/compute-class"] = computeClass
+			podTemplate.Spec.NodeSelector["cloud.google.com/gke-accelerator"] = pool.Spec.Hardware.Accelerator
+		} else {
+			// Preserve the existing annotation behavior for non-GPU pools; changing
+			// their scheduling contract is outside this GPU rollout.
+			podTemplate.Annotations["cloud.google.com/compute-class"] = computeClass
+		}
 
 		// Add spot toleration if using autopilot-spot compute class
 		// GKE Autopilot spot nodes have the taint cloud.google.com/gke-spot=true:NoSchedule
@@ -1160,7 +1199,13 @@ func (r *InferencePoolReconciler) applyGKEPodSpec(podTemplate *corev1.PodTemplat
 		return
 	}
 
-	// Standard GKE mode (non-Autopilot): use node selectors for spot instances
+	// Standard GKE mode (non-Autopilot): select the requested GPU type and spot nodes.
+	if pool.Spec.GKE != nil && pool.Spec.Hardware.Accelerator != "" && antflyaiv1alpha1.HasGPUResources(pool.Spec.Resources) {
+		if podTemplate.Spec.NodeSelector == nil {
+			podTemplate.Spec.NodeSelector = make(map[string]string)
+		}
+		podTemplate.Spec.NodeSelector["cloud.google.com/gke-accelerator"] = pool.Spec.Hardware.Accelerator
+	}
 	if pool.Spec.Hardware.Spot {
 		// Initialize nodeSelector if nil
 		if podTemplate.Spec.NodeSelector == nil {
@@ -1800,8 +1845,17 @@ func (r *InferencePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
+		Watches(&coordinationv1.Lease{}, handler.EnqueueRequestsFromMapFunc(r.requestsForActivationLease)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPod)).
 		Complete(r)
+}
+
+func (r *InferencePoolReconciler) requestsForActivationLease(_ context.Context, obj client.Object) []reconcile.Request {
+	poolName := obj.GetLabels()[antflyaiv1alpha1.ActivationLeasePoolLabel]
+	if poolName == "" || poolName != obj.GetName() {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: poolName, Namespace: obj.GetNamespace()}}}
 }
 
 func (r *InferencePoolReconciler) requestsForPod(ctx context.Context, obj client.Object) []reconcile.Request {

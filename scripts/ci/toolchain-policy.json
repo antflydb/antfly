@@ -1,0 +1,28 @@
+{
+  "python": {
+    "minimum": "3.11",
+    "supported": ["3.11", "3.12", "3.13", "3.14"],
+    "build": "3.14",
+    "ruffTarget": "py311"
+  },
+  "go": {
+    "version": "1.26.4"
+  },
+  "npm": {
+    "version": "11.19.1"
+  },
+  "zig": {
+    "version": "0.16.0",
+    "nixAttribute": "zig_0_16",
+    "nixpkgsRevision": "c5c4a43b0e8056328ec4529f735cabdb8f1942bb",
+    "x86_64LinuxSha256": "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+    "aarch64LinuxSha256": "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
+  },
+  "macosCrossSdk": {
+    "version": "15.5",
+    "sha256": "c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd"
+  },
+  "rust": {
+    "version": "1.93.1"
+  }
+}

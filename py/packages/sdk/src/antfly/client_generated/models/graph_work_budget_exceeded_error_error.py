@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphWorkBudgetExceededErrorError(str, Enum):
+class GraphWorkBudgetExceededErrorError(StrEnum):
     GRAPH_WORK_BUDGET_EXCEEDED = "graph_work_budget_exceeded"
 
     def __str__(self) -> str:

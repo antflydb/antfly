@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceGenerateChunkObject(str, Enum):
+class InferenceGenerateChunkObject(StrEnum):
     CHAT_COMPLETION_CHUNK = "chat.completion.chunk"
 
     def __str__(self) -> str:

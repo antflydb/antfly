@@ -156,12 +156,14 @@ def run_filtered_suite(
             env=env,
             timeout_seconds=timeout_seconds,
         )
-    failures = [name for name, result in subchecks.items() if result["pass"] is not True]
+    failures = [
+        name for name, result in subchecks.items() if result["pass"] is not True
+    ]
     return {
         "pass": not failures,
-        "returncode": 0 if not failures else next(
-            int(subchecks[name]["returncode"]) for name in failures
-        ),
+        "returncode": 0
+        if not failures
+        else next(int(subchecks[name]["returncode"]) for name in failures),
         "timed_out": any(result["timed_out"] is True for result in subchecks.values()),
         "argv": argv,
         "failures": failures,
@@ -171,7 +173,9 @@ def run_filtered_suite(
 
 def zig_local_cache_object_dir(package_dir: Path, env: dict[str, str]) -> Path:
     configured = env.get("ZIG_LOCAL_CACHE_DIR")
-    cache_dir = Path(configured).expanduser() if configured else package_dir / ".zig-cache"
+    cache_dir = (
+        Path(configured).expanduser() if configured else package_dir / ".zig-cache"
+    )
     if not cache_dir.is_absolute():
         cache_dir = package_dir / cache_dir
     return (cache_dir / "o").resolve()
@@ -189,16 +193,22 @@ def standalone_test_executable(
         try:
             output = log_path.read_text(encoding="utf-8")
         except OSError as exc:
-            raise ValueError(f"cannot read parity log needed for sanitizer target: {exc}") from exc
+            raise ValueError(
+                f"cannot read parity log needed for sanitizer target: {exc}"
+            ) from exc
         for match in TEST_EXECUTABLE_PATTERN.finditer(output):
             candidate_path = Path(match.group("path"))
             candidate = (
-                candidate_path if candidate_path.is_absolute() else package_dir / candidate_path
+                candidate_path
+                if candidate_path.is_absolute()
+                else package_dir / candidate_path
             ).resolve()
             try:
                 candidate.relative_to(cache_root)
             except ValueError as exc:
-                raise ValueError(f"sanitizer test executable escapes Zig cache: {candidate}") from exc
+                raise ValueError(
+                    f"sanitizer test executable escapes Zig cache: {candidate}"
+                ) from exc
             if candidate.is_file():
                 candidates.add(candidate)
     if len(candidates) != 1:
@@ -220,7 +230,9 @@ def gpu_identity() -> dict[str, str]:
         raise ValueError(f"nvidia-smi failed: {completed.stderr.strip()}")
     rows = [row.strip() for row in completed.stdout.splitlines() if row.strip()]
     if len(rows) != 1:
-        raise ValueError(f"qualification requires exactly one visible GPU, found {len(rows)}")
+        raise ValueError(
+            f"qualification requires exactly one visible GPU, found {len(rows)}"
+        )
     fields = [field.strip() for field in rows[0].split(",")]
     if len(fields) != 4:
         raise ValueError(f"unexpected nvidia-smi output: {rows[0]}")
@@ -228,9 +240,13 @@ def gpu_identity() -> dict[str, str]:
     try:
         architecture, family = ARCHITECTURES[capability]
     except KeyError as exc:
-        raise ValueError(f"unsupported qualification compute capability: {capability}") from exc
+        raise ValueError(
+            f"unsupported qualification compute capability: {capability}"
+        ) from exc
     if family.lower() not in name.lower():
-        raise ValueError(f"GPU {name!r} does not match required {family} identity for {architecture}")
+        raise ValueError(
+            f"GPU {name!r} does not match required {family} identity for {architecture}"
+        )
     return {
         "name": name,
         "family": family,
@@ -245,7 +261,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--zig", default="zig")
-    parser.add_argument("--cuda-artifacts", choices=("fatbin", "portable", "sm89"), default="fatbin")
+    parser.add_argument(
+        "--cuda-artifacts", choices=("fatbin", "portable", "sm89"), default="fatbin"
+    )
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     args = parser.parse_args()
 
@@ -306,7 +324,9 @@ def main() -> int:
         timeout_seconds=args.timeout_seconds,
     )
     try:
-        sanitizer_test_executable = standalone_test_executable(package_dir, log_dir, required_env)
+        sanitizer_test_executable = standalone_test_executable(
+            package_dir, log_dir, required_env
+        )
     except ValueError as exc:
         parser.error(str(exc))
 

@@ -60,6 +60,24 @@ pub fn gelu(data: []f32) void {
     }
 }
 
+/// Exact-erf GELU used by Hugging Face configs whose `hidden_act` is `gelu`.
+/// The erf approximation has a maximum absolute error around 1.5e-7 and is
+/// shared semantically with the device implementation.
+pub fn geluExact(data: []f32) void {
+    for (data) |*v| {
+        const x = v.*;
+        v.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+    }
+}
+
+fn erfApproxF32(x: f32) f32 {
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return sign * (1.0 - poly * @exp(-(ax * ax)));
+}
+
 /// ReLU activation: max(0, x)
 pub fn relu(data: []f32) void {
     const zero: F32xN = @splat(0.0);
@@ -568,6 +586,17 @@ test "gelu" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), data[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8412), data[1], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, -0.1588), data[2], 1e-3);
+}
+
+test "exact gelu matches erf reference values" {
+    var data = [_]f32{ 0.0, 1.0, -1.0, 2.0 };
+    geluExact(&data);
+    // erfApproxF32 is bounded to a few f32 ULPs after composition with GELU.
+    const tolerance = 4 * std.math.floatEps(f32);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), data[0], tolerance);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8413447), data[1], tolerance);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.15865526), data[2], tolerance);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.9544997), data[3], tolerance);
 }
 
 // Vector vs scalar parity for gelu/silu/sigmoid/quickGelu across full activation range,

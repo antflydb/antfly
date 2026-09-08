@@ -97,6 +97,7 @@ pub const MemoryClient = struct {
     }
 
     fn putObject(self: *MemoryClient, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         self.recordOperation();
         var object_map = try self.ensureBucket(bucket);
 
@@ -120,6 +121,7 @@ pub const MemoryClient = struct {
             .etag = owned_etag,
             .content_type = owned_content_type,
         };
+        if (opts.cancellation) |token| try token.check();
 
         // Fully construct before swapping the published value. Allocation
         // failure therefore leaves the old object intact and cannot leak a
@@ -237,6 +239,7 @@ pub const MemoryClient = struct {
     }
 
     fn deleteObject(self: *MemoryClient, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         self.recordOperation();
         _ = opts.version_id;
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
@@ -250,6 +253,7 @@ pub const MemoryClient = struct {
     }
 
     fn listObjects(self: *MemoryClient, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
+        if (opts.cancellation) |token| try token.check();
         self.recordOperation();
         const object_map = self.buckets.getPtr(bucket) orelse {
             return .{
@@ -261,7 +265,10 @@ pub const MemoryClient = struct {
         var keys = std.ArrayListUnmanaged([]const u8).empty;
         defer keys.deinit(alloc);
         var it = object_map.iterator();
-        while (it.next()) |entry| try keys.append(alloc, entry.key_ptr.*);
+        while (it.next()) |entry| {
+            if (opts.cancellation) |token| try token.check();
+            try keys.append(alloc, entry.key_ptr.*);
+        }
         std.mem.sort([]const u8, keys.items, {}, lessKey);
 
         var out = std.ArrayListUnmanaged(types.ListEntry).empty;
@@ -278,6 +285,7 @@ pub const MemoryClient = struct {
         var truncated = false;
         const continuation = opts.continuation_token orelse opts.start_after;
         for (keys.items) |key| {
+            if (opts.cancellation) |token| try token.check();
             if (!std.mem.startsWith(u8, key, opts.prefix)) continue;
             if (continuation) |token| {
                 if (std.mem.order(u8, key, token) != .gt) continue;
@@ -343,12 +351,14 @@ pub const MemoryClient = struct {
         self.deinit();
     }
 
-    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !bool {
+        if (opts.cancellation) |token| try token.check();
         const self: *MemoryClient = @ptrCast(@alignCast(ptr));
         return self.bucketExists(bucket);
     }
 
-    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         const self: *MemoryClient = @ptrCast(@alignCast(ptr));
         try self.makeBucket(bucket);
     }

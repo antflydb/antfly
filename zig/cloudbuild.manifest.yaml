@@ -8,7 +8,7 @@
 #   _ARM64_TAG: source arm64 image tag
 
 steps:
-  - name: gcr.io/cloud-builders/docker
+  - name: gcr.io/cloud-builders/docker@sha256:e85f8f20f7b533e74a4b1be279b9ff2b45dcc20ab97de9b302c26715a9d9ffc8
     id: create-manifest
     entrypoint: bash
     args:

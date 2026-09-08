@@ -46,17 +46,31 @@ from gemma4_metal_long_output import (  # noqa: E402
 )
 
 
-METADATA_SCHEMA = "antfly.gemma4_metal_ab.metadata.v3"
-SUMMARY_SCHEMA = "antfly.gemma4_metal_ab.v3"
+METADATA_SCHEMA = "antfly.gemma4_metal_ab.metadata.v8"
+SUMMARY_SCHEMA = "antfly.gemma4_metal_ab.v8"
 SHARED_PARSER = SCRIPT_DIR / "gemma4_metal_long_output.py"
+MAX_PIPELINED_FRAME_RETAINED_MB = 256
+MODEL_TOPOLOGIES = ("e2b", "e4b")
 ROUTE_PROFILES = (
     "split_ffn",
     "q4_mmv_workload",
     "pair_decode",
     "pair_prefill",
     "pair_decode_prefill",
+    "lm_head_repack",
     "concurrent_split",
     "gqa_split_schedule",
+    "gqa_split_rollback",
+    "gqa_split_rollback_pair_decode",
+)
+GQA_SPLIT_ROLLBACK_PROFILES = (
+    "gqa_split_rollback",
+    "gqa_split_rollback_pair_decode",
+)
+E2B_ROUTE_PROFILES = (
+    "pair_decode",
+    "lm_head_repack",
+    "gqa_split_rollback_pair_decode",
 )
 GQA_SPLIT_VARIANTS = ("s8", "s16", "s24", "s32")
 GQA_SPLIT_VARIANT_ENV = {
@@ -64,6 +78,7 @@ GQA_SPLIT_VARIANT_ENV = {
     "global": "TERMITE_METAL_DECODE_GQA_SPLIT_GLOBAL_VARIANT",
 }
 GQA_SPLIT_TRACE_ENV = "TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE"
+GQA_SPLIT_MIN_KV_ENV = "TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV"
 Q4_MMV_VARIANTS = ("nr4-nsg2", "nr8-nsg2", "nr4-nsg4", "nr8-nsg4")
 Q4_MMV_TRACE_ENV = "TERMITE_METAL_TRACE_Q4_0_MMV_VARIANT"
 Q4_MMV_WORKLOAD_ENV = {
@@ -131,6 +146,7 @@ CONTROLLED_ENV_NAMES = frozenset(
         "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH",
         "TERMITE_METAL_DECODE_GQA_SPLIT_SWA_VARIANT",
         "TERMITE_METAL_DECODE_GQA_SPLIT_GLOBAL_VARIANT",
+        GQA_SPLIT_MIN_KV_ENV,
         "TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE",
         "TERMITE_METAL_ENABLE_PREFILL_SG_DIRECT_LOAD",
         "TERMITE_METAL_DISABLE_PREFILL_SG_DIRECT_LOAD",
@@ -167,6 +183,7 @@ CONTROLLED_ENV_NAMES = frozenset(
         "TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE",
         "TERMITE_METAL_ENABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ",
         "TERMITE_METAL_DISABLE_Q4_0_LINEAR_RMS_ADD_SUMSQ",
+        "TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK",
         "TERMITE_METAL_ENABLE_RMS_NORM_GENERATED",
         "TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH",
         "TERMITE_METAL_DISABLE_CONCURRENT_PLANNED_DISPATCH",
@@ -270,7 +287,9 @@ def _resolve_gguf(model: Path, explicit: Path | None) -> Path:
             if "mmproj" not in path.name.lower()
         )
         if not matches:
-            raise BenchmarkContractError(f"no text GGUF found under model path: {model}")
+            raise BenchmarkContractError(
+                f"no text GGUF found under model path: {model}"
+            )
         result = matches[0]
     if not result.is_file():
         raise BenchmarkContractError(f"GGUF is not a file: {result}")
@@ -286,12 +305,16 @@ def _parse_env_entries(entries: Iterable[str], label: str) -> dict[str, str | No
         if name in result:
             raise BenchmarkContractError(f"duplicate {label} environment name: {name}")
         if "\n" in value or "\r" in value or "\0" in value:
-            raise BenchmarkContractError(f"control character in {label} environment value: {name}")
+            raise BenchmarkContractError(
+                f"control character in {label} environment value: {name}"
+            )
         result[name] = value if separator else None
     return result
 
 
-def _merge_env_json(entries: list[str], raw_json: str, label: str) -> dict[str, str | None]:
+def _merge_env_json(
+    entries: list[str], raw_json: str, label: str
+) -> dict[str, str | None]:
     result = _parse_env_entries(entries, label)
     if not raw_json.strip():
         return result
@@ -303,13 +326,17 @@ def _merge_env_json(entries: list[str], raw_json: str, label: str) -> dict[str, 
         raise BenchmarkContractError(f"{label} JSON must be an object")
     rendered: list[str] = []
     for name, value in decoded.items():
-        if not isinstance(name, str) or (value is not None and not isinstance(value, str)):
+        if not isinstance(name, str) or (
+            value is not None and not isinstance(value, str)
+        ):
             raise BenchmarkContractError(f"{label} JSON values must be strings or null")
         rendered.append(name if value is None else f"{name}={value}")
     extra = _parse_env_entries(rendered, label)
     overlap = sorted(result.keys() & extra.keys())
     if overlap:
-        raise BenchmarkContractError(f"duplicate {label} environment names: {', '.join(overlap)}")
+        raise BenchmarkContractError(
+            f"duplicate {label} environment names: {', '.join(overlap)}"
+        )
     result.update(extra)
     return result
 
@@ -327,7 +354,11 @@ def _validate_variant_environments(
             f"common and variant environment maps overlap: {', '.join(overlap)}"
         )
     for runner_owned in RUNNER_OWNED_ENV_NAMES:
-        if runner_owned in common or runner_owned in baseline or runner_owned in candidate:
+        if (
+            runner_owned in common
+            or runner_owned in baseline
+            or runner_owned in candidate
+        ):
             raise BenchmarkContractError(
                 f"{runner_owned} is runner-owned; select the corresponding benchmark mode/profile"
             )
@@ -357,6 +388,25 @@ def _validate_variant_environments(
                 raise BenchmarkContractError(
                     f"{label} sets {name} without route profile gqa_split_schedule"
                 )
+        min_kv = effective.get(GQA_SPLIT_MIN_KV_ENV)
+        if min_kv is not None:
+            if not min_kv.isdecimal() or int(min_kv) == 0:
+                raise BenchmarkContractError(
+                    f"{label} {GQA_SPLIT_MIN_KV_ENV} must be a positive decimal integer; "
+                    f"got {min_kv!r}"
+                )
+        split_rollback_required = profile in GQA_SPLIT_ROLLBACK_PROFILES
+        split_disabled = effective.get("TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT") == "1"
+        if split_disabled != split_rollback_required:
+            raise BenchmarkContractError(
+                f"{label} route profile {profile} and decode GQA split rollback disagree"
+            )
+        if split_rollback_required and effective.get(
+            "TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT"
+        ) not in (None, "0"):
+            raise BenchmarkContractError(
+                f"{label} decode GQA split is simultaneously enabled and disabled"
+            )
         for workload, name in Q4_MMV_WORKLOAD_ENV.items():
             value = effective.get(name)
             if value is not None and value not in ("auto", "legacy", *Q4_MMV_VARIANTS):
@@ -378,11 +428,17 @@ def _validate_variant_environments(
                     f"{workload} dispatches in the q4_mmv_workload contract"
                 )
         if profile == "q4_mmv_workload":
-            if effective.get("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO") not in (None, "0"):
+            if effective.get("TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO") not in (
+                None,
+                "0",
+            ):
                 raise BenchmarkContractError(
                     f"{label} q4_mmv_workload profile cannot disable the Q4 MMV portfolio"
                 )
-            if effective.get("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE") not in (None, "0"):
+            if effective.get("TERMITE_METAL_DISABLE_Q4_0_SMALL_REDUCE") not in (
+                None,
+                "0",
+            ):
                 raise BenchmarkContractError(
                     f"{label} q4_mmv_workload profile cannot disable the small Q4 MMV kernels"
                 )
@@ -392,28 +448,51 @@ def _validate_variant_environments(
                     f"{label} concurrent_split profile requires "
                     "TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH=1"
                 )
-            if env.get("TERMITE_METAL_DISABLE_CONCURRENT_PLANNED_DISPATCH") not in (None, "0"):
+            if env.get("TERMITE_METAL_DISABLE_CONCURRENT_PLANNED_DISPATCH") not in (
+                None,
+                "0",
+            ):
                 raise BenchmarkContractError(
                     f"{label} concurrent_split profile cannot disable concurrent dispatch"
                 )
-        decode_pair_required = profile in ("pair_decode", "pair_decode_prefill")
+        decode_pair_required = profile in (
+            "pair_decode",
+            "pair_decode_prefill",
+            "lm_head_repack",
+            "gqa_split_rollback_pair_decode",
+        )
         prefill_pair_required = profile in ("pair_prefill", "pair_decode_prefill")
-        if (env.get("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION") == "1") != decode_pair_required:
+        if (
+            env.get("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION") == "1"
+        ) != decode_pair_required:
             raise BenchmarkContractError(
                 f"{label} route profile {profile} and decode pair-activation enable disagree"
             )
         if decode_pair_required and env.get(
             "TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION"
         ) not in (None, "0"):
-            raise BenchmarkContractError(f"{label} decode pair activation is also disabled")
-        if (env.get("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM") == "1") != prefill_pair_required:
+            raise BenchmarkContractError(
+                f"{label} decode pair activation is also disabled"
+            )
+        if (
+            env.get("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM") == "1"
+        ) != prefill_pair_required:
             raise BenchmarkContractError(
                 f"{label} route profile {profile} and prefill pair-activation enable disagree"
             )
         if prefill_pair_required and env.get(
             "TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_MM"
         ) not in (None, "0"):
-            raise BenchmarkContractError(f"{label} prefill pair activation is also disabled")
+            raise BenchmarkContractError(
+                f"{label} prefill pair activation is also disabled"
+            )
+        repack_required = profile == "lm_head_repack"
+        if (
+            env.get("TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK") == "q4_k"
+        ) != repack_required:
+            raise BenchmarkContractError(
+                f"{label} route profile {profile} and lm-head Q4_K repack enable disagree"
+            )
 
 
 def _effective_environment(
@@ -499,9 +578,7 @@ def _expected_q4_mmv_workload_variants(
             selected = override
         elif override == "legacy":
             selected = (
-                "nr4-nsg2"
-                if workload in ("generic", "attention")
-                else "nr8-nsg2"
+                "nr4-nsg2" if workload in ("generic", "attention") else "nr8-nsg2"
             )
         else:
             # Current production AUTO policy: attention retains its legacy
@@ -544,7 +621,9 @@ def _invocation_plan(
     plan: list[dict[str, Any]] = []
     order = 0
 
-    def append(kind: str, variant: str, index: int, tokens: int, stage_timing: bool) -> None:
+    def append(
+        kind: str, variant: str, index: int, tokens: int, stage_timing: bool
+    ) -> None:
         nonlocal order
         order += 1
         plan.append(
@@ -582,22 +661,142 @@ def _invocation_plan(
     return plan
 
 
-def _route_expectations(profile: str, output_tokens: int) -> dict[str, Any]:
+def _route_expectations(
+    profile: str,
+    output_tokens: int,
+    model_topology: str = "e4b",
+    *,
+    prompt_tokens: int = 23,
+    split_min_kv: int | None = None,
+) -> dict[str, Any]:
     if profile not in ROUTE_PROFILES:
         raise BenchmarkContractError(f"unsupported route profile: {profile}")
-    decode_frames = output_tokens - 1
-    decode_pairs = 42 * decode_frames if profile in ("pair_decode", "pair_decode_prefill") else 0
+    if model_topology not in MODEL_TOPOLOGIES:
+        raise BenchmarkContractError(f"unsupported model topology: {model_topology}")
+    if split_min_kv is None:
+        split_min_kv = _default_gqa_split_min_kv(model_topology)
+    if prompt_tokens <= 0:
+        raise BenchmarkContractError("prompt token count must be positive")
+    # The compiled whole-model path submits one device frame for every emitted
+    # token, including the token selected from the prefill result.  Keep this
+    # tied to the live `metal_prepared_frame.fast_path` contract: using N-1
+    # silently rejects current production runs and shifts every route census.
+    decode_frames = output_tokens
+    first_decode_kv = prompt_tokens + 1
+    split_rollback = profile in GQA_SPLIT_ROLLBACK_PROFILES
+    if split_rollback:
+        below_floor_frames = 0
+        split_frames = 0
+        paged_decode_frames = decode_frames
+    else:
+        below_floor_frames = min(
+            decode_frames,
+            max(split_min_kv - first_decode_kv, 0),
+        )
+        split_frames = decode_frames - below_floor_frames
+        paged_decode_frames = below_floor_frames
+    if model_topology == "e2b":
+        # E2B has 35 text layers. Its short-context prefill uses seven HD512
+        # flash/paged groups plus 28 ordinary paged calls; unlike E4B, it has
+        # no generated flash-prefill calls. Only the decode-pair profiles have
+        # been qualified for this topology, so the split rollback is expressed
+        # as an explicit composition with pair decode.
+        if profile not in E2B_ROUTE_PROFILES:
+            raise BenchmarkContractError(
+                f"route profile {profile} is not qualified for E2B topology"
+            )
+        decode_pairs = 35 * decode_frames
+        decode_q4_dispatches = 105 * decode_frames
+        prefill_q4_rows = _row_bucket_counts(prompt_tokens, 275)
+        return {
+            "decode_frames": decode_frames,
+            "split_frames": split_frames,
+            "below_floor_calls": 35 * below_floor_frames,
+            "attention_routes": (
+                35 * paged_decode_frames + 28,
+                35 * split_frames,
+                0,
+                7,
+                0,
+                7,
+            ),
+            "q4_rows": (
+                decode_q4_dispatches + prefill_q4_rows[0],
+                prefill_q4_rows[1],
+                prefill_q4_rows[2],
+                prefill_q4_rows[3],
+            ),
+            "q4_decode_row_one": decode_q4_dispatches,
+            "decode_pairs": decode_pairs,
+            "prefill_pairs": 0,
+            "logical_decode_q4": 175 * decode_frames,
+            "logical_prefill_q4": 275,
+            "q4_mmv_variants": (70 * decode_frames, 35 * decode_frames, 0, 0),
+        }
+    decode_pairs = (
+        42 * decode_frames
+        if profile
+        in (
+            "pair_decode",
+            "pair_decode_prefill",
+            "lm_head_repack",
+            "gqa_split_rollback_pair_decode",
+        )
+        else 0
+    )
     prefill_pairs = 42 if profile in ("pair_prefill", "pair_decode_prefill") else 0
+    decode_q4_dispatches = 210 * decode_frames - 2 * decode_pairs
+    prefill_q4_dispatches = 342 - 2 * prefill_pairs
+    prefill_q4_rows = _row_bucket_counts(prompt_tokens, prefill_q4_dispatches)
+    q4_rows = (
+        decode_q4_dispatches + prefill_q4_rows[0],
+        prefill_q4_rows[1],
+        prefill_q4_rows[2],
+        prefill_q4_rows[3],
+    )
     return {
         "decode_frames": decode_frames,
+        "split_frames": split_frames,
+        "below_floor_calls": 42 * below_floor_frames,
         "attention": 42 * decode_frames,
-        "q4_row_one": 210 * decode_frames - 2 * decode_pairs,
-        "q4_row_65_plus": 342 - 2 * prefill_pairs,
+        "attention_routes": (
+            42 * paged_decode_frames,
+            42 * split_frames,
+            35,
+            7,
+            0,
+            42,
+        ),
+        "q4_rows": q4_rows,
+        "q4_decode_row_one": decode_q4_dispatches,
         "decode_pairs": decode_pairs,
         "prefill_pairs": prefill_pairs,
         "logical_decode_q4": 210 * decode_frames,
         "logical_prefill_q4": 342,
+        "q4_mmv_variants": None,
     }
+
+
+def _row_bucket_counts(rows: int, dispatches: int) -> tuple[int, int, int, int]:
+    if rows <= 0 or dispatches < 0:
+        raise BenchmarkContractError(
+            "row-bucket inputs must be non-negative and non-empty"
+        )
+    if rows == 1:
+        return (dispatches, 0, 0, 0)
+    if rows <= 8:
+        return (0, dispatches, 0, 0)
+    if rows <= 64:
+        return (0, 0, dispatches, 0)
+    return (0, 0, 0, dispatches)
+
+
+def _default_gqa_split_min_kv(model_topology: str) -> int:
+    if model_topology == "e2b":
+        return 192
+    if model_topology == "e4b":
+        return 32
+    raise BenchmarkContractError(f"unsupported model topology: {model_topology}")
 
 
 def _parse_key_values(raw: str, label: str, path: Path) -> dict[str, int]:
@@ -611,17 +810,25 @@ def _parse_key_values(raw: str, label: str, path: Path) -> dict[str, int]:
     return result
 
 
-def _require_keys(values: dict[str, int], keys: Iterable[str], label: str, path: Path) -> None:
+def _require_keys(
+    values: dict[str, int], keys: Iterable[str], label: str, path: Path
+) -> None:
     missing = sorted(set(keys) - values.keys())
     if missing:
-        raise BenchmarkContractError(f"missing {label} keys {', '.join(missing)}: {path}")
+        raise BenchmarkContractError(
+            f"missing {label} keys {', '.join(missing)}: {path}"
+        )
 
 
 def _parse_pair_policy(log: str, path: Path, required: bool) -> dict[str, int] | None:
-    matches = list(re.finditer(r"^metal_q4_0_pair_activation_policy:\s*(.+)$", log, re.MULTILINE))
+    matches = list(
+        re.finditer(r"^metal_q4_0_pair_activation_policy:\s*(.+)$", log, re.MULTILINE)
+    )
     if not matches:
         if required:
-            raise BenchmarkContractError(f"missing Q4_0 pair activation policy counters: {path}")
+            raise BenchmarkContractError(
+                f"missing Q4_0 pair activation policy counters: {path}"
+            )
         return None
     match = matches[-1]
     values = _parse_key_values(match.group(1), "Q4_0 pair activation policy", path)
@@ -687,7 +894,7 @@ def _parse_gqa_split_schedule(
     path: Path,
     *,
     required: bool,
-    decode_frames: int,
+    split_frames: int,
     expected_variants: dict[str, str] | None,
 ) -> dict[str, Any] | None:
     matches = list(
@@ -695,14 +902,14 @@ def _parse_gqa_split_schedule(
     )
     if not matches:
         if required:
-            raise BenchmarkContractError(f"missing decode GQA split schedule counters: {path}")
+            raise BenchmarkContractError(
+                f"missing decode GQA split schedule counters: {path}"
+            )
         return None
     if not required:
         return None
 
-    values = _parse_key_values(
-        matches[-1].group(1), "decode GQA split schedule", path
-    )
+    values = _parse_key_values(matches[-1].group(1), "decode GQA split schedule", path)
     missing = sorted(set(GQA_SPLIT_SCHEDULE_KEYS) - values.keys())
     extra = sorted(values.keys() - set(GQA_SPLIT_SCHEDULE_KEYS))
     if missing or extra:
@@ -714,8 +921,12 @@ def _parse_gqa_split_schedule(
         raise BenchmarkContractError(
             f"decode GQA split schedule schema mismatch ({'; '.join(details)}): {path}"
         )
-    if expected_variants is None or set(expected_variants) != set(GQA_SPLIT_VARIANT_ENV):
-        raise BenchmarkContractError(f"missing expected decode GQA split variants: {path}")
+    if expected_variants is None or set(expected_variants) != set(
+        GQA_SPLIT_VARIANT_ENV
+    ):
+        raise BenchmarkContractError(
+            f"missing expected decode GQA split variants: {path}"
+        )
     for shape, variant in expected_variants.items():
         if variant not in GQA_SPLIT_VARIANTS:
             raise BenchmarkContractError(
@@ -723,8 +934,8 @@ def _parse_gqa_split_schedule(
             )
 
     expected_shape_totals = {
-        "swa": 35 * decode_frames,
-        "global": 7 * decode_frames,
+        "swa": 35 * split_frames,
+        "global": 7 * split_frames,
     }
     variant_total = sum(
         values[f"{shape}_{variant}"]
@@ -741,7 +952,7 @@ def _parse_gqa_split_schedule(
             "decode GQA split legacy total does not equal per-shape/per-variant calls: "
             f"{path}"
         )
-    expected_legacy_total = 42 * decode_frames
+    expected_legacy_total = 42 * split_frames
     if values["legacy_total"] != expected_legacy_total:
         raise BenchmarkContractError(
             f"decode GQA split legacy total={values['legacy_total']}, "
@@ -830,9 +1041,13 @@ def _parse_stage_timing(
         return None
     for key in ("enabled", "supported", "complete"):
         if result[key] != 1:
-            raise BenchmarkContractError(f"Metal stage timing {key}={result[key]}, expected 1: {path}")
+            raise BenchmarkContractError(
+                f"Metal stage timing {key}={result[key]}, expected 1: {path}"
+            )
     if result["failures"] != 0:
-        raise BenchmarkContractError(f"Metal stage timing failures={result['failures']}: {path}")
+        raise BenchmarkContractError(
+            f"Metal stage timing failures={result['failures']}: {path}"
+        )
     expected_decode_frames = 0
     start = STAGE_TIMING_SAMPLING["decode_start"]
     if decode_frames > start:
@@ -840,7 +1055,10 @@ def _parse_stage_timing(
             STAGE_TIMING_SAMPLING["decode_max"],
             ((decode_frames - 1 - start) // STAGE_TIMING_SAMPLING["decode_stride"]) + 1,
         )
-    if result["prefill_frames"] != 1 or result["decode_frames"] != expected_decode_frames:
+    if (
+        result["prefill_frames"] != 1
+        or result["decode_frames"] != expected_decode_frames
+    ):
         raise BenchmarkContractError(
             "Metal stage timing frame selection mismatch: "
             f"prefill/decode={result['prefill_frames']}/{result['decode_frames']}, "
@@ -854,7 +1072,9 @@ def _parse_stage_timing(
     for phase in ("prefill", "decode"):
         gpu = result[f"{phase}_gpu"]
         if gpu <= 0:
-            raise BenchmarkContractError(f"Metal {phase} stage GPU time is non-positive: {path}")
+            raise BenchmarkContractError(
+                f"Metal {phase} stage GPU time is non-positive: {path}"
+            )
         attributed = sum(result[f"{phase}_{name}"] for name in STAGE_NAMES)
         if attributed != gpu:
             raise BenchmarkContractError(
@@ -873,30 +1093,41 @@ def parse_antfly_sample(
     expected_token_sha256: str | None,
     expected_prompt_sha256: str,
     route_profile: str,
+    model_topology: str,
     expected_q4_mmv_variant: str,
     expected_q4_mmv_workloads: dict[str, dict[str, str]] | None,
     expected_pair_mmv_variant: str,
     expected_pair_mm_variant: str,
     expected_metal_device: str,
     stage_timing: bool,
+    expected_split_min_kv: int,
     expected_gqa_split_variants: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     try:
         payload = json.loads(json_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise BenchmarkContractError(f"invalid Antfly JSON: {json_path}: {exc}") from exc
+        raise BenchmarkContractError(
+            f"invalid Antfly JSON: {json_path}: {exc}"
+        ) from exc
     log = log_path.read_text(errors="replace")
     if payload.get("backend") != "metal":
         raise BenchmarkContractError(f"Antfly did not report Metal: {json_path}")
-    if payload.get("tokens") != output_tokens or payload.get("finish_reason") != "length":
+    if (
+        payload.get("tokens") != output_tokens
+        or payload.get("finish_reason") != "length"
+    ):
         raise BenchmarkContractError(
             f"Antfly did not generate exactly {output_tokens} length-limited tokens: {json_path}"
         )
     if "speculative" not in payload or payload.get("speculative") is not None:
-        raise BenchmarkContractError(f"baseline A/B experiment unexpectedly used speculation: {json_path}")
+        raise BenchmarkContractError(
+            f"baseline A/B experiment unexpectedly used speculation: {json_path}"
+        )
     for key in ("draft_cuda", "draft_cuda_generate"):
         if payload.get(key) is not None:
-            raise BenchmarkContractError(f"baseline A/B experiment reported {key}: {json_path}")
+            raise BenchmarkContractError(
+                f"baseline A/B experiment reported {key}: {json_path}"
+            )
     if "generate-setup: live whole-model executor skipped" not in log:
         raise BenchmarkContractError(f"compiled generation marker missing: {log_path}")
     if "gen_debug: executePrefill whole-model fast path" not in log:
@@ -927,7 +1158,9 @@ def parse_antfly_sample(
         raise BenchmarkContractError(f"Antfly JSON/log token IDs differ: {json_path}")
 
     timing = _mapping(payload.get("timing_ms"), "Antfly timing", json_path)
-    total_ms = _positive_finite(float(timing.get("generate") or 0), "Antfly total", json_path)
+    total_ms = _positive_finite(
+        float(timing.get("generate") or 0), "Antfly total", json_path
+    )
     prefill_ms = _positive_finite(
         float(timing.get("prefill_inner") or 0), "Antfly prefill", json_path
     )
@@ -940,7 +1173,32 @@ def parse_antfly_sample(
             f"total={total_ms:.3f}ms: {json_path}"
         )
 
-    expected = _route_expectations(route_profile, output_tokens)
+    split_policy_match = _last_match(
+        log,
+        r"^metal_decode_gqa_split_policy:\s+min_kv=(\d+)\s+below_min_kv=(\d+)",
+        "decode GQA split floor policy",
+        log_path,
+    )
+    split_policy = {
+        "min_kv": int(split_policy_match.group(1)),
+        "below_min_kv": int(split_policy_match.group(2)),
+    }
+    if split_policy["min_kv"] == 0:
+        raise BenchmarkContractError(
+            f"decode GQA split min_kv must be positive: {log_path}"
+        )
+    if split_policy["min_kv"] != expected_split_min_kv:
+        raise BenchmarkContractError(
+            f"decode GQA split min_kv={split_policy['min_kv']}, "
+            f"expected {expected_split_min_kv}: {log_path}"
+        )
+    expected = _route_expectations(
+        route_profile,
+        output_tokens,
+        model_topology,
+        prompt_tokens=len(prompt_ids),
+        split_min_kv=split_policy["min_kv"],
+    )
     attention_match = _last_match(
         log,
         (
@@ -955,19 +1213,28 @@ def parse_antfly_sample(
         log_path,
     )
     attention_values = tuple(int(attention_match.group(index)) for index in range(1, 7))
-    expected_attention = (0, expected["attention"], 35, 7, 0, 42)
+    # The route topology is explicit provenance. E4B short-context profiles
+    # use 42 decode calls plus its 35/7 prefill split; E2B uses 35 decode calls
+    # plus a distinct 28/7 paged prefill. Do not infer this from the counters
+    # under test or from a model filename.
+    expected_attention = expected["attention_routes"]
     if attention_values != expected_attention:
         raise BenchmarkContractError(
             f"attention routes={attention_values}, expected {expected_attention}: {log_path}"
+        )
+    if split_policy["below_min_kv"] != expected["below_floor_calls"]:
+        raise BenchmarkContractError(
+            "decode GQA split below-floor calls="
+            f"{split_policy['below_min_kv']}, expected {expected['below_floor_calls']}: "
+            f"{log_path}"
         )
     gqa_split_schedule = _parse_gqa_split_schedule(
         log,
         log_path,
         required=route_profile == "gqa_split_schedule",
-        decode_frames=expected["decode_frames"],
+        split_frames=expected["split_frames"],
         expected_variants=expected_gqa_split_variants,
     )
-
     prepared_match = _last_match(
         log,
         r"^metal_prepared_frame:\s+fast_path=(\d+)\s+fallback=(\d+)",
@@ -982,12 +1249,22 @@ def parse_antfly_sample(
 
     memory_match = _last_match(
         log,
-        r"^metal_runtime_memory:.*\bframe_retained_mb=(\d+)",
+        r"^metal_runtime_memory:.*\btotal_mb=(\d+).*\bframe_retained_mb=(\d+)",
         "Metal runtime memory counters",
         log_path,
     )
-    if int(memory_match.group(1)) != 0:
-        raise BenchmarkContractError(f"compiled decoder retained a speculative frame: {log_path}")
+    runtime_total_mb = int(memory_match.group(1))
+    frame_retained_mb = int(memory_match.group(2))
+    if not 1 <= frame_retained_mb <= MAX_PIPELINED_FRAME_RETAINED_MB:
+        raise BenchmarkContractError(
+            f"pipelined frame retention={frame_retained_mb}MiB, expected 1.."
+            f"{MAX_PIPELINED_FRAME_RETAINED_MB}MiB: {log_path}"
+        )
+    if frame_retained_mb > runtime_total_mb:
+        raise BenchmarkContractError(
+            f"pipelined frame retention={frame_retained_mb}MiB exceeds runtime total="
+            f"{runtime_total_mb}MiB: {log_path}"
+        )
 
     q4_match = _last_match(
         log,
@@ -997,15 +1274,25 @@ def parse_antfly_sample(
     )
     q4_rows = tuple(int(q4_match.group(index)) for index in range(1, 5))
     pair_activation_dispatches = int(q4_match.group(5))
-    expected_q4_rows = (expected["q4_row_one"], 0, 0, expected["q4_row_65_plus"])
-    expected_pair_activation_dispatches = expected["decode_pairs"] + expected["prefill_pairs"]
-    if q4_rows != expected_q4_rows or pair_activation_dispatches != expected_pair_activation_dispatches:
+    expected_q4_rows = expected["q4_rows"]
+    expected_pair_activation_dispatches = (
+        expected["decode_pairs"] + expected["prefill_pairs"]
+    )
+    if (
+        q4_rows != expected_q4_rows
+        or pair_activation_dispatches != expected_pair_activation_dispatches
+    ):
         raise BenchmarkContractError(
             f"Q4 routes rows={q4_rows}, pair_activation_dispatches={pair_activation_dispatches}; expected "
             f"rows={expected_q4_rows}, pair_activation_dispatches={expected_pair_activation_dispatches}: {log_path}"
         )
-    if q4_rows[0] + 2 * expected["decode_pairs"] != expected["logical_decode_q4"]:
-        raise BenchmarkContractError(f"Q4 decode logical route invariant failed: {log_path}")
+    if (
+        expected["q4_decode_row_one"] + 2 * expected["decode_pairs"]
+        != expected["logical_decode_q4"]
+    ):
+        raise BenchmarkContractError(
+            f"Q4 decode logical route invariant failed: {log_path}"
+        )
 
     q4_policy_match = _last_match(
         log,
@@ -1021,12 +1308,22 @@ def parse_antfly_sample(
     q4_policy_values = tuple(int(q4_policy_match.group(index)) for index in range(1, 9))
     q4_variants = q4_policy_values[:4]
     if q4_policy_values[4] != 0:
-        raise BenchmarkContractError(f"Q4 MMV variant fallback={q4_policy_values[4]}: {log_path}")
+        raise BenchmarkContractError(
+            f"Q4 MMV variant fallback={q4_policy_values[4]}: {log_path}"
+        )
     variant_names = Q4_MMV_VARIANTS
     if expected_q4_mmv_variant not in variant_names:
-        raise BenchmarkContractError(f"unsupported expected Q4 MMV variant: {expected_q4_mmv_variant}")
+        raise BenchmarkContractError(
+            f"unsupported expected Q4 MMV variant: {expected_q4_mmv_variant}"
+        )
     expected_q4_variants = [0, 0, 0, 0]
-    if expected_q4_mmv_workloads is None:
+    if expected["q4_mmv_variants"] is not None:
+        if expected_q4_mmv_workloads is not None:
+            raise BenchmarkContractError(
+                f"Q4 workload overrides are not qualified for {model_topology.upper()}: {log_path}"
+            )
+        expected_q4_variants = list(expected["q4_mmv_variants"])
+    elif expected_q4_mmv_workloads is None:
         expected_q4_variants[variant_names.index(expected_q4_mmv_variant)] = q4_rows[0]
     else:
         workload_dispatches = {
@@ -1034,7 +1331,9 @@ def parse_antfly_sample(
             for workload, dispatches in Q4_MMV_WORKLOAD_DISPATCHES_PER_FRAME.items()
         }
         if set(expected_q4_mmv_workloads) != set(workload_dispatches):
-            raise BenchmarkContractError(f"invalid Q4 MMV workload contract: {log_path}")
+            raise BenchmarkContractError(
+                f"invalid Q4 MMV workload contract: {log_path}"
+            )
         for workload, dispatches in workload_dispatches.items():
             selected = expected_q4_mmv_workloads[workload]["selected"]
             if selected not in variant_names:
@@ -1055,54 +1354,113 @@ def parse_antfly_sample(
     pair_required = expected["decode_pairs"] > 0 or expected["prefill_pairs"] > 0
     pair_policy = _parse_pair_policy(log, log_path, pair_required)
     if pair_policy is not None:
-        if pair_policy["mmv_variant_fallbacks"] != 0 or pair_policy["mm_variant_fallbacks"] != 0:
-            raise BenchmarkContractError(f"Q4 pair activation route fallback: {log_path}")
+        if (
+            pair_policy["mmv_variant_fallbacks"] != 0
+            or pair_policy["mm_variant_fallbacks"] != 0
+        ):
+            raise BenchmarkContractError(
+                f"Q4 pair activation route fallback: {log_path}"
+            )
         pair_mmv_names = variant_names
         if expected_pair_mmv_variant not in pair_mmv_names:
             raise BenchmarkContractError(
                 f"unsupported expected pair MMV variant: {expected_pair_mmv_variant}"
             )
-        observed_pair_mmv = tuple(pair_policy[f"mmv_{name.replace('-', '_')}"] for name in pair_mmv_names)
+        observed_pair_mmv = tuple(
+            pair_policy[f"mmv_{name.replace('-', '_')}"] for name in pair_mmv_names
+        )
         expected_pair_mmv = [0, 0, 0, 0]
-        expected_pair_mmv[pair_mmv_names.index(expected_pair_mmv_variant)] = expected["decode_pairs"]
+        expected_pair_mmv[pair_mmv_names.index(expected_pair_mmv_variant)] = expected[
+            "decode_pairs"
+        ]
         if list(observed_pair_mmv) != expected_pair_mmv:
             raise BenchmarkContractError(
                 f"pair MMV variants={observed_pair_mmv}, expected {tuple(expected_pair_mmv)}: {log_path}"
             )
-        pair_mm_names = ("m32-n64-aligned", "m32-n64-tail", "m32-n32-aligned", "m32-n32-tail")
+        pair_mm_names = (
+            "m32-n64-aligned",
+            "m32-n64-tail",
+            "m32-n32-aligned",
+            "m32-n32-tail",
+        )
         if expected_pair_mm_variant not in pair_mm_names:
             raise BenchmarkContractError(
                 f"unsupported expected pair MM variant: {expected_pair_mm_variant}"
             )
-        observed_pair_mm = tuple(pair_policy[f"mm_{name.replace('-', '_')}"] for name in pair_mm_names)
+        observed_pair_mm = tuple(
+            pair_policy[f"mm_{name.replace('-', '_')}"] for name in pair_mm_names
+        )
         expected_pair_mm = [0, 0, 0, 0]
-        expected_pair_mm[pair_mm_names.index(expected_pair_mm_variant)] = expected["prefill_pairs"]
+        expected_pair_mm[pair_mm_names.index(expected_pair_mm_variant)] = expected[
+            "prefill_pairs"
+        ]
         if list(observed_pair_mm) != expected_pair_mm:
             raise BenchmarkContractError(
                 f"pair MM routes={observed_pair_mm}, expected {tuple(expected_pair_mm)}: {log_path}"
             )
-    if q4_rows[3] + 2 * expected["prefill_pairs"] != expected["logical_prefill_q4"]:
-        raise BenchmarkContractError(f"Q4 prefill logical route invariant failed: {log_path}")
+    observed_prefill_q4 = sum(q4_rows) - expected["q4_decode_row_one"]
+    if (
+        observed_prefill_q4 + 2 * expected["prefill_pairs"]
+        != expected["logical_prefill_q4"]
+    ):
+        raise BenchmarkContractError(
+            f"Q4 prefill logical route invariant failed: {log_path}"
+        )
 
-    q6_match = _last_match(
+    qk_match = _last_match(
         log,
-        r"^metal_q4_q6_k_dispatch:.*\bq6_linear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)",
-        "Q6_K route counters",
+        (
+            r"^metal_q4_q6_k_dispatch:.*\bq4_linear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)"
+            r".*\bq6_linear_reduce_rows=(\d+)/(\d+)/(\d+)/(\d+)"
+            r".*\blm_head_q4_q6_refine_dispatches=(\d+)"
+            r".*\blm_head_q4_resident_sampling_rejections=(\d+)"
+        ),
+        "Q4_K/Q6_K lm-head route counters",
         log_path,
     )
-    q6_rows = tuple(int(q6_match.group(index)) for index in range(1, 5))
-    if q6_rows != (output_tokens, 0, 0, 0):
+    q4_k_rows = tuple(int(qk_match.group(index)) for index in range(1, 5))
+    q6_rows = tuple(int(qk_match.group(index)) for index in range(5, 9))
+    refine_dispatches = int(qk_match.group(9))
+    resident_sampling_rejections = int(qk_match.group(10))
+    # The Q6_K lm_head runs once for prefill and once in each submitted
+    # pipelined decode frame. The compiled path submits N frames for N emitted
+    # tokens, so its cumulative tail census is N+1 even though the prepared
+    # frame census itself is exactly N.
+    repack_required = route_profile == "lm_head_repack"
+    expected_q4_k_rows = (output_tokens, 0, 0, 0) if repack_required else (0, 0, 0, 0)
+    expected_q6_rows = (1 if repack_required else output_tokens + 1, 0, 0, 0)
+    expected_refine_dispatches = output_tokens if repack_required else 0
+    if (
+        q4_k_rows != expected_q4_k_rows
+        or q6_rows != expected_q6_rows
+        or refine_dispatches != expected_refine_dispatches
+        or resident_sampling_rejections != 0
+    ):
         raise BenchmarkContractError(
-            f"Q6_K routes={q6_rows}, expected {(output_tokens, 0, 0, 0)}: {log_path}"
+            "lm-head Q4_K/Q6_K routes="
+            f"{q4_k_rows}/{q6_rows}/{refine_dispatches}/{resident_sampling_rejections}, expected "
+            f"{expected_q4_k_rows}/{expected_q6_rows}/{expected_refine_dispatches}/0: {log_path}"
+        )
+    repack_count = log.count("lm_head Q4_K repack:")
+    if repack_count != (1 if repack_required else 0):
+        raise BenchmarkContractError(
+            f"lm-head Q4_K repack count={repack_count}, expected "
+            f"{1 if repack_required else 0}: {log_path}"
         )
 
     runtime = _mapping(payload.get("runtime"), "runtime counters", json_path)
-    decoder = _mapping(payload.get("generation_decoder_runtime"), "decoder counters", json_path)
-    _exact_int(runtime, "decode_greedy_calls", expected["decode_frames"], "runtime", json_path)
+    decoder = _mapping(
+        payload.get("generation_decoder_runtime"), "decoder counters", json_path
+    )
+    # Token 1 is selected from prefill. The ordinary greedy-decode API is
+    # entered for the remaining N-1 tokens even though pipelining submits N
+    # prepared frames (the final frame is launched before the length stop).
+    decode_api_calls = max(output_tokens - 1, 0)
+    _exact_int(runtime, "decode_greedy_calls", decode_api_calls, "runtime", json_path)
     _exact_int(
         decoder,
         "forward_attempts",
-        expected["decode_frames"],
+        decode_api_calls,
         "generation_decoder_runtime",
         json_path,
     )
@@ -1123,16 +1481,26 @@ def parse_antfly_sample(
             f"{metal_device_registry_id!r}: {json_path}"
         )
     if metal.get("native_quant_null") is not False:
-        raise BenchmarkContractError(f"Metal native quant route unavailable: {json_path}")
-    operators = _mapping(metal.get("runtime_command_operators"), "operator counters", json_path)
+        raise BenchmarkContractError(
+            f"Metal native quant route unavailable: {json_path}"
+        )
+    operators = _mapping(
+        metal.get("runtime_command_operators"), "operator counters", json_path
+    )
     _exact_int(operators, "fallback", 0, "metal.runtime_command_operators", json_path)
-    fallbacks = _mapping(metal.get("frame_fallbacks"), "frame fallback counters", json_path)
+    fallbacks = _mapping(
+        metal.get("frame_fallbacks"), "frame fallback counters", json_path
+    )
     for key in ("decode_fallback", "prefill_plan_fail", "prefill_execute_fail"):
         _exact_int(fallbacks, key, 0, "metal.frame_fallbacks", json_path)
-    quant_plan = _mapping(metal.get("quant_kernel_plan"), "quant plan counters", json_path)
+    quant_plan = _mapping(
+        metal.get("quant_kernel_plan"), "quant plan counters", json_path
+    )
     for key in ("fast_path_misses", "unsupported_routes"):
         _exact_int(quant_plan, key, 0, "metal.quant_kernel_plan", json_path)
-    attention_json = _mapping(metal.get("attention_dispatch"), "attention counters", json_path)
+    attention_json = _mapping(
+        metal.get("attention_dispatch"), "attention counters", json_path
+    )
     for key, value in zip(
         (
             "paged_1x",
@@ -1146,9 +1514,45 @@ def parse_antfly_sample(
         strict=True,
     ):
         _exact_int(attention_json, key, value, "metal.attention_dispatch", json_path)
-    prepared_json = _mapping(metal.get("prepared_frame"), "prepared frame counters", json_path)
-    _exact_int(prepared_json, "fast_path", prepared[0], "metal.prepared_frame", json_path)
-    _exact_int(prepared_json, "fallback", prepared[1], "metal.prepared_frame", json_path)
+    split_policy_json = _mapping(
+        metal.get("decode_gqa_split_policy"), "decode GQA split floor policy", json_path
+    )
+    for key, value in split_policy.items():
+        _exact_int(
+            split_policy_json,
+            key,
+            value,
+            "metal.decode_gqa_split_policy",
+            json_path,
+        )
+    prepared_json = _mapping(
+        metal.get("prepared_frame"), "prepared frame counters", json_path
+    )
+    _exact_int(
+        prepared_json, "fast_path", prepared[0], "metal.prepared_frame", json_path
+    )
+    _exact_int(
+        prepared_json, "fallback", prepared[1], "metal.prepared_frame", json_path
+    )
+    refine_json = _mapping(
+        metal.get("lm_head_q4_q6_refine"),
+        "lm-head Q4_K/Q6_K refine counters",
+        json_path,
+    )
+    _exact_int(
+        refine_json,
+        "dispatches",
+        refine_dispatches,
+        "metal.lm_head_q4_q6_refine",
+        json_path,
+    )
+    _exact_int(
+        refine_json,
+        "resident_sampling_rejections",
+        resident_sampling_rejections,
+        "metal.lm_head_q4_q6_refine",
+        json_path,
+    )
 
     profile = _parse_stage_timing(
         log,
@@ -1157,7 +1561,9 @@ def parse_antfly_sample(
         expected["decode_frames"],
         metal,
     )
-    decode_tps = expected["decode_frames"] * 1000.0 / decode_ms
+    # The prefill result selects the first emitted token. Match llama.cpp's
+    # eval-run accounting by pricing only the remaining decode evaluations.
+    decode_tps = (output_tokens - 1) * 1000.0 / decode_ms
     return {
         "output_tokens": output_tokens,
         "prompt_tokens": len(prompt_ids),
@@ -1173,6 +1579,7 @@ def parse_antfly_sample(
         "routes": {
             "paged_1x": attention_values[0],
             "decode_gqa_split": attention_values[1],
+            "decode_gqa_split_policy": split_policy,
             **(
                 {"q4_mmv_workload_policy": q4_mmv_workload_policy}
                 if q4_mmv_workload_policy is not None
@@ -1195,8 +1602,13 @@ def parse_antfly_sample(
             "q4_mmv_variants": list(q4_variants),
             "q4_mmv_variant_fallbacks": q4_policy_values[4],
             "q4_pair_activation_policy": pair_policy,
+            "q4_k_linear_reduce_rows": list(q4_k_rows),
             "q6_linear_reduce_rows": list(q6_rows),
-            "frame_retained_mb": 0,
+            "lm_head_q4_q6_refine_dispatches": refine_dispatches,
+            "lm_head_q4_resident_sampling_rejections": resident_sampling_rejections,
+            "lm_head_q4_k_repack_count": repack_count,
+            "runtime_total_mb": runtime_total_mb,
+            "frame_retained_mb": frame_retained_mb,
         },
         "stage_timing_ns": profile,
         "exact_token_contract_passed": True,
@@ -1210,6 +1622,48 @@ def _verify_sha(value: Any, label: str, path: Path) -> str:
     return value
 
 
+def _sysctl(name: str) -> str:
+    try:
+        return subprocess.run(
+            ["sysctl", "-n", name], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+_NOMINAL_GB_S = {
+    "Apple M4 Max": 546.0,
+    "Apple M4 Pro": 273.0,
+    "Apple M4": 120.0,
+    "Apple M3 Max": 400.0,
+    "Apple M3 Pro": 150.0,
+    "Apple M3": 100.0,
+}
+
+
+def _nominal_bandwidth_gb_s(chip: str) -> float | None:
+    for prefix, gb_s in _NOMINAL_GB_S.items():
+        if chip.startswith(prefix):
+            return gb_s
+    return None
+
+
+def _thermal_speed_limit_pct() -> int | None:
+    try:
+        out = subprocess.run(
+            ["pmset", "-g", "therm"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if "CPU_Speed_Limit" in line:
+            try:
+                return int(line.split("=")[-1].strip())
+            except ValueError:
+                return None
+    return None
+
+
 def _load_metadata(root: Path) -> dict[str, Any]:
     path = root / "metadata.json"
     try:
@@ -1218,6 +1672,10 @@ def _load_metadata(root: Path) -> dict[str, Any]:
         raise BenchmarkContractError(f"invalid A/B metadata: {path}: {exc}") from exc
     if not isinstance(metadata, dict) or metadata.get("schema") != METADATA_SCHEMA:
         raise BenchmarkContractError(f"unsupported A/B metadata schema: {path}")
+    if metadata.get("decode_throughput_metric") != (
+        "(output_tokens - 1) / decode_inner_seconds"
+    ):
+        raise BenchmarkContractError(f"decode throughput metric was modified: {path}")
     for key in (
         "runner_sha256",
         "shared_parser_sha256",
@@ -1230,10 +1688,13 @@ def _load_metadata(root: Path) -> dict[str, Any]:
         "git_tracked_diff_sha256",
     ):
         _verify_sha(metadata.get(key), key, path)
-    if not isinstance(metadata.get("expected_metal_device"), str) or not metadata[
-        "expected_metal_device"
-    ].strip():
-        raise BenchmarkContractError(f"missing expected Metal device provenance: {path}")
+    if (
+        not isinstance(metadata.get("expected_metal_device"), str)
+        or not metadata["expected_metal_device"].strip()
+    ):
+        raise BenchmarkContractError(
+            f"missing expected Metal device provenance: {path}"
+        )
     current_sources = {
         "runner_sha256": _file_sha256(Path(__file__).resolve()),
         "shared_parser_sha256": _file_sha256(SHARED_PARSER),
@@ -1246,19 +1707,38 @@ def _load_metadata(root: Path) -> dict[str, Any]:
                 f"A/B provenance mismatch for {key}: recorded={metadata[key]}, current={current}: {path}"
             )
     prompt_path = root / "prompt.txt"
-    if not prompt_path.is_file() or _file_sha256(prompt_path) != metadata["prompt_sha256"]:
+    if (
+        not prompt_path.is_file()
+        or _file_sha256(prompt_path) != metadata["prompt_sha256"]
+    ):
         raise BenchmarkContractError(f"A/B prompt provenance mismatch: {prompt_path}")
     repo = Path(metadata["repo_root"])
     current_git = _git_provenance(repo)
-    for key in ("git_revision", "git_dirty", "git_status_sha256", "git_tracked_diff_sha256"):
+    for key in (
+        "git_revision",
+        "git_dirty",
+        "git_status_sha256",
+        "git_tracked_diff_sha256",
+    ):
         if metadata.get(key) != current_git[key]:
-            raise BenchmarkContractError(f"A/B git provenance changed for {key}: {path}")
+            raise BenchmarkContractError(
+                f"A/B git provenance changed for {key}: {path}"
+            )
     if metadata.get("mode") not in ("paired", "determinism", "stage"):
         raise BenchmarkContractError(f"invalid A/B mode: {path}")
     if metadata.get("baseline_route_profile") not in ROUTE_PROFILES:
         raise BenchmarkContractError(f"invalid baseline route profile: {path}")
     if metadata.get("candidate_route_profile") not in ROUTE_PROFILES:
         raise BenchmarkContractError(f"invalid candidate route profile: {path}")
+    if metadata.get("model_topology") not in MODEL_TOPOLOGIES:
+        raise BenchmarkContractError(f"invalid model topology: {path}")
+    if metadata["model_topology"] == "e2b":
+        for variant in ("baseline", "candidate"):
+            profile = metadata[f"{variant}_route_profile"]
+            if profile not in E2B_ROUTE_PROFILES:
+                raise BenchmarkContractError(
+                    f"route profile {profile} is not qualified for E2B topology: {path}"
+                )
     expected_isolation_contract = {
         "clear_inherited_prefixes": list(POLICY_ENV_PREFIXES),
         "reapply_only_explicit_maps": True,
@@ -1271,16 +1751,24 @@ def _load_metadata(root: Path) -> dict[str, Any]:
         },
     }
     if metadata.get("environment_isolation_contract") != expected_isolation_contract:
-        raise BenchmarkContractError(f"A/B environment isolation contract was modified: {path}")
+        raise BenchmarkContractError(
+            f"A/B environment isolation contract was modified: {path}"
+        )
     environments: dict[str, dict[str, str | None]] = {}
     for label in ("common", "baseline", "candidate"):
         raw = metadata.get(f"{label}_env")
         if not isinstance(raw, dict):
-            raise BenchmarkContractError(f"missing {label} environment provenance: {path}")
+            raise BenchmarkContractError(
+                f"missing {label} environment provenance: {path}"
+            )
         rendered: list[str] = []
         for name, value in raw.items():
-            if not isinstance(name, str) or (value is not None and not isinstance(value, str)):
-                raise BenchmarkContractError(f"invalid {label} environment provenance: {path}")
+            if not isinstance(name, str) or (
+                value is not None and not isinstance(value, str)
+            ):
+                raise BenchmarkContractError(
+                    f"invalid {label} environment provenance: {path}"
+                )
             rendered.append(name if value is None else f"{name}={value}")
         environments[label] = _parse_env_entries(rendered, label)
     _validate_variant_environments(
@@ -1323,10 +1811,16 @@ def _load_metadata(root: Path) -> dict[str, Any]:
         "variant_environments": GQA_SPLIT_VARIANT_ENV,
         "variants": list(GQA_SPLIT_VARIANTS),
         "default_variant": "s32",
+        "floor_environment": GQA_SPLIT_MIN_KV_ENV,
+        "default_floor_by_topology": {"e2b": 192, "e4b": 32},
+        "floor_log_prefix": "metal_decode_gqa_split_policy:",
+        "floor_json_path": "metal.decode_gqa_split_policy",
         "final_snapshot_wins": True,
     }
     if gqa_contract != expected_gqa_contract:
-        raise BenchmarkContractError(f"GQA split schedule contract was modified: {path}")
+        raise BenchmarkContractError(
+            f"GQA split schedule contract was modified: {path}"
+        )
     expected_q4_contract = {
         "log_prefix": "metal-q4-0-mmv",
         "trace_environment": f"{Q4_MMV_TRACE_ENV}=1",
@@ -1338,10 +1832,17 @@ def _load_metadata(root: Path) -> dict[str, Any]:
     if metadata.get("q4_mmv_workload_contract") != expected_q4_contract:
         raise BenchmarkContractError(f"Q4 MMV workload contract was modified: {path}")
     stage_contract = metadata.get("stage_timing_contract")
-    if not isinstance(stage_contract, dict) or stage_contract.get("sampling") != STAGE_TIMING_SAMPLING:
-        raise BenchmarkContractError(f"stage timing sampling contract was modified: {path}")
+    if (
+        not isinstance(stage_contract, dict)
+        or stage_contract.get("sampling") != STAGE_TIMING_SAMPLING
+    ):
+        raise BenchmarkContractError(
+            f"stage timing sampling contract was modified: {path}"
+        )
     if stage_contract.get("scope") != STAGE_TIMING_SCOPE:
-        raise BenchmarkContractError(f"stage timing scope contract was modified: {path}")
+        raise BenchmarkContractError(
+            f"stage timing scope contract was modified: {path}"
+        )
     plan = _invocation_plan(
         metadata["mode"],
         metadata["warmups"],
@@ -1356,14 +1857,19 @@ def _load_metadata(root: Path) -> dict[str, Any]:
 
 
 def _validate_artifact_set(root: Path, invocations: list[dict[str, Any]]) -> None:
-    expected_json = {"metadata.json", *(f"{item['label']}.json" for item in invocations)}
+    expected_json = {
+        "metadata.json",
+        *(f"{item['label']}.json" for item in invocations),
+    }
     allowed_json = expected_json | {"summary.json"}
     expected_logs = {f"{item['label']}.log" for item in invocations}
     observed_json = {path.name for path in root.glob("*.json")}
     observed_logs = {path.name for path in root.glob("*.log")}
     if not expected_json <= observed_json:
         missing = sorted(expected_json - observed_json)
-        raise BenchmarkContractError(f"missing A/B JSON artifacts: {', '.join(missing)}")
+        raise BenchmarkContractError(
+            f"missing A/B JSON artifacts: {', '.join(missing)}"
+        )
     if observed_json - allowed_json:
         raise BenchmarkContractError(
             f"unexpected A/B JSON artifacts: {', '.join(sorted(observed_json - allowed_json))}"
@@ -1376,7 +1882,9 @@ def _validate_artifact_set(root: Path, invocations: list[dict[str, Any]]) -> Non
         )
 
 
-def _metric_stats(samples: list[dict[str, Any]], variant: str, field: str) -> dict[str, float]:
+def _metric_stats(
+    samples: list[dict[str, Any]], variant: str, field: str
+) -> dict[str, float]:
     return stats(sample[field] for sample in samples if sample["variant"] == variant)
 
 
@@ -1404,6 +1912,7 @@ def build_summary(root: Path) -> dict[str, Any]:
             expected_token_sha256=expected_sha,
             expected_prompt_sha256=metadata["expected_prompt_token_ids_sha256"],
             route_profile=route_profile,
+            model_topology=metadata["model_topology"],
             expected_q4_mmv_variant=metadata["expected_q4_mmv_variant"],
             expected_q4_mmv_workloads=(
                 metadata[f"{variant}_q4_mmv_workloads"]
@@ -1414,6 +1923,10 @@ def build_summary(root: Path) -> dict[str, Any]:
             expected_pair_mm_variant=metadata["expected_pair_mm_variant"],
             expected_metal_device=metadata["expected_metal_device"],
             stage_timing=invocation["stage_timing"],
+            expected_split_min_kv=int(
+                metadata[f"effective_{variant}_env"].get(GQA_SPLIT_MIN_KV_ENV)
+                or _default_gqa_split_min_kv(metadata["model_topology"])
+            ),
             expected_gqa_split_variants=metadata[f"{variant}_gqa_split_variants"],
         )
         if invocation["kind"] == "warmup":
@@ -1452,7 +1965,9 @@ def build_summary(root: Path) -> dict[str, Any]:
         "output_tokens": metadata["output_tokens"],
         "prompt_tokens": metadata["expected_prompt_tokens"],
         "expected_token_ids_sha256": metadata["expected_token_ids_sha256"],
-        "expected_prompt_token_ids_sha256": metadata["expected_prompt_token_ids_sha256"],
+        "expected_prompt_token_ids_sha256": metadata[
+            "expected_prompt_token_ids_sha256"
+        ],
         "metal_device_registry_id": metal_device_registry_id,
         "warmup_token_ids_sha256": warmup_reference,
         "performance_samples": performance,
@@ -1464,7 +1979,9 @@ def build_summary(root: Path) -> dict[str, Any]:
         digests = {sample["token_ids_sha256"] for sample in determinism}
         prompt_digests = {sample["prompt_token_ids_sha256"] for sample in determinism}
         checks["determinism_runs"] = len(determinism) == metadata["runs"]
-        checks["deterministic_output"] = digests == {metadata["expected_token_ids_sha256"]}
+        checks["deterministic_output"] = digests == {
+            metadata["expected_token_ids_sha256"]
+        }
         checks["deterministic_prompt"] = prompt_digests == {
             metadata["expected_prompt_token_ids_sha256"]
         }
@@ -1481,7 +1998,9 @@ def build_summary(root: Path) -> dict[str, Any]:
         )
         return result
     if metadata["mode"] == "stage":
-        checks["stage_timing_runs"] = len(stage_samples) == metadata["stage_timing_runs"]
+        checks["stage_timing_runs"] = (
+            len(stage_samples) == metadata["stage_timing_runs"]
+        )
         checks["no_performance_samples"] = not performance
         if not all(checks.values()):
             failures.append("stage-only profiling contract failed")
@@ -1500,9 +2019,12 @@ def build_summary(root: Path) -> dict[str, Any]:
             {
                 "pair": index,
                 "execution_order": list(_variant_order(index)),
-                "candidate_total_latency_ratio": candidate["total_ms"] / baseline["total_ms"],
-                "candidate_prefill_latency_ratio": candidate["prefill_ms"] / baseline["prefill_ms"],
-                "candidate_decode_latency_ratio": candidate["decode_ms"] / baseline["decode_ms"],
+                "candidate_total_latency_ratio": candidate["total_ms"]
+                / baseline["total_ms"],
+                "candidate_prefill_latency_ratio": candidate["prefill_ms"]
+                / baseline["prefill_ms"],
+                "candidate_decode_latency_ratio": candidate["decode_ms"]
+                / baseline["decode_ms"],
                 "candidate_decode_throughput_ratio": candidate["decode_tok_s"]
                 / baseline["decode_tok_s"],
             }
@@ -1529,7 +2051,8 @@ def build_summary(root: Path) -> dict[str, Any]:
     cv_violations = {
         name: value["cv"]
         for name, value in metrics.items()
-        if not name.endswith("decode_tok_s") and value["cv"] > metadata["thresholds"]["max_cv"]
+        if not name.endswith("decode_tok_s")
+        and value["cv"] > metadata["thresholds"]["max_cv"]
     }
     target_field = {
         "total": "candidate_total_latency_ratio",
@@ -1545,7 +2068,9 @@ def build_summary(root: Path) -> dict[str, Any]:
         <= thresholds["max_prefill_latency_ratio"],
         "decode_latency": paired_ratios["candidate_decode_latency_ratio"]["median"]
         <= thresholds["max_decode_latency_ratio"],
-        "decode_throughput": paired_ratios["candidate_decode_throughput_ratio"]["median"]
+        "decode_throughput": paired_ratios["candidate_decode_throughput_ratio"][
+            "median"
+        ]
         >= thresholds["min_decode_throughput_ratio"],
         "target_wins": target_wins >= thresholds["min_target_wins"],
         "cv": not cv_violations,
@@ -1637,37 +2162,61 @@ def _run_invocation(
 
 
 def _validate_run_args(args: argparse.Namespace) -> None:
-    for name in ("runs", "output_tokens", "expected_prompt_tokens", "warmup_output_tokens"):
+    for name in (
+        "runs",
+        "output_tokens",
+        "expected_prompt_tokens",
+        "warmup_output_tokens",
+    ):
         if getattr(args, name) <= 0:
             raise BenchmarkContractError(f"--{name.replace('_', '-')} must be positive")
     if args.output_tokens < 2 or args.warmup_output_tokens < 2:
-        raise BenchmarkContractError("output and warmup token counts must be at least two")
+        raise BenchmarkContractError(
+            "output and warmup token counts must be at least two"
+        )
     for name in ("warmups", "stage_timing_runs", "cooldown_seconds"):
         if getattr(args, name) < 0:
-            raise BenchmarkContractError(f"--{name.replace('_', '-')} must be non-negative")
+            raise BenchmarkContractError(
+                f"--{name.replace('_', '-')} must be non-negative"
+            )
     if args.mode == "determinism":
         if args.runs < 3:
-            raise BenchmarkContractError("determinism mode requires at least three runs")
+            raise BenchmarkContractError(
+                "determinism mode requires at least three runs"
+            )
         if args.stage_timing_runs != 0:
-            raise BenchmarkContractError("determinism mode does not accept stage-timing runs")
+            raise BenchmarkContractError(
+                "determinism mode does not accept stage-timing runs"
+            )
     if args.mode == "stage":
         if args.stage_timing_runs <= 0:
             raise BenchmarkContractError("stage mode requires --stage-timing-runs > 0")
-    if args.stage_timing_runs > 0 and args.output_tokens <= STAGE_TIMING_SAMPLING["decode_start"]:
+    if (
+        args.stage_timing_runs > 0
+        and args.output_tokens <= STAGE_TIMING_SAMPLING["decode_start"]
+    ):
         raise BenchmarkContractError(
             "stage timing requires enough output tokens to sample at least one decode frame"
         )
     if args.mode == "paired" and (args.runs < 2 or args.runs % 2 != 0):
-        raise BenchmarkContractError("paired mode requires a positive even number of pairs")
+        raise BenchmarkContractError(
+            "paired mode requires a positive even number of pairs"
+        )
     for name in ("expected_token_ids_sha256", "expected_prompt_token_ids_sha256"):
         value = getattr(args, name).lower()
         if _HEX_SHA256.fullmatch(value) is None:
-            raise BenchmarkContractError(f"--{name.replace('_', '-')} must be a SHA-256")
+            raise BenchmarkContractError(
+                f"--{name.replace('_', '-')} must be a SHA-256"
+            )
         setattr(args, name, value)
     if args.expected_warmup_token_ids_sha256:
-        args.expected_warmup_token_ids_sha256 = args.expected_warmup_token_ids_sha256.lower()
+        args.expected_warmup_token_ids_sha256 = (
+            args.expected_warmup_token_ids_sha256.lower()
+        )
         if _HEX_SHA256.fullmatch(args.expected_warmup_token_ids_sha256) is None:
-            raise BenchmarkContractError("--expected-warmup-token-ids-sha256 must be a SHA-256")
+            raise BenchmarkContractError(
+                "--expected-warmup-token-ids-sha256 must be a SHA-256"
+            )
     if not (0 < args.max_cv < 1):
         raise BenchmarkContractError("--max-cv must be between zero and one")
     for name in (
@@ -1677,9 +2226,20 @@ def _validate_run_args(args: argparse.Namespace) -> None:
         "min_decode_throughput_ratio",
     ):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
-            raise BenchmarkContractError(f"--{name.replace('_', '-')} must be positive and finite")
+            raise BenchmarkContractError(
+                f"--{name.replace('_', '-')} must be positive and finite"
+            )
     if args.mode == "paired" and not 0 <= args.min_target_wins <= args.runs:
-        raise BenchmarkContractError("--min-target-wins must be between zero and --runs")
+        raise BenchmarkContractError(
+            "--min-target-wins must be between zero and --runs"
+        )
+    if args.model_topology == "e2b":
+        for label in ("baseline", "candidate"):
+            profile = getattr(args, f"{label}_route_profile")
+            if profile not in E2B_ROUTE_PROFILES:
+                raise BenchmarkContractError(
+                    f"--{label}-route-profile {profile} is not qualified for E2B topology"
+                )
 
 
 def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
@@ -1693,7 +2253,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise BenchmarkContractError("--out-dir must be outside the repository")
     if root.exists() and any(root.iterdir()):
-        raise BenchmarkContractError(f"--out-dir must not already contain files: {root}")
+        raise BenchmarkContractError(
+            f"--out-dir must not already contain files: {root}"
+        )
 
     model = args.model.resolve()
     if not model.exists():
@@ -1704,7 +2266,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         raise BenchmarkContractError(f"Antfly binary is not executable: {binary}")
     common = _merge_env_json(args.common_env, args.common_env_json, "common")
     baseline = _merge_env_json(args.baseline_env, args.baseline_env_json, "baseline")
-    candidate = _merge_env_json(args.candidate_env, args.candidate_env_json, "candidate")
+    candidate = _merge_env_json(
+        args.candidate_env, args.candidate_env_json, "candidate"
+    )
     _validate_variant_environments(
         common,
         baseline,
@@ -1712,7 +2276,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         args.baseline_route_profile,
         args.candidate_route_profile,
     )
-    prompt = args.prompt if args.prompt is not None else _default_prompt(args.prompt_repeat)
+    prompt = (
+        args.prompt if args.prompt is not None else _default_prompt(args.prompt_repeat)
+    )
     plan = _invocation_plan(
         args.mode,
         args.warmups,
@@ -1732,6 +2298,15 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "shared_parser_sha256": _file_sha256(SHARED_PARSER),
         "host": platform.platform(),
         "machine": platform.machine(),
+        "model_topology": args.model_topology,
+        # Machine-identity + thermal ledger (GEMMA4_PERF_PLAN.md M0.4): the
+        # roofline differs 2.3x between base M4 (120 GB/s) and M4 Pro
+        # (273 GB/s); summaries from different chips must never be compared.
+        "chip": _sysctl("machdep.cpu.brand_string"),
+        "hw_model": _sysctl("hw.model"),
+        "memsize_bytes": _sysctl("hw.memsize"),
+        "nominal_gb_s": _nominal_bandwidth_gb_s(_sysctl("machdep.cpu.brand_string")),
+        "thermal_speed_limit_pct_start": _thermal_speed_limit_pct(),
         "expected_metal_device": args.expected_metal_device,
         "model": str(model),
         "gguf": str(gguf),
@@ -1743,10 +2318,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "expected_prompt_tokens": args.expected_prompt_tokens,
         "expected_prompt_token_ids_sha256": args.expected_prompt_token_ids_sha256,
         "output_tokens": args.output_tokens,
+        "decode_throughput_metric": "(output_tokens - 1) / decode_inner_seconds",
         "expected_token_ids_sha256": args.expected_token_ids_sha256,
         "warmups": args.warmups,
         "warmup_output_tokens": args.warmup_output_tokens,
-        "expected_warmup_token_ids_sha256": args.expected_warmup_token_ids_sha256 or None,
+        "expected_warmup_token_ids_sha256": args.expected_warmup_token_ids_sha256
+        or None,
         "runs": args.runs,
         "stage_timing_runs": args.stage_timing_runs,
         "cooldown_seconds": args.cooldown_seconds,
@@ -1757,8 +2334,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "candidate_route_profile": args.candidate_route_profile,
         "baseline_gqa_split_variants": _expected_gqa_split_variants(common, baseline),
         "candidate_gqa_split_variants": _expected_gqa_split_variants(common, candidate),
-        "baseline_q4_mmv_workloads": _expected_q4_mmv_workload_variants(common, baseline),
-        "candidate_q4_mmv_workloads": _expected_q4_mmv_workload_variants(common, candidate),
+        "baseline_q4_mmv_workloads": _expected_q4_mmv_workload_variants(
+            common, baseline
+        ),
+        "candidate_q4_mmv_workloads": _expected_q4_mmv_workload_variants(
+            common, candidate
+        ),
         "expected_q4_mmv_variant": args.expected_q4_mmv_variant,
         "expected_pair_mmv_variant": args.expected_pair_mmv_variant,
         "expected_pair_mm_variant": args.expected_pair_mm_variant,
@@ -1799,6 +2380,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             "variant_environments": GQA_SPLIT_VARIANT_ENV,
             "variants": list(GQA_SPLIT_VARIANTS),
             "default_variant": "s32",
+            "floor_environment": GQA_SPLIT_MIN_KV_ENV,
+            "default_floor_by_topology": {"e2b": 192, "e4b": 32},
+            "floor_log_prefix": "metal_decode_gqa_split_policy:",
+            "floor_json_path": "metal.decode_gqa_split_policy",
             "final_snapshot_wins": True,
         },
         "q4_mmv_workload_contract": {
@@ -1849,11 +2434,17 @@ def _positive_env_int(name: str, default: int, *, allow_zero: bool = False) -> i
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    run = subparsers.add_parser("run", help="run fresh-process A/B or determinism samples")
+    run = subparsers.add_parser(
+        "run", help="run fresh-process A/B or determinism samples"
+    )
     run.add_argument("--out-dir", type=Path, required=True)
     run.add_argument("--experiment-id", required=True)
-    run.add_argument("--mode", choices=("paired", "determinism", "stage"), default="paired")
-    run.add_argument("--target-phase", choices=("total", "prefill", "decode"), default="decode")
+    run.add_argument(
+        "--mode", choices=("paired", "determinism", "stage"), default="paired"
+    )
+    run.add_argument(
+        "--target-phase", choices=("total", "prefill", "decode"), default="decode"
+    )
     run.add_argument("--model", type=Path, required=True)
     run.add_argument("--gguf", type=Path)
     run.add_argument("--antfly-bin", type=Path, required=True)
@@ -1867,9 +2458,7 @@ def parse_args() -> argparse.Namespace:
         default=_positive_env_int("OUTPUT_TOKENS", 128),
     )
     run.add_argument("--expected-token-ids-sha256", required=True)
-    run.add_argument(
-        "--runs", type=int, default=_positive_env_int("RUNS", 6)
-    )
+    run.add_argument("--runs", type=int, default=_positive_env_int("RUNS", 6))
     run.add_argument(
         "--warmups", type=int, default=_positive_env_int("WARMUPS", 1, allow_zero=True)
     )
@@ -1890,10 +2479,15 @@ def parse_args() -> argparse.Namespace:
         default=_positive_env_int("COOLDOWN_SECONDS", 15, allow_zero=True),
     )
     run.add_argument("--cache-dtype", default="f16")
+    run.add_argument("--model-topology", choices=MODEL_TOPOLOGIES, default="e4b")
     run.add_argument("--baseline-name", default="baseline")
     run.add_argument("--candidate-name", default="candidate")
-    run.add_argument("--baseline-route-profile", choices=ROUTE_PROFILES, default="split_ffn")
-    run.add_argument("--candidate-route-profile", choices=ROUTE_PROFILES, default="split_ffn")
+    run.add_argument(
+        "--baseline-route-profile", choices=ROUTE_PROFILES, default="split_ffn"
+    )
+    run.add_argument(
+        "--candidate-route-profile", choices=ROUTE_PROFILES, default="split_ffn"
+    )
     run.add_argument("--expected-q4-mmv-variant", default="nr4-nsg2")
     run.add_argument("--expected-pair-mmv-variant", default="nr4-nsg2")
     run.add_argument("--expected-pair-mm-variant", default="m32-n64-tail")
@@ -1901,8 +2495,12 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--baseline-env", action="append", default=[])
     run.add_argument("--candidate-env", action="append", default=[])
     run.add_argument("--common-env-json", default=os.environ.get("COMMON_ENV_JSON", ""))
-    run.add_argument("--baseline-env-json", default=os.environ.get("BASELINE_ENV_JSON", ""))
-    run.add_argument("--candidate-env-json", default=os.environ.get("CANDIDATE_ENV_JSON", ""))
+    run.add_argument(
+        "--baseline-env-json", default=os.environ.get("BASELINE_ENV_JSON", "")
+    )
+    run.add_argument(
+        "--candidate-env-json", default=os.environ.get("CANDIDATE_ENV_JSON", "")
+    )
     run.add_argument("--expected-metal-device", default="Apple M4")
     run.add_argument("--max-total-latency-ratio", type=float, default=0.995)
     run.add_argument("--max-prefill-latency-ratio", type=float, default=1.005)
@@ -1911,7 +2509,9 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--min-target-wins", type=int, default=5)
     run.add_argument("--max-cv", type=float, default=0.03)
 
-    summarize = subparsers.add_parser("summarize", help="revalidate and summarize raw artifacts")
+    summarize = subparsers.add_parser(
+        "summarize", help="revalidate and summarize raw artifacts"
+    )
     summarize.add_argument("--out-dir", type=Path, required=True)
     return parser.parse_args()
 

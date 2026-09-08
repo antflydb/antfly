@@ -5,18 +5,34 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import sys
 from pathlib import Path
 
 
-ARCHIVES = {
-    "darwin_arm64": ("Darwin", "arm64"),
-    "linux_arm64": ("Linux", "arm64"),
-    "linux_x86_64": ("Linux", "x86_64"),
-}
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "release"))
+from release_platforms import load_policy  # noqa: E402
 
 
-def archive_name(version: str, os_name: str, arch: str) -> str:
-    return f"antfly_{version}_{os_name}_{arch}.tar.gz"
+def homebrew_archives() -> dict[str, tuple[str, str, str | None]]:
+    result: dict[str, tuple[str, str, str | None]] = {}
+    for platform in load_policy()["platforms"]:
+        if "homebrew" not in platform["consumers"]:
+            continue
+        suffix = platform["archive_suffix"].removeprefix("_") or None
+        key = f"{platform['archive_os'].lower()}_{platform['archive_arch']}"
+        result[key] = (platform["archive_os"], platform["archive_arch"], suffix)
+    expected = {"darwin_arm64", "linux_arm64", "linux_x86_64"}
+    if set(result) != expected:
+        raise SystemExit(
+            f"Homebrew platform policy mismatch: expected {sorted(expected)}, got {sorted(result)}"
+        )
+    return result
+
+
+def archive_name(version: str, os_name: str, arch: str, variant: str | None) -> str:
+    suffix = f"_{variant}" if variant else ""
+    return f"antfly_{version}_{os_name}_{arch}{suffix}.tar.gz"
 
 
 def sha256(path: Path) -> str:
@@ -36,8 +52,8 @@ def main() -> int:
     args = parser.parse_args()
 
     values: dict[str, str] = {}
-    for key, (os_name, arch) in ARCHIVES.items():
-        name = archive_name(args.version, os_name, arch)
+    for key, (os_name, arch, variant) in homebrew_archives().items():
+        name = archive_name(args.version, os_name, arch, variant)
         path = args.archive_dir / name
         if not path.exists():
             raise SystemExit(f"missing archive for Homebrew formula: {path}")

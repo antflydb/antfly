@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TransactionConflictRetryScope(str, Enum):
+class TransactionConflictRetryScope(StrEnum):
     DOC_IDENTITY = "doc_identity"
     PARTICIPANT = "participant"
     SESSION = "session"

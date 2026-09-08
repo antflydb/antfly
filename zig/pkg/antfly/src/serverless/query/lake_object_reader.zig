@@ -15,6 +15,9 @@
 //! Object-storage backed range reader for lake scans.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
+const Crc32c = @import("antfly_hash").Crc32c;
+const Crc64Nvme = @import("antfly_hash").Crc64Nvme;
 const lake_range_io = @import("lake_range_io.zig");
 const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
 const object_storage = @import("../../storage/object_storage.zig");
@@ -135,22 +138,15 @@ fn validatePlannedObjectChecksum(
     switch (checksum.algorithm) {
         .crc32_base64 => {
             var digest: [4]u8 = undefined;
-            std.mem.writeInt(u32, &digest, std.hash.crc.Crc32.hash(body), .big);
+            std.mem.writeInt(u32, &digest, Crc32.hash(body), .big);
             try validateBase64Digest(checksum.value, &digest);
         },
         .crc32c_base64 => {
             var digest: [4]u8 = undefined;
-            std.mem.writeInt(u32, &digest, std.hash.crc.Crc32Iscsi.hash(body), .big);
+            std.mem.writeInt(u32, &digest, Crc32c.hash(body), .big);
             try validateBase64Digest(checksum.value, &digest);
         },
         .crc64nvme_base64 => {
-            const Crc64Nvme = std.hash.crc.Crc(u64, .{
-                .polynomial = 0xad93d23594c93659,
-                .initial = 0xffffffffffffffff,
-                .reflect_input = true,
-                .reflect_output = true,
-                .xor_output = 0xffffffffffffffff,
-            });
             var digest: [8]u8 = undefined;
             std.mem.writeInt(u64, &digest, Crc64Nvme.hash(body), .big);
             try validateBase64Digest(checksum.value, &digest);
@@ -309,10 +305,10 @@ test "object storage range reader validates returned planned object metadata" {
         }
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
-        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+        fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
-        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn makeBucket(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !void {}
         fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
             return error.UnsupportedOperation;
         }
@@ -413,10 +409,10 @@ test "lake object storage range reader validates full object checksums" {
         }
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
-        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+        fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
-        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn makeBucket(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !void {}
         fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
             return error.UnsupportedOperation;
         }
@@ -494,18 +490,29 @@ test "lake object storage range reader validates full object checksums" {
     var mismatched_reader = ObjectStorageRangeReader.init(mismatched.client());
     try std.testing.expectError(error.PreconditionFailed, mismatched_reader.parquetReader().readPlannedAlloc(alloc, full_read));
 
-    var crc32c_digest: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc32c_digest, std.hash.crc.Crc32Iscsi.hash("0123456789"), .big);
-    var crc32c_encoded: [std.base64.standard.Encoder.calcSize(crc32c_digest.len)]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&crc32c_encoded, &crc32c_digest);
-    var gcs_crc32c = ChecksumObjectStorage{ .checksum = .{
-        .algorithm = .crc32c_base64,
-        .value = &crc32c_encoded,
-    } };
-    var gcs_crc32c_reader = ObjectStorageRangeReader.init(gcs_crc32c.client());
-    const gcs_bytes = try gcs_crc32c_reader.parquetReader().readPlannedAlloc(alloc, full_read);
-    defer alloc.free(gcs_bytes);
-    try std.testing.expectEqualStrings("0123456789", gcs_bytes);
+    // Fixed, independently generated checksums for the full body "0123456789".
+    // This tests provider byte order/base64 framing as well as all three CRC variants.
+    const crc_cases = [_]struct { algorithm: object_storage.ObjectChecksumAlgorithm, value: []const u8 }{
+        .{ .algorithm = .crc32_base64, .value = "poTHxg==" },
+        .{ .algorithm = .crc32c_base64, .value = "KAwGng==" },
+        .{ .algorithm = .crc64nvme_base64, .value = "Ffmx7kz9nB0=" },
+    };
+    for (crc_cases) |case| {
+        var provider = ChecksumObjectStorage{ .checksum = .{
+            .algorithm = case.algorithm,
+            .value = case.value,
+        } };
+        var reader = ObjectStorageRangeReader.init(provider.client());
+        const checked = try reader.parquetReader().readPlannedAlloc(alloc, full_read);
+        defer alloc.free(checked);
+        try std.testing.expectEqualStrings("0123456789", checked);
+        provider.checksum.?.value = if (case.algorithm == .crc64nvme_base64) "AAAAAAAAAAA=" else "AAAAAA==";
+        try std.testing.expectError(error.PreconditionFailed, reader.parquetReader().readPlannedAlloc(alloc, full_read));
+        // An object-wide CRC cannot validate a range of that object.
+        const partial = try reader.parquetReader().readPlannedAlloc(alloc, partial_read);
+        defer alloc.free(partial);
+        try std.testing.expectEqualStrings("2345", partial);
+    }
 
     var composite = ChecksumObjectStorage{ .checksum = .{
         .algorithm = .sha256_base64,
@@ -574,10 +581,10 @@ test "object storage range reader retries transient planned reads only" {
         }
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
-        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+        fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
-        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn makeBucket(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !void {}
         fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
             return error.UnsupportedOperation;
         }
@@ -671,10 +678,10 @@ test "object storage range reader does not retry stale object identity" {
         }
 
         fn deinit(_: Allocator, _: *anyopaque) void {}
-        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+        fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
-        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn makeBucket(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !void {}
         fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
             return error.UnsupportedOperation;
         }

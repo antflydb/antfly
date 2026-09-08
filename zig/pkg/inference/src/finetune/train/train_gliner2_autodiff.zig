@@ -795,6 +795,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
         else => {},
     };
     defer switch (selected_backend) {
+        .native => native_backend.deinit(),
         .metal => if (comptime build_options.enable_metal) metal_backend.deinit(),
         .cuda => if (comptime build_options.enable_cuda) cuda_backend.deinit(),
         else => {},

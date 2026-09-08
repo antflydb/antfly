@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IndexSourceReadinessReason(str, Enum):
+class IndexSourceReadinessReason(StrEnum):
     ENRICHMENT_FAILURE = "enrichment_failure"
     INDEX_FAILED = "index_failed"
     PUBLICATION = "publication"

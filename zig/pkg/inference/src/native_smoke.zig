@@ -839,7 +839,7 @@ fn printGgufSummary(
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--draft-model path] [--inspect-only] [--no-chat-template]
+        \\usage: antfly inference smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|cuda|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--draft-model path] [--inspect-only] [--no-chat-template]
         \\  Loads a native GGUF/SafeTensors model, prints GGUF tensor coverage, and runs one native generation pass.
         \\  With --draft-model, prints Gemma4 MTP target/assistant compatibility metadata.
         \\

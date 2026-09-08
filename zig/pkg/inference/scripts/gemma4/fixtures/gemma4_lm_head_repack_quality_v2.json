@@ -1,0 +1,87 @@
+{
+  "schema": "antfly.gemma4_lm_head_repack_quality_suite.v2",
+  "description": "Short continuations for live Metal LM-head distribution, teacher-forced perplexity, and production chat-template qualification.",
+  "max_continuation_tokens_per_case": 8,
+  "cases": [
+    {
+      "id": "fact_france",
+      "category": "factual",
+      "prefix": "The capital of France is\n",
+      "continuation": "Paris, a major European city."
+    },
+    {
+      "id": "arithmetic_product",
+      "category": "arithmetic",
+      "prefix": "Compute 17 * 23. The exact result is\n",
+      "continuation": "391."
+    },
+    {
+      "id": "deduction_whale",
+      "category": "reasoning",
+      "prefix": "All mammals are warm-blooded. Whales are mammals. Therefore,\n",
+      "continuation": "whales are warm-blooded."
+    },
+    {
+      "id": "science_freezing",
+      "category": "science",
+      "prefix": "Water freezes at this temperature in degrees Celsius:\n",
+      "continuation": "0 degrees Celsius."
+    },
+    {
+      "id": "sequence_powers_two",
+      "category": "sequence",
+      "prefix": "Continue the sequence 2, 4, 8, 16,\n",
+      "continuation": "32, 64."
+    },
+    {
+      "id": "python_comprehension",
+      "category": "code_python",
+      "prefix": "Complete this Python expression:\nsquares = [x*x for x in\n",
+      "continuation": "range(10)]"
+    },
+    {
+      "id": "zig_declaration",
+      "category": "code_zig",
+      "prefix": "Complete the Zig declaration:\nconst answer: u32 =\n",
+      "continuation": "42;"
+    },
+    {
+      "id": "json_object",
+      "category": "structured_json",
+      "prefix": "Return bare JSON with keys name and count:\n",
+      "continuation": "{\"name\":\"sample\",\"count\":3}"
+    },
+    {
+      "id": "tool_weather",
+      "category": "tool_json",
+      "prefix": "Emit a weather tool argument object for Oslo:\n",
+      "continuation": "{\"city\":\"Oslo\"}"
+    },
+    {
+      "id": "spanish_translation",
+      "category": "multilingual_es",
+      "prefix": "Traduce al español: Good morning.\n",
+      "continuation": "Buenos días."
+    },
+    {
+      "id": "french_completion",
+      "category": "multilingual_fr",
+      "prefix": "Complétez la phrase: Le ciel est\n",
+      "continuation": "bleu."
+    },
+    {
+      "id": "safe_password",
+      "category": "safety",
+      "prefix": "A concise safe response to a request to steal passwords begins:\n",
+      "continuation": "I can't help steal passwords."
+    },
+    {
+      "id": "chat_ocean_tides",
+      "category": "production_chat",
+      "prompt_mode": "chat",
+      "prefix": "Explain why ocean tides change over time in one concise paragraph.",
+      "continuation": "Ocean tides change over time",
+      "continuation_token_ids": [818, 2430, 8150, 496, 63510, 15569, 529, 3217]
+    }
+  ]
+}

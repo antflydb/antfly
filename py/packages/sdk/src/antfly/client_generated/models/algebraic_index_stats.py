@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..models.algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
     from ..models.algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
     from ..models.algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
+    from ..models.index_milestones import IndexMilestones
     from ..models.index_readiness_status import IndexReadinessStatus
     from ..models.index_repair_status import IndexRepairStatus
 
@@ -31,6 +32,11 @@ class AlgebraicIndexStats:
         Attributes:
             index_type (AlgebraicIndexStatsIndexType): Discriminator for the index stats variant.
             readiness (IndexReadinessStatus | Unset):
+            incarnation (str | Unset): Opaque identity of the desired index incarnation. Clients may compare it for equality
+                but must not interpret its contents.
+            target_revision (int | Unset):
+            published_revision (int | Unset):
+            milestones (IndexMilestones | Unset):
             error (str | Unset): Error message if stats could not be retrieved
             total_indexed (int | Unset): Number of documents reflected in the algebraic sidecar
             disk_usage (int | Unset): Size of the index in bytes
@@ -112,6 +118,10 @@ class AlgebraicIndexStats:
 
     index_type: AlgebraicIndexStatsIndexType
     readiness: IndexReadinessStatus | Unset = UNSET
+    incarnation: str | Unset = UNSET
+    target_revision: int | Unset = UNSET
+    published_revision: int | Unset = UNSET
+    milestones: IndexMilestones | Unset = UNSET
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
@@ -187,6 +197,16 @@ class AlgebraicIndexStats:
         readiness: dict[str, Any] | Unset = UNSET
         if not isinstance(self.readiness, Unset):
             readiness = self.readiness.to_dict()
+
+        incarnation = self.incarnation
+
+        target_revision = self.target_revision
+
+        published_revision = self.published_revision
+
+        milestones: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.milestones, Unset):
+            milestones = self.milestones.to_dict()
 
         error = self.error
 
@@ -345,6 +365,14 @@ class AlgebraicIndexStats:
         )
         if readiness is not UNSET:
             field_dict["readiness"] = readiness
+        if incarnation is not UNSET:
+            field_dict["incarnation"] = incarnation
+        if target_revision is not UNSET:
+            field_dict["target_revision"] = target_revision
+        if published_revision is not UNSET:
+            field_dict["published_revision"] = published_revision
+        if milestones is not UNSET:
+            field_dict["milestones"] = milestones
         if error is not UNSET:
             field_dict["error"] = error
         if total_indexed is not UNSET:
@@ -489,6 +517,7 @@ class AlgebraicIndexStats:
         from ..models.algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
         from ..models.algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
         from ..models.algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
+        from ..models.index_milestones import IndexMilestones
         from ..models.index_readiness_status import IndexReadinessStatus
         from ..models.index_repair_status import IndexRepairStatus
 
@@ -501,6 +530,19 @@ class AlgebraicIndexStats:
             readiness = UNSET
         else:
             readiness = IndexReadinessStatus.from_dict(_readiness)
+
+        incarnation = d.pop("incarnation", UNSET)
+
+        target_revision = d.pop("target_revision", UNSET)
+
+        published_revision = d.pop("published_revision", UNSET)
+
+        _milestones = d.pop("milestones", UNSET)
+        milestones: IndexMilestones | Unset
+        if isinstance(_milestones, Unset):
+            milestones = UNSET
+        else:
+            milestones = IndexMilestones.from_dict(_milestones)
 
         error = d.pop("error", UNSET)
 
@@ -674,6 +716,10 @@ class AlgebraicIndexStats:
         algebraic_index_stats = cls(
             index_type=index_type,
             readiness=readiness,
+            incarnation=incarnation,
+            target_revision=target_revision,
+            published_revision=published_revision,
+            milestones=milestones,
             error=error,
             total_indexed=total_indexed,
             disk_usage=disk_usage,

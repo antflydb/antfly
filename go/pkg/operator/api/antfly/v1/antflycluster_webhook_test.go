@@ -24,6 +24,20 @@ func TestHAStartupGateSerializationPreservesExplicitFalseRuntimeEligibility(t *t
 	}
 }
 
+func TestHAPlannedActionSerializationPreservesZeroRetryGeneration(t *testing.T) {
+	raw, err := json.Marshal(HAPlannedActionStatus{
+		Kind:                  "DemoteFormerPrimary",
+		OperationID:           "haop-v2-test",
+		ExecutionStateVersion: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"retryGeneration":0`) {
+		t.Fatalf("explicit initial retry generation was omitted from durable action status: %s", raw)
+	}
+}
+
 func TestValidateCreate_ValidBalanced(t *testing.T) {
 	cluster := &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2111,6 +2125,41 @@ func TestValidateCreate_HighAvailabilityAutomaticFailoverRequiresNoLossDurabilit
 	}
 }
 
+func TestValidateCreate_AutomaticFailoverAllowsNonExecutingStagedStandby(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRoleStandby, NodeID: "standby-a",
+			AdminTokenEnvVar:    "ANTFLY_HA_ADMIN_TOKEN",
+			AdminTokenSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"}, Key: "token"},
+			FencingLease:        &HARuntimeFencingLeaseSpec{Name: "topology-ha-fence", TopologyID: "topology-anchor-uid", WatchdogGraceSeconds: 10},
+			Standby:             &HAStandbyRuntimeSpec{UpstreamURL: "http://primary-ha.default.svc:8080", SlotName: "standby-a"},
+		},
+		Admin: &HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081", ExecutePlannedActions: false},
+		Standbys: []HAStandbySpec{{
+			Name: "future-peer", AdminURL: "http://future-peer-ha.default.svc:8081",
+			RouteSelector: map[string]string{"app.kubernetes.io/instance": "future-peer"},
+		}},
+		Identity:          &HAReplicationIdentitySpec{ClusterID: 100, TimelineID: 1, Epoch: 1, CurrentPrimaryID: "primary-a"},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{Enabled: true, FencingAuthority: HAFencingAuthorityKubernetesLease},
+		SyncPolicy: &HASyncPolicy{
+			Mode: HADurabilityModeRemoteApply, Required: 1,
+			StandbyNames: []string{"future-peer"}, FailurePolicy: HAFailurePolicyBlock,
+		},
+	}
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected staged standby to retain dormant automatic-failover policy: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRolePrimary
+	cluster.Spec.HighAvailability.Runtime.NodeID = "primary-a"
+	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "admin.executePlannedActions=true") {
+		t.Fatalf("expected non-staged primary to require action execution, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityAllowsEmptyDisabledConfig(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{}
@@ -2314,6 +2363,62 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected exact activated-seed startup gate to be valid: %v", err)
+	}
+	// Promotion advances authority but must retain the exact materialized PVC
+	// binding even though the old standby slot is no longer in the new topology.
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
+	standby := cluster.DeepCopy()
+	cluster.Spec.HighAvailability.Identity.TimelineID = 2
+	cluster.Spec.HighAvailability.Identity.Epoch = 2
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRolePrimary
+	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	cluster.Spec.HighAvailability.Runtime.Primary = &HAPrimaryRuntimeSpec{
+		LogPath:   "/antflydb/ha/standby.wal",
+		SlotsPath: "/antflydb/ha/standby-progress.wal.promoted-primary-slots",
+	}
+	cluster.Spec.HighAvailability.Standbys = nil
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected promoted primary to retain exact activated-volume provenance: %v", err)
+	}
+	if err := cluster.ValidateUpdate(standby); err != nil {
+		t.Fatalf("expected promotion to retain the unchanged activated-volume binding: %v", err)
+	}
+
+	wrongStorage := cluster.DeepCopy()
+	wrongStorage.Spec.HighAvailability.Runtime.Primary = &HAPrimaryRuntimeSpec{
+		LogPath:   "/antflydb/ha/primary.wal",
+		SlotsPath: "/antflydb/ha/slots",
+	}
+	if err := wrongStorage.ValidateUpdate(standby); err == nil || !strings.Contains(err.Error(), "must reopen the promoted standby storage") {
+		t.Fatalf("expected promotion to reject a fresh primary WAL and slot store, got: %v", err)
+	}
+
+	customStandby := standby.DeepCopy()
+	customStandby.Spec.HighAvailability.Runtime.Standby.LogPath = "/antflydb/custom/receive.wal"
+	customStandby.Spec.HighAvailability.Runtime.Standby.ProgressPath = "/antflydb/custom/progress.wal"
+	customPromotion := cluster.DeepCopy()
+	customPromotion.Spec.HighAvailability.Runtime.Primary = &HAPrimaryRuntimeSpec{
+		LogPath:   "/antflydb/custom/receive.wal",
+		SlotsPath: "/antflydb/custom/progress.wal.promoted-primary-slots",
+	}
+	if err := customPromotion.ValidateUpdate(customStandby); err != nil {
+		t.Fatalf("expected promotion to preserve custom standby WAL paths: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = ""
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "targetPVCUID is required for runtime.role Primary") {
+		t.Fatalf("expected promoted primary without exact PVC incarnation to fail closed, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "standby-pvc-uid"
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	if err := cluster.ValidateCreate(); err == nil || !strings.Contains(err.Error(), "runtime.role Primary requires runtimeEligible=true") {
+		t.Fatalf("expected promoted primary with a declaratively closed retained gate to be rejected, got: %v", err)
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = true
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.Generation = "different-generation"
+	if err := cluster.ValidateUpdate(standby); err == nil || !strings.Contains(err.Error(), "activated-volume binding is immutable") {
+		t.Fatalf("expected promotion to reject a changed activated-volume binding, got: %v", err)
 	}
 }
 
@@ -2529,6 +2634,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
 			PrimaryURL:                       "primary-ha.default.svc:8081",
+			PrimaryActionURL:                 "grpc://primary-ha.default.svc:8081",
 			ExecutePlannedActions:            true,
 			JobBackoffLimit:                  &backoffLimit,
 			JobTimeoutSeconds:                &timeoutSeconds,
@@ -2551,6 +2657,7 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 		t.Fatal("expected invalid HA admin endpoint configuration to be rejected")
 	}
 	if !strings.Contains(err.Error(), "admin.primaryURL") ||
+		!strings.Contains(err.Error(), "admin.primaryActionURL") ||
 		!strings.Contains(err.Error(), "standbys[0].adminURL") ||
 		!strings.Contains(err.Error(), "admin.jobBackoffLimit") ||
 		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
@@ -2626,7 +2733,8 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
-			PrimaryURL: " http://primary-ha.default.svc:8081 ",
+			PrimaryURL:       " http://primary-ha.default.svc:8081 ",
+			PrimaryActionURL: " http://primary-action-ha.default.svc:8081 ",
 		},
 		Standbys: []HAStandbySpec{{
 			Name:     "standby-a",
@@ -2654,6 +2762,7 @@ func TestValidateCreate_HighAvailabilityRejectsPaddedAdminURLs(t *testing.T) {
 	}
 	for _, want := range []string{
 		"admin.primaryURL must not have leading or trailing whitespace",
+		"admin.primaryActionURL must not have leading or trailing whitespace",
 		"standbys[0].adminURL must not have leading or trailing whitespace",
 		"runtime.standby.upstreamURL must not have leading or trailing whitespace",
 	} {

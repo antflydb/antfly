@@ -708,11 +708,12 @@ Open/index/enrichment validation should reject:
          decisions cross that boundary. Verified by lib-resolver-test (the
          seam) and db-tests (record -> re-resolve honors the curated link,
          review is not promoted/materialized).
-   - [x] 2PC atomic promotion: the promoter commits all of a document's
-         resolved entities in one multi-participant transaction
+   - [x] Atomic promotion: the promoter commits all of a document's
+         resolved entities through one atomic batch
          (`EntitySink.upsertBatch` -> `DistributedEntitySink` ->
-         `commitTransaction` across the entity table's shards), so a document
-         never lands a partial set of its entities. Enabled in serving
+         `commitBatch`). A single entity shard uses one fenced Raft batch;
+         multiple entity shards use 2PC, so a document never lands a partial
+         set of its entities. Enabled in serving
          (`transactional = true`); verified live by e2e/test_resolution.py and a
          db-test (atomic batch). NOTE: atomically coupling the entity upsert with
          the *graph-edge* artifact is still not possible -- `TableCommitRequest`

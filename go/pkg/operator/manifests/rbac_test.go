@@ -57,7 +57,9 @@ func TestClusterRoleGrantsLeasePermissionsForHAFencing(t *testing.T) {
 
 func TestClusterRoleGrantsHARuntimeRBACReconciliationPermissions(t *testing.T) {
 	role := ClusterRole()
-	requiredVerbs := []string{"create", "get", "list", "update", "watch"}
+	// Disabling HA revokes the runtime's Lease access by deleting its owned
+	// RoleBinding before deleting the Role and generated ServiceAccount.
+	requiredVerbs := []string{"create", "delete", "get", "list", "update", "watch"}
 	required := map[string][]string{
 		"":                          {"serviceaccounts"},
 		"rbac.authorization.k8s.io": {"roles", "rolebindings"},

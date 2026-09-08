@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class HierarchyChildParentLevel(str, Enum):
+class HierarchyChildParentLevel(StrEnum):
     SOURCE = "source"
 
     def __str__(self) -> str:

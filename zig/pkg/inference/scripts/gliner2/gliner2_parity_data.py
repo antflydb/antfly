@@ -15,7 +15,9 @@ def allowed_labels_for_objective(objective: str, labels_csv: str) -> set[str] | 
     return None if objective == "gliner2-total-loss" else parse_label_csv(labels_csv)
 
 
-def summarize_upstream_output(output: dict[str, Any], labels: set[str], allowed_labels: set[str] | None) -> dict[str, int]:
+def summarize_upstream_output(
+    output: dict[str, Any], labels: set[str], allowed_labels: set[str] | None
+) -> dict[str, int]:
     counts = {
         "entity_mentions": 0,
         "classifications": len(output.get("classifications", []) or []),
@@ -37,7 +39,9 @@ def ensure_terminal_punctuation(text: str) -> str:
     return text or "."
 
 
-def normalize_python_record(record: dict[str, Any], allowed_labels: set[str] | None) -> tuple[dict[str, Any], dict[str, int], set[str]]:
+def normalize_python_record(
+    record: dict[str, Any], allowed_labels: set[str] | None
+) -> tuple[dict[str, Any], dict[str, int], set[str]]:
     labels: set[str] = set()
     if "input" in record and "output" in record:
         output = dict(record.get("output") or {})
@@ -48,7 +52,11 @@ def normalize_python_record(record: dict[str, Any], allowed_labels: set[str] | N
                 if label in allowed_labels
             }
         counts = summarize_upstream_output(output, labels, allowed_labels)
-        return {"input": ensure_terminal_punctuation(record["input"]), "output": output}, counts, labels
+        return (
+            {"input": ensure_terminal_punctuation(record["input"]), "output": output},
+            counts,
+            labels,
+        )
 
     grouped: dict[str, list[str]] = {}
     for ent in record.get("entities", []):
@@ -58,7 +66,15 @@ def normalize_python_record(record: dict[str, Any], allowed_labels: set[str] | N
         grouped.setdefault(label, []).append(ent["text"])
         labels.add(label)
     return (
-        {"input": ensure_terminal_punctuation(record["text"]), "output": {"entities": grouped}},
-        {"entity_mentions": sum(len(v) for v in grouped.values()), "classifications": 0, "json_structures": 0, "relations": 0},
+        {
+            "input": ensure_terminal_punctuation(record["text"]),
+            "output": {"entities": grouped},
+        },
+        {
+            "entity_mentions": sum(len(v) for v in grouped.values()),
+            "classifications": 0,
+            "json_structures": 0,
+            "relations": 0,
+        },
         labels,
     )

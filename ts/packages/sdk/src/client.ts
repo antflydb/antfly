@@ -8,6 +8,7 @@ import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import { validateGraphQueryResponses } from "./graph-results.js";
 import { validateCreateIndexRequestRelationships } from "./index-config.js";
 import type { paths } from "./public-api.js";
+import { parseSSEFrames } from "./sse.js";
 import type {
   AntflyAuth,
   AntflyConfig,
@@ -33,6 +34,7 @@ import type {
   DocumentArtifactTableReprocessRequest,
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
+  GlobalQueryRequest,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -51,6 +53,7 @@ import type {
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
+  Table,
   TableArtifactEnrichmentList,
   TableQueryRequest,
   TableSchema,
@@ -73,6 +76,15 @@ function validateTableQueryRequest(request: QueryRequest, tableName: string, ind
   throw new Error(
     `Table query ${requestLabel}.table must be omitted; the route already selects table ${JSON.stringify(tableName)}`
   );
+}
+
+function validateGlobalQueryRequest(
+  request: QueryRequest,
+  index?: number
+): asserts request is GlobalQueryRequest {
+  if (typeof request.table === "string" && request.table.length > 0) return;
+  const requestLabel = index === undefined ? "request" : `requests[${index}]`;
+  throw new Error(`Global query ${requestLabel}.table must be a non-empty string`);
 }
 
 export interface RestoreJobListOptions {
@@ -603,6 +615,7 @@ export class AntflyClient {
       validateGraphQueryResponses(data as QueryResponses, [request], tableName);
       return data as QueryResponses;
     } else {
+      validateGlobalQueryRequest(request);
       const { data, error, response } = await this.client.POST("/db/v1/query", {
         body: request,
         ...(options?.signal ? { signal: options.signal } : {}),
@@ -657,7 +670,7 @@ export class AntflyClient {
    * Global query operations
    */
   async query(
-    request: QueryRequest,
+    request: GlobalQueryRequest,
     options?: QueryExecutionOptions
   ): Promise<QueryResult | undefined> {
     const data = await this.performQuery("/db/v1/query", request, undefined, options);
@@ -668,7 +681,8 @@ export class AntflyClient {
   /**
    * Execute multiple queries in a single request
    */
-  async multiquery(requests: QueryRequest[]): Promise<QueryResponses | undefined> {
+  async multiquery(requests: GlobalQueryRequest[]): Promise<QueryResponses | undefined> {
+    for (const [index, request] of requests.entries()) validateGlobalQueryRequest(request, index);
     return this.performMultiquery("/db/v1/query", requests);
   }
 
@@ -723,145 +737,133 @@ export class AntflyClient {
       return result;
     }
 
-    // Handle SSE streaming response
-    if (callbacks) {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let currentEvent = "";
+    if (contentType.split(";", 1)[0]?.trim().toLowerCase() !== "text/event-stream") {
+      await response.body.cancel();
+      throw new Error("Retrieval agent returned an unsupported content type");
+    }
 
-      // Start reading the stream in the background
-      (async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+    // A JSON caller must not leave an unexpected stream open.
+    if (!callbacks) {
+      await response.body.cancel();
+      return abortController;
+    }
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
-              if (!line.trim()) {
-                currentEvent = "";
-                continue;
+    const stream = response.body;
+    // The controller is returned immediately; terminal failures are delivered
+    // through onError, including read errors, malformed frames, and early EOF.
+    void (async () => {
+      try {
+        for await (const frame of parseSSEFrames(stream, "Retrieval agent")) {
+          if (abortController.signal.aborted) return;
+          switch (frame.event) {
+            case "classification":
+              callbacks.onClassification?.(JSON.parse(frame.data));
+              break;
+            case "reasoning":
+              callbacks.onReasoning?.(JSON.parse(frame.data));
+              break;
+            case "hit":
+              callbacks.onHit?.(JSON.parse(frame.data));
+              break;
+            case "generation":
+              callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "step_started":
+              callbacks.onStepStarted?.(JSON.parse(frame.data));
+              break;
+            case "step_progress":
+              callbacks.onStepProgress?.(JSON.parse(frame.data));
+              break;
+            case "step_completed":
+              callbacks.onStepCompleted?.(JSON.parse(frame.data));
+              break;
+            case "tool_mode":
+              callbacks.onToolMode?.(JSON.parse(frame.data));
+              break;
+            case "followup":
+              callbacks.onFollowup?.(JSON.parse(frame.data));
+              break;
+            case "eval":
+              callbacks.onEvalResult?.(JSON.parse(frame.data));
+              break;
+            case "done": {
+              const result = JSON.parse(frame.data);
+              if (result === null || typeof result !== "object" || Array.isArray(result)) {
+                throw new Error("Retrieval agent returned an invalid done result");
               }
-
-              if (line.startsWith("event: ")) {
-                currentEvent = line.slice(7).trim();
-              } else if (line.startsWith("data: ")) {
-                const data = line.slice(6).trim();
-
-                let sseError: Error | undefined;
-                try {
-                  switch (currentEvent) {
-                    case "classification":
-                      if (callbacks.onClassification) {
-                        callbacks.onClassification(JSON.parse(data));
-                      }
-                      break;
-                    case "reasoning":
-                      if (callbacks.onReasoning) {
-                        callbacks.onReasoning(JSON.parse(data));
-                      }
-                      break;
-                    case "filter_applied":
-                      if (callbacks.onFilterApplied) {
-                        callbacks.onFilterApplied(JSON.parse(data));
-                      }
-                      break;
-                    case "search_executed":
-                      if (callbacks.onSearchExecuted) {
-                        callbacks.onSearchExecuted(JSON.parse(data));
-                      }
-                      break;
-                    case "hit":
-                      if (callbacks.onHit) {
-                        callbacks.onHit(JSON.parse(data));
-                      }
-                      break;
-                    case "generation":
-                      if (callbacks.onGeneration) {
-                        callbacks.onGeneration(JSON.parse(data));
-                      }
-                      break;
-                    case "step_started":
-                      if (callbacks.onStepStarted) {
-                        callbacks.onStepStarted(JSON.parse(data));
-                      }
-                      break;
-                    case "step_progress":
-                      if (callbacks.onStepProgress) {
-                        callbacks.onStepProgress(JSON.parse(data));
-                      }
-                      break;
-                    case "step_completed":
-                      if (callbacks.onStepCompleted) {
-                        callbacks.onStepCompleted(JSON.parse(data));
-                      }
-                      break;
-                    case "confidence":
-                      if (callbacks.onConfidence) {
-                        callbacks.onConfidence(JSON.parse(data));
-                      }
-                      break;
-                    case "followup":
-                      if (callbacks.onFollowup) {
-                        callbacks.onFollowup(JSON.parse(data));
-                      }
-                      break;
-                    case "eval":
-                      if (callbacks.onEvalResult) {
-                        callbacks.onEvalResult(JSON.parse(data));
-                      }
-                      break;
-                    case "done":
-                      if (callbacks.onDone) {
-                        callbacks.onDone(JSON.parse(data));
-                      }
-                      return;
-                    case "error": {
-                      const parsed = JSON.parse(data);
-                      const message =
-                        typeof parsed === "object" && parsed.error ? parsed.error : String(parsed);
-                      if (callbacks.onError) {
-                        callbacks.onError(message);
-                      }
-                      sseError = new Error(message);
-                      break;
-                    }
-                  }
-                } catch (e) {
-                  console.warn("Failed to parse SSE data:", currentEvent, data, e);
-                }
-                if (sseError) throw sseError;
+              if (
+                typeof result.generation_confidence === "number" &&
+                typeof result.context_relevance === "number"
+              ) {
+                callbacks.onConfidence?.({
+                  generation_confidence: result.generation_confidence,
+                  context_relevance: result.context_relevance,
+                });
               }
+              callbacks.onDone?.(result);
+              return;
+            }
+            case "error": {
+              const parsed = JSON.parse(frame.data);
+              const message =
+                parsed !== null && typeof parsed === "object" && parsed.error
+                  ? String(parsed.error)
+                  : String(parsed);
+              throw new Error(message);
             }
           }
-        } catch (error) {
-          if ((error as Error).name !== "AbortError") {
-            console.error("Retrieval agent streaming error:", error);
-          }
         }
-      })();
-    }
+        throw new Error("Retrieval agent stream ended before done");
+      } catch (error) {
+        if (!abortController.signal.aborted) {
+          callbacks.onError?.(error instanceof Error ? error.message : String(error));
+        }
+      }
+    })();
 
     return abortController;
   }
 
   /**
-   * Retrieval Agent - Unified retrieval pipeline with optional classification, generation, and eval
-   * Supports pipeline mode (structured queries) and agentic mode (tool-calling with LLM)
-   * Configure steps.classification, steps.answer, steps.eval to enable additional pipeline stages
-   * @param request - Retrieval agent request with query, mode, and optional step configs
-   * @param callbacks - Optional callbacks for SSE events (classification, reasoning, hit, answer, citation, confidence, followup_question, eval, done, error)
-   * @returns Promise with RetrievalAgentResult (JSON) or AbortController (when streaming)
+   * Run the retrieval agent and return one complete JSON result.
+   *
+   * Use streamRetrievalAgent when incremental events are required. Keeping the
+   * two response modes separate avoids runtime shape checks on the result.
    */
+  async retrievalAgent(request: RetrievalAgentRequest): Promise<RetrievalAgentResult>;
+  /**
+   * @deprecated Use streamRetrievalAgent(request, callbacks). This overload is
+   * retained for source compatibility and will be removed in a future major release.
+   */
+  async retrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks: RetrievalAgentStreamCallbacks
+  ): Promise<AbortController>;
   async retrievalAgent(
     request: RetrievalAgentRequest,
     callbacks?: RetrievalAgentStreamCallbacks
   ): Promise<RetrievalAgentResult | AbortController> {
-    return this.performRetrievalAgent(request, callbacks);
+    if (callbacks) return this.streamRetrievalAgent(request, callbacks);
+    const result = await this.performRetrievalAgent({ ...request, stream: false });
+    if (result instanceof AbortController) {
+      result.abort();
+      throw new Error("Retrieval agent returned a stream for a JSON request");
+    }
+    return result;
+  }
+
+  /** Run the retrieval agent as an SSE stream. */
+  async streamRetrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks: RetrievalAgentStreamCallbacks
+  ): Promise<AbortController> {
+    const result = await this.performRetrievalAgent({ ...request, stream: true }, callbacks);
+    if (result instanceof AbortController) return result;
+
+    // A proxy or older server may still answer with JSON. Preserve the complete
+    // result rather than dropping it, while keeping the streaming return shape.
+    callbacks.onDone?.(result);
+    return new AbortController();
   }
 
   /**
@@ -932,16 +934,13 @@ export class AntflyClient {
         },
       };
 
-      const abortController = (await this.performRetrievalAgent(
-        request,
-        wrappedCallbacks
-      )) as AbortController;
+      const abortController = await this.streamRetrievalAgent(request, wrappedCallbacks);
 
       return { abortController, messages: messagesPromise };
     }
 
     // Non-streaming mode
-    const result = (await this.performRetrievalAgent(request)) as RetrievalAgentResult;
+    const result = await this.retrievalAgent(request);
 
     // Use server-provided messages or build from response
     const updatedMessages: ChatMessage[] = result.messages?.length
@@ -1081,15 +1080,57 @@ export class AntflyClient {
       return true;
     },
 
-    /**
-     * Update schema for a table
-     */
-    updateSchema: async (tableName: string, config: TableSchema) => {
+    /** Replace the complete schema for a table. */
+    replaceSchema: async (
+      tableName: string,
+      config: TableSchema,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
         params: { path: { tableName } },
         body: config,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
-      if (error) throw new Error(`Failed to update table schema: ${error.error}`);
+      if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
+      return data;
+    },
+
+    /** Apply an RFC 7396 JSON Merge Patch without replacing unrelated fields. */
+    patchSchema: async (
+      tableName: string,
+      patch: Record<string, unknown>,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
+      const { data, error } = await this.client.PATCH("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName } },
+        body: patch,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
+      });
+      if (error) throw new Error(`Failed to patch table schema: ${error.error}`);
+      return data;
+    },
+
+    /** @deprecated Use replaceSchema for explicit full-replacement semantics. */
+    updateSchema: async (
+      tableName: string,
+      config: TableSchema,
+      options?: { expectedVersion?: number }
+    ): Promise<Table | undefined> => {
+      const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName } },
+        body: config,
+        headers:
+          options?.expectedVersion === undefined
+            ? undefined
+            : { "If-Match": `"schema-${options.expectedVersion}"` },
+      });
+      if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
       return data;
     },
 

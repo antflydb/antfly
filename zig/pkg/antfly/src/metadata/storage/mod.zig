@@ -18,6 +18,7 @@ pub const RaftApplyStoreConfig = raft_apply_store.RaftApplyStoreConfig;
 pub const AppliedMetadataBatch = raft_apply_store.AppliedMetadataBatch;
 pub const TransitionCommand = raft_apply_store.TransitionCommand;
 pub const ExtensionLifecycleDelta = raft_apply_store.ExtensionLifecycleDelta;
+pub const ExtensionLifecycleTablePrecondition = raft_apply_store.ExtensionLifecycleTablePrecondition;
 pub const ExtensionMemberKey = raft_apply_store.ExtensionMemberKey;
 pub const ExtensionDependencyKey = raft_apply_store.ExtensionDependencyKey;
 pub const validateTransitionCommandDataGroupIds = raft_apply_store.validateTransitionCommandDataGroupIds;
@@ -30,6 +31,7 @@ test "metadata storage module compiles" {
     _ = AppliedMetadataBatch;
     _ = TransitionCommand;
     _ = ExtensionLifecycleDelta;
+    _ = ExtensionLifecycleTablePrecondition;
     _ = ExtensionMemberKey;
     _ = ExtensionDependencyKey;
     _ = validateTransitionCommandDataGroupIds;

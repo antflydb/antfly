@@ -54,6 +54,10 @@ pub const Message = struct {
     reject_hint: types.Index = 0,
     entries: []types.Entry = &.{},
     snapshot: ?types.Snapshot = null,
+    /// Local snapshot-transport fence. This is intentionally not serialized by
+    /// the regular Raft codec because snapshot messages use the dedicated
+    /// snapshot transport.
+    snapshot_attempt_generation: u64 = 0,
     context: []u8 = &.{},
     responses: []Message = &.{},
 
@@ -71,6 +75,7 @@ pub const Message = struct {
             .reject_hint = self.reject_hint,
             .entries = try types.cloneEntries(alloc, self.entries),
             .snapshot = if (self.snapshot) |snapshot| try snapshot.clone(alloc) else null,
+            .snapshot_attempt_generation = self.snapshot_attempt_generation,
             .context = try alloc.dupe(u8, self.context),
             .responses = try cloneMessages(alloc, self.responses),
         };

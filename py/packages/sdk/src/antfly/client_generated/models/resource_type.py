@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ResourceType(str, Enum):
+class ResourceType(StrEnum):
     INFERENCE = "inference"
     TABLE = "table"
     USER = "user"

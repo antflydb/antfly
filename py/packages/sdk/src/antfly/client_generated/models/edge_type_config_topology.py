@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class EdgeTypeConfigTopology(str, Enum):
+class EdgeTypeConfigTopology(StrEnum):
     GRAPH = "graph"
     TREE = "tree"
 

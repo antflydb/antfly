@@ -188,7 +188,6 @@ pub fn applySettingsPayload(settings: *Http2ConnectionSettings, payload: []const
     }
 }
 
-
 /// HTTP/3 frame types as defined in RFC 9114.
 pub const Http3FrameType = enum(u64) {
     data = 0x00,

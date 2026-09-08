@@ -17,7 +17,7 @@ order: 6
 Every insert, update, and delete on a PostgreSQL table lands in an Antfly table without a sync job or a daemon in between. Antfly subscribes to PostgreSQL logical replication, backfills the existing rows, then follows the stream. Nothing changes in the application that writes to PostgreSQL. The table is created with a replication source, and rows can be read back from Antfly as soon as they land:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/users \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/users \
   -u admin:admin \
   -H "Content-Type: application/json" \
   -d '{
@@ -33,7 +33,7 @@ curl -X POST http://localhost:8080/db/v1/tables/users \
 ```
 
 ```bash
-curl -s http://localhost:8080/db/v1/tables/users/documents/user-1 -u admin:admin
+curl -s http://127.0.0.1:8080/db/v1/tables/users/documents/user-1 -u admin:admin
 ```
 
 ```json
@@ -42,7 +42,7 @@ curl -s http://localhost:8080/db/v1/tables/users/documents/user-1 -u admin:admin
 
 ## Before You Start
 
-Antfly running, PostgreSQL 14 or later with `wal_level = logical`, and a database user with the `REPLICATION` attribute:
+Antfly running, PostgreSQL 14 or later with `wal_level = logical` (15 or later only if you use `publication_filter`), and a database user with the `REPLICATION` attribute:
 
 ```sql
 SHOW wal_level;  -- logical
@@ -79,7 +79,7 @@ ALTER USER antfly WITH REPLICATION;
 The DSN carries a password, so it goes in the secret store and the table config references it by name:
 
 ```bash
-curl -X PUT http://localhost:8080/db/v1/secrets/pg_dsn \
+curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
   -u admin:admin \
   -H "Content-Type: application/json" \
   -d '{"value": "postgres://antfly:secret@pg-host:5432/mydb?sslmode=require"}'
@@ -103,7 +103,7 @@ CREATE TABLE users (
 The Antfly table, with a `replication_sources` block naming it:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/users \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/users \
   -u admin:admin \
   -H "Content-Type: application/json" \
   -d '{
@@ -121,7 +121,7 @@ curl -X POST http://localhost:8080/db/v1/tables/users \
 Antfly creates a replication slot and a publication, snapshots the rows already in the table through the normal batch path, then polls the slot for changes. The source's `status` in the table detail moves from `snapshot` to `streaming`:
 
 ```bash
-curl -s http://localhost:8080/db/v1/tables/users -u admin:admin
+curl -s http://127.0.0.1:8080/db/v1/tables/users -u admin:admin
 ```
 
 Three errors show up here and nowhere else. `permission denied to create replication slot` means the user lacks `REPLICATION` (or the managed-service role); pre-create the slot and pass `slot_name`. `publication does not exist` means the user cannot create publications; have the table owner create one and pass `publication_name`. `wal_level is not logical` means step 1 did not take effect, usually because the restart is still pending.
@@ -137,7 +137,7 @@ INSERT INTO users (id, name, email, score) VALUES ('user-1', 'Alice', 'alice@exa
 Read it back from Antfly:
 
 ```bash
-curl -s http://localhost:8080/db/v1/tables/users/documents/user-1 -u admin:admin
+curl -s http://127.0.0.1:8080/db/v1/tables/users/documents/user-1 -u admin:admin
 ```
 
 ```json
@@ -152,11 +152,13 @@ If nothing arrives, the DSN is the first suspect: check that PostgreSQL is reach
 
 Three fields on the source control how a row becomes a document.
 
-**`key_template`** derives the document key. A column name uses that column; a template composes several:
+**`key_template`** derives the document key. When omitted, Antfly uses the `_id` column if present and falls back to `id`; set it explicitly when the source uses another primary key. A column name uses that column; a template composes several:
 
 ```json
 "key_template": "{{tenant_id}}:{{user_id}}"
 ```
+
+**`publication_filter`** is a PostgreSQL 15+ row filter, applied only when Antfly creates the publication. Changing it later does not alter an existing publication.
 
 **`on_update`** replaces passthrough with explicit transforms for inserts and updates. Column references resolve to the row; literals are set every time:
 

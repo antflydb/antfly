@@ -208,6 +208,7 @@ pub const HttpHandler = struct {
     query: *query_mod.QueryRuntime,
     query_cache: ?*query_mod.QueryCache = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
+    embedding_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     io: ?std.Io = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
@@ -350,6 +351,13 @@ pub const HttpHandler = struct {
     ) void {
         self.managed_query_embedder = embedder;
         self.published_search_sources = search_sources.withDenseQueryIndexName(self.published_search_sources, index_name);
+    }
+
+    pub fn setEmbeddingProviderRuntime(
+        self: *HttpHandler,
+        runtime: *managed_embedder.ProviderRuntime,
+    ) void {
+        self.embedding_provider_runtime = runtime;
     }
 
     pub fn setRemoteContent(self: *HttpHandler, remote_content: ?*const scraping.RemoteContentConfig) void {
@@ -1021,7 +1029,10 @@ pub const HttpHandler = struct {
     fn handleTableBuildStatus(self: *HttpHandler, table_name: []const u8) !HttpResponse {
         var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
-            else => return try textResponse(self.alloc, 500, "status failed"),
+            else => {
+                std.log.warn("table build status failed table={s} err={s}", .{ table_name, @errorName(err) });
+                return try textResponse(self.alloc, 500, "status failed");
+            },
         };
         defer status.deinit(self.alloc);
         var table_status = api_types.TableBuildStatus.fromNamespaceBuildStatus(self.alloc, table_name, status) catch {
@@ -1219,14 +1230,16 @@ pub const HttpHandler = struct {
         }
 
         if (self.executeForeignPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             else => return err,
         }) |json| {
             return json;
         }
 
         const join_req = parseSupportedJoinRequestValueAlloc(self.alloc, body, raw_request.value) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             else => return err,
         };
         if (join_req) |parsed_join| {
@@ -1400,7 +1413,7 @@ pub const HttpHandler = struct {
         defer contract_request.deinit();
         if (contract_request.value.count == true) return error.InvalidQueryRequest;
 
-        const rewrite = distributed_join.rewriteJoinedBaseQueryBodyAlloc(self.alloc, contract_request.value, join.left_field) catch return error.InternalQueryFailure;
+        const rewrite = distributed_join.rewriteJoinedBaseQueryBodyAlloc(self.alloc, body, join.left_field) catch return error.InternalQueryFailure;
         const appended_left_field = rewrite.appended_left_field;
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
@@ -1690,8 +1703,9 @@ pub const HttpHandler = struct {
         defer if (computed_aggregations) |*computed| computed.deinit(self.alloc);
 
         if (aggregations_json) |json| {
-            computed_aggregations = computeServerlessAggregationResultsAlloc(self, &execution, json) catch |err| switch (err) {
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedAggregation, error.InvalidAggregation => return error.InvalidQueryRequest,
+            computed_aggregations = computeServerlessAggregationResultsAlloc(self, &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
+                error.InvalidQueryRequest => return error.InvalidQueryRequest,
+                error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
                 else => return error.InternalQueryFailure,
             };
             const computed = &computed_aggregations.?;
@@ -2268,12 +2282,15 @@ pub const HttpHandler = struct {
         defer contract_request.deinit();
         if (contract_request.value.count == true) return error.InvalidQueryRequest;
 
-        const rewrite = distributed_join.rewriteJoinedBaseQueryBodyAlloc(self.alloc, contract_request.value, join.left_field) catch return error.InternalQueryFailure;
+        const rewrite = distributed_join.rewriteJoinedBaseQueryBodyAlloc(self.alloc, body, join.left_field) catch return error.InternalQueryFailure;
         const appended_left_field = rewrite.appended_left_field;
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
 
-        const primary_json = try self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation);
+        const primary_json = self.executePlainPublicTableQueryJsonAlloc(table_name, primary_body, cancellation) catch |err| {
+            std.log.warn("serverless joined query rejected rewritten left input table={s} err={}", .{ table_name, err });
+            return err;
+        };
         errdefer self.alloc.free(primary_json);
 
         var owned_response = parseOwnedJsonValueAlloc(self.alloc, primary_json) catch return error.InternalQueryFailure;
@@ -2282,7 +2299,10 @@ pub const HttpHandler = struct {
         if (hits_ptr.items.len == 0) return primary_json;
 
         const plan = planSupportedJoinExecution(self, self.alloc, join, hits_ptr.items, foreign_sources);
-        var right_result = try self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources, cancellation);
+        var right_result = self.executeSupportedRightJoinQuery(join, hits_ptr.items, plan, foreign_sources, cancellation) catch |err| {
+            std.log.warn("serverless joined query rejected right input table={s} right_table={s} err={}", .{ table_name, join.right_table, err });
+            return err;
+        };
         defer right_result.deinit(self.alloc);
 
         var stats: JoinedQueryStats = .{
@@ -2950,12 +2970,9 @@ pub const HttpHandler = struct {
         var aggregations: ?std.json.Value = null;
         defer if (aggregations) |*value| deinitJsonValue(self.alloc, value);
         if (aggregations_json) |json| {
-            aggregations = encodeServerlessAggregationsValueAlloc(self, execution.session.?.namespace(), &execution, json) catch |err| switch (err) {
-                error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest,
-                error.UnsupportedAggregation,
-                error.InvalidAggregation,
-                => return try textResponse(self.alloc, 400, "invalid query request"),
+            aggregations = encodeServerlessAggregationsValueAlloc(self, execution.session.?.namespace(), &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
+                error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
                 else => {
                     std.log.err("namespace aggregations failed namespace={s} err={}", .{ namespace, err });
                     return try textResponse(self.alloc, 500, "query failed");
@@ -3027,12 +3044,9 @@ pub const HttpHandler = struct {
         var aggregations: ?std.json.Value = null;
         defer if (aggregations) |*value| deinitJsonValue(self.alloc, value);
         if (aggregations_json) |json| {
-            aggregations = encodeServerlessAggregationsValueAlloc(self, table_name, &execution, json) catch |err| switch (err) {
-                error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest,
-                error.UnsupportedAggregation,
-                error.InvalidAggregation,
-                => return try textResponse(self.alloc, 400, "invalid query request"),
+            aggregations = encodeServerlessAggregationsValueAlloc(self, table_name, &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
+                error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
                 error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 else => {
                     std.log.err("table aggregations failed table={s} err={}", .{ table_name, err });
@@ -3143,6 +3157,7 @@ pub const HttpHandler = struct {
             var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(self.alloc, table.indexes_json, .{
                 .io = self.io,
                 .remote_content = self.remote_content,
+                .provider_runtime = self.embedding_provider_runtime,
             });
             defer runtime.deinit();
             if (runtime.hasDenseEntries()) {
@@ -4995,6 +5010,7 @@ pub const HttpHandler = struct {
         _: []const u8,
         _: []const u8,
         _: *backups_api.BackupLocation,
+        _: *public_table_http.TableApi.BackupExecutionReceipt,
         _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         return error.MethodNotAllowed;
@@ -8341,6 +8357,18 @@ fn unsupportedQueryResponse(alloc: Allocator) !HttpResponse {
     return jsonResponse(alloc, 422, public_table_http.UnsupportedQueryError{});
 }
 
+/// Preserve the public distinction between malformed aggregation input and a
+/// well-formed capability this deployment cannot execute. Stateful and
+/// serverless query surfaces share this normalization so callers receive the
+/// same 400/422 contract independent of the serving architecture.
+fn normalizePublicAggregationError(err: anyerror) anyerror {
+    return switch (err) {
+        error.InvalidQueryRequest, error.InvalidAggregation => error.InvalidQueryRequest,
+        error.UnsupportedQueryRequest, error.UnsupportedAggregation => error.UnsupportedQueryRequest,
+        else => err,
+    };
+}
+
 const UnsupportedArtifactIndexSourcesError = struct {
     @"error": []const u8 = "unsupported_index_capability",
     message: []const u8 = "artifact-backed index sources are not supported by this deployment",
@@ -8400,6 +8428,14 @@ test "serverless unsupported query response uses the public contract" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("unsupported_query_request", parsed.value.@"error");
     try std.testing.expect(!parsed.value.retryable);
+}
+
+test "serverless aggregation errors preserve invalid and unsupported classes" {
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicAggregationError(error.InvalidQueryRequest));
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicAggregationError(error.InvalidAggregation));
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, normalizePublicAggregationError(error.UnsupportedQueryRequest));
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, normalizePublicAggregationError(error.UnsupportedAggregation));
+    try std.testing.expectEqual(error.OutOfMemory, normalizePublicAggregationError(error.OutOfMemory));
 }
 
 test "serverless public table query adapter preserves structured error content type" {
@@ -9323,6 +9359,25 @@ test "http handler join parser accepts foreign source maps" {
     }
 
     try std.testing.expectEqualStrings("customers", parsed.join.right_table);
+    try std.testing.expect(parsed.foreign_sources.contains("pg_customers"));
+}
+
+test "http handler join parser accepts projected foreign joins over full text" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"limit":10,"fields":["customer_id","product"],"full_text_search":{"query":"body:order"},"join":{"right_table":"pg_customers","join_type":"left","on":{"left_field":"customer_id","right_field":"customer_id","operator":"eq"},"right_fields":["name","email","tier"]},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://localhost:5432/postgres?sslmode=disable","postgres_table":"customers","columns":[{"name":"customer_id","type":"text"},{"name":"name","type":"text"}]}}}
+    ;
+    var raw = try ant_json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer raw.deinit();
+    const parsed = (try parseSupportedJoinRequestValueAlloc(alloc, body, raw.value)).?;
+    defer {
+        var owned = parsed;
+        owned.deinit(alloc);
+    }
+
+    try std.testing.expectEqualStrings("pg_customers", parsed.join.right_table);
+    try std.testing.expectEqual(SupportedJoinRequest.JoinType.left, parsed.join.join_type);
+    try std.testing.expectEqual(@as(usize, 3), parsed.join.right_fields.len);
     try std.testing.expect(parsed.foreign_sources.contains("pg_customers"));
 }
 
@@ -11163,7 +11218,7 @@ test "http handler query publication exposes vector compaction targets" {
     defer parsed_build_status.deinit();
     try std.testing.expectEqualStrings("docs", parsed_build_status.value.table_name);
     try std.testing.expectEqualStrings("semantic_idx", parsed_build_status.value.vector_compaction_driver_index_name.?);
-    try std.testing.expectEqual(shared_vector.DistanceMetric.cosine, parsed_build_status.value.vector_compaction_distance_metric.?);
+    try std.testing.expectEqual(shared_vector.default_distance_metric, parsed_build_status.value.vector_compaction_distance_metric.?);
     try std.testing.expectEqual(@as(bool, true), parsed_build_status.value.compaction_recommended);
     try std.testing.expectEqual(@as(bool, false), parsed_build_status.value.mutation_tail_compaction_recommended);
     try std.testing.expectEqual(@as(bool, true), parsed_build_status.value.vector_compaction_recommended);
@@ -11178,7 +11233,7 @@ test "http handler query publication exposes vector compaction targets" {
     defer parsed_query_published.deinit();
     try std.testing.expectEqualStrings("semantic_idx", parsed_query_published.value.publication.vector_compaction_driver_index_name.?);
     try std.testing.expectEqual(@as(bool, false), parsed_query_published.value.publication.mutation_tail_compaction_recommended);
-    try std.testing.expectEqual(shared_vector.DistanceMetric.cosine, parsed_query_published.value.publication.vector_distance_metric.?);
+    try std.testing.expectEqual(shared_vector.default_distance_metric, parsed_query_published.value.publication.vector_distance_metric.?);
     try std.testing.expectEqual(@as(bool, true), parsed_query_published.value.publication.vector_compaction_recommended);
     try std.testing.expect(parsed_query_published.value.publication.vector_cluster_count != null);
     try std.testing.expect(parsed_query_published.value.publication.vector_base_probe_count != null);
@@ -11198,7 +11253,7 @@ test "http handler query publication exposes vector compaction targets" {
     var parsed_semantic_index = try parseServerlessIndexStatusTestResponse(alloc, semantic_index.body, "semantic_idx");
     defer parsed_semantic_index.deinit();
     try std.testing.expectEqual(@as(?bool, true), parsed_semantic_index.value.status.vector_compaction_driver);
-    try std.testing.expectEqualStrings("cosine", parsed_semantic_index.value.status.vector_distance_metric.?);
+    try std.testing.expectEqualStrings(@tagName(shared_vector.default_distance_metric), parsed_semantic_index.value.status.vector_distance_metric.?);
     try std.testing.expectEqual(@as(?bool, true), parsed_semantic_index.value.status.vector_compaction_recommended);
     try std.testing.expect(parsed_semantic_index.value.status.vector_cluster_count != null);
     try std.testing.expect(parsed_semantic_index.value.status.vector_base_probe_count != null);

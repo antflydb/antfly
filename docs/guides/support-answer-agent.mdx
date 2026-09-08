@@ -21,8 +21,8 @@ antfly agents retrieval --table help \
   --indexes "title_content" \
   --fields "title,content" \
   --limit 20 \
-  --reranker '{"provider": "antfly", "model": "mixedbread-ai/mxbai-rerank-base-v1",
-               "field": "content"}' \
+  --reranker '{"provider": "antfly", "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+               "field": "content", "candidate_count": 50}' \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{"provider": "ollama", "model": "gemma3:4b"}' \
   --max-context-tokens 512 \
@@ -56,7 +56,7 @@ antfly agents retrieval --table help \
 Antfly running in standalone mode (the [Quickstart](/docs/guides/quickstart) leaves you there) and Ollama with a small model pulled:
 
 ```bash
-curl -s http://localhost:8080/db/v1/status | head -c 200
+curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
 ollama pull gemma3:4b
 ```
 
@@ -67,7 +67,7 @@ ollama pull gemma3:4b
 One embeddings index over title and content. The embedder and chunker run on Antfly Inference, inside the same process:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/help \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/help \
   -H "Content-Type: application/json" \
   -d '{
     "indexes": {
@@ -76,7 +76,7 @@ curl -X POST http://localhost:8080/db/v1/tables/help \
         "template": "{{title}} {{content}}",
         "embedder": {
           "provider": "antfly",
-          "model": "BAAI/bge-small-en-v1.5"
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
         },
         "chunker": {
           "provider": "antfly",
@@ -95,7 +95,7 @@ Every table gets a full-text index by default, so this one embeddings index is a
 ### 2. Load Your Help Articles
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/help/batch \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/help/batch \
   -H "Content-Type: application/json" \
   -d '{
     "inserts": {
@@ -136,8 +136,9 @@ antfly agents retrieval --table help \
   --limit 20 \
   --reranker '{
     "provider": "antfly",
-    "model": "mixedbread-ai/mxbai-rerank-base-v1",
-    "field": "content"
+    "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+    "field": "content",
+    "candidate_count": 50
   }' \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{
@@ -151,7 +152,7 @@ antfly agents retrieval --table help \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/agents/retrieval \
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -d '{
     "query": "Can I get my money back if I cancel?",
@@ -163,8 +164,9 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
       "limit": 20,
       "reranker": {
         "provider": "antfly",
-        "model": "mixedbread-ai/mxbai-rerank-base-v1",
-        "field": "content"
+        "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+        "field": "content",
+        "candidate_count": 50
       },
       "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
     }],
@@ -196,7 +198,7 @@ The pruner is what stops that:
 - `min_score_ratio: 0.6` drops anything scoring under 60% of the best match. If the best match is itself weak, everything goes, `hits` comes back empty, and your code can hand the conversation to a person instead of answering.
 - `max_score_gap_percent: 40` finds the elbow where relevance falls off and cuts there.
 
-Retrieve more than you need and let the pruner cut. A `limit` of 20 with a strict pruner beats a `limit` of 3 with no pruner, because the reranker sees more candidates and the model sees only the survivors. Start strict, watch what gets pruned on real questions, and loosen only when good articles are being cut.
+Let the reranker see more than the model does. A `candidate_count` of 50 with a strict pruner beats a `limit` of 3 with no pruner, because the reranker scores a wide window and the model sees only the survivors. Start strict, watch what gets pruned on real questions, and loosen only when good articles are being cut.
 
 ## Let Your Agent Drive
 

@@ -806,6 +806,9 @@ test "lite backend capabilities distinguish native and hosted profiles" {
     const hosted_caps = capabilitiesForProfile(.hosted);
     try std.testing.expect(hosted_caps.hosted_profile);
     try std.testing.expect(hosted_caps.manual_maintenance);
+    try std.testing.expect(hosted_caps.caller_supplied_artifacts);
+    try std.testing.expect(hosted_caps.no_inference_configured_ok);
+    try std.testing.expectEqual(local_runtime_available, hosted_caps.local_inference_runtime);
     try std.testing.expect(!hosted_caps.background_enrichment_runtime);
     try std.testing.expect(!hosted_caps.ttl_cleanup_runtime);
     try std.testing.expect(!hosted_caps.transaction_recovery_runtime);

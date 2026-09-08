@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SyncLevel(str, Enum):
+class SyncLevel(StrEnum):
     ENRICHMENTS = "enrichments"
     FULL_INDEX = "full_index"
     FULL_TEXT = "full_text"

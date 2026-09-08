@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphPathsResultKind(str, Enum):
+class GraphPathsResultKind(StrEnum):
     PATHS = "paths"
 
     def __str__(self) -> str:

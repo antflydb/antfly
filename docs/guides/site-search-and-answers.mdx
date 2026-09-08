@@ -21,7 +21,7 @@ Your React app has a search page and an answer box on the same Antfly table. Typ
 Antfly running with an indexed table, and Ollama with a small model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart) shows how to create one.
 
 ```bash
-curl -s http://localhost:8080/db/v1/tables/docs | head -c 300
+curl -s http://127.0.0.1:8080/db/v1/tables/docs | head -c 300
 ollama pull gemma3:4b
 ```
 
@@ -57,7 +57,7 @@ import {
   Results,
 } from '@antfly/components'
 
-const API = 'http://localhost:8080/db/v1'
+const API = 'http://127.0.0.1:8080/db/v1'
 const HEADERS = { Authorization: `ApiKey ${import.meta.env.VITE_ANTFLY_KEY}` }
 
 export default function SearchPage() {

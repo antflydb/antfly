@@ -16,30 +16,20 @@ import { Combobox } from "@/components/Combobox";
 import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connections";
 import { cn } from "@/lib/utils";
 
-export const GENERATOR_PROVIDER_DEFAULTS: Record<GeneratorProvider, string> = {
+export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "gemma-3-1b-it",
   ollama: "llama3.3:70b",
   gemini: "gemini-2.5-flash",
   openai: "gpt-4.1",
-  anthropic: "claude-sonnet-4-5-20250929",
   vertex: "gemini-2.5-flash",
-  cohere: "command-r-plus",
-  openrouter: "openai/gpt-4.1",
-  bedrock: "anthropic.claude-sonnet-4-5-20250929-v1:0",
-  mock: "mock",
 };
 
-export const GENERATOR_PROVIDER_LABELS: Record<GeneratorProvider, string> = {
+export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "Antfly (Local)",
   ollama: "Ollama (Local)",
   gemini: "Google AI (Gemini)",
   openai: "OpenAI",
-  anthropic: "Anthropic (Claude)",
   vertex: "Google Cloud Vertex AI",
-  cohere: "Cohere",
-  openrouter: "OpenRouter",
-  bedrock: "AWS Bedrock",
-  mock: "Mock (Testing)",
 };
 
 /** Default generator config used as the initial "custom" value across playgrounds. */
@@ -54,13 +44,8 @@ export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
   "gemini",
   "vertex",
   "openai",
-  "anthropic",
-  "bedrock",
   "ollama",
-  "cohere",
-  "openrouter",
   "antfly",
-  "mock",
 ];
 
 export function formatGeneratorSummary(
@@ -139,7 +124,9 @@ export function GeneratorSelector({
     if (!value) return [];
     const live = liveGenerators[value.provider] ?? [];
     const names = live.length > 0 ? live : [GENERATOR_PROVIDER_DEFAULTS[value.provider]];
-    return names.filter(Boolean).map((name) => ({ value: name, label: name }));
+    return names
+      .filter((name): name is string => Boolean(name))
+      .map((name) => ({ value: name, label: name }));
   }, [liveGenerators, value]);
 
   const handleModeChange = (nextMode: string) => {

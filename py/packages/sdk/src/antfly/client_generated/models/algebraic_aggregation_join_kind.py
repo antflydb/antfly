@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AlgebraicAggregationJoinKind(str, Enum):
+class AlgebraicAggregationJoinKind(StrEnum):
     BUCKET = "bucket"
     BUCKET_WINDOW = "bucket_window"
     NONE = "none"

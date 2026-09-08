@@ -38,6 +38,7 @@ pub const ClusterApi = struct {
         NoTables,
         BackupAlreadyExists,
         BackupRepositoryBusy,
+        BackupOutcomeAmbiguous,
         BackupManifestTooLarge,
         MethodNotAllowed,
         InternalFailure,
@@ -140,7 +141,8 @@ pub fn handleClusterBackupList(
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
     options: backups_api.BackupListOptions,
 ) !OwnedResponse {
     if (connection == null) {
@@ -151,7 +153,8 @@ pub fn handleClusterBackupList(
         .node_config = node_config,
         .connection = connection,
         .required_capability = "restore.read",
-        .io = io,
+        .network_io = network_io,
+        .filesystem_io = filesystem_io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
         return err;
@@ -172,7 +175,8 @@ pub fn handleClusterBackup(
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
     request: operation.RequestContext,
 ) !OwnedResponse {
     try request.ensureActive();
@@ -190,7 +194,8 @@ pub fn handleClusterBackup(
         .node_config = node_config,
         .connection = req.connection,
         .required_capability = "backup.write",
-        .io = io,
+        .network_io = network_io,
+        .filesystem_io = filesystem_io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -212,6 +217,11 @@ pub fn handleClusterBackup(
         error.NoTables => return .{ .status = 400, .body = try alloc.dupe(u8, "no tables to backup") },
         error.BackupAlreadyExists => return .{ .status = 409, .body = try alloc.dupe(u8, "backup id already exists") },
         error.BackupRepositoryBusy => return .{ .status = 409, .body = try alloc.dupe(u8, "backup repository is busy; retry later") },
+        error.BackupOutcomeAmbiguous => return .{
+            .status = 409,
+            .body = try backups_api.encodeBackupOutcomeAmbiguousBody(alloc, req.backup_id, null),
+            .json = true,
+        },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "backup failed") },
@@ -225,7 +235,8 @@ pub fn handleClusterRestore(
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
     request: operation.RequestContext,
 ) !OwnedResponse {
     var req = backups_api.parseClusterRestoreRequest(alloc, body) catch {
@@ -241,7 +252,8 @@ pub fn handleClusterRestore(
         .node_config = node_config,
         .connection = req.connection,
         .required_capability = "restore.read",
-        .io = io,
+        .network_io = network_io,
+        .filesystem_io = filesystem_io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -286,7 +298,7 @@ pub fn handleClusterRestore(
 }
 
 test "cluster backup APIs require named connections" {
-    var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null, null, .{});
+    var list = try handleClusterBackupList(std.testing.allocator, "s3://archive", null, undefined, null, null, null, null, .{});
     defer list.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), list.status);
 
@@ -294,6 +306,7 @@ test "cluster backup APIs require named connections" {
         std.testing.allocator,
         "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
         undefined,
+        null,
         null,
         null,
         null,
@@ -307,6 +320,7 @@ test "cluster backup APIs require named connections" {
         std.testing.allocator,
         "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
         undefined,
+        null,
         null,
         null,
         null,
@@ -366,6 +380,7 @@ test "cluster backup vtable preserves request context and canceled ingress stops
         std.testing.allocator,
         "not json",
         undefined,
+        null,
         null,
         null,
         null,

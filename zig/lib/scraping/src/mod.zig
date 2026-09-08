@@ -20,6 +20,11 @@ const Allocator = std.mem.Allocator;
 const default_max_download_size_bytes: u64 = 100 * 1024 * 1024;
 const default_download_timeout_ms: u64 = 30_000;
 
+/// Borrowed, transport-neutral cancellation for one remote-content request.
+/// Reuse objectstore's callback contract so HTTP, S3, and file sources share
+/// one operation context without coupling this library to an application.
+pub const CancellationToken = objectstore.CancellationToken;
+
 pub const DownloadedContent = struct {
     content_type: []u8,
     data: []u8,
@@ -60,6 +65,12 @@ pub const HTTPHeader = struct {
 pub const DownloadContext = struct {
     io: std.Io,
     timeout_ms: ?u64 = null,
+    cancellation: ?CancellationToken = null,
+
+    fn check(self: @This()) !void {
+        try self.io.checkCancel();
+        if (self.cancellation) |token| try token.check();
+    }
 };
 
 pub const ContentSecurityConfig = struct {
@@ -294,7 +305,7 @@ fn downloadContentOutcomeAllocImpl(
     s3_credentials: ?*const S3CredentialsConfig,
     http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
-    if (maybe_context) |context| try context.io.checkCancel();
+    if (maybe_context) |context| try context.check();
     if (uri.len >= "data:".len and std.ascii.eqlIgnoreCase(uri[0.."data:".len], "data:")) {
         const maybe_ceiling: ?DownloadCeiling = if (maybe_context) |context|
             try DownloadCeiling.init(context, security)
@@ -455,7 +466,7 @@ fn downloadHttpOutcomeAlloc(
     security: ?*const ContentSecurityConfig,
     http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
-    try context.io.checkCancel();
+    try context.check();
     const ceiling = try DownloadCeiling.init(context, security);
     var client = httpx.Client.initWithConfig(alloc, context.io, httpClientConfig(security));
     defer client.deinit();
@@ -492,6 +503,10 @@ fn downloadHttpOutcomeAlloc(
             .follow_redirects = false,
             .timeout_ms = try ceiling.remainingTimeoutMs(),
             .max_response_size = maxDownloadSize(security),
+            .cancellation = if (context.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
         }) catch |err| switch (err) {
             error.AddressRejected => return error.PrivateIpBlocked,
             error.ResponseTooLarge => return error.StreamTooLong,
@@ -678,13 +693,15 @@ fn effectiveDownloadTimeoutMs(context: DownloadContext, security: ?*const Conten
 
 const DownloadCeiling = struct {
     io: std.Io,
+    cancellation: ?CancellationToken,
     timeout_ms: u64,
     started_at: std.Io.Timestamp,
 
     fn init(context: DownloadContext, security: ?*const ContentSecurityConfig) !DownloadCeiling {
-        try context.io.checkCancel();
+        try context.check();
         return .{
             .io = context.io,
+            .cancellation = context.cancellation,
             .timeout_ms = effectiveDownloadTimeoutMs(context, security),
             .started_at = std.Io.Timestamp.now(context.io, .awake),
         };
@@ -692,6 +709,7 @@ const DownloadCeiling = struct {
 
     fn remainingTimeoutMs(self: *const DownloadCeiling) !u64 {
         try self.io.checkCancel();
+        if (self.cancellation) |token| try token.check();
         if (self.timeout_ms == 0) return 0;
         const elapsed_ns = std.Io.Timestamp.durationTo(
             self.started_at,
@@ -738,10 +756,10 @@ fn downloadFileAllocWithContext(
     // blocked on a network filesystem, so reject a claimed time ceiling
     // instead of returning after it has already expired.
     if ((context.timeout_ms orelse 0) != 0) return error.FileTimeoutUnsupported;
-    try context.io.checkCancel();
+    try context.check();
     var downloaded = try downloadFileAllocWithIo(alloc, context.io, path, security);
     errdefer downloaded.deinit(alloc);
-    try context.io.checkCancel();
+    try context.check();
     return downloaded;
 }
 
@@ -846,6 +864,7 @@ fn downloadS3Alloc(
     const range_length = std.math.add(u64, max_size, 1) catch null;
     var result = store_client.getObject(bucket, key, .{
         .range = if (range_length) |length| .{ .offset = 0, .length = length } else null,
+        .cancellation = context.cancellation,
     }) catch |err| return normalizeS3DownloadError(err);
     defer result.deinit(alloc);
     if (result.body.len > max_size) return error.StreamTooLong;

@@ -10,7 +10,6 @@ Antfly now has two native bounded-agent APIs in the Zig implementation:
 The A2A surface is an adapter over those native agents:
 
 - `POST /a2a`
-- `GET /.well-known/agent.json`
 - `GET /.well-known/agent-card.json`
 
 MCP remains the deterministic database/tool protocol. It exposes exact table, index, document, and query operations.
@@ -283,7 +282,6 @@ It should not duplicate query planning, retrieval strategy selection, tool polic
 
 The A2A agent card is served from:
 
-- `GET /.well-known/agent.json`
 - `GET /.well-known/agent-card.json`
 
 The reusable A2A dispatcher emits:

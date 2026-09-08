@@ -2250,7 +2250,7 @@ pub fn countArtifactsByKind(manifest: manifest_mod.Manifest, kind: manifest_mod.
 }
 
 pub const VectorArtifactInfo = struct {
-    metric: shared_vector.DistanceMetric = .cosine,
+    metric: shared_vector.DistanceMetric = shared_vector.default_distance_metric,
     cluster_count: usize = 0,
     base_probe_count: u32 = 2,
     shortlist_multiplier: u32 = 2,

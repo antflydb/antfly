@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceEmbedRequestInputType(str, Enum):
+class InferenceEmbedRequestInputType(StrEnum):
     CLASSIFICATION = "classification"
     CLUSTERING = "clustering"
     DOCUMENT = "document"

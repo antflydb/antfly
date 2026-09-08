@@ -29,6 +29,7 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const coverage_policy = @import("../api/coverage_policy.zig");
 const table_index_config = @import("../api/table_index_config.zig");
 const indexes_api = @import("../api/indexes.zig");
+const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 const table_reads = @import("../api/table_reads.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const tables_api = @import("../api/tables.zig");
@@ -364,9 +365,8 @@ pub fn reconcileDbIndexTargetWithOptions(
     options: ReconcileDbIndexOptions,
 ) !ProvisionSummary {
     if (!dbIndexReconciliationCanMutate(db)) return .{};
-    if (index_name.len == 0 or
-        std.mem.eql(u8, index_name, "resolvers") or
-        std.mem.eql(u8, index_name, "enrichments")) return error.InvalidTableIndexMetadata;
+    if (index_name.len == 0 or indexes_api.isReservedIndexMetadataEntry(index_name))
+        return error.InvalidTableIndexMetadata;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
@@ -1006,8 +1006,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     while (it.next()) |entry| {
         // Reserved top-level sections are handled by their own reconcilers, not
         // by the index reconciler.
-        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (indexes_api.isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
         try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
     }
@@ -1096,7 +1095,7 @@ fn desiredIndexContains(object: std.json.ObjectMap, name: []const u8) !bool {
         }
         return false;
     }
-    if (std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments")) return false;
+    if (indexes_api.isReservedIndexMetadataEntry(name)) return false;
     return object.contains(name);
 }
 
@@ -1264,7 +1263,7 @@ fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: [
         i -= 1;
         const cfg = existing[i];
         if (findEnrichmentByName(desired, cfg.name)) |desired_cfg| {
-            if (enrichmentConfigsEqual(cfg, desired_cfg)) continue;
+            if (try enrichmentConfigsEqual(alloc, cfg, desired_cfg)) continue;
         }
         if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
             if (deleted) removed += 1;
@@ -1321,7 +1320,7 @@ fn findEnrichment(
     return null;
 }
 
-fn enrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.EnrichmentConfig) bool {
+fn enrichmentConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.EnrichmentConfig, b: db_mod.types.EnrichmentConfig) !bool {
     return a.kind == b.kind and
         std.mem.eql(u8, a.name, b.name) and
         std.mem.eql(u8, a.field, b.field) and
@@ -1333,7 +1332,7 @@ fn enrichmentConfigsEqual(a: db_mod.types.EnrichmentConfig, b: db_mod.types.Enri
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
-        std.mem.eql(u8, a.producer_json, b.producer_json) and
+        try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.meta.eql(a.execution, b.execution);
 }
 
@@ -3078,7 +3077,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         },
         &.{.{
             .group_id = 2001,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/2001",
             .artifact_size_bytes = artifact_integrity.size_bytes,
@@ -3106,7 +3105,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         &.{.{
             .group_id = 2001,
             .table_id = 7,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .restore_backup_id = "snap1",
             .restore_artifact_backup_id = "snap1",
@@ -3119,7 +3118,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         .{
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         },
     );
@@ -3143,6 +3142,9 @@ test "table provisioner restores local shard data from metadata restore intent" 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -3267,7 +3269,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         },
         &.{.{
             .group_id = 2001,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/2001",
             .artifact_size_bytes = artifact_integrity.size_bytes,
@@ -3296,7 +3298,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         &.{.{
             .group_id = 2001,
             .table_id = 7,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .range_id = 2001,
             .restore_backup_id = "snap1",
@@ -3310,7 +3312,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         .{
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         },
     ));

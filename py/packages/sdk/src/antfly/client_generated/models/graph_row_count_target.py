@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphRowCountTarget(str, Enum):
+class GraphRowCountTarget(StrEnum):
     VALUE_0 = "*"
 
     def __str__(self) -> str:

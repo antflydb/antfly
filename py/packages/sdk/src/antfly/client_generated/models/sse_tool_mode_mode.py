@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SSEToolModeMode(str, Enum):
+class SSEToolModeMode(StrEnum):
     NATIVE = "native"
     STRUCTURED_OUTPUT = "structured_output"
 

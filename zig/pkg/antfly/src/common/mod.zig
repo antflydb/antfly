@@ -17,6 +17,7 @@ pub const config = @import("config.zig");
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
 pub const secrets = @import("secrets.zig");
+pub const credential_source_identity = @import("credential_source_identity.zig");
 pub const remote_content_runtime = @import("remote_content_runtime.zig");
 pub const health_server = @import("health_server.zig");
 pub const runtime_lifecycle = @import("runtime_lifecycle.zig");
@@ -28,6 +29,7 @@ pub const fs_paths = @import("fs_paths.zig");
 pub const byte_copy = @import("byte_copy.zig");
 pub const cache_budget = @import("cache_budget.zig");
 pub const threaded_io_limits = @import("threaded_io_limits.zig");
+pub const threaded_connect_io = @import("threaded_connect_io.zig");
 
 test {
     _ = provider_registry;
@@ -35,6 +37,7 @@ test {
     _ = http;
     _ = audio_runtime;
     _ = secrets;
+    _ = credential_source_identity;
     _ = remote_content_runtime;
     _ = health_server;
     _ = runtime_lifecycle;
@@ -46,4 +49,5 @@ test {
     _ = byte_copy;
     _ = cache_budget;
     _ = threaded_io_limits;
+    _ = threaded_connect_io;
 }

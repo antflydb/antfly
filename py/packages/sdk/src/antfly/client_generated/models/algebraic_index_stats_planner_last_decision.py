@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AlgebraicIndexStatsPlannerLastDecision(str, Enum):
+class AlgebraicIndexStatsPlannerLastDecision(StrEnum):
     FALLBACK = "fallback"
     SELECTED = "selected"
 

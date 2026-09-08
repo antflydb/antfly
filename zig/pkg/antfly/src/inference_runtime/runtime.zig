@@ -38,8 +38,8 @@ pub fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" }) catch "./ml";
 }
 
-/// Compatibility wrapper for callers that also resolve a data directory.
-/// Model discovery deliberately remains independent of the database data root.
+/// Compatibility wrappers for callers that also resolve a data directory.
+/// Inference asset discovery deliberately remains independent of the database data root.
 pub fn defaultModelsDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
     _ = data_dir;
     return defaultModelsDir(allocator);
@@ -54,14 +54,16 @@ pub fn defaultModelsDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: [
 }
 
 pub fn defaultMlDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
-    if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value| return value;
-    return std.fs.path.join(allocator, &.{ data_dir, "inference", "ml" }) catch defaultMlDir(allocator);
+    _ = data_dir;
+    return defaultMlDir(allocator);
 }
 
 pub fn defaultMlDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    _ = data_dir;
     if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value|
         return try allocator.dupe(u8, value);
-    return try std.fs.path.join(allocator, &.{ data_dir, "inference", "ml" });
+    const home = platform.env.getenv("HOME") orelse return try allocator.dupe(u8, "./ml");
+    return try std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" });
 }
 
 pub const SpawnedServer = struct {
@@ -97,7 +99,7 @@ pub const SpawnedServer = struct {
 const EmbeddedServerConfig = struct {
     api_url: []const u8,
     models_dir: ?[]const u8 = null,
-    allow_unknown_models: bool = false,
+    allow_unknown_models: bool = true,
     ml_dir: ?[]const u8 = null,
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
@@ -204,6 +206,10 @@ pub fn runFromIterator(
     const io = init.io;
 
     const command = args.next() orelse "run";
+
+    if (std.mem.eql(u8, command, "_worker")) {
+        return @import("../standalone/inference_worker.zig").runChild(alloc, io);
+    }
 
     if (std.mem.eql(u8, command, "run")) {
         if (runHelpRequested(args)) {
@@ -315,7 +321,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var kernel_jit_max_cache_bytes_mb_override: ?usize = null;
     var kernel_jit_preload_budget_ms_override: ?u64 = null;
     var allow_insecure_public_bind = false;
-    var allow_unknown_models = false;
+    var allow_unknown_models = true;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
     defer preload_models.deinit(alloc);
 
@@ -441,12 +447,15 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
+        .process_termination_available = platform.env.getenvBool(
+            platform.inference_process_supervisor.worker_env,
+        ),
     });
     defer node.deinit();
 
     // Bind the caller-owned runtime before warmup so model loading, tokenizer
     // work, and backend sessions all compose with the same executor.
-    node.attachIo(io);
+    try node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     node.startReadinessInventory(io);
@@ -521,7 +530,7 @@ pub fn spawnServerProcess(
     errdefer alloc.free(host_dup);
 
     try node.validateHttpBind(host_dup);
-    node.attachIo(io);
+    try node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
     node.startReadinessInventory(io);
 
@@ -549,10 +558,8 @@ pub fn spawnServerProcess(
 }
 
 fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
-    var models_dir: []const u8 = defaultModelsDir(alloc);
-    if (args.next()) |arg| {
-        if (!std.mem.startsWith(u8, arg, "--")) models_dir = arg;
-    }
+    const configured_models_dir = try parseListModelsDir(args);
+    const models_dir: []const u8 = configured_models_dir orelse defaultModelsDir(alloc);
 
     var reg = inference.registry.ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
@@ -563,6 +570,21 @@ fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iter
     for (models) |m| {
         std.debug.print("{s:<12} {s}\n", .{ @tagName(m.kind), m.name });
     }
+}
+
+fn parseListModelsDir(args: *std.process.Args.Iterator) !?[]const u8 {
+    var models_dir: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--models-dir")) {
+            if (models_dir != null) return error.InvalidArguments;
+            models_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--") or models_dir != null)
+            return error.InvalidArguments;
+        models_dir = arg;
+    }
+    return models_dir;
 }
 
 fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -855,7 +877,7 @@ fn printUsage() void {
         \\  --kernel-jit-max-cache-mb <n> Persistent JIT cache limit; 0 disables persistence
         \\  --kernel-jit-preload-budget-ms <n> Per-session best-effort startup JIT budget
         \\  --preload-model <kind:name|kind:backend:name>  Preload and warm a configured model before serving
-        \\  --allow-unknown-models  Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
+        \\  --allow-unknown-models  Accepted for compatibility; unknown architectures are attempted by default
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)
@@ -932,6 +954,20 @@ test "inference run detects trailing help without consuming arguments" {
     var no_help_argv = [_][*:0]const u8{ "--host", "127.0.0.1" };
     var no_help_args = std.process.Args.Iterator.init(.{ .vector = no_help_argv[0..] });
     try std.testing.expect(!runHelpRequested(&no_help_args));
+}
+
+test "inference list accepts models directory before or after flags" {
+    var flag_argv = [_][*:0]const u8{ "--models-dir", "/tmp/models" };
+    var flag_args = std.process.Args.Iterator.init(.{ .vector = flag_argv[0..] });
+    try std.testing.expectEqualStrings("/tmp/models", (try parseListModelsDir(&flag_args)).?);
+
+    var positional_argv = [_][*:0]const u8{"/tmp/positional-models"};
+    var positional_args = std.process.Args.Iterator.init(.{ .vector = positional_argv[0..] });
+    try std.testing.expectEqualStrings("/tmp/positional-models", (try parseListModelsDir(&positional_args)).?);
+
+    var invalid_argv = [_][*:0]const u8{ "--unknown", "/tmp/models" };
+    var invalid_args = std.process.Args.Iterator.init(.{ .vector = invalid_argv[0..] });
+    try std.testing.expectError(error.InvalidArguments, parseListModelsDir(&invalid_args));
 }
 
 test "inference pull recognizes help before model resolution" {

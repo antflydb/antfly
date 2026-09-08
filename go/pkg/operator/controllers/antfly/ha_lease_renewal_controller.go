@@ -8,12 +8,16 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 const (
@@ -26,6 +30,59 @@ const (
 // capture and every topology transition stay on the main reconciler.
 type haLeaseRenewalReconciler struct {
 	parent *AntflyClusterReconciler
+}
+
+func haLeaseRenewalControllerOptions() controller.Options {
+	// Runtime authority expires on the data-plane watchdog clock, which is
+	// intentionally shorter than a conventional controller-manager leader
+	// election. Waiting for manager leadership here would therefore turn an
+	// ordinary operator rollout or restart into a healthy primary self-fence.
+	//
+	// This is safe to run on every operator replica: the reconciler can only
+	// renew the unchanged, proof-authenticated holder (or an exact committed
+	// time-only handoff), uses current API-server Lease boundaries, and treats
+	// optimistic-lock conflicts as another replica having made progress. Every
+	// topology mutation remains on the leader-elected main reconciler.
+	needLeaderElection := false
+	return controller.Options{
+		MaxConcurrentReconciles: 16,
+		NeedLeaderElection:      &needLeaderElection,
+	}
+}
+
+func haLeaseRenewalEventPredicate() predicate.Predicate {
+	// Status observations are intentionally excluded. The controller's own
+	// fixed-cadence RequeueAfter is the renewal clock; allowing the main
+	// reconciler's status writes to enqueue this key can turn health churn into
+	// an unbounded proof-request loop and starve that clock. Spec generations
+	// still wake renewal immediately when HA is enabled, disabled, or changed.
+	return predicate.GenerationChangedPredicate{}
+}
+
+func antflyClusterDesiredStateEventPredicate() predicate.Predicate {
+	// Status is operator-owned observed state. Re-enqueueing the full
+	// reconciler for its own status writes creates a positive feedback loop
+	// when a health counter or timestamp advances. Desired-state metadata must
+	// still wake reconciliation because Colony intentionally carries topology
+	// identity and seed intent in labels/annotations, while finalizer and
+	// deletion changes drive safe cleanup.
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(update event.UpdateEvent) bool {
+			if update.ObjectOld == nil || update.ObjectNew == nil {
+				return false
+			}
+			oldObject := update.ObjectOld
+			newObject := update.ObjectNew
+			return oldObject.GetGeneration() != newObject.GetGeneration() ||
+				!reflect.DeepEqual(oldObject.GetLabels(), newObject.GetLabels()) ||
+				!reflect.DeepEqual(oldObject.GetAnnotations(), newObject.GetAnnotations()) ||
+				!reflect.DeepEqual(oldObject.GetFinalizers(), newObject.GetFinalizers()) ||
+				!reflect.DeepEqual(oldObject.GetDeletionTimestamp(), newObject.GetDeletionTimestamp())
+		},
+	}
 }
 
 func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -42,10 +99,13 @@ func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	proofCtx, cancel := context.WithTimeout(ctx, haLeaseProofTimeout)
 	defer cancel()
-	if err := r.parent.observeHACurrentPrimaryWatchdogProof(proofCtx, cluster); err == nil {
-		if err := r.parent.renewCurrentHAFencingLease(proofCtx, cluster); err != nil && !apierrors.IsConflict(err) {
-			return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, err
-		}
+	// Ordinary holder renewal independently rejects a missing or stale proof.
+	// Always run the narrow Lease path so an exact committed former-controller
+	// handoff can advance renewTime while the successor proof endpoint is
+	// intentionally transient during receipt binding.
+	_ = r.parent.observeHACurrentPrimaryWatchdogProof(proofCtx, cluster)
+	if err := r.parent.renewCurrentHAFencingLease(ctx, cluster); err != nil && !apierrors.IsConflict(err) {
+		return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, err
 	}
 	return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, nil
 }

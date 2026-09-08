@@ -15,18 +15,55 @@
 const std = @import("std");
 const core = @import("../core/mod.zig");
 const replica = @import("replica.zig");
+const snapshot_transport_iface = @import("snapshot_transport_iface.zig");
+
+pub const CatalogCapabilities = struct {
+    max_read_record_version: u16 = 1,
+    max_write_record_version: u16 = 1,
+    preserves_unknown_extensions: bool = false,
+    writes_explicit_snapshot_format: bool = true,
+
+    pub fn supportsRecord(self: CatalogCapabilities, record: replica.ReplicaRecord) bool {
+        const required_version: u16 = switch (record.bootstrap) {
+            .fetch_snapshot => |snapshot| if (snapshot.locator.format == snapshot_transport_iface.SnapshotArtifactFormat.unknown)
+                1
+            else
+                2,
+            .empty, .persisted => 1,
+        };
+        if (required_version > self.max_write_record_version) return false;
+        return required_version < 2 or self.writes_explicit_snapshot_format;
+    }
+};
 
 pub const ReplicaCatalog = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        capabilities: ?*const fn (ptr: *anyopaque) CatalogCapabilities = null,
+        validate_replica: ?*const fn (ptr: *anyopaque, record: replica.ReplicaRecord) anyerror!void = null,
         upsert_replica: *const fn (ptr: *anyopaque, record: replica.ReplicaRecord) anyerror!void,
         remove_replica: *const fn (ptr: *anyopaque, group_id: core.types.GroupId) anyerror!bool,
         list_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]replica.ReplicaRecord,
     };
 
+    pub fn capabilities(self: ReplicaCatalog) CatalogCapabilities {
+        const get = self.vtable.capabilities orelse return .{};
+        return get(self.ptr);
+    }
+
+    /// Allocation-free compatibility preflight. Admission must call this
+    /// before publishing a group or materializing a snapshot.
+    pub fn validateReplica(self: ReplicaCatalog, record: replica.ReplicaRecord) !void {
+        if (self.vtable.validate_replica) |validate|
+            try validate(self.ptr, record);
+        if (!self.capabilities().supportsRecord(record))
+            return error.ReplicaCatalogRecordUnsupported;
+    }
+
     pub fn upsertReplica(self: ReplicaCatalog, record: replica.ReplicaRecord) !void {
+        try self.validateReplica(record);
         return try self.vtable.upsert_replica(self.ptr, record);
     }
 

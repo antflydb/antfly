@@ -5,6 +5,8 @@
 
 Python SDK for [Antfly](https://github.com/antflydb/antfly) - a distributed key-value store and search engine.
 
+Supported Python versions: 3.11 through 3.14.
+
 For the nightly version, visit the [TestPyPI page](https://test.pypi.org/project/antfly-sdk/).
 
 ## Installation

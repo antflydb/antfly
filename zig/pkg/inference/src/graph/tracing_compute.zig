@@ -191,6 +191,7 @@ pub const TracingCompute = struct {
         .deinitBackend = &deinitBackend,
         .freeTensor = &freeTensor,
         .getWeight = &getWeight,
+        .acquireWeight = &getWeight,
         .prefetchWeightHint = &prefetchWeightHint,
         .drainPrefetchBudget = &drainPrefetchBudget,
         .embeddingLookup = &embeddingLookup,
@@ -199,6 +200,7 @@ pub const TracingCompute = struct {
         .layerNorm = &layerNormOp,
         .rmsNorm = &rmsNormOp,
         .gelu = &geluOp,
+        .geluExact = &geluExactOp,
         .relu = &reluOp,
         .silu = &siluOp,
         .quickGelu = &quickGeluOp,
@@ -399,6 +401,13 @@ pub const TracingCompute = struct {
         var tc = fromCtx(ctx);
         var b = Builder.init(tc.getGraphMut());
         const id = try b.gelu(nodeIdFromCT(input));
+        return tc.makeHandle(id);
+    }
+
+    fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        var tc = fromCtx(ctx);
+        var b = Builder.init(tc.getGraphMut());
+        const id = try b.geluExact(nodeIdFromCT(input));
         return tc.makeHandle(id);
     }
 

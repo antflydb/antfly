@@ -17,7 +17,7 @@ An artifact-backed index consumes the records that named enrichments produce, ra
 Confirm the deployment supports it first:
 
 ```bash
-curl http://localhost:8080/db/v1/status
+curl http://127.0.0.1:8080/db/v1/status
 ```
 
 `index_capabilities.artifact_sources` must be `true`. Embedded, standalone, and distributed deployments support artifact sources. Serverless rejects them and does not emulate older artifact-index behavior.
@@ -107,6 +107,8 @@ Creation starts materialization and replay; it does not mean coverage is complet
 - `readiness.complete` is the convergence authority: every source is fully covered.
 - `pending_reasons` gives typed aggregate blockers or failure reasons.
 - `readiness.sources` lists each artifact stream in configuration order with its state, completeness, and typed blockers, so document-vector lag and chunk-vector lag show up separately.
+
+Every index kind also reports a catalog-assigned `incarnation`, at the status root and inside `readiness`. A waiter succeeds only on a runtime observation of that same definition, so dropping and recreating an index under the same name cannot reuse stale readiness or searchable counts.
 
 Internal replay watermarks are diagnostics only.
 

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceModelBackend(str, Enum):
+class InferenceModelBackend(StrEnum):
     AUTO = "auto"
     CUDA = "cuda"
     METAL = "metal"

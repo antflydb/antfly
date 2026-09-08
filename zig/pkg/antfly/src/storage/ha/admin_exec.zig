@@ -2772,6 +2772,8 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
         "2",
         "--new-epoch",
         "2",
+        "--generation",
+        "1",
         "--required-lsn",
         "1",
         "--observed-lsn",

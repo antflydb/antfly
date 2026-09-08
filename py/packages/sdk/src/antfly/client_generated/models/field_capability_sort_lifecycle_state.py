@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class FieldCapabilitySortLifecycleState(str, Enum):
+class FieldCapabilitySortLifecycleState(StrEnum):
     ACCELERATED = "accelerated"
     COVERED = "covered"
     DECLARED = "declared"

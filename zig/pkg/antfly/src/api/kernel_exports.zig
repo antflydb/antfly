@@ -401,6 +401,7 @@ pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthCo
         .post => .POST,
         .put => .PUT,
         .delete => .DELETE,
+        .patch => .PATCH,
     }, target) catch |err| return fail(err);
     defer http_request.deinit();
     const input_headers = if (request.headers_ptr) |ptr| ptr[0..request.headers_len] else &.{};
@@ -441,6 +442,7 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
         .post => .POST,
         .put => .PUT,
         .delete => .DELETE,
+        .patch => .PATCH,
     }, target) catch |err| return fail(err);
     defer http_request.deinit();
     for (input_headers) |header|
@@ -533,6 +535,7 @@ fn ManifestServer(comptime prefix: []const u8) type {
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
+                .patch => .PATCH,
             }, prefix ++ path, handler) catch |err| {
                 std.log.err("API kernel route manifest rejected method={s} path={s} err={}", .{
                     @tagName(method),
@@ -573,6 +576,10 @@ fn ManifestServer(comptime prefix: []const u8) type {
         pub fn delete(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.delete, path, handler);
         }
+
+        pub fn patch(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            try self.register(.patch, path, handler);
+        }
     };
 }
 
@@ -587,6 +594,7 @@ fn routeMetadata(method: abi.HttpMethod, path: []const u8) RouteMetadata {
         .post => "POST",
         .put => "PUT",
         .delete => "DELETE",
+        .patch => "PATCH",
     };
     inline for (.{ metadata_openapi.server.routes, usermgr_openapi.server.routes }) |routes| {
         for (routes) |route| {

@@ -3,6 +3,11 @@ title: Antfly Lite
 order: 5
 sidebar: concepts
 description: How the embedded single-file profile of Antfly works, what it shares with a normal instance, and how data moves between the two
+prerequisites:
+  - "Antfly CLI built or installed"
+difficulty: intermediate
+estimatedTime: "20 min"
+tags: [lite, embedded, local-first, backup, migration]
 ---
 
 <Questions>
@@ -47,9 +52,11 @@ antfly lite status app.aflite
 | Extension | What it is | Use it for |
 |-----------|-----------|------------|
 | `.aflite` | The live embedded database | The file your application opens |
-| `.afb` | A portable Antfly backup archive | Archival retention, object-storage uploads, repeatable migrations, restoring into a normal instance |
+| `.afb` | An Antfly Backup Bundle | Archival retention, object-storage uploads, repeatable migrations, restoring into a normal instance |
 
-Never treat `.aflite` as the backup format. A normal Antfly can restore directly from one, but that is a convenience for promotion, not an archive. The `.aflite` open path accepts the documented v1 native format and fails explicitly on unknown versions or invalid headers; pre-release directory and LSM-container experiments are not read. To keep one of those, export it with the matching development build and restore the resulting `.afb`.
+An `.afb` bundle's manifest names its representation: `portable` (logical records) or `native` (physical generations). Lite writes and reads the portable representation; a normal instance can also package native generations in the same envelope. AFB1 portable archives remain readable, and new bundles use AFB2, which declares the representation explicitly. The Lite `backup` and `export` commands emit a self-contained `full` bundle. AFB2 also defines `delta` bundles against an exact base for incremental repository workflows; a delta is never treated as a self-contained archive.
+
+Never treat `.aflite` as the backup format. A normal Antfly can restore directly from one, but that is a convenience for promotion, not an archive. The `.aflite` open path accepts the documented v1 native format and fails explicitly on unknown versions or invalid headers; pre-release directory and LSM-container experiments are not read. To keep one of those, export it with the matching development build and restore the resulting portable AFB1 or AFB2 bundle.
 
 ## Writes, Reads, and Indexes
 
@@ -159,9 +166,9 @@ antfly lite restore app.afb --out restored.aflite
 antfly lite snapshot app.aflite --out copy.aflite
 ```
 
-`backup` writes a portable `.afb`. `restore` creates a new Lite database from one. `snapshot` copies a stable live checkpoint of the `.aflite` file itself, which is the right tool for local copies, test fixtures, and handing a database to another Lite application.
+`backup` writes a self-contained AFB2 bundle with the portable representation. Its manifest maps logical records to unique content digests, and a fixed trailer locates the digest index so a restore runs in bounded memory. A delta bundle, when a repository or export workflow supplies one, names the exact base-manifest digest it depends on and fails closed if that base is unavailable. `restore` creates a new Lite database from a bundle. `snapshot` copies a stable live checkpoint of the `.aflite` file itself, which is the right tool for local copies, test fixtures, and handing a database to another Lite application.
 
-`import` loads into a database that already exists:
+`import` loads a portable AFB1 or AFB2 bundle into a database that already exists:
 
 ```bash
 antfly lite init empty.aflite
@@ -179,12 +186,12 @@ Both directions are logical backup and restore. The portable stream carries docu
 
 ```bash
 antfly lite promote app.aflite \
-  --target http://localhost:8080 \
+  --target http://127.0.0.1:8080 \
   --table docs \
   --location file:///tmp/antfly_backups
 ```
 
-`antfly restore --input app.aflite --table docs --url http://localhost:8080` does the same thing through the normal restore command. Either way, omitting `--location` stages the backup under `~/.antfly/lite/backups`; pass it when the target needs a shared `file://`, `s3://`, or `gs://` location. For a repeatable release or disaster-recovery workflow, make the `.afb` explicit first:
+`antfly restore --input app.aflite --table docs --url http://127.0.0.1:8080` does the same thing through the normal restore command. Either way, omitting `--location` stages the backup under `~/.antfly/lite/backups`; pass it when the target needs a shared `file://`, `s3://`, or `gs://` location. For a repeatable release or disaster-recovery workflow, make the `.afb` explicit first:
 
 ```bash
 antfly lite backup app.aflite --out app.afb
@@ -192,17 +199,20 @@ antfly restore \
   --input app.afb \
   --table docs \
   --location file:///tmp/antfly_backups \
-  --url http://localhost:8080
+  --url http://127.0.0.1:8080
 ```
 
-**A normal instance into Lite.** Back up the table, then restore or import the `.afb`:
+**A normal instance into Lite.** Back up the table with `--format portable` (Lite cannot read a native bundle), then restore or import it:
 
 ```bash
 antfly backup \
   --table docs \
+  --backup-id docs-export \
+  --connection archive-writer \
+  --format portable \
   --out docs.afb \
   --location file:///tmp/antfly_backups \
-  --url http://localhost:8080
+  --url http://127.0.0.1:8080
 
 antfly lite restore docs.afb --out docs.aflite
 ```
@@ -280,7 +290,17 @@ func main() {
 }
 ```
 
-`Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `antflylite.InferenceModeCallerSuppliedArtifacts` and `antflylite.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (`zig build capi` in `zig/`, then `go test -tags antflylite_capi ./...` in `go/pkg/antflylite`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup).
+`Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `antflylite.InferenceModeCallerSuppliedArtifacts` and `antflylite.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags antflylite_capi ./...` in `go/pkg/antflylite`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup). Both are gated by `zig build lite-test` against the built `libantfly`.
+
+## Building from Source
+
+From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-out/bin/antfly` together with the `libantfly` library and its C header. It reuses the standalone runtime archives, including the API and inference runtimes that `lite serve` needs, and runs no tests. For the full Antfly CLI with the Lite commands and the C library, use the existing targets:
+
+```bash
+zig build antfly capi
+```
+
+When you embed a local inference runtime, pass `-Dlite-local-inference-runtime=true` so Lite status and the bindings advertise it; the flag declares the capability and does not package a separate runtime. `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
 
 ## Maintenance
 
@@ -296,7 +316,8 @@ For a production application, pair regular `.afb` backups with `check`.
 
 - **One writer, one machine.** Lite pins one shard and one replica. If two processes need to write the same data, run a normal instance.
 - **Bring your own vectors, or defer them.** With no inference runtime, Lite still indexes and queries the embeddings you supply. Configure a remote provider or ship the full build when the application itself must embed.
-- **Ship the file, back up the archive.** Snapshot `.aflite` to hand a database to another Lite app. Write an `.afb` for anything that has to outlive the storage engine.
+- **Ship the file, back up the bundle.** Snapshot `.aflite` to hand a database to another Lite app. Write a full `.afb` for anything that has to outlive the storage engine: archival retention, object-storage transfer, restore into a normal instance, cross-version migration.
+- **Portable for Lite, native for speed.** Choose the portable representation whenever Lite or another engine will read the bundle. Choose native only for fast restore into a compatible normal Antfly runtime.
 - **Promote when you outgrow it.** The path to a normal instance is one `promote`; nothing about the data model changes.
 
 ## Let Your Agent Drive

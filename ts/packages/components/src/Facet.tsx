@@ -1,5 +1,5 @@
 import type { AggregationBucket } from "@antfly/sdk";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useSharedContext } from "./SharedContext";
 import { disjunctsFrom, toTermQueries } from "./utils";
 
@@ -20,6 +20,19 @@ export interface FacetProps {
       isChecked: (item: AggregationBucket) => boolean;
     }
   ) => ReactNode;
+}
+
+export function facetFilterMatches(
+  key: string,
+  filterValue: string,
+  modifier?: (value: string) => string
+): boolean {
+  if (!modifier) return key.toLowerCase().includes(filterValue.toLowerCase());
+  try {
+    return new RegExp(modifier(filterValue), "i").test(key);
+  } catch {
+    return false;
+  }
 }
 
 export default function Facet({
@@ -46,10 +59,16 @@ export default function Facet({
   const { result } = widget || {};
   // Facet component always expects a single array, not array of arrays
   const rawFacetData = result?.facetData;
-  const data: AggregationBucket[] =
-    rawFacetData && Array.isArray(rawFacetData) && !Array.isArray(rawFacetData[0])
-      ? (rawFacetData as AggregationBucket[])
-      : [];
+  const data = useMemo(() => {
+    const buckets: AggregationBucket[] =
+      rawFacetData && Array.isArray(rawFacetData) && !Array.isArray(rawFacetData[0])
+        ? (rawFacetData as AggregationBucket[])
+        : [];
+    if (!filterValue) return buckets;
+    return buckets.filter((bucket) =>
+      facetFilterMatches(bucket.key, filterValue, filterValueModifier)
+    );
+  }, [rawFacetData, filterValue, filterValueModifier]);
 
   // Update widgets properties on state change.
   useEffect(() => {
@@ -63,9 +82,9 @@ export default function Facet({
       query: disjunctsFrom(toTermQueries(fields, value)),
       value,
       table: table,
-      configuration: { size, filterValue, fields, filterValueModifier },
+      configuration: { size, fields },
     });
-  }, [dispatch, id, size, filterValue, value, fields, filterValueModifier, table]);
+  }, [dispatch, id, size, value, fields, table]);
 
   // If widget value was updated elsewhere (ex: from active filters deletion)
   // We have to update and dispatch the component.

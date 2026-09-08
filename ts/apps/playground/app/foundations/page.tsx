@@ -72,7 +72,12 @@ const SEMANTIC_COLORS: TokenDef[] = [
   { name: "Card", varName: "--card", light: "#ffffff", dark: "#1c1c1c" },
   { name: "Card foreground", varName: "--card-foreground", light: "#1b1b1a", dark: "#ededec" },
   { name: "Popover", varName: "--popover", light: "#ffffff", dark: "#1c1c1c" },
-  { name: "Popover foreground", varName: "--popover-foreground", light: "#1b1b1a", dark: "#ededec" },
+  {
+    name: "Popover foreground",
+    varName: "--popover-foreground",
+    light: "#1b1b1a",
+    dark: "#ededec",
+  },
   {
     name: "Primary",
     varName: "--primary",
@@ -88,7 +93,12 @@ const SEMANTIC_COLORS: TokenDef[] = [
     description: "Ink on amber fills. Never use white on amber.",
   },
   { name: "Secondary", varName: "--secondary", light: "#f2f2f1", dark: "#1a1a1a" },
-  { name: "Secondary foreground", varName: "--secondary-foreground", light: "#1b1b1a", dark: "#ededec" },
+  {
+    name: "Secondary foreground",
+    varName: "--secondary-foreground",
+    light: "#1b1b1a",
+    dark: "#ededec",
+  },
   { name: "Muted", varName: "--muted", light: "#f2f2f1", dark: "#1a1a1a" },
   { name: "Muted foreground", varName: "--muted-foreground", light: "#54534f", dark: "#b2b1ad" },
   { name: "Accent", varName: "--accent", light: "#f2f2f1", dark: "#1a1a1a" },
@@ -359,8 +369,9 @@ export default function FoundationsPage() {
       <section className="space-y-6">
         <SectionHeading eyebrow="Color" title="Chart palette" />
         <p className="max-w-2xl text-sm text-muted-foreground">
-          Amber leads, then the semantic family. <code className="font-mono text-xs">--chart-2</code>{" "}
-          is muted neutral so single-series charts default to ink rather than a competing hue.
+          Amber leads, then the semantic family.{" "}
+          <code className="font-mono text-xs">--chart-2</code> is muted neutral so single-series
+          charts default to ink rather than a competing hue.
         </p>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {CHART_COLORS.map((c) => (
@@ -383,8 +394,9 @@ export default function FoundationsPage() {
         <p className="max-w-2xl text-sm text-muted-foreground">
           <code className="font-mono text-xs">--searchaf-*</code> and{" "}
           <code className="font-mono text-xs">--gray-*</code> are retained for surfaces still
-          migrating. Prefer the semantic tokens (<code className="font-mono text-xs">--foreground</code>
-          , <code className="font-mono text-xs">--muted-foreground</code>,{" "}
+          migrating. Prefer the semantic tokens (
+          <code className="font-mono text-xs">--foreground</code>,{" "}
+          <code className="font-mono text-xs">--muted-foreground</code>,{" "}
           <code className="font-mono text-xs">--border-strong</code>) for new work.
         </p>
         <div className="grid gap-4 md:grid-cols-2">
@@ -416,8 +428,9 @@ export default function FoundationsPage() {
                 button, badge, tab).
               </li>
               <li>
-                <strong className="font-medium">Inter</strong> if it's a heading or sentence the user
-                reads as a phrase (Card/Dialog/Sheet titles, page H1/H2, paragraphs, descriptions).
+                <strong className="font-medium">Inter</strong> if it's a heading or sentence the
+                user reads as a phrase (Card/Dialog/Sheet titles, page H1/H2, paragraphs,
+                descriptions).
               </li>
               <li>
                 <strong className="font-medium">Aeonik</strong> only when it's a brand moment
@@ -619,10 +632,9 @@ export default function FoundationsPage() {
           <p className="mt-1 text-muted-foreground">
             All <code className="font-mono text-xs">--shadow-*</code> tokens resolve to{" "}
             <code className="font-mono text-xs">0 0 #0000</code>. The chassis is flat — borders
-            (especially <code className="font-mono text-xs">--border-strong</code>) carry the
-            visual hierarchy. Existing consumers using{" "}
-            <code className="font-mono text-xs">shadow-md</code> classes will get no shadow rather
-            than a broken cascade. Don't add new shadow utilities.
+            (especially <code className="font-mono text-xs">--border-strong</code>) carry the visual
+            hierarchy. Existing consumers using <code className="font-mono text-xs">shadow-md</code>{" "}
+            classes will get no shadow rather than a broken cascade. Don't add new shadow utilities.
           </p>
         </div>
         <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-5">

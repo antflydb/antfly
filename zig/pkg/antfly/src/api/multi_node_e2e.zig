@@ -431,10 +431,13 @@ const PublicApiStatusSource = struct {
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 .create_table = createTable,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
-                .create_index = createIndex,
+                .replace_table_definition = replaceTableDefinition,
                 .drop_index = dropIndex,
             },
         };
@@ -495,6 +498,16 @@ const PublicApiStatusSource = struct {
         try self.node.upsertTable(updated);
     }
 
+    fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.node.adminSnapshot();
+        defer self.node.freeAdminSnapshot(&snapshot);
+        const current = api_tables.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
+        if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id)
+            return error.TableGenerationChanged;
+        try self.node.upsertTable(replacement);
+    }
+
     fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var snapshot = try self.node.adminSnapshot();
@@ -517,6 +530,9 @@ const PublicApiCatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = api_table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             },
         };
     }
@@ -5450,11 +5466,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.heap.page_allocator.free(semantic_index_body);
@@ -5466,11 +5478,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_fixed_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
@@ -5487,11 +5495,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_antfly_idx",
         "body",
         3,
-        .{
-            .provider = .antfly,
-            .model = "antfly-embed-v1",
-            .api_url = antfly_base_uri,
-        },
+        test_contract_helpers.antflyIndexEmbedder("antfly-embed-v1", antfly_base_uri, false),
         .{
             .provider = .antfly,
             .api_url = antfly_chunk_api,
@@ -5507,12 +5511,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_template_idx",
         "{{remoteMedia url=photo}}",
         3,
-        .{
-            .provider = .antfly,
-            .model = "antfly-clip-v1",
-            .api_url = antfly_base_uri,
-            .multimodal = true,
-        },
+        test_contract_helpers.antflyIndexEmbedder("antfly-clip-v1", antfly_base_uri, true),
     );
     defer std.heap.page_allocator.free(semantic_template_index_body);
     var semantic_template_index = try client.createTableIndex(api_base_uris[0], "docs", "semantic_template_idx", semantic_template_index_body);
@@ -5523,11 +5522,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "semantic_template_chunked_idx",
         "{{title}} {{remoteText url=transcript}}",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
@@ -7319,11 +7314,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.heap.page_allocator.free(semantic_index_body);
@@ -7335,11 +7326,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
         "semantic_fixed_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",
@@ -7666,11 +7653,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
         "semantic_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         null,
     );
     defer std.heap.page_allocator.free(semantic_index_body);
@@ -7682,11 +7665,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
         "semantic_fixed_idx",
         "body",
         3,
-        .{
-            .provider = .openai,
-            .model = "text-embedding-3-small",
-            .url = embed_base_uri,
-        },
+        test_contract_helpers.openAIIndexEmbedder("text-embedding-3-small", embed_base_uri),
         .{
             .provider = .antfly,
             .model = "fixed-bert-tokenizer",

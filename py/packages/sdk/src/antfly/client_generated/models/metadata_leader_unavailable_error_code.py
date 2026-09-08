@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class MetadataLeaderUnavailableErrorCode(str, Enum):
+class MetadataLeaderUnavailableErrorCode(StrEnum):
     METADATA_LEADER_UNAVAILABLE = "metadata_leader_unavailable"
 
     def __str__(self) -> str:

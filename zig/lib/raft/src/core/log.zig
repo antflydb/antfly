@@ -112,6 +112,36 @@ pub const RaftLog = struct {
         return self.lastIndex();
     }
 
+    /// Atomically transfers a fully-owned entry batch into the log. Capacity
+    /// is reserved before the existing suffix is touched, so allocation
+    /// pressure can never expose a partially appended local proposal batch.
+    /// On success ownership of every entry is transferred and each caller
+    /// slot is reset to an empty value; on failure the caller retains all
+    /// entries unchanged.
+    pub fn appendOwnedEntries(self: *RaftLog, entries: []types.Entry) !types.Index {
+        if (entries.len == 0) return self.lastIndex();
+
+        try self.entries.ensureUnusedCapacity(self.alloc, entries.len);
+        const first_new_index = entries[0].index;
+        var truncate_at: ?usize = null;
+        for (self.entries.items, 0..) |entry, i| {
+            if (entry.index >= first_new_index) {
+                truncate_at = i;
+                break;
+            }
+        }
+        if (truncate_at) |idx| {
+            for (self.entries.items[idx..]) |*entry| entry.deinit(self.alloc);
+            self.entries.shrinkRetainingCapacity(idx);
+        }
+
+        for (entries) |*entry| {
+            self.entries.appendAssumeCapacity(entry.*);
+            entry.* = .{};
+        }
+        return self.lastIndex();
+    }
+
     pub fn maybeAppend(self: *RaftLog, prev_index: types.Index, prev_term: types.Term, leader_commit: types.Index, entries: []const types.Entry) !?types.Index {
         if (!self.matchTerm(prev_index, prev_term)) return null;
 

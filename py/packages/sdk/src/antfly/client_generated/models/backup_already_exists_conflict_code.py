@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class BackupAlreadyExistsConflictCode(str, Enum):
+class BackupAlreadyExistsConflictCode(StrEnum):
     BACKUP_ALREADY_EXISTS = "backup_already_exists"
 
     def __str__(self) -> str:

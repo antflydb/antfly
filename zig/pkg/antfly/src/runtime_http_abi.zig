@@ -11,6 +11,7 @@ pub const HttpMethod = enum(c_int) {
     post,
     put,
     delete,
+    patch,
 };
 
 pub const RequestBodyMode = enum(c_int) {

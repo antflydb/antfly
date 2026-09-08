@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class JoinStrategy(str, Enum):
+class JoinStrategy(StrEnum):
     BROADCAST = "broadcast"
     INDEX_LOOKUP = "index_lookup"
     SHUFFLE = "shuffle"

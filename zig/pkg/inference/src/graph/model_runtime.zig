@@ -15,6 +15,9 @@
 const std = @import("std");
 const cache_mod = @import("cache.zig");
 const activations = @import("../backends/activations.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+const Interruption = @import("../execution_control.zig").Interruption;
+const UninterruptibleGuard = @import("../execution_control.zig").UninterruptibleGuard;
 const ops = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
 
@@ -85,8 +88,16 @@ pub const ModelRuntime = struct {
         allocator: std.mem.Allocator,
         request: PrepareRequest,
     ) !bool {
+        try request.check();
         const prepare_fn = self.vtable.prepare orelse return false;
-        return prepare_fn(self.ptr, allocator, request);
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
+        const prepared = try prepare_fn(self.ptr, allocator, request);
+        try request.check();
+        return prepared;
     }
 
     pub fn debugTimingStats(self: *const ModelRuntime) RuntimeDebugTimingStats {
@@ -113,7 +124,16 @@ pub const ModelRuntime = struct {
         allocator: std.mem.Allocator,
         request: PrefillRequest,
     ) !ModelOutput {
-        return self.vtable.prefill(self.ptr, allocator, request);
+        try request.check();
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
+        var output = try self.vtable.prefill(self.ptr, allocator, request);
+        errdefer output.deinit(allocator);
+        try request.check();
+        return output;
     }
 
     pub fn decode(
@@ -121,8 +141,17 @@ pub const ModelRuntime = struct {
         allocator: std.mem.Allocator,
         request: DecodeRequest,
     ) !ModelOutput {
+        try request.check();
         const decode_fn = self.vtable.decode orelse return error.UnsupportedDecode;
-        return decode_fn(self.ptr, allocator, request);
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
+        var output = try decode_fn(self.ptr, allocator, request);
+        errdefer output.deinit(allocator);
+        try request.check();
+        return output;
     }
 
     pub fn decodeGreedy(
@@ -130,8 +159,17 @@ pub const ModelRuntime = struct {
         allocator: std.mem.Allocator,
         request: DecodeRequest,
     ) !GreedyDecodeOutput {
+        try request.check();
         const decode_greedy_fn = self.vtable.decode_greedy orelse return error.UnsupportedGreedyDecode;
-        return decode_greedy_fn(self.ptr, allocator, request);
+        var hard_cancellation = if (request.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
+        var output = try decode_greedy_fn(self.ptr, allocator, request);
+        errdefer output.deinit();
+        try request.check();
+        return output;
     }
 
     pub fn decodeSample(
@@ -139,8 +177,16 @@ pub const ModelRuntime = struct {
         allocator: std.mem.Allocator,
         request: SampledDecodeRequest,
     ) !SampledDecodeOutput {
+        try request.decode.check();
         const decode_sample_fn = self.vtable.decode_sample orelse return error.UnsupportedSampleDecode;
-        return decode_sample_fn(self.ptr, allocator, request);
+        var hard_cancellation = if (request.decode.execution_control) |control|
+            try control.enterUninterruptible(self.capabilities().interruption)
+        else
+            UninterruptibleGuard{};
+        defer hard_cancellation.deinit();
+        const output = try decode_sample_fn(self.ptr, allocator, request);
+        try request.decode.check();
+        return output;
     }
 
     pub fn deinit(self: *ModelRuntime) void {
@@ -166,6 +212,7 @@ pub const RuntimeCapabilities = struct {
     supports_sample_decode: bool = false,
     supports_greedy_decode: bool = false,
     state_ownership: RuntimeStateOwnership = .host_assisted_inputs,
+    interruption: Interruption = .cooperative,
 };
 
 pub const RuntimeDebugTimingStats = struct {
@@ -240,6 +287,10 @@ pub const ModelOutput = struct {
         vocab_size: usize,
         eps: f32,
         final_logit_softcap: f32 = 0.0,
+        /// Diagnostic-only request used by the fail-closed LM-head repack
+        /// quality campaign. Production outputs leave this false and retain
+        /// checkpoint-format full logits.
+        use_transformed_lm_head: bool = false,
         greedy_token_id: ?i64 = null,
 
         fn logits(self: *PreparedTail) !?contracts.CT {
@@ -259,6 +310,7 @@ pub const ModelOutput = struct {
                     .hidden_size = self.hidden_size,
                     .eps = self.eps,
                     .out_dim = self.vocab_size,
+                    .use_transformed_lm_head = self.use_transformed_lm_head,
                 }),
             };
         }
@@ -375,12 +427,18 @@ fn applyFinalLogitSoftcapInPlace(logits: []f32, softcap: f32) void {
 }
 
 pub const PrepareRequest = struct {
+    execution_control: ?InferenceExecutionControl = null,
     /// Best-effort prompt/KV length hint. Backends may use this to prebuild
     /// shape-specific resources without mutating logical generation state.
     kv_tokens_hint: usize = 0,
+
+    pub fn check(self: PrepareRequest) !void {
+        if (self.execution_control) |control| try control.check();
+    }
 };
 
 pub const PrefillRequest = struct {
+    execution_control: ?InferenceExecutionControl = null,
     input_ids: []const i64,
     seq_len: usize,
     query_seq_len: usize,
@@ -392,13 +450,22 @@ pub const PrefillRequest = struct {
     allow_swa_ring: bool = false,
     force_host_logits: bool = false,
     prefer_greedy_token: bool = false,
+
+    pub fn check(self: PrefillRequest) !void {
+        if (self.execution_control) |control| try control.check();
+    }
 };
 
 pub const DecodeRequest = struct {
+    execution_control: ?InferenceExecutionControl = null,
     token_id: i64,
     input_token_tensor: ?ops.CT = null,
     position: usize,
     attention_mode: cache_mod.AttentionMode = .paged_decode,
+
+    pub fn check(self: DecodeRequest) !void {
+        if (self.execution_control) |control| try control.check();
+    }
 };
 
 pub const SampledDecodeRequest = struct {
@@ -410,9 +477,17 @@ pub const SampledDecodeRequest = struct {
 pub const GreedyDecodeOutput = struct {
     token_id: i64,
     /// Optional backend-owned token tensor for the returned token. Callers that
-    /// pass it back as DecodeRequest.input_token_tensor own and must eventually
-    /// free it with the producing backend.
+    /// pass it back as DecodeRequest.input_token_tensor own it and must either
+    /// transfer it again or call deinit.
     token_tensor: ?ops.CT = null,
+    token_tensor_backend: ?*const ops.ComputeBackend = null,
+
+    pub fn deinit(self: *GreedyDecodeOutput) void {
+        if (self.token_tensor) |tensor| {
+            if (self.token_tensor_backend) |backend| backend.free(tensor);
+        }
+        self.* = undefined;
+    }
 };
 
 pub const SampledDecodeOutput = struct {
@@ -558,6 +633,7 @@ const MockModel = struct {
     last_prepare_hint: usize = 0,
     runtime_deinits: usize = 0,
     executor_deinits: usize = 0,
+    saw_prefill_control: bool = false,
 
     const runtime_vtable = ModelRuntime.VTable{
         .prepare = prepare,
@@ -600,10 +676,12 @@ const MockModel = struct {
     }
 
     fn prefill(
-        _: *anyopaque,
+        ctx: *anyopaque,
         allocator: std.mem.Allocator,
         request: PrefillRequest,
     ) !ModelOutput {
+        const self: *MockModel = @ptrCast(@alignCast(ctx));
+        self.saw_prefill_control = request.execution_control != null;
         const logits = try allocator.alloc(f32, 2);
         logits[0] = @floatFromInt(request.input_ids.len);
         logits[1] = @floatFromInt(request.seq_len + request.query_seq_len);
@@ -702,6 +780,31 @@ test "ModelExecutor and ModelRuntime dispatch through vtables" {
     executor.deinit();
     try std.testing.expectEqual(@as(usize, 1), mock.runtime_deinits);
     try std.testing.expectEqual(@as(usize, 1), mock.executor_deinits);
+}
+
+test "ModelRuntime propagates control and releases output when the exit check cancels" {
+    const CancelAfterCall = struct {
+        checks: usize = 0,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= 2) return error.Cancelled;
+        }
+    };
+
+    var state = CancelAfterCall{};
+    var mock = MockModel{};
+    var runtime = ModelRuntime{ .ptr = &mock, .vtable = &MockModel.runtime_vtable };
+    try std.testing.expectError(error.Cancelled, runtime.prefill(std.testing.allocator, .{
+        .execution_control = .{ .ptr = &state, .check_fn = CancelAfterCall.check },
+        .input_ids = &.{ 1, 2, 3 },
+        .seq_len = 3,
+        .query_seq_len = 3,
+        .attention_mode = .paged_prefill,
+    }));
+    try std.testing.expect(mock.saw_prefill_control);
+    try std.testing.expectEqual(@as(usize, 2), state.checks);
 }
 
 test "ModelExecutor reports unsupported decode when backend has no decode path" {

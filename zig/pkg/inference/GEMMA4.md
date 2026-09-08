@@ -674,7 +674,7 @@ MLX streams/providers for the `.mlx` backend. The repaired smoke
 ### Phase 3: Performance Work
 
 Baseline, no-MTP prefill/decode optimization is tracked separately in
-[GEMMA4_METAL_PERFORMANCE.md](./GEMMA4_METAL_PERFORMANCE.md). That roadmap owns
+[GEMMA4_PERF_PLAN.md](./GEMMA4_PERF_PLAN.md). That roadmap owns
 the pinned llama.cpp comparison, current experiment ledger, promotion gates,
 and ordered Metal kernel/runtime tranches. MTP speedups are additive and must
 not be used to qualify the baseline model path.

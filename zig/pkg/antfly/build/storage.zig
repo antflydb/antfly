@@ -116,6 +116,7 @@ pub fn makeLmdbModule(
     build_options: *std.Build.Step.Options,
     lmdb_engine_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
+    hash_mod: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path(root_path),
@@ -125,6 +126,7 @@ pub fn makeLmdbModule(
     mod.addOptions("build_options", build_options);
     mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly_platform", platform_mod);
+    mod.addImport("antfly_hash", hash_mod);
     mod.addCSourceFiles(.{
         .files = &.{ "lib/lmdb/mdb.c", "lib/lmdb/midl.c" },
         .flags = &lmdb_c_flags,

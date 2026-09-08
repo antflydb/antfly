@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceRole(str, Enum):
+class InferenceRole(StrEnum):
     ASSISTANT = "assistant"
     SYSTEM = "system"
     TOOL = "tool"

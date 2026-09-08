@@ -29,6 +29,7 @@ pub const Routes = struct {
     pub const auth_subjects = "/auth/v1/subjects";
     pub const auth_subjects_prefix = "/auth/v1/subjects/";
     pub const eval = "/eval";
+    pub const global_query = "/query";
     pub const agents_query_builder = "/agents/query-builder";
     pub const agents_retrieval = "/agents/retrieval";
     pub const mcp_v1 = "/mcp/v1";
@@ -86,6 +87,7 @@ pub const Routes = struct {
     pub const routed_batch_suffix = "/batch-routed-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
+    pub const backup_shard_suffix = "/backup-shard";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
     pub const query_suffix = "/query";
@@ -108,6 +110,7 @@ pub const Routes = struct {
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
+    pub const group_db_index_activation_suffix = "/db/index-activation";
     pub const shard_ops_observe_split_suffix = "/shard-ops/observe-split";
     pub const shard_ops_observe_merge_suffix = "/shard-ops/observe-merge";
     pub const shard_ops_execute_suffix = "/shard-ops/execute";
@@ -1298,6 +1301,10 @@ pub const Routes = struct {
 
     pub fn matchGroupDbMedianKey(path: []const u8) ?GroupShardOp {
         return matchGroupShardPath(path, group_db_median_key_suffix);
+    }
+
+    pub fn matchGroupDbIndexActivation(path: []const u8) ?GroupShardOp {
+        return matchGroupShardPath(path, group_db_index_activation_suffix);
     }
 
     pub fn matchGroupShardObserveMerge(path: []const u8) ?GroupShardOp {

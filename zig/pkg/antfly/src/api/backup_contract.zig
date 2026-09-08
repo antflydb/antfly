@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const platform_time = @import("antfly_platform").time;
 
 pub const format_version: u32 = 2;
 pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
@@ -18,6 +19,13 @@ pub const backup_fence_definition_header = "X-Antfly-Backup-Definition-SHA256";
 pub const backup_fence_topology_count_header = "X-Antfly-Backup-Topology-Count";
 pub const backup_fence_topology_header = "X-Antfly-Backup-Topology-SHA256";
 pub const backup_writer_not_after_header = "X-Antfly-Backup-Writer-Not-After-Unix-Ns";
+/// Relative storage-owner execution budget. The coordinator retains a small
+/// response reserve and never sends its process-local monotonic timestamp.
+pub const backup_remaining_ms_header = "X-Antfly-Backup-Remaining-Ms";
+pub const backup_server_response_reserve_ms: u32 = 250;
+pub const max_backup_server_budget_ms: u32 = 24 * 60 * 60 * 1_000;
+pub const backup_outcome_header = "X-Antfly-Backup-Outcome";
+pub const backup_outcome_stopped_v1 = "stopped-v1";
 pub const catalog_changed_message = "table changed during backup admission";
 pub const backup_outcome_ambiguous_message = "backup outcome is ambiguous; inspect the backup id before retrying";
 
@@ -101,6 +109,12 @@ pub fn tableDefinitionDigest(
 
 pub const ShardSnapshot = struct {
     group_id: u64,
+    /// Logical range identity is distinct from the physical Raft group after
+    /// split/merge operations. Zero is the legacy encoding for `group_id`.
+    range_id: u64 = 0,
+    doc_identity_shard_id: u64 = 0,
+    doc_identity_range_id: u64 = 0,
+    split_attempt_epoch: u64 = 0,
     start_key: []const u8,
     end_key: ?[]const u8 = null,
     snapshot_path: []const u8,
@@ -168,10 +182,72 @@ pub const TableBackupPlan = struct {
     format: BackupFormat = .native,
     io: ?std.Io = null,
     fence: ?TableBackupFence = null,
+    /// Internal storage-owner dispatch may pin capture to one exact Raft
+    /// group. Public/coordinator callers leave this null and resolve the full
+    /// fenced table topology before fan-out.
+    target_group_id: ?u64 = null,
     /// Borrowed cooperative cancellation for capture, hashing, and local
     /// materialization. Durable publication still reports ambiguity according
     /// to the backup protocol once its commit point has been crossed.
     cancellation: CancellationToken = .none,
+    /// Absolute monotonic operation deadline shared by catalog resolution,
+    /// storage capture, hashing, and publication. Null is retained for direct
+    /// embedded callers; production coordinators always provide a deadline.
+    deadline_ns: ?u64 = null,
+
+    pub fn ensureActive(self: @This()) !void {
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline_ns|
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
+};
+
+/// Borrowed control plane for one table-backup operation. The monotonic
+/// deadline prevents a lost peer from retaining a writer reservation forever;
+/// cancellation lets bounded fanout stop admitting siblings after a failure.
+pub const BackupOperationControl = struct {
+    deadline_ns: u64,
+    cancellation: CancellationToken = .none,
+
+    pub fn ensureActive(self: @This()) !void {
+        try self.cancellation.check();
+        if (platform_time.monotonicNs() >= self.deadline_ns) return error.Timeout;
+    }
+
+    pub fn isCancelled(self: @This()) bool {
+        return self.cancellation.isCancelled() or platform_time.monotonicNs() >= self.deadline_ns;
+    }
+
+    pub fn token(self: *const @This()) CancellationToken {
+        return .{
+            .ptr = self,
+            .is_cancelled_fn = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const control: *const BackupOperationControl = @ptrCast(@alignCast(raw));
+                    return control.isCancelled();
+                }
+            }.call,
+        };
+    }
+
+    pub fn remainingTimeoutMs(self: @This()) !u32 {
+        try self.cancellation.check();
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= self.deadline_ns) return error.Timeout;
+        const remaining_ns = self.deadline_ns - now_ns;
+        const rounded_ms = std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1;
+        return @intCast(@max(@as(u64, 1), @min(rounded_ms, @as(u64, std.math.maxInt(u32)))));
+    }
+
+    /// Object-store transports expose cancellation as one portable error even
+    /// when the callback fired because this control's deadline elapsed. Recover
+    /// the operator-facing cause after the synchronous operation has drained.
+    pub fn normalizeInterruption(self: @This(), err: anyerror) anyerror {
+        if (err != error.Canceled and err != error.Cancelled) return err;
+        if (self.cancellation.isCancelled()) return error.Canceled;
+        if (platform_time.monotonicNs() >= self.deadline_ns) return error.Timeout;
+        return err;
+    }
 };
 
 pub const TableRestorePlan = struct {
@@ -188,3 +264,18 @@ pub const TableRestorePlan = struct {
     /// borrowed only for the synchronous restore callback.
     cancellation: CancellationToken = .none,
 };
+
+test "backup operation control preserves cancellation and deadline causes" {
+    const elapsed_deadline = BackupOperationControl{
+        .deadline_ns = platform_time.monotonicNs(),
+    };
+    try std.testing.expectEqual(error.Timeout, elapsed_deadline.normalizeInterruption(error.Canceled));
+
+    var cancellation = std.atomic.Value(bool).init(true);
+    const explicitly_cancelled = BackupOperationControl{
+        .deadline_ns = std.math.maxInt(u64),
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
+    };
+    try std.testing.expectEqual(error.Canceled, explicitly_cancelled.normalizeInterruption(error.Cancelled));
+    try std.testing.expectEqual(error.Unexpected, explicitly_cancelled.normalizeInterruption(error.Unexpected));
+}

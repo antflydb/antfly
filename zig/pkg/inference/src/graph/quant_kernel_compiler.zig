@@ -12480,8 +12480,13 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "output_offset % (4u * sizeof(float)) != 0u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 256u && sliding_window == 512u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 512u && sliding_window == 0u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS 512u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kv_tokens < TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_E2B_DEFAULT_MIN_KV_TOKENS 192u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS 32u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_metal_a4b_decode_gqa_split_enabled()"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "num_kv_heads == 1u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kv_tokens < min_kv_tokens"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "decode_gqa_split_below_min_kv_calls += 1u"));
 
     // A ragged final KV tile must gather each physical V row and explicitly
     // zero masked lanes. Loading an entire private-buffer tile lets NaN page

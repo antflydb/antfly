@@ -75,6 +75,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return error.InvalidArguments;
     }
 
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
+
     const started_at = std.Io.Timestamp.now(io, .awake);
     try ensureRequestedMetalHostedBackendAvailable(opts.backend);
 
@@ -113,6 +116,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
         try writeSparseResultJson(
             allocator,
+            &stdout.interface,
             opts.model_dir,
             opts.order.items,
             sparse_embeddings,
@@ -190,6 +194,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     try writeResultJson(
         allocator,
+        &stdout.interface,
         opts.model_dir,
         opts.order.items,
         text_embeddings,
@@ -322,6 +327,7 @@ fn durationMillis(from: std.Io.Timestamp, to: std.Io.Timestamp) u64 {
 
 fn writeResultJson(
     allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
     model_name: []const u8,
     order: []const InputRef,
     text_embeddings: [][]f32,
@@ -355,11 +361,13 @@ fn writeResultJson(
     }
     try buf.appendSlice(allocator, "]}\n");
 
-    print("{s}", .{buf.items});
+    try writer.writeAll(buf.items);
+    try writer.flush();
 }
 
 fn writeSparseResultJson(
     allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
     model_name: []const u8,
     order: []const InputRef,
     text_embeddings: []const sparse_embedding_mod.SparseVector,
@@ -382,7 +390,8 @@ fn writeSparseResultJson(
     }
     try buf.appendSlice(allocator, "]}\n");
 
-    print("{s}", .{buf.items});
+    try writer.writeAll(buf.items);
+    try writer.flush();
 }
 
 fn appendEmbeddingJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, emb: []const f32) !void {
@@ -553,4 +562,64 @@ test "appendSparseEmbeddingJson writes cli sparse embedding shape" {
         "{\"indices\":[2,17,42],\"values\":[0.25,1.5,3]}",
         buf.items,
     );
+}
+
+test "embed result writer preserves multimodal order and escaped model name" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var text = [_]f32{ 1, 2 };
+    var image = [_]f32{ 3, 4 };
+    var audio = [_]f32{ 5, 6 };
+    var texts = [_][]f32{&text};
+    var images = [_][]f32{&image};
+    var audios = [_][]f32{&audio};
+    try writeResultJson(std.testing.allocator, &output.writer, "model\"name", &.{
+        .{ .modality = .audio, .index = 0 },
+        .{ .modality = .text, .index = 0 },
+        .{ .modality = .image, .index = 0 },
+        .{ .modality = .text, .index = 0 },
+    }, &texts, &images, &audios);
+    try std.testing.expectEqualStrings(
+        "{\"model\":\"model\\\"name\",\"modalities\":[\"audio\",\"text\",\"image\",\"text\"],\"embeddings\":[[5,6],[1,2],[3,4],[1,2]]}\n",
+        output.written(),
+    );
+}
+
+test "embed sparse result writer preserves input order" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var indices = [_]u32{ 2, 17 };
+    var values = [_]f32{ 0.25, 1.5 };
+    const embeddings = [_]sparse_embedding_mod.SparseVector{
+        .{ .indices = indices[0..1], .values = values[0..1] },
+        .{ .indices = indices[1..], .values = values[1..] },
+    };
+    try writeSparseResultJson(std.testing.allocator, &output.writer, "model", &.{
+        .{ .modality = .text, .index = 1 },
+        .{ .modality = .text, .index = 0 },
+    }, &embeddings);
+    try std.testing.expectEqualStrings(
+        "{\"model\":\"model\",\"modalities\":[\"text\",\"text\"],\"embeddings\":[{\"indices\":[17],\"values\":[1.5]},{\"indices\":[2],\"values\":[0.25]}]}\n",
+        output.written(),
+    );
+}
+
+test "embed result writers propagate output failures" {
+    var output = std.Io.Writer.fixed(&.{});
+    try std.testing.expectError(error.WriteFailed, writeResultJson(
+        std.testing.allocator,
+        &output,
+        "model",
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+    ));
+    try std.testing.expectError(error.WriteFailed, writeSparseResultJson(
+        std.testing.allocator,
+        &output,
+        "model",
+        &.{},
+        &.{},
+    ));
 }

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CreatedGraphArtifactProducerConfigKind(str, Enum):
+class CreatedGraphArtifactProducerConfigKind(StrEnum):
     ASSET = "asset"
 
     def __str__(self) -> str:

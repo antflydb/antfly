@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("lsm_backend/mod.zig");
@@ -317,7 +318,7 @@ const EntryIterator = struct {
         const stored_crc = std.mem.readInt(u32, self.bytes[self.pos..][0..4], .little);
         self.pos += 4;
 
-        var crc = std.hash.Crc32.init();
+        var crc = Crc32.init();
         crc.update(std.mem.asBytes(&data_len_u32));
         crc.update(data);
         if (crc.final() != stored_crc) return error.CorruptWal;
@@ -336,7 +337,7 @@ fn appendEncodedEntry(alloc: Allocator, bytes: *std.ArrayListUnmanaged(u8), lsn:
     bytes.appendSliceAssumeCapacity(std.mem.asBytes(&data_len_u32));
     bytes.appendSliceAssumeCapacity(data);
 
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(std.mem.asBytes(&data_len_u32));
     crc.update(data);
     const stored_crc = crc.final();

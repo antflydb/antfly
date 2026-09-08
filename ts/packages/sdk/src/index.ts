@@ -252,6 +252,7 @@ export type {
   GenerationConfidence,
   GeneratorConfig,
   GeneratorProvider,
+  GlobalQueryRequest,
   GraphAggregatesResult,
   GraphAggregatesReturn,
   GraphAggregateValue,
@@ -302,6 +303,8 @@ export type {
   GraphTraverseQuery,
   GraphWhereExpression,
   IndexConfig,
+  IndexEmbedderConfig,
+  IndexEmbedderProvider,
   IndexRuntimeCapabilities,
   IndexStatus,
   IndexType,
@@ -358,6 +361,7 @@ export type {
   SortProfile,
   SparseEmbedding,
   SSEStepStarted,
+  SSEToolMode,
   // Table types
   Table,
   TableMigration,
@@ -378,9 +382,12 @@ export type {
   WriteOptions,
 } from "./types.js";
 export {
+  embedderProviderCapabilities,
   embedderProviders,
   formatQueryHitsTotal,
+  generatorProviderCapabilities,
   generatorProviders,
+  indexEmbedderProviders,
   queryHitsTotalIsExact,
   queryHitsTotalValue,
   queryResultHitsTotal,

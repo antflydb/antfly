@@ -5647,7 +5647,7 @@ pub const IndexManager = struct {
                 total_steps += @intCast(link_repair.repaired());
             }
             const backlog = try entry.index.postingBacklogStats();
-            if (!backlog.needsRepair()) continue;
+            if (!backlog.hasMaintenanceDebt()) continue;
 
             const result = try entry.index.repairDirtyPostingsWithOptions(.{
                 .max_postings = options.max_postings_per_index,
@@ -6180,6 +6180,18 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
+        // A replacement opens only its target generation, but named artifact
+        // sources still depend on the canonical durable producer/resolver
+        // contracts. Load those read-only before validating the index, just as
+        // ordinary catalog loading does; do not recreate or persist them.
+        const enrichment_checkpoint = self.enrichments.items.len;
+        const resolver_checkpoint = self.resolvers.items.len;
+        errdefer {
+            self.truncateEnrichments(enrichment_checkpoint);
+            self.truncateResolvers(resolver_checkpoint);
+        }
+        if (enrichment_checkpoint == 0) try self.loadEnrichmentCatalog(store);
+        if (resolver_checkpoint == 0) try self.loadResolverCatalog(store);
         try self.openConfiguredIndex(store, cfg, false, false);
         errdefer self.removeInMemory(cfg.name);
         try self.refreshGeneratedEnrichmentTargetCache();
@@ -6220,7 +6232,7 @@ pub const IndexManager = struct {
 
         for (self.enrichments.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, internal.name)) continue;
-            if (internalEnrichmentConfigsEqual(entry.*, internal)) return .unchanged;
+            if (try internalEnrichmentConfigsEqual(self.alloc, entry.*, internal)) return .unchanged;
 
             var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
             var previous = entry.*;
@@ -7945,6 +7957,34 @@ pub const IndexManager = struct {
         return try names.toOwnedSlice(alloc);
     }
 
+    /// Returns the complete producer path needed to materialize an index's
+    /// configured artifact sources from primary documents. Index status and
+    /// repair attribution intentionally use `artifactSourceNamesForIndexAlloc`
+    /// so they expose only the public, direct sources. Admission backfill uses
+    /// this transitive closure: forcing only a materialized chunk or embedding
+    /// would omit its upstream asset producer and create durable work that can
+    /// never reach the requested projection.
+    pub fn artifactProducerNamesForIndexAlloc(self: *const IndexManager, alloc: Allocator, name: []const u8) ![][]u8 {
+        var names = std.ArrayListUnmanaged([]u8).fromOwnedSlice(
+            try self.artifactSourceNamesForIndexAlloc(alloc, name),
+        );
+        errdefer {
+            for (names.items) |value| alloc.free(value);
+            names.deinit(alloc);
+        }
+
+        var cursor: usize = 0;
+        while (cursor < names.items.len) : (cursor += 1) {
+            const enrichment = self.getEnrichmentByName(names.items[cursor]) orelse continue;
+            const upstream = enrichment.source_artifact_name;
+            if (upstream.len == 0 or containsOwnedString(names.items, upstream)) continue;
+            const owned_upstream = try alloc.dupe(u8, upstream);
+            errdefer alloc.free(owned_upstream);
+            try names.append(alloc, owned_upstream);
+        }
+        return try names.toOwnedSlice(alloc);
+    }
+
     pub fn getEnrichment(self: *const IndexManager, kind: enrichment_catalog.EnrichmentType, name: []const u8) ?*const enrichment_catalog.EnrichmentConfig {
         return self.getEnrichmentExcluding(kind, name, null);
     }
@@ -8054,6 +8094,7 @@ pub const IndexManager = struct {
 
             if (try parseDenseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
                 defer generator.deinit(alloc);
+                const input_kind = embeddingInputKind(self, generator);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
                 const embedding_name = entry.embedding_name orelse entry.config.name;
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
@@ -8078,6 +8119,7 @@ pub const IndexManager = struct {
                         .index_name = try alloc.dupe(u8, entry.config.name),
                         .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
                         .embedding_name = try alloc.dupe(u8, embedding_name),
+                        .input_kind = input_kind,
                         .doc_key = try alloc.dupe(u8, doc_key),
                         .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
                         .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
@@ -8124,6 +8166,7 @@ pub const IndexManager = struct {
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -8167,6 +8210,7 @@ pub const IndexManager = struct {
             if (try parseSparseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
                 defer generator.deinit(alloc);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
+                const input_kind = embeddingInputKind(self, generator);
                 const embedding_name = if (chunk_cfg.embedding_name) |name| name else entry.config.name;
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                 if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
@@ -8189,6 +8233,7 @@ pub const IndexManager = struct {
                     .index_name = try alloc.dupe(u8, entry.config.name),
                     .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
                     .embedding_name = try alloc.dupe(u8, embedding_name),
+                    .input_kind = input_kind,
                     .doc_key = try alloc.dupe(u8, doc_key),
                     .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
                     .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
@@ -8233,6 +8278,7 @@ pub const IndexManager = struct {
                                 .index_name = try alloc.dupe(u8, entry.config.name),
                                 .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
                                 .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .input_kind = embeddingInputKindForChunkEnrichment(chunk_cfg),
                                 .doc_key = try alloc.dupe(u8, doc_key),
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
@@ -8959,8 +9005,10 @@ pub const IndexManager = struct {
             const doc_map_key = try denseDocMappingKey(self.alloc, index_name, item.metadata);
             defer self.alloc.free(doc_map_key);
 
-            var buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &buf, item.vector_id, .little);
+            var buf: [dense_vector_mapping_v1_len]u8 = undefined;
+            buf[0] = dense_vector_mapping_v1;
+            std.mem.writeInt(u64, buf[1..9], item.vector_id, .little);
+            @memcpy(buf[9..], &denseVectorFingerprint(item.vector));
             try txn.put(doc_map_key, &buf);
         }
     }
@@ -9431,6 +9479,18 @@ pub const IndexManager = struct {
 
     fn textEntryHasExplicitArtifactSources(entry: *const TextIndex) bool {
         return entry.chunk_name != null or entry.source_artifact_names.len > 0;
+    }
+
+    /// Returns whether deleting this internal artifact can remove a searchable
+    /// member from the named full-text projection. Control manifests and
+    /// artifacts owned by sibling pipelines are deliberately excluded.
+    pub fn textIndexAcceptsArtifactKey(self: *IndexManager, index_name: []const u8, key: []const u8) bool {
+        const entry = self.textIndexEntry(index_name) orelse return false;
+        if (!internal_keys.isInternalUserKey(key) or internal_keys.isPrimaryDocumentKey(key)) return false;
+        // Use the publication predicate, including implicit full-text chunk
+        // routing. A failed dependency inspection must conservatively schedule
+        // replay, which will surface the error, never silently skip a delete.
+        return textIndexShouldConsumeDoc(self, entry, key) catch true;
     }
 
     pub fn textIndexIsChunkBacked(self: *const IndexManager, alloc: Allocator, name: ?[]const u8) !bool {
@@ -10808,6 +10868,25 @@ pub const IndexManager = struct {
         return .projection_changed;
     }
 
+    /// Return whether `key` belongs to the source projection captured by
+    /// `context`. The caller must hold the catalog shared lock, normally
+    /// through a ManagedIndexApplyGuard. Replay delete lanes are shared by
+    /// all derived index kinds, so an artifact-backed text index must filter
+    /// them by the same source predicate used for indexing writes.
+    pub fn textPublicationContextConsumesKeyAssumeCatalogLocked(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        key: []const u8,
+    ) !bool {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        return try textIndexShouldConsumeDoc(self, entry, key);
+    }
+
     /// Plan the natural segment fan-out before producer admission. Projection
     /// is repeated during publication, but tokenization and segment construction
     /// still happen only once. Using the same source and segment splitters as
@@ -11430,8 +11509,51 @@ pub const IndexManager = struct {
         doc_key: []const u8,
         parent_doc_key: ?[]const u8 = null,
         vector_id: u64,
+        vector_fingerprint: ?DenseVectorFingerprint = null,
         ordinal: ?doc_identity.DocOrdinal = null,
     };
+
+    const DenseVectorMapping = struct {
+        vector_id: u64,
+        vector_fingerprint: ?DenseVectorFingerprint = null,
+    };
+
+    const DenseVectorFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+    const dense_vector_mapping_v1: u8 = 1;
+    const dense_vector_mapping_v1_len = 1 + @sizeOf(u64) + @sizeOf(DenseVectorFingerprint);
+
+    fn denseVectorFingerprint(vector: []const f32) DenseVectorFingerprint {
+        // Mapping metadata is portable across native backups, so hash a
+        // canonical little-endian representation instead of host bytes. This
+        // digest is a correctness witness for replay deduplication, so use a
+        // collision-resistant hash rather than a compact non-cryptographic
+        // checksum.
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var length: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(vector.len), .little);
+        hasher.update(&length);
+        var value_bytes: [@sizeOf(u32)]u8 = undefined;
+        for (vector) |value| {
+            std.mem.writeInt(u32, &value_bytes, @bitCast(value), .little);
+            hasher.update(&value_bytes);
+        }
+        var digest: DenseVectorFingerprint = undefined;
+        hasher.final(&digest);
+        return digest;
+    }
+
+    fn decodeDenseVectorMapping(raw: []const u8) !DenseVectorMapping {
+        if (raw.len == @sizeOf(u64)) return .{
+            .vector_id = std.mem.readInt(u64, raw[0..8], .little),
+            .vector_fingerprint = null,
+        };
+        if (raw.len != dense_vector_mapping_v1_len or raw[0] != dense_vector_mapping_v1)
+            return error.InvalidDenseVectorMetadata;
+        return .{
+            .vector_id = std.mem.readInt(u64, raw[1..9], .little),
+            .vector_fingerprint = raw[9..][0..@sizeOf(DenseVectorFingerprint)].*,
+        };
+    }
 
     const PendingDenseVectorDelete = struct {
         doc_key: []const u8,
@@ -12952,7 +13074,7 @@ pub const IndexManager = struct {
                             multi_source_has_implicit_vector_space = true;
                             if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
                             if (multi_source_implicit_producer) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
+                                if (!try enrichment_config_validation.producerJsonValuesEqual(self.alloc, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
                             } else {
                                 multi_source_implicit_producer = embedding_cfg.producer_json;
                             }
@@ -13128,7 +13250,7 @@ pub const IndexManager = struct {
                             multi_source_has_implicit_vector_space = true;
                             if (embedding_cfg.producer_json.len == 0) return error.InvalidIndexConfig;
                             if (multi_source_implicit_producer) |expected| {
-                                if (!std.mem.eql(u8, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
+                                if (!try enrichment_config_validation.producerJsonValuesEqual(self.alloc, expected, embedding_cfg.producer_json)) return error.InvalidIndexConfig;
                             } else {
                                 multi_source_implicit_producer = embedding_cfg.producer_json;
                             }
@@ -13694,7 +13816,7 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims or
                 !std.mem.eql(u8, existing.vector_space, cfg.vector_space) or
-                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
+                !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -13711,7 +13833,7 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
-                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
+                !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -14871,6 +14993,7 @@ pub const IndexManager = struct {
                 .doc_key = items.items[items.items.len - 1].metadata,
                 .parent_doc_key = null,
                 .vector_id = assignment.vector_id,
+                .vector_fingerprint = denseVectorFingerprint(vector_values),
             });
         }
 
@@ -15177,7 +15300,7 @@ pub const IndexManager = struct {
         writes: []const mapper.DenseEmbeddingWrite,
         keep_write: []const bool,
         prefetched_ordinals: ?[]const ?doc_identity.DocOrdinal,
-        prefetched_mapped_vector_ids: ?[]const ?u64,
+        prefetched_mappings: ?[]const ?DenseVectorMapping,
         memo: *DenseVectorMetadataPresenceMemo,
     ) !void {
         var candidate_count: usize = 0;
@@ -15206,9 +15329,9 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             if (write.vector.len == 0 and write.artifact_key == null) continue;
             const member_key = if (entry.embedding_names.len > 0) write.artifact_key.? else write.doc_key;
-            if (prefetched_mapped_vector_ids) |mapped_vector_ids| {
-                if (mapped_vector_ids[write_index]) |mapped_vector_id| {
-                    vector_ids_storage[filled] = mapped_vector_id;
+            if (prefetched_mappings) |mappings| {
+                if (mappings[write_index]) |mapping| {
+                    vector_ids_storage[filled] = mapping.vector_id;
                     filled += 1;
                 }
             }
@@ -15606,16 +15729,15 @@ pub const IndexManager = struct {
             },
             else => return err,
         };
-        if (raw.len != 8) return error.InvalidDenseVectorMetadata;
-        return std.mem.readInt(u64, raw[0..8], .little);
+        return (try decodeDenseVectorMapping(raw)).vector_id;
     }
 
-    fn lookupDenseVectorIdsTxnAlloc(
+    fn lookupDenseVectorMappingsTxnAlloc(
         self: *IndexManager,
         txn: anytype,
         index_name: []const u8,
         doc_keys: []const []const u8,
-    ) ![]?u64 {
+    ) ![]?DenseVectorMapping {
         const mutable_txn = txn;
         const PendingLookup = struct {
             source_index: usize,
@@ -15627,7 +15749,7 @@ pub const IndexManager = struct {
             }
         };
 
-        const out = try self.alloc.alloc(?u64, doc_keys.len);
+        const out = try self.alloc.alloc(?DenseVectorMapping, doc_keys.len);
         errdefer self.alloc.free(out);
         @memset(out, null);
         if (doc_keys.len == 0) return out;
@@ -15666,14 +15788,13 @@ pub const IndexManager = struct {
 
         for (pending, read_values) |item, maybe_raw| {
             const raw = maybe_raw orelse continue;
-            if (raw.len != @sizeOf(u64)) return error.InvalidDenseVectorMetadata;
-            const vector_id = std.mem.readInt(u64, raw[0..8], .little);
+            const mapping = try decodeDenseVectorMapping(raw);
             if (item.legacy) {
                 if (!modern_found[item.source_index] and out[item.source_index] == null) {
-                    out[item.source_index] = vector_id;
+                    out[item.source_index] = mapping;
                 }
             } else {
-                out[item.source_index] = vector_id;
+                out[item.source_index] = mapping;
                 modern_found[item.source_index] = true;
             }
         }
@@ -16479,6 +16600,7 @@ pub const IndexManager = struct {
                 .doc_key = write.key,
                 .parent_doc_key = null,
                 .vector_id = assignment.vector_id,
+                .vector_fingerprint = denseVectorFingerprint(vector_values),
             });
         }
 
@@ -17013,8 +17135,6 @@ pub const IndexManager = struct {
                 entry.index.setBypassExternalVectorCache(true);
             }
         }
-        const existing_vector_scratch = try self.alloc.alloc(f32, entry.dims);
-        defer self.alloc.free(existing_vector_scratch);
         const preloaded_artifact_vectors = try self.alloc.alloc(?[]const f32, writes.len);
         defer {
             self.alloc.free(preloaded_artifact_vectors);
@@ -17073,8 +17193,8 @@ pub const IndexManager = struct {
         }
         const prefetched_ordinals = try doc_identity.lookupOrdinalsTxnAlloc(self.alloc, store_txn, ordinal_doc_keys);
         defer self.alloc.free(prefetched_ordinals);
-        const prefetched_mapped_vector_ids = try self.lookupDenseVectorIdsTxnAlloc(store_txn, entry.config.name, mapping_doc_keys);
-        defer self.alloc.free(prefetched_mapped_vector_ids);
+        const prefetched_mappings = try self.lookupDenseVectorMappingsTxnAlloc(store_txn, entry.config.name, mapping_doc_keys);
+        defer self.alloc.free(prefetched_mappings);
         {
             var existing_index_write_txn = try entry.index.beginRuntimeWriteTxn();
             defer existing_index_write_txn.abort();
@@ -17085,7 +17205,7 @@ pub const IndexManager = struct {
                 writes,
                 keep_write,
                 prefetched_ordinals,
-                prefetched_mapped_vector_ids,
+                prefetched_mappings,
                 &metadata_presence_memo,
             );
 
@@ -17096,13 +17216,14 @@ pub const IndexManager = struct {
 
                 if (write.vector.len > 0) {
                     if (entry.dims != write.vector.len) return error.InvalidVectorDimensions;
+                    const vector_fingerprint = denseVectorFingerprint(write.vector);
                     const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
                         store_txn,
                         entry,
                         entry.config.name,
                         member_key,
                         write.parent_doc_key,
-                        prefetched_mapped_vector_ids[write_index],
+                        if (prefetched_mappings[write_index]) |mapping| mapping.vector_id else null,
                         prefetched_ordinals[write_index],
                         &metadata_presence_memo,
                     );
@@ -17110,7 +17231,9 @@ pub const IndexManager = struct {
                         const artifact_name = entry.embedding_name orelse entry.config.name;
                         try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, write.vector);
                     }
-                    if (try self.denseVectorWriteIsNoOp(entry, &existing_index_write_txn, assignment.vector_id, member_key, write.vector, existing_vector_scratch, &metadata_presence_memo)) continue;
+                    if (prefetched_mappings[write_index]) |mapping| {
+                        if (!assignment.can_assume_absent and mapping.vector_fingerprint != null and std.mem.eql(u8, &mapping.vector_fingerprint.?, &vector_fingerprint)) continue;
+                    }
                     all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
                     try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, member_key);
                     if (assignment.can_assume_absent) {
@@ -17125,21 +17248,25 @@ pub const IndexManager = struct {
                         .doc_key = items.items.items[items.items.items.len - 1].metadata,
                         .parent_doc_key = write.parent_doc_key,
                         .vector_id = assignment.vector_id,
+                        .vector_fingerprint = vector_fingerprint,
                         .ordinal = prefetched_ordinals[write_index],
                     });
                 } else if (write.artifact_key != null) {
                     const vector = preloaded_artifact_vectors[write_index] orelse continue;
+                    const vector_fingerprint = denseVectorFingerprint(vector);
                     const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
                         store_txn,
                         entry,
                         entry.config.name,
                         member_key,
                         write.parent_doc_key,
-                        prefetched_mapped_vector_ids[write_index],
+                        if (prefetched_mappings[write_index]) |mapping| mapping.vector_id else null,
                         prefetched_ordinals[write_index],
                         &metadata_presence_memo,
                     );
-                    if (try self.denseVectorWriteIsNoOp(entry, &existing_index_write_txn, assignment.vector_id, member_key, vector, existing_vector_scratch, &metadata_presence_memo)) continue;
+                    if (prefetched_mappings[write_index]) |mapping| {
+                        if (!assignment.can_assume_absent and mapping.vector_fingerprint != null and std.mem.eql(u8, &mapping.vector_fingerprint.?, &vector_fingerprint)) continue;
+                    }
                     all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
                     try items.appendBorrowedVectorOwnedMetadata(self.alloc, assignment.vector_id, vector, member_key);
                     if (assignment.can_assume_absent) {
@@ -17153,6 +17280,7 @@ pub const IndexManager = struct {
                         .doc_key = items.items.items[items.items.items.len - 1].metadata,
                         .parent_doc_key = write.parent_doc_key,
                         .vector_id = assignment.vector_id,
+                        .vector_fingerprint = vector_fingerprint,
                         .ordinal = prefetched_ordinals[write_index],
                     });
                 } else {
@@ -17453,7 +17581,7 @@ pub const IndexManager = struct {
         var batch = try runtime_store.store.beginBatch();
         errdefer batch.abort();
         for (pending) |mapping| {
-            try self.writeDenseVectorMappingTxn(&batch, index_name, mapping.doc_key, mapping.parent_doc_key, mapping.vector_id);
+            try self.writeDenseVectorMappingTxn(&batch, index_name, mapping.doc_key, mapping.parent_doc_key, mapping.vector_id, mapping.vector_fingerprint);
         }
         try batch.commit();
     }
@@ -17461,9 +17589,9 @@ pub const IndexManager = struct {
     fn commitDenseVectorMappingsTxn(self: *IndexManager, txn: anytype, index_name: []const u8, pending: []const PendingDenseVectorMapping) !void {
         for (pending) |mapping| {
             if (mapping.ordinal) |ordinal| {
-                try self.writeDenseVectorMappingTxnWithOrdinal(txn, index_name, mapping.doc_key, mapping.vector_id, ordinal);
+                try self.writeDenseVectorMappingTxnWithOrdinal(txn, index_name, mapping.doc_key, mapping.vector_id, mapping.vector_fingerprint, ordinal);
             } else {
-                try self.writeDenseVectorMappingTxn(txn, index_name, mapping.doc_key, mapping.parent_doc_key, mapping.vector_id);
+                try self.writeDenseVectorMappingTxn(txn, index_name, mapping.doc_key, mapping.parent_doc_key, mapping.vector_id, mapping.vector_fingerprint);
             }
         }
     }
@@ -17511,35 +17639,6 @@ pub const IndexManager = struct {
             }
             try seen.put(alloc, key, {});
         }
-    }
-
-    fn denseVectorWriteIsNoOp(
-        self: *IndexManager,
-        entry: *DenseIndex,
-        txn: anytype,
-        vector_id: u64,
-        doc_key: []const u8,
-        vector: []const f32,
-        scratch: []f32,
-        metadata_memo: ?*DenseVectorMetadataPresenceMemo,
-    ) !bool {
-        _ = self;
-        const existing_metadata = blk: {
-            if (metadata_memo) |memo| {
-                if (memo.get(vector_id)) |present| {
-                    if (!present) return false;
-                    if (memo.getMetadata(vector_id)) |metadata| break :blk metadata;
-                }
-            }
-            break :blk (try entry.index.getMetadataInTxn(txn, vector_id)) orelse return false;
-        };
-        if (!std.mem.eql(u8, existing_metadata, doc_key)) return false;
-        const existing_vector = entry.index.getVectorScratch(txn, vector_id, scratch) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        if (existing_vector.len != vector.len) return false;
-        return std.mem.eql(u8, std.mem.sliceAsBytes(existing_vector), std.mem.sliceAsBytes(vector));
     }
 
     fn rollbackPendingDenseVectors(self: *IndexManager, entry: *DenseIndex, pending: []const PendingDenseVectorMapping) void {
@@ -19410,7 +19509,7 @@ pub const IndexManager = struct {
         var batch = try store.beginWriteBatch();
         errdefer batch.abort();
         const txn = batch.asTxn();
-        try self.writeDenseVectorMappingTxn(txn, index_name, doc_key, null, vector_id);
+        try self.writeDenseVectorMappingTxn(txn, index_name, doc_key, null, vector_id, null);
         try batch.commit();
     }
 
@@ -19421,11 +19520,12 @@ pub const IndexManager = struct {
         doc_key: []const u8,
         parent_doc_key: ?[]const u8,
         vector_id: u64,
+        vector_fingerprint: ?DenseVectorFingerprint,
     ) !void {
         const mutable_txn = txn;
         const ordinal_doc_key = parent_doc_key orelse doc_key;
         const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, ordinal_doc_key);
-        try self.writeDenseVectorMappingTxnOptionalOrdinal(mutable_txn, index_name, doc_key, vector_id, ordinal);
+        try self.writeDenseVectorMappingTxnOptionalOrdinal(mutable_txn, index_name, doc_key, vector_id, vector_fingerprint, ordinal);
     }
 
     fn writeDenseVectorMappingTxnWithOrdinal(
@@ -19434,9 +19534,10 @@ pub const IndexManager = struct {
         index_name: []const u8,
         doc_key: []const u8,
         vector_id: u64,
+        vector_fingerprint: ?DenseVectorFingerprint,
         ordinal: doc_identity.DocOrdinal,
     ) !void {
-        try self.writeDenseVectorMappingTxnOptionalOrdinal(txn, index_name, doc_key, vector_id, ordinal);
+        try self.writeDenseVectorMappingTxnOptionalOrdinal(txn, index_name, doc_key, vector_id, vector_fingerprint, ordinal);
     }
 
     fn writeDenseVectorMappingTxnOptionalOrdinal(
@@ -19445,6 +19546,7 @@ pub const IndexManager = struct {
         index_name: []const u8,
         doc_key: []const u8,
         vector_id: u64,
+        vector_fingerprint: ?DenseVectorFingerprint,
         ordinal: ?doc_identity.DocOrdinal,
     ) !void {
         const mutable_txn = txn;
@@ -19453,9 +19555,16 @@ pub const IndexManager = struct {
         const vector_map_key = try denseVectorIdMappingKey(self.alloc, index_name, vector_id);
         defer self.alloc.free(vector_map_key);
 
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &buf, vector_id, .little);
-        try mutable_txn.put(doc_map_key, &buf);
+        var vector_id_buf: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &vector_id_buf, vector_id, .little);
+        var versioned_mapping_buf: [dense_vector_mapping_v1_len]u8 = undefined;
+        const doc_mapping_value = if (vector_fingerprint) |fingerprint| blk: {
+            versioned_mapping_buf[0] = dense_vector_mapping_v1;
+            @memcpy(versioned_mapping_buf[1..9], &vector_id_buf);
+            @memcpy(versioned_mapping_buf[9..], &fingerprint);
+            break :blk versioned_mapping_buf[0..];
+        } else vector_id_buf[0..];
+        try mutable_txn.put(doc_map_key, doc_mapping_value);
         try mutable_txn.put(vector_map_key, doc_key);
 
         if (ordinal) |doc_ordinal| {
@@ -19468,8 +19577,8 @@ pub const IndexManager = struct {
 
             var ordinal_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &ordinal_buf, doc_ordinal, .little);
-            try mutable_txn.put(ordinal_map_key, &buf);
-            try mutable_txn.put(ordinal_member_key, &buf);
+            try mutable_txn.put(ordinal_map_key, &vector_id_buf);
+            try mutable_txn.put(ordinal_member_key, &vector_id_buf);
             try mutable_txn.put(vector_ordinal_map_key, &ordinal_buf);
         }
     }
@@ -20828,7 +20937,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
     };
 }
 
-fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) bool {
+fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.EnrichmentConfig, b: enrichment_catalog.EnrichmentConfig) !bool {
     return a.kind == b.kind and
         std.mem.eql(u8, a.name, b.name) and
         std.mem.eql(u8, a.source_field, b.source_field) and
@@ -20841,7 +20950,7 @@ fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enr
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
-        std.mem.eql(u8, a.producer_json, b.producer_json) and
+        try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
@@ -21876,6 +21985,48 @@ fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) 
     return generator;
 }
 
+/// Resolve embedding input semantics while the planner still has the catalog
+/// identity that distinguishes a named document output from a chunk producer.
+/// Runtime and replay code must consume this explicit shape rather than infer
+/// it from the overloaded artifact name.
+fn embeddingInputKind(self: *const IndexManager, generator: GeneratorConfig) enrichment_types.EmbeddingInputKind {
+    if (generator.artifact_name.len > 0) {
+        if (self.getEnrichment(.chunk, generator.artifact_name)) |cfg|
+            return embeddingInputKindForChunkEnrichment(cfg);
+    }
+    if (generatorHasChunking(generator)) return .inline_chunks;
+    return .document;
+}
+
+fn embeddingInputKindForChunkEnrichment(cfg: *const enrichment_catalog.EnrichmentConfig) enrichment_types.EmbeddingInputKind {
+    return if (cfg.source_artifact_name.len > 0) .materialized_chunks else .inline_chunks;
+}
+
+test "embedding input kind is explicit at the catalog boundary" {
+    var manager = try IndexManager.init(std.testing.allocator, ".");
+    defer manager.deinit();
+
+    try std.testing.expectEqual(
+        enrichment_types.EmbeddingInputKind.document,
+        embeddingInputKind(&manager, .{ .source_field = @constCast("body"), .artifact_name = @constCast("named_embedding_output") }),
+    );
+    try std.testing.expectEqual(
+        enrichment_types.EmbeddingInputKind.inline_chunks,
+        embeddingInputKind(&manager, .{ .source_field = @constCast("body"), .artifact_name = @constCast("inline_chunks"), .chunk_size = 256 }),
+    );
+    try std.testing.expect(try manager.ensureChunkEnrichment(.{
+        .name = "materialized_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .source_artifact_name = "document_units",
+        .chunk_size = 256,
+    }));
+    try std.testing.expectEqual(
+        enrichment_types.EmbeddingInputKind.materialized_chunks,
+        embeddingInputKind(&manager, .{ .source_field = @constCast("body"), .artifact_name = @constCast("materialized_chunks") }),
+    );
+}
+
 fn generatorHasChunking(generator: GeneratorConfig) bool {
     return generator.chunk_size > 0 or generator.chunker_json.len > 0;
 }
@@ -21953,6 +22104,13 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
 
     for (edge_types.array.items, 0..) |item, i| {
         if (item != .object) return error.InvalidIndexConfig;
+        var fields = item.object.iterator();
+        while (fields.next()) |field| {
+            const key = field.key_ptr.*;
+            if (!std.mem.eql(u8, key, "name") and
+                !std.mem.eql(u8, key, "field") and
+                !std.mem.eql(u8, key, "topology")) return error.InvalidIndexConfig;
+        }
         const name = item.object.get("name") orelse return error.InvalidIndexConfig;
         if (name != .string) return error.InvalidIndexConfig;
 
@@ -22461,6 +22619,16 @@ test "graph config rejects artifact source combined with document field edge typ
     ));
 }
 
+test "graph edge type config rejects unsupported constraints" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"edge_types":[{"name":"mentions","max_weight":1.0}]}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"edge_types":[{"name":"mentions","allow_self_loops":false}]}
+    ));
+}
+
 test "graph config rejects unreleased source discriminator forms" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
@@ -22796,6 +22964,35 @@ test "dense metadata keys preserve embedded index separators" {
     try std.testing.expect(!std.mem.startsWith(u8, child_next, parent_delete_prefix));
 }
 
+test "dense vector mapping codec accepts released rows and rejects unknown versions" {
+    const vector_id: u64 = 0x0102030405060708;
+    var released: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &released, vector_id, .little);
+    const legacy = try IndexManager.decodeDenseVectorMapping(&released);
+    try std.testing.expectEqual(vector_id, legacy.vector_id);
+    try std.testing.expectEqual(@as(?IndexManager.DenseVectorFingerprint, null), legacy.vector_fingerprint);
+
+    const vector = [_]f32{ 1.0, -0.0, 3.5 };
+    const fingerprint = IndexManager.denseVectorFingerprint(&vector);
+    var current: [IndexManager.dense_vector_mapping_v1_len]u8 = undefined;
+    current[0] = IndexManager.dense_vector_mapping_v1;
+    std.mem.writeInt(u64, current[1..9], vector_id, .little);
+    @memcpy(current[9..], &fingerprint);
+    const decoded = try IndexManager.decodeDenseVectorMapping(&current);
+    try std.testing.expectEqual(vector_id, decoded.vector_id);
+    try std.testing.expectEqual(fingerprint, decoded.vector_fingerprint.?);
+
+    current[0] += 1;
+    try std.testing.expectError(
+        error.InvalidDenseVectorMetadata,
+        IndexManager.decodeDenseVectorMapping(&current),
+    );
+    try std.testing.expectError(
+        error.InvalidDenseVectorMetadata,
+        IndexManager.decodeDenseVectorMapping(current[0 .. current.len - 1]),
+    );
+}
+
 test "dense metadata lookups read legacy textual rows" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -22848,10 +23045,11 @@ test "dense metadata lookups read legacy textual rows" {
     var read_txn = try store.beginProbeTxn();
     defer read_txn.abort();
     try std.testing.expectEqual(@as(?u64, vector_id), try manager.lookupDenseVectorIdTxn(&read_txn, index_name, doc_key));
-    const batch_vector_ids = try manager.lookupDenseVectorIdsTxnAlloc(&read_txn, index_name, &.{ doc_key, "doc:missing" });
-    defer alloc.free(batch_vector_ids);
-    try std.testing.expectEqual(@as(?u64, vector_id), batch_vector_ids[0]);
-    try std.testing.expectEqual(@as(?u64, null), batch_vector_ids[1]);
+    const batch_mappings = try manager.lookupDenseVectorMappingsTxnAlloc(&read_txn, index_name, &.{ doc_key, "doc:missing" });
+    defer alloc.free(batch_mappings);
+    try std.testing.expectEqual(vector_id, batch_mappings[0].?.vector_id);
+    try std.testing.expectEqual(@as(?IndexManager.DenseVectorFingerprint, null), batch_mappings[0].?.vector_fingerprint);
+    try std.testing.expectEqual(@as(?IndexManager.DenseVectorMapping, null), batch_mappings[1]);
     const mapped_doc = (try manager.lookupDenseDocKeyByVectorIdTxn(&read_txn, index_name, vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(mapped_doc);
     try std.testing.expectEqualStrings(doc_key, mapped_doc);
@@ -24652,12 +24850,13 @@ test "dense index unions multiple embedding artifact sources without overwriting
     manager.updateRange(.{ .start = "", .end = "" });
 
     const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"test\",\"dimensions\":3}";
+    const producer_json_reordered = "{ \"dimensions\": 3, \"model\": \"test\", \"provider\": \"antfly\", \"version\": 1 }";
     try manager.addEnrichment(&store, .{
         .name = "title_dense_v1",
         .kind = .embedding,
         .field = "title",
         .expected_dims = 3,
-        .producer_json = producer_json,
+        .producer_json = producer_json_reordered,
     });
     try manager.addEnrichment(&store, .{
         .name = "document_chunks_v1",
@@ -24692,7 +24891,14 @@ test "dense index unions multiple embedding artifact sources without overwriting
     for (generated) |request| {
         if (request.kind != .dense_embedding) continue;
         embedding_request_count += 1;
-        try std.testing.expectEqualStrings(producer_json, request.producer_json);
+        try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
+        try std.testing.expectEqual(
+            if (std.mem.eql(u8, request.embedding_name, "body_dense_v1"))
+                enrichment_types.EmbeddingInputKind.inline_chunks
+            else
+                enrichment_types.EmbeddingInputKind.document,
+            request.input_kind,
+        );
     }
     try std.testing.expectEqual(@as(usize, 2), embedding_request_count);
 
@@ -24762,11 +24968,12 @@ test "sparse multi-source requests carry semantic producer identity" {
     manager.updateRange(.{ .start = "", .end = "" });
 
     const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-test\"}";
+    const producer_json_reordered = "{ \"model\": \"sparse-test\", \"provider\": \"antfly\", \"version\": 1 }";
     try manager.addEnrichment(&store, .{
         .name = "title_sparse_v1",
         .kind = .embedding,
         .field = "title",
-        .producer_json = producer_json,
+        .producer_json = producer_json_reordered,
     });
     try manager.addEnrichment(&store, .{
         .name = "body_sparse_v1",
@@ -24788,7 +24995,8 @@ test "sparse multi-source requests carry semantic producer identity" {
     try std.testing.expectEqual(@as(usize, 2), generated.len);
     for (generated) |request| {
         try std.testing.expect(request.kind == .sparse_embedding);
-        try std.testing.expectEqualStrings(producer_json, request.producer_json);
+        try std.testing.expect(try enrichment_config_validation.producerJsonValuesEqual(alloc, producer_json, request.producer_json));
+        try std.testing.expectEqual(enrichment_types.EmbeddingInputKind.document, request.input_kind);
     }
 
     const foreign_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:multi", "foreign_sparse_v1");
@@ -25688,6 +25896,7 @@ test "dense vector id allocator spills preferred-id collisions without aliasing 
         "artifact:second",
         null,
         occupied_id,
+        null,
     );
     var corruption_memo: IndexManager.DenseVectorMetadataPresenceMemo = .{};
     defer corruption_memo.deinit(alloc);
@@ -27920,7 +28129,7 @@ test "dense apply resource manager accounts working bytes and releases them" {
     try std.testing.expect(stats.peak_bytes >= (@as(u64, 3 * @sizeOf(f32)) + @as(u64, "doc:tracked".len)));
 }
 
-test "dense replay-shaped bulk apply skips identical already indexed vector" {
+test "dense replay-shaped bulk apply skips identical and replaces changed vector atomically" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -27977,6 +28186,41 @@ test "dense replay-shaped bulk apply skips identical already indexed vector" {
     const artifact_payload = try store.get(alloc, artifact_key);
     defer alloc.free(artifact_payload);
     try std.testing.expect(artifact_payload.len > 0);
+
+    const changed_vector = [_]f32{ 9.0, 8.0, 7.0 };
+    const changed_writes = [_]mapper.DenseEmbeddingWrite{.{
+        .index_name = dense_index_name,
+        .doc_key = dense_doc_key,
+        .vector = @constCast(changed_vector[0..]),
+        .artifact_key = null,
+    }};
+    const before_changed_generation = entry.index.publishedGeneration();
+    try manager.applyDenseEmbeddingWritesByNameWithOptions(&store, "dv_v1", &changed_writes, .{ .mode = .bulk_ingest });
+
+    // A replay replacement is one HBC publication, not a visible delete
+    // followed by an insert. Cardinality therefore stays stable while the
+    // changed vector becomes searchable at the next generation.
+    try std.testing.expectEqual(before_changed_generation + 2, entry.index.publishedGeneration());
+    try std.testing.expectEqual(@as(u64, 1), entry.index.publishedActiveCount());
+    var changed_results = try entry.index.search(changed_vector[0..], 1);
+    defer changed_results.deinit();
+    try std.testing.expectEqual(@as(usize, 1), changed_results.getHits().len);
+    try std.testing.expectEqualStrings(dense_doc_key, changed_results.getHits()[0].metadata.?);
+    const mapped_vector_id = blk: {
+        var mapping_txn = try store.beginProbeTxn();
+        defer mapping_txn.abort();
+        const mappings = try manager.lookupDenseVectorMappingsTxnAlloc(&mapping_txn, "dv_v1", &.{dense_doc_key});
+        defer alloc.free(mappings);
+        try std.testing.expectEqual(IndexManager.denseVectorFingerprint(changed_vector[0..]), mappings[0].?.vector_fingerprint.?);
+        break :blk mappings[0].?.vector_id;
+    };
+
+    // The fingerprint is an optimization witness, not serving authority. If
+    // the mapped HBC member is absent, identical replay must restore it.
+    try entry.index.batchDelete(&.{mapped_vector_id});
+    try std.testing.expectEqual(@as(u64, 0), entry.index.publishedActiveCount());
+    try manager.applyDenseEmbeddingWritesByNameWithOptions(&store, "dv_v1", &changed_writes, .{ .mode = .bulk_ingest });
+    try std.testing.expectEqual(@as(u64, 1), entry.index.publishedActiveCount());
 }
 
 test "dense artifact-only replay apply remains searchable after incremental catch-up" {
@@ -30544,6 +30788,38 @@ test "external dense embedding writes use stable vector ids and ordinal member r
     defer alloc.free(chunk_vectors);
     try std.testing.expectEqual(@as(usize, 1), chunk_vectors.len);
     try std.testing.expectEqual(chunk_vector_id, chunk_vectors[0]);
+
+    // The versioned document mapping and the fixed-width ordinal side indexes
+    // intentionally use different wire formats. Persisting a fingerprint must
+    // not prefix or truncate the vector id stored in the ordinal lookup.
+    const primary_fingerprint = IndexManager.denseVectorFingerprint(writes[0].vector);
+    var mapping_batch = try store.beginWriteBatch();
+    errdefer mapping_batch.abort();
+    try manager.writeDenseVectorMappingTxnWithOrdinal(
+        mapping_batch.asTxn(),
+        "semantic_idx",
+        "doc:primary",
+        primary_vector_id,
+        primary_fingerprint,
+        1,
+    );
+    try mapping_batch.commit();
+    var mapping_probe = try store.beginProbeTxn();
+    defer mapping_probe.abort();
+    try std.testing.expectEqual(
+        @as(?u64, primary_vector_id),
+        try manager.lookupDenseVectorIdByOrdinalTxn(&mapping_probe, "semantic_idx", 1),
+    );
+    const fingerprinted_mapping = try manager.lookupDenseVectorMappingsTxnAlloc(
+        &mapping_probe,
+        "semantic_idx",
+        &.{"doc:primary"},
+    );
+    defer alloc.free(fingerprinted_mapping);
+    try std.testing.expectEqual(
+        primary_fingerprint,
+        fingerprinted_mapping[0].?.vector_fingerprint.?,
+    );
 }
 
 test "primary dense stable vector ids survive identity namespace reassignment" {

@@ -60,6 +60,13 @@ fn preparedTailDisabled() bool {
     return slice.len > 0 and !std.mem.eql(u8, slice, "0");
 }
 
+pub fn repackQualityRawLogitsEnabled() bool {
+    const value = c_std.getenv("TERMITE_METAL_LM_HEAD_Q4_REPACK_QUALITY_RAW_LOGITS") orelse return false;
+    if (!std.mem.eql(u8, std.mem.span(value), "1")) return false;
+    const dump_path = c_std.getenv("TERMITE_METAL_DUMP_GENERATE_LOGITS_F32") orelse return false;
+    return std.mem.span(dump_path).len != 0;
+}
+
 pub const FinalNormKind = enum {
     layer,
     rms,
@@ -403,6 +410,7 @@ pub fn forwardPreparedLogitsTensorFromFinalHidden(
             .hidden_size = gpt_config.hidden_size,
             .eps = gpt_config.norm_eps,
             .out_dim = gpt_config.vocab_size,
+            .use_transformed_lm_head = repackQualityRawLogitsEnabled(),
         }),
     };
     const finished_at = monotonicNowNs();

@@ -31,6 +31,7 @@ const HeaderName = @import("../core/headers.zig").HeaderName;
 const Uri = @import("../core/uri.zig").Uri;
 const Request = @import("../core/request.zig").Request;
 const Response = @import("../core/response.zig").Response;
+const AttemptObserver = @import("../core/attempt_observer.zig").AttemptObserver;
 const Status = @import("../core/status.zig").Status;
 const socket_mod = @import("../net/socket.zig");
 const Socket = socket_mod.Socket;
@@ -58,8 +59,26 @@ const H2Connection = h2_mod.H2Connection;
 const hpack = @import("../protocol/hpack.zig");
 const Stream = @import("../protocol/stream.zig").Stream;
 
+const H1ReadResult = struct {
+    response: Response,
+    reusable: bool,
+};
+
+/// A persistent HTTP/1 connection is reusable only when both the connection
+/// semantics and the response framing permit another message on the socket.
+/// Close-delimited bodies consume EOF as their terminator, so they can never
+/// be returned to the pool even if the headers otherwise request keep-alive.
+fn parsedResponseReusable(parser: *const Parser, req_method: types.Method) bool {
+    const code = parser.status_code orelse return false;
+    const has_no_body = req_method == .HEAD or
+        (code >= 100 and code < 200) or code == 204 or code == 304;
+    const self_delimited = has_no_body or parser.chunked or parser.content_length != null;
+    return self_delimited and parser.headers.isKeepAlive(parser.version);
+}
+
 /// HTTP client configuration.
 pub const ClientConfig = struct {
+    attempt_observer: ?AttemptObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
     retry_policy: types.RetryPolicy = .{},
@@ -68,6 +87,11 @@ pub const ClientConfig = struct {
     user_agent: []const u8 = meta.default_user_agent,
     max_response_size: usize = types.default_max_body_size,
     max_response_headers: usize = 256,
+    /// Default request lifetime for adapters whose provider interface does not
+    /// expose per-call HTTP options. An explicit RequestOptions cancellation
+    /// source takes precedence. The token is borrowed for the client's
+    /// lifetime.
+    request_cancellation: ?CancellationToken = null,
     verify_ssl: bool = true,
     /// Optional explicit CA bundle file. When set, system roots are not loaded.
     tls_ca_file: ?[]const u8 = null,
@@ -104,6 +128,7 @@ pub const ClientConfig = struct {
 
 /// Per-request options.
 pub const RequestOptions = struct {
+    attempt_observer: ?AttemptObserver = null,
     headers: ?[]const [2][]const u8 = null,
     body: ?[]const u8 = null,
     json: ?[]const u8 = null,
@@ -667,6 +692,7 @@ pub const Client = struct {
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
+        req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -707,7 +733,11 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
+        var response = try self.executeRequest(
+            &req,
+            reqOpts.timeout_ms,
+            reqOpts.cancellation orelse self.config.request_cancellation,
+        );
         errdefer response.deinit();
 
         if (self.config.cookies_enabled) try self.storeCookies(&response);
@@ -762,6 +792,7 @@ pub const Client = struct {
         var req = try Request.init(self.allocator, method, full_url);
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
+        req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -801,7 +832,14 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
+        var response = try self.executeRequestToWriter(
+            &req,
+            reqOpts.timeout_ms,
+            writer,
+            progress_cb,
+            progress_ctx,
+            reqOpts.cancellation orelse self.config.request_cancellation,
+        );
         errdefer response.deinit();
 
         if (self.config.cookies_enabled) try self.storeCookies(&response);
@@ -1227,6 +1265,62 @@ pub const Client = struct {
     }
 
     fn connectHost(self: *Self, host: []const u8, port: u16) !Socket {
+        const timeout_ms = self.config.timeouts.connect_ms;
+        if (timeout_ms == 0) return self.connectHostDirect(host, port);
+
+        const ConnectResult = anyerror!Socket;
+        const SelectResult = union(enum) {
+            connect: ConnectResult,
+            watchdog: anyerror!RequestWatchdogOutcome,
+        };
+        const Task = struct {
+            fn connectTask(client: *Self, target_host: []const u8, target_port: u16) ConnectResult {
+                return client.connectHostDirect(target_host, target_port);
+            }
+
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), connect_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestCancellationOrTimeout(io, stop, null, connect_timeout_ms);
+            }
+
+            fn drainLateResult(result: SelectResult) void {
+                switch (result) {
+                    .connect => |connect_result| if (connect_result) |socket_value| {
+                        var socket = socket_value;
+                        socket.close();
+                    } else |_| {},
+                    .watchdog => {},
+                }
+            }
+        };
+
+        var select_buffer: [2]SelectResult = undefined;
+        var select = Io.Select(SelectResult).init(self.io, &select_buffer);
+        var watchdog_stop = std.atomic.Value(u32).init(0);
+        try select.concurrent(.connect, Task.connectTask, .{ self, host, port });
+        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms }) catch |err| {
+            while (select.cancel()) |late| Task.drainLateResult(late);
+            return err;
+        };
+        errdefer while (select.cancel()) |late| Task.drainLateResult(late);
+
+        const first = try select.await();
+        switch (first) {
+            .connect => |connect_result| {
+                stopRequestWatchdog(self.io, &watchdog_stop);
+                select.cancelDiscard();
+                return try connect_result;
+            },
+            .watchdog => |watchdog_result| {
+                while (select.cancel()) |late| Task.drainLateResult(late);
+                return switch (try watchdog_result) {
+                    .timed_out => error.Timeout,
+                    .cancelled, .stopped => unreachable,
+                };
+            },
+        }
+    }
+
+    fn connectHostDirect(self: *Self, host: []const u8, port: u16) !Socket {
         if (self.config.address_filter != null) {
             const address = try resolveAddressFiltered(self.io, host, port, self.config.address_filter);
             return try Socket.connect(address, self.io);
@@ -1315,6 +1409,29 @@ pub const Client = struct {
     }
 
     fn executeRequestOnce(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
+        const observer = req.attempt_observer;
+        if (observer) |hook| try hook.before(hook.ptr, .{
+            .io = self.io,
+            .deadline_ms = deadline_ms,
+            .cancellation_ptr = interrupt,
+            .is_cancelled = attemptCancelled,
+            .body_bytes = if (req.body) |body| body.len else 0,
+            .output_tokens = hook.output_tokens,
+        });
+        var response = self.executeRequestOnceUnobserved(req, timeout_override_ms, deadline_ms, interrupt) catch |err| {
+            if (observer) |hook| hook.after(hook.ptr, null);
+            return err;
+        };
+        if (observer) |hook| hook.after(hook.ptr, &response);
+        return response;
+    }
+
+    fn attemptCancelled(ptr: *const anyopaque) bool {
+        const interrupt: *const RequestInterrupt = @ptrCast(@alignCast(ptr));
+        return @constCast(interrupt).isCancellationRequested();
+    }
+
+    fn executeRequestOnceUnobserved(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
@@ -1412,6 +1529,32 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         interrupt: *RequestInterrupt,
     ) !Response {
+        if (req.attempt_observer) |hook| try hook.before(hook.ptr, .{
+            .io = self.io,
+            .deadline_ms = deadline_ms,
+            .cancellation_ptr = interrupt,
+            .is_cancelled = attemptCancelled,
+            .body_bytes = if (req.body) |body| body.len else 0,
+            .output_tokens = hook.output_tokens,
+        });
+        var response = self.executeRequestToWriterOnceUnobserved(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, interrupt) catch |err| {
+            if (req.attempt_observer) |hook| hook.after(hook.ptr, null);
+            return err;
+        };
+        if (req.attempt_observer) |hook| hook.after(hook.ptr, &response);
+        return response;
+    }
+
+    fn executeRequestToWriterOnceUnobserved(
+        self: *Self,
+        req: *Request,
+        timeout_override_ms: ?u64,
+        deadline_ms: ?i64,
+        writer: anytype,
+        progress_cb: ?WriterProgressCallback,
+        progress_ctx: ?*anyopaque,
+        interrupt: *RequestInterrupt,
+    ) !Response {
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
         const timeout_ms = timeout_override_ms orelse blk: {
@@ -1424,7 +1567,7 @@ pub const Client = struct {
         };
 
         if (shouldUseHttp2(self.config)) {
-            var res = try self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt);
+            var res = try self.executeRequestOnceUnobserved(req, timeout_override_ms, deadline_ms, interrupt);
             errdefer res.deinit();
             try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
             return res;
@@ -1479,11 +1622,11 @@ pub const Client = struct {
         const bytes = try serializeToSlice(self.allocator, req);
         defer self.allocator.free(bytes);
         try socket.sendAll(bytes);
-        var res = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
+        const result = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
-            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+            out.* = result.reusable;
         }
-        return res;
+        return result.response;
     }
 
     fn executeOnSocketToWriter(
@@ -1498,7 +1641,7 @@ pub const Client = struct {
         const bytes = try serializeToSlice(self.allocator, req);
         defer self.allocator.free(bytes);
         try socket.sendAll(bytes);
-        var res = try self.readResponseToWriter(
+        const result = try self.readResponseToWriter(
             socket,
             req.method,
             self.responseSizeLimit(req),
@@ -1507,9 +1650,9 @@ pub const Client = struct {
             progress_ctx,
         );
         if (keep_alive_out) |out| {
-            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+            out.* = result.reusable;
         }
-        return res;
+        return result.response;
     }
 
     /// Sends request and reads response over an established TLS session.
@@ -1520,11 +1663,11 @@ pub const Client = struct {
         const w = try session.getWriter();
         try w.writeAll(bytes);
         try session.flush();
-        var res = try self.readResponse(session, req.method, self.responseSizeLimit(req));
+        const result = try self.readResponse(session, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
-            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+            out.* = result.reusable;
         }
-        return res;
+        return result.response;
     }
 
     fn executeOnTlsToWriter(
@@ -1541,7 +1684,7 @@ pub const Client = struct {
         const w = try session.getWriter();
         try w.writeAll(bytes);
         try session.flush();
-        var res = try self.readResponseToWriter(
+        const result = try self.readResponseToWriter(
             session,
             req.method,
             self.responseSizeLimit(req),
@@ -1550,9 +1693,9 @@ pub const Client = struct {
             progress_ctx,
         );
         if (keep_alive_out) |out| {
-            out.* = res.headers.isKeepAlive(.HTTP_1_1);
+            out.* = result.reusable;
         }
-        return res;
+        return result.response;
     }
 
     /// Creates a new TLS session on a socket and executes a request.
@@ -2369,7 +2512,7 @@ pub const Client = struct {
     /// Streaming pipeline: parse headers only → build Io.Reader chain
     /// (leftover → socket/TLS → content-length/chunked → decompress) → read into output.
     /// Only one copy of the body is ever in memory at a time.
-    fn readResponse(self: *Self, source: anytype, req_method: types.Method, max_response_size: usize) !Response {
+    fn readResponse(self: *Self, source: anytype, req_method: types.Method, max_response_size: usize) !H1ReadResult {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
         parser.max_body_size = max_response_size;
@@ -2425,7 +2568,11 @@ pub const Client = struct {
             break;
         }
 
-        return self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method, max_response_size);
+        const reusable = parsedResponseReusable(&parser, req_method);
+        return .{
+            .response = try self.buildStreamingResponse(&parser, source, buf[0..leftover], req_method, max_response_size),
+            .reusable = reusable,
+        };
     }
 
     fn readResponseToWriter(
@@ -2436,7 +2583,7 @@ pub const Client = struct {
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
-    ) !Response {
+    ) !H1ReadResult {
         var parser = Parser.initResponse(self.allocator);
         defer parser.deinit();
         parser.max_body_size = max_response_size;
@@ -2489,16 +2636,20 @@ pub const Client = struct {
             break;
         }
 
-        return self.writeStreamingResponse(
-            &parser,
-            source,
-            buf[0..leftover],
-            req_method,
-            max_response_size,
-            writer,
-            progress_cb,
-            progress_ctx,
-        );
+        const reusable = parsedResponseReusable(&parser, req_method);
+        return .{
+            .response = try self.writeStreamingResponse(
+                &parser,
+                source,
+                buf[0..leftover],
+                req_method,
+                max_response_size,
+                writer,
+                progress_cb,
+                progress_ctx,
+            ),
+            .reusable = reusable,
+        };
     }
 
     /// Read bytes from either a Socket or a TlsSession into `buf`.
@@ -2605,6 +2756,15 @@ pub const Client = struct {
         try appendDecompressed(allocator, encoded, .raw, output, max_size);
     }
 
+    fn takeParsedResponse(parser: *Parser, code: u16) Response {
+        var res = Response.init(parser.allocator, code);
+        res.version = parser.version;
+        res.headers.deinit();
+        res.headers = parser.headers;
+        parser.headers = Headers.init(parser.allocator);
+        return res;
+    }
+
     /// Builds a Response by streaming the body through an Io.Reader chain.
     /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
     fn buildStreamingResponse(
@@ -2616,12 +2776,8 @@ pub const Client = struct {
         max_response_size: usize,
     ) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
-        var res = Response.init(parser.allocator, code);
+        var res = takeParsedResponse(parser, code);
         errdefer res.deinit();
-        // Move headers ownership from parser to response.
-        res.headers.deinit();
-        res.headers = parser.headers;
-        parser.headers = Headers.init(parser.allocator);
 
         // RFC 7230 §3.3: Responses to HEAD and 1xx/204/304 status codes
         // MUST NOT contain a message body regardless of headers.
@@ -2753,11 +2909,8 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
     ) !Response {
         const code = parser.status_code orelse return error.InvalidResponse;
-        var res = Response.init(parser.allocator, code);
+        var res = takeParsedResponse(parser, code);
         errdefer res.deinit();
-        res.headers.deinit();
-        res.headers = parser.headers;
-        parser.headers = Headers.init(parser.allocator);
 
         const no_body_status = (code >= 100 and code < 200) or code == 204 or code == 304;
         const has_body = !no_body_status and req_method != .HEAD and
@@ -3243,6 +3396,18 @@ test "Client rejects an already cancelled request" {
     );
 }
 
+test "ClientConfig supplies cancellation to provider adapters" {
+    var cancellation = std.atomic.Value(bool).init(true);
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .request_cancellation = .fromAtomic(&cancellation),
+    });
+    defer client.deinit();
+    try std.testing.expectError(
+        error.Cancelled,
+        client.get("http://127.0.0.1:1/never", .{}),
+    );
+}
+
 test "Client rejects callback-backed cancellation" {
     const State = struct {
         canceled: bool,
@@ -3287,6 +3452,50 @@ test "Response parsing" {
     const code = parser.status_code orelse return error.InvalidResponse;
     try std.testing.expectEqual(@as(u16, 200), code);
     try std.testing.expectEqualStrings("application/json", parser.headers.get("Content-Type").?);
+}
+
+test "parsed HTTP 1.0 response is not reusable by default" {
+    const allocator = std.testing.allocator;
+    const data = "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    var parser = Parser.initResponse(allocator);
+    defer parser.deinit();
+
+    _ = try parser.feed(data);
+    try std.testing.expect(parser.isComplete());
+
+    var response = Client.takeParsedResponse(&parser, parser.status_code orelse return error.InvalidResponse);
+    defer response.deinit();
+
+    try std.testing.expectEqual(types.Version.HTTP_1_0, response.version);
+    try std.testing.expect(!response.headers.isKeepAlive(response.version));
+}
+
+test "HTTP 1 response reuse requires persistent self-delimited framing" {
+    var parser = Parser.initResponse(std.testing.allocator);
+    defer parser.deinit();
+    parser.status_code = 200;
+
+    try std.testing.expect(!parsedResponseReusable(&parser, .GET));
+
+    parser.content_length = 0;
+    try std.testing.expect(parsedResponseReusable(&parser, .GET));
+
+    try parser.headers.set("Connection", "close");
+    try std.testing.expect(!parsedResponseReusable(&parser, .GET));
+
+    try parser.headers.set("Connection", "keep-alive");
+    parser.version = .HTTP_1_0;
+    try std.testing.expect(parsedResponseReusable(&parser, .GET));
+
+    parser.content_length = null;
+    try std.testing.expect(!parsedResponseReusable(&parser, .GET));
+
+    parser.version = .HTTP_1_1;
+    _ = parser.headers.remove("Connection");
+    try std.testing.expect(parsedResponseReusable(&parser, .HEAD));
+    parser.status_code = 204;
+    try std.testing.expect(parsedResponseReusable(&parser, .GET));
 }
 
 test "Client stores Set-Cookie headers" {
@@ -4011,6 +4220,27 @@ const python_tls_head_keepalive_server_script =
     "        time.sleep(30.0)\n" ++
     "listener.close()\n";
 
+const python_close_delimited_server_script =
+    "import socket\n" ++
+    "import sys\n" ++
+    "\n" ++
+    "port = int(sys.argv[1])\n" ++
+    "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n" ++
+    "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
+    "listener.bind(('127.0.0.1', port))\n" ++
+    "listener.listen(4)\n" ++
+    "for _ in range(4):\n" ++
+    "    conn, _ = listener.accept()\n" ++
+    "    with conn:\n" ++
+    "        data = b''\n" ++
+    "        while b'\\r\\n\\r\\n' not in data:\n" ++
+    "            chunk = conn.recv(4096)\n" ++
+    "            if not chunk:\n" ++
+    "                break\n" ++
+    "            data += chunk\n" ++
+    "        conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\n\\r\\nok')\n" ++
+    "listener.close()\n";
+
 const python_slow_drip_server_script =
     "import socket\n" ++
     "import sys\n" ++
@@ -4081,6 +4311,60 @@ fn requestWithRetry(client: *Client, io: Io, method: types.Method, url: []const 
         };
     }
     unreachable;
+}
+
+test "close-delimited H1 responses are evicted for buffered and writer requests" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_close_delimited_server_script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer child.kill(io);
+    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = true,
+        .retry_policy = .{ .max_retries = 0 },
+    });
+    defer client.deinit();
+
+    for (0..2) |_| {
+        var response = try getWithRetry(&client, io, url, 20);
+        defer response.deinit();
+        try std.testing.expectEqualStrings("ok", response.body.?);
+        try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
+    }
+
+    for (0..2) |_| {
+        var output = std.ArrayListUnmanaged(u8).empty;
+        defer output.deinit(allocator);
+        var response = try client.getToWriter(
+            url,
+            .{},
+            arrayListWriter(&output, allocator),
+            null,
+            null,
+        );
+        defer response.deinit();
+        try std.testing.expectEqualStrings("ok", output.items);
+        try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
+    }
 }
 
 test "buffered H1 timeout evicts an interrupted pooled connection" {

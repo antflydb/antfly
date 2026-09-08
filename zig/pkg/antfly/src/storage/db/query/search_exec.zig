@@ -1266,12 +1266,16 @@ pub fn searchComposed(
     }
 
     const fuse_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    // Reranking and pruning are coordinator transforms. Keep their bounded
+    // retrieval window through local fusion instead of truncating it to the
+    // final page, and defer pruning until provider scores exist when present.
+    const fusion_req = composedFusionRequest(shared_req);
     var base = if (named_sets.items.len == 0)
         try emptySearchResult(alloc)
     else if (named_sets.items.len == 1)
         try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], shared_req.include_stored)
     else
-        try executor.fuse_named_sets(executor.ctx, alloc, shared_req, named_sets.items);
+        try executor.fuse_named_sets(executor.ctx, alloc, fusion_req, named_sets.items);
     if (bench_query_profile) fuse_ns = platform_time.monotonicNs() - fuse_start_ns;
     errdefer base.deinit();
 
@@ -1494,6 +1498,25 @@ pub fn isDefaultMatchAll(query: types.Query) bool {
     };
 }
 
+/// Whether request execution binds `index_name` directly as a full-text index.
+/// Keep planning, binding validation, and API lifecycle error classification
+/// on one definition so an unavailable index cannot change a permanent shape
+/// error into a retryable rebuilding response.
+pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
+    return req.full_text != null or
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0 or
+        (!isDefaultMatchAll(req.query) and isTextQuery(req.query));
+}
+
+/// Structured text filters use their own resolution chain: the routed primary
+/// text index, then the root index, then the default full-text index. Keep that
+/// distinct from direct root-index binding so preflight does not reject a
+/// valid request merely because its semantic root index is not full-text.
+pub fn requestBindsFilterTextIndex(req: types.SearchRequest) bool {
+    return req.filter_text != null or req.exclusion_text != null;
+}
+
 fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (req.full_text_queries.len > 0) return true;
@@ -1697,7 +1720,10 @@ const ComponentPaging = struct {
 };
 
 fn componentPaging(req: types.SearchRequest) ComponentPaging {
-    var limit = req.limit +| req.offset;
+    var limit = if (req.reranker) |reranker|
+        reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset
+    else
+        req.limit +| req.offset;
     const needs_component_window = requestHasPostprocessPageTransforms(req);
 
     if (!needs_component_window) {
@@ -1711,15 +1737,74 @@ fn componentPaging(req: types.SearchRequest) ComponentPaging {
         if (merge_config.window_size > limit) limit = merge_config.window_size;
     }
     if (req.reranker) |reranker| {
-        if (reranker.top_n) |top_n| {
-            if (top_n > limit) limit = top_n;
-        }
+        const reranker_window = reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset;
+        if (reranker_window > limit) limit = reranker_window;
     }
 
     return .{
         .offset = 0,
         .limit = limit,
     };
+}
+
+fn composedFusionRequest(req: types.SearchRequest) types.SearchRequest {
+    if (req.reranker == null and req.pruner == null) return req;
+    const paging = componentPaging(req);
+    var copy = req;
+    copy.offset = paging.offset;
+    copy.limit = paging.limit;
+    copy.pruner = null;
+    return copy;
+}
+
+test "composed fusion preserves the coordinator reranker window" {
+    const req = types.SearchRequest{
+        .offset = 10,
+        .limit = 10,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .candidate_count = 50,
+        },
+        .pruner = .{ .min_score_ratio = 0.5 },
+    };
+    const fusion_req = composedFusionRequest(req);
+    try std.testing.expectEqual(@as(u32, 0), fusion_req.offset);
+    try std.testing.expectEqual(@as(u32, 50), fusion_req.limit);
+    try std.testing.expect(fusion_req.pruner == null);
+
+    const pruner_only = composedFusionRequest(.{
+        .offset = 10,
+        .limit = 10,
+        .pruner = .{ .min_score_ratio = 0.5 },
+    });
+    try std.testing.expectEqual(@as(u32, 0), pruner_only.offset);
+    try std.testing.expectEqual(@as(u32, 20), pruner_only.limit);
+    try std.testing.expect(pruner_only.pruner == null);
+}
+
+test "reranker component paging includes the post-rerank offset" {
+    const paging = componentPaging(.{
+        .limit = 5,
+        .offset = 7,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .top_n = 10,
+        },
+    });
+    try std.testing.expectEqual(@as(u32, 0), paging.offset);
+    try std.testing.expectEqual(@as(u32, 17), paging.limit);
+
+    const legacy_top_n = componentPaging(.{
+        .limit = 5,
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .top_n = 2,
+        },
+    });
+    try std.testing.expectEqual(@as(u32, 2), legacy_top_n.limit);
 }
 
 fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {

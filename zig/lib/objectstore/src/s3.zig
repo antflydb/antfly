@@ -18,6 +18,7 @@ const client_mod = @import("client.zig");
 const s3_compat = @import("s3_compat.zig");
 const test_support = @import("test_support.zig");
 const types = @import("types.zig");
+const transfer = @import("transfer.zig");
 
 const Allocator = std.mem.Allocator;
 const multipart_upload_threshold: u64 = 64 * 1024 * 1024;
@@ -25,7 +26,6 @@ const multipart_upload_min_part_bytes: u64 = 16 * 1024 * 1024;
 const multipart_upload_max_part_bytes: u64 = 512 * 1024 * 1024;
 const multipart_upload_part_alignment: u64 = 1024 * 1024;
 const max_multipart_parts: u64 = 10_000;
-
 pub const Scheme = s3_compat.Scheme;
 pub const AddressingStyle = s3_compat.AddressingStyle;
 pub const Credentials = s3_compat.Credentials;
@@ -526,7 +526,7 @@ test "request-scoped S3 transport preserves caller IO and client config" {
     try std.testing.expectError(error.Timeout, remainingRequestTimeoutMs(250, 250 * std.time.ns_per_ms));
 }
 
-test "s3 read cancellation reaches active GET and HEAD transport requests" {
+test "s3 cancellation reaches active read and write transport requests" {
     const alloc = std.testing.allocator;
     const State = struct {
         signal: *std.atomic.Value(bool),
@@ -589,6 +589,56 @@ test "s3 read cancellation reaches active GET and HEAD transport requests" {
         }),
     );
     try std.testing.expectEqual(@as(usize, 2), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .PUT;
+    try std.testing.expectError(
+        error.Canceled,
+        client.putObject("bucket", "object", "payload", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .HEAD;
+    try std.testing.expectError(
+        error.Canceled,
+        client.bucketExistsWithOptions("bucket", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .PUT;
+    try std.testing.expectError(
+        error.Canceled,
+        client.makeBucketWithOptions("bucket", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .GET;
+    try std.testing.expectError(
+        error.Canceled,
+        client.listObjects("bucket", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 6), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .DELETE;
+    try std.testing.expectError(
+        error.Canceled,
+        client.deleteObject("bucket", "object", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 7), state.calls);
 }
 
 pub const Client = struct {
@@ -598,6 +648,13 @@ pub const Client = struct {
     request_fn: RequestFn,
     owned_httpx: ?*HttpxTransport,
     owned_context_httpx: ?*ContextHttpxTransport,
+
+    fn operationIo(self: *const Client) ?std.Io {
+        if (self.cfg.io) |io| return io;
+        if (self.owned_httpx) |transport| return transport.client.io;
+        if (self.owned_context_httpx) |transport| return transport.io;
+        return null;
+    }
 
     pub fn init(alloc: Allocator, cfg: Config) !Client {
         const transport = try alloc.create(HttpxTransport);
@@ -668,11 +725,11 @@ pub const Client = struct {
         };
     }
 
-    fn bucketExists(self: *Client, bucket: []const u8) !bool {
+    fn bucketExists(self: *Client, bucket: []const u8, opts: types.BucketOptions) !bool {
         var target = try bucketTargetAlloc(self.alloc, self.cfg, bucket);
         defer target.deinit(self.alloc);
 
-        var response = try self.perform(.HEAD, target, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(.HEAD, target, &.{}, null, null, null, opts.cancellation);
         defer response.deinit(self.alloc);
         return switch (response.status) {
             200, 204 => true,
@@ -683,11 +740,11 @@ pub const Client = struct {
         };
     }
 
-    fn makeBucket(self: *Client, bucket: []const u8) !void {
+    fn makeBucket(self: *Client, bucket: []const u8, opts: types.BucketOptions) !void {
         var target = try bucketTargetAlloc(self.alloc, self.cfg, bucket);
         defer target.deinit(self.alloc);
 
-        var response = try self.perform(.PUT, target, &.{}, "", null);
+        var response = try self.performWithResponseLimitAndCancellation(.PUT, target, &.{}, "", null, null, opts.cancellation);
         defer response.deinit(self.alloc);
         switch (response.status) {
             200, 201 => return,
@@ -704,6 +761,7 @@ pub const Client = struct {
         body: []const u8,
         opts: types.PutOptions,
     ) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         var target = try objectTargetAlloc(alloc, self.cfg, bucket, key);
         defer target.deinit(alloc);
 
@@ -712,7 +770,15 @@ pub const Client = struct {
         const owned_if_match = try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
         defer if (owned_if_match) |value| alloc.free(value);
 
-        var response = try self.perform(.PUT, target, headers.items, body, opts.content_type);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .PUT,
+            target,
+            headers.items,
+            body,
+            opts.content_type,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -749,6 +815,7 @@ pub const Client = struct {
         opts: types.PutOptions,
         multipart_threshold: u64,
     ) !types.PutResult {
+        if (opts.cancellation) |token| try token.check();
         const source = try openFilePath(io, src_path);
         defer source.close(io);
         const stat = try source.stat(io);
@@ -760,6 +827,7 @@ pub const Client = struct {
             if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
             if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
+            if (opts.cancellation) |token| try token.check();
             return try self.putObject(alloc, bucket, key, body, opts);
         }
         if (opts.if_match_etag != null or opts.if_none_match) return error.ConditionalMultipartUnsupported;
@@ -777,14 +845,33 @@ pub const Client = struct {
         defer freeQueryPairs(alloc, initiate_pairs);
         var initiate_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, initiate_pairs);
         defer initiate_target.deinit(alloc);
-        var initiated = try self.perform(.POST, initiate_target, &.{}, null, opts.content_type);
+        var initiated = try self.performWithResponseLimitAndCancellation(
+            .POST,
+            initiate_target,
+            &.{},
+            null,
+            opts.content_type,
+            null,
+            opts.cancellation,
+        );
         defer initiated.deinit(alloc);
         if (initiated.status != 200) return unexpectedStatusError(initiated.status);
         const upload_id = try requiredTagAlloc(alloc, initiated.body, "UploadId");
         defer alloc.free(upload_id);
 
         var completed = false;
-        defer if (!completed) self.abortMultipartUpload(bucket, key, upload_id) catch {};
+        defer if (!completed) {
+            var cleanup_deadline: ?transfer.CleanupDeadline = if (self.operationIo()) |cleanup_io|
+                transfer.CleanupDeadline.init(cleanup_io)
+            else
+                null;
+            self.abortMultipartUpload(
+                bucket,
+                key,
+                upload_id,
+                if (cleanup_deadline) |*deadline| deadline.token() else null,
+            ) catch {};
+        };
         var etags = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (etags.items) |etag| alloc.free(etag);
@@ -795,8 +882,10 @@ pub const Client = struct {
         var offset: u64 = 0;
         var part_number: u32 = 1;
         while (offset < stat.size) : (part_number += 1) {
+            if (opts.cancellation) |token| try token.check();
             const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
-            if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
+            if (try transfer.readPositionalAllWithCancellation(source, io, buffer[0..wanted], offset, opts.cancellation) != wanted)
+                return error.SourceFileChanged;
             const current_stat = try source.stat(io);
             if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
             const part_number_text = try std.fmt.allocPrint(alloc, "{d}", .{part_number});
@@ -809,7 +898,15 @@ pub const Client = struct {
             defer freeQueryPairs(alloc, query_pairs);
             var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query_pairs);
             defer target.deinit(alloc);
-            var response = try self.perform(.PUT, target, &.{}, buffer[0..wanted], null);
+            var response = try self.performWithResponseLimitAndCancellation(
+                .PUT,
+                target,
+                &.{},
+                buffer[0..wanted],
+                null,
+                null,
+                opts.cancellation,
+            );
             defer response.deinit(alloc);
             if (response.status != 200) return unexpectedStatusError(response.status);
             const etag = response.etag orelse return error.MissingMultipartEtag;
@@ -818,6 +915,7 @@ pub const Client = struct {
         }
         var extra: [1]u8 = undefined;
         if (try source.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
+        if (opts.cancellation) |token| try token.check();
 
         const completion_xml = try completeMultipartXmlAlloc(alloc, etags.items);
         defer alloc.free(completion_xml);
@@ -828,7 +926,15 @@ pub const Client = struct {
         defer freeQueryPairs(alloc, complete_pairs);
         var complete_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, complete_pairs);
         defer complete_target.deinit(alloc);
-        var response = try self.perform(.POST, complete_target, &.{}, completion_xml, "application/xml");
+        var response = try self.performWithResponseLimitAndCancellation(
+            .POST,
+            complete_target,
+            &.{},
+            completion_xml,
+            "application/xml",
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
         if (response.status != 200) return unexpectedStatusError(response.status);
         if (findBlock(response.body, "Error", 0) != null) return error.MultipartCompletionFailed;
@@ -845,7 +951,13 @@ pub const Client = struct {
         };
     }
 
-    fn abortMultipartUpload(self: *Client, bucket: []const u8, key: []const u8, upload_id: []const u8) !void {
+    fn abortMultipartUpload(
+        self: *Client,
+        bucket: []const u8,
+        key: []const u8,
+        upload_id: []const u8,
+        cancellation: ?types.CancellationToken,
+    ) !void {
         var query = std.ArrayListUnmanaged(QueryPair).empty;
         errdefer deinitQueryList(self.alloc, &query);
         try appendQueryPair(self.alloc, &query, "uploadId", upload_id);
@@ -853,7 +965,15 @@ pub const Client = struct {
         defer freeQueryPairs(self.alloc, query_pairs);
         var target = try objectTargetAllocWithQuery(self.alloc, self.cfg, bucket, key, query_pairs);
         defer target.deinit(self.alloc);
-        var response = try self.perform(.DELETE, target, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .DELETE,
+            target,
+            &.{},
+            null,
+            null,
+            null,
+            cancellation,
+        );
         defer response.deinit(self.alloc);
         if (response.status != 200 and response.status != 204 and response.status != 404)
             return unexpectedStatusError(response.status);
@@ -1029,7 +1149,15 @@ pub const Client = struct {
         const owned_if_match = try appendConditionalHeaders(self.alloc, &headers, opts.if_match_etag, false);
         defer if (owned_if_match) |value| self.alloc.free(value);
 
-        var response = try self.perform(.DELETE, target, headers.items, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .DELETE,
+            target,
+            headers.items,
+            null,
+            null,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(self.alloc);
         switch (response.status) {
             200, 204 => return,
@@ -1045,13 +1173,39 @@ pub const Client = struct {
         var target = try bucketTargetAllocWithQuery(alloc, self.cfg, bucket, query);
         defer target.deinit(alloc);
 
-        var response = try self.perform(.GET, target, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .GET,
+            target,
+            &.{},
+            null,
+            null,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
         switch (response.status) {
             200 => return try parseListResponse(alloc, response.body),
             404 => return .{
                 .entries = try alloc.alloc(types.ListEntry, 0),
                 .common_prefixes = try alloc.alloc([]u8, 0),
+            },
+            else => return unexpectedStatusError(response.status),
+        }
+    }
+
+    fn listObjectVersions(self: *Client, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        const query = try buildListObjectVersionsQueryAlloc(alloc, opts);
+        defer freeQueryPairs(alloc, query);
+        var target = try bucketTargetAllocWithQuery(alloc, self.cfg, bucket, query);
+        defer target.deinit(alloc);
+
+        var response = try self.perform(.GET, target, &.{}, null, null);
+        defer response.deinit(alloc);
+        switch (response.status) {
+            200 => return try parseListObjectVersionsResponse(alloc, response.body),
+            404 => return .{
+                .entries = try alloc.alloc(types.ObjectVersionEntry, 0),
+                .is_truncated = false,
             },
             else => return unexpectedStatusError(response.status),
         }
@@ -1176,6 +1330,7 @@ pub const Client = struct {
         .stat_object_with_options = erasedStatObjectWithOptions,
         .delete_object = erasedDeleteObject,
         .list_objects = erasedListObjects,
+        .list_object_versions = erasedListObjectVersions,
     };
 
     fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
@@ -1183,14 +1338,14 @@ pub const Client = struct {
         self.deinit();
     }
 
-    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !bool {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        return try self.bucketExists(bucket);
+        return try self.bucketExists(bucket, opts);
     }
 
-    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !void {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        try self.makeBucket(bucket);
+        try self.makeBucket(bucket, opts);
     }
 
     fn erasedPutObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
@@ -1231,6 +1386,11 @@ pub const Client = struct {
     fn erasedListObjects(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
         const self: *Client = @ptrCast(@alignCast(ptr));
         return try self.listObjects(alloc, bucket, opts);
+    }
+
+    fn erasedListObjectVersions(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return try self.listObjectVersions(alloc, bucket, opts);
     }
 };
 
@@ -1400,6 +1560,22 @@ fn buildListQueryAlloc(alloc: Allocator, opts: types.ListOptions) ![]QueryPair {
     if (!opts.recursive and opts.delimiter.len > 0) try appendQueryPair(alloc, &query, "delimiter", opts.delimiter);
     if (opts.start_after) |value| try appendQueryPair(alloc, &query, "start-after", value);
     if (opts.continuation_token) |value| try appendQueryPair(alloc, &query, "continuation-token", value);
+    if (opts.max_keys != 1000) {
+        const value = try std.fmt.allocPrint(alloc, "{d}", .{opts.max_keys});
+        defer alloc.free(value);
+        try appendQueryPair(alloc, &query, "max-keys", value);
+    }
+    return try query.toOwnedSlice(alloc);
+}
+
+fn buildListObjectVersionsQueryAlloc(alloc: Allocator, opts: types.ListObjectVersionsOptions) ![]QueryPair {
+    var query = std.ArrayListUnmanaged(QueryPair).empty;
+    errdefer deinitQueryList(alloc, &query);
+
+    try appendQueryPair(alloc, &query, "versions", "");
+    if (opts.prefix.len > 0) try appendQueryPair(alloc, &query, "prefix", opts.prefix);
+    if (opts.key_marker) |value| try appendQueryPair(alloc, &query, "key-marker", value);
+    if (opts.version_id_marker) |value| try appendQueryPair(alloc, &query, "version-id-marker", value);
     if (opts.max_keys != 1000) {
         const value = try std.fmt.allocPrint(alloc, "{d}", .{opts.max_keys});
         defer alloc.free(value);
@@ -2003,6 +2179,64 @@ fn parseListResponse(alloc: Allocator, xml: []const u8) !types.ListResult {
     };
 }
 
+fn parseListObjectVersionsResponse(alloc: Allocator, xml: []const u8) !types.ListObjectVersionsResult {
+    var entries = std.ArrayListUnmanaged(types.ObjectVersionEntry).empty;
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit(alloc);
+    }
+
+    try appendObjectVersionBlocks(alloc, &entries, xml, "Version", false);
+    try appendObjectVersionBlocks(alloc, &entries, xml, "DeleteMarker", true);
+
+    const truncated_raw = try requiredTagAlloc(alloc, xml, "IsTruncated");
+    defer alloc.free(truncated_raw);
+    const is_truncated = if (std.mem.eql(u8, truncated_raw, "true"))
+        true
+    else if (std.mem.eql(u8, truncated_raw, "false"))
+        false
+    else
+        return error.InvalidListVersionsResponse;
+
+    const next_key_marker = try optionalDecodedXmlAlloc(alloc, xml, "NextKeyMarker");
+    errdefer if (next_key_marker) |value| alloc.free(value);
+    const next_version_id_marker = try optionalDecodedXmlAlloc(alloc, xml, "NextVersionIdMarker");
+    errdefer if (next_version_id_marker) |value| alloc.free(value);
+    if (is_truncated and next_key_marker == null)
+        return error.InvalidListVersionsResponse;
+    if (!is_truncated and (next_key_marker != null or next_version_id_marker != null))
+        return error.InvalidListVersionsResponse;
+
+    return .{
+        .entries = try entries.toOwnedSlice(alloc),
+        .is_truncated = is_truncated,
+        .next_key_marker = next_key_marker,
+        .next_version_id_marker = next_version_id_marker,
+    };
+}
+
+fn appendObjectVersionBlocks(
+    alloc: Allocator,
+    entries: *std.ArrayListUnmanaged(types.ObjectVersionEntry),
+    xml: []const u8,
+    tag: []const u8,
+    is_delete_marker: bool,
+) !void {
+    var search_from: usize = 0;
+    while (findBlock(xml, tag, search_from)) |block| {
+        search_from = block.end;
+        const key = try decodeXmlAlloc(alloc, block.inner, "Key");
+        errdefer alloc.free(key);
+        const version_id = try decodeXmlAlloc(alloc, block.inner, "VersionId");
+        errdefer alloc.free(version_id);
+        try entries.append(alloc, .{
+            .key = key,
+            .version_id = version_id,
+            .is_delete_marker = is_delete_marker,
+        });
+    }
+}
+
 const XmlBlock = struct {
     inner: []const u8,
     end: usize,
@@ -2030,6 +2264,14 @@ fn requiredTagAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) ![]u8 {
 fn optionalTagAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) !?[]u8 {
     const block = findBlock(xml, tag, 0) orelse return null;
     return try alloc.dupe(u8, block.inner);
+}
+
+fn optionalDecodedXmlAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) !?[]u8 {
+    if (findBlock(xml, tag, 0) == null) return null;
+    const value = try decodeXmlAlloc(alloc, xml, tag);
+    if (value.len != 0) return value;
+    alloc.free(value);
+    return null;
 }
 
 fn completeMultipartXmlAlloc(alloc: Allocator, etags: []const []u8) ![]u8 {
@@ -2242,6 +2484,74 @@ test "s3 list parser extracts entries and prefixes" {
     try std.testing.expectEqualStrings("nested/", parsed.common_prefixes[0]);
 }
 
+test "s3 version-list query preserves paired pagination authority" {
+    const alloc = std.testing.allocator;
+    const query = try buildListObjectVersionsQueryAlloc(alloc, .{
+        .prefix = "instances/a & b/",
+        .key_marker = "key/one",
+        .version_id_marker = "version+one",
+        .max_keys = 17,
+    });
+    defer freeQueryPairs(alloc, query);
+    const rendered = try canonicalQueryStringAlloc(alloc, query);
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(
+        "key-marker=key%2Fone&max-keys=17&prefix=instances%2Fa%20%26%20b%2F&version-id-marker=version%2Bone&versions=",
+        rendered,
+    );
+}
+
+test "s3 version-list parser returns object versions and delete markers" {
+    const alloc = std.testing.allocator;
+    const xml =
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<ListVersionsResult>
+        \\  <IsTruncated>true</IsTruncated>
+        \\  <Version><Key>prefix/a&amp;b</Key><VersionId>v1</VersionId></Version>
+        \\  <Version><Key>prefix/a&amp;b</Key><VersionId>v0</VersionId></Version>
+        \\  <DeleteMarker><Key>prefix/deleted</Key><VersionId>marker-1</VersionId></DeleteMarker>
+        \\  <NextKeyMarker>prefix/a&amp;b</NextKeyMarker>
+        \\  <NextVersionIdMarker>v0</NextVersionIdMarker>
+        \\</ListVersionsResult>
+    ;
+    var parsed = try parseListObjectVersionsResponse(alloc, xml);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.is_truncated);
+    try std.testing.expectEqual(@as(usize, 3), parsed.entries.len);
+    try std.testing.expectEqualStrings("prefix/a&b", parsed.entries[0].key);
+    try std.testing.expectEqualStrings("v1", parsed.entries[0].version_id);
+    try std.testing.expect(!parsed.entries[0].is_delete_marker);
+    try std.testing.expect(parsed.entries[2].is_delete_marker);
+    try std.testing.expectEqualStrings("marker-1", parsed.entries[2].version_id);
+    try std.testing.expectEqualStrings("prefix/a&b", parsed.next_key_marker.?);
+    try std.testing.expectEqualStrings("v0", parsed.next_version_id_marker.?);
+}
+
+test "s3 version-list parser fails closed on unusable pagination" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidListVersionsResponse,
+        parseListObjectVersionsResponse(alloc, "<ListVersionsResult><IsTruncated>true</IsTruncated></ListVersionsResult>"),
+    );
+    try std.testing.expectError(
+        error.InvalidListVersionsResponse,
+        parseListObjectVersionsResponse(alloc, "<ListVersionsResult><IsTruncated>false</IsTruncated><NextKeyMarker>unexpected</NextKeyMarker></ListVersionsResult>"),
+    );
+}
+
+test "s3 version-list parser normalizes empty terminal markers" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseListObjectVersionsResponse(
+        alloc,
+        "<ListVersionsResult><NextVersionIdMarker></NextVersionIdMarker><IsTruncated>false</IsTruncated></ListVersionsResult>",
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expect(!parsed.is_truncated);
+    try std.testing.expectEqual(@as(usize, 0), parsed.entries.len);
+    try std.testing.expectEqual(@as(?[]u8, null), parsed.next_key_marker);
+    try std.testing.expectEqual(@as(?[]u8, null), parsed.next_version_id_marker);
+}
+
 test "s3 object query includes version and part selectors" {
     const alloc = std.testing.allocator;
     const query = try buildObjectQueryAlloc(alloc, "v123", 7);
@@ -2301,6 +2611,18 @@ test "s3 query and signing builders clean up every allocation failure" {
                 "<ListBucketResult><Contents><Key>backup/a</Key><ETag>\"a\"</ETag><Size>1</Size></Contents><Contents><Key>backup/b</Key><ETag>\"b\"</ETag><Size>2</Size></Contents><CommonPrefixes><Prefix>backup/nested/</Prefix></CommonPrefixes><NextContinuationToken>next</NextContinuationToken></ListBucketResult>",
             );
             defer listed.deinit(alloc);
+            const version_query = try buildListObjectVersionsQueryAlloc(alloc, .{
+                .prefix = "backup/",
+                .key_marker = "backup/a",
+                .version_id_marker = "v1",
+                .max_keys = 17,
+            });
+            defer freeQueryPairs(alloc, version_query);
+            var versions = try parseListObjectVersionsResponse(
+                alloc,
+                "<ListVersionsResult><IsTruncated>true</IsTruncated><Version><Key>backup/a</Key><VersionId>v1</VersionId></Version><DeleteMarker><Key>backup/b</Key><VersionId>m1</VersionId></DeleteMarker><NextKeyMarker>backup/b</NextKeyMarker><NextVersionIdMarker>m1</NextVersionIdMarker></ListVersionsResult>",
+            );
+            defer versions.deinit(alloc);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
@@ -2463,6 +2785,8 @@ test "s3 client signs and issues object operations through request fn" {
         .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_checksum_mode = true, .expect_max_response_size = 4 },
         .{ .method = .HEAD, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-head", .checksum_type = .full_object, .expect_checksum_mode = true },
         .{ .method = .GET, .url_contains = "list-type=2", .status = 200, .body = "<ListBucketResult><Contents><Key>docs/a.txt</Key><ETag>\"etag-head\"</ETag><Size>5</Size></Contents></ListBucketResult>" },
+        .{ .method = .GET, .url_contains = "versions=", .status = 200, .body = "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>docs/a.txt</Key><VersionId>v1</VersionId></Version></ListVersionsResult>" },
+        .{ .method = .DELETE, .url_contains = "versionId=v1", .status = 204 },
         .{ .method = .DELETE, .url_contains = "/bucket/docs/a.txt", .status = 204 },
     };
     var fake = Fake{ .steps = &steps };
@@ -2527,6 +2851,11 @@ test "s3 client signs and issues object operations through request fn" {
     try std.testing.expectEqual(@as(usize, 1), listed.entries.len);
     try std.testing.expectEqualStrings("docs/a.txt", listed.entries[0].key);
 
+    var versions = try client.listObjectVersions("bucket", .{ .prefix = "docs/" });
+    defer versions.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), versions.entries.len);
+    try std.testing.expectEqualStrings("v1", versions.entries[0].version_id);
+    try client.deleteObject("bucket", "docs/a.txt", .{ .version_id = "v1" });
     try client.deleteObject("bucket", "docs/a.txt", .{});
     try std.testing.expectEqual(steps.len, fake.index);
 }

@@ -673,84 +673,84 @@ export const Anty = forwardRef<AntyHandle, AntyProps>((props, ref) => {
 
         <div ref={characterRef} style={styles.character}>
           <div ref={vectorLayerRef} style={styles.vectorLayer}>
-          <div ref={rightBodyRef} style={styles.rightBody}>
-            <svg
-              aria-hidden="true"
-              viewBox={`0 0 ${LOGO_VIEWBOX} ${LOGO_VIEWBOX}`}
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-              style={styles.bodyImage}
-            >
-              <path d={LOGO_BRACKET_BR} fill="currentColor" />
-            </svg>
-          </div>
-          <div ref={leftBodyRef} style={styles.leftBody}>
-            <svg
-              aria-hidden="true"
-              viewBox={`0 0 ${LOGO_VIEWBOX} ${LOGO_VIEWBOX}`}
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-              style={styles.bodyImage}
-            >
-              <path d={LOGO_BRACKET_TL} fill="currentColor" />
-            </svg>
-          </div>
-
-          <div style={styles.leftEyeContainer}>
-            <div
-              ref={leftEyeRef}
-              style={styles.eyeWrapper(
-                initialEyeDimensions.width,
-                initialEyeDimensions.height,
-                sizeScale
-              )}
-            >
+            <div ref={rightBodyRef} style={styles.rightBody}>
               <svg
                 aria-hidden="true"
-                ref={leftEyeSvgRef}
-                width="100%"
-                height="100%"
-                viewBox={initialEyeDimensions.viewBox}
+                viewBox={`0 0 ${LOGO_VIEWBOX} ${LOGO_VIEWBOX}`}
                 fill="none"
                 xmlns="http://www.w3.org/2000/svg"
-                style={{ display: "block" }}
+                style={styles.bodyImage}
               >
-                <path
-                  ref={leftEyePathRef}
-                  d={getEyeShape(useOriginalEyes ? "OFF_LEFT" : "IDLE", "left")}
-                  fill="currentColor"
-                />
+                <path d={LOGO_BRACKET_BR} fill="currentColor" />
               </svg>
             </div>
-          </div>
-
-          <div style={styles.rightEyeContainer}>
-            <div
-              ref={rightEyeRef}
-              style={styles.eyeWrapper(
-                initialEyeDimensions.width,
-                initialEyeDimensions.height,
-                sizeScale
-              )}
-            >
+            <div ref={leftBodyRef} style={styles.leftBody}>
               <svg
                 aria-hidden="true"
-                ref={rightEyeSvgRef}
-                width="100%"
-                height="100%"
-                viewBox={initialEyeDimensions.viewBox}
+                viewBox={`0 0 ${LOGO_VIEWBOX} ${LOGO_VIEWBOX}`}
                 fill="none"
                 xmlns="http://www.w3.org/2000/svg"
-                style={{ display: "block" }}
+                style={styles.bodyImage}
               >
-                <path
-                  ref={rightEyePathRef}
-                  d={getEyeShape(useOriginalEyes ? "OFF_RIGHT" : "IDLE", "right")}
-                  fill="currentColor"
-                />
+                <path d={LOGO_BRACKET_TL} fill="currentColor" />
               </svg>
             </div>
-          </div>
+
+            <div style={styles.leftEyeContainer}>
+              <div
+                ref={leftEyeRef}
+                style={styles.eyeWrapper(
+                  initialEyeDimensions.width,
+                  initialEyeDimensions.height,
+                  sizeScale
+                )}
+              >
+                <svg
+                  aria-hidden="true"
+                  ref={leftEyeSvgRef}
+                  width="100%"
+                  height="100%"
+                  viewBox={initialEyeDimensions.viewBox}
+                  fill="none"
+                  xmlns="http://www.w3.org/2000/svg"
+                  style={{ display: "block" }}
+                >
+                  <path
+                    ref={leftEyePathRef}
+                    d={getEyeShape(useOriginalEyes ? "OFF_LEFT" : "IDLE", "left")}
+                    fill="currentColor"
+                  />
+                </svg>
+              </div>
+            </div>
+
+            <div style={styles.rightEyeContainer}>
+              <div
+                ref={rightEyeRef}
+                style={styles.eyeWrapper(
+                  initialEyeDimensions.width,
+                  initialEyeDimensions.height,
+                  sizeScale
+                )}
+              >
+                <svg
+                  aria-hidden="true"
+                  ref={rightEyeSvgRef}
+                  width="100%"
+                  height="100%"
+                  viewBox={initialEyeDimensions.viewBox}
+                  fill="none"
+                  xmlns="http://www.w3.org/2000/svg"
+                  style={{ display: "block" }}
+                >
+                  <path
+                    ref={rightEyePathRef}
+                    d={getEyeShape(useOriginalEyes ? "OFF_RIGHT" : "IDLE", "right")}
+                    fill="currentColor"
+                  />
+                </svg>
+              </div>
+            </div>
           </div>
           <canvas ref={pixelCanvasRef} style={styles.pixelCanvas} />
         </div>

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RestoreJobResultDurability(str, Enum):
+class RestoreJobResultDurability(StrEnum):
     PENDING = "pending"
 
     def __str__(self) -> str:

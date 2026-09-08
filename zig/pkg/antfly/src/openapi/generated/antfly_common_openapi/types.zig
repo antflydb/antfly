@@ -139,6 +139,34 @@ pub const AwsCredentialConfig = struct {
     }
 };
 
+/// Operator-owned limits for backup execution.
+pub const BackupConfig = struct {
+    /// End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
+    operation_timeout_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "operation_timeout_seconds", "operation_timeout_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.operation_timeout_seconds) |value| {
+            try jw.objectField("operation_timeout_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const CdcConnectionConfig = struct {
     /// CDC provider type. Initially postgres.
     provider: []const u8,
@@ -264,6 +292,7 @@ pub const Config = struct {
     admission: ?AdmissionConfig = null,
     graph_execution: ?GraphExecutionConfig = null,
     mcp: ?McpConfig = null,
+    backup: ?BackupConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     metadata: ?MetadataInfo = null,
@@ -301,9 +330,9 @@ pub const Config = struct {
     deployment_mode: ?[]const u8 = null,
     /// Named embedder configurations for embedding operations. Define named embedders that can be referenced by indexes, templates, and API calls. The first embedder defined becomes the default when no embedder name is specified. **API Key Configuration:** API keys can be provided through a protected secret-store file or environment variables: 1. **Secret store** (recommended for production): mount a platform-managed secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`. Reference its values in JSON config as `"api_key": "${secret:openai.api_key}"`. 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - OpenAI: `OPENAI_API_KEY` - Gemini: `GEMINI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` - Cohere: `COHERE_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```json { "embedders": { "openai-small": { "provider": "openai", "model": "text-embedding-3-small" }, "antfly-local": { "provider": "antfly", "model": "bge-base-en-v1.5", "api_url": "http://localhost:8082" } } } ```
     embedders: ?std.json.ArrayHashMap(antfly_embeddings_openapi.EmbedderConfig) = null,
-    /// Named generator configurations for AI operations. Define named generators that can be referenced by chains, templates, and API calls. The first generator defined becomes the default when no generator name is specified. **API Key Configuration:** API keys can be provided through a protected secret-store file or environment variables: 1. **Secret store** (recommended for production): mount a platform-managed secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`. Reference its values in JSON config as `"api_key": "${secret:gemini.api_key}"`. 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - Gemini: `GEMINI_API_KEY` - OpenAI: `OPENAI_API_KEY` - Anthropic: `ANTHROPIC_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```json { "generators": { "gemini-flash": { "provider": "gemini", "model": "gemini-2.5-flash" }, "ollama-local": { "provider": "ollama", "model": "llama3" }, "openai-gpt4": { "provider": "openai", "model": "gpt-4.1" } } } ```
+    /// Named generator configurations for AI operations. Define named generators that can be referenced by chains, templates, and API calls. The first generator defined becomes the default when no generator name is specified. **API Key Configuration:** API keys can be provided through a protected secret-store file or environment variables: 1. **Secret store** (recommended for production): mount a platform-managed secret file and pass `--secret-store-path /run/secrets/antfly/secrets.json`. Reference its values in JSON config as `"api_key": "${secret:gemini.api_key}"`. 2. **Environment variable** (simpler for development): Omit `api_key` from config and set the appropriate env var: - Gemini: `GEMINI_API_KEY` - OpenAI: `OPENAI_API_KEY` See [Secrets Management](/docs/secrets) for complete documentation. **Example:** ```json { "generators": { "gemini-flash": { "provider": "gemini", "model": "gemini-2.5-flash" }, "ollama-local": { "provider": "ollama", "model": "llama3" }, "openai-gpt4": { "provider": "openai", "model": "gpt-4.1" } } } ```
     generators: ?std.json.ArrayHashMap(antfly_generating_openapi.GeneratorConfig) = null,
-    /// Named chain configurations for fallback/retry logic. Chains are ordered lists of generators with retry and fallback logic. Each link references a generator by name from the `generators` map. The first chain defined becomes the default when no chain name is specified. **Chain Conditions:** - `on_error`: Try next generator on any error (default) - `on_rate_limit`: Try next only on rate limit (429) errors - `on_timeout`: Try next only on timeout errors - `always`: Always try the next generator **Example:** ```json { "chains": { "default": [ { "generator": "gemini-flash", "retry": { "max_attempts": 3 }, "condition": "on_rate_limit" }, { "generator": "ollama-local" } ], "with-inline": [ { "generator": "gemini-flash" }, { "generator_config": { "provider": "anthropic", "model": "claude-sonnet-4-5-20250929" } } ] } } ``` Then in API calls: `chain: "default"` or `chain: "with-inline"`
+    /// Named chain configurations for fallback/retry logic. Chains are ordered lists of generators with retry and fallback logic. Each link references a generator by name from the `generators` map. The first chain defined becomes the default when no chain name is specified. **Chain Conditions:** - `on_error`: Try next generator on any error (default) - `on_rate_limit`: Try next only on rate limit (429) errors - `on_timeout`: Try next only on timeout errors - `always`: Always try the next generator **Example:** ```json { "chains": { "default": [ { "generator": "gemini-flash", "retry": { "max_attempts": 3 }, "condition": "on_rate_limit" }, { "generator": "ollama-local" } ], "with-inline": [ { "generator": "gemini-flash" }, { "generator_config": { "provider": "openai", "model": "gpt-4.1" } } ] } } ``` Then in API calls: `chain: "default"` or `chain: "with-inline"`
     chains: ?std.json.ArrayHashMap([]const NamedChainLink) = null,
     /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```json { "rerankers": { "cohere-english": { "provider": "cohere", "model": "rerank-english-v3.0" }, "antfly-local": { "provider": "antfly", "model": "mxbai-rerank-base-v1", "url": "http://localhost:8080" } } } ```
     rerankers: ?std.json.ArrayHashMap(antfly_reranking_openapi.RerankerConfig) = null,
@@ -319,6 +348,7 @@ pub const Config = struct {
         .{ "admission", "admission", true },
         .{ "graph_execution", "graph_execution", true },
         .{ "mcp", "mcp", true },
+        .{ "backup", "backup", true },
         .{ "storage", "storage", true },
         .{ "transaction_sessions", "transaction_sessions", true },
         .{ "metadata", "metadata", true },
@@ -386,6 +416,10 @@ pub const Config = struct {
         }
         if (self.mcp) |value| {
             try jw.objectField("mcp");
+            try jw.write(value);
+        }
+        if (self.backup) |value| {
+            try jw.objectField("backup");
             try jw.write(value);
         }
         if (self.storage) |value| {

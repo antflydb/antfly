@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ChainCondition(str, Enum):
+class ChainCondition(StrEnum):
     ALWAYS = "always"
     ON_ERROR = "on_error"
     ON_RATE_LIMIT = "on_rate_limit"

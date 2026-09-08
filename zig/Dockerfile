@@ -19,6 +19,7 @@ FROM --platform=$BUILDPLATFORM alpine:3.21 AS builder
 
 ARG TARGETARCH
 ARG ZIG_OPTIMIZE=ReleaseFast
+ARG ZIG_BUILD_MAX_RSS
 
 RUN apk add --no-cache build-base clang lld curl xz git perl python3 linux-headers
 
@@ -34,6 +35,9 @@ RUN case "${TARGETARCH}" in \
         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
     cd zig && \
+    if [ -n "${ZIG_BUILD_MAX_RSS}" ]; then \
+      export ANTFLY_ZIG_MAX_RSS="${ZIG_BUILD_MAX_RSS}"; \
+    fi && \
     python3 tools/run_bounded_zig_build.py --zig zig -- build \
       -Dtarget="${zig_target}" \
       -Doptimize="${ZIG_OPTIMIZE}" \

@@ -28,6 +28,7 @@
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const c_file = @import("../util/c_file.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const manifest_mod = @import("../models/manifest.zig");
 
 /// Configuration parsed from config.json for the decoder architecture.
@@ -61,6 +62,7 @@ pub const EncoderDecoderPipeline = struct {
     encoder: backends.Session,
     decoder: backends.Session,
     config: DecoderConfig,
+    execution_control: ?InferenceExecutionControl = null,
 
     /// Run the encoder on input_ids, returning hidden state tensors.
     pub fn encode(self: *EncoderDecoderPipeline, allocator: std.mem.Allocator, input_ids: []const i64, seq_len: usize) ![]backends.Tensor {
@@ -79,7 +81,8 @@ pub const EncoderDecoderPipeline = struct {
         var mask_tensor = try backends.Tensor.initInt64(allocator, "attention_mask", shape, mask);
         defer mask_tensor.deinit();
 
-        return try self.encoder.run(&.{ input_ids_tensor, mask_tensor }, allocator);
+        if (self.execution_control) |control| try control.update(.executing, 0, 1);
+        return try self.encoder.runWithControl(&.{ input_ids_tensor, mask_tensor }, allocator, self.execution_control);
     }
 
     /// Run one decoder step, returning logits for the last token position.
@@ -107,11 +110,11 @@ pub const EncoderDecoderPipeline = struct {
         // (encoder outputs "last_hidden_state", decoder expects "encoder_hidden_states")
         const enc_hidden_renamed = encoder_hidden.borrowedView("encoder_hidden_states");
 
-        var decoder_outputs = try self.decoder.run(&.{
+        var decoder_outputs = try self.decoder.runWithControl(&.{
             dec_input_ids,
             enc_mask_tensor,
             enc_hidden_renamed,
-        }, allocator);
+        }, allocator, self.execution_control);
         defer {
             for (decoder_outputs) |*o| o.deinit();
             allocator.free(decoder_outputs);
@@ -150,7 +153,9 @@ pub const EncoderDecoderPipeline = struct {
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
         const encoder_hidden = &encoder_outputs[0];
 
-        for (0..max_len) |_| {
+        for (0..max_len) |step| {
+            if (self.execution_control) |control|
+                try control.update(.executing, @intCast(step), @intCast(max_len));
             const dec_seq_len: usize = output_ids.items.len;
 
             // Convert output_ids (i32) to i64 for the decoder
@@ -237,7 +242,10 @@ pub const EncoderDecoderPaths = struct { encoder: []const u8, decoder: []const u
 
 pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const u8) !EncoderDecoderPaths {
     const encoder_path = try findModelFile(allocator, model_dir, encoder_candidates);
-    const decoder_path = try findModelFile(allocator, model_dir, decoder_candidates);
+    const decoder_path = findModelFile(allocator, model_dir, decoder_candidates) catch |err| {
+        if (encoder_path) |path| allocator.free(path);
+        return err;
+    };
 
     if (encoder_path != null and decoder_path != null) {
         return .{ .encoder = encoder_path.?, .decoder = decoder_path.? };
@@ -267,8 +275,10 @@ pub fn nativeFlorenceEncoderDecoderPaths(
         manifestHasNativeAssets(manifest) and
         manifest.visual_model_path != null)
     {
+        const encoder = try allocator.dupe(u8, manifest.visual_model_path.?);
+        errdefer allocator.free(encoder);
         return .{
-            .encoder = try allocator.dupe(u8, manifest.visual_model_path.?),
+            .encoder = encoder,
             .decoder = try allocator.dupe(u8, model_dir),
         };
     }
@@ -276,24 +286,20 @@ pub fn nativeFlorenceEncoderDecoderPaths(
     return error.EncoderModelNotFound;
 }
 
-/// Whether `findEncoderDecoderPaths` would succeed, without allocating the paths.
+/// Probe paths without loading model weights or tokenizer metadata.
 pub fn hasEncoderDecoderPaths(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     manifest: manifest_mod.ModelManifest,
-) bool {
-    const encoder_path = findModelFile(allocator, model_dir, encoder_candidates) catch null;
+) !bool {
+    const encoder_path = try findModelFile(allocator, model_dir, encoder_candidates);
     defer if (encoder_path) |path| allocator.free(path);
-    const decoder_path = findModelFile(allocator, model_dir, decoder_candidates) catch null;
+    const decoder_path = try findModelFile(allocator, model_dir, decoder_candidates);
     defer if (decoder_path) |path| allocator.free(path);
     if (encoder_path != null and decoder_path != null) return true;
 
-    if (nativeFlorenceEncoderDecoderPaths(allocator, model_dir, manifest)) |paths| {
-        allocator.free(paths.encoder);
-        allocator.free(paths.decoder);
-        return true;
-    } else |_| {}
-    return false;
+    return manifest.native_arch_hint == .florence and
+        manifestHasNativeAssets(manifest) and manifest.visual_model_path != null;
 }
 
 fn manifestHasNativeAssets(manifest: manifest_mod.ModelManifest) bool {
@@ -364,9 +370,10 @@ fn findModelFile(allocator: std.mem.Allocator, model_dir: []const u8, candidates
 
         for (candidates) |name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, name });
+            errdefer allocator.free(path);
             const path_z = try allocator.dupeZ(u8, path);
             defer allocator.free(path_z);
-            if (c_file.fileExistsZ(path_z)) {
+            if (try c_file.fileExistsZChecked(path_z)) {
                 return path;
             }
             allocator.free(path);

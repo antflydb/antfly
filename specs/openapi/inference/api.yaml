@@ -1197,10 +1197,10 @@ components:
             - float
         dimensions:
           type: integer
-          description: Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+          description: Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
         task_type:
           type: string
-          description: Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+          description: "Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction."
           enum:
             - RETRIEVAL_QUERY
             - RETRIEVAL_DOCUMENT
@@ -1210,6 +1210,9 @@ components:
             - CLASSIFICATION
             - CLUSTERING
             - SEMANTIC_SIMILARITY
+        instruction:
+          type: string
+          description: "Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper (\"Instruct: {instruction}\\nQuery:{input}\"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support."
         input_type:
           type: string
           deprecated: true
@@ -3001,7 +3004,7 @@ components:
         - fp16
     A4bResidencyMode:
       type: string
-      description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+      description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
       enum:
         - auto
         - streamed
@@ -3048,14 +3051,14 @@ components:
         residency_mode:
           $ref: '#/components/schemas/A4bResidencyMode'
           default: auto
-          description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+          description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
         memory_budget_mb:
           type: integer
           format: uint32
           minimum: 0
           maximum: 1048576
           default: 0
-          description: Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
+          description: Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
     PromptCacheConfig:
       type: object
       description: Native generator prompt KV cache configuration.

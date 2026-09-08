@@ -137,6 +137,9 @@ const WEBGPU_ATTN_MAX_SEQ: usize = 512;
 const WEBGPU_CACHED_ATTN_MAX_KV: usize = 2048;
 
 const WasmBuf = struct {
+    // An acquired weight has independent handle identity but resolves to the
+    // model-owned buffer, including its GPU residency and host materialization.
+    weight_source: ?*WasmBuf = null,
     data: []f32,
     len: usize, // logical element count
     owned: bool,
@@ -543,7 +546,8 @@ fn quantFormatFromTensorType(tensor_type: tensor_types.TensorType) ?quant_matmul
 }
 
 fn toBuf(ct: CT) *WasmBuf {
-    return @ptrCast(@alignCast(ct));
+    const buf: *WasmBuf = @ptrCast(@alignCast(ct));
+    return buf.weight_source orelse buf;
 }
 
 fn fromBuf(buf: *WasmBuf) CT {
@@ -967,9 +971,27 @@ pub const WasmCompute = struct {
         return fromBuf(buf);
     }
 
+    fn acquireWeightOp(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
+        const source = toBuf(try getWeightOp(ctx, name));
+        const handle = try self.allocator.create(WasmBuf);
+        handle.* = .{
+            .data = &.{},
+            .len = source.len,
+            .owned = false,
+            .allocator = self.allocator,
+            .weight_source = source,
+        };
+        return fromBuf(handle);
+    }
+
     fn freeTensorOp(ctx: *anyopaque, tensor: CT) void {
         _ = ctx;
-        const buf = toBuf(tensor);
+        const buf: *WasmBuf = @ptrCast(@alignCast(tensor));
+        if (buf.weight_source != null) {
+            buf.allocator.destroy(buf);
+            return;
+        }
         // Don't free weight tensors (not owned)
         if (buf.owned) {
             buf.deinit();
@@ -1282,6 +1304,15 @@ pub const WasmCompute = struct {
 
     fn geluNewOp(ctx: *anyopaque, input: CT) anyerror!CT {
         return geluOp(ctx, input);
+    }
+
+    fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
+        const inp = toBuf(input);
+        const out = try self.allocator.alloc(f32, inp.len);
+        @memcpy(out, inp.data);
+        activations.geluExact(out);
+        return fromBuf(try copyBufShape(WasmBuf.fromSlice(self.allocator, out, true), inp));
     }
 
     fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -1851,12 +1882,13 @@ pub const WasmCompute = struct {
         _ = request.dim;
         return switch (request.kind) {
             .gelu, .gelu_new => try geluOp(ctx, request.input),
+            .gelu_exact => try geluExactOp(ctx, request.input),
             .silu => try siluOp(ctx, request.input),
             .relu => try reluOp(ctx, request.input),
             .quick_gelu => try quickGeluOp(ctx, request.input),
             .relu_squared => blk: {
                 const relu = try reluOp(ctx, request.input);
-                errdefer freeTensorOp(ctx, relu);
+                defer freeTensorOp(ctx, relu);
                 break :blk try multiplyOp(ctx, relu, relu);
             },
         };
@@ -4984,6 +5016,7 @@ pub const WasmCompute = struct {
         .freeTensor = freeTensorOp,
         .reserveGraphPlanSlots = reserveGraphPlanSlotsOp,
         .getWeight = getWeightOp,
+        .acquireWeight = acquireWeightOp,
         .prefetchWeightHint = noopPrefetch,
         .drainPrefetchBudget = noopDrain,
         .embeddingLookup = embeddingLookupOp,
@@ -4999,6 +5032,7 @@ pub const WasmCompute = struct {
         .layerNorm = layerNormOp,
         .rmsNorm = rmsNormOp,
         .gelu = geluOp,
+        .geluExact = geluExactOp,
         .geluNew = geluNewOp,
         .relu = reluOp,
         .silu = siluOp,
@@ -5101,10 +5135,30 @@ test {
     _ = @import("wasm_e2e_test.zig");
 }
 
+test "wasm_compute: acquired weights preserve independent identity and shared residency" {
+    const allocator = std.testing.allocator;
+    var compute = WasmCompute.init(allocator);
+    const cb = compute.computeBackend();
+    defer cb.deinit();
+    var data = [_]f32{ 1, -2 };
+    compute.registerWeight("weight", &data);
+    const borrowed = try cb.getWeight("weight");
+    const first = try cb.acquireWeight("weight");
+    const second = try cb.acquireWeight("weight");
+    defer cb.free(second);
+    try std.testing.expect(first != second and first != borrowed and second != borrowed);
+    try std.testing.expectEqual(toBuf(borrowed), toBuf(second));
+    cb.free(first);
+    cb.free(borrowed);
+    const values = try cb.toFloat32(second, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &data, values);
+}
+
 test "wasm compute graph plan reservation reports unavailable without webgpu" {
     const allocator = std.testing.allocator;
     var compute = WasmCompute.init(allocator);
-    defer compute.deinitBackendOp(&compute);
+    defer WasmCompute.deinitBackendOp(&compute);
     var cb = compute.computeBackend();
 
     const reserved = try cb.reserveGraphPlanSlots(&.{.{ .slot = 0, .bytes = 4096 }});
@@ -5159,7 +5213,7 @@ test "wasm_compute: runAttention includes attention sink probability mass" {
 test "wasm_compute: cached attention includes attention sink probability mass" {
     const allocator = std.testing.allocator;
     var compute = WasmCompute.init(allocator);
-    defer compute.deinitBackendOp(&compute);
+    defer WasmCompute.deinitBackendOp(&compute);
 
     var q_data = [_]f32{0.0};
     var k_data = [_]f32{ 0.0, 0.0, 0.0 };

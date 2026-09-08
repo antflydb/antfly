@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class FieldCapabilityQueryModesItem(str, Enum):
+class FieldCapabilityQueryModesItem(StrEnum):
     AUTOCOMPLETE = "autocomplete"
     EXACT = "exact"
     FULL_TEXT = "full_text"

@@ -19,8 +19,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import signal
 import shutil
+import signal
 import struct
 import subprocess
 import tempfile
@@ -32,7 +32,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     _read_log_tail,
@@ -44,7 +43,6 @@ from conftest import (
 )
 from port_reservations import LoopbackPortReservations
 
-
 HA_ADMIN_ROOT = "/admin/v1/ha"
 DB_API_ROOT = "/db/v1"
 HA_BACKUP_MAGIC = b"AFHABKP\n"
@@ -52,8 +50,15 @@ HA_BACKUP_HEADER_SIZE = 96
 HA_BACKUP_ENTRY_HEADER_SIZE = 28
 HA_BACKUP_FORMAT_VERSION = 1
 HA_BACKUP_FILE_KIND_METADATA = 3
+HA_TRANSITION_BUSY_BODY = b"HAStateTransitionBusy"
+HA_TRANSITION_RETRY_TIMEOUT_S = 20.0
+HA_TRANSITION_RETRY_INTERVAL_S = 0.1
 
 pytestmark = pytest.mark.ha_standby
+
+
+def _is_ha_transition_busy(response: requests.Response) -> bool:
+    return response.status_code == 503 and response.content == HA_TRANSITION_BUSY_BODY
 
 
 class HAStandaloneNode:
@@ -114,7 +119,9 @@ class HAStandaloneNode:
 
     def start(self, *, enable_replication: bool = True) -> None:
         self.node_root.mkdir(parents=True, exist_ok=True)
-        command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.node_root)
+        command = _standalone_stateful_command(
+            self.binary, host=self.host, port=self.port, root=self.node_root
+        )
         command.extend(["--health", "true", "--health-port", str(self.health_port)])
         if self.role == "primary":
             command.extend(
@@ -157,7 +164,11 @@ class HAStandaloneNode:
             command.extend(["--ha-shard-id", str(self.shard_id)])
         if self.table_id is not None:
             command.extend(["--ha-table-id", str(self.table_id)])
-        if self.role == "primary" and self.sync_standby_name is not None and self.table_id is not None:
+        if (
+            self.role == "primary"
+            and self.sync_standby_name is not None
+            and self.table_id is not None
+        ):
             command.extend(
                 [
                     "--ha-sync-mode",
@@ -199,7 +210,9 @@ class HAStandaloneNode:
         if not wait_for_server(self.url, path="/readyz", timeout=30.0):
             logs = self.debug_logs()
             self.stop()
-            raise RuntimeError(f"HA {self.role} node failed to start at {self.url}\n{logs}")
+            raise RuntimeError(
+                f"HA {self.role} node failed to start at {self.url}\n{logs}"
+            )
 
     def reset_ha_state(self) -> None:
         self.stop()
@@ -260,7 +273,9 @@ class HAStandaloneNode:
             timeout=10,
         )
 
-    def admin_post_response(self, path: str, payload: dict[str, Any]) -> requests.Response:
+    def admin_post_response(
+        self, path: str, payload: dict[str, Any]
+    ) -> requests.Response:
         return self._request(
             "POST",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
@@ -270,12 +285,30 @@ class HAStandaloneNode:
         )
 
     def admin_get(self, path: str, **params: Any) -> dict[str, Any]:
-        response = self.admin_get_response(path, **params)
-        return self._check(response)
+        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
+        while True:
+            response = self.admin_get_response(path, **params)
+            if not _is_ha_transition_busy(response):
+                return self._check(response)
+            if time.monotonic() >= deadline:
+                return self._check(response)
+            # HA GETs are observations. The runtime deliberately sheds them
+            # while a role transition owns the state mutex, so retry the exact
+            # transient response without weakening any other failure signal.
+            time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
     def admin_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.admin_post_response(path, payload)
-        return self._check(response)
+        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
+        while True:
+            response = self.admin_post_response(path, payload)
+            if not _is_ha_transition_busy(response):
+                return self._check(response)
+            if time.monotonic() >= deadline:
+                return self._check(response)
+            # This exact response is emitted before route dispatch when the HA
+            # state mutex is owned, so no mutation has occurred and retrying is
+            # safe. Do not retry arbitrary 503 responses from route handlers.
+            time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
     def create_table(self, table_name: str) -> dict[str, Any]:
         response = self._request(
@@ -286,11 +319,15 @@ class HAStandaloneNode:
         )
         return self._check(response)
 
-    def batch_write(self, table_name: str, inserts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def batch_write(
+        self, table_name: str, inserts: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
         response = self.batch_write_response(table_name, inserts)
         return self._check(response)
 
-    def batch_write_response(self, table_name: str, inserts: dict[str, dict[str, Any]]) -> requests.Response:
+    def batch_write_response(
+        self, table_name: str, inserts: dict[str, dict[str, Any]]
+    ) -> requests.Response:
         return self._request(
             "POST",
             f"{self.url}{DB_API_ROOT}/tables/{table_name}/batch",
@@ -298,7 +335,9 @@ class HAStandaloneNode:
             timeout=30,
         )
 
-    def lookup_key(self, table_name: str, key: str, *, consistency: str | None = None) -> dict[str, Any]:
+    def lookup_key(
+        self, table_name: str, key: str, *, consistency: str | None = None
+    ) -> dict[str, Any]:
         params = {"consistency": consistency} if consistency is not None else None
         response = self._request(
             "GET",
@@ -316,6 +355,58 @@ class HAStandaloneNode:
                 response=response,
             )
         return response.json()
+
+
+def _test_response(status_code: int, body: bytes) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = body
+    response.request = requests.Request(
+        "POST", f"http://127.0.0.1{HA_ADMIN_ROOT}/test"
+    ).prepare()
+    response.url = response.request.url
+    return response
+
+
+def test_admin_post_retries_exact_pre_dispatch_transition_busy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    responses = iter(
+        [
+            _test_response(503, HA_TRANSITION_BUSY_BODY),
+            _test_response(200, b'{"result":"ok"}'),
+        ]
+    )
+    attempts = 0
+
+    def next_response(_path: str, _payload: dict[str, Any]) -> requests.Response:
+        nonlocal attempts
+        attempts += 1
+        return next(responses)
+
+    node.admin_post_response = next_response
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    assert node.admin_post("/test", {}) == {"result": "ok"}
+    assert attempts == 2
+
+
+def test_admin_post_does_not_retry_ambiguous_service_unavailable():
+    node = object.__new__(HAStandaloneNode)
+    attempts = 0
+
+    def unavailable(_path: str, _payload: dict[str, Any]) -> requests.Response:
+        nonlocal attempts
+        attempts += 1
+        return _test_response(503, b"upstream unavailable")
+
+    node.admin_post_response = unavailable
+    node.debug_logs = lambda: "test logs"
+
+    with pytest.raises(requests.HTTPError, match="upstream unavailable"):
+        node.admin_post("/test", {})
+    assert attempts == 1
 
 
 class HACluster:
@@ -477,7 +568,9 @@ def ha_cluster(request: pytest.FixtureRequest) -> HACluster:
     if Path(binary).name != "antfly":
         pytest.skip("HA standby e2e requires the supported Zig antfly binary")
     if not _binary_supports_ha_standalone(binary):
-        pytest.skip(f"Antfly binary does not expose HA standalone flags; rebuild current Zig binary: {binary}")
+        pytest.skip(
+            f"Antfly binary does not expose HA standalone flags; rebuild current Zig binary: {binary}"
+        )
 
     cluster = HACluster(binary)
     try:
@@ -487,7 +580,9 @@ def ha_cluster(request: pytest.FixtureRequest) -> HACluster:
         cluster.close(test_failed=bool(report and report.failed))
 
 
-def _wait_for_standby_applied(cluster: HACluster, lsn: int, *, timeout_s: float = 20.0) -> dict[str, Any]:
+def _wait_for_standby_applied(
+    cluster: HACluster, lsn: int, *, timeout_s: float = 20.0
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last_snapshot: dict[str, Any] | None = None
     last_error: Exception | None = None
@@ -533,7 +628,9 @@ def _wait_for_promoted_write_check(
         if response.status_code not in {409, 503}:
             return cluster.standby._check(response)
         time.sleep(0.1)
-    exit_code = cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    exit_code = (
+        cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    )
     raise AssertionError(
         "promoted standby did not expose its write decision before the deadline; "
         f"exit_code={exit_code}; last_response={last_response}; last_error={last_error}\n"
@@ -571,7 +668,9 @@ def _wait_for_promoted_primary_missing_lookup(
             cluster.standby._check(response)
             raise AssertionError(f"promoted primary unexpectedly contained {key!r}")
         time.sleep(0.1)
-    exit_code = cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    exit_code = (
+        cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    )
     raise AssertionError(
         "promoted standby did not publish primary read authority before the deadline; "
         f"exit_code={exit_code}; last_response={last_response}; last_error={last_error}\n"
@@ -600,12 +699,28 @@ def _wait_for_standby_lookup(
         except requests.RequestException as err:
             last_error = err
             time.sleep(0.25)
-    raise AssertionError(f"standby lookup for {key!r} did not become visible; last_error={last_error}\n{cluster.debug_logs()}")
+    raise AssertionError(
+        f"standby lookup for {key!r} did not become visible; last_error={last_error}\n{cluster.debug_logs()}"
+    )
 
 
-def _primary_lsn(cluster: HACluster) -> int:
-    status = cluster.primary.admin_get("/primary/status")
-    return int(status["snapshot"]["current_lsn"])
+def _primary_lsn(cluster: HACluster, *, timeout_s: float = 20.0) -> int:
+    deadline = time.monotonic() + timeout_s
+    last_response: requests.Response | None = None
+    while time.monotonic() < deadline:
+        response = cluster.primary.admin_get_response("/primary/status")
+        last_response = response
+        if response.status_code == 200:
+            status = cluster.primary._check(response)
+            return int(status["snapshot"]["current_lsn"])
+        if response.status_code == 503 and response.text == "HAStateTransitionBusy":
+            time.sleep(0.1)
+            continue
+        cluster.primary._check(response)
+    raise AssertionError(
+        "primary status remained transition-busy before the deadline; "
+        f"last_response={last_response}\n{cluster.debug_logs()}"
+    )
 
 
 def _wait_for_primary_slot_applied(
@@ -636,11 +751,15 @@ def _wait_for_primary_slot_applied(
     )
 
 
-def _table_identity_from_catalog(node: HAStandaloneNode, table_name: str) -> tuple[int, int]:
+def _table_identity_from_catalog(
+    node: HAStandaloneNode, table_name: str
+) -> tuple[int, int]:
     catalog = json.loads(node.catalog_path.read_text())
     table = next(table for table in catalog["tables"] if table["name"] == table_name)
     table_id = int(table["table_id"])
-    table_range = next(record for record in catalog["ranges"] if int(record["table_id"]) == table_id)
+    table_range = next(
+        record for record in catalog["ranges"] if int(record["table_id"]) == table_id
+    )
     return int(table_range["group_id"]), table_id
 
 
@@ -711,6 +830,9 @@ def _encode_ha_backup_manifest(
 
 def _promotion_fence_request(cluster: HACluster, required_lsn: int) -> dict[str, Any]:
     return {
+        # Model the exact Kubernetes Lease transition generation supplied by
+        # the operator. Runtime receipts must preserve this external value.
+        "generation": 1,
         "identity": _identity(cluster),
         "old_primary_id": cluster.primary.node_id,
         "promoted_node_id": cluster.standby.node_id,
@@ -789,7 +911,9 @@ def _assert_internal_replication_requires_bearer(node: HAStandaloneNode) -> None
     assert authorized.json()["identity"]["cluster_id"] == node.cluster_id
 
 
-def _sync_policy(mode: str, *, failure_policy: str = "block", standby_name: str = "standby-a") -> dict[str, Any]:
+def _sync_policy(
+    mode: str, *, failure_policy: str = "block", standby_name: str = "standby-a"
+) -> dict[str, Any]:
     return {
         "mode": mode,
         "selection": "first",
@@ -807,7 +931,9 @@ def _slot_by_name(status: dict[str, Any], slot_name: str) -> dict[str, Any]:
     )
 
 
-def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: HACluster):
+def test_standby_streams_public_writes_restarts_and_rejects_writes(
+    ha_cluster: HACluster,
+):
     table_name = "ha_standby_docs"
     ha_cluster.primary.start()
     created = ha_cluster.primary.create_table(table_name)
@@ -826,7 +952,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     _assert_admin_requires_bearer(ha_cluster.standby, "/standby/status")
     bootstrapped = ha_cluster.standby.admin_post(
         "/standby/bootstrap",
-        {"manifest_path": str(seed["manifest_path"]), "content_root": str(seed["content_root"])},
+        {
+            "manifest_path": str(seed["manifest_path"]),
+            "content_root": str(seed["content_root"]),
+        },
     )
     assert bootstrapped["manifest_id"] == seed["manifest_id"]
     assert int(bootstrapped["backup_lsn"]) == seed["backup_lsn"]
@@ -840,7 +969,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         node_id="standby-a",
     )
 
-    seeding_slot = _slot_by_name(ha_cluster.primary.admin_get("/primary/status"), "standby-a")
+    seeding_slot = _slot_by_name(
+        ha_cluster.primary.admin_get("/primary/status"), "standby-a"
+    )
     assert seeding_slot["active"] is False
     blocked_stream = requests.post(
         f"{ha_cluster.primary.url}/internal/v1/ha/replication/start",
@@ -868,7 +999,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert activated["slot_name"] == "standby-a"
     assert int(activated["checkpoint_lsn"]) == seed["backup_lsn"]
-    activated_slot = _slot_by_name(ha_cluster.primary.admin_get("/primary/status"), "standby-a")
+    activated_slot = _slot_by_name(
+        ha_cluster.primary.admin_get("/primary/status"), "standby-a"
+    )
     assert activated_slot["active"] is True
 
     activated_retry = ha_cluster.activate_seeded_slot(seed, bootstrapped)
@@ -975,7 +1108,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
 
     blocked_commit = ha_cluster.primary.admin_post(
         "/commit/check",
-        {"target_lsn": second_lsn, "sync_policy": _sync_policy("remote_apply", standby_name="missing-standby")},
+        {
+            "target_lsn": second_lsn,
+            "sync_policy": _sync_policy("remote_apply", standby_name="missing-standby"),
+        },
     )
     assert blocked_commit["gate"]["action"] == "wait_for_standby"
     assert blocked_commit["gate"]["durability"]["status"] == "would_block"
@@ -1033,13 +1169,18 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert fence["receipt"]["new_epoch"] == 2
     assert fence["receipt"]["required_lsn"] == second_lsn
     assert fence["receipt"]["observed_lsn"] == second_lsn
-    assert fence["receipt"]["generation"] >= 1
+    assert fence["receipt"]["generation"] == fence_request["generation"]
     assert fence["receipt"]["forced"] is False
     assert fence["receipt"]["token"]
 
     assessment = ha_cluster.standby.admin_post(
         "/promotion/assess",
-        {"required_lsn": second_lsn, "fencing_confirmed": False, "force": False, "use_current_fence": True},
+        {
+            "required_lsn": second_lsn,
+            "fencing_confirmed": False,
+            "force": False,
+            "use_current_fence": True,
+        },
     )
     _assert_action_receipt(
         assessment,
@@ -1087,8 +1228,14 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert promoted_write_check["decision"]["role"] == "promoted_standby"
     assert promoted_write_check["decision"]["action"] == "open_promoted_primary"
-    assert promoted_write_check["decision"]["durable_lsn"] == promoted["promotion"]["switch_lsn"]
-    assert promoted_write_check["decision"]["next_lsn"] == promoted["promotion"]["switch_lsn"] + 1
+    assert (
+        promoted_write_check["decision"]["durable_lsn"]
+        == promoted["promotion"]["switch_lsn"]
+    )
+    assert (
+        promoted_write_check["decision"]["next_lsn"]
+        == promoted["promotion"]["switch_lsn"] + 1
+    )
 
     primary_fence = ha_cluster.primary.admin_post("/fence", fence_request)
     _assert_action_receipt(
@@ -1133,7 +1280,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         "retained_from_lsn": second_lsn + 1,
         "receipt": fence["receipt"],
     }
-    rejoin_assessment = ha_cluster.primary.admin_post("/rejoin/assess", reseed_rejoin_request)
+    rejoin_assessment = ha_cluster.primary.admin_post(
+        "/rejoin/assess", reseed_rejoin_request
+    )
     _assert_action_receipt(
         rejoin_assessment,
         action_id="rejoin_assess:primary-a",
@@ -1149,7 +1298,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert rejoin_assessment["assessment"]["target_epoch"] == 2
     assert rejoin_assessment["assessment"]["fork_lsn"] == second_lsn
 
-    rejoin_reseed = ha_cluster.primary.admin_post("/rejoin/reseed", reseed_rejoin_request)
+    rejoin_reseed = ha_cluster.primary.admin_post(
+        "/rejoin/reseed", reseed_rejoin_request
+    )
     _assert_action_receipt(
         rejoin_reseed,
         action_id="rejoin_reseed:primary-a",
@@ -1176,7 +1327,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         # The fenced node is no longer authoritative. Ask explicitly for its
         # retained local generation to verify that the rejected write did not
         # reach storage; the default read-index mode must remain unavailable.
-        ha_cluster.primary.lookup_key(table_name, "doc:old-primary", consistency="stale")
+        ha_cluster.primary.lookup_key(
+            table_name, "doc:old-primary", consistency="stale"
+        )
     assert missing_old_primary_doc.value.response is not None
     assert missing_old_primary_doc.value.response.status_code == 404
     missing_promoted_primary_doc = _wait_for_promoted_primary_missing_lookup(
@@ -1186,9 +1339,25 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert missing_promoted_primary_doc.status_code == 404
 
-    ha_cluster.standby.batch_write(table_name, {"doc:promoted": {"title": "promoted"}})
-    promoted_doc = ha_cluster.standby.lookup_key(table_name, "doc:promoted")
-    assert promoted_doc["title"] == "promoted"
+    # Promotion changes authority, but this in-process standby has not been
+    # restarted as a primary with a replacement synchronous replica. Keep the
+    # public mutation surface fail-closed until continuous replication exists.
+    rejected_promoted_write = ha_cluster.standby.batch_write_response(
+        table_name,
+        {"doc:promoted": {"title": "must not commit without replication"}},
+    )
+    assert rejected_promoted_write.status_code == 503
+    assert rejected_promoted_write.json() == {
+        "error": "mutation is not continuously replicated while HA is active",
+        "code": "ha_mutation_not_replicated",
+        "surface": "document_batch",
+    }
+    missing_promoted_copy = _wait_for_promoted_primary_missing_lookup(
+        ha_cluster,
+        table_name,
+        "doc:promoted",
+    )
+    assert missing_promoted_copy.status_code == 404
     with pytest.raises(requests.HTTPError) as missing_former_primary_copy:
         ha_cluster.primary.lookup_key(table_name, "doc:promoted", consistency="stale")
     assert missing_former_primary_copy.value.response is not None
@@ -1201,6 +1370,7 @@ def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HAC
 
     required_lsn = 1
     forced_request = {
+        "generation": 1,
         "identity": _whole_instance_identity(ha_cluster),
         "old_primary_id": ha_cluster.primary.node_id,
         "promoted_node_id": ha_cluster.standby.node_id,
@@ -1224,11 +1394,17 @@ def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HAC
     assert fence["receipt"]["forced"] is True
     assert fence["receipt"]["required_lsn"] == required_lsn
     assert fence["receipt"]["observed_lsn"] == 0
+    assert fence["receipt"]["generation"] == forced_request["generation"]
     assert fence["receipt"]["token"]
 
     assessment = ha_cluster.standby.admin_post(
         "/promotion/assess",
-        {"required_lsn": required_lsn, "fencing_confirmed": False, "force": False, "use_current_fence": True},
+        {
+            "required_lsn": required_lsn,
+            "fencing_confirmed": False,
+            "force": False,
+            "use_current_fence": True,
+        },
     )
     _assert_action_receipt(
         assessment,

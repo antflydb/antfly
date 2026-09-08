@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceToolChoiceType0(str, Enum):
+class InferenceToolChoiceType0(StrEnum):
     AUTO = "auto"
     NONE = "none"
     REQUIRED = "required"

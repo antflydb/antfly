@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AgentQuestionKind(str, Enum):
+class AgentQuestionKind(StrEnum):
     CONFIRM = "confirm"
     FIELD_POLICY = "field_policy"
     FREE_TEXT = "free_text"

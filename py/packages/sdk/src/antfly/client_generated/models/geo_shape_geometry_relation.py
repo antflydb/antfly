@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GeoShapeGeometryRelation(str, Enum):
+class GeoShapeGeometryRelation(StrEnum):
     CONTAINS = "contains"
     INTERSECTS = "intersects"
     WITHIN = "within"

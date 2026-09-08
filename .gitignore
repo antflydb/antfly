@@ -31,6 +31,7 @@ onnxruntime
 gosec_output.txt
 
 .DS_Store
+/.env
 
 dist/
 

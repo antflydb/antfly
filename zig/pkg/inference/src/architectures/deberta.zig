@@ -507,6 +507,7 @@ pub fn forwardCtProfiled(
 
     var timer = profileStart(profile);
     var hidden = try embeddings(cb, allocator, config, input_ids, attention_mask, total, H);
+    errdefer cb.free(hidden);
     if (profile) |p| p.embeddings_ns += profileElapsed(timer);
     timer = profileStart(profile);
     const rel_emb = try buildRelativePositionEmbInfo(cb, allocator, config, seq_len);
@@ -515,17 +516,27 @@ pub fn forwardCtProfiled(
     if (profile) |p| p.relative_position_ns += profileElapsed(timer);
 
     for (0..config.num_hidden_layers) |layer| {
+        try cb.checkExecutionControl();
         timer = profileStart(profile);
         const new_hidden = try encoderLayer(cb, allocator, config, hidden, attention_mask, rel_emb, batch, seq_len, layer, resident_slots, profile);
         cb.free(hidden);
         hidden = new_hidden;
         if (profile) |p| p.layer_total_ns += profileElapsed(timer);
+        if (cb.execution_control != null and encoder_frame_active and
+            (layer + 1) % 2 == 0 and layer + 1 < config.num_hidden_layers)
+        {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            encoder_frame_active = false;
+            try cb.checkExecutionControl();
+            encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+        }
     }
     // No post-encoder LayerNorm in DeBERTa-v3 (encoder.LayerNorm is norm_rel_ebd).
     if (encoder_frame_active) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         encoder_frame_active = false;
     }
+    try cb.checkExecutionControl();
     return hidden;
 }
 

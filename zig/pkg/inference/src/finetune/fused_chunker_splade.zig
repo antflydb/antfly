@@ -491,9 +491,9 @@ test "computeSpladeActivation — single token, max pooling" {
     // weight row 2 = [0.5, 0, 0, 0]→ proj = 0.5 → log1p(0.5) ≈ 0.4055
     const hidden = [_]f32{ 1, 0, 0, 0 };
     const weight = [_]f32{
-        2,    0, 0, 0, // vocab 0
-        -1,   0, 0, 0, // vocab 1
-        0.5,  0, 0, 0, // vocab 2
+        2, 0, 0, 0, // vocab 0
+        -1, 0, 0, 0, // vocab 1
+        0.5, 0, 0, 0, // vocab 2
     };
 
     var out = [_]f32{ 0, 0, 0 };
@@ -561,12 +561,12 @@ test "computeSpladeFlopsLoss — basic" {
 
     // Gradient signs.
     const scale: f32 = 1e-3 / 2.0;
-    try std.testing.expectApproxEqAbs(scale, grad[0], 1e-7);   // +1
-    try std.testing.expectApproxEqAbs(-scale, grad[1], 1e-7);  // -2
+    try std.testing.expectApproxEqAbs(scale, grad[0], 1e-7); // +1
+    try std.testing.expectApproxEqAbs(-scale, grad[1], 1e-7); // -2
     try std.testing.expectApproxEqAbs(@as(f32, 0), grad[2], 1e-7); // 0
-    try std.testing.expectApproxEqAbs(scale, grad[3], 1e-7);   // +3
+    try std.testing.expectApproxEqAbs(scale, grad[3], 1e-7); // +3
     try std.testing.expectApproxEqAbs(@as(f32, 0), grad[4], 1e-7); // 0
-    try std.testing.expectApproxEqAbs(-scale, grad[5], 1e-7);  // -1
+    try std.testing.expectApproxEqAbs(-scale, grad[5], 1e-7); // -1
 }
 
 test "computeSpladeContrastiveLoss — trivial V<2 returns zero" {

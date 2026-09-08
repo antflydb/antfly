@@ -55,7 +55,7 @@ pub fn encodeManagedEmbeddingsIndexRequest(
     index_name: []const u8,
     field_name: []const u8,
     dimension: i64,
-    embedder: embeddings_openapi.EmbedderConfig,
+    embedder: embeddings_openapi.IndexEmbedderConfig,
     chunker: ?chunking_openapi.ChunkerConfig,
 ) ![]u8 {
     const embedder_json = try stringifyJsonAlloc(alloc, embedder);
@@ -94,7 +94,7 @@ pub fn encodeManagedEmbeddingsIndexTemplateRequest(
     index_name: []const u8,
     template_source: []const u8,
     dimension: i64,
-    embedder: embeddings_openapi.EmbedderConfig,
+    embedder: embeddings_openapi.IndexEmbedderConfig,
 ) ![]u8 {
     const embedder_json = try stringifyJsonAlloc(alloc, embedder);
     defer alloc.free(embedder_json);
@@ -116,7 +116,7 @@ pub fn encodeManagedEmbeddingsIndexTemplateWithChunkerRequest(
     index_name: []const u8,
     template_source: []const u8,
     dimension: i64,
-    embedder: embeddings_openapi.EmbedderConfig,
+    embedder: embeddings_openapi.IndexEmbedderConfig,
     chunker: chunking_openapi.ChunkerConfig,
 ) ![]u8 {
     const embedder_json = try stringifyJsonAlloc(alloc, embedder);
@@ -135,6 +135,23 @@ pub fn encodeManagedEmbeddingsIndexTemplateWithChunkerRequest(
             chunker_json,
         },
     );
+}
+
+pub fn openAIIndexEmbedder(model: []const u8, url: []const u8) embeddings_openapi.IndexEmbedderConfig {
+    return .{ .open_ai_embedder_config = .{
+        .provider = "openai",
+        .model = model,
+        .url = url,
+    } };
+}
+
+pub fn antflyIndexEmbedder(model: []const u8, api_url: []const u8, multimodal: bool) embeddings_openapi.IndexEmbedderConfig {
+    return .{ .antfly_embedder_config = .{
+        .provider = "antfly",
+        .model = model,
+        .api_url = api_url,
+        .multimodal = multimodal,
+    } };
 }
 
 pub fn encodeManagedSparseEmbeddingsIndexRequest(

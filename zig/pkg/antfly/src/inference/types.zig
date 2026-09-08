@@ -25,6 +25,94 @@ pub const ChatMessageContent = generating.ChatMessageContent;
 pub const ToolCall = generating.ToolCall;
 pub const ChatMessage = generating.ChatMessage;
 
+/// Request-scoped local generation controls. Keep these in the provider
+/// request (including its serialized bridge), never in shared model state.
+pub const GenerationOptions = struct {
+    max_tokens: i32 = 256,
+
+    pub fn fromMaxTokens(value: i64) !GenerationOptions {
+        if (value <= 0) return error.InvalidGeneratorConfig;
+        return .{ .max_tokens = std.math.cast(i32, value) orelse return error.InvalidGeneratorConfig };
+    }
+};
+
+/// Shared request schemas for the independently compiled inference bridge.
+/// Defaults retain the historical budget for older internal callers only.
+pub const GenerateTextRequest = struct {
+    model: []const u8,
+    roles: []const []const u8,
+    contents: []const []const u8,
+    options: GenerationOptions = .{},
+};
+
+pub const GenerateMessagesRequest = struct {
+    model: []const u8,
+    messages: []const ChatMessage,
+    options: GenerationOptions = .{},
+};
+
+/// Preserve explicit, transient inference admission failures across both the
+/// HTTP provider and the in-process generation bridge. Permanent budget/model
+/// failures and unstructured 503s must not masquerade as capacity retries.
+pub fn localGenerationStatusError(alloc: std.mem.Allocator, status: u16, body: ?[]const u8) anyerror {
+    if (status == 429) return error.RateLimit;
+    if (status == 504) return error.Timeout;
+    if (status == 503) {
+        const Failure = struct { @"error": []const u8 = "", retryable: bool = false };
+        if (body) |bytes| {
+            var parsed = std.json.parseFromSlice(Failure, alloc, bytes, .{ .ignore_unknown_fields = true }) catch
+                return error.GenerateRequestFailed;
+            defer parsed.deinit();
+            if (parsed.value.retryable and std.mem.eql(u8, parsed.value.@"error", "MODEL_RESOURCE_BUSY"))
+                return error.GenerationCapacityUnavailable;
+        }
+    }
+    return error.GenerateRequestFailed;
+}
+
+test "local generation bridge preserves retryable capacity without retrying permanent failures" {
+    const alloc = std.testing.allocator;
+    const busy = "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true,\"reason\":\"inference_capacity\",\"retry_after_ms\":1000}";
+    try std.testing.expectEqual(error.GenerationCapacityUnavailable, localGenerationStatusError(alloc, 503, busy));
+    try std.testing.expectEqual(error.GenerateRequestFailed, localGenerationStatusError(alloc, 500, busy));
+    for ([_]?[]const u8{ null, "unavailable", "{}", "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":false}", "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"retryable\":false}", "{\"error\":\"MODEL_NOT_FOUND\",\"retryable\":true}" }) |body| {
+        try std.testing.expectEqual(error.GenerateRequestFailed, localGenerationStatusError(alloc, 503, body));
+    }
+    try std.testing.expectEqual(error.RateLimit, localGenerationStatusError(alloc, 429, null));
+    try std.testing.expectEqual(error.Timeout, localGenerationStatusError(alloc, 504, null));
+}
+
+test "local generation budgets preserve explicit limits and reject overflow" {
+    try std.testing.expectEqual(@as(i32, 128), (try GenerationOptions.fromMaxTokens(128)).max_tokens);
+    try std.testing.expectEqual(@as(i32, 256), (GenerationOptions{}).max_tokens);
+    try std.testing.expectError(error.InvalidGeneratorConfig, GenerationOptions.fromMaxTokens(0));
+    try std.testing.expectError(error.InvalidGeneratorConfig, GenerationOptions.fromMaxTokens(-1));
+    try std.testing.expectError(error.InvalidGeneratorConfig, GenerationOptions.fromMaxTokens(std.math.maxInt(i64)));
+}
+
+test "local generation bridge round trips request budgets" {
+    const alloc = std.testing.allocator;
+    const encoded = try std.json.Stringify.valueAlloc(alloc, GenerateMessagesRequest{
+        .model = "gemma",
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hello" } }},
+        .options = try GenerationOptions.fromMaxTokens(128),
+    }, .{});
+    defer alloc.free(encoded);
+    var decoded = try std.json.parseFromSlice(GenerateMessagesRequest, alloc, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(i32, 128), decoded.value.options.max_tokens);
+    var text = try std.json.parseFromSlice(GenerateTextRequest, alloc,
+        \\{"model":"gemma","roles":["user"],"contents":["hello"],"options":{"max_tokens":37}}
+    , .{});
+    defer text.deinit();
+    try std.testing.expectEqual(@as(i32, 37), text.value.options.max_tokens);
+    var legacy = try std.json.parseFromSlice(GenerateMessagesRequest, alloc,
+        \\{"model":"gemma","messages":[]}
+    , .{});
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(i32, 256), legacy.value.options.max_tokens);
+}
+
 pub const ChatWireFlavor = enum {
     openai_compatible,
     termite_native,
@@ -39,6 +127,7 @@ pub const ChatRequestOptions = struct {
     top_k: ?i64 = null,
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
+    enable_thinking: ?bool = null,
 };
 
 pub fn chatRequestJsonAlloc(
@@ -83,6 +172,9 @@ pub fn chatRequestJsonWithOptionsAlloc(
     if (options.top_k) |top_k| try appendJsonI64Field(alloc, &out, "top_k", top_k);
     if (options.frequency_penalty) |frequency_penalty| try appendJsonFloatField(alloc, &out, "frequency_penalty", frequency_penalty);
     if (options.presence_penalty) |presence_penalty| try appendJsonFloatField(alloc, &out, "presence_penalty", presence_penalty);
+    if (options.enable_thinking) |enabled| {
+        try out.appendSlice(alloc, if (enabled) ",\"chat_template_kwargs\":{\"enable_thinking\":true}" else ",\"chat_template_kwargs\":{\"enable_thinking\":false}");
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }

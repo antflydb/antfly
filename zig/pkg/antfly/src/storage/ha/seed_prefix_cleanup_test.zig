@@ -9,8 +9,8 @@ const cleanup = @import("seed_prefix_cleanup.zig");
 const namespace_control = @import("seed_namespace_control.zig");
 const object_storage = @import("../object_storage.zig");
 
-const location = "s3://ha-bucket/instances/instance-a/ha-seeds/";
-const object_prefix = "instances/instance-a/ha-seeds/";
+const location = "s3://ha-bucket/orgs/org-a/instances/instance-a/ha-seeds/";
+const object_prefix = "orgs/org-a/instances/instance-a/ha-seeds/";
 
 fn requestAlloc(alloc: std.mem.Allocator) !cleanup.Request {
     const prefix_sha256 = try cleanup.sha256HexAlloc(alloc, location);
@@ -43,6 +43,195 @@ fn put(client: *object_storage.ObjectStorage, bucket: []const u8, key: []const u
     result.deinit(std.testing.allocator);
 }
 
+const VersionedTestStore = struct {
+    const keys = [_][]const u8{
+        object_prefix ++ "generations/gen-a/COMPLETE.json",
+        object_prefix ++ "generations/gen-a/COMPLETE.json",
+        object_prefix ++ "uploads/orphan.part",
+    };
+    const version_ids = [_][]const u8{ "version-2", "version-1", "delete-marker-1" };
+    const delete_markers = [_]bool{ false, false, true };
+
+    backing: object_storage.MemoryObjectStorage,
+    deleted: [keys.len]bool = @splat(false),
+
+    fn init(alloc: std.mem.Allocator) VersionedTestStore {
+        return .{ .backing = object_storage.MemoryObjectStorage.init(alloc) };
+    }
+
+    fn client(self: *VersionedTestStore, alloc: std.mem.Allocator) object_storage.ObjectStorage {
+        return .{ .allocator = alloc, .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(_: std.mem.Allocator, ptr: *anyopaque) void {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        self.backing.deinit();
+    }
+
+    fn bucketExists(ptr: *anyopaque, bucket: []const u8, opts: object_storage.BucketOptions) !bool {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        var backing = self.backing.client();
+        return try backing.bucketExistsWithOptions(bucket, opts);
+    }
+
+    fn makeBucket(ptr: *anyopaque, bucket: []const u8, opts: object_storage.BucketOptions) !void {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        var backing = self.backing.client();
+        try backing.makeBucketWithOptions(bucket, opts);
+    }
+
+    fn putObject(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: object_storage.PutOptions) !object_storage.PutResult {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        var backing = self.backing.client();
+        backing.allocator = alloc;
+        return try backing.putObject(bucket, key, body, opts);
+    }
+
+    fn getObject(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8, opts: object_storage.GetOptions) !object_storage.GetResult {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        var backing = self.backing.client();
+        backing.allocator = alloc;
+        return try backing.getObject(bucket, key, opts);
+    }
+
+    fn getObjectAttributes(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8) !object_storage.ObjectAttributes {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        var backing = self.backing.client();
+        backing.allocator = alloc;
+        return try backing.getObjectAttributes(bucket, key);
+    }
+
+    fn statObject(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8) !object_storage.ObjectMetadata {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        var backing = self.backing.client();
+        backing.allocator = alloc;
+        return try backing.statObject(bucket, key);
+    }
+
+    fn deleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: object_storage.DeleteOptions) !void {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        if (opts.version_id) |version_id| {
+            for (keys, version_ids, 0..) |candidate_key, candidate_version, index| {
+                if (std.mem.eql(u8, key, candidate_key) and std.mem.eql(u8, version_id, candidate_version)) {
+                    if (self.deleted[index]) return error.FileNotFound;
+                    self.deleted[index] = true;
+                    return;
+                }
+            }
+            return error.FileNotFound;
+        }
+        var backing = self.backing.client();
+        try backing.deleteObject(bucket, key, opts);
+    }
+
+    fn listObjects(ptr: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, opts: object_storage.ListOptions) !object_storage.ListResult {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        var backing = self.backing.client();
+        backing.allocator = alloc;
+        return try backing.listObjects(bucket, opts);
+    }
+
+    fn listObjectVersions(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, opts: object_storage.ListObjectVersionsOptions) !object_storage.ListObjectVersionsResult {
+        const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
+        var start: usize = 0;
+        if (opts.key_marker) |key_marker| {
+            const version_marker = opts.version_id_marker orelse return error.InvalidVersionPagination;
+            var found = false;
+            for (keys, version_ids, 0..) |key, version_id, index| {
+                if (std.mem.eql(u8, key_marker, key) and std.mem.eql(u8, version_marker, version_id)) {
+                    start = index + 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.InvalidVersionPagination;
+        }
+
+        var entries = std.ArrayListUnmanaged(object_storage.ObjectVersionEntry).empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(alloc);
+            entries.deinit(alloc);
+        }
+        var last_index: ?usize = null;
+        var index = start;
+        while (index < keys.len and entries.items.len < opts.max_keys) : (index += 1) {
+            if (self.deleted[index] or !std.mem.startsWith(u8, keys[index], opts.prefix)) continue;
+            const key = try alloc.dupe(u8, keys[index]);
+            errdefer alloc.free(key);
+            const version_id = try alloc.dupe(u8, version_ids[index]);
+            errdefer alloc.free(version_id);
+            try entries.append(alloc, .{
+                .key = key,
+                .version_id = version_id,
+                .is_delete_marker = delete_markers[index],
+            });
+            last_index = index;
+        }
+        var has_more = false;
+        while (index < keys.len) : (index += 1) {
+            if (!self.deleted[index] and std.mem.startsWith(u8, keys[index], opts.prefix)) {
+                has_more = true;
+                break;
+            }
+        }
+        const marker_index = if (has_more) last_index orelse return error.InvalidVersionPagination else null;
+        const owned_entries = try entries.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_entries) |*entry| entry.deinit(alloc);
+            alloc.free(owned_entries);
+        }
+        const next_key_marker = if (marker_index) |value| try alloc.dupe(u8, keys[value]) else null;
+        errdefer if (next_key_marker) |value| alloc.free(value);
+        const next_version_id_marker = if (marker_index) |value| try alloc.dupe(u8, version_ids[value]) else null;
+        return .{
+            .entries = owned_entries,
+            .is_truncated = has_more,
+            .next_key_marker = next_key_marker,
+            .next_version_id_marker = next_version_id_marker,
+        };
+    }
+
+    const vtable: object_storage.ObjectStorage.VTable = .{
+        .deinit = deinit,
+        .bucket_exists = bucketExists,
+        .make_bucket = makeBucket,
+        .put_object = putObject,
+        .get_object = getObject,
+        .get_object_attributes = getObjectAttributes,
+        .stat_object = statObject,
+        .delete_object = deleteObject,
+        .list_objects = listObjects,
+        .list_object_versions = listObjectVersions,
+    };
+};
+
+test "storage.ha seed prefix cleanup purges every version and delete marker before receipt" {
+    const alloc = std.testing.allocator;
+    var versioned = VersionedTestStore.init(alloc);
+    var client = versioned.client(alloc);
+    defer client.deinit();
+    try client.makeBucket("ha-bucket");
+
+    const request = try requestAlloc(alloc);
+    defer freeRequest(alloc, request);
+    var result = try cleanup.deleteAll(alloc, .{
+        .client = &client,
+        .bucket = "ha-bucket",
+        .prefix = object_prefix,
+    }, request, .{
+        .max_keys = 2,
+        .completed_at_override = "2026-07-14T12:34:56Z",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.deleted_generations);
+    try std.testing.expectEqual(@as(usize, 3), result.deleted_objects);
+    try std.testing.expectEqual([_]bool{ true, true, true }, versioned.deleted);
+    var remaining = try client.listObjectVersions("ha-bucket", .{ .prefix = object_prefix });
+    defer remaining.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), remaining.entries.len);
+}
+
 test "storage.ha seed prefix cleanup deletes the exact instance prefix and emits a bound receipt" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -54,7 +243,7 @@ test "storage.ha seed prefix cleanup deletes the exact instance prefix and emits
     try put(&client, "ha-bucket", object_prefix ++ "generations/gen-a/files/catalog");
     try put(&client, "ha-bucket", object_prefix ++ "generations/gen-b/COMPLETE.json");
     try put(&client, "ha-bucket", object_prefix ++ "uploads/orphan.part");
-    try put(&client, "ha-bucket", "instances/instance-a-other/ha-seeds/generations/keep/COMPLETE.json");
+    try put(&client, "ha-bucket", "orgs/org-a/instances/instance-a-other/ha-seeds/generations/keep/COMPLETE.json");
 
     const request = try requestAlloc(alloc);
     defer freeRequest(alloc, request);
@@ -64,6 +253,7 @@ test "storage.ha seed prefix cleanup deletes the exact instance prefix and emits
         .prefix = object_prefix,
     }, request, .{
         .max_keys = 2,
+        .require_version_purge = false,
         .completed_at_override = "2026-07-14T12:34:56.123456789Z",
     });
     defer result.deinit(alloc);
@@ -83,7 +273,7 @@ test "storage.ha seed prefix cleanup deletes the exact instance prefix and emits
     var exact = try client.listObjects("ha-bucket", .{ .prefix = object_prefix, .recursive = true });
     defer exact.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), exact.entries.len);
-    var sibling = try client.getObject("ha-bucket", "instances/instance-a-other/ha-seeds/generations/keep/COMPLETE.json", .{});
+    var sibling = try client.getObject("ha-bucket", "orgs/org-a/instances/instance-a-other/ha-seeds/generations/keep/COMPLETE.json", .{});
     defer sibling.deinit(alloc);
     try std.testing.expectEqualStrings("x", sibling.body);
 }
@@ -106,12 +296,20 @@ test "storage.ha seed prefix cleanup fails closed on mutated authority and is id
     }, wrong_digest, .{}));
 
     var wrong_prefix = request;
-    wrong_prefix.location = "s3://ha-bucket/instances/instance-a/ha-seeds-extra/";
+    wrong_prefix.location = "s3://ha-bucket/orgs/org-a/instances/instance-a/ha-seeds-extra/";
     try std.testing.expectError(error.InvalidSeedPrefixCleanupPrefix, cleanup.deleteAll(alloc, .{
         .client = &client,
         .bucket = "ha-bucket",
-        .prefix = "instances/instance-a/ha-seeds-extra/",
+        .prefix = "orgs/org-a/instances/instance-a/ha-seeds-extra/",
     }, wrong_prefix, .{}));
+
+    var nested_scope = request;
+    nested_scope.location = "s3://ha-bucket/tenants/tenant-a/orgs/org-a/instances/instance-a/ha-seeds/";
+    try std.testing.expectError(error.InvalidSeedPrefixCleanupPrefix, cleanup.validateRequestAuthority(alloc, nested_scope));
+
+    var missing_separator = request;
+    missing_separator.location = "s3://ha-bucket/orgs/org-a/instances/instance-a/ha-seeds";
+    try std.testing.expectError(error.InvalidSeedPrefixCleanupPrefix, cleanup.validateRequestAuthority(alloc, missing_separator));
 
     var not_delete_all = request;
     not_delete_all.delete_all = false;
@@ -125,7 +323,10 @@ test "storage.ha seed prefix cleanup fails closed on mutated authority and is id
         .client = &client,
         .bucket = "ha-bucket",
         .prefix = object_prefix,
-    }, request, .{ .completed_at_override = "2026-07-14T12:34:56Z" });
+    }, request, .{
+        .require_version_purge = false,
+        .completed_at_override = "2026-07-14T12:34:56Z",
+    });
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), result.deleted_generations);
     try std.testing.expectEqual(@as(usize, 0), result.deleted_objects);
@@ -163,7 +364,10 @@ test "storage.ha seed cleanup excludes publishers and leaves a durable tombstone
         .client = &client,
         .bucket = "ha-bucket",
         .prefix = object_prefix,
-    }, request, .{ .completed_at_override = "2026-07-14T12:34:56Z" });
+    }, request, .{
+        .require_version_purge = false,
+        .completed_at_override = "2026-07-14T12:34:56Z",
+    });
     defer result.deinit(alloc);
 
     try std.testing.expectError(error.SeedNamespaceUnavailable, namespace_control.acquirePublish(

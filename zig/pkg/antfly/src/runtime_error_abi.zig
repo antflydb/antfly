@@ -297,6 +297,14 @@ pub const Detail = enum(c_int) {
     enrichment_wait_canceled,
     enrichment_wait_timeout,
     enrichment_worker_failed,
+    // A locally committed RemoteApply write can cross the independently
+    // generated storage/runtime boundary before its standby acknowledgement
+    // is available. Preserve the exact reason so the public API can return
+    // its explicit pending-durability contract instead of a generic 500.
+    ha_sync_commit_would_block,
+    ha_sync_commit_wait_limit_exceeded,
+    ha_sync_commit_wait_missing_context,
+    ha_sync_commit_wait_standby_not_in_policy,
     deadline_exceeded,
     pre_decision_deadline_exceeded,
     graph_distinct_budget_exceeded,
@@ -307,6 +315,39 @@ pub const Detail = enum(c_int) {
     graph_min_weight_domain_violation,
     graph_max_weight_domain_violation,
     graph_path_weight_overflow,
+    /// A metadata mutation may already be committed. Callers must observe the
+    /// durable catalog state before deciding whether a retry is safe.
+    metadata_mutation_outcome_unknown,
+    missing_embedding_artifact_producer,
+    invalid_embedding_artifact_producer,
+    embedding_artifact_dimension_required,
+    conflicting_embedding_artifact_dimensions,
+    native_backup_repair_state_not_quiescent,
+    native_backup_projection_not_quiescent,
+    native_backup_projection_repair_failed,
+    native_backup_projection_repair_paused,
+    reranker_candidate_limit_exceeded,
+    // Reranker execution happens behind the independently generated data
+    // runtime boundary. Preserve the public retry/dependency classification
+    // instead of collapsing provider failures into RuntimeBoundaryFailure.
+    rerank_rate_limited,
+    rerank_transient_failure,
+    rerank_upstream_failure,
+    invalid_rate_limit_policy,
+    conflicting_rate_limit_policy,
+    provider_token_budget_exceeded,
+    provider_quota_registry_full,
+    unsupported_media_token_budget,
+    unsupported_local_rate_limit,
+    // Append after published main values to preserve their wire identities.
+    // Model compatibility is decided inside the independently generated
+    // inference runtime; do not reinterpret compilation-local error integers.
+    incompatible_model,
+    unsupported_generator_provider,
+    generate_request_failed,
+    generation_rate_limit,
+    unsupported_tensor_type,
+    generation_capacity_unavailable,
 };
 
 pub const Status = extern struct {
@@ -383,6 +424,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
         error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
         error.HAFencedPrimary => status(.conflict, .ha_fenced_primary),
+        error.HASyncCommitWouldBlock => status(.unavailable, .ha_sync_commit_would_block),
+        error.HASyncCommitWaitLimitExceeded => status(.unavailable, .ha_sync_commit_wait_limit_exceeded),
+        error.HASyncCommitWaitMissingContext => status(.unavailable, .ha_sync_commit_wait_missing_context),
+        error.HASyncCommitWaitStandbyNotInPolicy => status(.unavailable, .ha_sync_commit_wait_standby_not_in_policy),
         error.InternalFailure => status(.internal, .internal_failure),
         error.NotLeader => status(.retryable, .not_leader),
         error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
@@ -399,6 +444,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.MethodNotAllowed => status(.unsupported, .method_not_allowed),
         error.Unsupported => status(.unsupported, .unsupported),
         error.UnsupportedOperation => status(.unsupported, .unsupported_operation),
+        error.UnsupportedTensorType => status(.unsupported, .unsupported_tensor_type),
         error.UnsupportedTransformOperation => status(.invalid_argument, .unsupported_transform_operation),
         error.InvalidGraphEdges => status(.invalid_argument, .invalid_graph_edges),
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
@@ -472,6 +518,30 @@ pub fn statusFromError(err: anyerror) Status {
         error.LeaderTransferInProgress => status(.retryable, .leader_transfer_in_progress),
         error.MetadataLinearizableReadTimeout => status(.timeout, .metadata_linearizable_read_timeout),
         error.ReconcileLeaseNotHeld => status(.retryable, .reconcile_lease_not_held),
+        error.MetadataMutationOutcomeUnknown => status(.conflict, .metadata_mutation_outcome_unknown),
+        error.MissingEmbeddingArtifactProducer => status(.invalid_argument, .missing_embedding_artifact_producer),
+        error.InvalidEmbeddingArtifactProducer => status(.invalid_argument, .invalid_embedding_artifact_producer),
+        error.EmbeddingArtifactDimensionRequired => status(.invalid_argument, .embedding_artifact_dimension_required),
+        error.ConflictingEmbeddingArtifactDimensions => status(.invalid_argument, .conflicting_embedding_artifact_dimensions),
+        error.NativeBackupRepairStateNotQuiescent => status(.retryable, .native_backup_repair_state_not_quiescent),
+        error.NativeBackupProjectionNotQuiescent => status(.retryable, .native_backup_projection_not_quiescent),
+        error.NativeBackupProjectionRepairFailed => status(.corrupt, .native_backup_projection_repair_failed),
+        error.NativeBackupProjectionRepairPaused => status(.conflict, .native_backup_projection_repair_paused),
+        error.RerankerCandidateLimitExceeded => status(.invalid_argument, .reranker_candidate_limit_exceeded),
+        error.RerankRateLimited => status(.retryable, .rerank_rate_limited),
+        error.RerankTransientFailure => status(.retryable, .rerank_transient_failure),
+        error.RerankUpstreamFailure => status(.unavailable, .rerank_upstream_failure),
+        error.IncompatibleModel => status(.invalid_argument, .incompatible_model),
+        error.UnsupportedGeneratorProvider => status(.unsupported, .unsupported_generator_provider),
+        error.GenerateRequestFailed => status(.unavailable, .generate_request_failed),
+        error.GenerationCapacityUnavailable => status(.retryable, .generation_capacity_unavailable),
+        error.RateLimit => status(.retryable, .generation_rate_limit),
+        error.InvalidRateLimitPolicy => status(.invalid_argument, .invalid_rate_limit_policy),
+        error.ConflictingRateLimitPolicy => status(.conflict, .conflicting_rate_limit_policy),
+        error.ProviderTokenBudgetExceeded => status(.invalid_argument, .provider_token_budget_exceeded),
+        error.ProviderQuotaRegistryFull => status(.retryable, .provider_quota_registry_full),
+        error.UnsupportedMediaTokenBudget => status(.unsupported, .unsupported_media_token_budget),
+        error.UnsupportedLocalRateLimit => status(.unsupported, .unsupported_local_rate_limit),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -711,6 +781,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .method_not_allowed => "MethodNotAllowed",
         .unsupported => "Unsupported",
         .unsupported_operation => "UnsupportedOperation",
+        .unsupported_tensor_type => "UnsupportedTensorType",
         .unsupported_query_request => "UnsupportedQueryRequest",
         .unsupported_filter_query_request => "UnsupportedFilterQueryRequest",
         .unsupported_exclusion_query_request => "UnsupportedExclusionQueryRequest",
@@ -905,6 +976,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
         .enrichment_wait_timeout => "EnrichmentWaitTimeout",
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
+        .ha_sync_commit_would_block => "HASyncCommitWouldBlock",
+        .ha_sync_commit_wait_limit_exceeded => "HASyncCommitWaitLimitExceeded",
+        .ha_sync_commit_wait_missing_context => "HASyncCommitWaitMissingContext",
+        .ha_sync_commit_wait_standby_not_in_policy => "HASyncCommitWaitStandbyNotInPolicy",
         .deadline_exceeded => "DeadlineExceeded",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
@@ -915,6 +990,30 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
         .graph_path_weight_overflow => "GraphPathWeightOverflow",
+        .metadata_mutation_outcome_unknown => "MetadataMutationOutcomeUnknown",
+        .missing_embedding_artifact_producer => "MissingEmbeddingArtifactProducer",
+        .invalid_embedding_artifact_producer => "InvalidEmbeddingArtifactProducer",
+        .embedding_artifact_dimension_required => "EmbeddingArtifactDimensionRequired",
+        .conflicting_embedding_artifact_dimensions => "ConflictingEmbeddingArtifactDimensions",
+        .native_backup_repair_state_not_quiescent => "NativeBackupRepairStateNotQuiescent",
+        .native_backup_projection_not_quiescent => "NativeBackupProjectionNotQuiescent",
+        .native_backup_projection_repair_failed => "NativeBackupProjectionRepairFailed",
+        .native_backup_projection_repair_paused => "NativeBackupProjectionRepairPaused",
+        .reranker_candidate_limit_exceeded => "RerankerCandidateLimitExceeded",
+        .rerank_rate_limited => "RerankRateLimited",
+        .rerank_transient_failure => "RerankTransientFailure",
+        .rerank_upstream_failure => "RerankUpstreamFailure",
+        .incompatible_model => "IncompatibleModel",
+        .unsupported_generator_provider => "UnsupportedGeneratorProvider",
+        .generate_request_failed => "GenerateRequestFailed",
+        .generation_capacity_unavailable => "GenerationCapacityUnavailable",
+        .generation_rate_limit => "RateLimit",
+        .invalid_rate_limit_policy => "InvalidRateLimitPolicy",
+        .conflicting_rate_limit_policy => "ConflictingRateLimitPolicy",
+        .provider_token_budget_exceeded => "ProviderTokenBudgetExceeded",
+        .provider_quota_registry_full => "ProviderQuotaRegistryFull",
+        .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
+        .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
     };
 }
 
@@ -936,6 +1035,18 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.EnrichmentWorkerFailed, errorFromStatus(statusFromError(error.EnrichmentWorkerFailed)));
     try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
+    try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, errorFromStatus(statusFromError(error.MetadataMutationOutcomeUnknown)));
+    try std.testing.expectEqual(error.InvalidEmbeddingArtifactProducer, errorFromStatus(statusFromError(error.InvalidEmbeddingArtifactProducer)));
+    try std.testing.expectEqual(error.NativeBackupRepairStateNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupRepairStateNotQuiescent)));
+    try std.testing.expectEqual(error.NativeBackupProjectionNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupProjectionNotQuiescent)));
+    try std.testing.expectEqual(error.RerankerCandidateLimitExceeded, errorFromStatus(statusFromError(error.RerankerCandidateLimitExceeded)));
+    try std.testing.expectEqual(error.RerankRateLimited, errorFromStatus(statusFromError(error.RerankRateLimited)));
+    try std.testing.expectEqual(error.RerankTransientFailure, errorFromStatus(statusFromError(error.RerankTransientFailure)));
+    try std.testing.expectEqual(error.RerankUpstreamFailure, errorFromStatus(statusFromError(error.RerankUpstreamFailure)));
+    try std.testing.expectEqual(error.IncompatibleModel, errorFromStatus(statusFromError(error.IncompatibleModel)));
+    try std.testing.expectEqual(error.UnsupportedGeneratorProvider, errorFromStatus(statusFromError(error.UnsupportedGeneratorProvider)));
+    try std.testing.expectEqual(error.GenerateRequestFailed, errorFromStatus(statusFromError(error.GenerateRequestFailed)));
+    try std.testing.expectEqual(error.RateLimit, errorFromStatus(statusFromError(error.RateLimit)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
@@ -943,6 +1054,10 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.CommitVisibilityNotSatisfied, errorFromStatus(statusFromError(error.CommitVisibilityNotSatisfied)));
     try std.testing.expectEqual(error.AbortDecisionNotDurable, errorFromStatus(statusFromError(error.AbortDecisionNotDurable)));
     try std.testing.expectEqual(error.LeaderUnavailable, errorFromStatus(statusFromError(error.LeaderUnavailable)));
+    try std.testing.expectEqual(error.HASyncCommitWouldBlock, errorFromStatus(statusFromError(error.HASyncCommitWouldBlock)));
+    try std.testing.expectEqual(error.HASyncCommitWaitLimitExceeded, errorFromStatus(statusFromError(error.HASyncCommitWaitLimitExceeded)));
+    try std.testing.expectEqual(error.HASyncCommitWaitMissingContext, errorFromStatus(statusFromError(error.HASyncCommitWaitMissingContext)));
+    try std.testing.expectEqual(error.HASyncCommitWaitStandbyNotInPolicy, errorFromStatus(statusFromError(error.HASyncCommitWaitStandbyNotInPolicy)));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
 }
 
@@ -989,4 +1104,19 @@ test "unknown wire values fail closed" {
         .code = @intFromEnum(Code.invalid_argument),
         .detail = @intFromEnum(Detail.table_not_found),
     }));
+}
+
+test "provider quota errors retain stable boundary details" {
+    try std.testing.expectEqual(error.InvalidRateLimitPolicy, errorFromStatus(statusFromError(error.InvalidRateLimitPolicy)));
+    try std.testing.expectEqual(error.ConflictingRateLimitPolicy, errorFromStatus(statusFromError(error.ConflictingRateLimitPolicy)));
+    try std.testing.expectEqual(error.ProviderTokenBudgetExceeded, errorFromStatus(statusFromError(error.ProviderTokenBudgetExceeded)));
+    try std.testing.expectEqual(error.ProviderQuotaRegistryFull, errorFromStatus(statusFromError(error.ProviderQuotaRegistryFull)));
+    try std.testing.expectEqual(error.UnsupportedMediaTokenBudget, errorFromStatus(statusFromError(error.UnsupportedMediaTokenBudget)));
+    try std.testing.expectEqual(error.UnsupportedLocalRateLimit, errorFromStatus(statusFromError(error.UnsupportedLocalRateLimit)));
+}
+
+test "generation capacity retains retryability across the runtime boundary" {
+    const result = statusFromError(error.GenerationCapacityUnavailable);
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), result.code);
+    try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
 }

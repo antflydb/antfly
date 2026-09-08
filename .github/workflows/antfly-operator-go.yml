@@ -12,6 +12,8 @@ on:
       - 'go/pkg/sdk/go.mod'
       - 'go/pkg/sdk/go.sum'
       - 'specs/openapi/**'
+      - 'scripts/ci/toolchain-policy.json'
+      - '.github/actions/load-toolchain-policy/action.yml'
       - '.github/workflows/antfly-operator-go.yml'
   pull_request:
     branches: ["main"]
@@ -21,8 +23,13 @@ on:
       - 'go/pkg/sdk/go.mod'
       - 'go/pkg/sdk/go.sum'
       - 'specs/openapi/**'
+      - 'scripts/ci/toolchain-policy.json'
+      - '.github/actions/load-toolchain-policy/action.yml'
       - '.github/workflows/antfly-operator-go.yml'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -30,7 +37,6 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  GO_VERSION: "1.26.4"
 
 jobs:
   test:
@@ -39,15 +45,19 @@ jobs:
       run:
         working-directory: go/pkg/operator
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false
 
       - name: Set Go experiment

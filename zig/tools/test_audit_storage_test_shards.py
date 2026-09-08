@@ -111,8 +111,7 @@ class StorageTestShardAuditTest(unittest.TestCase):
         source = self.root / "db.zig"
         self.write(
             "db.zig",
-            'test "db restore snapshot" {}\n'
-            'test "db transaction" {}\n',
+            'test "db restore snapshot" {}\ntest "db transaction" {}\n',
         )
         self.assertEqual(
             [

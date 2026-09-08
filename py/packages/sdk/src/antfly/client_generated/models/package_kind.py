@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class PackageKind(str, Enum):
+class PackageKind(StrEnum):
     EXTENSION = "extension"
 
     def __str__(self) -> str:

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RestoreJobResultStatus(str, Enum):
+class RestoreJobResultStatus(StrEnum):
     COMPLETED = "completed"
     DURABILITY_PENDING = "durability_pending"
     FAILED = "failed"

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const bloom = @import("bloom");
 const byte_copy = @import("../../common/byte_copy.zig");
@@ -1289,7 +1290,7 @@ test "repository rejects forged run metadata length before allocating" {
     const footer_offset = encoded.len - lsm_table_file.footer_len;
     const footer = encoded[footer_offset..];
     std.mem.writeInt(u64, footer[24..32], max_run_file_read_bytes, .little);
-    std.mem.writeInt(u32, footer[44..48], std.hash.Crc32.hash(footer[0..44]), .little);
+    std.mem.writeInt(u32, footer[44..48], Crc32.hash(footer[0..44]), .little);
 
     const path = "/repository-forged-run-metadata/run.tbl";
     try storage.storage().writeFileAbsolute(path, encoded);

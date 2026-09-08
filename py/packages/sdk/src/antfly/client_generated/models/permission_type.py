@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class PermissionType(str, Enum):
+class PermissionType(StrEnum):
     ADMIN = "admin"
     READ = "read"
     WRITE = "write"

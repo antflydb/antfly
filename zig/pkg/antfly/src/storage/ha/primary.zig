@@ -1007,19 +1007,31 @@ test "storage.ha primary opens from promoted standby handoff and continues write
         break :blk try standby.promotedPrimaryHandoff();
     };
 
-    var primary = try Primary.openPromotedFromStandby(alloc, paths.log.ptr, paths.slots.ptr, handoff, .{});
-    defer primary.close();
-    try std.testing.expectEqual(promoted_identity, primary.identity);
-    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 3), primary.nextLsn());
+    {
+        var primary = try Primary.openPromotedFromStandby(alloc, paths.log.ptr, paths.slots.ptr, handoff, .{});
+        defer primary.close();
+        try std.testing.expectEqual(promoted_identity, primary.identity);
+        try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+        try std.testing.expectEqual(@as(u64, 3), primary.nextLsn());
 
-    const appended_lsn = try primary.append(.{ .payload = "after-promotion" });
-    try std.testing.expectEqual(@as(u64, 3), appended_lsn);
-    var appended = (try primary.log.entryAt(alloc, appended_lsn)) orelse return error.TestExpectedEqual;
-    defer appended.deinit(alloc);
-    try validateRecordIdentity(promoted_identity, appended.record);
-    try std.testing.expectEqual(@as(u64, 2), appended.record.previous_lsn);
-    try std.testing.expectEqualStrings("after-promotion", appended.record.payload);
+        try primary.createSlot("replacement-a", primary.lastLsn());
+        const appended_lsn = try primary.append(.{ .payload = "after-promotion" });
+        try std.testing.expectEqual(@as(u64, 3), appended_lsn);
+        var appended = (try primary.log.entryAt(alloc, appended_lsn)) orelse return error.TestExpectedEqual;
+        defer appended.deinit(alloc);
+        try validateRecordIdentity(promoted_identity, appended.record);
+        try std.testing.expectEqual(@as(u64, 2), appended.record.previous_lsn);
+        try std.testing.expectEqualStrings("after-promotion", appended.record.payload);
+    }
+
+    // A declarative role transition must reopen these exact paths. Opening a
+    // fresh primary WAL would reset both the timeline tail and its sync slots.
+    {
+        var reopened = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, promoted_identity, .{});
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 3), reopened.lastLsn());
+        try std.testing.expect(reopened.slot("replacement-a") != null);
+    }
 }
 
 test "storage.ha primary adoption serializes standby ownership transfer" {

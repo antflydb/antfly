@@ -917,7 +917,8 @@ pub fn fuseNamedSets(
     defer fusion_mod.freeHits(alloc, fused);
     const pruned = if (req.pruner) |pruner| pruner.prune(fused) else fused;
 
-    const limit = @min(req.limit, @as(u32, @intCast(pruned.len)));
+    const start = @min(@as(usize, req.offset), pruned.len);
+    const limit = @min(@as(usize, req.limit), pruned.len - start);
     var hits = try alloc.alloc(types.SearchHit, limit);
     var initialized: usize = 0;
     errdefer {
@@ -925,7 +926,7 @@ pub fn fuseNamedSets(
         alloc.free(hits);
     }
 
-    for (pruned[0..limit], 0..) |hit, i| {
+    for (pruned[start..][0..limit], 0..) |hit, i| {
         const representative = if (ordinal_complete)
             fusion_key_entries.get(hit.doc_id) orelse return error.UnsupportedQueryRequest
         else
@@ -5630,6 +5631,37 @@ test "fuseNamedSets preserves source hit ordinals" {
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), result.hits[1].doc_ordinal);
     try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+}
+
+test "fuseNamedSets applies offset after fusion and pruning" {
+    const alloc = std.testing.allocator;
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("doc:a"), .score = 1.0 },
+        .{ .id = @constCast("doc:b"), .score = 0.6 },
+        .{ .id = @constCast("doc:c"), .score = 0.2 },
+    };
+    const named_sets = [_]NamedResultSet{.{
+        .name = "dense",
+        .hits = &hits,
+        .total_hits = hits.len,
+    }};
+    const Harness = struct {
+        fn loadProjectedDocument(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .offset = 1,
+        .limit = 1,
+        .include_stored = false,
+    }, &named_sets, .{
+        .ctx = null,
+        .load_projected_document = Harness.loadProjectedDocument,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
 test "fuseNamedSets reports a lower bound while any source window is truncated" {

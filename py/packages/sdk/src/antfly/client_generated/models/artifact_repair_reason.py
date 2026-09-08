@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ArtifactRepairReason(str, Enum):
+class ArtifactRepairReason(StrEnum):
     CORRUPT_ARTIFACT = "corrupt_artifact"
     ENRICHMENT_FAILED = "enrichment_failed"
     MISSING_ARTIFACT = "missing_artifact"

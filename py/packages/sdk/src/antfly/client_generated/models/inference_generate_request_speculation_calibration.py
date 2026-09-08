@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceGenerateRequestSpeculationCalibration(str, Enum):
+class InferenceGenerateRequestSpeculationCalibration(StrEnum):
     NONE = "none"
     POSITIVE = "positive"
     PROBE = "probe"

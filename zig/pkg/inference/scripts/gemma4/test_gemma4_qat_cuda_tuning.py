@@ -7,7 +7,9 @@ import unittest
 
 
 TUNING_SCRIPT = pathlib.Path(__file__).resolve().with_name("gemma4_qat_cuda_tuning.sh")
-WRAPPER_SCRIPT = pathlib.Path(__file__).resolve().with_name("with_gemma4_qat_cuda_tuning.sh")
+WRAPPER_SCRIPT = (
+    pathlib.Path(__file__).resolve().with_name("with_gemma4_qat_cuda_tuning.sh")
+)
 
 
 def configured_environment(**overrides: str) -> dict[str, str]:
@@ -83,7 +85,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
                 environment = configured_environment(
                     ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=profile,
                 )
-                self.assertEqual(profile, environment["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"])
+                self.assertEqual(
+                    profile, environment["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"]
+                )
 
     def test_gqa_prefill_can_preserve_the_runtime_automatic_default(self):
         environment = configured_environment(
@@ -118,7 +122,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(2, completed.returncode)
-        self.assertIn("conflicts with explicit GQA prefill configuration", completed.stderr)
+        self.assertIn(
+            "conflicts with explicit GQA prefill configuration", completed.stderr
+        )
 
     def test_gqa_prefill_rejects_unknown_typed_profile(self):
         environment = os.environ.copy()
@@ -137,7 +143,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(2, completed.returncode)
-        self.assertIn("invalid ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", completed.stderr)
+        self.assertIn(
+            "invalid ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE", completed.stderr
+        )
 
     def test_ple_gate_prefill_profile_is_typed_and_default_off(self):
         environment = configured_environment()
@@ -156,7 +164,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
 
     def test_ple_gate_prefill_rejects_unknown_typed_profile(self):
         environment = os.environ.copy()
-        environment["ANTFLY_INFERENCE_CUDA_PLE_GATE_PREFILL_PROFILE"] = "mirror_first_sm89_e2b"
+        environment["ANTFLY_INFERENCE_CUDA_PLE_GATE_PREFILL_PROFILE"] = (
+            "mirror_first_sm89_e2b"
+        )
         completed = subprocess.run(
             [
                 "bash",
@@ -185,7 +195,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         for name, expected in cases.items():
             with self.subTest(name=name):
                 environment = configured_environment(**{name: "1"})
-                self.assertEqual(expected, environment["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"])
+                self.assertEqual(
+                    expected, environment["ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"]
+                )
 
     def test_gqa_prefill_rejects_ambiguous_legacy_profiles(self):
         environment = os.environ.copy()
@@ -233,9 +245,15 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
 
     def test_generated_attention_defaults_disabled_and_honors_explicit_opt_in(self):
         environment = configured_environment()
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"])
-        self.assertNotIn("ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", environment)
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION"])
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"]
+        )
+        self.assertNotIn(
+            "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK", environment
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION"]
+        )
 
         for name in (
             "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE",
@@ -244,7 +262,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 environment = configured_environment(**{name: "1"})
-                self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"])
+                self.assertEqual(
+                    "1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE"]
+                )
 
         for name in (
             "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK",
@@ -253,12 +273,19 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 environment = configured_environment(**{name: "1"})
-                self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK"])
+                self.assertEqual(
+                    "1",
+                    environment[
+                        "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK"
+                    ],
+                )
 
         environment = configured_environment(
             ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK="0",
         )
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK"])
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK"]
+        )
 
         for name in (
             "ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION",
@@ -267,27 +294,45 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 environment = configured_environment(**{name: "1"})
-                self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION"])
+                self.assertEqual(
+                    "1", environment["ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION"]
+                )
 
     def test_readback_tuning_defaults_to_enabled(self):
         environment = configured_environment()
-        self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"])
-        self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"])
+        self.assertEqual(
+            "1", environment["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"]
+        )
+        self.assertEqual(
+            "1", environment["ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK"]
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX"]
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"]
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"]
+        )
         self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
-        self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"])
+        self.assertEqual(
+            "1", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"]
+        )
 
     def test_graph_off_removes_graph_only_temp_and_request_state(self):
         environment = configured_environment(ANTFLY_DECODE_GRAPH_REPLAY="off")
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY"])
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"]
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY"]
+        )
 
     def test_batching_wrapper_requires_graph_replay_off(self):
         rejected = wrapped_environment(
@@ -302,8 +347,12 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
             ANTFLY_SERVER_DECODE_GRAPH_REPLAY="off",
         )
         self.assertEqual(0, accepted.returncode, accepted.stderr)
-        environment = dict(line.split("=", 1) for line in accepted.stdout.splitlines() if "=" in line)
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"])
+        environment = dict(
+            line.split("=", 1) for line in accepted.stdout.splitlines() if "=" in line
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET"]
+        )
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"])
@@ -315,9 +364,7 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         )
         self.assertEqual(0, completed.returncode, completed.stderr)
         environment = dict(
-            line.split("=", 1)
-            for line in completed.stdout.splitlines()
-            if "=" in line
+            line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
         )
         self.assertEqual(
             "2400",
@@ -332,7 +379,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 environment = configured_environment(**{name: "997"})
-                self.assertEqual("997", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"])
+                self.assertEqual(
+                    "997", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD"]
+                )
 
         for name in (
             "ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP",
@@ -341,7 +390,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 environment = configured_environment(**{name: "2112"})
-                self.assertEqual("2112", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"])
+                self.assertEqual(
+                    "2112", environment["ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP"]
+                )
 
         for name in (
             "ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN",
@@ -350,33 +401,45 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 environment = configured_environment(**{name: "0"})
-                self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"])
+                self.assertEqual(
+                    "0", environment["ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"]
+                )
 
     def test_readback_tuning_honors_ambient_overrides(self):
         environment = configured_environment(
             ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING="0",
             ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK="0",
         )
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK"])
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING"]
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_GREEDY_PENDING_TOKEN_READBACK"]
+        )
 
     def test_generated_q6_lm_head_gate_honors_ambient_override(self):
         environment = configured_environment(
             ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX="1",
         )
-        self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX"])
+        self.assertEqual(
+            "1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q6_K_Q8_1_LM_HEAD_ARGMAX"]
+        )
 
     def test_exact_e2b_ffn_gate_honors_ambient_override(self):
         environment = configured_environment(
             ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT="1",
         )
-        self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
+        self.assertEqual(
+            "1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"]
+        )
 
     def test_pair_only_e2b_ffn_gate_honors_ambient_override(self):
         environment = configured_environment(
             ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY="1",
         )
-        self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"])
+        self.assertEqual(
+            "1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"]
+        )
 
     def test_e2b_ffn_candidate_modes_are_mutually_exclusive(self):
         cases = (
@@ -415,7 +478,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
 
     def test_e2b_ffn_candidate_modes_reject_invalid_boolean(self):
         environment = os.environ.copy()
-        environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"] = "sometimes"
+        environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_PAIR_ONLY"] = (
+            "sometimes"
+        )
         completed = subprocess.run(
             [
                 "bash",
@@ -430,7 +495,9 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(2, completed.returncode)
-        self.assertIn("invalid generated E2B FFN pair-only candidate value", completed.stderr)
+        self.assertIn(
+            "invalid generated E2B FFN pair-only candidate value", completed.stderr
+        )
 
     def test_f32_ffn_comparison_q8_routes_honor_explicit_overrides(self):
         environment = configured_environment(
@@ -442,13 +509,28 @@ class Gemma4QatCudaTuningTest(unittest.TestCase):
             ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN="0",
             ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT="1",
         )
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A"])
+        self.assertEqual(
+            "0",
+            environment[
+                "ANTFLY_INFERENCE_CUDA_Q4_0_GATE_UP_ACTIVATION_Q8_1_PRECOMPUTE"
+            ],
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A"]
+        )
         self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A"])
-        self.assertEqual("0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN"])
-        self.assertEqual("1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"])
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_ACTIVATION_Q8_1_DP4A"]
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_Q4_0_GATED_DOWN_Q8_1_DP4A"]
+        )
+        self.assertEqual(
+            "0", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN"]
+        )
+        self.assertEqual(
+            "1", environment["ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT"]
+        )
 
 
 if __name__ == "__main__":

@@ -236,7 +236,16 @@ export function useAnimationController(
       isReady.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onStateChange, onAnimationSequenceChange, maxQueueSize, callbacks.onStateChange, enableQueue, callbacks, defaultPriority, enableLogging]);
+  }, [
+    onStateChange,
+    onAnimationSequenceChange,
+    maxQueueSize,
+    callbacks.onStateChange,
+    enableQueue,
+    callbacks,
+    defaultPriority,
+    enableLogging,
+  ]);
 
   useEffect(() => {
     const hasRequiredElements =
@@ -442,7 +451,22 @@ export function useAnimationController(
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOff, elements.eyeRightPath, sizeScale, elements.outerGlow, elements.innerGlow, elements.eyeLeftPath, elements.eyeRight, onAnimationSequenceChange, elements.eyeRightSvg, elements.character, elements.shadow, elements.eyeLeftSvg, elements.eyeLeft, autoStartIdle]);
+  }, [
+    isOff,
+    elements.eyeRightPath,
+    sizeScale,
+    elements.outerGlow,
+    elements.innerGlow,
+    elements.eyeLeftPath,
+    elements.eyeRight,
+    onAnimationSequenceChange,
+    elements.eyeRightSvg,
+    elements.character,
+    elements.shadow,
+    elements.eyeLeftSvg,
+    elements.eyeLeft,
+    autoStartIdle,
+  ]);
 
   useEffect(() => {
     if (!autoStartIdle || !isReady.current || !controllerRef.current) return;

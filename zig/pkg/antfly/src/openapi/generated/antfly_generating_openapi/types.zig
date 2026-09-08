@@ -2,9 +2,11 @@
 // Package: antfly_generating_openapi
 
 const std = @import("std");
+const antfly_provider_openapi = @import("antfly_provider_openapi");
 
 /// Configuration for the Antfly inference generative AI provider.
 pub const AntflyGeneratorConfig = struct {
+    provider: []const u8,
     /// The name of the generator model.
     model: []const u8,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -22,6 +24,7 @@ pub const AntflyGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_url", "api_url", true },
         .{ "temperature", "temperature", true },
@@ -41,6 +44,8 @@ pub const AntflyGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_url) |value| {
@@ -528,6 +533,7 @@ pub const ContentPart = union(enum) {
 
 /// A unified configuration for a generative AI provider.
 pub const GeneratorConfig = struct {
+    provider: ?[]const u8 = null,
     /// The Google Cloud project ID.
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1').
@@ -556,14 +562,11 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
     presence_penalty: ?f32 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
-    /// The AWS region for the Bedrock service.
-    region: ?[]const u8 = null,
-    provider: GeneratorProvider,
+    rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "model", "model", true },
@@ -578,9 +581,7 @@ pub const GeneratorConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
-        .{ "models", "models", true },
-        .{ "region", "region", true },
-        .{ "provider", "provider", false },
+        .{ "rate_limit", "rate_limit", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -593,6 +594,10 @@ pub const GeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
@@ -649,32 +654,24 @@ pub const GeneratorConfig = struct {
             try jw.objectField("presence_penalty");
             try jw.write(value);
         }
-        if (self.models) |value| {
-            try jw.objectField("models");
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
             try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("rate_limit");
+            try jw.write(@as(?u8, null));
         }
-        if (self.region) |value| {
-            try jw.objectField("region");
-            try jw.write(value);
-        }
-        try jw.objectField("provider");
-        try jw.write(self.provider);
         try jw.endObject();
     }
 };
 
-/// The generative AI provider to use.
+/// Generator providers implemented by Antfly's generation runtime.
 pub const GeneratorProvider = enum {
     gemini,
     vertex,
     ollama,
     openai,
-    openrouter,
-    bedrock,
-    anthropic,
-    cohere,
     antfly,
-    mock,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -682,12 +679,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
-            .openrouter => "openrouter",
-            .bedrock => "bedrock",
-            .anthropic => "anthropic",
-            .cohere => "cohere",
             .antfly => "antfly",
-            .mock => "mock",
         };
         try jw.write(s);
     }
@@ -702,12 +694,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
-            .{ "openrouter", .openrouter },
-            .{ "bedrock", .bedrock },
-            .{ "anthropic", .anthropic },
-            .{ "cohere", .cohere },
             .{ "antfly", .antfly },
-            .{ "mock", .mock },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -715,6 +702,7 @@ pub const GeneratorProvider = enum {
 
 /// Configuration for the Google generative AI provider (Gemini).
 pub const GoogleGeneratorConfig = struct {
+    provider: []const u8,
     /// The Google Cloud project ID.
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1').
@@ -736,6 +724,7 @@ pub const GoogleGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "model", "model", false },
@@ -757,6 +746,8 @@ pub const GoogleGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);
@@ -818,6 +809,7 @@ pub const MediaContentPart = struct {
 
 /// Configuration for the Ollama generative AI provider.
 pub const OllamaGeneratorConfig = struct {
+    provider: []const u8,
     /// The name of the Ollama model to use.
     model: []const u8,
     /// The URL of the Ollama API endpoint.
@@ -835,6 +827,7 @@ pub const OllamaGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "url", "url", true },
         .{ "temperature", "temperature", true },
@@ -854,6 +847,8 @@ pub const OllamaGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.url) |value| {
@@ -886,6 +881,7 @@ pub const OllamaGeneratorConfig = struct {
 
 /// Configuration for the OpenAI generative AI provider.
 pub const OpenAIGeneratorConfig = struct {
+    provider: []const u8,
     /// The name of the OpenAI model to use.
     model: []const u8,
     /// The URL of the OpenAI API endpoint.
@@ -905,6 +901,7 @@ pub const OpenAIGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
@@ -925,6 +922,8 @@ pub const OpenAIGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.url) |value| {
@@ -1036,6 +1035,8 @@ pub const OpenRouterGeneratorConfig = struct {
     }
 };
 
+pub const RateLimitConfig = antfly_provider_openapi.RateLimitConfig;
+
 /// Retry configuration for generator calls
 pub const RetryConfig = struct {
     /// Maximum number of retry attempts
@@ -1110,6 +1111,7 @@ pub const ToolCallFunction = struct {
 
 /// Configuration for Google Cloud Vertex AI generative models.
 pub const VertexGeneratorConfig = struct {
+    provider: []const u8,
     /// The name of the Vertex AI model to use.
     model: []const u8,
     /// Google Cloud project ID.
@@ -1129,6 +1131,7 @@ pub const VertexGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
@@ -1149,6 +1152,8 @@ pub const VertexGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.project_id) |value| {

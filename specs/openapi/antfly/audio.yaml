@@ -93,7 +93,7 @@ components:
           description: "Google Cloud location."
         credentials_path:
           type: string
-          description: "Path to service account JSON key file."
+          description: "Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain."
         language_code:
           type: string
           default: en-US
@@ -204,7 +204,7 @@ components:
           description: "Google Cloud location."
         credentials_path:
           type: string
-          description: "Path to service account JSON key file."
+          description: "Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain."
         language_code:
           type: string
           default: en-US

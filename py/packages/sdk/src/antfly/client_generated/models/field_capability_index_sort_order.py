@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class FieldCapabilityIndexSortOrder(str, Enum):
+class FieldCapabilityIndexSortOrder(StrEnum):
     ASC = "asc"
     DESC = "desc"
 

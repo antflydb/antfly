@@ -22,11 +22,11 @@ from typing import Any
 
 import pytest
 import requests
-
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
     DEFAULT_ANTFLY_BIN,
     StatefulAntflyServer,
+    internal_service_headers,
     lookup_key_path,
     raise_request_error_with_logs,
     resolve_binary_path,
@@ -39,11 +39,17 @@ from port_reservations import find_free_port
 pytestmark = pytest.mark.postgres_integration
 
 DEFAULT_PG_DSN = "postgres://localhost:5432/postgres?sslmode=disable"
-PSQL_BIN = os.environ.get("ANTFLY_TEST_PSQL_BIN", "/opt/homebrew/opt/postgresql@18/bin/psql")
+PSQL_BIN = os.environ.get(
+    "ANTFLY_TEST_PSQL_BIN", "/opt/homebrew/opt/postgresql@18/bin/psql"
+)
 
 
 def _pg_dsn() -> str:
-    return os.environ.get("ANTFLY_TEST_PG_DSN") or os.environ.get("PG_DSN") or DEFAULT_PG_DSN
+    return (
+        os.environ.get("ANTFLY_TEST_PG_DSN")
+        or os.environ.get("PG_DSN")
+        or DEFAULT_PG_DSN
+    )
 
 
 def _pg_available() -> bool:
@@ -99,27 +105,6 @@ def _run_psql_best_effort(sql: str) -> None:
         pass
 
 
-def _cleanup_reseed_artifacts_best_effort() -> None:
-    _run_psql_best_effort(
-        """
-        DO $$
-        DECLARE rec record;
-        BEGIN
-          FOR rec IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'antfly_pub_cdc_%' LOOP
-            EXECUTE 'DROP PUBLICATION IF EXISTS ' || quote_ident(rec.pubname);
-          END LOOP;
-        END $$;
-        """
-    )
-    _run_psql_best_effort(
-        """
-        select pg_drop_replication_slot(slot_name)
-        from pg_replication_slots
-        where slot_name like 'antfly_cdc_%' and not active;
-        """
-    )
-
-
 def _psql_scalar_best_effort(sql: str) -> str:
     try:
         result = subprocess.run(
@@ -134,6 +119,42 @@ def _psql_scalar_best_effort(sql: str) -> str:
     return result.stdout.strip()
 
 
+def _cleanup_stale_e2e_cdc_resources() -> None:
+    # The Antfly process owns the active slot for a test. Pytest tears the
+    # independent PostgreSQL fixture down before that process on some runs, so
+    # its immediate cleanup can legitimately find the slot active. The next
+    # case runs only after the prior process has exited; reclaim those narrowly
+    # named inactive resources here before PostgreSQL's bounded slot pool is
+    # consumed. Never terminate or remove an active slot.
+    deadline = time.monotonic() + 5.0
+    while True:
+        _run_psql_best_effort(
+            """
+            select pg_drop_replication_slot(slot_name)
+            from pg_replication_slots
+            where slot_name like 'antfly_e2e_%' and not active;
+            """
+        )
+        remaining = _psql_scalar_best_effort(
+            "select count(*) from pg_replication_slots "
+            "where slot_name like 'antfly_e2e_%';"
+        )
+        if remaining in {"", "0"} or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    _run_psql_best_effort(
+        """
+        DO $$
+        DECLARE rec record;
+        BEGIN
+          FOR rec IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'antfly_e2e_%' LOOP
+            EXECUTE 'DROP PUBLICATION IF EXISTS ' || quote_ident(rec.pubname);
+          END LOOP;
+        END $$;
+        """
+    )
+
+
 def _lookup_doc(stateful_api, table_name: str, key: str) -> dict[str, Any] | None:
     try:
         return stateful_api.lookup_key(table_name, key)
@@ -141,7 +162,9 @@ def _lookup_doc(stateful_api, table_name: str, key: str) -> dict[str, Any] | Non
         return None
 
 
-def _lookup_doc_if(stateful_api, table_name: str, key: str, predicate) -> dict[str, Any] | None:
+def _lookup_doc_if(
+    stateful_api, table_name: str, key: str, predicate
+) -> dict[str, Any] | None:
     doc = _lookup_doc(stateful_api, table_name, key)
     if doc is None:
         return None
@@ -155,7 +178,9 @@ def _get_table_if_visible(stateful_api, table_name: str) -> dict[str, Any] | Non
         return None
 
 
-def _wait_until_absent(stateful_api, table_name: str, key: str, *, timeout_s: float, interval_s: float) -> None:
+def _wait_until_absent(
+    stateful_api, table_name: str, key: str, *, timeout_s: float, interval_s: float
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _lookup_doc(stateful_api, table_name, key) is None:
@@ -181,7 +206,9 @@ def _metadata_admin_base_url(stateful_api) -> str:
     if env_url:
         return env_url.rstrip("/")
     logs = _server_logs(stateful_api)
-    matches = re.findall(r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs)
+    matches = re.findall(
+        r"(?:standalone )?metadata admin api listening on (http://[^\s]+)", logs
+    )
     if matches:
         return matches[-1].rstrip("/")
     return ""
@@ -192,7 +219,11 @@ def _metadata_admin_snapshot(stateful_api) -> str:
     if not base_url:
         return ""
     try:
-        response = requests.get(f"{base_url}/metadata/v1/admin/snapshot", timeout=5)
+        response = requests.get(
+            f"{base_url}/metadata/v1/admin/snapshot",
+            headers=internal_service_headers(),
+            timeout=5,
+        )
         response.raise_for_status()
     except requests.RequestException:
         return ""
@@ -204,7 +235,11 @@ def _metadata_admin_snapshot_json(stateful_api) -> dict[str, Any]:
     if not base_url:
         return {}
     try:
-        response = requests.get(f"{base_url}/metadata/v1/admin/snapshot", timeout=5)
+        response = requests.get(
+            f"{base_url}/metadata/v1/admin/snapshot",
+            headers=internal_service_headers(),
+            timeout=5,
+        )
         response.raise_for_status()
         payload = response.json()
     except (requests.RequestException, ValueError):
@@ -222,7 +257,11 @@ def _metadata_replication_status_records(stateful_api) -> list[dict[str, Any]]:
     if not base_url:
         return []
     try:
-        response = requests.get(f"{base_url}/metadata/v1/admin/snapshot", timeout=5)
+        response = requests.get(
+            f"{base_url}/metadata/v1/admin/snapshot",
+            headers=internal_service_headers(),
+            timeout=5,
+        )
         response.raise_for_status()
         payload = response.json()
     except (requests.RequestException, ValueError):
@@ -244,25 +283,6 @@ def _metadata_status(stateful_api) -> dict[str, Any]:
     except (requests.RequestException, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}
-
-
-def _reseed_exact_cutover(stateful_api, table_name: str, source_ordinal: int) -> dict[str, Any]:
-    base_url = _metadata_admin_base_url(stateful_api)
-    if not base_url:
-        raise AssertionError(
-            "metadata admin base url unavailable for CDC reseed\n"
-            f"{_server_logs(stateful_api)}"
-        )
-    response = requests.post(
-        f"{base_url}/internal/v1/tables/{table_name}/replication-sources/{source_ordinal}/reseed-exact-cutover",
-        headers={"Connection": "close"},
-        timeout=30,
-    )
-    try:
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise_request_error_with_logs(exc, getattr(stateful_api, "_server", None))
-    return response.json()
 
 
 def _pg_replication_debug(slot_name: str, publication_name: str) -> str:
@@ -304,7 +324,9 @@ def _address_foreign_source(table_name: str) -> dict[str, Any]:
     }
 
 
-def _drop_replication_slot_when_inactive(slot_name: str, *, timeout_s: float = 10.0) -> None:
+def _drop_replication_slot_when_inactive(
+    slot_name: str, *, timeout_s: float = 10.0
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         active = _psql_scalar_best_effort(
@@ -312,8 +334,8 @@ def _drop_replication_slot_when_inactive(slot_name: str, *, timeout_s: float = 1
         ).lower()
         if active in {"", "f", "false"}:
             _run_psql_best_effort(
-                "select pg_drop_replication_slot('{slot}') "
-                "from pg_replication_slots where slot_name = '{slot}' and not active;".format(slot=slot_name)
+                f"select pg_drop_replication_slot('{slot_name}') "
+                f"from pg_replication_slots where slot_name = '{slot_name}' and not active;"
             )
             remaining = _psql_scalar_best_effort(
                 f"select coalesce(slot_name,'') from pg_replication_slots where slot_name = '{slot_name}'"
@@ -321,10 +343,30 @@ def _drop_replication_slot_when_inactive(slot_name: str, *, timeout_s: float = 1
             if not remaining:
                 return
         time.sleep(0.25)
-    raise AssertionError(f"replication slot {slot_name} remained active and could not be dropped")
+    raise AssertionError(
+        f"replication slot {slot_name} remained active and could not be dropped"
+    )
 
 
-def _create_table_via_metadata_admin(stateful_api, table_name: str, payload: dict[str, Any]) -> None:
+def _create_table_public(
+    stateful_api, table_name: str, payload: dict[str, Any]
+) -> None:
+    # Exercise the same normalization and authorization path users call. When
+    # routes target another table, this is also where the caller's durable
+    # destination grant is sealed into the catalog definition.
+    response = stateful_api._request("POST", f"/tables/{table_name}", payload)
+    if response.status_code not in (200, 201):
+        body = response.text.strip()
+        raise AssertionError(
+            f"public CDC table create failed: {response.status_code} {body}\n"
+            f"{_server_logs(stateful_api)}\n"
+            f"{_metadata_admin_snapshot(stateful_api)}"
+        )
+
+
+def _create_table_via_metadata_admin(
+    stateful_api, table_name: str, payload: dict[str, Any]
+) -> None:
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
         raise AssertionError(
@@ -334,7 +376,11 @@ def _create_table_via_metadata_admin(stateful_api, table_name: str, payload: dic
     response = requests.post(
         f"{base_url}/internal/v1/tables/{table_name}",
         json=payload,
-        headers={"Content-Type": "application/json", "Connection": "close"},
+        headers={
+            **internal_service_headers(),
+            "Content-Type": "application/json",
+            "Connection": "close",
+        },
         timeout=30,
     )
     if response.status_code != 201:
@@ -346,13 +392,23 @@ def _create_table_via_metadata_admin(stateful_api, table_name: str, payload: dic
         )
 
 
+def _metadata_table_id(stateful_api, table_name: str) -> int | None:
+    payload = _metadata_admin_snapshot_json(stateful_api)
+    for table in payload.get("tables", []):
+        if isinstance(table, dict) and table.get("name") == table_name:
+            return int(table["table_id"])
+    return None
+
+
 @pytest.fixture(scope="function")
 def cdc_stateful_api():
     base_url = os.environ.get("ANTFLY_STATEFUL_URL")
     server = None
     default_root = os.environ.get("ANTFLY_STATEFUL_API_ROOT")
     if not base_url:
-        binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+        binary = resolve_binary_path(
+            os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+        )
         if not os.path.exists(binary):
             pytest.skip(f"Public API binary not found: {binary}")
         port = find_free_port()
@@ -382,7 +438,11 @@ def cdc_stateful_api():
         def _check(self, response: requests.Response) -> Any:
             if response.status_code >= 400:
                 body = response.text.strip()
-                logs = self._server.debug_logs().strip() if self._server is not None else ""
+                logs = (
+                    self._server.debug_logs().strip()
+                    if self._server is not None
+                    else ""
+                )
                 if body:
                     if logs:
                         raise requests.HTTPError(
@@ -403,9 +463,13 @@ def cdc_stateful_api():
                 return {}
             return response.json()
 
-        def _request(self, method: str, path: str, payload: dict | None = None) -> requests.Response:
+        def _request(
+            self, method: str, path: str, payload: dict | None = None
+        ) -> requests.Response:
             try:
-                return self.s.request(method, f"{self.url}{path}", json=payload, timeout=30)
+                return self.s.request(
+                    method, f"{self.url}{path}", json=payload, timeout=30
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
                 raise AssertionError("unreachable")
@@ -419,18 +483,26 @@ def cdc_stateful_api():
                 return None
             return self._check(response)
 
-        def query_table(self, table_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-            return self._check(self._request("POST", f"/tables/{table_name}/query", payload))
+        def query_table(
+            self, table_name: str, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            return self._check(
+                self._request("POST", f"/tables/{table_name}/query", payload)
+            )
 
         def restart_server(self) -> None:
             server = self._server
             if server is None or not hasattr(server, "restart"):
-                raise AssertionError("restart is only available for locally managed stateful servers")
+                raise AssertionError(
+                    "restart is only available for locally managed stateful servers"
+                )
             self.s.close()
             server.restart()
             if not wait_for_server(self.url, timeout=20):
                 logs = server.debug_logs().strip()
-                raise AssertionError(f"stateful server failed to restart at {self.url}\n{logs}")
+                raise AssertionError(
+                    f"stateful server failed to restart at {self.url}\n{logs}"
+                )
             new_session = requests.Session()
             new_session.headers["Content-Type"] = "application/json"
             new_session.headers["Connection"] = "close"
@@ -456,6 +528,8 @@ def pg_cdc_source():
         pytest.skip("local PostgreSQL is unavailable for CDC E2E")
     if not _pg_supports_logical_replication():
         pytest.skip("local PostgreSQL is not configured with wal_level=logical")
+
+    _cleanup_stale_e2e_cdc_resources()
 
     suffix = str(time.time_ns())
     table_name = f"antfly_e2e_pg_cdc_{suffix}"
@@ -483,8 +557,8 @@ def pg_cdc_source():
     finally:
         _run_psql_best_effort(f"drop publication if exists {publication_name};")
         _run_psql_best_effort(
-            "select pg_drop_replication_slot('{slot}') "
-            "from pg_replication_slots where slot_name = '{slot}' and not active;".format(slot=slot_name)
+            f"select pg_drop_replication_slot('{slot_name}') "
+            f"from pg_replication_slots where slot_name = '{slot_name}' and not active;"
         )
         _run_psql_best_effort(f"drop table if exists {table_name};")
 
@@ -505,7 +579,7 @@ def test_stateful_postgres_cdc_snapshot_and_streaming(stateful_api, pg_cdc_sourc
             }
         ],
     }
-    _create_table_via_metadata_admin(stateful_api, table_name, create_payload)
+    _create_table_public(stateful_api, table_name, create_payload)
 
     created = wait_until(
         lambda: _get_table_if_visible(stateful_api, table_name),
@@ -520,8 +594,16 @@ def test_stateful_postgres_cdc_snapshot_and_streaming(stateful_api, pg_cdc_sourc
     assert created["name"] == table_name
 
     table_detail = stateful_api.get_table(table_name)
-    assert table_detail["replication_sources"][0]["slot_name"] == pg_cdc_source["slot_name"]
-    assert table_detail["replication_sources"][0]["publication_name"] == pg_cdc_source["publication_name"]
+    assert (
+        table_detail["replication_sources"][0]["slot_name"]
+        == pg_cdc_source["slot_name"]
+    )
+    assert (
+        table_detail["replication_sources"][0]["publication_name"]
+        == pg_cdc_source["publication_name"]
+    )
+    table_id = _metadata_table_id(stateful_api, table_name)
+    assert table_id is not None
 
     snapshot_doc = wait_until(
         lambda: _lookup_doc_if(
@@ -536,7 +618,8 @@ def test_stateful_postgres_cdc_snapshot_and_streaming(stateful_api, pg_cdc_sourc
     assert snapshot_doc is not None, (
         "CDC snapshot did not import the initial PostgreSQL row\n"
         f"{_server_logs(stateful_api)}\n"
-        f"{_metadata_replication_statuses(stateful_api)}"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_metadata_admin_snapshot(stateful_api)}"
     )
     _run_psql(
         f"""
@@ -546,7 +629,7 @@ def test_stateful_postgres_cdc_snapshot_and_streaming(stateful_api, pg_cdc_sourc
     )
 
     inserted_doc = wait_until(
-            lambda: _lookup_doc_if(
+        lambda: _lookup_doc_if(
             stateful_api,
             table_name,
             "user-2",
@@ -586,33 +669,64 @@ def test_stateful_postgres_cdc_snapshot_and_streaming(stateful_api, pg_cdc_sourc
         f"{_metadata_replication_statuses(stateful_api)}"
     )
     status_after_update = _metadata_status(stateful_api)
-    assert status_after_update.get("projected_replication_source_statuses_streaming", 0) >= 1
-    assert status_after_update.get("projected_replication_source_statuses_with_consecutive_failures", 0) == 0
-    assert status_after_update.get("projected_replication_source_consecutive_failures_max", 0) == 0
+    assert (
+        status_after_update.get("projected_replication_source_statuses_streaming", 0)
+        >= 1
+    )
+    assert (
+        status_after_update.get(
+            "projected_replication_source_statuses_with_consecutive_failures", 0
+        )
+        == 0
+    )
+    assert (
+        status_after_update.get(
+            "projected_replication_source_consecutive_failures_max", 0
+        )
+        == 0
+    )
     assert "projected_replication_source_lag_millis_max" in status_after_update
     assert "projected_replication_source_observed_lag_millis_max" in status_after_update
+    assert status_after_update.get(
+        "projected_replication_source_observed_lag_millis_max", 0
+    ) >= status_after_update.get("projected_replication_source_lag_millis_max", 0)
     assert (
-        status_after_update.get("projected_replication_source_observed_lag_millis_max", 0)
-        >= status_after_update.get("projected_replication_source_lag_millis_max", 0)
+        status_after_update.get(
+            "projected_replication_source_statuses_with_source_commit_timestamp", 0
+        )
+        >= 1
     )
-    assert status_after_update.get("projected_replication_source_statuses_with_source_commit_timestamp", 0) >= 1
-    matching_after_update = [
-        status
-        for status in _metadata_replication_status_records(stateful_api)
-        if status.get("slot_name") == pg_cdc_source["slot_name"]
-        and status.get("publication_name") == pg_cdc_source["publication_name"]
-    ]
-    assert any(status.get("last_source_commit_at_ms", 0) > 0 for status in matching_after_update), (
+    matching_after_update = wait_until(
+        lambda: [
+            status
+            for status in _metadata_replication_status_records(stateful_api)
+            if int(status.get("table_id", 0)) == table_id
+            and int(status.get("source_ordinal", -1)) == 0
+            and status.get("last_source_commit_at_ms", 0) > 0
+        ],
+        timeout_s=30.0,
+        interval_s=0.1,
+    )
+    assert matching_after_update, (
         "replication status did not expose source commit timestamps after streamed update\n"
         f"{matching_after_update!r}"
     )
-    assert status_after_update.get("projected_replication_source_last_change_applied_at_ms_max", 0) > 0
+    assert (
+        status_after_update.get(
+            "projected_replication_source_last_change_applied_at_ms_max", 0
+        )
+        > 0
+    )
 
     _run_psql(f"delete from {pg_cdc_source['table_name']} where id = 'user-2';")
-    _wait_until_absent(stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25)
+    _wait_until_absent(
+        stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25
+    )
 
 
-def test_stateful_postgres_cdc_table_joins_with_foreign_lookup(stateful_api, pg_cdc_source):
+def test_stateful_postgres_cdc_table_joins_with_foreign_lookup(
+    stateful_api, pg_cdc_source
+):
     table_name = f"cdc_join_docs_{time.time_ns()}"
     lookup_table = f"antfly_e2e_pg_tier_lookup_{time.time_ns()}"
     joined_field = "pg_tier_lookup.label"
@@ -775,7 +889,9 @@ def test_stateful_postgres_cdc_table_joins_with_foreign_lookup(stateful_api, pg_
         _run_psql_best_effort(f"drop table if exists {lookup_table};")
 
 
-def test_stateful_postgres_cdc_table_joins_with_nested_foreign_lookup(stateful_api, pg_cdc_source):
+def test_stateful_postgres_cdc_table_joins_with_nested_foreign_lookup(
+    stateful_api, pg_cdc_source
+):
     table_name = f"cdc_nested_join_docs_{time.time_ns()}"
     lookup_table = f"antfly_e2e_pg_tier_profile_{time.time_ns()}"
     address_table = f"antfly_e2e_pg_tier_addresses_{time.time_ns()}"
@@ -852,7 +968,11 @@ def test_stateful_postgres_cdc_table_joins_with_nested_foreign_lookup(stateful_a
                                 "right_field": "tier",
                                 "operator": "eq",
                             },
-                            "right_fields": ["label", "pg_addresses.city", "pg_addresses.region"],
+                            "right_fields": [
+                                "label",
+                                "pg_addresses.city",
+                                "pg_addresses.region",
+                            ],
                             "nested_join": {
                                 "right_table": "pg_addresses",
                                 "join_type": "left",
@@ -865,7 +985,9 @@ def test_stateful_postgres_cdc_table_joins_with_nested_foreign_lookup(stateful_a
                             },
                         },
                         "foreign_sources": {
-                            "pg_tier_profiles": _tier_profile_foreign_source(lookup_table),
+                            "pg_tier_profiles": _tier_profile_foreign_source(
+                                lookup_table
+                            ),
                             "pg_addresses": _address_foreign_source(address_table),
                         },
                     },
@@ -976,6 +1098,8 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         ],
     }
     _create_table_via_metadata_admin(stateful_api, table_name, create_payload)
+    table_id = _metadata_table_id(stateful_api, table_name)
+    assert table_id is not None
 
     snapshot_doc = wait_until(
         lambda: _lookup_doc_if(
@@ -1019,48 +1143,60 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         lambda: [
             status
             for status in _metadata_replication_status_records(stateful_api)
-            if status.get("slot_name") == pg_cdc_source["slot_name"]
-            and status.get("publication_name") == pg_cdc_source["publication_name"]
+            if int(status.get("table_id", 0)) == table_id
+            and int(status.get("source_ordinal", -1)) == 0
             and status.get("stream_checkpoint")
         ],
         timeout_s=30.0,
         interval_s=0.25,
     )
     statuses_before_restart = _metadata_replication_status_records(stateful_api)
-    assert matching_before_restart, f"unexpected replication statuses before restart: {statuses_before_restart!r}"
+    assert matching_before_restart, (
+        f"unexpected replication statuses before restart: {statuses_before_restart!r}"
+    )
     assert any(
-        status.get("phase") == "cutover_prepared"
-        and status.get("prepared_checkpoint")
+        status.get("phase") == "cutover_prepared" and status.get("prepared_checkpoint")
         for status in matching_before_restart
     ) or any(
-        status.get("phase") == "streaming"
-        and status.get("prepared_checkpoint")
+        status.get("phase") == "streaming" and status.get("prepared_checkpoint")
         for status in matching_before_restart
     ), f"missing cutover-prepared status before restart: {statuses_before_restart!r}"
     prepared_checkpoint_before_restart = next(
-        (status.get("prepared_checkpoint", "") for status in matching_before_restart if status.get("prepared_checkpoint")),
+        (
+            status.get("prepared_checkpoint", "")
+            for status in matching_before_restart
+            if status.get("prepared_checkpoint")
+        ),
         "",
     )
     cutover_mode_before_restart = next(
-        (status.get("cutover_mode", "") for status in matching_before_restart if status.get("cutover_mode")),
+        (
+            status.get("cutover_mode", "")
+            for status in matching_before_restart
+            if status.get("cutover_mode")
+        ),
         "",
     )
     stream_checkpoint_before_restart = next(
-        (status.get("stream_checkpoint", "") for status in matching_before_restart if status.get("stream_checkpoint")),
+        (
+            status.get("stream_checkpoint", "")
+            for status in matching_before_restart
+            if status.get("stream_checkpoint")
+        ),
         "",
     )
     assert prepared_checkpoint_before_restart, (
-        "missing prepared_checkpoint before restart\n"
-        f"{statuses_before_restart!r}"
+        f"missing prepared_checkpoint before restart\n{statuses_before_restart!r}"
     )
     assert cutover_mode_before_restart == "exported_snapshot", (
-        "unexpected cutover_mode before restart\n"
-        f"{statuses_before_restart!r}"
+        f"unexpected cutover_mode before restart\n{statuses_before_restart!r}"
     )
     assert stream_checkpoint_before_restart, (
         "missing stream_checkpoint before restart after streamed insert\n"
         f"{statuses_before_restart!r}"
     )
+    physical_slot_name = matching_before_restart[0]["slot_name"]
+    physical_publication_name = matching_before_restart[0]["publication_name"]
 
     stateful_api.restart_server()
 
@@ -1084,8 +1220,8 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
     matching_after_restart = [
         status
         for status in statuses_after_restart
-        if status.get("slot_name") == pg_cdc_source["slot_name"]
-        and status.get("publication_name") == pg_cdc_source["publication_name"]
+        if int(status.get("table_id", 0)) == table_id
+        and int(status.get("source_ordinal", -1)) == 0
     ]
     assert matching_after_restart, (
         "missing replication status after restart\n"
@@ -1101,10 +1237,12 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
     assert any(
         status.get("cutover_mode") == "exported_snapshot"
         for status in matching_after_restart
-    ), (
-        "cutover_mode did not persist across restart\n"
-        f"{matching_after_restart!r}"
-    )
+    ), f"cutover_mode did not persist across restart\n{matching_after_restart!r}"
+    assert all(
+        status.get("slot_name") == physical_slot_name
+        and status.get("publication_name") == physical_publication_name
+        for status in matching_after_restart
+    ), "restart changed the exact-cutover PostgreSQL resource identity"
     assert any(
         status.get("stream_checkpoint") == stream_checkpoint_before_restart
         for status in matching_after_restart
@@ -1113,14 +1251,44 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         f"before={stream_checkpoint_before_restart!r} after={matching_after_restart!r}"
     )
     status_after_restart = _metadata_status(stateful_api)
-    assert status_after_restart.get("projected_replication_source_statuses_streaming", 0) >= 1
-    assert status_after_restart.get("projected_replication_source_statuses_exact_cutover", 0) == 1
-    assert status_after_restart.get("projected_replication_source_statuses_non_exact_cutover", 0) == 0
-    assert status_after_restart.get("projected_replication_source_statuses_exported_snapshot", 0) == 1
-    assert status_after_restart.get("projected_replication_source_statuses_with_success_timestamp", 0) >= 1
-    assert status_after_restart.get("projected_replication_source_statuses_with_change_timestamp", 0) >= 1
+    assert (
+        status_after_restart.get("projected_replication_source_statuses_streaming", 0)
+        >= 1
+    )
+    assert (
+        status_after_restart.get(
+            "projected_replication_source_statuses_exact_cutover", 0
+        )
+        == 1
+    )
+    assert (
+        status_after_restart.get(
+            "projected_replication_source_statuses_non_exact_cutover", 0
+        )
+        == 0
+    )
+    assert (
+        status_after_restart.get(
+            "projected_replication_source_statuses_exported_snapshot", 0
+        )
+        == 1
+    )
+    assert (
+        status_after_restart.get(
+            "projected_replication_source_statuses_with_success_timestamp", 0
+        )
+        >= 1
+    )
+    assert (
+        status_after_restart.get(
+            "projected_replication_source_statuses_with_change_timestamp", 0
+        )
+        >= 1
+    )
     assert "projected_replication_source_lag_millis_max" in status_after_restart
-    assert "projected_replication_source_observed_lag_millis_max" in status_after_restart
+    assert (
+        "projected_replication_source_observed_lag_millis_max" in status_after_restart
+    )
 
     _run_psql(
         f"""
@@ -1148,12 +1316,18 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
     )
 
     _run_psql(f"delete from {pg_cdc_source['table_name']} where id = 'user-2';")
-    _wait_until_absent(stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25)
+    _wait_until_absent(
+        stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25
+    )
 
 
-def test_stateful_postgres_cdc_marks_existing_slot_resume(stateful_api, pg_cdc_source):
+def test_stateful_postgres_cdc_exact_cutover_isolates_preexisting_logical_slot(
+    stateful_api, pg_cdc_source
+):
     table_name = f"cdc_existing_slot_docs_{time.time_ns()}"
-    _run_psql(f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};")
+    _run_psql(
+        f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
+    )
     _run_psql(
         "select * from pg_create_logical_replication_slot('{slot}', 'pgoutput');".format(
             slot=pg_cdc_source["slot_name"]
@@ -1175,6 +1349,8 @@ def test_stateful_postgres_cdc_marks_existing_slot_resume(stateful_api, pg_cdc_s
         ],
     }
     _create_table_via_metadata_admin(stateful_api, table_name, create_payload)
+    table_id = _metadata_table_id(stateful_api, table_name)
+    assert table_id is not None
 
     snapshot_doc = wait_until(
         lambda: _lookup_doc_if(
@@ -1196,55 +1372,63 @@ def test_stateful_postgres_cdc_marks_existing_slot_resume(stateful_api, pg_cdc_s
         lambda: [
             status
             for status in _metadata_replication_status_records(stateful_api)
-            if status.get("slot_name") == pg_cdc_source["slot_name"]
-            and status.get("publication_name") == pg_cdc_source["publication_name"]
-            and status.get("cutover_mode") == "slot_resumed"
+            if int(status.get("table_id", 0)) == table_id
+            and int(status.get("source_ordinal", -1)) == 0
+            and status.get("cutover_mode") == "exported_snapshot"
         ],
         timeout_s=30.0,
         interval_s=0.25,
     )
     statuses = _metadata_replication_status_records(stateful_api)
     assert matching, (
-        "existing logical slot was not surfaced as slot_resumed\n"
+        "exact cutover did not publish its isolated physical resources\n"
         f"{statuses!r}\n"
         f"{_server_logs(stateful_api)}"
     )
+    physical_status = matching[0]
+    assert physical_status["slot_name"] != pg_cdc_source["slot_name"]
+    assert physical_status["publication_name"] != pg_cdc_source["publication_name"]
+    assert (
+        _psql_scalar_best_effort(
+            "select coalesce(slot_name,'') from pg_replication_slots "
+            f"where slot_name = '{pg_cdc_source['slot_name']}'"
+        )
+        == pg_cdc_source["slot_name"]
+    ), "exact cutover adopted or removed the caller's preexisting logical slot"
     existing_slot_status = _metadata_status(stateful_api)
-    assert existing_slot_status.get("projected_replication_source_statuses_exact_cutover", 0) == 0
-    assert existing_slot_status.get("projected_replication_source_statuses_non_exact_cutover", 0) == 1
-    assert existing_slot_status.get("projected_replication_source_statuses_slot_resumed", 0) == 1
-    assert existing_slot_status.get("projected_replication_source_statuses_reseed_recommended", 0) >= 1
-    action_hints = _metadata_admin_snapshot_json(stateful_api).get("replication_source_action_hints", [])
-    assert any(
+    assert (
+        existing_slot_status.get(
+            "projected_replication_source_statuses_exact_cutover", 0
+        )
+        == 1
+    )
+    assert (
+        existing_slot_status.get(
+            "projected_replication_source_statuses_non_exact_cutover", 0
+        )
+        == 0
+    )
+    assert (
+        existing_slot_status.get(
+            "projected_replication_source_statuses_slot_resumed", 0
+        )
+        == 0
+    )
+    assert (
+        existing_slot_status.get(
+            "projected_replication_source_statuses_reseed_recommended", 0
+        )
+        == 0
+    )
+    action_hints = _metadata_admin_snapshot_json(stateful_api).get(
+        "replication_source_action_hints", []
+    )
+    assert not any(
         hint.get("table_name") == table_name
         and hint.get("source_ordinal") == 0
         and hint.get("action") == "reseed_exact_cutover"
-        and "reseed-exact-cutover" in hint.get("reseed_exact_cutover_path", "")
         for hint in action_hints
-    ), (
-        "existing-slot CDC source did not surface reseed recommendation\n"
-        f"{_metadata_admin_snapshot(stateful_api)}"
     )
-    source_detail = wait_until(
-        lambda: next(
-            (
-                detail["replication_sources"][0]
-                for detail in [_get_table_if_visible(stateful_api, table_name)]
-                if detail is not None
-                and detail.get("replication_sources")
-                and isinstance(detail["replication_sources"][0], dict)
-                and isinstance(detail["replication_sources"][0].get("status"), dict)
-                and isinstance(detail["replication_sources"][0].get("action_hint"), dict)
-            ),
-            None,
-        ),
-        timeout_s=30.0,
-        interval_s=0.25,
-    )
-    assert source_detail["status"]["cutover_mode"] == "slot_resumed"
-    assert source_detail["status"]["slot_name"] == pg_cdc_source["slot_name"]
-    assert source_detail["action_hint"]["action"] == "reseed_exact_cutover"
-    assert "reseed-exact-cutover" in source_detail["action_hint"]["reseed_exact_cutover_path"]
 
     _run_psql(
         f"""
@@ -1266,15 +1450,17 @@ def test_stateful_postgres_cdc_marks_existing_slot_resume(stateful_api, pg_cdc_s
         "CDC stream did not apply through existing-slot path\n"
         f"{_server_logs(stateful_api)}\n"
         f"{_metadata_replication_statuses(stateful_api)}\n"
-        f"{_pg_replication_debug(pg_cdc_source['slot_name'], pg_cdc_source['publication_name'])}"
+        f"{_pg_replication_debug(physical_status['slot_name'], physical_status['publication_name'])}"
     )
 
 
-def test_stateful_postgres_cdc_rejects_existing_slot_when_exact_cutover_is_required(
+def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_collision(
     stateful_api, pg_cdc_source
 ):
     table_name = f"cdc_exact_cutover_docs_{time.time_ns()}"
-    _run_psql(f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};")
+    _run_psql(
+        f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
+    )
     _run_psql(
         "select * from pg_create_logical_replication_slot('{slot}', 'pgoutput');".format(
             slot=pg_cdc_source["slot_name"]
@@ -1297,180 +1483,77 @@ def test_stateful_postgres_cdc_rejects_existing_slot_when_exact_cutover_is_requi
         ],
     }
     _create_table_via_metadata_admin(stateful_api, table_name, create_payload)
+    table_id = _metadata_table_id(stateful_api, table_name)
+    assert table_id is not None
 
-    failed = wait_until(
-        lambda: next(
-            (
-                status
-                for status in _metadata_replication_status_records(stateful_api)
-                if status.get("slot_name") == pg_cdc_source["slot_name"]
-                and status.get("publication_name") == pg_cdc_source["publication_name"]
-                and status.get("phase") == "failed"
-                and status.get("last_error") == "ReplicationExactCutoverRequired"
-            ),
-            None,
+    snapshot_doc = wait_until(
+        lambda: _lookup_doc_if(
+            stateful_api,
+            table_name,
+            "user-1",
+            lambda doc: doc.get("name") == "Alice" and doc.get("tier") == "gold",
         ),
         timeout_s=30.0,
         interval_s=0.25,
     )
-    assert failed is not None, (
-        "existing logical slot did not fail exact-cutover enforcement\n"
+    assert snapshot_doc is not None, (
+        "required exact cutover did not import its exported snapshot\n"
+        f"{_server_logs(stateful_api)}\n"
+        f"{_metadata_replication_statuses(stateful_api)}"
+    )
+    matching = wait_until(
+        lambda: [
+            status
+            for status in _metadata_replication_status_records(stateful_api)
+            if int(status.get("table_id", 0)) == table_id
+            and int(status.get("source_ordinal", -1)) == 0
+            and status.get("cutover_mode") == "exported_snapshot"
+            and status.get("phase") == "streaming"
+        ],
+        timeout_s=30.0,
+        interval_s=0.25,
+    )
+    assert matching, (
+        "required exact cutover did not publish a streaming observation\n"
         f"{_metadata_replication_statuses(stateful_api)}\n"
         f"{_server_logs(stateful_api)}"
     )
-    assert failed.get("failure_class") == "terminal"
-    assert failed.get("cutover_mode", "") == ""
+    physical_status = matching[0]
+    assert physical_status["slot_name"] != pg_cdc_source["slot_name"]
+    assert physical_status["publication_name"] != pg_cdc_source["publication_name"]
+    assert (
+        _psql_scalar_best_effort(
+            "select coalesce(slot_name,'') from pg_replication_slots "
+            f"where slot_name = '{pg_cdc_source['slot_name']}'"
+        )
+        == pg_cdc_source["slot_name"]
+    ), "required exact cutover adopted or removed the caller's logical slot"
 
     exact_required_status = _metadata_status(stateful_api)
-    assert exact_required_status.get("projected_replication_source_statuses_exact_cutover", 0) == 0
-    assert exact_required_status.get("projected_replication_source_statuses_non_exact_cutover", 0) == 0
-    assert exact_required_status.get("projected_replication_source_statuses_terminal_failed", 0) >= 1
-    assert exact_required_status.get("projected_replication_source_statuses_reseed_recommended", 0) >= 1
-
-    time.sleep(1.0)
-    assert _lookup_doc(stateful_api, table_name, "user-1") is None, (
-        "exact-cutover-required table should not import snapshot rows through slot_resumed fallback\n"
-        f"{_metadata_replication_statuses(stateful_api)}"
+    assert (
+        exact_required_status.get(
+            "projected_replication_source_statuses_exact_cutover", 0
+        )
+        == 1
     )
-
-
-def test_stateful_postgres_cdc_reseed_exact_cutover_recovers_from_existing_slot(
-    stateful_api, pg_cdc_source
-):
-    table_name = f"cdc_reseed_exact_cutover_docs_{time.time_ns()}"
-    _cleanup_reseed_artifacts_best_effort()
-    _run_psql(f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};")
-    _run_psql(
-        "select * from pg_create_logical_replication_slot('{slot}', 'pgoutput');".format(
-            slot=pg_cdc_source["slot_name"]
+    assert (
+        exact_required_status.get(
+            "projected_replication_source_statuses_non_exact_cutover", 0
         )
+        == 0
     )
-    new_slot_name = ""
-    new_publication_name = ""
-    try:
-        create_payload = {
-            "num_shards": 1,
-            "replication_sources": [
-                {
-                    "type": "postgres",
-                    "dsn": _pg_dsn(),
-                    "postgres_table": pg_cdc_source["table_name"],
-                    "key_template": "id",
-                    "slot_name": pg_cdc_source["slot_name"],
-                    "publication_name": pg_cdc_source["publication_name"],
-                    "require_exact_cutover": True,
-                    "on_delete": [{"op": "$delete_document"}],
-                }
-            ],
-        }
-        _create_table_via_metadata_admin(stateful_api, table_name, create_payload)
-
-        failed = wait_until(
-            lambda: next(
-                (
-                    status
-                    for status in _metadata_replication_status_records(stateful_api)
-                    if status.get("slot_name") == pg_cdc_source["slot_name"]
-                    and status.get("publication_name") == pg_cdc_source["publication_name"]
-                    and status.get("phase") == "failed"
-                    and status.get("last_error") == "ReplicationExactCutoverRequired"
-                ),
-                None,
-            ),
-            timeout_s=30.0,
-            interval_s=0.25,
+    assert (
+        exact_required_status.get(
+            "projected_replication_source_statuses_terminal_failed", 0
         )
-        assert failed is not None, (
-            "expected initial exact-cutover failure before reseed\n"
-            f"{_metadata_replication_statuses(stateful_api)}\n"
-            f"{_server_logs(stateful_api)}"
+        == 0
+    )
+    assert (
+        exact_required_status.get(
+            "projected_replication_source_statuses_reseed_recommended", 0
         )
-
-        reseed_result = _reseed_exact_cutover(stateful_api, table_name, 0)
-        new_slot_name = reseed_result["slot_name"]
-        new_publication_name = reseed_result["publication_name"]
-        assert new_slot_name != pg_cdc_source["slot_name"]
-        assert new_publication_name != pg_cdc_source["publication_name"]
-
-        table_detail = wait_until(
-            lambda: next(
-                (
-                    detail
-                    for detail in [_get_table_if_visible(stateful_api, table_name)]
-                    if detail is not None
-                    and detail["replication_sources"][0]["slot_name"] == new_slot_name
-                    and detail["replication_sources"][0]["publication_name"] == new_publication_name
-                ),
-                None,
-            ),
-            timeout_s=30.0,
-            interval_s=0.25,
-        )
-        assert table_detail["replication_sources"][0]["slot_name"] == new_slot_name
-        assert table_detail["replication_sources"][0]["publication_name"] == new_publication_name
-        assert table_detail["replication_sources"][0]["require_exact_cutover"] is True
-
-        snapshot_doc = wait_until(
-            lambda: _lookup_doc_if(
-                stateful_api,
-                table_name,
-                "user-1",
-                lambda doc: doc.get("name") == "Alice" and doc.get("tier") == "gold",
-            ),
-            timeout_s=30.0,
-            interval_s=0.25,
-        )
-        assert snapshot_doc is not None, (
-            "reseeded exact cutover did not import snapshot rows\n"
-            f"{_metadata_replication_statuses(stateful_api)}\n"
-            f"{_server_logs(stateful_api)}"
-        )
-
-        reseeded_status = wait_until(
-            lambda: next(
-                (
-                    status
-                    for status in _metadata_replication_status_records(stateful_api)
-                    if status.get("slot_name") == new_slot_name
-                    and status.get("publication_name") == new_publication_name
-                    and status.get("cutover_mode") == "exported_snapshot"
-                ),
-                None,
-            ),
-            timeout_s=30.0,
-            interval_s=0.25,
-        )
-        assert reseeded_status is not None, (
-            "reseeded exact cutover did not surface exported_snapshot status\n"
-            f"{_metadata_replication_statuses(stateful_api)}"
-        )
-
-        _run_psql(
-            f"""
-            insert into {pg_cdc_source["table_name"]} (id, name, tier)
-            values ('user-2', 'Bob', 'silver');
-            """
-        )
-        inserted_doc = wait_until(
-            lambda: _lookup_doc_if(
-                stateful_api,
-                table_name,
-                "user-2",
-                lambda doc: doc.get("name") == "Bob" and doc.get("tier") == "silver",
-            ),
-            timeout_s=30.0,
-            interval_s=0.25,
-        )
-        assert inserted_doc is not None, (
-            "reseeded exact cutover did not resume streaming on the fresh slot\n"
-            f"{_metadata_replication_statuses(stateful_api)}\n"
-            f"{_pg_replication_debug(new_slot_name, new_publication_name)}"
-        )
-    finally:
-        if new_publication_name:
-            _run_psql_best_effort(f"drop publication if exists {new_publication_name};")
-        if new_slot_name:
-            _drop_replication_slot_when_inactive(new_slot_name)
+        == 0
+    )
 
 
 def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_terminal(
@@ -1492,6 +1575,8 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
         ],
     }
     _create_table_via_metadata_admin(stateful_api, table_name, create_payload)
+    table_id = _metadata_table_id(stateful_api, table_name)
+    assert table_id is not None
 
     snapshot_doc = wait_until(
         lambda: _lookup_doc_if(
@@ -1509,15 +1594,33 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
         f"{_metadata_replication_statuses(stateful_api)}"
     )
 
-    _run_psql_best_effort(f"drop publication if exists {pg_cdc_source['publication_name']};")
+    active_status = wait_until(
+        lambda: next(
+            (
+                status
+                for status in _metadata_replication_status_records(stateful_api)
+                if int(status.get("table_id", 0)) == table_id
+                and int(status.get("source_ordinal", -1)) == 0
+                and status.get("phase") == "streaming"
+            ),
+            None,
+        ),
+        timeout_s=30.0,
+        interval_s=0.1,
+    )
+    assert active_status is not None
+    physical_slot_name = active_status["slot_name"]
+    physical_publication_name = active_status["publication_name"]
+
+    _run_psql_best_effort(f"drop publication if exists {physical_publication_name};")
     recreated_publication = wait_until(
         lambda: _psql_scalar_best_effort(
-            f"select coalesce(pubname,'') from pg_publication where pubname = '{pg_cdc_source['publication_name']}'"
+            f"select coalesce(pubname,'') from pg_publication where pubname = '{physical_publication_name}'"
         ),
         timeout_s=30.0,
         interval_s=0.25,
     )
-    assert recreated_publication == pg_cdc_source["publication_name"], (
+    assert recreated_publication == physical_publication_name, (
         "CDC polling did not recreate the dropped publication\n"
         f"{_server_logs(stateful_api)}\n"
         f"{_metadata_replication_statuses(stateful_api)}"
@@ -1544,10 +1647,10 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
         "CDC stream did not recover after publication loss\n"
         f"{_server_logs(stateful_api)}\n"
         f"{_metadata_replication_statuses(stateful_api)}\n"
-        f"{_pg_replication_debug(pg_cdc_source['slot_name'], pg_cdc_source['publication_name'])}"
+        f"{_pg_replication_debug(physical_slot_name, physical_publication_name)}"
     )
 
-    _drop_replication_slot_when_inactive(pg_cdc_source["slot_name"])
+    _drop_replication_slot_when_inactive(physical_slot_name)
     _run_psql(
         f"""
         insert into {pg_cdc_source["table_name"]} (id, name, tier)
@@ -1559,8 +1662,8 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
         lambda: [
             status
             for status in _metadata_replication_status_records(stateful_api)
-            if status.get("slot_name") == pg_cdc_source["slot_name"]
-            and status.get("publication_name") == pg_cdc_source["publication_name"]
+            if int(status.get("table_id", 0)) == table_id
+            and int(status.get("source_ordinal", -1)) == 0
             and status.get("phase") == "streaming_failed"
             and status.get("failure_class") == "terminal"
         ],
@@ -1573,13 +1676,21 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
         f"{_server_logs(stateful_api)}"
     )
     failed_summary = _metadata_status(stateful_api)
-    assert failed_summary.get("projected_replication_source_statuses_terminal_failed", 0) >= 1
-    assert failed_summary.get("projected_replication_source_statuses_with_last_error", 0) >= 1
-    assert failed_summary.get("projected_replication_source_statuses_slot_missing_failed", 0) >= 1
+    assert (
+        failed_summary.get("projected_replication_source_statuses_terminal_failed", 0)
+        >= 1
+    )
+    assert (
+        failed_summary.get("projected_replication_source_statuses_with_last_error", 0)
+        >= 1
+    )
+    assert (
+        failed_summary.get(
+            "projected_replication_source_statuses_slot_missing_failed", 0
+        )
+        >= 1
+    )
     assert any(
         status.get("last_error") == "ForeignReplicationSlotMissing"
         for status in failed_statuses
-    ), (
-        "slot loss was not surfaced explicitly\n"
-        f"{failed_statuses!r}"
-    )
+    ), f"slot loss was not surfaced explicitly\n{failed_statuses!r}"

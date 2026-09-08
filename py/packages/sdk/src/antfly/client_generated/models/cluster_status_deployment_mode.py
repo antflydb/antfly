@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ClusterStatusDeploymentMode(str, Enum):
+class ClusterStatusDeploymentMode(StrEnum):
     DISTRIBUTED = "distributed"
     EMBEDDED = "embedded"
     SERVERLESS = "serverless"

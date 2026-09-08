@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceMediaContentPartType(str, Enum):
+class InferenceMediaContentPartType(StrEnum):
     MEDIA = "media"
 
     def __str__(self) -> str:

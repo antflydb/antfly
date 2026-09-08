@@ -15,6 +15,7 @@
 const std = @import("std");
 const cache_mod = @import("cache.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
+const gpt_mod = @import("../models/gpt.zig");
 const generation = @import("../pipelines/generation.zig");
 const runtime = @import("../runtime/root.zig");
 
@@ -34,6 +35,10 @@ pub const DecodeStateRuntime = struct {
 
     pub fn deinit(self: *DecodeStateRuntime) void {
         self.state.deinit();
+    }
+
+    pub fn configureForGptConfig(self: *DecodeStateRuntime, config: gpt_mod.Config) void {
+        self.state.configureForGptConfig(config);
     }
 
     pub fn currentTokenCount(self: *const DecodeStateRuntime) usize {
@@ -144,4 +149,36 @@ test "decode state runtime paged prefill and decode step" {
     const step = try ds.beginDecodeStep(4, .paged_decode);
     try std.testing.expectEqual(@as(usize, 5), step.seq_len);
     try std.testing.expectEqual(@as(usize, 1), step.decode_context.query_sequence_len);
+}
+
+test "decode state runtime preserves Qwen3-VL text-only M-RoPE contract" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_layers_packed = 2,
+        .num_kv_heads = 2,
+        .head_dim = 8,
+        .sliding_window_size = null,
+    });
+
+    var ds = DecodeStateRuntime.initPaged(allocator, &manager, pool_id, null);
+    defer ds.deinit();
+    ds.configureForGptConfig(.{ .family = .qwen3_vl });
+
+    const prefill_ctx = try ds.preparePrefill(4, 4, .paged_prefill);
+    try std.testing.expect(prefill_ctx.qwen3vl_text_only);
+    try std.testing.expect(prefill_ctx.mrope_positions == null);
+
+    const step = try ds.beginDecodeStep(4, .paged_decode);
+    try std.testing.expect(step.decode_context.qwen3vl_text_only);
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ 4, 4, 4 },
+        step.decode_context.mrope_positions orelse return error.MissingMropePositions,
+    );
 }

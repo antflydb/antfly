@@ -22,7 +22,7 @@ pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
 
 const Allocator = std.mem.Allocator;
-const minimum_direct_render_dpi: u16 = 72;
+const minimum_direct_render_dpi: u16 = 1;
 const minimum_requested_render_dpi: u16 = 72;
 
 pub const RenderedPagePng = struct {
@@ -225,9 +225,10 @@ fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
 }
 
 /// Renders at the requested DPI when safe, reducing it only enough to satisfy
-/// both the dimension and pixel guards without crossing the 72-DPI quality
-/// floor. Pages that cannot fit safely at that floor fail explicitly rather
-/// than silently producing an OCR input below the documented minimum.
+/// both the dimension and pixel guards. The requested DPI remains at least 72,
+/// but malformed or scan-oriented PDFs sometimes encode pixel dimensions as
+/// page points; adaptive rendering may report a lower effective DPI while
+/// still producing the largest output admitted by the explicit safety caps.
 pub fn renderParsedPagePngAdaptiveAlloc(
     alloc: Allocator,
     parsed: *reader.Reader,
@@ -2724,8 +2725,11 @@ test "adaptive OCR rendering records effective DPI and enforces safety caps" {
     try std.testing.expectEqual(adaptive.width, decoded.width);
     try std.testing.expectEqual(adaptive.height, decoded.height);
 
-    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 700));
-    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 400));
+    var compact = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 400);
+    defer compact.deinit(alloc);
+    try std.testing.expect(compact.effective_dpi < 72);
+    try std.testing.expect(compact.width <= 400);
+    try std.testing.expect(compact.height <= 400);
     try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 10, 4096));
     try std.testing.expectError(error.InvalidRenderDpi, renderParsedPagePngAlloc(alloc, &parsed, 1, 48, 40_000_000));
 }

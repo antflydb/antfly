@@ -51,7 +51,9 @@ class BoundedZigBuildTest(unittest.TestCase):
 
     def test_uncapped_build_uses_detected_host_budget(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch.object(launcher, "detect_memory_limit", return_value=40_000):
+            with mock.patch.object(
+                launcher, "detect_memory_limit", return_value=40_000
+            ):
                 self.assertEqual(32_000, launcher.detect_max_rss())
 
     def test_command_adds_missing_scheduler_options(self):
@@ -119,7 +121,9 @@ class BoundedZigBuildTest(unittest.TestCase):
                 "patch_build_runner",
                 side_effect=RuntimeError("unknown runner"),
             ):
-                with mock.patch.object(launcher, "zig_version", return_value=(0, 17, 0)):
+                with mock.patch.object(
+                    launcher, "zig_version", return_value=(0, 17, 0)
+                ):
                     self.assertIsNone(
                         launcher.prepare_build_runner("zig", Path("/tmp/patched.zig"))
                     )
@@ -131,7 +135,9 @@ class BoundedZigBuildTest(unittest.TestCase):
                 "patch_build_runner",
                 side_effect=RuntimeError("unknown runner"),
             ):
-                with mock.patch.object(launcher, "zig_version", return_value=(0, 16, 0)):
+                with mock.patch.object(
+                    launcher, "zig_version", return_value=(0, 16, 0)
+                ):
                     with self.assertRaisesRegex(RuntimeError, "unknown runner"):
                         launcher.prepare_build_runner("zig", Path("/tmp/patched.zig"))
 

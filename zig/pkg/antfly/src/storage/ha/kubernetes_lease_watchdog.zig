@@ -145,6 +145,7 @@ pub const Watchdog = struct {
 
         const scope_matches = try self.scopeMatches(annotations);
         if (self.authorized_once and !scope_matches) return self.latch(.scope_changed);
+        if (!scope_matches) return error.LeaseScopeMismatch;
         if (generation < self.last_generation) {
             if (self.authorized_once) return self.latch(.generation_rollback);
             return error.LeaseGenerationRollback;
@@ -154,11 +155,20 @@ pub const Watchdog = struct {
             return error.LeaseRenewalRollback;
         }
         if (self.authorized_once and !std.mem.eql(u8, holder, self.cfg.scope.node_id)) return self.latch(.holder_changed);
+
+        // A successful read of an exact but expired Lease still proves that a
+        // standby's watchdog is alive and enforcing the closed authority
+        // gate. Preserve that observation for the controller's promotion
+        // proof while granting no runtime authority from the expired Lease.
+        const newer_renewal = self.last_renew_ns != 0 and renew_ns > self.last_renew_ns;
+        self.last_generation = @max(self.last_generation, generation);
+        self.last_renew_ns = @max(self.last_renew_ns, renew_ns);
+        @memcpy(self.last_observed_holder[0..holder.len], holder);
+        self.last_observed_holder_len = @intCast(holder.len);
         if (renew_ns > std.math.maxInt(u64) - duration_ns or realtime_ns >= renew_ns + duration_ns) {
             if (self.authorized_once) return self.latch(.lease_expired);
             return .waiting;
         }
-        if (!scope_matches) return error.LeaseScopeMismatch;
 
         const process_matches = if (std.mem.eql(u8, holder, self.cfg.scope.node_id) and self.cfg.scope.process_boot_id.len != 0)
             if (annotations.get("antfly.io/ha-fence-process-boot-id")) |value|
@@ -178,11 +188,6 @@ pub const Watchdog = struct {
         // process's still-live authority. The operator observes this process's
         // pod/process proof and performs a subsequent renewal; only that
         // strictly post-observation renewal may open writes.
-        const newer_renewal = self.last_renew_ns != 0 and renew_ns > self.last_renew_ns;
-        self.last_generation = @max(self.last_generation, generation);
-        self.last_renew_ns = @max(self.last_renew_ns, renew_ns);
-        @memcpy(self.last_observed_holder[0..holder.len], holder);
-        self.last_observed_holder_len = @intCast(holder.len);
         if (!std.mem.eql(u8, holder, self.cfg.scope.node_id)) return .observed;
         if (!process_matches) return .pending_authority;
 
@@ -689,18 +694,18 @@ test "kubernetes lease watchdog standby waits for transfer then fences rollback"
     try std.testing.expectEqual(FenceReason.generation_rollback, watchdog.fence_reason.?);
 }
 
-test "kubernetes lease watchdog rejects expired pre-transfer lease as inactive" {
+test "kubernetes lease watchdog preserves exact expired pre-transfer observation" {
     const expired =
         \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:00Z","leaseTransitions":3}}
     ;
     const after_expiry = try rfc3339UnixNs("2026-07-15T12:00:31Z");
     var watchdog = try Watchdog.init(.{ .scope = .{ .topology_id = "topology-7", .node_id = "standby-a", .data_generation = "seed-a" }, .grace_ns = 10 * std.time.ns_per_s, .sentinel_path = "/tmp/fence" }, null, null);
 
-    // `waiting`, rather than `observed`, tells the runtime not to publish or
-    // refresh Active capability proof for this stale Lease.
+    // The expired Lease grants no authority, but a successful exact
+    // observation remains usable as process capability evidence.
     try std.testing.expectEqual(Decision.waiting, try watchdog.observe(std.testing.allocator, expired, after_expiry, 1));
-    try std.testing.expectEqual(@as(u64, 0), watchdog.last_generation);
-    try std.testing.expectEqual(@as(usize, 0), watchdog.observedHolder().len);
+    try std.testing.expectEqual(@as(u64, 3), watchdog.last_generation);
+    try std.testing.expectEqualStrings("primary-a", watchdog.observedHolder());
 }
 
 test "kubernetes lease watchdog duplicate renewal cannot extend authority deadline" {

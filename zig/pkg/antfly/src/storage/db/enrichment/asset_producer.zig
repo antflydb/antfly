@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const RequestContext = @import("../../../inference/request_context.zig").RequestContext;
 
 const Allocator = std.mem.Allocator;
 
@@ -87,7 +88,9 @@ pub const Producer = struct {
 
     pub const VTable = struct {
         produce: *const fn (ptr: *anyopaque, alloc: Allocator, request: Request) anyerror![]u8,
+        produce_with_context: ?*const fn (ptr: *anyopaque, alloc: Allocator, request: Request, context: RequestContext) anyerror![]u8 = null,
         produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 = null,
+        produce_batch_with_context: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request, context: RequestContext) anyerror![][]u8 = null,
         can_produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!bool = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
         /// See embedder.DenseEmbedder.foreground_bounded. This is deliberately
@@ -106,6 +109,12 @@ pub const Producer = struct {
     };
 
     pub fn foregroundBoundedForRequests(self: Producer, alloc: Allocator, requests: []const Request) !bool {
+        // A finite implementation-specific timeout is not sufficient for a
+        // foreground request: the provider must accept the caller's actual
+        // deadline and cancellation token. Legacy callbacks remain available
+        // to durable background replay, but can never advertise foreground
+        // cancellability.
+        if (self.vtable.produce_with_context == null) return false;
         if (self.vtable.foreground_bounded_for_requests) |foreground_bounded|
             return try foreground_bounded(self.ptr, alloc, requests);
         return self.vtable.foreground_bounded;
@@ -113,6 +122,19 @@ pub const Producer = struct {
 
     pub fn produce(self: Producer, alloc: Allocator, request: Request) ![]u8 {
         return try self.vtable.produce(self.ptr, alloc, request);
+    }
+
+    pub fn produceWithContext(self: Producer, alloc: Allocator, request: Request, context: RequestContext) ![]u8 {
+        try context.check();
+        const output = if (self.vtable.produce_with_context) |produce_with_context|
+            try produce_with_context(self.ptr, alloc, request, context)
+        else
+            try self.produce(alloc, request);
+        context.check() catch |err| {
+            alloc.free(output);
+            return err;
+        };
+        return output;
     }
 
     pub fn produceBatch(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
@@ -129,6 +151,33 @@ pub const Producer = struct {
         for (requests, 0..) |request, i| {
             out[i] = try self.produce(alloc, request);
         }
+        return out;
+    }
+
+    pub fn produceBatchWithContext(self: Producer, alloc: Allocator, requests: []const Request, context: RequestContext) ![][]u8 {
+        try context.check();
+        const out = if (self.vtable.produce_batch_with_context) |produce_batch|
+            try produce_batch(self.ptr, alloc, requests, context)
+        else if (self.vtable.produce_batch) |produce_batch|
+            // Preserve the native-batch contract advertised by canProduceBatch.
+            // Legacy callbacks cannot observe the context internally, but
+            // remain fenced by the checks before and after this call.
+            try produce_batch(self.ptr, alloc, requests)
+        else blk: {
+            const items = try alloc.alloc([]u8, requests.len);
+            errdefer {
+                for (items) |item| if (item.len > 0) alloc.free(item);
+                alloc.free(items);
+            }
+            for (items) |*item| item.* = "";
+            for (requests, 0..) |request, i| items[i] = try self.produceWithContext(alloc, request, context);
+            break :blk items;
+        };
+        context.check() catch |err| {
+            for (out) |item| if (item.len > 0) alloc.free(item);
+            alloc.free(out);
+            return err;
+        };
         return out;
     }
 
@@ -183,4 +232,96 @@ test "asset producer parses extractor config" {
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(ProducerType.extractor, cfg.type);
     try std.testing.expect(std.mem.indexOf(u8, cfg.config_json, "\"entities\"") != null);
+}
+
+test "asset producer forwards request context to cancellable implementations" {
+    const Probe = struct {
+        context_calls: usize = 0,
+
+        fn legacy(_: *anyopaque, _: Allocator, _: Request) anyerror![]u8 {
+            return error.LegacyCallbackInvoked;
+        }
+
+        fn controlled(raw: *anyopaque, alloc: Allocator, _: Request, context: RequestContext) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.check();
+            self.context_calls += 1;
+            return try alloc.dupe(u8, "controlled");
+        }
+    };
+
+    var probe = Probe{};
+    const producer = Producer{
+        .ptr = &probe,
+        .vtable = &.{ .produce = Probe.legacy, .produce_with_context = Probe.controlled },
+    };
+    const output = try producer.produceWithContext(std.testing.allocator, .{
+        .producer_type = .copy,
+        .config_json = "",
+        .source_text = "input",
+    }, .{ .io = std.testing.io, .deadline_ns = null });
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("controlled", output);
+    try std.testing.expectEqual(@as(usize, 1), probe.context_calls);
+}
+
+test "asset producer preserves legacy native batch under request context" {
+    const Probe = struct {
+        batch_calls: usize = 0,
+        cancel_after_batch: ?*std.atomic.Value(bool) = null,
+
+        fn single(_: *anyopaque, _: Allocator, _: Request) anyerror![]u8 {
+            return error.SingleCallbackInvoked;
+        }
+
+        fn batch(raw: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batch_calls += 1;
+            const out = try alloc.alloc([]u8, requests.len);
+            for (out) |*item| item.* = "";
+            errdefer {
+                for (out) |item| if (item.len > 0) alloc.free(item);
+                alloc.free(out);
+            }
+            for (out, requests) |*item, request| item.* = try alloc.dupe(u8, request.source_text);
+            if (self.cancel_after_batch) |cancelled| cancelled.store(true, .release);
+            return out;
+        }
+    };
+
+    const requests = [_]Request{
+        .{ .producer_type = .copy, .config_json = "", .source_text = "one" },
+        .{ .producer_type = .copy, .config_json = "", .source_text = "two" },
+    };
+    var probe = Probe{};
+    const producer = Producer{
+        .ptr = &probe,
+        .vtable = &.{ .produce = Probe.single, .produce_batch = Probe.batch },
+    };
+    try std.testing.expect(try producer.canProduceBatch(std.testing.allocator, &requests));
+    const output = try producer.produceBatchWithContext(
+        std.testing.allocator,
+        &requests,
+        .{ .io = std.testing.io, .deadline_ns = null },
+    );
+    defer {
+        for (output) |item| std.testing.allocator.free(item);
+        std.testing.allocator.free(output);
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
+    try std.testing.expectEqualStrings("one", output[0]);
+    try std.testing.expectEqualStrings("two", output[1]);
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    probe.cancel_after_batch = &cancelled;
+    try std.testing.expectError(error.Cancelled, producer.produceBatchWithContext(
+        std.testing.allocator,
+        &requests,
+        .{
+            .io = std.testing.io,
+            .deadline_ns = null,
+            .cancellation = @import("../../../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled),
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), probe.batch_calls);
 }

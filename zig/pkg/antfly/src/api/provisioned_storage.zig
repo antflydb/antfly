@@ -319,6 +319,17 @@ pub const ProvisionedGroupStorage = struct {
         self.* = undefined;
     }
 
+    /// Join every cached writer DB before an externally owned provider is
+    /// destroyed. Sources and request runtimes must already be quiescent, so
+    /// no new cache lease can appear while this barrier holds the shared state
+    /// mutex. The cache containers remain valid for the ordinary final deinit.
+    pub fn quiesceExternalProviderUsers(self: *ProvisionedGroupStorage) !void {
+        lockAtomic(&self.write_cache_state_mutex);
+        defer self.write_cache_state_mutex.unlock();
+        try self.startup_write_cache.closeAllDbsLocked();
+        try self.write_cache.closeAllDbsLocked();
+    }
+
     /// Break every cache-to-source callback edge while both owners are still
     /// alive. Call this after attached write sources are quiescent and before
     /// either the sources or this storage are destroyed.
@@ -360,6 +371,7 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = self.backend_runtime;
         self.read_cache.antfly_provider = read_source.antfly_provider;
         self.read_cache.secret_store = read_source.secret_store;
+        read_source.reranker_runtime = try self.read_cache.ensureRerankerRuntime();
         // Resident writer DBs also serve freshness-sensitive reads. Leaving
         // their cache unset makes the LSM backend retain a private decoded
         // index for every run, bypassing both the shared cache bound and the

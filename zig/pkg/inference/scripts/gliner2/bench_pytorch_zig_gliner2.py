@@ -68,7 +68,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument("--label", action="append", dest="labels", default=None)
-    parser.add_argument("--batch-size", type=int, action="append", dest="batch_sizes", default=None)
+    parser.add_argument(
+        "--batch-size", type=int, action="append", dest="batch_sizes", default=None
+    )
     parser.add_argument("--warmup-iters", type=int, default=1)
     parser.add_argument("--measure-iters", type=int, default=3)
     parser.add_argument("--out-dir", default="/private/tmp/termite-gliner2-fp32-bench")
@@ -86,19 +88,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-metal", action="store_true")
     parser.add_argument("--skip-cuda", action="store_true")
     parser.add_argument("--skip-full-graph", action="store_true")
-    parser.add_argument("--profile", action="store_true", help="Enable verbose GLiNER profile output in Zig runs.")
-    parser.add_argument("--pytorch-device", choices=("cuda", "mps", "cpu"), action="append", default=None)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable verbose GLiNER profile output in Zig runs.",
+    )
+    parser.add_argument(
+        "--pytorch-device",
+        choices=("cuda", "mps", "cpu"),
+        action="append",
+        default=None,
+    )
     parser.add_argument(
         "--cuda-artifacts",
         default="fatbin",
         choices=("portable", "sm89", "fatbin"),
         help="Embedded CUDA artifact (fatbin is the production default)",
     )
-    parser.add_argument("--zig-cache-dir", default="/private/tmp/termite-zig-cache-gliner2-bench/local")
-    parser.add_argument("--zig-global-cache-dir", default="/private/tmp/termite-zig-cache-gliner2-bench/global")
-    parser.add_argument("--metal-debug", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--zig-cache-dir", default="/private/tmp/termite-zig-cache-gliner2-bench/local"
+    )
+    parser.add_argument(
+        "--zig-global-cache-dir",
+        default="/private/tmp/termite-zig-cache-gliner2-bench/global",
+    )
+    parser.add_argument(
+        "--metal-debug", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--metal-timeout", type=int, default=180)
-    parser.add_argument("--zig-release", choices=("fast", "safe", "small"), default=None)
+    parser.add_argument(
+        "--zig-release", choices=("fast", "safe", "small"), default=None
+    )
     parser.add_argument("--extra-zig-build-arg", action="append", default=[])
     parser.add_argument("--extra-zig-arg", action="append", default=[])
     return parser.parse_args()
@@ -107,7 +127,9 @@ def parse_args() -> argparse.Namespace:
 def percentile(sorted_values: list[float], pct: float) -> float:
     if not sorted_values:
         return 0.0
-    idx = min(len(sorted_values) - 1, max(0, int((len(sorted_values) * pct + 99) // 100 - 1)))
+    idx = min(
+        len(sorted_values) - 1, max(0, int((len(sorted_values) * pct + 99) // 100 - 1))
+    )
     return sorted_values[idx]
 
 
@@ -235,7 +257,9 @@ def run_pytorch(
     }
 
 
-def run_command(cmd: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_command(
+    cmd: list[str], cwd: Path, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -248,7 +272,11 @@ def run_command(cmd: list[str], cwd: Path, env: dict[str, str]) -> subprocess.Co
 
 
 def parse_zig_csv(output: str) -> tuple[dict[str, str] | None, dict[str, str]]:
-    lines = [line for line in output.splitlines() if line.startswith("task,") or line.startswith("entities,")]
+    lines = [
+        line
+        for line in output.splitlines()
+        if line.startswith("task,") or line.startswith("entities,")
+    ]
     if len(lines) < 2:
         raise ValueError("no GLiNER2 CSV rows found")
     reader = csv.DictReader(lines)
@@ -260,7 +288,9 @@ def parse_zig_csv(output: str) -> tuple[dict[str, str] | None, dict[str, str]]:
     return (first_rows[-1] if first_rows else None), warm_rows[-1]
 
 
-def zig_result_from_csv(row: dict[str, str], runner: str, graph_runtime: str | None) -> dict[str, Any]:
+def zig_result_from_csv(
+    row: dict[str, str], runner: str, graph_runtime: str | None
+) -> dict[str, Any]:
     def f(name: str) -> float:
         return float(row.get(name, "0") or 0)
 
@@ -310,24 +340,26 @@ def run_zig(
     if args.zig_release:
         cmd.append(f"--release={args.zig_release}")
     cmd.extend(args.extra_zig_build_arg)
-    cmd.extend([
-        "bench-gliner2-e2e",
-        "--",
-        "--model-dir",
-        args.model_dir,
-        "--backend",
-        backend,
-        "--batch-size",
-        str(batch_size),
-        "--warmup-iters",
-        str(args.warmup_iters),
-        "--measure-iters",
-        str(args.measure_iters),
-        "--format",
-        "csv",
-        "--text",
-        args.text,
-    ])
+    cmd.extend(
+        [
+            "bench-gliner2-e2e",
+            "--",
+            "--model-dir",
+            args.model_dir,
+            "--backend",
+            backend,
+            "--batch-size",
+            str(batch_size),
+            "--warmup-iters",
+            str(args.warmup_iters),
+            "--measure-iters",
+            str(args.measure_iters),
+            "--format",
+            "csv",
+            "--text",
+            args.text,
+        ]
+    )
     if graph_runtime:
         cmd.extend(["--graph-runtime", graph_runtime])
     for label in labels:
@@ -400,7 +432,9 @@ def run_zig(
         warm_entities = int(warm_row.get("entity_count", "0") or 0)
         if first_entities != warm_entities:
             result["status"] = "failed"
-            result["error"] = f"warm entity_count {warm_entities} != first_run entity_count {first_entities}"
+            result["error"] = (
+                f"warm entity_count {warm_entities} != first_run entity_count {first_entities}"
+            )
     result["log"] = str(log_path)
     return result
 
@@ -413,7 +447,9 @@ def tail_for_error(output: str, max_lines: int = 40) -> str:
 
 def write_outputs(out_dir: Path, rows: list[dict[str, Any]]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "results.json").write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+    (out_dir / "results.json").write_text(
+        json.dumps(rows, indent=2, sort_keys=True) + "\n"
+    )
     fieldnames = [
         "runner",
         "backend",
@@ -448,7 +484,9 @@ def main() -> int:
     oracle: dict[str, str] | None = None
     if not args.skip_pytorch:
         if args.upstream_source is None:
-            raise SystemExit("--upstream-source is required unless --skip-pytorch is set")
+            raise SystemExit(
+                "--upstream-source is required unless --skip-pytorch is set"
+            )
         try:
             verify_canonical_python_runtime()
             oracle = verify_upstream_checkout(args.upstream_source)
@@ -492,7 +530,11 @@ def main() -> int:
                 rows.append(run_zig(args, labels, batch_size, "metal", None, out_dir))
                 write_outputs(out_dir, rows)
                 if not args.skip_full_graph:
-                    rows.append(run_zig(args, labels, batch_size, "metal", "partitioned", out_dir))
+                    rows.append(
+                        run_zig(
+                            args, labels, batch_size, "metal", "partitioned", out_dir
+                        )
+                    )
                     write_outputs(out_dir, rows)
             if not args.skip_cuda:
                 rows.append(run_zig(args, labels, batch_size, "cuda", None, out_dir))

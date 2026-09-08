@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class PathFindWeightMode(str, Enum):
+class PathFindWeightMode(StrEnum):
     MAX_WEIGHT = "max_weight"
     MIN_HOPS = "min_hops"
     MIN_WEIGHT = "min_weight"

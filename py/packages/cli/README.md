@@ -2,6 +2,8 @@
 
 Python package for installing the native Antfly CLI.
 
+Supported Python versions: 3.11 through 3.14.
+
 ```bash
 pipx install antfly-cli
 antfly --version

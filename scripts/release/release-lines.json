@@ -1,0 +1,11 @@
+{
+  "schema_version": 2,
+  "lines": {
+    "0.2": {
+      "source_ref": "refs/heads/main",
+      "trusted_source_refs": ["refs/heads/main"],
+      "status": "active"
+    }
+  },
+  "nightly_source_ref": "refs/heads/main"
+}

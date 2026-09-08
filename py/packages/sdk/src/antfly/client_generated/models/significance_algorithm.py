@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SignificanceAlgorithm(str, Enum):
+class SignificanceAlgorithm(StrEnum):
     CHI_SQUARED = "chi_squared"
     JLH = "jlh"
     MUTUAL_INFORMATION = "mutual_information"

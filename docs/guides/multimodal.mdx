@@ -1,159 +1,252 @@
 ---
-title: Build Image Search
-order: 8
-description: "An index over your images that answers a plain-language description, or another image, with the pictures that match"
+title: Multimodal Embeddings
+description: Index and search images, audio, and documents with executable Antfly workflows
+prerequisites:
+  - Antfly installed and running
+  - Antfly inference with the ClipClap model for native image or audio embeddings
+difficulty: intermediate
+estimatedTime: "20 min"
+tags: [multimodal, images, pdf, embeddings]
+sidebar: concepts
+order: 6
 ---
 
 <Questions>
 - How do I index images in Antfly?
-- How do I search images by describing them?
-- How do I search with an image instead of text?
-- Which embedding models understand images?
-- What does coverage_policy partial do?
+- How do I search by image or audio?
+- When should I preprocess media into text?
+- How do I index PDFs durably?
+- Which embedding providers can maintain an index?
 </Questions>
 
-## The Result
+Antfly indexes images, audio, and documents in one of three shapes, and the choice decides what runs at write time, what is stored durably, and which providers can maintain the index. ClipClap, the native model, puts text, images, and audio in one vector space, so a plain-language query can return a picture and a picture can return its neighbors.
 
-"map of a country" returns the articles whose thumbnails are maps, and an image URL returns the pictures that look like it. One embedding model places text and images in the same space, so there is no captioning step and no vision model in the middle, and it runs on Antfly Inference inside your instance:
+## Decisions
 
-```bash
-antfly query --table wikipedia \
-  --semantic-search "map of a country" \
-  --indexes "thumbnail" \
-  --fields "title,thumbnail_url" \
-  --limit 5
-```
+Antfly supports three explicit multimodal workflows:
 
-```json
-{
-  "hits": [
-    {
-      "_id": "Iceland",
-      "_source": {
-        "title": "Iceland",
-        "thumbnail_url": "https://upload.wikimedia.org/.../Iceland_location_map.svg.png"
-      }
-    },
-    {
-      "_id": "Mongolia",
-      "_source": {
-        "title": "Mongolia",
-        "thumbnail_url": "https://upload.wikimedia.org/.../Mongolia_map.png"
-      }
-    }
-  ]
-}
-```
+1. **Native multimodal embeddings** use the `antfly` index provider with a
+   locally installed model such as `antflydb/clipclap`. A template turns a URL
+   into a media part with `remoteMedia`, and the model embeds that part directly.
+2. **Application-managed descriptions** run OCR, captioning, or transcription
+   before the write. Store the resulting text in a document field and use any
+   managed text embedder supported for index creation.
+3. **Application-managed vectors** create an `external: true` embeddings index
+   and write vectors through `_embeddings`. This is the escape hatch for a model
+   or provider that Antfly's managed indexing runtime does not execute.
 
-## Before You Start
+`EmbeddingsIndexConfig` deliberately has no `summarizer` field. Keeping
+summarization outside the index definition avoids an implicit second provider
+call on every write and makes retries, cost, and durable intermediate output
+observable. It also prevents an index configuration from parsing successfully
+and failing only after ingestion starts.
 
-The Wikipedia table from the [Quickstart](/docs/guides/quickstart), whose articles carry a `thumbnail_url` field:
+## Native Image and Audio Embeddings
 
-```bash
-antfly query --table wikipedia --full-text-search 'title:Iceland' --fields title,thumbnail_url --limit 1
-```
-
-## Build It
-
-### 1. Pull the Model
-
-ClipClap is a multimodal embedding model that understands text, images, and audio. Pull it onto Antfly Inference:
+ClipClap embeds text, images, and audio into one vector space. Install it once:
 
 ```bash
 antfly inference pull antflydb/clipclap:gguf:Q4_K
 ```
 
-If the running instance does not pick it up, restart `antfly standalone`.
+Restart `antfly standalone` if the running inference service does not discover
+the newly installed model.
 
-### 2. Add an Image Index
+### Define the Source Field
 
-The index template fetches each article's thumbnail and hands the bytes to the embedder. Articles without a thumbnail render an empty template and are skipped:
+Link annotations make the remote-media intent visible in the table schema and
+available to tooling. The index template still controls when the URL is fetched.
 
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
 ```bash
-antfly index create --table wikipedia \
-  --index thumbnail \
+antfly table create --table product_catalog \
+  --schema '{
+    "document_schemas": {
+      "product": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "image_url": {
+              "type": "string",
+              "x-antfly-types": ["link"]
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+
+### Create the Managed Index
+
+```bash
+antfly index create --table product_catalog \
+  --index visual_search \
   --type embeddings \
   --coverage-policy partial \
-  --template "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}" \
-  --embedder '{"provider": "antfly", "model": "antflydb/clipclap"}' \
-  --dimension 512
+  --template '{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}' \
+  --embedder '{
+    "provider": "antfly",
+    "model": "antflydb/clipclap"
+  }' \
+  --distance-metric cosine
 ```
-  </TabsContent>
 
-  <TabsContent value="curl">
+`partial` treats documents without an image as intentional skips while still
+requiring every source document to reach a durable outcome. Antfly probes the
+model during index creation and records its dimension, so omit `dimension`
+unless you want creation to verify an expected value.
+
+For remote URLs, configure `remote_content` with the narrowest required host or
+object-store allowlist. Remote access is denied by default; private and special
+IP addresses remain blocked unless explicitly enabled. Data URIs do not require
+network access, but they are still subject to request and decoded-media limits.
+
+Wait for existing documents to finish indexing before querying:
+
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
+antfly index wait --table product_catalog \
+  --index visual_search \
+  --until searchable-artifacts=1 \
+  --timeout 20m
+```
+
+### Search with Text
+
+Because ClipClap shares a vector space across modalities, ordinary text can
+retrieve matching images:
+
+```bash
+antfly query --table product_catalog \
+  --semantic-search "brown leather jacket with zipper" \
+  --indexes visual_search \
+  --fields "name,description,image_url" \
+  --limit 10
+```
+
+### Search with an Image URL
+
+Use `embedding_template` to turn the query value into a media part using the
+same embedding model as the index:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
-    "type": "embeddings",
-    "coverage_policy": "partial",
-    "template": "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
-    "embedder": {
-      "provider": "antfly",
-      "model": "antflydb/clipclap"
-    },
-    "dimension": 512,
-    "distance_metric": "cosine"
-  }'
-```
-  </TabsContent>
-</Tabs>
-
-`{{remoteMedia url=...}}` downloads the image and prepares it as model input. It accepts `http://`, `https://`, `s3://`, and `file://` URLs, refuses private IP ranges, and caps downloads at 100 MB. For images you already hold as data URIs, use `{{media url=...}}` instead.
-
-### 3. Wait for the Backfill
-
-The index embeds every existing article in the background. Wait for it before querying:
-
-```bash
-antfly index wait --table wikipedia --index thumbnail --until complete --timeout 20m
-```
-
-### 4. Search by Description, or by Image
-
-Describe what you want to see:
-
-```bash
-antfly query --table wikipedia \
-  --semantic-search "map of a country" \
-  --indexes "thumbnail" \
-  --fields "title,thumbnail_url" \
-  --limit 5
-```
-
-Or hand it an image. `embedding_template` tells Antfly how to turn the `semantic_search` value into an embedding, and `this` is that value:
-
-```bash
-curl -X POST http://localhost:8080/db/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "table": "wikipedia",
-    "semantic_search": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2e/Iceland_location_map.svg/500px-Iceland_location_map.svg.png",
+    "table": "product_catalog",
+    "semantic_search": "https://images.example.com/query.jpg",
     "embedding_template": "{{remoteMedia url=this}}",
-    "indexes": ["thumbnail"],
-    "fields": ["title", "thumbnail_url"],
-    "limit": 5
+    "indexes": ["visual_search"],
+    "fields": ["name", "description", "image_url"],
+    "limit": 10
   }'
 ```
 
-A base64 data URI works the same way with `{{media url=this}}`. Mix text and image in one query by writing both into the template: `"Find pages like this: {{remoteMedia url=this}}"`.
+For an inline data URI, use `{{media url=this}}` instead. Avoid logging or
+persisting large data URIs in query histories.
 
-## Tradeoffs
+## Precomputed Descriptions for Text Retrieval
 
-Two choices shape the index: embedding images directly instead of captioning them, and how documents with no image count toward completion.
+If users search for detailed attributes that a joint embedding model does not
+capture well, generate a caption or transcript in the application and store it
+as a normal field:
 
-The older way to search images was to caption them first: run a vision model over every picture, store the caption, embed the caption. Search then matched your words against the captioner's words, so any detail the captioner left out was unsearchable.
+```json
+{
+  "_type": "product",
+  "name": "Vintage Leather Jacket",
+  "image_url": "https://images.example.com/jacket.jpg",
+  "media_description": "Brown leather motorcycle jacket with an asymmetric zipper"
+}
+```
 
-A multimodal embedder needs no caption. Text and images land in one vector space, so "map of a country" and a picture of a map sit near each other with no description in between, and a query image compares directly against indexed images. That is also why the image index is a separate index rather than a field folded into the text index: the two spaces are different, and a query names which one it is asking. When you want text and picture weighed together, put both in one template (`{{title}} {{remoteMedia url=thumbnail_url}}`) and the model embeds the pair as one item.
+Then index only the durable text:
 
-`coverage_policy: partial` is the other decision. The default, `strict`, requires one embedding per source document. Image fields are usually optional, so `partial` counts a document whose template rendered nothing as a deliberate skip, and the index still reaches `complete`. `best_effort` goes one step further and treats outright failures (a dead URL, an oversized file) as complete too, while reporting the index unhealthy.
+```bash
+antfly index create --table product_catalog \
+  --index media_description_search \
+  --type embeddings \
+  --field media_description \
+  --embedder '{
+    "provider": "openai",
+    "model": "text-embedding-3-small"
+  }'
+```
+
+This shape is efficient for repeated rebuilds: captioning runs once, the
+description can be inspected or corrected, and changing the embedding model
+does not repeat vision inference.
+
+## Application-Managed Vectors
+
+Use an external index when the application already calls Gemini, Vertex, Cohere,
+OpenRouter, or another embedding service that is not executable by managed
+index creation:
+
+```bash
+antfly index create --table product_catalog \
+  --index application_vectors \
+  --type embeddings \
+  --external \
+  --dimension 768 \
+  --distance-metric cosine
+```
+
+Write each vector with the document under the index's `_embeddings` entry. The
+application owns provider retries, batching, and vector-space consistency;
+Antfly owns storage and retrieval. Do not mix vectors from different models or
+model revisions in one index.
+
+Managed index creation accepts `antfly`, `ollama`, `openai`, and `bedrock`.
+Provider names exposed by broader embedding APIs are not automatically valid
+for managed indexing.
+
+## Durable PDF Ingestion
+
+Template helpers are request-time transformations; they do not persist PDF
+pages or make OCR output independently reprocessable. Use a
+`document_extraction` asset producer for durable document ingestion:
+
+```json
+{
+  "name": "document_units_v1",
+  "kind": "asset",
+  "field": "url",
+  "content_type": "application/json",
+  "producer_json": "{\"type\":\"document_extraction\",\"config\":{}}"
+}
+```
+
+The built-in parser targets unencrypted, born-digital PDFs. Pages with no native
+text use the local `antflydb/Florence-2-base` reader by default. Install it with:
+
+```bash
+antfly inference pull antflydb/Florence-2-base
+```
+
+If the model is absent, the page records a failed OCR outcome instead of
+silently disappearing. Install the model and explicitly reprocess the artifact
+to retry. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to disable
+OCR. For formats outside the built-in parser, use the
+[docsaf example](https://github.com/antflydb/antfly/tree/main/examples/docsaf).
+
+`remotePDF` remains a compatibility helper for template-time extraction, but it
+is deprecated. Prefer durable extraction for production workflows.
+
+## Operational Guidance
+
+- Keep `remote_content` allowlists narrow and use dedicated read-only object
+  storage credentials.
+- Use `partial` coverage when media fields are optional; use `strict` when every
+  source document must produce a vector.
+- Store durable captions, transcripts, or extracted pages when they are costly
+  to reproduce.
+- Use `cosine` for ClipClap and other models trained for cosine similarity. The
+  database default remains `l2_squared`, so select the model's metric explicitly
+  when it differs.
+- Monitor index status and wait for the required coverage before serving a new
+  index to users.
 
 ## Let Your Agent Drive
 
@@ -168,6 +261,6 @@ Then prompt it with the outcome, for example "Add a ClipClap image index over th
 
 ## Next Steps
 
-- [Antfly Inference](/docs/guides/inference): what else runs on the built-in model runtime, and how to pull other models
-- [Artifact-Backed Indexes](/docs/guides/artifact-indexes): indexing extracted PDF pages and chunks alongside whole documents
-- [Tune Hybrid Search](/docs/guides/hybrid-search): combining the image index with keyword and text-embedding matches in one query
+- [Quickstart](/docs/guides/quickstart#image-search): the same image index built over the Wikipedia thumbnails
+- [Artifact-Backed Indexes](/docs/guides/artifact-indexes): searching extracted PDF pages and chunks alongside whole documents
+- [Antfly Inference](/docs/guides/inference): pulling ClipClap and the other local models
