@@ -1860,6 +1860,7 @@ test "gemma4 12b real mmproj optional projector smoke" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer native_compute.deinitPrefetchQueue(&weight_store);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     if (image_path) |path| {

@@ -16833,6 +16833,7 @@ test "metal partition executor consumes buffer plan and evaluates partition" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -16902,6 +16903,7 @@ test "metal partition executor command path handles add softmax and reshape" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -16981,6 +16983,7 @@ test "metal partition executor command path handles linear and norms" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -17203,6 +17206,7 @@ test "metal partition executor eager multi op chain matches host" {
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
     var mesh = try device_mesh_mod.DeviceMesh.init(allocator, &.{
         .{ .id = 0, .backend = &native_cb, .kind = .native },
@@ -17322,6 +17326,7 @@ test "metal partition executor fuses sibling no-bias linears into one pair comma
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -19386,6 +19391,7 @@ test "metal partition executor owned runtime region plan reuses cached plan" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
     var exec = MetalPartitionExecutor.initBorrowed(allocator, &g, &cb);
     exec.owned = true;
@@ -19990,6 +19996,7 @@ test "metal partition executor resident primitive chain stays device backed" {
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
     var mesh = try device_mesh_mod.DeviceMesh.init(allocator, &.{
         .{ .id = 0, .backend = &native_cb, .kind = .native },
@@ -20088,6 +20095,7 @@ test "metal partition executor resident concat prim stays device backed" {
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
     var mesh = try device_mesh_mod.DeviceMesh.init(allocator, &.{
         .{ .id = 0, .backend = &native_cb, .kind = .native },
@@ -20550,6 +20558,7 @@ test "metal partition executor resident last-dim reductions stay device backed" 
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
     var mesh = try device_mesh_mod.DeviceMesh.init(allocator, &.{
         .{ .id = 0, .backend = &native_cb, .kind = .native },
@@ -22146,6 +22155,7 @@ test "metal partition executor owned lifecycle deinitializes cleanly" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const exec = try MetalPartitionExecutor.create(allocator, &g, &cb);

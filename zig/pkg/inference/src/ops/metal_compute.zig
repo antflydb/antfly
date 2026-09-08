@@ -28969,6 +28969,7 @@ test "metal_compute: paged decode attention matches native on f32 cache" {
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     var prior_k: [prior_tokens * hidden_kv]f32 = undefined;
@@ -29111,6 +29112,7 @@ test "metal_compute: mixed paged attention batch matches native" {
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     var decode_prior_k: [decode_prior_tokens * hidden_kv]f32 = undefined;
@@ -29299,6 +29301,7 @@ test "metal_compute: paged decode attention matches native on storage runtime f3
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     var prior_k: [prior_tokens * hidden_kv]f32 = undefined;
@@ -29628,6 +29631,7 @@ test "metal_compute: paged decode attention matches native on metal device f32 c
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     var prior_k: [prior_tokens * hidden_kv]f32 = undefined;
@@ -29802,6 +29806,7 @@ test "metal_compute: paged decode attention matches native on Gemma qLen1 f32 ca
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     const prior_k = try allocator.alloc(f32, prior_tokens * hidden_kv);
@@ -29971,6 +29976,7 @@ test "metal_compute: dense causal attention without kv cache matches native" {
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     var q_data: [q_len * hidden_q]f32 = undefined;
@@ -30123,6 +30129,7 @@ test "metal_compute: shared-kv prefill ignores placeholder kv when skip_kv_write
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     var donor_k: [seq_len * hidden_kv]f32 = undefined;
@@ -30285,6 +30292,7 @@ test "metal_compute: shared-kv prefill reuses manager gathered span when skip_kv
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     var donor_k: [seq_len * hidden_kv]f32 = undefined;
@@ -33731,6 +33739,7 @@ test "metal_compute: disentangled relative attention backward matches native at 
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     const native_q = try native_cb.fromFloat32Shape(q_data, &token_shape);
@@ -33843,6 +33852,7 @@ fn expectStableDebertaForward(allocator: std.mem.Allocator) !void {
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     const native_q = try native_cb.fromFloat32Shape(q_data, &token_shape);
@@ -33976,6 +33986,7 @@ test "metal_compute: compact DeBERTa relative rows match expanded native attenti
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
     const native_q = try native_cb.fromFloat32Shape(q_data, &token_shape);
     defer native_cb.free(native_q);
@@ -34084,6 +34095,7 @@ test "metal_compute: threadgroup scaled dot product attention is stable at multi
     defer native_ws.resident_weights.deinit(allocator);
     defer native_ws.lazy_weights.deinit(allocator);
     var native_compute = native_compute_mod.NativeCompute.init(allocator, &native_ws, null);
+    defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
     const native_q = try native_cb.fromFloat32Shape(q_data, &token_shape);
@@ -34129,6 +34141,7 @@ const audit_repeats = 20;
 const AuditNative = struct {
     ws: native_compute_mod.WeightStore,
     compute: native_compute_mod.NativeCompute,
+    compute_initialized: bool = false,
 
     fn init(allocator: std.mem.Allocator) AuditNative {
         return .{
@@ -34138,11 +34151,14 @@ const AuditNative = struct {
     }
 
     fn backend(self: *AuditNative, allocator: std.mem.Allocator) ops.ComputeBackend {
+        std.debug.assert(!self.compute_initialized);
         self.compute = native_compute_mod.NativeCompute.init(allocator, &self.ws, null);
+        self.compute_initialized = true;
         return self.compute.computeBackend();
     }
 
     fn deinit(self: *AuditNative, allocator: std.mem.Allocator) void {
+        if (self.compute_initialized) self.compute.deinit();
         self.ws.resident_weights.deinit(allocator);
         self.ws.lazy_weights.deinit(allocator);
     }

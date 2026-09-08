@@ -4986,6 +4986,7 @@ test "runtime shape tensors preserve distinct ONNX reshape layouts" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const x_ct = try cb_val.fromFloat32Shape(&.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &.{16});
@@ -5710,6 +5711,7 @@ test "native interpreter does not donate a reshape view before a future sibling 
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
@@ -5820,6 +5822,7 @@ test "execute lowered graph through native backend" {
     // Set up native backend (empty WeightStore — we inject params via runtime_inputs).
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     // Create parameter CTs.
@@ -5875,6 +5878,7 @@ test "primitive elementwise ops execute through native" {
     // All primitive ops — set up native backend, inject x via runtime_inputs.
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const x_ct = try cb_val.fromFloat32(&.{ 3.0, 4.0 });
@@ -5913,6 +5917,7 @@ test "execute clones aliased passthrough outputs that outlive their input branch
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const x_ct = try cb_val.fromFloat32(&.{ 1.5, -0.5 });
@@ -5949,6 +5954,7 @@ test "execute preserves runtime shape when cloning an aliased dynamic tensor" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const input = [_]f32{ 1.5, -0.5, 2.0, -1.0, 0.0, 0.5 };
@@ -5988,6 +5994,7 @@ test "execution result deinit frees duplicate output handles once" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const x_ct = try cb_val.fromFloat32(&.{ 1.0, 2.0 });
@@ -6024,6 +6031,7 @@ test "reshape uses declared input shape before symbolic transpose" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     var input: [2 * 3 * 8]f32 = undefined;
@@ -6061,6 +6069,7 @@ test "reshape preserves runtime batch for exported singleton target" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     var input: [2 * 6 * 4]f32 = undefined;
@@ -6098,6 +6107,7 @@ test "runtime shape drives symbolic reduce" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     var input: [2 * 4 * 3]f32 = undefined;
@@ -6146,6 +6156,7 @@ test "runtime shape drives symbolic slice" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     var input: [2 * 4 * 3]f32 = undefined;
@@ -6216,6 +6227,7 @@ test "runtime shape expression bounds a slice of a static tensor" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const ids: [3 * 4]f32 = @splat(0);
@@ -6250,6 +6262,7 @@ test "runtime shape drives symbolic concat" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     var a_input: [2 * 2 * 3]f32 = undefined;
@@ -6306,6 +6319,7 @@ test "runtime shape drives symbolic batched dot_general" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const a_input = [_]f32{
@@ -6365,6 +6379,7 @@ test "runtime shape drives symbolic argmax" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const input = [_]f32{
@@ -6412,6 +6427,7 @@ test "runtime binary broadcasting expands complementary symbolic axes" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const lhs_ct = try cb_val.fromFloat32Shape(&.{ 0, 1, 2 }, &.{ 3, 1 });
@@ -6459,6 +6475,7 @@ test "runtime shape drives symbolic broadcast_in_dim" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const input = [_]f32{ 1, 2, 3, 4, 5, 6 };
@@ -6514,6 +6531,7 @@ test "runtime shape tensor drives dynamic broadcast_in_dim" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3 }, &.{ 1, 1, 3 });
@@ -6558,6 +6576,7 @@ test "native interpreter executes GatherElements along the selected axis" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const data_values = [_]f32{
@@ -6620,6 +6639,7 @@ test "native GatherElements uses concrete shape of a dynamic broadcast result" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const data_values = [_]f32{
@@ -6678,6 +6698,7 @@ test "runtime shape drives dynamic integer resize broadcast values" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const input = [_]f32{
@@ -6725,6 +6746,7 @@ test "runtime shape drives symbolic scatter_add" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const dest_ct = try cb_val.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &.{ 3, 2 });
@@ -6777,6 +6799,7 @@ test "reshape restores batched flattened projection shape before gather" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     var input: [2 * 4 * 6]f32 = undefined;

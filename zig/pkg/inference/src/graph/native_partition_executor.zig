@@ -938,6 +938,7 @@ test "native partition executor evaluates a partition through backend ops" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -994,6 +995,7 @@ test "native partition executor executes linear through native cblas path" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const count: usize = @intCast(g.nodeCount());
@@ -1048,6 +1050,7 @@ test "native partition executor owned lifecycle deinitializes cleanly" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const exec = try NativePartitionExecutor.create(allocator, &g, &cb);
