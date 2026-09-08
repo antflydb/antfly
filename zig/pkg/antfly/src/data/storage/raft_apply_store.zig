@@ -3710,13 +3710,66 @@ test "data raft merge source fence persists and transfers in snapshots" {
         return error.MissingMergeSourceState;
     try std.testing.expectEqual(shard_state_store.MergeSourcePhase.finalized, restored.phase);
     try std.testing.expectEqual(@as(u64, 4), restored.applied_index);
-    try std.testing.expectError(error.ConflictingMergeTransition, Apply.command(alloc, &target, group_id, 5, .{
-        .merge_source_transition = .{
-            .kind = .rollback,
+    for ([_]db_types.MergeSourceTransitionMutation.Kind{ .prepare, .rollback, .finalize }, 5..) |kind, index| {
+        try Apply.command(alloc, &target, group_id, index, .{ .merge_source_transition = .{
+            .kind = kind,
             .transition_id = 400,
             .receiver_group_id = 402,
-        },
+        } });
+    }
+    try std.testing.expectEqual(@as(u64, 7), (try target.latestBatchForTransition(group_id)).?.last_entry_index);
+    try std.testing.expectEqual(@as(u64, 4), (try target.currentMergeSourceState(alloc, group_id)).?.applied_index);
+    try std.testing.expectError(error.ConflictingMergeTransition, Apply.command(alloc, &target, group_id, 8, .{
+        .merge_source_transition = .{ .kind = .prepare, .transition_id = 400, .receiver_group_id = 999 },
     }));
+
+    // Rollback keeps the donor live: delayed controls must not prevent an
+    // ordinary document command at a later Raft index from applying.
+    const rollback_group = group_id + 10;
+    try Apply.barrier(alloc, &target, rollback_group, 1);
+    try Apply.command(alloc, &target, rollback_group, 2, .{
+        .merge_source_transition = .{ .kind = .prepare, .transition_id = 410, .receiver_group_id = 412 },
+    });
+    try Apply.command(alloc, &target, rollback_group, 3, .{
+        .merge_source_transition = .{ .kind = .rollback, .transition_id = 410, .receiver_group_id = 412 },
+    });
+    for ([_]db_types.MergeSourceTransitionMutation.Kind{ .prepare, .finalize, .rollback }, 4..) |kind, index| {
+        try Apply.command(alloc, &target, rollback_group, index, .{ .merge_source_transition = .{
+            .kind = kind,
+            .transition_id = 410,
+            .receiver_group_id = 412,
+        } });
+    }
+    try Apply.command(alloc, &target, rollback_group, 7, .{ .writes = &.{.{ .key = "doc:c", .value = "{}" }} });
+    try std.testing.expectEqual(@as(u64, 7), (try target.latestBatchForTransition(rollback_group)).?.last_entry_index);
+    const rolled_back = (try target.currentMergeSourceState(alloc, rollback_group)).?;
+    try std.testing.expectEqual(shard_state_store.MergeSourcePhase.rolled_back, rolled_back.phase);
+    try std.testing.expectEqual(@as(u64, 3), rolled_back.applied_index);
+    const receiver_group = rollback_group + 1;
+    try Apply.barrier(alloc, &target, receiver_group, 1);
+    var checkpoint: db_types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 410,
+        .donor_group_id = rollback_group,
+        .receiver_group_id = receiver_group,
+        .receiver_base_start = "doc:m",
+        .receiver_base_end = "doc:z",
+        .merged_start = "doc:a",
+        .merged_end = "doc:z",
+    };
+    try Apply.command(alloc, &target, receiver_group, 2, .{ .merge_checkpoint = checkpoint });
+    checkpoint.kind = .rollback;
+    try Apply.command(alloc, &target, receiver_group, 3, .{ .merge_checkpoint = checkpoint });
+    for ([_]db_types.MergeReplicationCheckpoint.Kind{ .accept, .bootstrap_complete, .finalize, .rollback }, 4..) |kind, index| {
+        checkpoint.kind = kind;
+        checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+        try Apply.command(alloc, &target, receiver_group, index, .{ .merge_checkpoint = checkpoint });
+    }
+    try Apply.command(alloc, &target, receiver_group, 8, .{ .writes = &.{.{ .key = "doc:n", .value = "{}" }} });
+    var receiver_terminal = (try target.currentMergeReceiverState(alloc, receiver_group)).?;
+    defer receiver_terminal.deinit(alloc);
+    try std.testing.expectEqual(merge_state.Phase.rolled_back, receiver_terminal.phase);
+    try std.testing.expectEqual(@as(u64, 8), (try target.latestBatchForTransition(receiver_group)).?.last_entry_index);
 }
 
 test "data raft merge receiver checkpoint expands monotonically and snapshots" {

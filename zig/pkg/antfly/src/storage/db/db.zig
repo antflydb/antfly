@@ -105064,10 +105064,7 @@ test "db replicated merge checkpoints persist phase range and watermark across r
         try std.testing.expectEqualStrings("doc:a", db.getRange().start);
         var newer_after_finalize = finalized;
         newer_after_finalize.bootstrap_applied_index = 20;
-        try std.testing.expectError(
-            error.ConflictingMergeTransition,
-            db.batchReplicatedApply(.{ .merge_checkpoint = newer_after_finalize }),
-        );
+        try db.batchReplicatedApply(.{ .merge_checkpoint = newer_after_finalize });
         var different_transition = checkpoint_base;
         different_transition.transition_id = 41;
         try std.testing.expectError(
@@ -105076,10 +105073,7 @@ test "db replicated merge checkpoints persist phase range and watermark across r
         );
         var rollback = checkpoint_base;
         rollback.kind = .rollback;
-        try std.testing.expectError(
-            error.ConflictingMergeTransition,
-            db.batchReplicatedApply(.{ .merge_checkpoint = rollback }),
-        );
+        try db.batchReplicatedApply(.{ .merge_checkpoint = rollback });
         const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.TestExpectedEqual;
         defer alloc.free(raw);
         var state = try merge_state_mod.decodeAlloc(alloc, raw);
@@ -105088,6 +105082,52 @@ test "db replicated merge checkpoints persist phase range and watermark across r
         try std.testing.expect(state.bootstrap_complete);
         try std.testing.expectEqual(@as(u64, 19), state.bootstrap_applied_index);
     }
+}
+
+test "db replicated merge checkpoints keep rolled back receivers live across delayed controls and reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var checkpoint: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 50,
+        .donor_group_id = 51,
+        .receiver_group_id = 52,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+        checkpoint.kind = .rollback;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 3..) |kind, index| {
+        checkpoint.kind = kind;
+        checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+        checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+        try std.testing.expectEqualStrings("m", db.getRange().start);
+    }
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 8 });
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(merge_state_mod.Phase.rolled_back, state.phase);
+    try std.testing.expect(!state.bootstrap_complete);
+    try std.testing.expectEqual(@as(u64, 0), state.bootstrap_applied_index);
+    try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+    const value = (try db.get(alloc, "n")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"live\":true}", value);
 }
 
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {

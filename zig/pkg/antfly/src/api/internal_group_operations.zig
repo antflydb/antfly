@@ -738,10 +738,10 @@ pub const Operations = struct {
             .catch_up_split_destination => |op| group_id == op.source_group_id or group_id == op.destination_group_id,
             .finalize_split_source => |op| group_id == op.source_group_id,
             .rollback_split => |op| group_id == op.source_group_id,
-            .accept_merge_receiver => |op| group_id == op.receiver_group_id,
-            .catch_up_merge_receiver => |op| group_id == op.receiver_group_id,
-            .finalize_merge => |op| group_id == op.receiver_group_id,
-            .rollback_merge => |op| group_id == op.receiver_group_id,
+            .accept_merge_receiver => |op| group_id == op.donor_group_id,
+            .catch_up_merge_receiver => |op| group_id == op.donor_group_id,
+            .finalize_merge => |op| group_id == op.donor_group_id,
+            .rollback_merge => |op| group_id == op.donor_group_id,
         };
     }
 

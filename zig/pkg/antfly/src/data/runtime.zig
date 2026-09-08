@@ -13274,6 +13274,27 @@ pub const DataServer = struct {
             observation.receiver.phase == .finalized;
     }
 
+    fn replicatedMergeAcceptIsObsolete(self: *DataServer, transition_id: u64, donor_group_id: u64, receiver_group_id: u64) !bool {
+        const store = self.localTransitionApplyStore() orelse return error.MissingMergeSourceStore;
+        var receiver = try store.currentMergeReceiverState(self.alloc, receiver_group_id);
+        defer if (receiver) |*state| state.deinit(self.alloc);
+        if (receiver) |state| {
+            if (antfly.db.merge_state.isRetired(state, transition_id)) return true;
+            if (state.transition_id == transition_id) {
+                if (state.donor_group_id != donor_group_id or state.receiver_group_id != receiver_group_id)
+                    return error.ConflictingMergeTransition;
+                if (state.phase == .finalized or state.phase == .rolled_back) return true;
+            }
+        }
+        if (try store.currentMergeSourceState(self.alloc, donor_group_id)) |state| {
+            if (state.transition_id == transition_id) {
+                if (state.receiver_group_id != receiver_group_id) return error.ConflictingMergeTransition;
+                if (state.phase == .finalized or state.phase == .rolled_back) return true;
+            }
+        }
+        return false;
+    }
+
     fn localAcceptMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try op.table_contract.validateForMerge(
@@ -13284,6 +13305,10 @@ pub const DataServer = struct {
             var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
                 return error.TransitionOperationBusy;
             defer lane.deinit();
+            // Check receipts before opening/reconciling DBs or proposing any
+            // controls. The replicated folds also handle controls that were
+            // already in flight when a terminal receipt won.
+            if (try self.replicatedMergeAcceptIsObsolete(op.transition_id, op.donor_group_id, op.receiver_group_id)) return;
             const donor_root = try antfly.metadata.groupDbPathFromReplicaRoot(
                 self.alloc,
                 self.write_source.replica_root_dir,
@@ -35162,6 +35187,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
             } }) catch |err| return self.fail(err);
             self.stage = 4;
             self.rollback_observation = ops.observeMerge(self.record) catch |err| return self.fail(err);
+            self.checkTerminalAccept(&ops, self.record) catch |err| return self.fail(err);
 
             // A rolled-back attempt must release both durable participants so
             // a fresh metadata transition can copy and finalize the same
@@ -35195,9 +35221,25 @@ test "production DataServer replicated merge actions run on VoprIo" {
             } }) catch |err| return self.fail(err);
             self.stage = 8;
             self.observation = ops.observeMerge(retry_record) catch |err| return self.fail(err);
+            self.checkTerminalAccept(&ops, retry_record) catch |err| return self.fail(err);
             self.server.quiesceBackgroundWork();
             self.done = true;
             self.stop_driver = true;
+        }
+
+        fn checkTerminalAccept(self: *@This(), ops: *antfly.raft.ShardOperationAdapter, terminal_record: antfly.metadata.MergeTransitionRecord) !void {
+            const store = self.server.localTransitionApplyStore().?;
+            const donor_before = (try store.latestBatchForTransition(terminal_record.donor_group_id)).?.last_entry_index;
+            const receiver_before = (try store.latestBatchForTransition(terminal_record.receiver_group_id)).?.last_entry_index;
+            try ops.execute(.{ .accept_merge_receiver = .{
+                .transition_id = terminal_record.transition_id,
+                .donor_group_id = terminal_record.donor_group_id,
+                .receiver_group_id = terminal_record.receiver_group_id,
+                .allow_doc_identity_reassignment = terminal_record.allow_doc_identity_reassignment,
+                .table_contract = terminal_record.table_contract,
+            } });
+            try std.testing.expectEqual(donor_before, (try store.latestBatchForTransition(terminal_record.donor_group_id)).?.last_entry_index);
+            try std.testing.expectEqual(receiver_before, (try store.latestBatchForTransition(terminal_record.receiver_group_id)).?.last_entry_index);
         }
 
         fn checkCopyAttemptFence(self: *@This(), ops: *antfly.raft.ShardOperationAdapter, copy_record: antfly.metadata.MergeTransitionRecord) !void {

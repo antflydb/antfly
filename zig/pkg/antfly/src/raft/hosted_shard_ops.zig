@@ -922,7 +922,7 @@ test "hosted shard operation adapter rediscovers leader across placed replicas" 
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
 }
 
-test "hosted shard db adapter routes median key to remote leader" {
+test "hosted shard adapters route database reads and merge actions through remote HTTP" {
     const api_http_server = @import("../api/http_server.zig");
     const http_test_runtime = @import("../api/http_test_runtime.zig");
     const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -1005,8 +1005,71 @@ test "hosted shard db adapter routes median key to remote leader" {
 
     const internal_service_secret = "hosted-shard-db-test-internal-service-secret-v1";
     const internal_service_issuer = "hosted-shard-db-test";
+    const RemoteMergeOps = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn adapter(self: *@This()) shard_ops.ShardOperationAdapter {
+            return .{ .ptr = self, .vtable = &.{
+                .observe_split = observeSplit,
+                .observe_merge = observeMerge,
+                .prepare_split_source = prepareSplit,
+                .start_split_source = startSplit,
+                .bootstrap_split_destination = bootstrapSplit,
+                .catch_up_split_destination = catchUpSplit,
+                .finalize_split_source = finalizeSplit,
+                .rollback_split = rollbackSplit,
+                .accept_merge_receiver = acceptMerge,
+                .catch_up_merge_receiver = catchUpMerge,
+                .finalize_merge = finalizeMerge,
+                .rollback_merge = rollbackMerge,
+            } };
+        }
+        fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+            return error.UnsupportedOperation;
+        }
+        fn observeMerge(_: *anyopaque, _: u64, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+            return error.UnsupportedOperation;
+        }
+        fn prepareSplit(_: *anyopaque, _: u64, _: PrepareSplitSource) !void {
+            return error.UnsupportedOperation;
+        }
+        fn startSplit(_: *anyopaque, _: u64, _: StartSplitSource) !void {
+            return error.UnsupportedOperation;
+        }
+        fn bootstrapSplit(_: *anyopaque, _: u64, _: BootstrapSplitDestination) !void {
+            return error.UnsupportedOperation;
+        }
+        fn catchUpSplit(_: *anyopaque, _: u64, _: CatchUpSplitDestination) !void {
+            return error.UnsupportedOperation;
+        }
+        fn finalizeSplit(_: *anyopaque, _: u64, _: FinalizeSplitSource) !void {
+            return error.UnsupportedOperation;
+        }
+        fn rollbackSplit(_: *anyopaque, _: u64, _: RollbackSplit) !void {
+            return error.UnsupportedOperation;
+        }
+        fn record(ptr: *anyopaque, donor: u64, receiver: u64) !void {
+            if (donor != 88 or receiver != 99) return error.UnknownGroup;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .release);
+        }
+        fn acceptMerge(ptr: *anyopaque, _: u64, op: AcceptMergeReceiver) !void {
+            try record(ptr, op.donor_group_id, op.receiver_group_id);
+        }
+        fn catchUpMerge(ptr: *anyopaque, _: u64, op: CatchUpMergeReceiver) !void {
+            try record(ptr, op.donor_group_id, op.receiver_group_id);
+        }
+        fn finalizeMerge(ptr: *anyopaque, _: u64, op: FinalizeMerge) !void {
+            try record(ptr, op.donor_group_id, op.receiver_group_id);
+        }
+        fn rollbackMerge(ptr: *anyopaque, _: u64, op: RollbackMerge) !void {
+            try record(ptr, op.donor_group_id, op.receiver_group_id);
+        }
+    };
+    var remote_ops: RemoteMergeOps = .{};
     var server = api_http_server.ApiHttpServer.init(std.heap.page_allocator, .{
         .shard_db_adapter = FakeRemoteShardDb.adapter(),
+        .shard_ops = remote_ops.adapter(),
         .internal_service_secret = internal_service_secret,
         .internal_service_issuer = internal_service_issuer,
     }, FakeStatus.iface(), null, null);
@@ -1073,6 +1136,27 @@ test "hosted shard db adapter routes median key to remote leader" {
     defer std.testing.allocator.free(median_key);
     try std.testing.expectEqualStrings("doc:m", median_key);
     try std.testing.expectError(error.UnsupportedOperation, hosted.adapter().schemaIndexReady(std.testing.allocator, "docs", 88, 2, 1));
+    var merge_hosted = HostedShardOperationAdapter.init(std.testing.allocator, FakeCatalog.iface(), router.iface(), executor.executor(), undefined, null);
+    _ = merge_hosted.withInternalServiceAuth(internal_service_secret, internal_service_issuer);
+    inline for (.{ "accept_merge_receiver", "catch_up_merge_receiver", "finalize_merge", "rollback_merge" }) |kind| {
+        const action = @unionInit(metadata_mod.TransitionAction, kind, .{
+            .transition_id = 500,
+            .donor_group_id = 88,
+            .receiver_group_id = 99,
+            .table_contract = test_transition_table_contract,
+        });
+        try merge_hosted.adapter().execute(action);
+        // The endpoint must reject both receiver-addressed and unrelated
+        // commands before they can reach the production callback boundary.
+        const operations = @import("../api/internal_group_operations.zig").Operations{
+            .shard_ops = remote_ops.adapter(),
+            .reads = null,
+            .shard_db_adapter = null,
+        };
+        try std.testing.expectError(error.InvalidArgument, operations.executeTransition(.{}, 99, action));
+        try std.testing.expectError(error.InvalidArgument, operations.executeTransition(.{}, 100, action));
+    }
+    try std.testing.expectEqual(@as(u32, 4), remote_ops.calls.load(.acquire));
 }
 
 test "hosted shard db adapter rediscovers median key after stale leader route" {

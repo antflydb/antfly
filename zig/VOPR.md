@@ -3541,6 +3541,41 @@ All report zero skips, failures, or leaks. The production build,
 previous head had no reported failures but several jobs were still pending;
 these results are local validation, not a remote CI certification.
 
+### Remote Merge Control Routing and Terminal Retries (2026-09-07)
+
+The hosted merge adapter routed transition-control RPCs to the donor leader,
+but the receiving HTTP operation still required the receiver group in the URL.
+That mismatch rejected all four remotely routed merge actions with HTTP 400
+while local dispatch bypassed the check. Endpoint validation now agrees with
+donor-owned execution. Copy payloads and receiver checkpoints still target the
+receiver group; this change applies only to transition-control RPCs.
+
+An exact accept retry after rollback could also commit a receiver checkpoint
+that failed apply with `ConflictingMergeTransition`, blocking later entries in
+the still-live group. The analogous prepare retry after finalization failed
+donor projection apply. Acceptance now checks terminal/retired receipts before
+opening databases or proposing controls. Matching controls already in flight
+when rollback or finalization won fold to durable no-ops in both receiver and
+source apply, preserving terminal evidence while allowing Raft receipts to
+advance. Conflicting participant identities and receiver range/namespace
+contracts remain errors; this is not blanket suppression of apply failures.
+
+Regression coverage includes all four actions through the hosted remote
+adapter and actual HTTP listener, typed-operation rejection of
+receiver/unrelated group IDs, no new Raft entries for terminal accept retries
+in the production DataServer history, source and receiver terminal-control replay, subsequent
+ordinary writes after rollback, and durable reopen/snapshot evidence. These
+tests cover exact terminal retries, not arbitrary invalid internal commands
+or all overlapping transition histories.
+
+Validation: the default data-storage gate passes 69/69; the focused production
+runtime/remote-HTTP gate passes 4/4. The five DB merge regressions pass in Debug
+and ReleaseSafe, with the 34 delegated query tests also passing in each mode.
+All report zero skips, failures, and leaks. The production build,
+`make fmt-check`, and `git diff --check` pass. Pre-push CI on the previous head
+reported no failures but still had pending jobs; these are local results,
+not certification of the new commit by remote CI.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and

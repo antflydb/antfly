@@ -2823,6 +2823,14 @@ pub fn appendOperationEffects(
             if (transition.transition_id == 0 or transition.receiver_group_id == 0 or
                 transition.receiver_group_id == group_id or transition.raft_index == 0)
                 return error.InvalidMergeSourceTransition;
+            if (merge_source_state) |current| {
+                if (current.transition_id == transition.transition_id and
+                    (current.phase == .finalized or current.phase == .rolled_back))
+                {
+                    try validateMergeSourceIdentity(current, transition);
+                    continue;
+                }
+            }
             switch (transition.kind) {
                 .prepare => if (merge_source_state) |current| switch (current.phase) {
                     .accepting => {

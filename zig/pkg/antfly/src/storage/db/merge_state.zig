@@ -333,6 +333,12 @@ pub fn planCheckpointApply(
     };
     if (!rangesEqual(current_range, expected_current)) return error.MergeRangeStateMismatch;
 
+    // An exact terminal identity is a durable no-op for delayed controls, not
+    // a command error that can wedge replay at an already committed index.
+    // Identity/range/namespace mismatches above remain fail closed.
+    if (prior.phase == .finalized or prior.phase == .rolled_back)
+        return preserveAdvanced(prior, checkpoint, current_range);
+
     // Attempts are ordered first by the donor's elected term, then by its
     // node-local sequence. Delayed begins cannot reclaim a newer attempt;
     // delayed completion/finalization cannot certify a different copy.
@@ -353,7 +359,7 @@ pub fn planCheckpointApply(
         .begin_copy => unreachable,
         .accept => switch (prior.phase) {
             .accepting, .finalized => return preserveAdvanced(prior, checkpoint, expected_current),
-            .rolling_back, .rolled_back => return error.ConflictingMergeTransition,
+            .rolling_back, .rolled_back => return preserveAdvanced(prior, checkpoint, expected_current),
             .none => unreachable,
         },
         .bootstrap_complete => switch (prior.phase) {
