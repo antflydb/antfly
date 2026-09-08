@@ -1589,6 +1589,25 @@ pub const ResourceManager = struct {
         requested_primary_bytes: u64,
         required_secondary_bytes: u64,
     ) !OwnedSplitReservation {
+        return self.reserveOwnedSplitAtMostWithPolicy(slice, requested_primary_bytes, required_secondary_bytes, true);
+    }
+
+    /// Atomically grant available headroom up to the requested ceiling. Like
+    /// reserveWithoutReclaim, this never calls cache owners while the caller
+    /// holds another subsystem's resources. A nonzero request requires a
+    /// nonzero grant; partial grants remain ordinary owned reservations.
+    pub fn reserveAtMostWithoutReclaim(self: *ResourceManager, slice: Slice, requested_bytes: u64) !Reservation {
+        const split = try self.reserveOwnedSplitAtMostWithPolicy(slice, requested_bytes, 0, false);
+        return split.reservation;
+    }
+
+    fn reserveOwnedSplitAtMostWithPolicy(
+        self: *ResourceManager,
+        slice: Slice,
+        requested_primary_bytes: u64,
+        required_secondary_bytes: u64,
+        allow_reclaim: bool,
+    ) !OwnedSplitReservation {
         const requested_total = std.math.add(u64, requested_primary_bytes, required_secondary_bytes) catch
             return error.ResourceBudgetExceeded;
         if (requested_total == 0) return .{
@@ -1597,7 +1616,7 @@ pub const ResourceManager = struct {
             .secondary_bytes = 0,
         };
 
-        if (self.reserve(slice, requested_total)) |reservation| {
+        if (if (allow_reclaim) self.reserve(slice, requested_total) else self.reserveWithoutReclaim(slice, requested_total)) |reservation| {
             return .{
                 .reservation = reservation,
                 .primary_bytes = requested_primary_bytes,
@@ -3457,6 +3476,38 @@ test "owned split reservations prevent concurrent headroom theft" {
         const thread = try std.Thread.spawn(.{}, Concurrent.run, .{&concurrent});
         thread.join();
         try std.testing.expect(!concurrent.acquired.load(.acquire));
+    }
+}
+
+test "nonreclaiming partial reservations atomically respect slice and host headroom" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+    for ([_]u64{ 90, 200 }) |host_limit| {
+        var budgets = Options.defaultBudgets();
+        budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+        var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = host_limit } });
+        defer manager.deinit(std.testing.allocator);
+        var probe = Probe{};
+        const id = try manager.registerReclaimer(.document_extraction_working_set, &probe, Probe.reclaim);
+        defer manager.unregisterReclaimer(id);
+        var held = try manager.reserveWithoutReclaim(.document_extraction_working_set, 40);
+        defer held.release();
+        var other = try manager.reserveWithoutReclaim(.hbc_node_metadata_cache, 10);
+        defer other.release();
+        var growth = try manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 100);
+        try std.testing.expectEqual(@as(u64, if (host_limit == 90) 40 else 60), growth.bytes);
+        try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 1));
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        growth.release();
+        try std.testing.expectEqual(@as(u64, 40), manager.sliceStats(.document_extraction_working_set).used_bytes);
+        var zero = try manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 0);
+        zero.release();
     }
 }
 

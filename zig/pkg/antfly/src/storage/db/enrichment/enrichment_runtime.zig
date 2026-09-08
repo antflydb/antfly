@@ -12988,16 +12988,18 @@ const PdfWindowCompositeLease = struct {
         if (self.scratch_retry_reservation != null) return false;
         const requested = std.math.mul(usize, max_scratch_per_window, self.window_slots) catch return false;
         if (requested <= self.scratch_bytes) return false;
+        var growth = requested - self.scratch_bytes;
         if (self.manager) |manager| {
-            self.scratch_retry_reservation = manager.reserveWithoutReclaim(
+            self.scratch_retry_reservation = manager.reserveAtMostWithoutReclaim(
                 .document_extraction_working_set,
-                std.math.cast(u64, requested - self.scratch_bytes) orelse return false,
+                std.math.cast(u64, growth) orelse return false,
             ) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => return false,
                 else => return err,
             };
+            growth = @intCast(self.scratch_retry_reservation.?.bytes);
         }
-        self.scratch_bytes = requested;
+        self.scratch_bytes += growth;
         return true;
     }
 
@@ -13839,11 +13841,11 @@ test "PDF render scratch retry admits delta and releases first attempt before re
         }
     };
     for ([_]bool{ false, true }) |raster| {
-        for (0..4) |scenario| {
+        for (0..5) |scenario| {
             var budgets = resource_manager_mod.Options.defaultBudgets();
             budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
                 .soft_limit_bytes = 0,
-                .hard_limit_bytes = if (scenario == 2) 4196 else 4296,
+                .hard_limit_bytes = if (scenario == 2) 4196 else if (scenario == 4) 4246 else 4296,
             };
             var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
             defer manager.deinit(std.testing.allocator);
@@ -13863,12 +13865,12 @@ test "PDF render scratch retry admits delta and releases first attempt before re
                 switch (batch) {
                     inline else => |value| {
                         try std.testing.expectEqual(@as(usize, 7), value.results[0].page_number);
-                        try std.testing.expectEqual(scenario != 0, value.results[0].failure != null);
+                        try std.testing.expectEqual(scenario == 1 or scenario == 2, value.results[0].failure != null);
                     },
                 }
             }
             try std.testing.expectEqual(@as(usize, if (scenario == 2) 1 else 2), fake.calls);
-            try std.testing.expectEqual(@as(u64, if (scenario == 2) 4196 else 4296), manager.sliceStats(.document_extraction_working_set).used_bytes);
+            try std.testing.expectEqual(@as(u64, if (scenario == 2) 4196 else if (scenario == 4) 4246 else 4296), manager.sliceStats(.document_extraction_working_set).used_bytes);
             lease.finishRendering();
             try std.testing.expectEqual(@as(u64, 4096), manager.sliceStats(.document_extraction_working_set).used_bytes);
         }

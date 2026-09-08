@@ -5038,7 +5038,11 @@ estimate, not a bound on expanded font outlines. OCR/generation and embedding
 windows therefore share one admitted scratch-retry path. On a worker-budget
 failure, it non-blockingly reserves the delta up to the already configured
 scratch ceiling, keeps output credit pinned, frees the joined attempt's outputs,
-and retries rendering once with one worker. No model invocation is replayed.
+and retries rendering once with one worker. Growth accepts a partial grant:
+the document-working-set slice also covers retained output and metadata, so
+requiring the full configured scratch ceiling can reject useful headroom even
+with just one page. The resource manager atomically clamps growth to both slice
+and host headroom without invoking reclaimers. No model invocation is replayed.
 The original deadline, transforms, page identities and output caps remain in
 force. If extra admission is denied, the ordered original failures are retained;
 if the second attempt still exceeds the cap, it remains a failure. Both grants
