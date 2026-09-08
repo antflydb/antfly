@@ -761,7 +761,7 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
         table_name,
         index_name,
         timeout_s=30.0,
-        interval_s=0.25,
+        interval_s=0.01,
         until="complete",
     )
     index = backup_api.get_index(table_name, index_name)
@@ -1414,14 +1414,45 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert first_continuity_samples >= 5
 
     progressive_openai_embedder.allow_rate_limited_requests()
-    complete = backup_api.wait_index_ready(
-        table_name,
-        index_name,
-        timeout_s=120.0,
-        interval_s=0.1,
-        until="complete",
-        require_query_fresh=True,
-    )
+    try:
+        complete = backup_api.wait_index_ready(
+            table_name,
+            index_name,
+            timeout_s=120.0,
+            interval_s=0.1,
+            until="complete",
+            require_query_fresh=True,
+        )
+    except AssertionError:
+        print(
+            json.dumps(
+                {
+                    "progressive_completion_status": backup_api.get_index(
+                        table_name, index_name
+                    )["status"]
+                },
+                indent=2,
+            )
+        )
+        try:
+            print(
+                json.dumps(
+                    {
+                        "progressive_completion_query": backup_api.query_table(
+                            table_name,
+                            {
+                                "embeddings": {index_name: [1.0, 0.0, 0.0]},
+                                "indexes": [index_name],
+                                "limit": 1,
+                            },
+                        )
+                    },
+                    indent=2,
+                )
+            )
+        except Exception as exc:
+            print(f"progressive_completion_query_error: {exc}")
+        raise
     assert complete["readiness"]["state"] == "ready"
     assert complete["readiness"]["queryable"] is True
     assert complete["readiness"]["complete"] is True
