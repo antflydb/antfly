@@ -1757,6 +1757,7 @@ pub fn build(b: *std.Build) void {
     usermgr_mod.link_libc = link_libc;
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
     usermgr_mod.addImport("usermgr_storage", storage_mod);
+    usermgr_mod.addImport("antfly_platform", platform_mod);
     const wasm_bloom_mod = b.createModule(.{
         .root_source_file = b.path("lib/bloom/src/mod.zig"),
         .target = wasm_target,

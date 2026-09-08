@@ -267,6 +267,8 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
     data.prefetch.stop();
 }
 
+/// Stops the worker and retires borrowed guards. Call before destroying
+/// lazy_weights, whose entries still refer to this queue's Io and mutex.
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
     if (!data.prefetch_initialized) return;
     data.prefetch.stop();

@@ -205,9 +205,9 @@ const BackendContext = union(enum) {
             .native => |*ctx| {
                 if (comptime build_options.enable_native) {
                     ctx.compute.computeBackend().deinit();
+                    native_mod.deinitPrefetchQueue(ctx.weight_store);
                     ctx.weight_store.resident_weights.deinit(allocator);
                     ctx.weight_store.lazy_weights.deinit(allocator);
-                    native_mod.deinitPrefetchQueue(ctx.weight_store);
                     allocator.destroy(ctx.weight_store);
                 } else {
                     unreachable;
