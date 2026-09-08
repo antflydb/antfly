@@ -31,7 +31,7 @@ believes what it retrieves").
   pull quote, rewrite it as a plain statement or delete it.
 - "Antfly", never "AntflyDB". "Antfly Inference" for the built-in model runtime.
   "standalone mode" for `antfly standalone`.
-- Roadmap never appears as shipped. No "coming soon", no "future enhancements".
+- Roadmap never appears as shipped, and no future-tense feature promises.
 - Explain the why only for non-obvious steps. Readers are here for the commands.
 - Callouts carry one fact each and only when the fact would otherwise be missed. An
   `info` callout that restates the paragraph above it is deleted.

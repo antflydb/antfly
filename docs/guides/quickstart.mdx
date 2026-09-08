@@ -114,7 +114,7 @@ curl -L -o wiki-articles.jsonl https://cdn.antfly.io/datasets/wiki-articles-10k-
 head -n 1 wiki-articles.jsonl | jq '.'
 ```
 
-One article per line, each with `title`, `body`, and `url`. 2,446 of them also carry a `thumbnail_url`, which the image search step uses later.
+One article per line, each with `title`, `body`, and `url`. 2,446 of the 10,000 also carry a `thumbnail_url`, which the image search step uses later.
 
 ## Create a Table
 
@@ -336,7 +336,7 @@ antfly index wait --table wikipedia \
 
 Continue as soon as it returns. Results improve as the remaining documents are indexed; `antfly index list --table wikipedia` shows progress. To wait for the full corpus instead, use `--until complete`. Timing depends on hardware. If the wait times out, do not press on; see [Troubleshooting](#troubleshooting).
 
-In the status output, articles can produce multiple chunks, so `SEARCHABLE` may exceed the document count, and `avg_embeddings` measures chunk embeddings per second, not documents.
+Articles can produce multiple chunks, so `SEARCHABLE` in the status output may exceed the document count, and `avg_embeddings` measures chunk embeddings per second, not documents.
 
 ## Search
 

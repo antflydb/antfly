@@ -15,7 +15,7 @@ QUICKSTART = REPO / "docs" / "guides" / "quickstart.mdx"
 # Pages on the launch path (home -> install -> docs). Their fenced blocks and
 # cURL payloads get the same static checks as the quickstart.
 LAUNCH_PAGES = (
-    REPO / "docs" / "index.mdx",
+    REPO / "docs" / "introduction.mdx",
     REPO / "docs" / "downloads.mdx",
     REPO / "docs" / "guides" / "inference.mdx",
     REPO / "docs" / "guides" / "hybrid-search.mdx",
