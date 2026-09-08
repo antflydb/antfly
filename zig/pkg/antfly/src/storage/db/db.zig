@@ -70392,12 +70392,13 @@ test "db repair issue list exposes algebraic generation debt as repairable" {
     try std.testing.expectEqualStrings("", page.issues[0].unsupported_reason);
     try std.testing.expectEqualStrings("index_repair_required", page.issues[0].last_error);
 
-    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+    // This checks repairability and completion, not the production pause SLA.
+    var repair = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
         .target = .index,
         .artifact_kind = .algebraic,
         .index_name = "alg_v1",
         .limit = 1,
-    });
+    }, repair_completion_test_options);
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
     try std.testing.expectEqual(@as(u64, 0), repair.unsupported);

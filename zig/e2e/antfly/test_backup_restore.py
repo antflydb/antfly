@@ -285,6 +285,40 @@ def _check_response(response: requests.Response) -> dict:
     return payload
 
 
+def _seed_cluster_docs_when_writable(
+    cluster, session: requests.Session, table_name: str, docs: dict, *, timeout_s=30.0
+) -> dict:
+    # Replication status is an observation, not a lease on the data leader or
+    # its routing catalog. Seed through the write API's admission contract.
+    # Only this explicit pre-commit response permits a fresh batch attempt;
+    # transport failures and ambiguous/post-commit outcomes must remain errors.
+    deadline = time.monotonic() + timeout_s
+    last_response: requests.Response | None = None
+
+    def attempt() -> dict | None:
+        nonlocal last_response
+        cluster.assert_processes_alive()
+        last_response = session.post(
+            f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
+            json={"inserts": docs, "sync_level": "write"},
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+        if (
+            last_response.status_code == 503
+            and last_response.text.strip() == "write unavailable"
+        ):
+            return None
+        return _check_response(last_response)
+
+    batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
+    assert batch is not None, (
+        f"table {table_name} did not become writable; "
+        f"last_response={last_response.text if last_response is not None else None}\n"
+        f"{cluster.debug_logs()}"
+    )
+    return batch
+
+
 def _is_metadata_not_leader_response(response: requests.Response) -> bool:
     return response.headers.get("X-Antfly-Metadata-Not-Leader", "").lower() == "true"
 
@@ -1426,13 +1460,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
             "content": "high range backup and restore coverage",
         },
     }
-    batch = _check_response(
-        session.post(
-            f"{data_api_url}/tables/{table_name}/batch",
-            json={"inserts": source_docs, "sync_level": "write"},
-            timeout=30,
-        )
-    )
+    batch = _seed_cluster_docs_when_writable(cluster, session, table_name, source_docs)
     assert batch["inserted"] == len(source_docs)
     assert wait_until(
         lambda: (
