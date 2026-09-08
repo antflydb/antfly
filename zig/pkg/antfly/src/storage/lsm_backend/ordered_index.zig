@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Account = @import("memory_account.zig").Account;
 
 /// Persistent rank-indexed AVL tree. A snapshot retains only its root. Writers
 /// mutate unique paths and copy shared paths; no reader observes a mutation.
@@ -23,6 +24,7 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
     return struct {
         const Self = @This();
         pub const Node = struct {
+            account: ?*Account = null,
             refs: std.atomic.Value(usize) = .init(1),
             entry: Entry,
             left: ?*Node = null,
@@ -41,6 +43,7 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
                 if (self.left) |node| node.release(allocator);
                 if (self.right) |node| node.release(allocator);
                 self.entry.deinit(allocator);
+                if (self.account) |account| account.discharge(@sizeOf(Node));
                 allocator.destroy(self);
             }
 
@@ -78,6 +81,7 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
         };
 
         root: ?*Node = null,
+        account: ?*Account = null,
         spare: std.ArrayListUnmanaged(*Node) = .empty,
 
         /// Borrowed cursor: its owner pins the immutable root. AVL height is
@@ -130,15 +134,6 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
             }
         };
 
-        pub fn admissionGrowthBytes(self: *const Self, edits: usize, shared: bool) u64 {
-            if (edits == 0) return 0;
-            const future_count = size(self.root) +| edits;
-            const height_bound = 2 * @as(usize, std.math.log2_int(usize, future_count)) + 2;
-            const reserve = 3 * @as(u64, height_bound) + 4;
-            const copies = if (shared) @min(size(self.root), edits *| reserve) else 0;
-            return (edits +| copies +| reserve) *| @sizeOf(Node) +| reserve * @sizeOf(*Node);
-        }
-
         fn size(node: ?*const Node) usize {
             return if (node) |value| value.count else 0;
         }
@@ -148,9 +143,17 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             if (self.root) |root| root.release(allocator);
-            for (self.spare.items) |node| allocator.destroy(node);
+            for (self.spare.items) |node| {
+                if (self.account) |account| account.discharge(@sizeOf(Node));
+                allocator.destroy(node);
+            }
             self.spare.deinit(allocator);
+            if (self.account) |account| account.release();
             self.* = .{};
+        }
+
+        pub fn fork(self: *const Self) Self {
+            return .{ .root = if (self.root) |root| root.retain() else null, .account = if (self.account) |account| account.retain() else null };
         }
 
         pub fn memoryBytes(self: *const Self) u64 {
@@ -160,15 +163,20 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
         }
 
         pub fn prepare(self: *Self, allocator: std.mem.Allocator) !void {
+            if (self.account == null) self.account = try Account.create(allocator);
             const needed = 3 * @as(usize, depth(self.root)) + 4;
             try self.spare.ensureTotalCapacity(allocator, needed);
-            while (self.spare.items.len < needed) self.spare.appendAssumeCapacity(try allocator.create(Node));
+            while (self.spare.items.len < needed) {
+                const node = try allocator.create(Node);
+                self.account.?.charge(@sizeOf(Node));
+                self.spare.appendAssumeCapacity(node);
+            }
         }
 
         fn unique(self: *Self, allocator: std.mem.Allocator, node: *Node) *Node {
             if (node.refs.load(.acquire) == 1) return node;
             const copy = self.spare.pop().?;
-            copy.* = .{ .entry = node.entry.retainShared(), .left = if (node.left) |child| child.retain() else null, .right = if (node.right) |child| child.retain() else null, .count = node.count, .height = node.height, .bytes = node.bytes };
+            copy.* = .{ .account = self.account, .entry = node.entry.retainShared(), .left = if (node.left) |child| child.retain() else null, .right = if (node.right) |child| child.retain() else null, .count = node.count, .height = node.height, .bytes = node.bytes };
             node.release(allocator);
             return copy;
         }
@@ -194,7 +202,7 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
         fn insert(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry) *Node {
             const root = if (old) |node| self.unique(allocator, node) else {
                 const node = self.spare.pop().?;
-                node.* = .{ .entry = entry.retainShared() };
+                node.* = .{ .account = self.account, .entry = entry.retainShared() };
                 node.refresh();
                 return node;
             };

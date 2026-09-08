@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("../backend_adapter.zig");
 const backend_types = @import("../backend_types.zig");
+pub const memory_account = @import("memory_account.zig");
 
 const CollisionBucket = std.ArrayListUnmanaged(usize);
 
@@ -153,6 +154,7 @@ const OrderedIndex = @import("ordered_index.zig").Index(OwnedEntry, struct {
 }.compare);
 
 const SharedEntry = struct {
+    account: ?*memory_account.Account = null,
     references: std.atomic.Value(usize) = .init(1),
     allocator: Allocator,
     allocation_len: usize,
@@ -161,6 +163,7 @@ const SharedEntry = struct {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         const bytes: [*]align(@alignOf(SharedEntry)) u8 = @ptrCast(self);
+        if (self.account) |account| account.discharge(self.allocation_len);
         allocator.free(bytes[0..self.allocation_len]);
     }
 };
@@ -184,6 +187,8 @@ fn initSharedEntry(allocator: Allocator, namespace: backend_types.Namespace, key
 }
 
 pub const State = struct {
+    retired_next: ?*State = null,
+    account: ?*memory_account.Account = null,
     entries: std.ArrayListUnmanaged(OwnedEntry) = .empty,
     arena_owner: ?*std.heap.ArenaAllocator = null,
     frozen_memory_bytes: ?u64 = null,
@@ -223,6 +228,22 @@ pub const State = struct {
         return self.frozen_memory_bytes orelse self.computeMemoryBytes();
     }
 
+    pub fn accountedMemoryBytes(self: *const State, pass: u64) u64 {
+        if (self.account) |account| return account.chargeOnce(pass) + self.entries.capacity * @sizeOf(OwnedEntry);
+        if (self.arena_owner != null) return self.estimatedMemoryBytes();
+        var bytes: u64 = self.entries.capacity * @sizeOf(OwnedEntry);
+        for (self.entries.items) |entry| {
+            if (entry.shared) |owner| {
+                if (owner.account) |account| {
+                    bytes +|= account.chargeOnce(pass);
+                    continue;
+                }
+            }
+            bytes +|= logicalEntryBytes(entry) - @sizeOf(OwnedEntry) + entry.sharedOverheadBytes();
+        }
+        return bytes;
+    }
+
     pub fn estimatedLogicalBytes(self: *const State) u64 {
         if (self.ordered_root) |root| return root.bytes - root.count * (@sizeOf(OrderedIndex.Node) + @sizeOf(SharedEntry)) + root.count * @sizeOf(OwnedEntry);
         var bytes: u64 = 0;
@@ -246,10 +267,13 @@ pub const State = struct {
             arena.deinit();
             allocator.destroy(arena);
         }
+        if (self.account) |account| account.release();
         self.* = .{};
     }
 
     pub fn clone(self: *const State, allocator: Allocator) !State {
+        // Flat states may subsequently mix allocations from several accounts.
+        // Their shared entries retain those accounts individually.
         var out: State = .{};
         errdefer out.deinit(allocator);
         try out.entries.ensureTotalCapacity(allocator, self.entryCount());
@@ -410,10 +434,10 @@ pub const ActiveMemTable = struct {
     ordered_enabled: bool = true,
 
     pub fn entryCount(self: *const ActiveMemTable) usize {
-        return self.entries.items.len;
+        return if (self.ordered_enabled) (if (self.ordered.root) |root| root.count else 0) else self.entries.items.len;
     }
     pub fn entryAt(self: *const ActiveMemTable, index: usize) OwnedEntry {
-        return self.entries.items[index];
+        return if (self.ordered_enabled) self.ordered.root.?.at(index) else self.entries.items[index];
     }
 
     pub fn deinit(self: *ActiveMemTable, allocator: Allocator) void {
@@ -429,6 +453,11 @@ pub const ActiveMemTable = struct {
     }
 
     pub fn clone(self: *const ActiveMemTable, allocator: Allocator) !State {
+        if (self.ordered_enabled) {
+            var pinned = try self.snapshot(allocator);
+            defer pinned.deinit(allocator);
+            return pinned.clone(allocator);
+        }
         var out: State = .{};
         errdefer out.deinit(allocator);
         try out.entries.ensureTotalCapacity(allocator, self.entries.items.len);
@@ -440,6 +469,11 @@ pub const ActiveMemTable = struct {
     }
 
     pub fn cloneArena(self: *const ActiveMemTable, allocator: Allocator) !State {
+        if (self.ordered_enabled) {
+            var pinned = try self.snapshot(allocator);
+            defer pinned.deinit(allocator);
+            return pinned.cloneArena(allocator);
+        }
         var out: State = .{};
         errdefer out.deinit(allocator);
         try out.entries.ensureTotalCapacity(allocator, self.entries.items.len);
@@ -454,12 +488,21 @@ pub const ActiveMemTable = struct {
     /// Snapshot just the ordered index; shared entry bytes are immutable for
     /// this epoch. Overwrites replace only the affected entry, and retired
     /// values are released with the last reader instead of a whole arena.
-    pub fn snapshot(self: *const ActiveMemTable, allocator: Allocator) !State {
+    pub fn snapshot(self: *const ActiveMemTable, allocator: Allocator) Allocator.Error!State {
         if (!self.ordered_enabled) return self.clone(allocator);
-        return .{ .ordered_root = if (self.ordered.root) |root| root.retain() else null };
+        return .{ .ordered_root = if (self.ordered.root) |root| root.retain() else null, .account = if (self.ordered.account) |account| account.retain() else null };
     }
 
     pub fn toStateMove(self: *ActiveMemTable, allocator: Allocator) !State {
+        if (self.ordered_enabled) {
+            // Transfer the generation in constant time. Keep the small spare
+            // pool in the writer; it is independent of the published root.
+            var out = State{ .ordered_root = self.ordered.root, .account = if (self.ordered.account) |account| account.retain() else null };
+            self.ordered.root = null;
+            self.logical_bytes = 0;
+            out.freezeMemoryAccounting();
+            return out;
+        }
         self.ordered.deinit(allocator);
         var out = State{
             .entries = self.entries,
@@ -502,13 +545,25 @@ pub const ActiveMemTable = struct {
 
     pub fn get(self: *const ActiveMemTable, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
         const idx = self.findIndex(namespace, key) orelse return error.NotFound;
-        const entry = self.entries.items[idx];
+        const entry = self.entryAt(idx);
         if (entry.tombstone) return error.NotFound;
         return entry.value;
     }
 
     pub fn findIndex(self: *const ActiveMemTable, namespace: backend_types.Namespace, key: []const u8) ?usize {
+        if (self.ordered_enabled) {
+            const root = self.ordered.root orelse return null;
+            const rank = root.lowerBound(.{ .namespace_name = if (namespace.name) |name| @constCast(name) else null, .key = @constCast(key), .value = &.{}, .tombstone = false });
+            if (rank == root.count or compareEntryTo(root.at(rank), namespace, key) != .eq) return null;
+            return rank;
+        }
         return self.index.find(self.entries.items, hashEntryKey(namespace, key), namespace, key);
+    }
+
+    pub fn lowerBound(self: *const ActiveMemTable, namespace: backend_types.Namespace, key: []const u8) usize {
+        std.debug.assert(self.ordered_enabled);
+        const root = self.ordered.root orelse return 0;
+        return root.lowerBound(.{ .namespace_name = if (namespace.name) |name| @constCast(name) else null, .key = @constCast(key), .value = &.{}, .tombstone = false });
     }
 
     pub fn estimatedIndexMemoryBytes(self: *const ActiveMemTable) u64 {
@@ -520,6 +575,7 @@ pub const ActiveMemTable = struct {
     }
 
     pub fn estimatedMemoryBytes(self: *const ActiveMemTable) u64 {
+        if (self.ordered_enabled) return self.ordered.memoryBytes() + self.logical_bytes - self.entryCount() * @sizeOf(OwnedEntry) + self.entryCount() * @sizeOf(SharedEntry) + (if (self.ordered.account != null) @as(u64, @sizeOf(memory_account.Account)) else 0);
         // Every active entry crosses upsertSharedMove/upsert, so its packed
         // allocation has exactly one SharedEntry header. logical_bytes is
         // maintained on every insert/overwrite; capacity is charged separately.
@@ -530,6 +586,32 @@ pub const ActiveMemTable = struct {
             self.index.estimatedMemoryBytes() +| self.ordered.memoryBytes() +| (if (self.arena_owner) |arena| arena.queryCapacity() else 0);
     }
 
+    pub fn accountedMemoryBytes(self: *const ActiveMemTable, pass: u64) u64 {
+        if (self.ordered_enabled) return (if (self.ordered.account) |account| account.chargeOnce(pass) else 0) + self.ordered.spare.capacity * @sizeOf(*OrderedIndex.Node);
+        return self.estimatedMemoryBytes();
+    }
+
+    /// Build the complete successor before WAL append. The live root is never
+    /// edited, including when any allocation fails halfway through the batch.
+    pub fn preparePublication(self: *ActiveMemTable, allocator: Allocator, incoming: *const ActiveMemTable) !ActiveMemTable {
+        std.debug.assert(self.ordered_enabled);
+        var candidate = ActiveMemTable{ .ordered = self.ordered.fork(), .logical_bytes = self.logical_bytes };
+        std.mem.swap(std.ArrayListUnmanaged(*OrderedIndex.Node), &candidate.ordered.spare, &self.ordered.spare);
+        errdefer candidate.deinit(allocator);
+        for (0..incoming.entryCount()) |i| {
+            var entry = try cloneEntry(allocator, incoming.entryAt(i));
+            errdefer entry.deinit(allocator);
+            try candidate.upsertMove(allocator, entry);
+        }
+        return candidate;
+    }
+
+    /// No allocation, validation, or fallible work may follow the WAL boundary
+    /// before this swap. The caller retires the previous root after publication.
+    pub fn publishPrepared(self: *ActiveMemTable, candidate: *ActiveMemTable) void {
+        std.mem.swap(ActiveMemTable, self, candidate);
+    }
+
     pub fn upsert(
         self: *ActiveMemTable,
         allocator: Allocator,
@@ -538,12 +620,15 @@ pub const ActiveMemTable = struct {
         value: []const u8,
         tombstone: bool,
     ) !void {
-        if (self.ordered_enabled) try self.ordered.prepare(allocator);
+        if (self.ordered_enabled) {
+            var entry = try initSharedEntry(allocator, namespace, key, value, tombstone);
+            errdefer entry.deinit(allocator);
+            return self.upsertSharedMove(allocator, entry);
+        }
         const key_hash = hashEntryKey(namespace, key);
         if (self.index.find(self.entries.items, key_hash, namespace, key)) |idx| {
             const old_value_len: u64 = @intCast(self.entries.items[idx].value.len);
             try replaceEntryValueCopy(&self.entries.items[idx], allocator, value, tombstone, false);
-            if (self.ordered_enabled) self.ordered.putPrepared(allocator, self.entries.items[idx]);
             self.logical_bytes = self.logical_bytes -| old_value_len +| @as(u64, @intCast(value.len));
             return;
         }
@@ -554,7 +639,6 @@ pub const ActiveMemTable = struct {
         const idx = self.entries.items.len;
         try self.index.insert(allocator, key_hash, idx);
         self.entries.appendAssumeCapacity(owned);
-        if (self.ordered_enabled) self.ordered.putPrepared(allocator, owned);
         self.logical_bytes +|= logicalEntryBytes(self.entries.items[idx]);
     }
 
@@ -570,14 +654,31 @@ pub const ActiveMemTable = struct {
     }
 
     fn upsertSharedMove(self: *ActiveMemTable, allocator: Allocator, entry: OwnedEntry) !void {
-        if (self.ordered_enabled) try self.ordered.prepare(allocator);
+        if (self.ordered_enabled) {
+            try self.ordered.prepare(allocator);
+            const account = self.ordered.account.?;
+            var owned = entry;
+            if (entry.shared.?.account) |previous| {
+                if (previous != account) owned = try initSharedEntry(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
+            }
+            if (owned.shared.?.account == null) {
+                owned.shared.?.account = account;
+                account.charge(owned.shared.?.allocation_len);
+            }
+            self.ordered.putPrepared(allocator, owned);
+            const root = self.ordered.root.?;
+            self.logical_bytes = root.bytes - root.count * (@sizeOf(OrderedIndex.Node) + @sizeOf(SharedEntry)) + root.count * @sizeOf(OwnedEntry);
+            if (owned.shared != entry.shared) owned.deinit(allocator);
+            var moved = entry;
+            moved.deinit(allocator);
+            return;
+        }
         const namespace = namespaceOf(entry);
         const key_hash = hashEntryKey(namespace, entry.key);
         if (self.index.find(self.entries.items, key_hash, namespace, entry.key)) |idx| {
             const old_value_len: u64 = @intCast(self.entries.items[idx].value.len);
             const new_value_len: u64 = @intCast(entry.value.len);
             replaceEntryValueMove(&self.entries.items[idx], allocator, entry);
-            if (self.ordered_enabled) self.ordered.putPrepared(allocator, entry);
             self.logical_bytes = self.logical_bytes -| old_value_len +| new_value_len;
             return;
         }
@@ -586,7 +687,6 @@ pub const ActiveMemTable = struct {
         const idx = self.entries.items.len;
         try self.index.insert(allocator, key_hash, idx);
         self.entries.appendAssumeCapacity(entry);
-        if (self.ordered_enabled) self.ordered.putPrepared(allocator, entry);
         self.logical_bytes +|= logicalEntryBytes(self.entries.items[idx]);
     }
 
@@ -811,19 +911,9 @@ pub fn mergeStatesMove(
     }
 
     older.entries.items.len = 0;
-    older.entries.deinit(allocator);
-    if (older.arena_owner) |arena| {
-        arena.deinit();
-        allocator.destroy(arena);
-    }
-    older.* = .{};
+    older.deinit(allocator);
     newer.entries.items.len = 0;
-    newer.entries.deinit(allocator);
-    if (newer.arena_owner) |arena| {
-        arena.deinit();
-        allocator.destroy(arena);
-    }
-    newer.* = .{};
+    newer.deinit(allocator);
 
     return merged;
 }
@@ -869,12 +959,7 @@ pub fn applyStateMove(target: *State, allocator: Allocator, source: *State) !voi
     }
 
     source.entries.items.len = 0;
-    source.entries.deinit(allocator);
-    if (source.arena_owner) |arena| {
-        arena.deinit();
-        allocator.destroy(arena);
-    }
-    source.* = .{};
+    source.deinit(allocator);
 }
 
 pub fn applyStateMoveToMutable(target: anytype, allocator: Allocator, source: *State) !void {
@@ -916,15 +1001,27 @@ fn applyStateMoveToActive(target: *ActiveMemTable, allocator: Allocator, source:
         transferred += 1;
     }
     source.entries.items.len = 0;
-    source.entries.deinit(allocator);
-    if (source.arena_owner) |arena| {
-        arena.deinit();
-        allocator.destroy(arena);
-    }
-    source.* = .{};
+    source.deinit(allocator);
 }
 
 fn applyActiveMoveToMutable(target: anytype, allocator: Allocator, source: *ActiveMemTable) !void {
+    if (comptime @TypeOf(target.*) == ActiveMemTable) {
+        if (target.ordered_enabled) {
+            var prepared = try target.preparePublication(allocator, source);
+            defer prepared.deinit(allocator);
+            target.publishPrepared(&prepared);
+            source.deinit(allocator);
+            return;
+        }
+    }
+    if (source.ordered_enabled) {
+        for (0..source.entryCount()) |i| {
+            const entry = source.entryAt(i);
+            try target.upsert(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
+        }
+        source.deinit(allocator);
+        return;
+    }
     if (source.arena_owner != null) {
         for (source.entries.items) |entry| {
             try target.upsert(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
@@ -1003,6 +1100,87 @@ pub fn stripTombstones(state: *State, allocator: Allocator) !void {
     }
     state.deinit(allocator);
     state.entries = filtered;
+}
+
+test "prepared mutable publication is atomic at every allocation failure" {
+    var failures: usize = 0;
+    var successes: usize = 0;
+    for (0..80) |offset| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const alloc = failing.allocator();
+        var live: ActiveMemTable = .{};
+        defer live.deinit(alloc);
+        for (0..64) |i| {
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try live.upsert(alloc, .{}, &key, "old", false);
+        }
+        var pinned = try live.snapshot(alloc);
+        defer pinned.deinit(alloc);
+        var incoming: ActiveMemTable = .{ .ordered_enabled = false };
+        defer incoming.deinit(alloc);
+        const a = [_]u8{0} ** 8;
+        const b = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
+        try incoming.upsert(alloc, .{}, &a, "new-a", false);
+        try incoming.upsert(alloc, .{}, &b, "new-b", false);
+        failing.fail_index = failing.alloc_index + offset;
+        var prepared = live.preparePublication(alloc, &incoming) catch |err| {
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqualStrings("old", try live.get(.{}, &a));
+            try std.testing.expectEqualStrings("old", try live.get(.{}, &b));
+            failures += 1;
+            continue;
+        };
+        defer prepared.deinit(alloc);
+        failing.fail_index = failing.alloc_index;
+        live.publishPrepared(&prepared);
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqualStrings("new-a", try live.get(.{}, &a));
+        try std.testing.expectEqualStrings("new-b", try live.get(.{}, &b));
+        try std.testing.expectEqualStrings("old", try pinned.get(.{}, &a));
+        successes += 1;
+    }
+    try std.testing.expect(failures > 1 and successes > 1);
+}
+
+test "ordered generations account shared allocations once and rotate without allocation" {
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = counter.allocator();
+    var live: ActiveMemTable = .{};
+    defer live.deinit(alloc);
+    const value = [_]u8{'x'} ** 4096;
+    for (0..1024) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try live.upsert(alloc, .{}, &key, &value, false);
+    }
+    var epochs: [32]State = undefined;
+    var initialized: usize = 0;
+    defer for (epochs[0..initialized]) |*epoch| epoch.deinit(alloc);
+    for (&epochs, 0..) |*epoch, i| {
+        epoch.* = try live.snapshot(alloc);
+        initialized += 1;
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try live.upsert(alloc, .{}, &key, &value, false);
+    }
+    const pass = memory_account.nextPass();
+    var charged = live.accountedMemoryBytes(pass);
+    for (&epochs) |*epoch| charged += epoch.accountedMemoryBytes(pass);
+    try std.testing.expectEqual(counter.allocated_bytes - counter.freed_bytes, charged);
+    const root = live.ordered.root;
+    const allocations = counter.allocations;
+    const frees = counter.deallocations;
+    counter.fail_index = counter.alloc_index;
+    var immutable = try live.toStateMove(alloc);
+    counter.fail_index = std.math.maxInt(usize);
+    defer immutable.deinit(alloc);
+    try std.testing.expect(immutable.ordered_root == root);
+    try std.testing.expectEqual(allocations, counter.allocations);
+    try std.testing.expectEqual(frees, counter.deallocations);
+    try std.testing.expectEqual(@as(usize, 1024), immutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), live.entryCount());
 }
 
 test "ordered mutable snapshot setup benchmark" {
@@ -1161,6 +1339,29 @@ test "mergeStates prefers newer entries and preserves ordering" {
     try std.testing.expectEqualStrings("lsn", merged.entries.items[3].key);
 }
 
+test "materialized ordered generations can move entries across allocation accounts" {
+    const alloc = std.testing.allocator;
+    var first: ActiveMemTable = .{};
+    defer first.deinit(alloc);
+    var second: ActiveMemTable = .{};
+    defer second.deinit(alloc);
+    try first.upsert(alloc, .{}, "a", "old", false);
+    try second.upsert(alloc, .{}, "b", "new", false);
+    var older = try first.snapshot(alloc);
+    defer older.deinit(alloc);
+    var newer = try second.snapshot(alloc);
+    defer newer.deinit(alloc);
+    var merged = try mergeStatesMove(alloc, &older, &newer);
+    defer merged.deinit(alloc);
+    try merged.upsert(alloc, .{}, "c", "third", false);
+    try std.testing.expectEqualStrings("old", try merged.get(.{}, "a"));
+    try std.testing.expectEqualStrings("new", try merged.get(.{}, "b"));
+    const pass = memory_account.nextPass();
+    const live_bytes = first.accountedMemoryBytes(pass) + second.accountedMemoryBytes(pass);
+    try std.testing.expect(live_bytes > 0);
+    try std.testing.expectEqual(@as(u64, merged.entries.capacity * @sizeOf(OwnedEntry) + 6), merged.accountedMemoryBytes(pass));
+}
+
 test "mergeStatesMove prefers newer entries and consumes inputs" {
     var older: State = .{};
     try older.appendUpsert(std.testing.allocator, .{}, "doc:a", "A1", false);
@@ -1195,13 +1396,13 @@ test "applyStateMove updates active mutable in place and consumes source" {
 
     try applyStateMove(&target, std.testing.allocator, &source);
 
-    try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 4), target.entries.items.len);
-    try std.testing.expectEqualStrings("doc:a", target.entries.items[0].key);
-    try std.testing.expectEqualStrings("doc:b", target.entries.items[1].key);
-    try std.testing.expectEqualStrings("doc:c", target.entries.items[2].key);
-    try std.testing.expectEqualStrings("C2", target.entries.items[2].value);
-    try std.testing.expectEqualStrings("doc:d", target.entries.items[3].key);
+    try std.testing.expectEqual(@as(usize, 0), source.entryCount());
+    try std.testing.expectEqual(@as(usize, 4), target.entryCount());
+    try std.testing.expectEqualStrings("doc:a", target.entryAt(0).key);
+    try std.testing.expectEqualStrings("doc:b", target.entryAt(1).key);
+    try std.testing.expectEqualStrings("doc:c", target.entryAt(2).key);
+    try std.testing.expectEqualStrings("C2", target.entryAt(2).value);
+    try std.testing.expectEqualStrings("doc:d", target.entryAt(3).key);
 }
 
 test "applyStateMove copies arena backed source into active mutable" {
@@ -1214,10 +1415,10 @@ test "applyStateMove copies arena backed source into active mutable" {
 
     try applyMutableMoveToMutable(&target, std.testing.allocator, &source);
 
-    try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), target.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), source.entryCount());
+    try std.testing.expectEqual(@as(usize, 1), target.entryCount());
     try std.testing.expect(target.arena_owner == null);
-    try std.testing.expect(target.entries.items[0].shared != null);
+    try std.testing.expect(target.entryAt(0).shared != null);
     try std.testing.expectEqualStrings("A1", try target.get(.{}, "doc:a"));
 }
 
@@ -1225,17 +1426,17 @@ test "applyMutableMoveToMutable transfers shared active entries without copying"
     var target: ActiveMemTable = .{};
     defer target.deinit(std.testing.allocator);
 
-    var source: ActiveMemTable = .{};
+    var source: ActiveMemTable = .{ .ordered_enabled = false };
     try source.upsert(std.testing.allocator, .{}, "doc:a", "A1", false);
     try source.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:b", "B1", false);
     const first_bytes = (try source.get(.{}, "doc:a")).ptr;
 
     try applyMutableMoveToMutable(&target, std.testing.allocator, &source);
 
-    try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), source.entryCount());
     try std.testing.expect(source.arena_owner == null);
     try std.testing.expect(target.arena_owner == null);
-    try std.testing.expectEqual(@as(usize, 2), target.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), target.entryCount());
     for (target.entries.items) |entry| {
         try std.testing.expect(entry.shared != null);
     }
@@ -1265,7 +1466,7 @@ test "mergeStatesMove clones arena backed inputs before consuming them" {
     try std.testing.expectEqualStrings("doc:b", merged.entries.items[1].key);
 }
 
-test "ActiveMemTable overwrites by hash index and materializes sorted state" {
+test "ActiveMemTable overwrites ordered entries and transfers sorted generation" {
     var active: ActiveMemTable = .{};
     defer active.deinit(std.testing.allocator);
 
@@ -1274,31 +1475,32 @@ test "ActiveMemTable overwrites by hash index and materializes sorted state" {
     try active.upsert(std.testing.allocator, .{ .name = "meta" }, "lsn", "1", false);
     try active.upsert(std.testing.allocator, .{}, "doc:c", "C2", false);
 
-    try std.testing.expectEqual(@as(usize, 3), active.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 3), active.entryCount());
     try std.testing.expect(active.arena_owner == null);
-    for (active.entries.items) |entry| {
+    for (0..active.entryCount()) |i| {
+        const entry = active.entryAt(i);
         try std.testing.expect(entry.shared != null);
     }
     try std.testing.expectEqualStrings("C2", try active.get(.{}, "doc:c"));
 
     var flushed = try active.clone(std.testing.allocator);
     defer flushed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 3), flushed.entries.items.len);
-    try std.testing.expectEqualStrings("doc:a", flushed.entries.items[0].key);
-    try std.testing.expectEqualStrings("doc:c", flushed.entries.items[1].key);
-    try std.testing.expectEqualStrings("C2", flushed.entries.items[1].value);
-    try std.testing.expectEqualStrings("lsn", flushed.entries.items[2].key);
+    try std.testing.expectEqual(@as(usize, 3), flushed.entryCount());
+    try std.testing.expectEqualStrings("doc:a", flushed.entryAt(0).key);
+    try std.testing.expectEqualStrings("doc:c", flushed.entryAt(1).key);
+    try std.testing.expectEqualStrings("C2", flushed.entryAt(1).value);
+    try std.testing.expectEqualStrings("lsn", flushed.entryAt(2).key);
 
     var moved = try active.toStateMove(std.testing.allocator);
     defer moved.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), active.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), active.entryCount());
     try std.testing.expectEqual(@as(usize, 0), active.index.count());
     try std.testing.expect(active.arena_owner == null);
     try std.testing.expect(moved.arena_owner == null);
-    for (moved.entries.items) |entry| try std.testing.expect(entry.shared != null);
-    try std.testing.expectEqual(@as(usize, 3), moved.entries.items.len);
-    try std.testing.expectEqualStrings("doc:a", moved.entries.items[0].key);
-    try std.testing.expectEqualStrings("doc:c", moved.entries.items[1].key);
+    for (0..moved.entryCount()) |i| try std.testing.expect(moved.entryAt(i).shared != null);
+    try std.testing.expectEqual(@as(usize, 3), moved.entryCount());
+    try std.testing.expectEqualStrings("doc:a", moved.entryAt(0).key);
+    try std.testing.expectEqualStrings("doc:c", moved.entryAt(1).key);
 }
 
 test "EntryIndex stores unique hashes inline and preserves collision lookup" {

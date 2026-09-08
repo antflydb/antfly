@@ -197,6 +197,8 @@ class ServerBenchmarkTest(unittest.TestCase):
                 "size_bytes": 10,
                 "entry_count": 1,
                 "tombstone_count": None,
+                "oldest_tombstone_unix_ns": 0,
+                "visibility_id": 0,
                 "logical_entry_bytes": 0,
                 "physical_entry_bytes": 0,
                 "raw_blocks": 0,
@@ -370,6 +372,8 @@ def lsm_manifest(active_paths, obsolete_paths, active_size_bytes, version=8):
         )
         if version >= 10:
             raw.extend(struct.pack("<Q", 1))
+            raw.extend(struct.pack("<Q", 123))
+            raw.extend(struct.pack("<Q", 0))
         raw.extend(encoded + smallest + largest)
     for path in obsolete_paths:
         encoded = str(path).encode()

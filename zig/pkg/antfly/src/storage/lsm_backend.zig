@@ -389,8 +389,14 @@ pub const Options = struct {
     // count in tombstones. Summing all versions would strand deleted keys
     // behind duplicate older values. Ordinary compaction reclaims eagerly.
     tombstone_gc_min_percent: u8 = 50,
+    /// Sparse/skewed deletes must eventually advance even below density debt.
+    /// Age is persisted in the manifest and survives compaction and reopen.
+    tombstone_gc_max_age_ns: u64 = std.time.ns_per_hour,
+    tombstone_gc_max_input_bytes: u64 = 2 * 1024 * 1024 * 1024,
     // Preferred logical payload target used to shape runs.
     max_run_file_bytes: usize = 512 * 1024 * 1024,
+    /// Internal/output shaping cap; zero uses only byte and domain bounds.
+    max_run_file_entries: usize = 0,
     // Hard physical publication bound. Keep this no larger than the reader
     // allocation cap; tests and embedded users may lower it independently of
     // the logical target to exercise encoded-size admission.
@@ -619,6 +625,10 @@ fn walOperationLockPathAlloc(allocator: Allocator, root_dir: []const u8) ![]u8 {
 }
 
 pub const Backend = struct {
+    const ReclaimingMemory = struct {
+        states: ?*State,
+        next: ?*ReclaimingMemory,
+    };
     pub var test_deep_mutable_snapshots: bool = false;
     pub const OpenPhase = enum {
         idle,
@@ -1552,10 +1562,17 @@ pub const Backend = struct {
     retired_immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     retired_mutable_snapshots: std.ArrayListUnmanaged(*State) = .empty,
     retired_mutable_snapshot_by_state: std.AutoHashMapUnmanaged(*const State, usize) = .empty,
+    bulk_snapshot_accounts: std.AutoHashMapUnmanaged(*state_mod.memory_account.Account, usize) = .empty,
+    bulk_snapshot_unshared_bytes: u64 = 0,
     closing: std.atomic.Value(bool) = .init(false),
     recovery_replaying_wal: bool = false,
     runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty,
     read_version: ?*runtime_mod.ReadVersion = null,
+    retired_memory_head: ?*State = null,
+    reclaiming_memory: ?*ReclaimingMemory = null,
+    gc_maintenance_turn: u8 = 0,
+    tombstone_gc_retry_after_ns: u64 = 0,
+
     domain_index: ?*compaction_mod.DomainIndex = null,
     domain_index_builds: u64 = 0,
     read_version_builds: u64 = 0,
@@ -1995,7 +2012,7 @@ pub const Backend = struct {
     }
 
     pub fn recordOpenReplayComplete(self: *Backend) void {
-        self.open_stats.mutable_entries_after_replay = @intCast(self.mutable.entries.items.len);
+        self.open_stats.mutable_entries_after_replay = @intCast(self.mutable.entryCount());
         self.open_stats.immutable_memtables_after_replay = @intCast(self.activeImmutableMemtableCount());
         self.open_stats.wal_replay_records = self.write_stats.wal_replay_records;
         self.open_stats.wal_replay_entries = self.write_stats.wal_replay_entries;
@@ -2040,7 +2057,7 @@ pub const Backend = struct {
             .read_version_builds = self.read_version_builds,
             .domain_index_builds = self.domain_index_builds,
             .read_version_pins = self.read_version_pins,
-            .mutable_entries = @intCast(self.mutable.entries.items.len),
+            .mutable_entries = @intCast(self.mutable.entryCount()),
             .mutable_bytes = estimateStateBytes(&self.mutable),
             .mutable_snapshot_clone_calls = self.mutable_snapshot_clone_calls,
             .mutable_snapshot_clone_bytes_total = self.mutable_snapshot_clone_bytes_total,
@@ -2099,11 +2116,11 @@ pub const Backend = struct {
             }
         }
         for (self.activeImmutableMemtables()) |state| {
-            stats.immutable_entries += @intCast(state.entries.items.len);
+            stats.immutable_entries += @intCast(state.entryCount());
             stats.immutable_bytes += estimateStateBytes(state);
         }
         for (self.retired_immutable_memtables.items) |state| {
-            stats.retired_immutable_entries +|= @intCast(state.entries.items.len);
+            stats.retired_immutable_entries +|= @intCast(state.entryCount());
             stats.retired_immutable_bytes +|= estimateStateBytes(state);
         }
         for (self.immutable_memtable_pins.items) |pin| {
@@ -2250,7 +2267,7 @@ pub const Backend = struct {
 
     pub fn noteWriteMutationLocked(self: *Backend) void {
         if (self.options.mutable_idle_flush_after_ns > 0 and
-            self.mutable.entries.items.len > 0 and
+            self.mutable.entryCount() > 0 and
             !self.options.backend.read_only)
         {
             const now_ns = self.nowNs();
@@ -2287,7 +2304,7 @@ pub const Backend = struct {
     /// run/manifest/WAL checkpoint sequence.
     pub fn noteRecoveredWriteMutationLocked(self: *Backend) void {
         if (self.options.mutable_idle_flush_after_ns > 0 and
-            self.mutable.entries.items.len > 0 and
+            self.mutable.entryCount() > 0 and
             !self.options.backend.read_only)
         {
             const due_ns = @max(self.nowNs(), 1);
@@ -2453,16 +2470,34 @@ pub const Backend = struct {
     }
 
     fn estimateInMemoryStateBytesLocked(self: *const Backend) u64 {
-        var bytes = estimateStateBytes(&self.mutable);
+        return self.estimateInMemoryStateBytesWithCandidateLocked(null);
+    }
+
+    fn estimateInMemoryStateBytesWithCandidateLocked(self: *const Backend, candidate: ?*const ActiveMemTable) u64 {
+        const pass = state_mod.memory_account.nextPass();
+        var bytes = self.mutable.accountedMemoryBytes(pass);
         if (self.domain_index) |index| bytes +|= index.memoryBytes();
         for (self.activeImmutableMemtables()) |state| {
-            bytes +|= estimateStateBytes(state);
+            bytes +|= state.accountedMemoryBytes(pass);
         }
         for (self.retired_immutable_memtables.items) |state| {
-            bytes +|= estimateStateBytes(state);
+            bytes +|= state.accountedMemoryBytes(pass);
         }
-        bytes +|= self.bulk_ingest_current_scan_clone_active_bytes;
-        bytes +|= self.mutableReadSnapshotBytesLocked();
+        bytes +|= self.bulk_snapshot_unshared_bytes;
+        var accounts = self.bulk_snapshot_accounts.keyIterator();
+        while (accounts.next()) |account| bytes +|= account.*.chargeOnce(pass);
+        if (self.mutable_read_snapshot) |snapshot| bytes +|= snapshot.accountedMemoryBytes(pass);
+        for (self.retired_mutable_snapshots.items) |snapshot| bytes +|= snapshot.accountedMemoryBytes(pass);
+        if (candidate) |prepared| bytes +|= prepared.accountedMemoryBytes(pass);
+        var retired = self.retired_memory_head;
+        while (retired) |state| : (retired = state.retired_next) bytes +|= state.accountedMemoryBytes(pass);
+        var reclaiming = self.reclaiming_memory;
+        while (reclaiming) |batch| : (reclaiming = batch.next) {
+            var state = batch.states;
+            while (state) |pending| : (state = pending.retired_next) {
+                bytes +|= if (pending.account) |account| account.chargeOnce(pass) else pending.frozen_memory_bytes.?;
+            }
+        }
         return bytes;
     }
 
@@ -2477,7 +2512,7 @@ pub const Backend = struct {
         return bytes;
     }
 
-    fn releaseTrackedResourceUsage(self: *Backend) void {
+    pub fn releaseTrackedResourceUsage(self: *Backend) void {
         const manager = self.options.resource_manager orelse return;
         manager.observeUsage(.lsm_in_memory_state, &self.tracked_in_memory_state_bytes, 0);
         manager.observeUsage(.lsm_wal_retention, &self.tracked_wal_retention_bytes, 0);
@@ -2598,7 +2633,10 @@ pub const Backend = struct {
             else
                 false;
             if (!defer_soft_compaction) {
-                const compacted = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
+                self.gc_maintenance_turn +%= 1;
+                const aged_gc = self.gc_maintenance_turn % 8 == 0 and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
+                    try compaction_mod.compactTombstonesScheduled(Backend, self, score);
+                const compacted = aged_gc or try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
                     Backend,
                     self,
                     if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
@@ -2763,7 +2801,7 @@ pub const Backend = struct {
     pub fn prepareReadSnapshot(self: *Backend) !void {
         if (self.mutable_read_snapshot != null) return;
         if (self.options.read_snapshot_rotate_mutable_bytes == 0) return;
-        if (self.mutable.entries.items.len == 0) return;
+        if (self.mutable.entryCount() == 0) return;
         const mutable_bytes = estimateStateBytes(&self.mutable);
         if (mutable_bytes < self.options.read_snapshot_rotate_mutable_bytes) return;
 
@@ -2776,7 +2814,7 @@ pub const Backend = struct {
     }
 
     pub fn prepareCurrentScanSnapshot(self: *Backend) !void {
-        if (self.mutable.entries.items.len == 0) return;
+        if (self.mutable.entryCount() == 0) return;
         const mutable_bytes = estimateStateBytes(&self.mutable);
         try self.rotateMutableToImmutable();
         self.read_snapshot_mutable_rotations +|= 1;
@@ -2818,7 +2856,7 @@ pub const Backend = struct {
             self.retainMutableSnapshotReader(snapshot);
             return snapshot;
         }
-        if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
+        if (self.mutable.entryCount() == 0) return &self.empty_mutable_snapshot;
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.cloneMutableStateWithReason(reason);
@@ -2879,7 +2917,7 @@ pub const Backend = struct {
     pub fn cloneCurrentScanMutableStateForBulkIngest(self: *Backend) !?State {
         if (!self.bulkIngestActive()) return null;
         if (self.options.bulk_ingest_current_scan_clone_max_bytes == 0) return null;
-        if (self.mutable.entries.items.len == 0) return State{};
+        if (self.mutable.entryCount() == 0) return State{};
         const mutable_bytes = estimateStateBytes(&self.mutable);
         if (mutable_bytes > self.options.bulk_ingest_current_scan_clone_max_bytes) return null;
         if (!self.canAdmitBulkIngestCurrentScanClone(mutable_bytes)) {
@@ -2899,6 +2937,11 @@ pub const Backend = struct {
             snapshot.deinit(self.allocator);
             return null;
         }
+        if (snapshot.account) |account| {
+            const refs = try self.bulk_snapshot_accounts.getOrPut(self.allocator, account);
+            if (!refs.found_existing) refs.value_ptr.* = 0;
+            refs.value_ptr.* += 1;
+        } else self.bulk_snapshot_unshared_bytes +|= snapshot_bytes;
         self.bulk_ingest_current_scan_clone_active_bytes +|= snapshot_bytes;
         self.bulk_ingest_current_scan_clone_peak_active_bytes = @max(
             self.bulk_ingest_current_scan_clone_peak_active_bytes,
@@ -2917,6 +2960,11 @@ pub const Backend = struct {
 
     pub fn releaseCurrentScanMutableStateForBulkIngest(self: *Backend, snapshot: *const State) void {
         const snapshot_bytes = estimateStateBytes(snapshot);
+        if (snapshot.account) |account| {
+            const refs = self.bulk_snapshot_accounts.getPtr(account).?;
+            refs.* -= 1;
+            if (refs.* == 0) _ = self.bulk_snapshot_accounts.remove(account);
+        } else self.bulk_snapshot_unshared_bytes -|= snapshot_bytes;
         if (snapshot_bytes >= self.bulk_ingest_current_scan_clone_active_bytes) {
             self.bulk_ingest_current_scan_clone_active_bytes = 0;
         } else {
@@ -2933,13 +2981,50 @@ pub const Backend = struct {
     }
 
     fn destroyImmutableMemtable(self: *Backend, state: *State) void {
-        state.deinit(self.allocator);
-        self.allocator.destroy(state);
+        self.destroyMutableSnapshot(state);
     }
 
     fn destroyMutableSnapshot(self: *Backend, state: *State) void {
-        state.deinit(self.allocator);
-        self.allocator.destroy(state);
+        state.retired_next = self.retired_memory_head;
+        self.retired_memory_head = state;
+    }
+
+    /// Detach retired generations while serialized; reclaim their potentially
+    /// large subtrees outside the writer lock. A lifecycle pin protects close.
+    pub fn unlockWithReclamation(self: *Backend) void {
+        var turns: usize = 0;
+        while (self.retired_memory_head != null and turns < 8) : (turns += 1) {
+            var batch = ReclaimingMemory{ .states = self.retired_memory_head, .next = self.reclaiming_memory };
+            self.retired_memory_head = null;
+            // Keep accounting handles reachable even if another operation
+            // replaces the live memtable while this batch is being reclaimed.
+            var retired = batch.states;
+            while (retired) |state| : (retired = state.retired_next) {
+                if (state.account) |account| _ = account.retain() else state.freezeMemoryAccounting();
+            }
+            self.reclaiming_memory = &batch;
+            self.retainReaderKind(.other);
+            self.mu.unlock();
+            retired = batch.states;
+            while (retired) |state| : (retired = state.retired_next) {
+                // Leave the small header immutable for concurrent accounting.
+                var owned = state.*;
+                owned.deinit(self.allocator);
+            }
+            _ = runtime_mod.lockBackend(Backend, self);
+            var link = &self.reclaiming_memory;
+            while (link.*.? != &batch) link = &link.*.?.next;
+            link.* = batch.next;
+            retired = batch.states;
+            while (retired) |state| {
+                retired = state.retired_next;
+                if (state.account) |account| account.release();
+                self.allocator.destroy(state);
+            }
+            self.releaseReaderKind(.other);
+            self.syncTrackedInMemoryStateUsageCurrentLocked();
+        }
+        self.mu.unlock();
     }
 
     fn reserveImmutableMemtableRetirement(self: *Backend, state: *const State) !void {
@@ -3045,7 +3130,7 @@ pub const Backend = struct {
     fn maybeCheckpointWalAfterManifestPublish(self: *Backend) !void {
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         if (self.recovery_replaying_wal) return;
-        if (self.mutable.entries.items.len == 0 and self.activeImmutableMemtableCount() == 0) {
+        if (self.mutable.entryCount() == 0 and self.activeImmutableMemtableCount() == 0) {
             try self.resetWalAfterManifestCheckpoint();
             return;
         }
@@ -3222,13 +3307,10 @@ pub const Backend = struct {
     pub fn enforceMutableWriteAdmission(self: *Backend, incoming: *const ActiveMemTable) !void {
         const manager = self.options.resource_manager orelse return;
         while (true) {
-            // Transaction-local batches have no ordered index. Include the
-            // published nodes, spare pool and worst-case shared-path copies
-            // before WAL admission. Recompute after local draining.
-            const incoming_bytes = estimateStateBytes(incoming) +| self.mutable.ordered.admissionGrowthBytes(
-                incoming.entryCount(),
-                self.mutable_read_snapshot != null or self.retired_mutable_snapshots.items.len != 0 or self.bulk_ingest_current_scan_clone_active_bytes != 0,
-            );
+            // Drain against the incoming batch first. The final serialized
+            // WAL boundary admits the successor's actual unique allocations,
+            // not a multiplied worst-case charge for every shared path.
+            const incoming_bytes = estimateStateBytes(incoming);
             const decision = manager.admissionDecision(.lsm_in_memory_state, incoming_bytes);
             switch (decision.action) {
                 .report, .shrink_cache, .defer_background_work => return,
@@ -3240,7 +3322,7 @@ pub const Backend = struct {
                 if (try self.flushOldestImmutableMemtable()) continue;
                 self.scheduleImmutableFlushJob();
                 if (self.waitForImmutableFlushBuildLocked()) continue;
-            } else if (self.mutable.entries.items.len > 0) {
+            } else if (self.mutable.entryCount() > 0) {
                 try self.flushMutable();
                 continue;
             }
@@ -3537,7 +3619,7 @@ pub const Backend = struct {
     }
 
     fn flushMutable(self: *Backend) !void {
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
         try self.flushAllImmutableMemtables();
@@ -3545,7 +3627,7 @@ pub const Backend = struct {
 
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
@@ -3559,7 +3641,7 @@ pub const Backend = struct {
 
     pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.mutable.entries.items.len == 0) return true;
+        if (self.mutable.entryCount() == 0) return true;
         if (self.activeImmutableMemtableCount() != 0) return false;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
@@ -3572,7 +3654,7 @@ pub const Backend = struct {
     }
 
     fn rotateMutableToImmutable(self: *Backend) !void {
-        if (self.mutable.entries.items.len == 0) return;
+        if (self.mutable.entryCount() == 0) return;
         self.invalidateMutableReadSnapshot();
         const rotated_logical_bytes = self.mutable.logical_bytes;
         const rotated = try self.allocator.create(State);
@@ -3686,7 +3768,7 @@ pub const Backend = struct {
             return try self.flushOldestImmutableMemtableUnlockedBuild();
         }
         const start_ns = self.writeStatsNowNs();
-        const input_entries = state.entries.items.len;
+        const input_entries = state.entryCount();
 
         var new_runs = try compaction_mod.makeRunsFromStateBorrowed(Backend, self, state);
         errdefer {
@@ -3732,7 +3814,7 @@ pub const Backend = struct {
         const start_ns = self.writeStatsNowNs();
         const publish_head = self.immutable_head;
         const state = self.immutable_memtables.items[publish_head];
-        const input_entries = state.entries.items.len;
+        const input_entries = state.entryCount();
         const reserved_run_ids = @max(@as(u64, 1), @as(u64, @intCast(input_entries)));
         const reserved_run_id_start = self.next_run_id;
         self.next_run_id +|= reserved_run_ids;
@@ -3821,7 +3903,7 @@ pub const Backend = struct {
         key: []const u8,
     ) ![]const u8 {
         if (mutable.findIndex(namespace, key)) |idx| {
-            const entry = mutable.entries.items[idx];
+            const entry = mutable.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             return entry.value;
         }
@@ -3830,7 +3912,7 @@ pub const Backend = struct {
             immutable_index -= 1;
             const immutable = self.immutable_memtables.items[immutable_index];
             if (immutable.findIndex(namespace, key)) |idx| {
-                const entry = immutable.entries.items[idx];
+                const entry = immutable.entryAt(idx);
                 if (entry.tombstone) return error.NotFound;
                 return entry.value;
             }
@@ -3858,7 +3940,7 @@ pub const Backend = struct {
         }
         const state = try self.resolveRunState(run);
         if (state.findIndex(namespace, key)) |idx| {
-            const entry = state.entries.items[idx];
+            const entry = state.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             return entry.value;
         }
@@ -3873,7 +3955,7 @@ pub const Backend = struct {
         key: []const u8,
     ) ![]const u8 {
         if (overlay.findIndex(namespace, key)) |idx| {
-            const entry = overlay.entries.items[idx];
+            const entry = overlay.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             return entry.value;
         }
@@ -3932,7 +4014,7 @@ pub const Backend = struct {
         if (self.options.backend.read_only) return error.ReadOnly;
         if (entries.len == 0) return;
 
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.flushMutable();
         }
 
@@ -3962,9 +4044,9 @@ pub const Backend = struct {
 
     pub fn ingestSortedState(self: *Backend, state: *const State) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
-        if (state.entries.items.len == 0) return;
+        if (state.entryCount() == 0) return;
 
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.flushMutable();
         }
 
@@ -4000,13 +4082,13 @@ pub const Backend = struct {
 
     pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
-        if (state.entries.items.len == 0) return;
+        if (state.entryCount() == 0) return;
         if (self.root_dir != null) {
             try self.ingestSortedState(state);
             return;
         }
 
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.flushMutable();
         }
 
@@ -4052,7 +4134,7 @@ pub const Backend = struct {
         if (self.activeImmutableMemtableCount() != 0) return false;
         const byte_threshold = self.effectiveFlushThresholdBytes();
         if (byte_threshold > 0) return stateMeetsByteFlushThreshold(mutable, byte_threshold);
-        return mutable.entries.items.len >= self.effectiveFlushThreshold();
+        return mutable.entryCount() >= self.effectiveFlushThreshold();
     }
 
     pub fn persistManifest(self: *Backend) !void {
@@ -4135,13 +4217,34 @@ pub const Backend = struct {
     }
 
     pub fn appendWalForMutable(self: *Backend, state: anytype) !void {
-        if (!self.options.wal_enabled or
-            self.root_dir == null or
-            self.options.backend.read_only or
-            state.entries.items.len == 0) return;
+        try self.appendWalWithPreparation(state, null);
+    }
+
+    pub fn prepareAndAppendWalForMutable(self: *Backend, state: *const ActiveMemTable) !ActiveMemTable {
+        var prepared: ActiveMemTable = .{};
+        errdefer prepared.deinit(self.allocator);
+        try self.appendWalWithPreparation(state, &prepared);
+        return prepared;
+    }
+
+    fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable) !void {
+        const wal_enabled = self.options.wal_enabled and self.root_dir != null and !self.options.backend.read_only and state.entryCount() != 0;
 
         const encoded_bytes: u64 = @intCast(wal_mod.encodedStateRecordLen(state));
-        try self.prepareWalAppendForPressureLocked(encoded_bytes);
+        if (wal_enabled) try self.prepareWalAppendForPressureLocked(encoded_bytes);
+        // Pressure relief can flush and unlock the backend. Pin/build the
+        // successor only after that work, at the final serialized boundary.
+        if (comptime @TypeOf(state.*) == ActiveMemTable) {
+            if (prepared) |candidate| {
+                candidate.* = try self.mutable.preparePublication(self.allocator, state);
+                if (self.options.resource_manager) |manager| {
+                    const actual = self.estimateInMemoryStateBytesWithCandidateLocked(candidate);
+                    const decision = manager.admissionDecision(.lsm_in_memory_state, actual -| self.tracked_in_memory_state_bytes);
+                    if (decision.action == .reject_work or (decision.action == .throttle_writes and decision.pressure == .hard)) return error.ResourceBudgetExceeded;
+                }
+            }
+        } else std.debug.assert(prepared == null);
+        if (!wal_enabled) return;
 
         const start_ns = self.writeStatsNowNs();
         var wal_write_bytes: u64 = 0;
@@ -4169,7 +4272,7 @@ pub const Backend = struct {
         self.noteMutableWalSegment(append_result.segment);
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_append_records += 1;
-        self.write_stats.wal_append_entries += @intCast(state.entries.items.len);
+        self.write_stats.wal_append_entries += @intCast(state.entryCount());
         self.write_stats.wal_append_bytes += append_result.bytes;
         self.write_stats.wal_segment_syncs += append_result.segment_syncs;
         self.write_stats.wal_index_syncs += append_result.index_syncs;
@@ -4219,7 +4322,7 @@ pub const Backend = struct {
         };
         if (!self.options.backend.read_only and
             recovery_session.flushes > 0 and
-            (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0))
+            (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0))
         {
             try self.flushMutable();
             recovery_session.flushes += 1;
@@ -4230,7 +4333,7 @@ pub const Backend = struct {
             try self.maybeCheckpointWalAfterManifestPublish();
         }
         const retention = try self.cachedWalRetentionLocked();
-        self.mutable_wal_range = if (retention.segments == 0 or self.mutable.entries.items.len == 0)
+        self.mutable_wal_range = if (retention.segments == 0 or self.mutable.entryCount() == 0)
             .{}
         else
             .{
@@ -4335,7 +4438,7 @@ pub const Backend = struct {
         self.maintenance_io_budget_remaining = null;
         defer self.maintenance_io_budget_remaining = saved_budget;
 
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
         while (self.activeImmutableMemtableCount() > 0) {
@@ -4508,7 +4611,36 @@ pub const Backend = struct {
 
     pub fn domainIndex(self: *Backend) !*const compaction_mod.DomainIndex {
         if (self.domain_index == null) {
-            self.domain_index = try compaction_mod.DomainIndex.create(self);
+            if (self.runs.items.len <= 64) {
+                self.domain_index = try compaction_mod.DomainIndex.create(self);
+            } else {
+                if (self.read_version == null) {
+                    self.read_version = try runtime_mod.ReadVersion.create(self);
+                    self.read_version_builds +|= 1;
+                }
+                const version = self.read_version.?;
+                _ = version.references.fetchAdd(1, .monotonic);
+                self.retainReaderKind(.compaction);
+                var snapshot = .{ .allocator = self.allocator, .options = self.options, .runs = std.ArrayListUnmanaged(Run){ .items = version.runs, .capacity = 0 } };
+                runtime_mod.unlockBackend(Backend, self, true);
+                const built = compaction_mod.DomainIndex.create(&snapshot);
+                _ = runtime_mod.lockBackend(Backend, self);
+                defer self.releaseReaderKind(.compaction);
+                defer version.release(self);
+                const index = try built;
+                if (self.domain_index) |current| {
+                    index.destroy(self.allocator);
+                    return current;
+                }
+                if (self.read_version != version) {
+                    index.destroy(self.allocator);
+                    return error.CompactionPlanningStale;
+                }
+                // Rebind borrowed metadata to the live version before releasing
+                // the temporary pin. Publication invalidates this cache first.
+                for (index.order, 0..) |run_index, i| index.runs[i] = self.runs.items[run_index];
+                self.domain_index = index;
+            }
             self.domain_index_builds +|= 1;
         }
         return self.domain_index.?;
@@ -5172,14 +5304,14 @@ pub const Backend = struct {
     fn stateMeetsBulkFlushThreshold(self: *const Backend, state: *const State) bool {
         const byte_threshold = self.effectiveFlushThresholdBytes();
         if (byte_threshold > 0) return stateMeetsByteFlushThreshold(state, byte_threshold);
-        return state.entries.items.len >= self.effectiveFlushThreshold();
+        return state.entryCount() >= self.effectiveFlushThreshold();
     }
 
     fn shouldFlushMutable(self: *const Backend) bool {
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         const byte_threshold = self.effectiveFlushThresholdBytes();
         if (byte_threshold > 0) return stateMeetsByteFlushThreshold(&self.mutable, byte_threshold);
-        return self.mutable.entries.items.len >= self.effectiveFlushThreshold();
+        return self.mutable.entryCount() >= self.effectiveFlushThreshold();
     }
 
     fn shouldFlushMutableForIdleLocked(self: *Backend) bool {
@@ -5187,18 +5319,18 @@ pub const Backend = struct {
     }
 
     fn shouldFlushMutableDuringRecoveryReplay(self: *const Backend) bool {
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         const byte_threshold = self.effectiveFlushThresholdBytes();
         if (byte_threshold > 0) return stateMeetsByteFlushThreshold(&self.mutable, byte_threshold);
         const recovery_threshold = @max(
             self.effectiveFlushThreshold(),
             self.options.recovery_replay_flush_threshold,
         );
-        return self.mutable.entries.items.len >= recovery_threshold;
+        return self.mutable.entryCount() >= recovery_threshold;
     }
 
     fn shouldFlushMutableForWalPressureLocked(self: *Backend) !bool {
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         const retention = try self.snapshotWalRetentionForPressureLocked() orelse return false;
         return self.walRetentionOverSoftLimit(retention);
     }
@@ -5414,13 +5546,13 @@ pub const Backend = struct {
         self.maintenance_io_budget_remaining = null;
         defer self.maintenance_io_budget_remaining = saved_budget;
 
-        if (self.mutable.entries.items.len > 0) try self.rotateMutableToImmutable();
+        if (self.mutable.entryCount() > 0) try self.rotateMutableToImmutable();
         try self.flushAllImmutableMemtables();
         if (self.root_dir != null and
             (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()))
         {
             try self.persistManifest();
-        } else if (self.mutable.entries.items.len == 0 and self.activeImmutableMemtableCount() == 0) {
+        } else if (self.mutable.entryCount() == 0 and self.activeImmutableMemtableCount() == 0) {
             try self.resetWalAfterManifestCheckpoint();
         }
 
@@ -5661,7 +5793,7 @@ pub const Backend = struct {
         defer self.write_pressure_enforcing = false;
         const start_ns = self.writeStatsNowNs();
 
-        if (self.activeImmutableMemtableCount() == 0 and self.mutable.entries.items.len > 0) {
+        if (self.activeImmutableMemtableCount() == 0 and self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
 
@@ -5698,7 +5830,7 @@ pub const Backend = struct {
 
         const start_ns = self.writeStatsNowNs();
         var flushes: u64 = 0;
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
 
@@ -5725,7 +5857,7 @@ pub const Backend = struct {
             retention = try self.snapshotWalRetentionForPressureLocked() orelse retention;
         }
 
-        if (!self.manifest_dirty and self.activeImmutableMemtableCount() == 0 and self.mutable.entries.items.len == 0 and self.walRetentionOverHardLimit(retention)) {
+        if (!self.manifest_dirty and self.activeImmutableMemtableCount() == 0 and self.mutable.entryCount() == 0 and self.walRetentionOverHardLimit(retention)) {
             try self.resetWalAfterManifestCheckpoint();
             retention = try self.snapshotWalRetentionForPressureLocked() orelse retention;
         }
@@ -5741,7 +5873,7 @@ pub const Backend = struct {
     }
 
     pub fn shouldDrainMutableBeforeDirectBulkIngest(self: *const Backend, incoming: *const ActiveMemTable) bool {
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         if (self.active_bulk_ingest_batches <= 1) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
         const byte_threshold = self.effectiveFlushThresholdBytes();
@@ -5755,7 +5887,7 @@ pub const Backend = struct {
             ) catch std.math.maxInt(u64);
             return estimateStateBytes(&self.mutable) +| estimateStateBytes(incoming) >= memory_threshold;
         }
-        return self.mutable.entries.items.len + incoming.entries.items.len >= self.effectiveFlushThreshold();
+        return self.mutable.entryCount() + incoming.entryCount() >= self.effectiveFlushThreshold();
     }
 
     fn writePressureDuringBulkIngestEnabled(self: *const Backend) bool {
@@ -5790,7 +5922,7 @@ pub const Backend = struct {
     }
 
     fn flushBufferedWritesWithOptionsLocked(self: *Backend, options: BulkIngestFinishOptions) !void {
-        if (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0) {
+        if (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0) {
             try self.flushMutable();
         }
         try self.runForegroundCompactionBudget(options);
@@ -5807,7 +5939,7 @@ pub const Backend = struct {
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         if (!options.compact and self.active_bulk_ingest_batches == 1) {
             if ((options.flush or self.shouldFlushMemtablesOnLastBulkIngestFinish()) and
-                (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0))
+                (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0))
             {
                 if (!try self.directIngestMutableAtBulkFinishIfPossible()) {
                     try self.flushMutable();
@@ -5830,7 +5962,7 @@ pub const Backend = struct {
         self.active_bulk_ingest_batches -= 1;
         errdefer self.active_bulk_ingest_batches += 1;
         if (self.active_bulk_ingest_batches == 0) {
-            if (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0) {
+            if (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0) {
                 if (!try self.directIngestMutableAtBulkFinishIfPossible()) {
                     try self.flushMutable();
                 }
@@ -5876,7 +6008,7 @@ pub const Backend = struct {
 
     fn finalizeDeferredStorageWorkLocked(self: *Backend) !void {
         if (self.options.backend.read_only) return;
-        if (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0) {
+        if (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0) {
             try self.flushMutable();
         }
         try self.finalizeDeferredRunWork(.{});
@@ -6123,13 +6255,16 @@ pub const Backend = struct {
         if (self.nextWalCheckpointRetryDelayNsLocked()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
+        if (compaction_mod.nextTombstoneGcDelay(self)) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
         return delay_ns;
     }
 
     fn nextMutableIdleFlushDelayNsLocked(self: *Backend) ?u64 {
         if (self.options.mutable_idle_flush_after_ns == 0 or
             self.mutable_idle_flush_deadline_ns == 0 or
-            self.mutable.entries.items.len == 0 or
+            self.mutable.entryCount() == 0 or
             self.root_dir == null or
             self.storage == null or
             self.options.backend.read_only or
@@ -6162,7 +6297,7 @@ pub const Backend = struct {
         return delay_ns;
     }
 
-    fn nowNs(self: *Backend) u64 {
+    pub fn nowNs(self: *Backend) u64 {
         if (self.storage) |storage| return storage.nowNs();
         return 0;
     }
@@ -6640,8 +6775,12 @@ fn validateRunLayoutForManifest(runs: []const Run) !void {
             }
             if (prev.level == run.level) {
                 if (prev.level == 0) {
-                    if (prev.id <= run.id) {
-                        logInvalidRunLayout("l0_id_order", prior, run);
+                    const previous_visibility = if (prev.visibility_id == 0) prev.id else prev.visibility_id;
+                    const visibility = if (run.visibility_id == 0) run.id else run.visibility_id;
+                    if (previous_visibility < visibility or
+                        (previous_visibility == visibility and compareRunBound(prev.largest_namespace_name, prev.largest_key, run.smallest_namespace_name, run.smallest_key) != .lt))
+                    {
+                        logInvalidRunLayout("l0_visibility_order", prior, run);
                         return error.InvalidTableFile;
                     }
                 } else {
@@ -6764,7 +6903,7 @@ fn countRunEntriesForTest(backend: *Backend) !usize {
     var count: usize = 0;
     for (backend.runs.items) |*run| {
         const state = try backend.resolveRunState(run);
-        count += state.entries.items.len;
+        count += state.entryCount();
     }
     return count;
 }
@@ -7547,6 +7686,155 @@ test "lsm backend deferred immutable queue enforces aggregate byte limit" {
     try std.testing.expect(backend.activeImmutableMemtableBytes() <= one_memtable_bytes);
 }
 
+test "lsm GC splits wide sources without making older L0 deletes newer" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-gc-split-order", .{
+        .storage = storage.storage(),
+        .compact_threshold_runs = 1000,
+        .l0_overlap_compact_threshold_runs = 0,
+        .level_target_bytes_base = 1024 * 1024,
+        .tombstone_gc_max_input_bytes = 24 * 1024,
+        .max_compaction_input_bytes = 24 * 1024,
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+    var payload: [16 * 1024]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(51);
+    random.random().bytes(&payload);
+    for (0..4) |i| {
+        var state: State = .{};
+        errdefer state.deinit(std.testing.allocator);
+        if (i < 2) {
+            try state.upsert(std.testing.allocator, .{}, if (i == 0) "a" else "z", &payload, false);
+        } else if (i == 2) {
+            try state.upsert(std.testing.allocator, .{}, "a", &.{}, true);
+            try state.upsert(std.testing.allocator, .{}, "z", &.{}, true);
+        } else try state.upsert(std.testing.allocator, .{}, "a", "fresh", false);
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, if (i < 2) 1 else 0);
+        state = .{};
+        errdefer run.deinit(std.testing.allocator);
+        try backend.runs.append(std.testing.allocator, run);
+    }
+    compaction_mod.sortRuns(backend.runs.items);
+    try backend.persistManifest();
+    var pinned = try backend.beginRead();
+    defer pinned.abort();
+    try std.testing.expectEqualStrings("fresh", try pinned.get(.{}, "a"));
+    try std.testing.expectError(error.NotFound, pinned.get(.{}, "z"));
+    try std.testing.expect(try backend.runMaintenanceStep());
+    var split_outputs: usize = 0;
+    for (backend.runs.items) |run| if (run.visibility_id == 3) {
+        split_outputs += 1;
+        try std.testing.expectEqual(@as(u32, 1), run.entry_count);
+    };
+    try std.testing.expectEqual(@as(usize, 2), split_outputs);
+    // The manifest must preserve old L0 priority across a process restart.
+    {
+        var reopened = try Backend.open(std.testing.allocator, "/lsm-gc-split-order", .{ .storage = storage.storage(), .backend = .{ .read_only = true } });
+        defer reopened.close();
+        try std.testing.expectEqualStrings("fresh", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
+        try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{}, "z"));
+    }
+    for (0..16) |_| {
+        const before = backend.compaction_stats.input_bytes;
+        if (!try backend.runMaintenanceStep()) break;
+        try std.testing.expect(backend.compaction_stats.input_bytes - before <= 24 * 1024);
+        try std.testing.expectEqualStrings("fresh", try backend.getMergedWithMutable(&backend.mutable, .{}, "a"));
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "z"));
+    }
+    for (backend.runs.items) |run| try std.testing.expectEqual(@as(?u32, 0), run.tombstone_count);
+    try std.testing.expectEqualStrings("fresh", try pinned.get(.{}, "a"));
+}
+
+test "lsm aged GC below irreducible input budget schedules a retry instead of spinning" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/lsm-gc-budget-retry", .{
+        .storage = storage.storage(),
+        .tombstone_gc_max_input_bytes = 1,
+        .max_compaction_input_bytes = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+    var state: State = .{};
+    errdefer state.deinit(alloc);
+    try state.upsert(alloc, .{}, "deleted", &.{}, true);
+    var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 1);
+    state = .{};
+    run.oldest_tombstone_unix_ns = 1;
+    try backend.runs.append(alloc, run);
+    try backend.persistManifest();
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+    const deadline = backend.tombstone_gc_retry_after_ns;
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    try std.testing.expectEqual(deadline, backend.tombstone_gc_retry_after_ns);
+}
+
+test "lsm GC checkpoints bounded level progress while preserving old readers" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const options = Options{
+        .storage = storage.storage(),
+        .compact_threshold_runs = 1000,
+        .l0_overlap_compact_threshold_runs = 0,
+        .level_target_bytes_base = 1024 * 1024,
+        .tombstone_gc_max_input_bytes = 24 * 1024,
+        .max_compaction_input_bytes = 24 * 1024,
+        .obsolete_retention_ns = 0,
+    };
+    var backend = try Backend.open(std.testing.allocator, "/lsm-bounded-gc-progress", options);
+    defer backend.close();
+    var payload: [16 * 1024]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(42);
+    random.random().bytes(&payload);
+    for (0..3) |i| {
+        var state: State = .{};
+        errdefer state.deinit(std.testing.allocator);
+        try state.upsert(std.testing.allocator, .{}, "key", &payload, false);
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, @intCast(3 - i));
+        state = .{};
+        errdefer run.deinit(std.testing.allocator);
+        try backend.runs.append(std.testing.allocator, run);
+    }
+    compaction_mod.sortRuns(backend.runs.items);
+    try backend.persistManifest();
+    var old = try backend.beginRead();
+    defer old.abort();
+    try std.testing.expectEqualSlices(u8, &payload, try old.get(.{}, "key"));
+    {
+        var deleted: State = .{};
+        errdefer deleted.deinit(std.testing.allocator);
+        try deleted.upsert(std.testing.allocator, .{}, "key", &.{}, true);
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, deleted, 0);
+        deleted = .{};
+        errdefer run.deinit(std.testing.allocator);
+        run.oldest_tombstone_unix_ns = 1;
+        backend.invalidateReadVersion();
+        try backend.runs.append(std.testing.allocator, run);
+        compaction_mod.sortRuns(backend.runs.items);
+        try backend.persistManifest();
+    }
+    var steps: usize = 0;
+    while (backend.runs.items.len != 0 and steps < 16) : (steps += 1) {
+        const before = backend.compaction_stats.input_bytes;
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expect(backend.compaction_stats.input_bytes - before <= options.tombstone_gc_max_input_bytes);
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+        for (backend.runs.items) |run| if ((run.tombstone_count orelse 0) != 0) {
+            try std.testing.expectEqual(@as(u64, 1), run.oldest_tombstone_unix_ns);
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expect(steps >= 3);
+    try std.testing.expectEqualSlices(u8, &payload, try old.get(.{}, "key"));
+    var reopened = try Backend.open(std.testing.allocator, "/lsm-bounded-gc-progress", .{ .storage = storage.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{}, "key"));
+}
+
 test "lsm backend resource manager throttles projected immutable state" {
     var sample: ActiveMemTable = .{};
     defer sample.deinit(std.testing.allocator);
@@ -7668,8 +7956,7 @@ test "lsm backend resource manager rejects before wal apply" {
     defer sample.deinit(std.testing.allocator);
     try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
     const one_memtable_bytes = Backend.estimateStateBytes(&sample);
-    const empty: ActiveMemTable = .{};
-    const admission_bytes = one_memtable_bytes + empty.ordered.admissionGrowthBytes(1, false);
+    const admission_bytes = one_memtable_bytes * 16;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
@@ -7696,6 +7983,9 @@ test "lsm backend resource manager rejects before wal apply" {
         try txn.put(.{}, "key:a", "a");
         try txn.commit();
     }
+    // Fill the slice at the exact retained allocation charge; the next batch
+    // must be rejected before appending its WAL record, regardless of layout.
+    manager.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].budget.hard_limit_bytes = manager.sliceStats(.lsm_in_memory_state).used_bytes;
     {
         var txn = try backend.beginWrite();
         try txn.put(.{}, "key:b", "b");
@@ -8212,7 +8502,7 @@ test "lsm backend replays committed mutable writes from wal after crash reopen" 
         try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
 
     backend.options.backend.read_only = true;
     backend.close();
@@ -8307,7 +8597,7 @@ test "lsm backend idle mutable deadline checkpoints retained wal" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
     try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
 
@@ -8325,7 +8615,7 @@ test "lsm backend idle mutable deadline checkpoints retained wal" {
     try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
     try std.testing.expect(try backend.runMaintenanceStep());
 
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_idle_flush_deadline_ns);
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
     try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -8435,7 +8725,7 @@ test "lsm backend recovered mutable state is immediately checkpoint eligible" {
         try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     const original_max_deadline = backend.mutable_idle_flush_max_deadline_ns;
     try std.testing.expect(original_max_deadline > storage.tick);
 
@@ -8450,7 +8740,7 @@ test "lsm backend recovered mutable state is immediately checkpoint eligible" {
     try std.testing.expect(backend.write_stats.wal_replay_records > 0);
     try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
     try std.testing.expect(try backend.runMaintenanceStep());
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
 }
 
@@ -8528,14 +8818,14 @@ test "lsm backend durable boundary checkpoint flushes mutable state and retires 
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
 
     try backend.checkpointWalAfterDurableBoundary();
 
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
     try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
@@ -9438,7 +9728,7 @@ test "lsm backend byte flush window coalesces hot overwrites before run publicat
             try txn.commit();
         }
     }
-    try std.testing.expectEqual(@as(usize, 500), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 500), backend.mutable.entryCount());
     try backend.finalizeDeferredStorageWork();
 
     try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
@@ -9558,7 +9848,7 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
 
     {
         var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
@@ -9567,7 +9857,7 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
 
     {
         var txn = try backend.beginWrite();
@@ -9576,7 +9866,7 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqualStrings("C", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:c"));
 }
 
@@ -9736,7 +10026,7 @@ test "lsm backend direct-ingests threshold-sized bulk batches" {
 
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -9822,7 +10112,7 @@ test "lsm backend direct bulk ingest drains existing mutable before threshold ba
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
 
     {
@@ -9838,7 +10128,7 @@ test "lsm backend direct bulk ingest drains existing mutable before threshold ba
     bulk_active = false;
 
     const stats = backend.snapshotWriteStats();
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     try std.testing.expectEqual(@as(u64, 2), stats.sorted_ingest_runs);
@@ -10033,7 +10323,7 @@ test "lsm backend can disable direct bulk ingest for overwrite-heavy stores" {
 
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), stats.sorted_ingest_runs);
     try std.testing.expectEqual(@as(u64, 1), stats.flushes);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -10056,12 +10346,12 @@ test "lsm backend byte flush threshold controls mutable flushes" {
     try txn.commit();
 
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 1), backend.immutable_memtables.items.len);
     try std.testing.expectEqualStrings(value[0..], try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
-test "lsm backend mutable byte estimate includes shared ownership and hash index capacity" {
+test "lsm backend mutable byte estimate includes shared ownership and ordered index capacity" {
     var mutable: ActiveMemTable = .{};
     defer mutable.deinit(std.testing.allocator);
 
@@ -10069,7 +10359,8 @@ test "lsm backend mutable byte estimate includes shared ownership and hash index
     try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:b", "two", false);
 
     var owned_bytes: u64 = 0;
-    for (mutable.entries.items) |entry| {
+    for (0..mutable.entryCount()) |i| {
+        const entry = mutable.entryAt(i);
         owned_bytes += entry.sharedOverheadBytes() + entry.key.len + entry.value.len;
         if (entry.namespace_name) |name| owned_bytes += name.len;
     }
@@ -10079,7 +10370,7 @@ test "lsm backend mutable byte estimate includes shared ownership and hash index
         2 * "docs".len + "doc:a".len + "one".len + "doc:b".len + "two".len;
     try std.testing.expect(index_bytes > 0);
     try std.testing.expectEqual(@as(u64, logical_bytes), mutable.estimatedLogicalBytes());
-    try std.testing.expectEqual(entries_bytes +| owned_bytes +| index_bytes, Backend.estimateStateBytes(&mutable));
+    try std.testing.expectEqual(entries_bytes +| owned_bytes +| index_bytes + @sizeOf(state_mod.memory_account.Account), Backend.estimateStateBytes(&mutable));
 
     try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:a", "replacement", false);
     try std.testing.expectEqual(
@@ -10107,7 +10398,7 @@ test "lsm backend preserves logical flush sizing with an actual memory guard" {
     try std.testing.expect(!Backend.stateMeetsByteFlushThreshold(&mutable, actual_bytes));
     try std.testing.expect(!Backend.stateMeetsByteFlushThreshold(&mutable, logical_bytes + 1));
     // Excess index capacity still participates in the actual memory guard.
-    try mutable.entries.ensureTotalCapacity(std.testing.allocator, 16384);
+    try mutable.ordered.spare.ensureTotalCapacity(std.testing.allocator, 128 * 1024);
     try std.testing.expect(Backend.stateMeetsByteFlushThreshold(&mutable, logical_bytes + 1));
 }
 
@@ -10208,6 +10499,42 @@ test "lsm backend reclaims a retired immutable when its exact reader exits" {
     try std.testing.expectEqualStrings(value_b[0..], try newer_reader.get(.{ .name = "docs" }, "doc:b"));
 }
 
+test "lsm publication allocation failure leaves WAL and live keys unchanged" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var backend = try Backend.open(failing.allocator(), "/lsm-atomic-publication", .{ .storage = storage.storage(), .flush_threshold = 1000 });
+    defer backend.close();
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "a", "old-a");
+        try txn.put(.{}, "b", "old-b");
+        try txn.commit();
+    }
+    var old = try backend.beginRead();
+    defer old.abort();
+    var incoming = ActiveMemTable{ .ordered_enabled = false };
+    defer incoming.deinit(alloc);
+    try incoming.upsert(alloc, .{}, "a", "new-a", false);
+    try incoming.upsert(alloc, .{}, "b", "new-b", false);
+    const before = backend.write_stats.wal_append_records;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const prepared = backend.prepareAndAppendWalForMutable(&incoming);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.OutOfMemory, prepared);
+    try std.testing.expectEqual(before, backend.write_stats.wal_append_records);
+    try std.testing.expectEqualStrings("old-a", try backend.mutable.get(.{}, "a"));
+    try std.testing.expectEqualStrings("old-b", try backend.mutable.get(.{}, "b"));
+    try std.testing.expectEqualStrings("old-a", try old.get(.{}, "a"));
+    var reopened = try Backend.open(alloc, "/lsm-atomic-publication", .{ .storage = storage.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    try std.testing.expectEqualStrings("old-a", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
+    try std.testing.expectEqualStrings("old-b", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "b"));
+}
+
 test "lsm backend pinned immutable retirement is allocation free after reservation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
@@ -10271,7 +10598,7 @@ test "lsm backend probe owns active mutable point values across later writes" {
     const before = backend.snapshotReadStats();
     const owned_a = try probe.get("doc:a");
     try std.testing.expectEqualStrings("A", owned_a);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
     {
@@ -10281,7 +10608,7 @@ test "lsm backend probe owns active mutable point values across later writes" {
     }
 
     try std.testing.expectEqualStrings("A", owned_a);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
     const owned_b = try probe.get("doc:a");
@@ -10318,7 +10645,7 @@ test "lsm backend probe owns active mutable point values during bulk ingest" {
     const before = backend.snapshotReadStats();
     const copied_a = try probe.get("doc:a");
     try std.testing.expectEqualStrings("A", copied_a);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
     {
@@ -10328,7 +10655,7 @@ test "lsm backend probe owns active mutable point values during bulk ingest" {
     }
 
     try std.testing.expectEqualStrings("A", copied_a);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
     const after = backend.snapshotReadStats();
@@ -10359,7 +10686,7 @@ test "lsm backend wal backed entry threshold defers commit flush to maintenance"
     var stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 
@@ -10482,7 +10809,7 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
 
     {
         var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
@@ -10492,7 +10819,7 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 1), backend.immutable_memtables.items.len);
 }
 
@@ -11257,7 +11584,7 @@ test "lsm backend bulk ingest session defers batch finalization" {
     try std.testing.expect(backend.bulkIngestActive());
     try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
     try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
 
     try backend.finishBulkIngestSession();
@@ -11327,12 +11654,12 @@ test "lsm backend bulk ingest finish can flush without compaction for wal-backed
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = true });
     bulk_active = false;
 
     try std.testing.expect(!backend.bulkIngestActive());
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
@@ -11363,10 +11690,10 @@ test "lsm backend flushes buffered writes outside bulk ingest" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
     try backend.flushBufferedWritesWithOptions(.{ .compact = false });
 
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -11398,7 +11725,7 @@ test "lsm backend bulk ingest session coalesces repeated overwrites before flush
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
     bulk_active = false;
 
@@ -11486,7 +11813,7 @@ test "lsm backend bulk ingest session can reopen wal-backed mutable state withou
         }
 
         try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-        try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
         try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
         try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
@@ -11495,7 +11822,7 @@ test "lsm backend bulk ingest session can reopen wal-backed mutable state withou
         try std.testing.expectEqual(@as(u64, 0), stats.flushes);
         try std.testing.expectEqual(@as(u64, 0), stats.manifest_writes);
         try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-        try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
         try std.testing.expect(!backend.bulkIngestActive());
     }
 
@@ -14037,7 +14364,7 @@ test "lsm backend bulk current scan clones mutable under memory cap" {
         try std.testing.expect(after_open.bulk_ingest_current_scan_clone_active_bytes > 0);
         try std.testing.expectEqual(after_open.bulk_ingest_current_scan_clone_active_bytes, after_open.bulk_ingest_current_scan_clone_peak_active_bytes);
         try std.testing.expectEqual(
-            after_open.mutable_bytes +| after_open.immutable_bytes +| after_open.bulk_ingest_current_scan_clone_active_bytes,
+            after_open.mutable_bytes +| after_open.immutable_bytes,
             manager.sliceStats(.lsm_in_memory_state).used_bytes,
         );
 
@@ -14943,7 +15270,7 @@ test "lsm backend resource manager accounts pinned mutable read snapshots" {
     try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
 
     const with_snapshot = manager.sliceStats(.lsm_in_memory_state).used_bytes;
-    try std.testing.expect(with_snapshot > base_bytes);
+    try std.testing.expectEqual(base_bytes, with_snapshot);
 
     {
         var txn = try backend.beginWrite();
@@ -15033,13 +15360,13 @@ test "lsm backend rotates large mutable state for read snapshots instead of clon
         try txn.commit();
     }
 
-    try std.testing.expect(backend.mutable.entries.items.len > 0);
+    try std.testing.expect(backend.mutable.entryCount() > 0);
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
 
     var read = try backend.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("A", try read.get(.{ .name = "docs" }, "doc:a"));
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
@@ -15396,7 +15723,7 @@ test "lsm repository run readers request cap above 64 MiB" {
     {
         var state = try repository_mod.loadRunStateAllocWithStorage(host.storage(), alloc, run_path);
         defer state.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 1), state.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 1), state.entryCount());
         try std.testing.expectEqualStrings("A", state.entries.items[0].value);
     }
 
@@ -17624,7 +17951,7 @@ test "lsm backend recovery replay stores snapshot-shareable mutable entries" {
     defer reopened.close();
 
     try std.testing.expect(reopened.mutable.arena_owner == null);
-    try std.testing.expectEqual(@as(usize, 2), reopened.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), reopened.mutable.entryCount());
     for (reopened.mutable.entries.items) |entry| {
         try std.testing.expect(entry.shared != null);
     }
@@ -17632,7 +17959,7 @@ test "lsm backend recovery replay stores snapshot-shareable mutable entries" {
 
     try reopened.finalizeDeferredStorageWork();
     try std.testing.expect(reopened.mutable.arena_owner == null);
-    try std.testing.expectEqual(@as(usize, 0), reopened.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), reopened.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), reopened.activeImmutableMemtableCount());
     try std.testing.expect(reopened.runs.items.len > 0);
 }

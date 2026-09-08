@@ -216,7 +216,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
                     "lsm backend open wal replay done root={s} mutable_entries={d} immutable_memtables={d}",
                     .{
                         backend.root_dir.?,
-                        backend.mutable.entries.items.len,
+                        backend.mutable.entryCount(),
                         if (@hasField(BackendType, "immutable_memtables")) backend.immutable_memtables.items.len else 0,
                     },
                 );
@@ -240,11 +240,11 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         }
     }
     cleanupRecoveredRunFiles(BackendType, backend, "after_mounting_runs", false);
-    if (@hasDecl(BackendType, "noteRecoveredWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
+    if (@hasDecl(BackendType, "noteRecoveredWriteMutationLocked") and backend.mutable.entryCount() > 0) {
         const locked = runtime_mod.lockBackend(BackendType, backend);
         defer runtime_mod.unlockBackend(BackendType, backend, locked);
         backend.noteRecoveredWriteMutationLocked();
-    } else if (@hasDecl(BackendType, "noteWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
+    } else if (@hasDecl(BackendType, "noteWriteMutationLocked") and backend.mutable.entryCount() > 0) {
         const locked = runtime_mod.lockBackend(BackendType, backend);
         defer runtime_mod.unlockBackend(BackendType, backend, locked);
         backend.noteWriteMutationLocked();
@@ -256,7 +256,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     if (debug_open) {
         std.log.info(
             "lsm backend open done root={s} runs={d} mutable_entries={d}",
-            .{ backend.root_dir.?, backend.runs.items.len, backend.mutable.entries.items.len },
+            .{ backend.root_dir.?, backend.runs.items.len, backend.mutable.entryCount() },
         );
     }
 }
@@ -279,7 +279,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
                 }
                 std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
             };
-        } else if (backend.mutable.entries.items.len > 0) {
+        } else if (backend.mutable.entryCount() > 0) {
             compaction_mod.flushMutable(BackendType, backend) catch |err| {
                 std.log.err("lsm backend close skipped mutable flush root={?s} err={}", .{ backend.root_dir, err });
             };
@@ -390,5 +390,14 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
     }
     if (backend.root_dir) |root_dir| backend.allocator.free(root_dir);
+    if (@hasField(BackendType, "bulk_snapshot_accounts")) backend.bulk_snapshot_accounts.deinit(backend.allocator);
+    if (@hasField(BackendType, "retired_memory_head")) {
+        while (backend.retired_memory_head) |state| {
+            backend.retired_memory_head = state.retired_next;
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
+    }
+    if (@hasDecl(BackendType, "releaseTrackedResourceUsage")) backend.releaseTrackedResourceUsage();
     backend.* = undefined;
 }

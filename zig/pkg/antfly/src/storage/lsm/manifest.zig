@@ -32,6 +32,8 @@ pub const RunMeta = struct {
     largest_key: []const u8,
     entry_count: u32,
     tombstone_count: ?u32 = null,
+    oldest_tombstone_unix_ns: u64 = 0,
+    visibility_id: u64 = 0,
 };
 
 pub const ObsoletePathMeta = struct {
@@ -51,6 +53,8 @@ pub const OwnedRunMeta = struct {
     largest_key: []u8,
     entry_count: u32,
     tombstone_count: ?u32 = null,
+    oldest_tombstone_unix_ns: u64 = 0,
+    visibility_id: u64 = 0,
 
     pub fn deinit(self: *OwnedRunMeta, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -104,6 +108,8 @@ pub const BorrowedRunMeta = struct {
     largest_key: []const u8,
     entry_count: u32,
     tombstone_count: ?u32 = null,
+    oldest_tombstone_unix_ns: u64 = 0,
+    visibility_id: u64 = 0,
 };
 
 pub const BorrowedObsoletePathMeta = struct {
@@ -146,6 +152,8 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
         try appendU32(allocator, &bytes, @intCast(run.largest_key.len));
         try appendU32(allocator, &bytes, run.entry_count);
         try appendU64(allocator, &bytes, if (run.tombstone_count) |count| count else std.math.maxInt(u64));
+        try appendU64(allocator, &bytes, run.oldest_tombstone_unix_ns);
+        try appendU64(allocator, &bytes, run.visibility_id);
         try bytes.appendSlice(allocator, run.path);
         if (run.smallest_namespace_name) |name| try bytes.appendSlice(allocator, name);
         try bytes.appendSlice(allocator, run.smallest_key);
@@ -175,7 +183,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
     const next_run_id = try readU64(body, &cursor);
     const run_count: usize = @intCast(try readU32(body, &cursor));
     const obsolete_count: usize = @intCast(try readU32(body, &cursor));
-    if (run_count > (body.len - cursor) / @as(usize, if (found_version >= 10) 92 else 84)) return error.InvalidManifest;
+    if (run_count > (body.len - cursor) / @as(usize, if (found_version >= 10) 108 else 84)) return error.InvalidManifest;
     if (obsolete_count > (body.len - cursor) / 12) return error.InvalidManifest;
     var out: OwnedManifest = .{
         .next_run_id = next_run_id,
@@ -208,6 +216,9 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
         const largest_len: usize = @intCast(try readU32(body, &cursor));
         const entry_count = try readU32(body, &cursor);
         const tombstone_count = if (found_version >= 10) try readTombstoneCount(body, &cursor, entry_count) else null;
+        const oldest_tombstone_unix_ns = if (found_version >= 10) try readU64(body, &cursor) else 0;
+        const visibility_id = if (found_version >= 10) try readU64(body, &cursor) else 0;
+        if (visibility_id > id) return error.InvalidManifest;
         if (id == 0 or path_len == 0) return error.InvalidManifest;
 
         run.* = .{
@@ -222,6 +233,8 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
             .largest_key = try allocator.dupe(u8, try readSlice(body, &cursor, largest_len)),
             .entry_count = entry_count,
             .tombstone_count = tombstone_count,
+            .oldest_tombstone_unix_ns = oldest_tombstone_unix_ns,
+            .visibility_id = visibility_id,
         };
         initialized += 1;
     }
@@ -254,7 +267,7 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
     const next_run_id = try readU64(body, &cursor);
     const run_count: usize = @intCast(try readU32(body, &cursor));
     const obsolete_count: usize = @intCast(try readU32(body, &cursor));
-    if (run_count > (body.len - cursor) / @as(usize, if (found_version >= 10) 92 else 84)) return error.InvalidManifest;
+    if (run_count > (body.len - cursor) / @as(usize, if (found_version >= 10) 108 else 84)) return error.InvalidManifest;
     if (obsolete_count > (body.len - cursor) / 12) return error.InvalidManifest;
     const out: BorrowedManifest = .{
         .raw = raw,
@@ -279,6 +292,9 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
         const largest_len: usize = @intCast(try readU32(body, &cursor));
         const entry_count = try readU32(body, &cursor);
         const tombstone_count = if (found_version >= 10) try readTombstoneCount(body, &cursor, entry_count) else null;
+        const oldest_tombstone_unix_ns = if (found_version >= 10) try readU64(body, &cursor) else 0;
+        const visibility_id = if (found_version >= 10) try readU64(body, &cursor) else 0;
+        if (visibility_id > id) return error.InvalidManifest;
         if (id == 0 or path_len == 0) return error.InvalidManifest;
 
         run.* = .{
@@ -293,6 +309,8 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
             .largest_key = try readSlice(body, &cursor, largest_len),
             .entry_count = entry_count,
             .tombstone_count = tombstone_count,
+            .oldest_tombstone_unix_ns = oldest_tombstone_unix_ns,
+            .visibility_id = visibility_id,
         };
     }
 
@@ -374,19 +392,38 @@ fn readSlice(raw: []const u8, cursor: *usize, len: usize) ![]const u8 {
 
 test "manifest tombstone counts round trip and reject impossible values" {
     const allocator = std.testing.allocator;
-    var runs = [_]RunMeta{.{ .id = 1, .level = 0, .size_bytes = 1, .path = "runs/1.tbl", .smallest_namespace_name = null, .smallest_key = "a", .largest_namespace_name = null, .largest_key = "z", .entry_count = 4, .tombstone_count = 3 }};
+    var runs = [_]RunMeta{.{ .id = 1, .level = 0, .size_bytes = 1, .path = "runs/1.tbl", .smallest_namespace_name = null, .smallest_key = "a", .largest_namespace_name = null, .largest_key = "z", .entry_count = 4, .tombstone_count = 3, .oldest_tombstone_unix_ns = 123 }};
     const encoded = try encodeAlloc(allocator, .{ .next_run_id = 2, .runs = &runs });
     defer allocator.free(encoded);
     var owned = try decodeAlloc(allocator, encoded);
     defer owned.deinit(allocator);
     try std.testing.expectEqual(@as(?u32, 3), owned.runs[0].tombstone_count);
+    try std.testing.expectEqual(@as(u64, 123), owned.runs[0].oldest_tombstone_unix_ns);
     var borrowed = try decodeBorrowedOwnedAlloc(allocator, try allocator.dupe(u8, encoded));
     defer borrowed.deinit(allocator);
     try std.testing.expectEqual(@as(?u32, 3), borrowed.runs[0].tombstone_count);
+    try std.testing.expectEqual(@as(u64, 123), borrowed.runs[0].oldest_tombstone_unix_ns);
     runs[0].tombstone_count = 5;
     const invalid = try encodeAlloc(allocator, .{ .next_run_id = 2, .runs = &runs });
     defer allocator.free(invalid);
     try std.testing.expectError(error.InvalidManifest, decodeAlloc(allocator, invalid));
+    runs[0].tombstone_count = 3;
+    runs[0].id = 7;
+    runs[0].visibility_id = 1;
+    const split_encoded = try encodeAlloc(allocator, .{ .next_run_id = 8, .runs = &runs });
+    defer allocator.free(split_encoded);
+    var split = try decodeAlloc(allocator, split_encoded);
+    defer split.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 1), split.runs[0].visibility_id);
+    var split_borrowed = try decodeBorrowedOwnedAlloc(allocator, try allocator.dupe(u8, split_encoded));
+    defer split_borrowed.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 1), split_borrowed.runs[0].visibility_id);
+    runs[0].visibility_id = 8;
+    const invalid_visibility = try encodeAlloc(allocator, .{ .next_run_id = 8, .runs = &runs });
+    defer allocator.free(invalid_visibility);
+    try std.testing.expectError(error.InvalidManifest, decodeAlloc(allocator, invalid_visibility));
+    // Ownership transfers only on successful decoding.
+    try std.testing.expectError(error.InvalidManifest, decodeBorrowedOwnedAlloc(allocator, invalid_visibility));
 }
 
 test "manifest codec round trips run metadata" {

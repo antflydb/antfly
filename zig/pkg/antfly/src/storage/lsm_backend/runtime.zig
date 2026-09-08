@@ -211,6 +211,29 @@ fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
+fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable) !void {
+    if (incoming.entryCount() == 0) return;
+    if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
+        var candidate = if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
+            try backend.prepareAndAppendWalForMutable(incoming)
+        else blk: {
+            var prepared = try backend.mutable.preparePublication(allocator, incoming);
+            errdefer prepared.deinit(allocator);
+            try backend.appendWalForMutable(incoming);
+            break :blk prepared;
+        };
+        defer candidate.deinit(allocator);
+        if (@hasDecl(@TypeOf(backend.*), "invalidateMutableReadSnapshot")) backend.invalidateMutableReadSnapshot();
+        backend.mutable.publishPrepared(&candidate);
+        incoming.deinit(allocator);
+        incoming.* = .{ .ordered_enabled = false };
+    } else {
+        try backend.appendWalForMutable(incoming);
+        if (@hasDecl(@TypeOf(backend.*), "invalidateMutableReadSnapshot")) backend.invalidateMutableReadSnapshot();
+        try state_mod.applyMutableMoveToMutable(&backend.mutable, allocator, incoming);
+    }
+}
+
 fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTable) !void {
     if (@hasDecl(@TypeOf(backend.*), "enforceMutableWriteAdmission")) {
         try backend.enforceMutableWriteAdmission(incoming);
@@ -321,7 +344,7 @@ pub fn lockBackend(comptime BackendType: type, backend: *BackendType) bool {
 
 pub fn unlockBackend(comptime BackendType: type, backend: *BackendType, locked: bool) void {
     if (locked) {
-        backend.mu.unlock();
+        if (@hasDecl(BackendType, "unlockWithReclamation")) backend.unlockWithReclamation() else backend.mu.unlock();
     }
 }
 
@@ -2434,7 +2457,7 @@ pub const ReadVersion = struct {
     l0_groups: []RunGroup,
     levels: []RunLevel,
 
-    fn create(backend: anytype) !*ReadVersion {
+    pub fn create(backend: anytype) !*ReadVersion {
         const allocator = runtimeScratchAllocator(backend.allocator);
         const version = try allocator.create(ReadVersion);
         errdefer allocator.destroy(version);
@@ -3635,9 +3658,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try self.backend.appendWalForMutable(&self.mutable);
-                    if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
-                    try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
+                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -6267,7 +6288,7 @@ fn nextStateKey(state: *const State, namespace: backend_types.Namespace, target:
 
 fn nextStateIndex(state: anytype, namespace: backend_types.Namespace, target: []const u8, inclusive: bool) ?usize {
     const StateType = @TypeOf(state.*);
-    if (StateType == ActiveMemTable) {
+    if (if (comptime StateType == ActiveMemTable) !state.ordered_enabled else false) {
         var best: ?usize = null;
         for (state.entries.items, 0..) |entry, idx| {
             if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
@@ -6295,7 +6316,7 @@ fn nextStateIndex(state: anytype, namespace: backend_types.Namespace, target: []
 
 fn nextIndexFrom(state: anytype, namespace: backend_types.Namespace, current: usize) ?usize {
     const StateType = @TypeOf(state.*);
-    if (StateType == ActiveMemTable) {
+    if (if (comptime StateType == ActiveMemTable) !state.ordered_enabled else false) {
         if (current >= state.entryCount()) return null;
         const current_entry = state.entryAt(current);
         var best: ?usize = null;
@@ -6320,7 +6341,7 @@ fn nextIndexFrom(state: anytype, namespace: backend_types.Namespace, current: us
 
 fn prevStateKey(state: anytype, namespace: backend_types.Namespace, target: []const u8, inclusive: bool) ?[]const u8 {
     const StateType = @TypeOf(state.*);
-    if (StateType == ActiveMemTable) {
+    if (if (comptime StateType == ActiveMemTable) !state.ordered_enabled else false) {
         var best: ?[]const u8 = null;
         for (state.entries.items) |entry| {
             if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
@@ -6451,9 +6472,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try self.backend.appendWalForMutable(&self.mutable);
-                    if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
-                    try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
+                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);

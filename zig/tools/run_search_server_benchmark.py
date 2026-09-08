@@ -664,9 +664,17 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
             entry_count = struct.unpack_from("<I", raw, offset)[0]
             offset += 4
             tombstone_count = None
+            oldest_tombstone_unix_ns = 0
+            visibility_id = 0
             if version >= 10:
                 count = struct.unpack_from("<Q", raw, offset)[0]
                 offset += 8
+                oldest_tombstone_unix_ns = struct.unpack_from("<Q", raw, offset)[0]
+                offset += 8
+                visibility_id = struct.unpack_from("<Q", raw, offset)[0]
+                offset += 8
+                if visibility_id > run_id:
+                    return None
                 if count != (1 << 64) - 1:
                     if count > entry_count:
                         return None
@@ -697,6 +705,8 @@ def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | 
                     "size_bytes": size_bytes,
                     "entry_count": entry_count,
                     "tombstone_count": tombstone_count,
+                    "oldest_tombstone_unix_ns": oldest_tombstone_unix_ns,
+                    "visibility_id": visibility_id,
                     "logical_entry_bytes": run_logical_entry_bytes,
                     "physical_entry_bytes": run_physical_entry_bytes,
                     "raw_blocks": run_raw_blocks,

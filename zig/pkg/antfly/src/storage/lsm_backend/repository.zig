@@ -59,6 +59,8 @@ pub const Run = struct {
     largest_key: []u8,
     entry_count: u32,
     tombstone_count: ?u32 = null,
+    oldest_tombstone_unix_ns: u64 = 0,
+    visibility_id: u64 = 0,
     bloom_filter: ?bloom.OwnedFilter,
     owns_metadata: bool = true,
     owns_path: bool = false,
@@ -172,6 +174,8 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
         .largest_key = largest_key,
         .entry_count = source.entry_count,
         .tombstone_count = source.tombstone_count,
+        .oldest_tombstone_unix_ns = source.oldest_tombstone_unix_ns,
+        .visibility_id = source.visibility_id,
         .bloom_filter = if (source.bloom_filter) |filter| try filter.clone(allocator) else null,
         .cached_state_index = null,
         .cached_index_index = null,
@@ -210,6 +214,8 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
         .largest_key = largest_key,
         .entry_count = source.entry_count,
         .tombstone_count = source.tombstone_count,
+        .oldest_tombstone_unix_ns = source.oldest_tombstone_unix_ns,
+        .visibility_id = source.visibility_id,
         .bloom_filter = null,
         .owns_bloom_filter = false,
         .cached_state_index = null,
@@ -296,6 +302,8 @@ pub fn loadManifestIfPresentWithStorage(
             .largest_key = @constCast(meta.largest_key),
             .entry_count = meta.entry_count,
             .tombstone_count = meta.tombstone_count,
+            .oldest_tombstone_unix_ns = meta.oldest_tombstone_unix_ns,
+            .visibility_id = meta.visibility_id,
             .bloom_filter = null,
             .owns_metadata = false,
             .owns_path = true,
@@ -380,7 +388,7 @@ pub fn persistRunFileWithStorageAccountedOptions(
         allocator,
         root_dir,
         run.id,
-        state.entries.items.len,
+        state.entryCount(),
         @min(max_file_bytes, max_run_file_read_bytes),
         bloom_config,
         compression_policy,
@@ -390,7 +398,9 @@ pub fn persistRunFileWithStorageAccountedOptions(
     var writer_active = true;
     errdefer if (writer_active) writer.deinit();
 
-    for (state.entries.items) |entry| {
+    var cursor: state_mod.State.EntryCursor = .{};
+    for (0..state.entryCount()) |i| {
+        const entry = cursor.at(&state, i);
         try writer.appendEntry(.{
             .namespace_name = entry.namespace_name,
             .key = entry.key,
@@ -446,9 +456,11 @@ pub fn buildFilterForStateWithConfig(
     state: *const state_mod.State,
     config: bloom.Config,
 ) !bloom.OwnedFilter {
-    var table_entries = try allocator.alloc(lsm_table_file.Entry, state.entries.items.len);
+    var table_entries = try allocator.alloc(lsm_table_file.Entry, state.entryCount());
     defer allocator.free(table_entries);
-    for (state.entries.items, 0..) |entry, i| {
+    var cursor: state_mod.State.EntryCursor = .{};
+    for (0..state.entryCount()) |i| {
+        const entry = cursor.at(state, i);
         table_entries[i] = .{
             .namespace_name = entry.namespace_name,
             .key = entry.key,
@@ -509,6 +521,8 @@ pub fn persistManifestWithStorageCount(
             .largest_key = run.largest_key,
             .entry_count = run.entry_count,
             .tombstone_count = run.tombstone_count,
+            .oldest_tombstone_unix_ns = run.oldest_tombstone_unix_ns,
+            .visibility_id = run.visibility_id,
         };
     }
 

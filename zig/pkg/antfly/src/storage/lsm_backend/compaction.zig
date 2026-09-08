@@ -21,6 +21,34 @@ const compaction_scheduler_mod = @import("compaction_scheduler.zig");
 
 const State = state_mod.State;
 const Run = repository_mod.Run;
+fn gcNowNs() u64 {
+    return @import("antfly_platform").time.realtimeNs();
+}
+
+pub fn nextTombstoneGcDelay(backend: anytype) ?u64 {
+    if (comptime !@hasField(@TypeOf(backend.options), "tombstone_gc_max_age_ns")) return null;
+    if (backend.options.tombstone_gc_max_age_ns == 0) return null;
+    const now = gcNowNs();
+    var delay: ?u64 = null;
+    for (backend.runs.items) |run| {
+        if ((run.tombstone_count orelse 0) == 0) continue;
+        // Unknown ages and wall-clock rollback must not postpone GC indefinitely.
+        const due = if (run.oldest_tombstone_unix_ns == 0 or run.oldest_tombstone_unix_ns > now) 0 else run.oldest_tombstone_unix_ns +| backend.options.tombstone_gc_max_age_ns;
+        const candidate = due -| now;
+        delay = if (delay) |current| @min(current, candidate) else candidate;
+    }
+    if (comptime @hasField(@TypeOf(backend.*), "tombstone_gc_retry_after_ns")) {
+        if (delay) |due| return @max(due, backend.tombstone_gc_retry_after_ns -| backend.nowNs());
+    }
+    return delay;
+}
+
+fn tombstoneAgeDue(backend: anytype, run: Run) bool {
+    if (comptime !@hasField(@TypeOf(backend.options), "tombstone_gc_max_age_ns")) return false;
+    const age = backend.options.tombstone_gc_max_age_ns;
+    const now = gcNowNs();
+    return age != 0 and (run.oldest_tombstone_unix_ns == 0 or run.oldest_tombstone_unix_ns > now or now -| run.oldest_tombstone_unix_ns >= age);
+}
 pub const max_remembered_compaction_run_ids = 64;
 pub const max_exact_l0_overlap_runs = 64;
 /// Differential benchmark switch only; there is no production legacy planner
@@ -58,6 +86,7 @@ pub const CompactionPlan = struct {
     partition_key: PartitionKey = null,
     // A whole overlap component, potentially spanning several levels.
     tombstone_gc: bool = false,
+    split_gc: bool = false,
 
     fn sourceIndex(self: @This(), i: usize) usize {
         const index = self.source_start + i;
@@ -231,10 +260,12 @@ fn tombstoneGcCandidate(backend: anytype, index: *const DomainIndex, max_bytes: 
         var tombstones: u64 = 0;
         var entries: u64 = 0;
         var level: u32 = 1;
+        var aged = false;
         for (indices) |i| {
             const run = backend.runs.items[i];
             bytes +|= run.size_bytes;
             tombstones +|= run.tombstone_count orelse 0;
+            if ((run.tombstone_count orelse 0) != 0) aged = aged or tombstoneAgeDue(backend, run);
             // Each input has unique keys, but inputs can contain many old
             // versions of the same keys. The maximum is a conservative lower
             // bound on the component's distinct keys; their sum is not.
@@ -243,16 +274,14 @@ fn tombstoneGcCandidate(backend: anytype, index: *const DomainIndex, max_bytes: 
         }
         if (tombstones == 0 or bytes >= best_bytes) continue;
         const min_percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) @min(@as(u8, 100), backend.options.tombstone_gc_min_percent) else 50;
-        if (@as(u128, tombstones) * 100 < @as(u128, entries) * min_percent) continue;
-        if (max_bytes != 0 and bytes > max_bytes and !allowOversizedSingleCompactionInput(backend)) continue;
+        if (!aged and @as(u128, tombstones) * 100 < @as(u128, entries) * min_percent) continue;
+        if (max_bytes != 0 and bytes > max_bytes) continue;
         best = indices;
         best_bytes = bytes;
         best_level = level;
     }
     if (best.len == 0) return null;
-    // Prefer a fitting component; the smallest oversized closure is allowed
-    // only by the existing single-job policy and still needs a scheduler/IO
-    // grant. Otherwise a large retired generation would never be reclaimed.
+    // Larger closures advance through bounded level jobs or source splits.
     return .{ .indices = best, .level = best_level };
 }
 
@@ -264,22 +293,93 @@ pub fn hasTombstoneGcDebt(backend: anytype) bool {
 }
 
 fn selectTombstoneGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
-    const index = if (comptime @hasDecl(@TypeOf(backend.*), "domainIndex")) try backend.domainIndex() else try DomainIndex.create(backend);
+    const index = if (comptime @hasDecl(@TypeOf(backend.*), "domainIndex")) backend.domainIndex() catch |err| {
+        if (err == error.CompactionPlanningStale) return null;
+        return err;
+    } else try DomainIndex.create(backend);
     defer if (comptime !@hasDecl(@TypeOf(backend.*), "domainIndex")) index.destroy(backend.allocator);
-    const candidate = tombstoneGcCandidate(backend, index, max_bytes) orelse return null;
+    const configured = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_max_input_bytes")) backend.options.tombstone_gc_max_input_bytes else max_bytes;
+    const limit = if (max_bytes == 0) configured else if (configured == 0) max_bytes else @min(max_bytes, configured);
+    const candidate = tombstoneGcCandidate(backend, index, limit) orelse {
+        if (tombstoneGcCandidate(backend, index, 0) == null) return null;
+        return try selectGcProgress(backend, index, limit);
+    };
     const best = candidate.indices;
     return .{ .plan = .{ .source_level = backend.runs.items[best[0]].level, .source_start = 0, .source_len = best.len, .target_start = 0, .target_len = 0, .output_level = candidate.level, .run_indices = try backend.allocator.dupe(usize, best), .tombstone_gc = true } };
 }
 
+/// A large connected component is not one indivisible GC job. Advance one
+/// source window and its next-level overlap closure. Each manifest publication
+/// is a durable checkpoint of progress, and normal level/recency rules apply.
+fn selectGcProgress(backend: anytype, index: *const DomainIndex, limit: u64) !?SelectedPlan {
+    var best: ?ScoredCompactionPlan = null;
+    var best_indices: ?[]const usize = null;
+    const all_end = [_]usize{backend.runs.items.len};
+    const ends = if (index.mixed) &all_end else index.ends;
+    var start: usize = 0;
+    for (ends) |end| {
+        defer start = end;
+        const runs = if (index.mixed) backend.runs.items else index.runs[start..end];
+        for (runs, 0..) |run, i| {
+            const deletes = run.tombstone_count orelse 0;
+            if (deletes == 0 or run.level == std.math.maxInt(u32)) continue;
+            const percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) backend.options.tombstone_gc_min_percent else 50;
+            if (!tombstoneAgeDue(backend, run) and @as(u64, deletes) * 100 < @as(u64, run.entry_count) * percent) continue;
+            var plan = buildPlanForSourceRange(runs, run.level, i, 1) orelse continue;
+            var priority: u64 = if (tombstoneAgeDue(backend, run)) 3 else 2;
+            if (!planWithinInputBudget(runs, plan, limit)) {
+                // Drain an older L0 dependency first if it makes the delete's
+                // window indivisible. This work need not itself contain deletes.
+                const split_index = if (run.level == 0 and plan.source_len > 1) plan.source_start + plan.source_len - 1 else i;
+                plan = buildPlanForSourceRange(runs, run.level, split_index, 1) orelse continue;
+                if (!planWithinInputBudget(runs, plan, limit)) {
+                    const source = runs[split_index];
+                    if (source.entry_count <= 1 or (limit != 0 and source.size_bytes > limit)) continue;
+                    // Split wide sources; persistent visibility IDs retain L0 order.
+                    plan = .{ .source_level = run.level, .source_start = split_index, .source_len = 1, .target_start = split_index, .target_len = 0, .output_level = run.level, .split_gc = true };
+                }
+                priority = 1;
+            }
+            const candidate = scoredPlan(runs, plan, priority);
+            if (best) |previous| if (!candidate.betterThan(previous)) continue;
+            best = candidate;
+            best_indices = if (index.mixed) null else index.order[start..end];
+        }
+    }
+    var plan = (best orelse return null).plan;
+    if (best_indices) |indices| {
+        plan.run_indices = try backend.allocator.dupe(usize, indices);
+        plan.partition_key = backend.options.run_partition_key orelse wholeKeyspace;
+    }
+    return .{ .plan = plan };
+}
+
 pub fn compactTombstonesScheduled(comptime BackendType: type, backend: *BackendType, score: u64) !bool {
-    const selected = try selectTombstoneGc(backend, backend.options.max_compaction_input_bytes) orelse return false;
+    if (comptime @hasField(BackendType, "tombstone_gc_retry_after_ns")) {
+        if (backend.nowNs() < backend.tombstone_gc_retry_after_ns) return false;
+    }
+    const selected = try selectTombstoneGc(backend, backend.options.max_compaction_input_bytes) orelse {
+        if ((nextTombstoneGcDelay(backend) orelse 1) == 0) deferTombstoneGc(backend);
+        return false;
+    };
     defer selected.deinit(backend.allocator);
     var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, selected.plan, score);
     defer work.deinit(backend.allocator);
-    var grant = backend.acquireCompactionGrant(work) orelse return false;
+    var grant = backend.acquireCompactionGrant(work) orelse {
+        deferTombstoneGc(backend);
+        return false;
+    };
     defer grant.complete();
     try compactPlanAt(BackendType, backend, selected.plan);
+    if (comptime @hasField(BackendType, "tombstone_gc_retry_after_ns")) backend.tombstone_gc_retry_after_ns = 0;
     return true;
+}
+
+fn deferTombstoneGc(backend: anytype) void {
+    // A past age deadline with an inadmissible closure must not turn the idle
+    // worker into a busy loop. New writes still use the ordinary wake path.
+    if (comptime @hasField(@TypeOf(backend.*), "tombstone_gc_retry_after_ns"))
+        backend.tombstone_gc_retry_after_ns = backend.nowNs() +| 250 * std.time.ns_per_ms;
 }
 
 /// Project each independently compactable domain into the existing leveled
@@ -287,10 +387,13 @@ pub fn compactTombstonesScheduled(comptime BackendType: type, backend: *BackendT
 /// unrelated interleaved runs are never added merely to make a global slice.
 fn selectDomainPlan(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
     const allocator = backend.allocator;
-    const runs = backend.runs.items;
     const partition = backend.options.run_partition_key.?;
-    const index = if (comptime @hasDecl(@TypeOf(backend.*), "domainIndex")) try backend.domainIndex() else try DomainIndex.create(backend);
+    const index = if (comptime @hasDecl(@TypeOf(backend.*), "domainIndex")) backend.domainIndex() catch |err| {
+        if (err == error.CompactionPlanningStale) return null;
+        return err;
+    } else try DomainIndex.create(backend);
     defer if (comptime !@hasDecl(@TypeOf(backend.*), "domainIndex")) index.destroy(allocator);
+    const runs = backend.runs.items;
     if (index.mixed) {
         // Previously written mixed SSTs must first be reshaped with the full
         // overlap closure. Never hide overlapping data behind a new domain.
@@ -428,17 +531,22 @@ pub fn maybeFlushMutable(comptime BackendType: type, backend: *BackendType) !voi
 }
 
 pub fn maybeFlushMutableWithThreshold(comptime BackendType: type, backend: *BackendType, flush_threshold: usize) !void {
-    if (backend.mutable.entries.items.len < flush_threshold) return;
+    if (backend.mutable.entryCount() < flush_threshold) return;
     try flushMutable(BackendType, backend);
 }
 
 pub fn flushMutable(comptime BackendType: type, backend: *BackendType) !void {
-    if (backend.mutable.entries.items.len == 0) return;
+    if (backend.mutable.entryCount() == 0) return;
     const start_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) backend.writeStatsNowNs() else 0;
-    var flushed = backend.mutable;
-    backend.mutable = .{};
+    var flushed = if (comptime @TypeOf(backend.mutable) == state_mod.ActiveMemTable)
+        try backend.mutable.toStateMove(backend.allocator)
+    else blk: {
+        const state = backend.mutable;
+        backend.mutable = .{};
+        break :blk state;
+    };
     errdefer flushed.deinit(backend.allocator);
-    const input_entries = flushed.entries.items.len;
+    const input_entries = flushed.entryCount();
     var new_runs = try makeRuns(BackendType, backend, &flushed);
     errdefer discardOutputRuns(BackendType, backend, &new_runs);
     if (@hasDecl(BackendType, "recordFlushWriteStats")) {
@@ -853,7 +961,12 @@ pub fn sortRuns(runs: []Run) void {
     std.sort.pdq(Run, runs, {}, struct {
         fn lessThan(_: void, lhs: Run, rhs: Run) bool {
             if (lhs.level != rhs.level) return lhs.level < rhs.level;
-            if (lhs.level == 0) return lhs.id > rhs.id;
+            if (lhs.level == 0) {
+                const lhs_visibility = if (lhs.visibility_id == 0) lhs.id else lhs.visibility_id;
+                const rhs_visibility = if (rhs.visibility_id == 0) rhs.id else rhs.visibility_id;
+                if (lhs_visibility != rhs_visibility) return lhs_visibility > rhs_visibility;
+                return compareRunBound(lhs.smallest_namespace_name, lhs.smallest_key, rhs.smallest_namespace_name, rhs.smallest_key) == .lt;
+            }
             const bound_order = compareRunBound(
                 lhs.smallest_namespace_name,
                 lhs.smallest_key,
@@ -894,6 +1007,9 @@ fn planHasCompleteCoverage(runs: []const Run, plan: CompactionPlan) bool {
     };
     for (runs, 0..) |run, i| {
         if (planSelectsIndex(plan, i)) continue;
+        // Smaller levels (and earlier L0 runs) are newer than every selected
+        // source. Their continued existence cannot reveal an older value.
+        if (run.level < plan.source_level or (plan.source_level == 0 and run.level == 0 and i < plan.sourceIndex(0))) continue;
         if (compareRunBound(run.largest_namespace_name, run.largest_key, smallest.smallest_namespace_name, smallest.smallest_key) != .lt and
             compareRunBound(run.smallest_namespace_name, run.smallest_key, largest.largest_namespace_name, largest.largest_key) != .gt) return false;
     }
@@ -901,8 +1017,8 @@ fn planHasCompleteCoverage(runs: []const Run, plan: CompactionPlan) bool {
 }
 
 fn compactPlanAt(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
-    if (!plan.tombstone_gc and plan.partition_key != null and plan.source_len == 1 and plan.target_len == 0 and
-        (backend.runs.items[plan.sourceIndex(0)].tombstone_count orelse 0) == 0)
+    if (!plan.tombstone_gc and !plan.split_gc and plan.partition_key != null and plan.source_len == 1 and plan.target_len == 0 and
+        ((backend.runs.items[plan.sourceIndex(0)].tombstone_count orelse 0) == 0 or !planHasCompleteCoverage(backend.runs.items, plan)))
     {
         // A closed, nonoverlapping domain needs only a manifest-level move.
         // SST bytes and file identity are immutable; do not decode/re-encode
@@ -955,11 +1071,16 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     }
     const input_bytes = sumRunPtrBytes(selected[0..selected_len]);
 
-    const drop_tombstones = planHasCompleteCoverage(backend.runs.items, plan);
-    var compacted_runs = if (backend.root_dir != null)
+    const drop_tombstones = !plan.split_gc and planHasCompleteCoverage(backend.runs.items, plan);
+    const split_start = backend.next_run_id;
+    if (plan.split_gc) backend.next_run_id +|= countRunPtrEntries(selected[0..selected_len]);
+    var compacted_runs = if (plan.split_gc)
+        try buildCompactedRunsFromSnapshots(BackendType, backend, selected[0..selected_len], plan.output_level, split_start, backend.next_run_id, false, true)
+    else if (backend.root_dir != null)
         try makePersistedRunsFromSelectedRunsWithGc(BackendType, backend, selected[0..selected_len], plan.output_level, drop_tombstones)
     else
         try makeStateRunsFromSelectedRuns(BackendType, backend, selected[0..selected_len], plan.output_level, drop_tombstones);
+    inheritTombstoneAge(compacted_runs.items, selected[0..selected_len]);
     errdefer discardOutputRuns(BackendType, backend, &compacted_runs);
 
     var retained = std.ArrayListUnmanaged(Run).empty;
@@ -1041,7 +1162,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
 
 fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
     if (plan.source_len == 0) return;
-    const drop_tombstones = planHasCompleteCoverage(backend.runs.items, plan);
+    const drop_tombstones = !plan.split_gc and planHasCompleteCoverage(backend.runs.items, plan);
     const start_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) backend.writeStatsNowNs() else 0;
 
     var selected_runs = std.ArrayListUnmanaged(Run).empty;
@@ -1081,6 +1202,7 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         reserved_run_id_start,
         reserved_run_id_end,
         drop_tombstones,
+        plan.split_gc,
     ) catch |err| blk: {
         build_err = err;
         break :blk .empty;
@@ -1098,11 +1220,11 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         return err;
     }
 
-    const domain_plan = if (plan.tombstone_gc)
+    const domain_plan = if (plan.tombstone_gc or plan.split_gc)
         try relocateGcPlan(backend.allocator, backend.runs.items, plan, selected_runs.items)
     else if (plan.partition_key != null) try relocateDomainPlan(backend.allocator, backend.runs.items, plan, selected_run_ids) else null;
     defer if (domain_plan) |selected_plan| selected_plan.deinit(backend.allocator);
-    const publish_plan = (if (plan.partition_key != null or plan.tombstone_gc)
+    const publish_plan = (if (plan.partition_key != null or plan.tombstone_gc or plan.split_gc)
         if (domain_plan) |selected_plan| selected_plan.plan else null
     else
         relocatePlanIfInputsStillMatch(backend.runs.items, plan, selected_run_ids)) orelse {
@@ -1113,9 +1235,9 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         return;
     };
 
-    // The proof covers all levels, not just the target-level closure. A
-    // concurrent flush or ingest may add an older overlapping value while
-    // the build is unlocked; never publish elided deletes against that view.
+    // Revalidate all older persisted data, not only the target-level closure.
+    // Concurrent newer L0 publication is harmless, but an older overlapping
+    // value outside the selected inputs must prevent delete elision.
     if (drop_tombstones and !planHasCompleteCoverage(backend.runs.items, publish_plan)) {
         if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
@@ -1189,6 +1311,7 @@ fn buildCompactedRunsFromSnapshots(
     reserved_run_id_start: u64,
     reserved_run_id_end: u64,
     drop_tombstones: bool,
+    split_gc: bool,
 ) !std.ArrayListUnmanaged(Run) {
     const BuildBackend = struct {
         allocator: std.mem.Allocator,
@@ -1204,10 +1327,17 @@ fn buildCompactedRunsFromSnapshots(
         .options = backend.options,
         .next_run_id = reserved_run_id_start,
     };
+    if (comptime @hasField(@TypeOf(build_backend.options), "max_run_file_entries")) {
+        if (split_gc) build_backend.options.max_run_file_entries = @max(@as(usize, 1), selected[0].entry_count / 2);
+    } else std.debug.assert(!split_gc);
     const runs = if (backend.root_dir != null)
         try makePersistedRunsFromSelectedRunsWithGc(BuildBackend, &build_backend, selected, output_level, drop_tombstones)
     else
         try makeStateRunsFromSelectedRuns(BuildBackend, &build_backend, selected, output_level, drop_tombstones);
+    inheritTombstoneAge(runs.items, selected);
+    if (split_gc) for (runs.items) |*run| {
+        run.visibility_id = if (selected[0].visibility_id == 0) selected[0].id else selected[0].visibility_id;
+    };
     errdefer {
         var owned = runs;
         discardOutputRuns(BuildBackend, &build_backend, &owned);
@@ -1259,7 +1389,10 @@ fn relocateGcPlan(allocator: std.mem.Allocator, runs: []const Run, plan: Compact
     if (indices.items.len != selected.len) return null;
     var relocated = plan;
     relocated.run_indices = indices.items;
-    if (!planHasCompleteCoverage(runs, relocated)) return null;
+    if (plan.split_gc) {
+        relocated.source_start = 0;
+        relocated.target_start = 0;
+    } else if (!planHasCompleteCoverage(runs, relocated)) return null;
     relocated.run_indices = try indices.toOwnedSlice(allocator);
     return .{ .plan = relocated };
 }
@@ -2204,7 +2337,7 @@ test "domain planner uses global lower level budgets and normalized pressure" {
     try std.testing.expectEqual(@as(usize, 1), selected.plan.source_len);
 }
 
-test "tombstone GC coverage rejects deeper values and concurrent flushes" {
+test "tombstone GC coverage rejects deeper values but permits newer concurrent flushes" {
     const allocator = std.testing.allocator;
     var runs = [_]Run{
         testRun(3, 0, "a", "a", 10),
@@ -2219,7 +2352,8 @@ test "tombstone GC coverage rejects deeper values and concurrent flushes" {
     const same = (try relocateGcPlan(allocator, &runs, complete, &runs)).?;
     defer same.deinit(allocator);
     var concurrent = [_]Run{testRun(4, 0, "a", "a", 10)} ++ runs;
-    try std.testing.expect((try relocateGcPlan(allocator, &concurrent, complete, &runs)) == null);
+    const newer = (try relocateGcPlan(allocator, &concurrent, complete, &runs)).?;
+    defer newer.deinit(allocator);
     concurrent[0] = testRun(4, 0, "z", "z", 10);
     const disjoint = (try relocateGcPlan(allocator, &concurrent, complete, &runs)).?;
     defer disjoint.deinit(allocator);
@@ -2238,25 +2372,39 @@ test "tombstone GC density bounds garbage without stranding duplicate older vers
             level_target_bytes_base: usize = 0,
             level_target_bytes_multiplier: usize = 8,
             tombstone_gc_min_percent: u8 = 50,
+            tombstone_gc_max_age_ns: u64 = std.time.ns_per_hour,
             max_compaction_input_allow_oversized_single_job: bool = false,
         } = .{},
     };
     var runs = [_]Run{ testRun(4, 0, "a", "z", 10), testRun(3, 1, "a", "z", 10), testRun(2, 2, "a", "z", 10), testRun(1, 3, "a", "z", 10) };
     for (&runs) |*run| run.entry_count = 100;
     runs[0].tombstone_count = 10;
+    runs[0].oldest_tombstone_unix_ns = gcNowNs();
     var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
     try std.testing.expect((try selectTombstoneGc(&backend, 0)) == null);
+    // Sparse deletes eventually qualify independently of their key fraction.
+    runs[0].oldest_tombstone_unix_ns = 1;
+    const aged = (try selectTombstoneGc(&backend, 0)).?;
+    defer aged.deinit(backend.allocator);
+    try std.testing.expectEqual(@as(?u64, 0), nextTombstoneGcDelay(&backend));
+    runs[0].oldest_tombstone_unix_ns = std.math.maxInt(u64);
+    try std.testing.expect(tombstoneAgeDue(&backend, runs[0]));
+    try std.testing.expectEqual(@as(?u64, 0), nextTombstoneGcDelay(&backend));
+    runs[0].oldest_tombstone_unix_ns = gcNowNs();
     runs[0].tombstone_count = 100;
     // One complete delete generation over three older copies must qualify,
     // even though tombstones are only 25% of physical input entries.
     const selected = (try selectTombstoneGc(&backend, 0)).?;
     defer selected.deinit(backend.allocator);
     try std.testing.expectEqual(@as(usize, 4), selected.plan.source_len);
-    try std.testing.expect((try selectTombstoneGc(&backend, 20)) == null);
+    const bounded = (try selectTombstoneGc(&backend, 20)).?;
+    defer bounded.deinit(backend.allocator);
+    try std.testing.expect(compactionInputBytes(&runs, bounded.plan) <= 20);
+    try std.testing.expect(!bounded.plan.tombstone_gc);
     backend.options.max_compaction_input_allow_oversized_single_job = true;
     const oversized = (try selectTombstoneGc(&backend, 20)).?;
     defer oversized.deinit(backend.allocator);
-    try std.testing.expect(planHasCompleteCoverage(&runs, oversized.plan));
+    try std.testing.expect(compactionInputBytes(&runs, oversized.plan) <= 20);
 }
 
 test "domain compaction maps interleaved inputs and revalidates concurrent publication" {
@@ -2675,6 +2823,7 @@ fn makePersistedRunsFromSelectedRunsWithGc(comptime BackendType: type, backend: 
                 backend.options.run_partition_key,
             );
             if (partition_changed or
+                output.entry_count >= outputEntryLimit(backend) or
                 (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes + entry_bytes > target_bytes) or
                 (output.entry_count > 0 and !output.canAppendEntry(winner)))
             {
@@ -2855,6 +3004,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 .largest_key = largest_key,
                 .entry_count = @intCast(persisted.entry_count),
                 .tombstone_count = self.tombstone_count,
+                .oldest_tombstone_unix_ns = if (self.tombstone_count != 0) gcNowNs() else 0,
                 .bloom_filter = persisted.filter,
                 .state = null,
             };
@@ -3125,13 +3275,13 @@ pub fn makeRuns(comptime BackendType: type, backend: *BackendType, state: *State
 }
 
 pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendType, state: *const State) !std.ArrayListUnmanaged(Run) {
-    if (state.entries.items.len == 0) return error.EmptyRun;
+    if (state.entryCount() == 0) return error.EmptyRun;
     if (backend.root_dir != null) return try makePersistedRunsFromStateBorrowedAtLevel(BackendType, backend, state, 0);
 
     var scratch_bytes_accounted: u64 = 0;
     if (@hasField(BackendType, "options")) {
         if (backend.options.resource_manager) |manager| {
-            const bytes = std.math.mul(u64, @intCast(state.entries.items.len), @sizeOf(lsm_table_file.Entry)) catch std.math.maxInt(u64);
+            const bytes = std.math.mul(u64, @intCast(state.entryCount()), @sizeOf(lsm_table_file.Entry)) catch std.math.maxInt(u64);
             manager.observeUsage(.lsm_compaction_work, &scratch_bytes_accounted, bytes);
         }
     }
@@ -3140,9 +3290,11 @@ pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendTy
             manager.observeUsage(.lsm_compaction_work, &scratch_bytes_accounted, 0);
         }
     };
-    var entries = try backend.allocator.alloc(lsm_table_file.Entry, state.entries.items.len);
+    var entries = try backend.allocator.alloc(lsm_table_file.Entry, state.entryCount());
     defer backend.allocator.free(entries);
-    for (state.entries.items, 0..) |entry, i| {
+    var cursor: State.EntryCursor = .{};
+    for (0..state.entryCount()) |i| {
+        const entry = cursor.at(state, i);
         entries[i] = .{
             .namespace_name = entry.namespace_name,
             .key = entry.key,
@@ -3154,7 +3306,7 @@ pub fn makeRunsFromStateBorrowed(comptime BackendType: type, backend: *BackendTy
 }
 
 pub fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, backend: *BackendType, state: *const State, level: u32) !std.ArrayListUnmanaged(Run) {
-    if (state.entries.items.len == 0) return error.EmptyRun;
+    if (state.entryCount() == 0) return error.EmptyRun;
     try validateSortedUniqueOwnedEntries(state.entries.items);
 
     var runs = std.ArrayListUnmanaged(Run).empty;
@@ -3162,8 +3314,9 @@ pub fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, bac
 
     const target_bytes = targetRunFileBytes(BackendType, backend);
     var start: usize = 0;
-    while (start < state.entries.items.len) {
-        const preferred_end = splitOwnedEntriesEnd(state.entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes, backend.options.run_partition_key);
+    var cursor: State.EntryCursor = .{};
+    while (start < state.entryCount()) {
+        const preferred_end = splitStateEnd(state, start, target_bytes, backend.options.run_partition_prefix_bytes, backend.options.run_partition_key);
         try runs.ensureUnusedCapacity(backend.allocator, 1);
 
         var output: PersistedOutputRunBuilder(BackendType) = undefined;
@@ -3173,7 +3326,7 @@ pub fn makePersistedRunsFromStateBorrowedAtLevel(comptime BackendType: type, bac
 
         var end = start;
         while (end < preferred_end) : (end += 1) {
-            const entry = state.entries.items[end];
+            const entry = cursor.at(state, end);
             const table_entry = tableEntryFromOwnedEntry(entry);
             if (!output.canAppendEntry(table_entry)) {
                 if (end == start) return error.TableFileTooLarge;
@@ -3197,7 +3350,7 @@ pub fn makeRunsFromSortedTableEntries(comptime BackendType: type, backend: *Back
 }
 
 fn makeRunsFromStateAtLevel(comptime BackendType: type, backend: *BackendType, state: *State, level: u32) !std.ArrayListUnmanaged(Run) {
-    if (state.entries.items.len == 0) return error.EmptyRun;
+    if (state.entryCount() == 0) return error.EmptyRun;
 
     if (backend.root_dir != null) {
         const runs = try makePersistedRunsFromStateBorrowedAtLevel(BackendType, backend, state, level);
@@ -3206,6 +3359,7 @@ fn makeRunsFromStateAtLevel(comptime BackendType: type, backend: *BackendType, s
         return runs;
     }
 
+    try state.ensureFlat(backend.allocator);
     var source_entries = state.entries;
     state.entries = .empty;
     var moved_until: usize = 0;
@@ -3221,7 +3375,7 @@ fn makeRunsFromStateAtLevel(comptime BackendType: type, backend: *BackendType, s
     var start: usize = 0;
     while (start < source_entries.items.len) {
         try runs.ensureUnusedCapacity(backend.allocator, 1);
-        const end = splitOwnedEntriesEnd(source_entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes, backend.options.run_partition_key);
+        const end = @min(splitOwnedEntriesEnd(source_entries.items, start, target_bytes, backend.options.run_partition_prefix_bytes, backend.options.run_partition_key), start +| outputEntryLimit(backend));
 
         var chunk: State = .{};
         errdefer chunk.deinit(backend.allocator);
@@ -3284,17 +3438,17 @@ fn makeRunsFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *B
 }
 
 pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: State, level: u32) !Run {
-    if (state.entries.items.len == 0) return error.EmptyRun;
+    if (state.entryCount() == 0) return error.EmptyRun;
     const run_id = backend.next_run_id;
     backend.next_run_id += 1;
 
-    const smallest_namespace_name = if (state.entries.items[0].namespace_name) |name| try backend.allocator.dupe(u8, name) else null;
+    const smallest_namespace_name = if (state.entryAt(0).namespace_name) |name| try backend.allocator.dupe(u8, name) else null;
     errdefer if (smallest_namespace_name) |name| backend.allocator.free(name);
-    const smallest_key = try backend.allocator.dupe(u8, state.entries.items[0].key);
+    const smallest_key = try backend.allocator.dupe(u8, state.entryAt(0).key);
     errdefer backend.allocator.free(smallest_key);
-    const largest_namespace_name = if (state.entries.items[state.entries.items.len - 1].namespace_name) |name| try backend.allocator.dupe(u8, name) else null;
+    const largest_namespace_name = if (state.entryAt(state.entryCount() - 1).namespace_name) |name| try backend.allocator.dupe(u8, name) else null;
     errdefer if (largest_namespace_name) |name| backend.allocator.free(name);
-    const largest_key = try backend.allocator.dupe(u8, state.entries.items[state.entries.items.len - 1].key);
+    const largest_key = try backend.allocator.dupe(u8, state.entryAt(state.entryCount() - 1).key);
     errdefer backend.allocator.free(largest_key);
 
     var frozen = state;
@@ -3308,8 +3462,9 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
         .smallest_key = smallest_key,
         .largest_namespace_name = largest_namespace_name,
         .largest_key = largest_key,
-        .entry_count = @intCast(state.entries.items.len),
-        .tombstone_count = countTombstones(state.entries.items),
+        .entry_count = @intCast(state.entryCount()),
+        .tombstone_count = countStateTombstones(&state),
+        .oldest_tombstone_unix_ns = gcNowNs(),
         .bloom_filter = try repository_mod.buildFilterForStateWithConfig(
             backend.allocator,
             &state,
@@ -3405,6 +3560,7 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         .largest_key = largest_key,
         .entry_count = @intCast(persisted.entry_count),
         .tombstone_count = countTombstones(entries),
+        .oldest_tombstone_unix_ns = gcNowNs(),
         .bloom_filter = persisted.filter,
         .state = null,
     };
@@ -3413,6 +3569,21 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
 fn countTombstones(entries: anytype) u32 {
     var count: u32 = 0;
     for (entries) |entry| count += @intFromBool(entry.tombstone);
+    return count;
+}
+
+fn inheritTombstoneAge(outputs: []Run, inputs: []const *Run) void {
+    var oldest = gcNowNs();
+    for (inputs) |run| if ((run.tombstone_count orelse 0) != 0) {
+        oldest = @min(oldest, run.oldest_tombstone_unix_ns);
+    };
+    for (outputs) |*run| run.oldest_tombstone_unix_ns = if ((run.tombstone_count orelse 0) != 0) oldest else 0;
+}
+
+fn countStateTombstones(state: *const State) u32 {
+    var count: u32 = 0;
+    var cursor: State.EntryCursor = .{};
+    for (0..state.entryCount()) |i| count += @intFromBool(cursor.at(state, i).tombstone);
     return count;
 }
 
@@ -3442,7 +3613,9 @@ fn validateSortedUniqueOwnedEntries(entries: []const state_mod.OwnedEntry) !void
 
 fn estimateStateBytes(state: *const State) u64 {
     var total: u64 = 0;
-    for (state.entries.items) |entry| {
+    var cursor: State.EntryCursor = .{};
+    for (0..state.entryCount()) |i| {
+        const entry = cursor.at(state, i);
         total += 1 + 3 * 4;
         if (entry.namespace_name) |name| total += name.len;
         total += entry.key.len + entry.value.len;
@@ -3530,6 +3703,28 @@ fn splitOwnedEntriesEnd(entries: []const state_mod.OwnedEntry, start: usize, tar
         total +|= entry_bytes;
     }
     return end;
+}
+
+fn splitStateEnd(state: *const State, start: usize, target_bytes: usize, prefix_bytes: usize, partition: PartitionKey) usize {
+    var cursor: State.EntryCursor = .{};
+    const first = cursor.at(state, start);
+    var total: usize = 0;
+    var end = start;
+    while (end < state.entryCount()) : (end += 1) {
+        const entry = cursor.at(state, end);
+        if (end > start and !sameRunPartition(first.namespace_name, first.key, entry.namespace_name, entry.key, prefix_bytes, partition)) break;
+        const bytes = estimateOwnedEntryBytes(entry);
+        if (end > start and total +| bytes > target_bytes) break;
+        total +|= bytes;
+    }
+    return end;
+}
+
+fn outputEntryLimit(backend: anytype) usize {
+    if (comptime @hasField(@TypeOf(backend.options), "max_run_file_entries")) {
+        if (backend.options.max_run_file_entries != 0) return backend.options.max_run_file_entries;
+    }
+    return std.math.maxInt(usize);
 }
 
 fn splitTableEntriesEnd(entries: []const lsm_table_file.Entry, start: usize, target_bytes: usize, partition_prefix_bytes: usize, partition_key: PartitionKey) usize {

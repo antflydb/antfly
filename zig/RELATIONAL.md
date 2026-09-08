@@ -586,44 +586,67 @@ shared descriptors never acquire unsynchronized lazy Bloom-filter ownership.
 The topology is built lazily once per version under the backend mutex, not once
 per key. SST I/O remains outside the writer lock.
 
-Mutable snapshots now pin a reference-counted, rank-indexed AVL root in O(1).
-Writers mutate unique paths and copy shared paths; edits reserve node capacity
-before changing either index. Forward merge cursors traverse tree edges in
-amortized O(1) per entry. Transaction-local batches keep only the hash index;
-admission includes the ordered nodes and potential path copies at publication.
-Values overwritten after a snapshot remain alive until their last owner
-releases them. The primary store no longer rotates memtables to open ordinary
-read snapshots; configured write, WAL, idle and retention limits still apply.
-Retained-state accounting remains conservative across epochs sharing bytes.
-The active ordered index adds one AVL node per key plus a bounded spare pool;
-this is a memory-for-snapshot-latency tradeoff, especially for narrow values,
-and is included in the memory guard rather than hidden from it.
-Mutable allocation charges are incremental and immutable charges are frozen
-at publication, so memory guards no longer rescan every key on narrow writes.
+Mutable snapshots pin a reference-counted, rank-indexed AVL root in O(1).
+The live memtable owns only this ordered representation, not a second hash
+index and entry vector. Transaction-local batches keep the hash index. Commit
+builds a complete successor root after any WAL-pressure relief (which may
+flush and unlock), performs final allocation-based admission, appends the WAL,
+then publishes with a non-failing root swap. Allocation failure cannot expose
+a partial batch. Writers copy shared paths and mutate private paths. Forward
+merge cursors traverse tree edges in amortized O(1) per entry.
+
+Rotation transfers the root without sorting, allocation or reclamation.
+Retired snapshot and immutable-generation subtrees are reclaimed outside the
+writer mutex, with lifecycle and accounting handles held until completion.
+Values remain alive until their last owner releases them. Ordinary reads do
+not rotate memtables; configured write, WAL, idle and retention limits apply.
+An allocation account tracks nodes and shared payloads once, independently of
+the number of epochs referencing them. Memory guards deduplicate accounts and
+include spare capacity, rather than summing each snapshot's reachable tree.
+The single AVL still costs one node per key and a bounded spare pool, so narrow
+rows retain more indexing overhead than a densely packed immutable block.
 `mutable_snapshot_clone_bytes_total` now counts copied index/owned bytes rather
 than counting shared payload bytes as copies. `read_version_builds` and
 `read_version_pins` distinguish topology publication from request pinning.
 
 Domain membership, global level budgets and complete overlap components are
 cached once per published run version. `domain_index_builds` exposes rebuilds.
+For more than 64 runs, planner sorting and overlap-component construction run
+outside the writer mutex against a pinned version; publication discards stale
+plans. Capturing a previously unbuilt read version still copies metadata and
+builds read topology under the mutex: this is not a fully incremental planner.
 Selection retains normalized pressure scores across domains and uses the same
 global level targets as maintenance debt accounting. A collection of individually
 small domains can no longer strand global lower-level debt.
 
-Manifest v10 records each run's tombstone count. The existing main-branch v9
+Manifest v10 records each run's tombstone count, oldest delete timestamp, and
+stable L0 visibility identity. The existing main-branch v9
 manifest remains readable with unknown counts until runs are rewritten; no
-historical relational format is retained. Ordinary compaction drops tombstones
-only with complete all-level coverage. Below ordinary level thresholds,
+historical relational format is retained. Compaction drops tombstones
+only with complete coverage of older persisted data. Below ordinary level thresholds,
 maintenance schedules a complete overlapping SST component containing deletes,
 including singleton runs. To avoid rewriting mostly live data after every small
 delete, standalone GC defaults to at least 50% of the largest input's key count
 in tombstones. It does not sum duplicate older versions into that denominator:
 fully retired components still qualify, even with many historical copies.
 Ordinary compaction elides covered deletes regardless of this threshold.
-Selection prefers the smallest eligible component and honors
-input, scheduler and IO budgets, including the configured oversized-single-job
-exception. Strict budgets can defer a larger component until reconfigured.
-Publication revalidates exact input IDs, levels and all-level coverage after
+Sparse deletes also become eligible after one hour by default, so a key-count
+threshold cannot indefinitely strand byte-heavy obsolete values. Ages survive
+rewrites and reopen; unknown ages and clock rollback qualify immediately.
+One in eight compaction maintenance turns gives aged GC first opportunity.
+
+GC has a default 2 GiB input cap, further restricted by the normal compaction
+cap, scheduler and IO grants; it never takes the oversized-job exception.
+Selection prefers a fitting complete component. Larger components advance
+through bounded next-level jobs. A wide source whose target closure cannot
+fit is split first, preserving its L0 visibility identity independently of
+new file IDs. Each manifest publication is a restart-safe progress checkpoint.
+The input budget must accommodate an irreducible source/target window; an
+individually oversized source or insufficient maintenance bandwidth can still
+defer GC. Inadmissible aged work uses a timed retry instead of spinning on an
+already expired age deadline.
+This bounds individual work units, not an unconditional physical/live ratio.
+Publication revalidates exact input IDs, levels and older-data coverage after
 the unlocked streaming build. Empty output atomically retires every input.
 Pinned readers retain their old files; actual deletion still waits for reader
 release, manifest publication and the configured grace period. The
@@ -633,20 +656,35 @@ Development-host measurements for this redesign:
 
 | Fixture | Before | After |
 | --- | ---: | ---: |
-| 40,000 single-row writes, 8-byte values, guarded, median | 1.722 s | 0.691 s |
+| 40,000 single-row writes, 8-byte values, guarded, median | 1.722 s | 0.735 s |
 | 8,192 narrow keys / 32 snapshot setups, median | 95.595 ms | 0.003 ms |
 | Descriptor bytes copied by those snapshots | 16 MiB | 0 |
 | 24 unique-key insert/delete generations after maintenance | Retained delete entries | 0 SSTs |
 
 The write fixture uses ReleaseFast, three samples, memory-backed real WAL/SST
 encoding, a 64 MiB byte guard and no intermediate row-count flush. Accounting
-alone measured 0.666 s; the ordered index adds about 4% to that narrow-write
-fixture. The snapshot fixture uses ReleaseSafe and five alternating samples;
+alone measured 0.666 s; the preceding shared-root implementation measured
+0.691 s. Atomic successor preparation and allocation ownership add about 6%
+over that implementation in this narrow-write fixture. The snapshot fixture
+uses ReleaseSafe and five alternating samples;
 it measures root pin/release and point lookup, not end-to-end request latency.
 The churn regression keeps an old reader during GC, reopens the store repeatedly,
 and verifies old/current visibility and physical reclamation (539 bytes peak
 retained files for this tiny fixture). These are diagnostics, not timing gates
 or a universal physical-to-live-byte bound.
+
+The subsequent atomic-publication/allocation-accounting change measured
+17,645,096 charged bytes for 17,645,096 allocated bytes in a 4,096-row, 4 KiB,
+32-epoch diagnostic (previously 574,603,456 charged for 17,981,488 allocated).
+For 100,000 narrow keys, allocated memory fell from 25,064,072 to 17,607,304
+bytes. Root handoff performs zero allocations/frees and no tree traversal;
+the previous rotation took about 45 ms in that isolated fixture. These measure
+allocator-requested bytes, not process RSS or end-to-end request latency.
+The final three write samples were 0.745, 0.735 and 0.735 s. Shared-host timing
+is diagnostic, not a gate or a general throughput claim.
+The production physical-churn fixture retained its previous write reduction:
+about 17.28 MB SST output at the default density threshold versus 29.31 MB
+with eager standalone GC; WAL output remained 10.09 MB in both cases.
 
 The native production-shaped churn fixture compares eager standalone GC with
 the 50% trigger using otherwise identical primary options (ReleaseFast, one
