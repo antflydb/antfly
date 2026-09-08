@@ -3244,6 +3244,8 @@ pub const HttpHandler = struct {
             if (source_row >= nodes.len) return error.InvalidQueryRequest;
             local_node_count += @intFromBool(graphMetricLocalNodeId(nodes[source_row]) != null);
         }
+        try session.chargeGraphMetricRetained(std.math.mul(usize, local_node_count, @sizeOf([]const u8) + @sizeOf(usize)) catch
+            return error.GraphMetricQueryBudgetExceeded);
         const node_ids = try self.alloc.alloc([]const u8, local_node_count);
         defer self.alloc.free(node_ids);
         const local_node_indexes = try self.alloc.alloc(usize, local_node_count);
@@ -3409,11 +3411,9 @@ pub const HttpHandler = struct {
         result: *db_types.GraphSearchResult,
     ) !void {
         try graph_query_mod.validateGraphMetricQueryShape(query);
-        var dependency_names: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
-        var dependency_count: usize = 0;
-        for (query.metrics) |metric| appendUniqueMetricDependency(&dependency_names, &dependency_count, metric.name);
-        for (query.order_by) |order| appendUniqueMetricDependency(&dependency_names, &dependency_count, order.name);
-        for (query.where_metric) |filter| appendUniqueMetricDependency(&dependency_names, &dependency_count, filter.name);
+        const read_plan = try graph_query_mod.MetricReadPlan.init(query);
+        const dependency_names = read_plan.dependencies.buffer;
+        const dependency_count = read_plan.dependencies.len;
         if (dependency_count == 0) return;
         if (graphMetricPostProcessingNeeded(query) and result.nodes.len > graph_query_mod.graph_metric_candidate_limit) return error.QueryCandidateBudgetExceeded;
 
@@ -3424,17 +3424,12 @@ pub const HttpHandler = struct {
             for (statuses, status_initialized[0..dependency_count]) |*status, initialized| if (initialized) status.deinit(self.alloc);
             self.alloc.free(statuses);
         };
-        var filter_names_buffer: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
-        var filter_name_count: usize = 0;
-        for (query.where_metric) |filter| appendUniqueMetricDependency(&filter_names_buffer, &filter_name_count, filter.name);
-
-        var order_names_buffer: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
-        var order_name_count: usize = 0;
-        for (query.order_by) |order| appendUniqueMetricDependency(&order_names_buffer, &order_name_count, order.name);
-
-        var projection_names_buffer: [graph_query_mod.graph_metric_dependency_limit][]const u8 = undefined;
-        var projection_name_count: usize = 0;
-        for (query.metrics) |metric| appendUniqueMetricDependency(&projection_names_buffer, &projection_name_count, metric.name);
+        const filter_names_buffer = read_plan.filters.buffer;
+        const filter_name_count = read_plan.filters.len;
+        const order_names_buffer = read_plan.orders.buffer;
+        const order_name_count = read_plan.orders.len;
+        const projection_names_buffer = read_plan.projections.buffer;
+        const projection_name_count = read_plan.projections.len;
 
         const initial_row_bytes = std.math.mul(usize, result.nodes.len, @sizeOf(usize)) catch
             return error.GraphMetricQueryBudgetExceeded;
@@ -3476,6 +3471,10 @@ pub const HttpHandler = struct {
             var filter_query = query;
             filter_query.metrics = &.{};
             filter_query.order_by = &.{};
+            // The selector retains its candidate permutation while copying
+            // the selected prefix; reserve both arrays before entering it.
+            try session.chargeGraphMetricRetained(std.math.mul(usize, active_rows.len, 2 * @sizeOf(usize)) catch
+                return error.GraphMetricQueryBudgetExceeded);
             const selected = try graph_query_mod.GraphQueryEngine.selectLoadedMetricCandidateIndexesAlloc(
                 self.alloc,
                 filter_names_buffer[0..filter_name_count],
@@ -3536,6 +3535,8 @@ pub const HttpHandler = struct {
             var order_query = query;
             order_query.metrics = &.{};
             order_query.where_metric = &.{};
+            try session.chargeGraphMetricRetained(std.math.mul(usize, active_rows.len, 2 * @sizeOf(usize)) catch
+                return error.GraphMetricQueryBudgetExceeded);
             const selected = try graph_query_mod.GraphQueryEngine.selectLoadedMetricCandidateIndexesAlloc(
                 self.alloc,
                 order_names_buffer[0..order_name_count],
@@ -3591,6 +3592,11 @@ pub const HttpHandler = struct {
             return error.GraphMetricQueryBudgetExceeded;
         var projected_retained_bytes = std.math.mul(usize, projected_value_count, @sizeOf(graph_query_mod.GraphMetricValue)) catch
             return error.GraphMetricQueryBudgetExceeded;
+        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, active_rows.len, @sizeOf(graph_query_mod.GraphResultNode)) catch
+            return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
+        const selection_words = std.math.divCeil(usize, result.nodes.len, @bitSizeOf(usize)) catch return error.GraphMetricQueryBudgetExceeded;
+        projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, selection_words, @sizeOf(usize)) catch
+            return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
         projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, dependency_count, @sizeOf([]u8)) catch
             return error.GraphMetricQueryBudgetExceeded) catch return error.GraphMetricQueryBudgetExceeded;
         projected_retained_bytes = std.math.add(usize, projected_retained_bytes, std.math.mul(usize, dependency_count, @sizeOf(db_types.GraphMetricStatus)) catch

@@ -362,6 +362,61 @@ pub const graph_metric_order_limit: usize = 8;
 pub const graph_metric_filter_limit: usize = 32;
 pub const graph_metric_dependency_limit: usize = 16;
 
+/// Backend-independent late-materialization plan. Names borrow the validated
+/// query; each stage is deduplicated and ordering remains user-defined.
+pub const MetricReadPlan = struct {
+    const Names = struct {
+        buffer: [graph_metric_dependency_limit][]const u8 = undefined,
+        len: usize = 0,
+
+        pub fn slice(self: *const @This()) []const []const u8 {
+            return self.buffer[0..self.len];
+        }
+        fn append(self: *@This(), name: []const u8) void {
+            for (self.slice()) |prior| if (std.mem.eql(u8, name, prior)) return;
+            std.debug.assert(self.len < self.buffer.len);
+            self.buffer[self.len] = name;
+            self.len += 1;
+        }
+    };
+    dependencies: Names = .{},
+    filters: Names = .{},
+    orders: Names = .{},
+    projections: Names = .{},
+    policies: [graph_metric_dependency_limit]graph_mod.GraphIndex.GraphMetricColumnReadPolicy = @splat(.{}),
+
+    fn require(self: *@This(), name: []const u8, freshness: GraphMetricFreshness, published: bool) void {
+        for (self.dependencies.slice(), 0..) |dependency, i| {
+            if (!std.mem.eql(u8, dependency, name)) continue;
+            self.policies[i].require_published = self.policies[i].require_published or published;
+            self.policies[i].require_fresh = self.policies[i].require_fresh or freshness == .fresh;
+            return;
+        }
+        unreachable;
+    }
+
+    pub fn init(query: GraphQuery) !MetricReadPlan {
+        try validateGraphMetricQueryShape(query);
+        var plan = MetricReadPlan{};
+        for (query.metrics) |metric| {
+            plan.dependencies.append(metric.name);
+            plan.projections.append(metric.name);
+            plan.require(metric.name, metric.freshness, false);
+        }
+        for (query.order_by) |order| {
+            plan.dependencies.append(order.name);
+            plan.orders.append(order.name);
+            plan.require(order.name, order.freshness, true);
+        }
+        for (query.where_metric) |filter| {
+            plan.dependencies.append(filter.name);
+            plan.filters.append(filter.name);
+            plan.require(filter.name, filter.freshness, true);
+        }
+        return plan;
+    }
+};
+
 pub fn nodeFilterActive(filter: pattern_mod.NodeFilter) bool {
     return filter.filter_prefix.len > 0 or filter.filter_query_json != null;
 }
@@ -783,10 +838,8 @@ pub const GraphQueryEngine = struct {
         if (defer_result_limit and result.nodes.len > graph_metric_candidate_limit) {
             return error.QueryCandidateBudgetExceeded;
         }
-        const metric_dependencies = try self.graphMetricDependenciesAlloc(gq);
-        defer if (metric_dependencies.len > 0) self.alloc.free(metric_dependencies);
-        if (metric_dependencies.len > 0) {
-            try self.applyMetricDependenciesColumnar(graph_index, metric_dependencies, gq, defer_result_limit, &result);
+        if (gq.metrics.len != 0 or gq.order_by.len != 0 or gq.where_metric.len != 0) {
+            try self.applyMetricDependenciesColumnar(graph_index, gq, defer_result_limit, &result);
         }
         return result;
     }
@@ -881,127 +934,6 @@ pub const GraphQueryEngine = struct {
         if (right == null) return order.nulls != .first;
         if (left.? == right.?) return null;
         return if (order.direction == .desc) left.? > right.? else left.? < right.?;
-    }
-
-    const GraphMetricDependency = struct {
-        read: GraphMetricRead,
-        require_published: bool = false,
-    };
-
-    fn graphMetricDependenciesAlloc(
-        self: *GraphQueryEngine,
-        gq: GraphQuery,
-    ) ![]GraphMetricDependency {
-        var deps = std.ArrayListUnmanaged(GraphMetricDependency).empty;
-        errdefer deps.deinit(self.alloc);
-        for (gq.metrics) |metric| try appendGraphMetricDependency(self.alloc, &deps, metric.name, metric.freshness, false);
-        for (gq.order_by) |order| try appendGraphMetricDependency(self.alloc, &deps, order.name, order.freshness, true);
-        for (gq.where_metric) |filter| try appendGraphMetricDependency(self.alloc, &deps, filter.name, filter.freshness, true);
-        return try deps.toOwnedSlice(self.alloc);
-    }
-
-    fn appendGraphMetricDependency(
-        alloc: Allocator,
-        deps: *std.ArrayListUnmanaged(GraphMetricDependency),
-        name: []const u8,
-        freshness: GraphMetricFreshness,
-        require_published: bool,
-    ) !void {
-        for (deps.items) |*dep| {
-            if (!std.mem.eql(u8, dep.read.name, name)) continue;
-            dep.read.freshness = stricterGraphMetricFreshness(dep.read.freshness, freshness);
-            dep.require_published = dep.require_published or require_published;
-            return;
-        }
-        if (deps.items.len == graph_metric_dependency_limit) return error.InvalidQueryRequest;
-        try deps.append(alloc, .{
-            .read = .{ .name = name, .freshness = freshness },
-            .require_published = require_published,
-        });
-    }
-
-    fn stricterGraphMetricFreshness(left: GraphMetricFreshness, right: GraphMetricFreshness) GraphMetricFreshness {
-        if (left == .fresh or right == .fresh) return .fresh;
-        return .published;
-    }
-
-    const MetricColumnWorkspace = struct {
-        graph_alloc: Allocator,
-        statuses: []GraphMetricStatus,
-        score_columns: [][]?f64,
-
-        fn deinit(self: *@This(), result_alloc: Allocator) void {
-            for (self.statuses) |*status| status.deinit(result_alloc);
-            if (self.statuses.len > 0) result_alloc.free(self.statuses);
-            for (self.score_columns) |column| self.graph_alloc.free(column);
-            if (self.score_columns.len > 0) result_alloc.free(self.score_columns);
-            self.* = undefined;
-        }
-
-        fn takeStatuses(self: *@This()) []GraphMetricStatus {
-            const statuses = self.statuses;
-            self.statuses = @constCast((&[_]GraphMetricStatus{})[0..]);
-            return statuses;
-        }
-    };
-
-    fn loadMetricColumns(
-        self: *GraphQueryEngine,
-        graph_index: *graph_mod.GraphIndex,
-        metric_dependencies: []const GraphMetricDependency,
-        nodes: []const GraphResultNode,
-    ) !MetricColumnWorkspace {
-        const statuses = try self.alloc.alloc(GraphMetricStatus, metric_dependencies.len);
-        var initialized_statuses: usize = 0;
-        errdefer {
-            for (statuses[0..initialized_statuses]) |*status| status.deinit(self.alloc);
-            if (statuses.len > 0) self.alloc.free(statuses);
-        }
-
-        const node_keys = try self.alloc.alloc([]const u8, nodes.len);
-        defer self.alloc.free(node_keys);
-        for (nodes, 0..) |node, i| node_keys[i] = node.key;
-
-        const metric_names = try self.alloc.alloc([]const u8, metric_dependencies.len);
-        defer self.alloc.free(metric_names);
-        var read_policy_buffer: [graph_metric_dependency_limit]graph_mod.GraphIndex.GraphMetricColumnReadPolicy = undefined;
-        const read_policies = read_policy_buffer[0..metric_dependencies.len];
-        for (metric_dependencies, 0..) |metric, i| {
-            metric_names[i] = metric.read.name;
-            read_policies[i] = .{
-                .require_published = metric.require_published,
-                .require_fresh = metric.read.freshness == .fresh,
-            };
-        }
-
-        var snapshot = try graph_index.graphMetricColumnsSnapshotAlloc(metric_names, node_keys, read_policies);
-        var transferred_columns: usize = 0;
-        defer {
-            for (snapshot.statuses) |*status| status.deinit(graph_index.alloc);
-            if (snapshot.statuses.len > 0) graph_index.alloc.free(snapshot.statuses);
-            for (snapshot.score_columns[transferred_columns..]) |column| graph_index.alloc.free(column);
-            if (snapshot.score_columns.len > 0) graph_index.alloc.free(snapshot.score_columns);
-        }
-
-        const score_columns = try self.alloc.alloc([]?f64, metric_dependencies.len);
-        var initialized_columns: usize = 0;
-        errdefer {
-            for (score_columns[0..initialized_columns]) |column| graph_index.alloc.free(column);
-            if (score_columns.len > 0) self.alloc.free(score_columns);
-        }
-        for (metric_dependencies, 0..) |metric, i| {
-            try validateGraphMetricDependencyStatus(snapshot.statuses[i], metric.read.freshness, metric.require_published);
-            statuses[i] = try cloneGraphMetricStatus(self.alloc, snapshot.statuses[i]);
-            initialized_statuses += 1;
-            score_columns[i] = snapshot.score_columns[i];
-            initialized_columns += 1;
-            transferred_columns += 1;
-        }
-        return .{
-            .graph_alloc = graph_index.alloc,
-            .statuses = statuses,
-            .score_columns = score_columns,
-        };
     }
 
     fn metricColumnNameIndex(dependency_names: []const []const u8, name: []const u8) ?usize {
@@ -1212,6 +1144,18 @@ pub const GraphQueryEngine = struct {
         selected_source_indexes: []const usize,
         nodes: *[]GraphResultNode,
     ) ![]GraphMetricValue {
+        return materializeSelectedMetricColumnsWithAllocators(alloc, alloc, alloc, metric_value_names, aligned_score_columns, selected_source_indexes, nodes);
+    }
+
+    fn materializeSelectedMetricColumnsWithAllocators(
+        node_alloc: Allocator,
+        alloc: Allocator,
+        scratch: Allocator,
+        metric_value_names: []const []const u8,
+        aligned_score_columns: []const []?f64,
+        selected_source_indexes: []const usize,
+        nodes: *[]GraphResultNode,
+    ) ![]GraphMetricValue {
         if (metric_value_names.len != aligned_score_columns.len)
             return error.InvalidQueryRequest;
         for (aligned_score_columns, metric_value_names, 0..) |column, name, i| {
@@ -1222,8 +1166,8 @@ pub const GraphQueryEngine = struct {
             }
         }
 
-        var selected_mask = try std.DynamicBitSetUnmanaged.initEmpty(alloc, nodes.*.len);
-        defer selected_mask.deinit(alloc);
+        var selected_mask = try std.DynamicBitSetUnmanaged.initEmpty(scratch, nodes.*.len);
+        defer selected_mask.deinit(scratch);
         for (selected_source_indexes) |source_index| {
             if (source_index >= nodes.*.len or selected_mask.isSet(source_index))
                 return error.InvalidQueryRequest;
@@ -1247,14 +1191,14 @@ pub const GraphQueryEngine = struct {
         const final_nodes = try alloc.alloc(GraphResultNode, selected_source_indexes.len);
         for (selected_source_indexes, 0..) |source_index, out_index| {
             var node = nodes.*[source_index];
-            for (node.metrics) |*metric| metric.deinit(alloc);
-            if (node.metrics_owned and node.metrics.len > 0) alloc.free(node.metrics);
+            for (node.metrics) |*metric| metric.deinit(node_alloc);
+            if (node.metrics_owned and node.metrics.len > 0) node_alloc.free(node.metrics);
             node.metrics = metric_values_slab[out_index * metric_value_names.len ..][0..metric_value_names.len];
             node.metrics_owned = false;
             final_nodes[out_index] = node;
         }
-        for (nodes.*, 0..) |*node, source_index| if (!selected_mask.isSet(source_index)) node.deinit(alloc);
-        alloc.free(nodes.*);
+        for (nodes.*, 0..) |*node, source_index| if (!selected_mask.isSet(source_index)) node.deinit(node_alloc);
+        node_alloc.free(nodes.*);
         nodes.* = final_nodes;
         return metric_values_slab;
     }
@@ -1265,48 +1209,188 @@ pub const GraphQueryEngine = struct {
     fn applyMetricDependenciesColumnar(
         self: *GraphQueryEngine,
         graph_index: *graph_mod.GraphIndex,
-        metric_dependencies: []const GraphMetricDependency,
         query: GraphQuery,
         apply_result_limit: bool,
         result: *GraphQueryResult,
     ) !void {
-        var workspace = try self.loadMetricColumns(graph_index, metric_dependencies, result.nodes);
-        defer workspace.deinit(self.alloc);
+        var scratch_budget = work_budget_mod.RetainedAllocator{ .backing = self.alloc, .budget = self.work_budget };
+        var output_budget = work_budget_mod.RetainedAllocator{ .backing = self.alloc, .budget = self.work_budget };
+        defer std.debug.assert(scratch_budget.live_bytes == 0 and output_budget.live_bytes == 0);
+        self.applyStagedMetricDependencies(graph_index, query, apply_result_limit, result, scratch_budget.allocator(), output_budget.allocator()) catch |err| {
+            if (err == error.OutOfMemory and (scratch_budget.denied or output_budget.denied)) return error.GraphWorkBudgetExceeded;
+            return err;
+        };
+        output_budget.detach();
+    }
 
-        var dependency_names: [graph_metric_dependency_limit][]const u8 = undefined;
-        const metric_value_names = try self.alloc.alloc([]u8, metric_dependencies.len);
+    fn applyStagedMetricDependencies(
+        self: *GraphQueryEngine,
+        graph_index: *graph_mod.GraphIndex,
+        query: GraphQuery,
+        apply_result_limit: bool,
+        result: *GraphQueryResult,
+        scratch: Allocator,
+        output: Allocator,
+    ) !void {
+        const plan = try MetricReadPlan.init(query);
+        var session = try graph_index.openGraphMetricReadSessionAlloc(scratch, plan.dependencies.slice(), plan.policies[0..plan.dependencies.len]);
+        defer session.deinit();
+        var workspace = try MetricStageWorkspace.init(scratch, plan, result.nodes.len);
+        defer workspace.deinit();
+        if (plan.filters.len != 0) {
+            try workspace.ensure(&session, plan.filters.slice(), result.nodes);
+            var filter_query = query;
+            filter_query.metrics = &.{};
+            filter_query.order_by = &.{};
+            try workspace.select(filter_query, apply_result_limit and plan.orders.len == 0, plan.filters.slice(), plan.orders.slice(), plan.projections.slice());
+        }
+        if (plan.orders.len != 0) {
+            try workspace.ensure(&session, plan.orders.slice(), result.nodes);
+            var order_query = query;
+            order_query.metrics = &.{};
+            order_query.where_metric = &.{};
+            try workspace.select(order_query, apply_result_limit, plan.orders.slice(), plan.projections.slice(), &.{});
+        }
+        try workspace.ensure(&session, plan.projections.slice(), result.nodes);
+
+        const statuses = try output.alloc(GraphMetricStatus, plan.dependencies.len);
+        var initialized_statuses: usize = 0;
+        errdefer {
+            for (statuses[0..initialized_statuses]) |*status| status.deinit(output);
+            output.free(statuses);
+        }
+        for (session.statuses, statuses) |status, *out| {
+            out.* = try cloneGraphMetricStatus(output, status);
+            initialized_statuses += 1;
+        }
+        const metric_value_names = try output.alloc([]u8, plan.projections.len);
         var initialized_metric_names: usize = 0;
         errdefer {
-            for (metric_value_names[0..initialized_metric_names]) |name| self.alloc.free(name);
-            if (metric_value_names.len > 0) self.alloc.free(metric_value_names);
+            for (metric_value_names[0..initialized_metric_names]) |name| output.free(name);
+            output.free(metric_value_names);
         }
-        for (metric_dependencies, workspace.statuses, 0..) |dependency, status, i| {
-            dependency_names[i] = dependency.read.name;
-            metric_value_names[i] = try self.alloc.dupe(u8, status.name);
+        for (plan.projections.slice(), metric_value_names) |name, *out| {
+            out.* = try output.dupe(u8, name);
             initialized_metric_names += 1;
         }
-        result.metric_values_slab = try applyLoadedMetricColumns(
+        var columns: [graph_metric_dependency_limit][]?f64 = undefined;
+        workspace.columnsFor(plan.projections.slice(), columns[0..plan.projections.len]);
+        const slab = try materializeSelectedMetricColumnsWithAllocators(
             self.alloc,
-            dependency_names[0..metric_dependencies.len],
+            output,
+            scratch,
             metric_value_names,
-            workspace.score_columns,
-            query,
-            apply_result_limit,
+            columns[0..plan.projections.len],
+            workspace.rows,
             &result.nodes,
         );
+        if (result.metric_values_slab.len > 0) self.alloc.free(result.metric_values_slab);
+        for (result.metric_value_names) |name| self.alloc.free(name);
+        if (result.metric_value_names.len > 0) self.alloc.free(result.metric_value_names);
+        result.metric_values_slab = slab;
         result.metric_value_names = metric_value_names;
-
         for (result.metric_status) |*status| status.deinit(self.alloc);
         if (result.metric_status.len > 0) self.alloc.free(result.metric_status);
-        result.metric_status = workspace.takeStatuses();
+        result.metric_status = statuses;
     }
 
-    fn validateGraphMetricDependencyStatus(status: graph_mod.GraphIndex.GraphMetricStatus, freshness: GraphMetricFreshness, require_published: bool) !void {
-        if (require_published and status.published_generation == 0) return error.MetricNotReady;
-        if (freshness != .fresh) return;
-        if (status.published_generation == 0) return error.MetricNotReady;
-        if (freshness == .fresh and status.state != .fresh) return error.MetricStale;
-    }
+    /// A stable source-row selection and only the columns needed by future
+    /// stages. The reader is snapshot-owned; this executor never opens storage.
+    pub const MetricStageWorkspace = struct {
+        alloc: Allocator,
+        plan: MetricReadPlan,
+        rows: []usize,
+        columns: [graph_metric_dependency_limit]?[]?f64 = @splat(null),
+
+        pub fn init(alloc: Allocator, plan: MetricReadPlan, node_count: usize) !@This() {
+            const rows = try alloc.alloc(usize, node_count);
+            for (rows, 0..) |*row, i| row.* = i;
+            return .{ .alloc = alloc, .plan = plan, .rows = rows };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            for (self.columns) |column| if (column) |scores| self.alloc.free(scores);
+            self.alloc.free(self.rows);
+        }
+
+        fn index(self: *const @This(), name: []const u8) usize {
+            return metricColumnNameIndex(self.plan.dependencies.slice(), name).?;
+        }
+
+        pub fn columnsFor(self: *const @This(), names: []const []const u8, out: [][]?f64) void {
+            for (names, out) |name, *column| column.* = self.columns[self.index(name)].?;
+        }
+
+        pub fn ensure(self: *@This(), reader: anytype, names: []const []const u8, nodes: []const GraphResultNode) !void {
+            var missing: MetricReadPlan.Names = .{};
+            for (names) |name| if (self.columns[self.index(name)] == null) {
+                missing.append(name);
+            };
+            if (missing.len == 0) return;
+            var local_count: usize = 0;
+            for (self.rows) |row| local_count += @intFromBool(nodes[row].table == null);
+            const keys = try self.alloc.alloc([]const u8, local_count);
+            defer self.alloc.free(keys);
+            var local_index: usize = 0;
+            for (self.rows) |row| if (nodes[row].table == null) {
+                keys[local_index] = nodes[row].key;
+                local_index += 1;
+            };
+            var columns: [graph_metric_dependency_limit][]?f64 = undefined;
+            var local_columns: [graph_metric_dependency_limit][]?f64 = undefined;
+            var initialized: usize = 0;
+            errdefer for (columns[0..initialized]) |column| self.alloc.free(column);
+            for (columns[0..missing.len]) |*column| {
+                column.* = try self.alloc.alloc(?f64, self.rows.len);
+                local_columns[initialized] = column.*[0..local_count];
+                initialized += 1;
+            }
+            try reader.readColumns(self.alloc, missing.slice(), keys, local_columns[0..missing.len]);
+            // Expand backwards in-place: qualified identities must not alias a
+            // local document with the same key. No second score slab is needed.
+            if (local_count != self.rows.len) for (columns[0..missing.len]) |column| {
+                var source = local_count;
+                var target = self.rows.len;
+                while (target != 0) {
+                    target -= 1;
+                    if (nodes[self.rows[target]].table == null) {
+                        source -= 1;
+                        column[target] = column[source];
+                    } else column[target] = null;
+                }
+            };
+            for (missing.slice(), columns[0..missing.len]) |name, column| self.columns[self.index(name)] = column;
+        }
+
+        pub fn select(self: *@This(), query: GraphQuery, apply_limit: bool, names: []const []const u8, future: []const []const u8, later: []const []const u8) !void {
+            var columns: [graph_metric_dependency_limit][]?f64 = undefined;
+            self.columnsFor(names, columns[0..names.len]);
+            const selected = try selectLoadedMetricCandidateIndexesAlloc(self.alloc, names, columns[0..names.len], query, apply_limit, self.rows.len);
+            defer self.alloc.free(selected);
+            const rows = try self.alloc.alloc(usize, selected.len);
+            errdefer self.alloc.free(rows);
+            for (selected, rows) |parent, *row| row.* = self.rows[parent];
+            var replacements: [graph_metric_dependency_limit]?[]?f64 = @splat(null);
+            errdefer for (replacements) |column| if (column) |scores| self.alloc.free(scores);
+            for (self.plan.dependencies.slice(), self.columns[0..self.plan.dependencies.len], 0..) |name, *maybe_column, i| {
+                const column = maybe_column.* orelse continue;
+                if (metricColumnNameIndex(future, name) == null and metricColumnNameIndex(later, name) == null) {
+                    self.alloc.free(column);
+                    maybe_column.* = null;
+                    continue;
+                }
+                const rebased = try self.alloc.alloc(?f64, selected.len);
+                for (selected, rebased) |parent, *value| value.* = column[parent];
+                replacements[i] = rebased;
+            }
+            for (&self.columns, replacements) |*column, replacement| if (replacement) |scores| {
+                self.alloc.free(column.*.?);
+                column.* = scores;
+            };
+            self.alloc.free(self.rows);
+            self.rows = rows;
+        }
+    };
 
     fn executeTraverse(
         self: *GraphQueryEngine,
@@ -3829,6 +3913,129 @@ test "graph metric stable row materialization moves nodes once and is allocation
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "graph metric staged reads only load display columns for selected rows" {
+    const Runner = struct {
+        const Reader = struct {
+            keys: usize = 0,
+            pub fn readColumns(self: *@This(), _: Allocator, names: []const []const u8, keys: []const []const u8, columns: []const []?f64) !void {
+                self.keys += names.len * keys.len;
+                for (columns) |column| for (keys, column) |key, *value| {
+                    value.* = @floatFromInt(key[0] - '0');
+                };
+            }
+        };
+        fn run(alloc: Allocator) !void {
+            const query = GraphQuery{
+                .query_type = .neighbors,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"0"} },
+                .params = .{ .max_results = 2 },
+                .metrics = &.{ .{ .name = "rank" }, .{ .name = "display" } },
+                .order_by = &.{.{ .name = "rank" }},
+                .where_metric = &.{.{ .name = "rank", .op = .gte, .value = 2 }},
+            };
+            const nodes = [_]GraphResultNode{
+                .{ .key = "0", .depth = 0, .distance = 0 }, .{ .key = "1", .depth = 0, .distance = 0 }, .{ .key = "2", .depth = 0, .distance = 0 },
+                .{ .key = "3", .depth = 0, .distance = 0 }, .{ .key = "4", .depth = 0, .distance = 0 }, .{ .key = "5", .depth = 0, .distance = 0 },
+            };
+            const plan = try MetricReadPlan.init(query);
+            var work = try GraphQueryEngine.MetricStageWorkspace.init(alloc, plan, nodes.len);
+            defer work.deinit();
+            var reader = Reader{};
+            try work.ensure(&reader, plan.filters.slice(), &nodes);
+            var filter = query;
+            filter.metrics = &.{};
+            filter.order_by = &.{};
+            try work.select(filter, false, plan.filters.slice(), plan.orders.slice(), plan.projections.slice());
+            try work.ensure(&reader, plan.orders.slice(), &nodes);
+            var order = query;
+            order.metrics = &.{};
+            order.where_metric = &.{};
+            try work.select(order, true, plan.orders.slice(), plan.projections.slice(), &.{});
+            try work.ensure(&reader, plan.projections.slice(), &nodes);
+            try std.testing.expectEqual(@as(usize, 8), reader.keys);
+            try std.testing.expectEqualSlices(usize, &.{ 5, 4 }, work.rows);
+            for (work.columns[0..2]) |column| try std.testing.expectEqualSlices(?f64, &.{ 5, 4 }, column.?);
+        }
+    };
+    try Runner.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "graph metric staged columns do not alias qualified node identities" {
+    const alloc = std.testing.allocator;
+    const query = GraphQuery{ .query_type = .neighbors, .index_name = "graph", .start_nodes = .{ .keys = &.{} }, .metrics = &.{.{ .name = "rank" }} };
+    const nodes = [_]GraphResultNode{
+        .{ .key = "same", .table = "other", .depth = 0, .distance = 0 },
+        .{ .key = "same", .depth = 0, .distance = 0 },
+        .{ .key = "same", .table = "other", .depth = 0, .distance = 0 },
+    };
+    var work = try GraphQueryEngine.MetricStageWorkspace.init(alloc, try MetricReadPlan.init(query), nodes.len);
+    defer work.deinit();
+    const Reader = struct {
+        pub fn readColumns(_: *@This(), _: Allocator, _: []const []const u8, keys: []const []const u8, columns: []const []?f64) !void {
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            columns[0][0] = 7;
+        }
+    };
+    var reader = Reader{};
+    try work.ensure(&reader, &.{"rank"}, &nodes);
+    try std.testing.expectEqualSlices(?f64, &.{ null, 7, null }, work.columns[0].?);
+}
+
+test "graph metric staged query admits scratch and output and pins publication" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const configs = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-staged-budget-s", "gq-staged-budget-r", &sb, &rb, .{ .metric_configs = &configs });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+    try ctx.graph.addEdge("A", "B", "e", 1, 0, 0, "");
+    var published = try ctx.graph.runDegreeMetric("degree");
+    published.deinit(alloc);
+    var session = try ctx.graph.openGraphMetricReadSession(&.{"degree"}, &.{.{ .require_fresh = true }});
+    defer session.deinit();
+    var scores: [1]?f64 = undefined;
+    try session.readColumns(alloc, &.{"degree"}, &.{"A"}, &.{&scores});
+    try std.testing.expectEqual(@as(?f64, 1), scores[0]);
+    try ctx.graph.addEdge("A", "C", "e", 1, 0, 0, "");
+    published = try ctx.graph.runDegreeMetric("degree");
+    published.deinit(alloc);
+    try session.readColumns(alloc, &.{"degree"}, &.{"A"}, &.{&scores});
+    try std.testing.expectEqual(@as(?f64, 1), scores[0]);
+
+    const Runner = struct {
+        fn run(out_alloc: Allocator, index: *graph_mod.GraphIndex, maximum: usize) !void {
+            var result = GraphQueryResult{ .nodes = try out_alloc.alloc(GraphResultNode, 1) };
+            result.nodes[0] = .{ .key = out_alloc.dupe(u8, "A") catch |err| {
+                out_alloc.free(result.nodes);
+                return err;
+            }, .depth = 0, .distance = 0 };
+            defer result.deinit(out_alloc);
+            var budget = work_budget_mod.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = maximum });
+            var engine = GraphQueryEngine{ .alloc = out_alloc, .work_budget = &budget };
+            const query = GraphQuery{ .query_type = .neighbors, .index_name = "graph", .start_nodes = .{ .keys = &.{"A"} }, .metrics = &.{.{ .name = "degree" }} };
+            engine.applyMetricDependenciesColumnar(index, query, false, &result) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+                return err;
+            };
+            try std.testing.expect(budget.retained_state_bytes > 0 and budget.retained_state_bytes <= maximum);
+            try std.testing.expectEqual(@as(?f64, 2), result.nodes[0].metrics[0].score);
+        }
+    };
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, Runner.run(alloc, &ctx.graph, 1));
+    for ([_]usize{ 64, 256, 512, 1024, 2048, 4096, 8192 }) |maximum| {
+        Runner.run(alloc, &ctx.graph, maximum) catch |err| {
+            try std.testing.expectEqual(error.GraphWorkBudgetExceeded, err);
+        };
+    }
+    try Runner.run(alloc, &ctx.graph, 64 * 1024);
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ &ctx.graph, @as(usize, 64 * 1024) });
 }
 
 test "graph metric order and filter dependencies attach status without projection" {

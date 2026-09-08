@@ -15708,6 +15708,10 @@ pub const GraphIndex = struct {
     const MetricStatusDetail = enum { query, operator };
 
     fn graphMetricSnapshotStatusInTxn(self: *GraphIndex, metric_name: []const u8, txn: anytype, comptime detail: MetricStatusDetail) !GraphMetricStatus {
+        return self.graphMetricSnapshotStatusInTxnAlloc(self.alloc, metric_name, txn, detail);
+    }
+
+    fn graphMetricSnapshotStatusInTxnAlloc(self: *GraphIndex, result_alloc: Allocator, metric_name: []const u8, txn: anytype, comptime detail: MetricStatusDetail) !GraphMetricStatus {
         const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
         const lifecycle_cfg = self.graphMetricLifecycleOwnerConfig(cfg);
         const lifecycle_name = lifecycle_cfg.name;
@@ -15747,17 +15751,17 @@ pub const GraphIndex = struct {
             meta.target_edge_generation
         else
             published_generation;
-        const name = try self.alloc.dupe(u8, metric_name);
-        errdefer self.alloc.free(name);
-        var edge_filter = try cfg.edge_filter.cloneAlloc(self.alloc);
-        errdefer edge_filter.deinit(self.alloc);
+        const name = try result_alloc.dupe(u8, metric_name);
+        errdefer result_alloc.free(name);
+        var edge_filter = try cfg.edge_filter.cloneAlloc(result_alloc);
+        errdefer edge_filter.deinit(result_alloc);
         var has_stored_edge_filter = false;
         if (published_generation != 0) {
             const edge_filter_key = try self.graphMetricMetaEdgeFilterKeyAlloc(metric_name, published_generation);
             defer self.alloc.free(edge_filter_key);
             if (txn.get(edge_filter_key)) |raw| {
-                if (try decodeGraphMetricEdgeFilterAlloc(self.alloc, raw)) |stored_edge_filter| {
-                    edge_filter.deinit(self.alloc);
+                if (try decodeGraphMetricEdgeFilterAlloc(result_alloc, raw)) |stored_edge_filter| {
+                    edge_filter.deinit(result_alloc);
                     edge_filter = stored_edge_filter;
                     has_stored_edge_filter = true;
                 }
@@ -15795,10 +15799,10 @@ pub const GraphIndex = struct {
         const build_iteration = if (active_build_lease) maybe_build_lease.?.iteration else 0;
         const build_lease_expires_at_ms = if (active_build_lease) maybe_build_lease.?.lease_expires_at_ms else 0;
         const active_build_worker_id = if (active_build_lease)
-            try self.alloc.dupe(u8, maybe_build_lease.?.worker_id)
+            try result_alloc.dupe(u8, maybe_build_lease.?.worker_id)
         else
             "";
-        errdefer if (active_build_worker_id.len > 0) self.alloc.free(active_build_worker_id);
+        errdefer if (active_build_worker_id.len > 0) result_alloc.free(active_build_worker_id);
         const active_build_job = if (detail == .operator and active_build_lease and maybe_build_job != null and maybe_build_job.?.job_id == build_job_id)
             maybe_build_job.?
         else
@@ -15830,10 +15834,10 @@ pub const GraphIndex = struct {
             .fresh;
         const failure_applies = base_state == .failed and maybe_failure_detail != null;
         const last_error = if (failure_applies)
-            try self.alloc.dupe(u8, maybe_failure_detail.?.last_error)
+            try result_alloc.dupe(u8, maybe_failure_detail.?.last_error)
         else
             "";
-        errdefer if (last_error.len > 0) self.alloc.free(last_error);
+        errdefer if (last_error.len > 0) result_alloc.free(last_error);
         const state: GraphMetricState = if (active_build_lease) .building else base_state;
         const queued_generation: u64 = if (active_build_lease)
             if (target_edge_generation > building_generation) target_edge_generation else 0
@@ -16095,6 +16099,32 @@ pub const GraphIndex = struct {
         return .{ .status = status, .scores = scores };
     }
 
+    /// Synthetic published columns for read benchmarks. No topology or metric
+    /// execution is included in fixture setup or measured query work.
+    pub fn benchmarkSeedScoreColumns(self: *GraphIndex, names: []const []const u8, nodes: []const []const u8) !void {
+        for (names) |name| {
+            var offset: usize = 0;
+            while (offset < nodes.len) {
+                var batch = try self.beginWriteReverseBatch();
+                errdefer batch.abort();
+                const end = @min(nodes.len, offset + 4096);
+                for (nodes[offset..end], offset..) |node, i| {
+                    const key = try self.graphMetricScoreKeyAlloc(name, 1, node);
+                    defer self.alloc.free(key);
+                    try putF64(&batch, key, @floatFromInt(i));
+                }
+                try batch.commit();
+                offset = end;
+            }
+            var batch = try self.beginWriteReverseBatch();
+            errdefer batch.abort();
+            const key = try self.graphMetricPublishedGenerationKeyAlloc(name);
+            defer self.alloc.free(key);
+            try putU64(&batch, key, 1);
+            try batch.commit();
+        }
+    }
+
     /// Benchmark oracle for the former operator-status query path. It shares
     /// the exact score reader and read transaction with production snapshots.
     pub fn benchmarkScoreSnapshotAlloc(self: *GraphIndex, metric_name: []const u8, nodes: []const []const u8, operator_details: bool) !GraphMetricScoreSnapshot {
@@ -16107,56 +16137,98 @@ pub const GraphIndex = struct {
         return .{ .status = status, .scores = scores };
     }
 
+    /// One publication snapshot spanning filter, order and projection reads.
+    /// Resolve every policy before reading scores, including dependencies whose
+    /// eventual row selection is empty. Never reopen between query stages.
+    pub const GraphMetricReadSession = struct {
+        alloc: Allocator,
+        txn: backend_erased.ReadTxn,
+        statuses: []GraphMetricStatus,
+        prefixes: []?[]const u8,
+        reads: score_read.Stats = .{},
+
+        pub fn deinit(self: *@This()) void {
+            self.txn.abort();
+            for (self.statuses) |*status| status.deinit(self.alloc);
+            self.alloc.free(self.statuses);
+            for (self.prefixes) |prefix| if (prefix) |value| self.alloc.free(value);
+            self.alloc.free(self.prefixes);
+            self.* = undefined;
+        }
+
+        pub fn readColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []?f64) !void {
+            if (names.len != columns.len) return error.InvalidQueryRequest;
+            for (columns) |column| if (column.len != nodes.len) return error.InvalidQueryRequest;
+            const prefixes = try alloc.alloc(?[]const u8, names.len);
+            defer alloc.free(prefixes);
+            for (names, prefixes) |name, *prefix| {
+                prefix.* = for (self.statuses, self.prefixes) |status, value| {
+                    if (std.mem.eql(u8, status.name, name)) break value;
+                } else return error.InvalidQueryRequest;
+            }
+            const read_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
+            self.reads.keys += read_stats.keys;
+            self.reads.batches += read_stats.batches;
+        }
+    };
+
+    pub fn openGraphMetricReadSession(self: *GraphIndex, metric_names: []const []const u8, policies: []const GraphMetricColumnReadPolicy) !GraphMetricReadSession {
+        return self.openGraphMetricReadSessionAlloc(self.alloc, metric_names, policies);
+    }
+
+    pub fn openGraphMetricReadSessionAlloc(self: *GraphIndex, alloc: Allocator, metric_names: []const []const u8, policies: []const GraphMetricColumnReadPolicy) !GraphMetricReadSession {
+        if (metric_names.len != policies.len) return error.InvalidQueryRequest;
+        var txn = try self.beginReadReverseTxn();
+        errdefer txn.abort();
+        const statuses = try alloc.alloc(GraphMetricStatus, metric_names.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (statuses[0..initialized]) |*status| status.deinit(alloc);
+            alloc.free(statuses);
+        }
+        for (metric_names, policies, 0..) |name, policy, i| {
+            statuses[i] = try self.graphMetricSnapshotStatusInTxnAlloc(alloc, name, &txn, .query);
+            initialized += 1;
+            if ((policy.require_published or policy.require_fresh) and statuses[i].published_generation == 0) return error.MetricNotReady;
+            if (policy.require_fresh and statuses[i].state != .fresh) return error.MetricStale;
+        }
+        const prefixes = try alloc.alloc(?[]const u8, metric_names.len);
+        @memset(prefixes, null);
+        errdefer {
+            for (prefixes) |prefix| if (prefix) |value| alloc.free(value);
+            alloc.free(prefixes);
+        }
+        for (metric_names, statuses, prefixes) |name, status, *prefix| {
+            if (status.published_generation != 0) {
+                var generation_buf: [20]u8 = undefined;
+                const generation = try std.fmt.bufPrint(&generation_buf, "{d}", .{status.published_generation});
+                prefix.* = try graphMetricKeyWithAllocator(alloc, &.{ name, "score", generation });
+            }
+        }
+        return .{ .alloc = alloc, .txn = txn, .statuses = statuses, .prefixes = prefixes };
+    }
+
     pub fn graphMetricColumnsSnapshotAlloc(
         self: *GraphIndex,
         metric_names: []const []const u8,
         nodes: []const []const u8,
         policies: []const GraphMetricColumnReadPolicy,
     ) !GraphMetricColumnsSnapshot {
-        if (metric_names.len != policies.len) return error.InvalidQueryRequest;
-        const statuses = try self.alloc.alloc(GraphMetricStatus, metric_names.len);
-        var initialized_statuses: usize = 0;
-        errdefer {
-            for (statuses[0..initialized_statuses]) |*status| status.deinit(self.alloc);
-            if (statuses.len > 0) self.alloc.free(statuses);
-        }
-        var txn = try self.beginReadReverseTxn();
-        defer txn.abort();
-        for (metric_names, policies, 0..) |metric_name, policy, i| {
-            statuses[i] = try self.graphMetricSnapshotStatusInTxn(metric_name, &txn, .query);
-            initialized_statuses += 1;
-            if (policy.require_published and statuses[i].published_generation == 0) return error.MetricNotReady;
-            if (policy.require_fresh) {
-                if (statuses[i].published_generation == 0) return error.MetricNotReady;
-                if (statuses[i].state != .fresh) return error.MetricStale;
-            }
-        }
-
-        // Status policy is deliberately resolved before score storage. A
-        // rejected dependency must stay O(metric count), irrespective of the
-        // candidate set size.
+        var session = try self.openGraphMetricReadSession(metric_names, policies);
+        defer session.deinit();
         const score_columns = try self.alloc.alloc([]?f64, metric_names.len);
-        var initialized_columns: usize = 0;
+        var initialized: usize = 0;
         errdefer {
-            for (score_columns[0..initialized_columns]) |column| self.alloc.free(column);
-            if (score_columns.len > 0) self.alloc.free(score_columns);
+            for (score_columns[0..initialized]) |column| self.alloc.free(column);
+            self.alloc.free(score_columns);
         }
-        for (metric_names, 0..) |_, i| {
-            score_columns[i] = try self.alloc.alloc(?f64, nodes.len);
-            initialized_columns += 1;
+        for (score_columns) |*column| {
+            column.* = try self.alloc.alloc(?f64, nodes.len);
+            initialized += 1;
         }
-
-        const prefixes = try self.alloc.alloc(?[]const u8, metric_names.len);
-        @memset(prefixes, null);
-        defer {
-            for (prefixes) |prefix| if (prefix) |value| self.alloc.free(value);
-            self.alloc.free(prefixes);
-        }
-        for (metric_names, statuses, 0..) |name, status, i| {
-            if (status.published_generation != 0)
-                prefixes[i] = try self.graphMetricScorePrefixAlloc(name, status.published_generation);
-        }
-        _ = try score_read.populate(self.alloc, &txn, prefixes, nodes, score_columns);
+        try session.readColumns(self.alloc, metric_names, nodes, score_columns);
+        const statuses = session.statuses;
+        session.statuses = &.{};
         return .{ .statuses = statuses, .score_columns = score_columns };
     }
 

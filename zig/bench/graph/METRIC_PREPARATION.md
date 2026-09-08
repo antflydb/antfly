@@ -265,6 +265,40 @@ setting latency guarantees.
 See [execution and resource ownership](../../docs/GRAPH_METRICS_EXECUTION.md)
 for the associated admission, checkpoint, and integrity contracts.
 
+## Staged stateful metric queries
+
+Run just this case with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --staged-only
+```
+
+The fixture seeds 16 published score columns in the default storage backend,
+with 100,000 distinct node IDs. One metric orders the top ten rows; all sixteen
+are projected. The eager reference loads every dependency before selection.
+The staged path uses the production snapshot reader and stage workspace. Both
+must return exactly the same selected ordinals and every projected score.
+
+Final local ReleaseFast rerun (six samples, first discarded):
+
+| Metric | Eager reference | Staged reads |
+| --- | ---: | ---: |
+| Logical score keys | 1,600,000 | 100,150 |
+| Median execution | 17.575 s | 1.101 s |
+| Tracked peak allocations | 29,233,056 B | 5,232,576 B |
+
+The timer includes snapshot acquisition, score reads, selection, validation and
+scratch cleanup. Fixture writes, traversal, response encoding and backend-owned
+allocations are excluded. These are warm-cache results on a shared development
+host with concurrent builds, not end-to-end latency guarantees. The reference
+and current paths use the same byte-bounded physical score reader. The measured
+work-count reduction is independent of host contention.
+
+The preceding full benchmark run measured 21.108 s and 1.085 s respectively;
+the difference between runs illustrates why the timing is a local measurement,
+not a service-level guarantee. Both runs reported the same key counts and peak
+allocation sizes.
+
 ## Sparse projection and resource-bounded iterations
 
 ReleaseFast measurements on the same host/toolchain, with a prepared

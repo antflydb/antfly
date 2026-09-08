@@ -141,6 +141,16 @@ fn benchmarkSparseProjections(output: anytype) !void {
 pub fn main(init: std.process.Init) !void {
     var output_buf: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buf);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, std.heap.smp_allocator);
+    defer args.deinit();
+    _ = args.next();
+    var staged_only = false;
+    while (args.next()) |arg| {
+        if (!std.mem.eql(u8, arg, "--staged-only")) return error.InvalidArgument;
+        staged_only = true;
+    }
+    try benchmarkStagedQueries(init.io, &output);
+    if (staged_only) return;
     try benchmarkStateful(&output);
     try benchmarkVectorWrites(&output);
     try benchmarkQuerySnapshots(init.io, &output);
@@ -442,6 +452,94 @@ fn benchmarkVectorWrites(out: anytype) !void {
             .allocated_bytes = last.total_alloc_bytes,
             .peak_bytes = last.peak_bytes,
             .note = "one production vector write; mock storage; all output scores checked; excludes caller fixture and numerical iteration",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkStagedQueries(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const query_mod = antfly.graph_query;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-metric-staged-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const store_path = try std.fmt.allocPrint(fixture, "{s}/store\x00", .{root});
+    const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
+    var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
+    defer store.close();
+    var configs: [16]antfly.graph.GraphMetricConfig = undefined;
+    var reads: [16]query_mod.GraphMetricRead = undefined;
+    var names: [16][]const u8 = undefined;
+    for (&configs, &reads, &names, 0..) |*config, *read, *name, i| {
+        name.* = try std.fmt.allocPrint(fixture, "metric-{d:0>2}", .{i});
+        config.* = .{ .name = name.*, .kind = .degree, .refresh = .manual };
+        read.* = .{ .name = name.* };
+    }
+    var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "graph", .{ .metric_configs = &configs });
+    defer index.close();
+    const ids = try fixture.alloc([]const u8, 100_000);
+    const nodes = try fixture.alloc(query_mod.GraphResultNode, ids.len);
+    for (ids, nodes, 0..) |*id, *node, i| {
+        id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
+        node.* = .{ .key = id.*, .depth = 0, .distance = 0 };
+    }
+    try index.benchmarkSeedScoreColumns(&names, ids);
+    const query = query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+        .metrics = &reads,
+        .order_by = &.{.{ .name = names[0] }},
+        .params = .{ .max_results = 10 },
+    };
+    const plan = try query_mod.MetricReadPlan.init(query);
+    const policies: [16]antfly.graph.GraphIndex.GraphMetricColumnReadPolicy = @splat(.{ .require_published = true });
+    for ([_]bool{ true, false }) |reference| {
+        var times: [5]u64 = undefined;
+        var last = PhaseAllocStats{};
+        var keys: usize = 0;
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            const tracked = tracking.allocator();
+            const start = antfly.platform_time.monotonicNs();
+            {
+                var session = try index.openGraphMetricReadSessionAlloc(tracked, &names, &policies);
+                defer session.deinit();
+                var work = try query_mod.GraphQueryEngine.MetricStageWorkspace.init(tracked, plan, nodes.len);
+                defer work.deinit();
+                try work.ensure(&session, if (reference) plan.dependencies.slice() else plan.orders.slice(), nodes);
+                try work.select(query, true, plan.orders.slice(), plan.projections.slice(), &.{});
+                try work.ensure(&session, plan.projections.slice(), nodes);
+                keys = session.reads.keys;
+                for (work.rows, 0..) |row, i| if (row != nodes.len - i - 1) return error.InvalidBenchmarkResult;
+                for (work.columns) |column| for (column.?, 0..) |value, i| {
+                    if (value != @as(f64, @floatFromInt(nodes.len - i - 1))) return error.InvalidBenchmarkResult;
+                };
+            }
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (stats.current_bytes != 0 or keys != (if (reference) @as(usize, 1_600_000) else 100_150)) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+            last = stats;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "stateful_eager_metric_columns" else "stateful_staged_metric_columns",
+            .candidates = nodes.len,
+            .metrics = names.len,
+            .selected = 10,
+            .score_keys = keys,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .peak_bytes = last.peak_bytes,
+            .allocation_count = last.alloc_count,
+            .note = "real default storage; six warm-cache samples, first discarded; exact selected row and score parity; includes snapshot, score reads, selection and scratch frees; excludes fixture writes, traversal, backend-owned allocations and response encoding",
         }, .{});
         try out.interface.writeAll(json);
         try out.interface.writeByte('\n');

@@ -427,12 +427,15 @@ fn inProjectionGroup(candidate: graph_mod.GraphMetricConfig, representative: gra
 /// Overestimation can forgo sharing, but cannot reject an affordable metric or
 /// spend work building a union which is immediately discarded under pressure.
 fn projectionGroupFits(topology: CompiledTopology, configs: []const graph_mod.GraphMetricConfig, processed: []const bool, filter: graph_mod.GraphMetricEdgeFilter, limits: Limits, budget: graph_metric_policy.Budget) bool {
-    const n = topology.source_node_count;
     var e: usize = 0;
     for (topology.edge_types, 0..) |edge_type, i| {
         if (filter.mode != .all and !filter.includesType(edge_type)) continue;
         e += topology.edge_type_offsets[i + 1] - topology.edge_type_offsets[i];
     }
+    // Every active vertex is an endpoint of a selected local edge. This
+    // allocation-free bound is valid even before constructing the exact census
+    // and, unlike source V, scales with sparse edge-type selections.
+    const n = @min(topology.source_node_count, std.math.mul(usize, e, 2) catch return false);
     // Covers packed source residency, active/mapping/CSR construction, every
     // kernel's vectors, borrowed score views and one encoded output. Paired
     // HITS outputs are encoded sequentially and share the same peak bound.
@@ -440,13 +443,21 @@ fn projectionGroupFits(topology: CompiledTopology, configs: []const graph_mod.Gr
     peak = std.math.add(usize, peak, std.math.mul(usize, topology.string_bytes.len, 2) catch return false) catch return false;
     peak = std.math.add(usize, peak, std.math.mul(usize, n, 192) catch return false) catch return false;
     peak = std.math.add(usize, peak, std.math.mul(usize, e, 24) catch return false) catch return false;
+    // Dense preparation still owns a source-wide ordinal map and bitset;
+    // sparse preparation owns at most 2E endpoint ordinals instead.
+    const mapping = if (useSparseProjection(topology.source_node_count, e))
+        std.math.mul(usize, e, 8) catch return false
+    else
+        std.math.mul(usize, topology.source_node_count, 5) catch return false;
+    peak = std.math.add(usize, peak, mapping) catch return false;
     if (peak > limits.max_peak_memory_bytes) return false;
-    const projection = graph_metric_policy.projectionWorkItems(n, topology.source_edge_count, n, e, 4) catch return false;
+    const census = projectionCensusWork(topology, filter, e) catch return false;
+    const projection = std.math.add(u64, census, graph_metric_policy.workItems(n, e, 1, 4) catch return false) catch return false;
     var work = projection;
     for (configs, processed, 0..) |config, done, i| {
         if (done or !config.edge_filter.equivalent(filter)) continue;
         const paired = for (configs[0..i], processed[0..i]) |prior, prior_done| {
-            if (!prior_done and graph_mod.graphMetricHitsPairCompatible(prior, config)) break true;
+            if (!prior_done and (graph_mod.graphMetricHitsPairCompatible(prior, config) or sameComputation(prior, config))) break true;
         } else false;
         if (paired) continue;
         const kernel = graph_metric_policy.metricWorkItems(config.kind, n, e, config.max_iterations) catch return false;
@@ -501,7 +512,9 @@ fn publishPreparedComputationsAlloc(
             var cheapest: u64 = std.math.maxInt(u64);
             for (configs, processed) |candidate, done| {
                 if (done or !candidate.edge_filter.equivalent(config.edge_filter)) continue;
-                const cost = graph_metric_policy.metricWorkItems(candidate.kind, prepared.topology.source_node_count, prepared.topology.edges.len, candidate.max_iterations) catch std.math.maxInt(u64);
+                const selected_edges = try selectedEdgeCount(prepared.topology, candidate.edge_filter, cancellation);
+                const selected_nodes = @min(prepared.topology.source_node_count, selected_edges * 2);
+                const cost = graph_metric_policy.metricWorkItems(candidate.kind, selected_nodes, selected_edges, candidate.max_iterations) catch std.math.maxInt(u64);
                 if (cost < cheapest) {
                     cheapest = cost;
                     config = candidate;
@@ -1642,7 +1655,11 @@ fn useSparseProjection(nodes: usize, edges: usize) bool {
 
 fn compiledProjectionCensusWork(topology: CompiledTopology, options: BuildOptions) !u64 {
     const edges = try selectedEdgeCount(topology, options.config.edge_filter, options.cancellation);
-    const filter_work = try graph_metric_policy.workItems(topology.edge_types.len, options.config.edge_filter.types.len, 1, @max(1, topology.edge_types.len));
+    return projectionCensusWork(topology, options.config.edge_filter, edges);
+}
+
+fn projectionCensusWork(topology: CompiledTopology, filter: graph_mod.GraphMetricEdgeFilter, edges: usize) !u64 {
+    const filter_work = try graph_metric_policy.workItems(topology.edge_types.len, filter.types.len, 1, @max(1, topology.edge_types.len));
     const census = if (useSparseProjection(topology.node_ids.len, edges)) blk: {
         // Endpoint sort plus binary searches in both replay passes. This
         // upper bound is charged before scratch allocation, including rejects.
@@ -1757,6 +1774,36 @@ test "serverless sparse projections bound scratch independently of the source di
         defer projection.deinit(alloc);
         try std.testing.expectEqualSlices([]const u8, &.{ "a", "z" }, projection.node_ids.items);
         try std.testing.expect(budget.work_items < 100);
+    }
+}
+
+test "serverless sparse projection group admission uses selected endpoints and deduplicates aliases" {
+    const alloc = std.testing.allocator;
+    const ids = try alloc.alloc([]const u8, 1_000_000);
+    defer alloc.free(ids);
+    @memset(ids, "unused");
+    const topology = sparseProjectionFixture(ids);
+    const configs = [_]graph_mod.GraphMetricConfig{
+        .{ .name = "rank", .kind = .pagerank, .max_iterations = 10 },
+        .{ .name = "rank_alias", .kind = .pagerank, .max_iterations = 10 },
+        .{ .name = "eigen", .kind = .eigenvector, .max_iterations = 10 },
+        .{ .name = "hub", .kind = .hits_hub, .max_iterations = 10 },
+    };
+    const limits = Limits{ .max_peak_memory_bytes = topology.retained_bytes + 2 * 1024 * 1024, .max_work_items = 2000, .max_total_work_items = 2000 };
+    try std.testing.expect(projectionGroupFits(topology, &configs, &@as([4]bool, @splat(false)), .{}, limits, .{ .limits = limits }));
+    var budget = graph_metric_policy.Budget{ .limits = limits, .work_items = 1999 };
+    try std.testing.expect(!projectionGroupFits(topology, &configs, &@as([4]bool, @splat(false)), .{}, limits, budget));
+    budget.work_items = 0;
+    const one = configs[0..1];
+    const aliases = configs[0..2];
+    var cap: u64 = 1;
+    while (cap <= limits.max_total_work_items) : (cap += 1) {
+        var restricted = limits;
+        restricted.max_total_work_items = cap;
+        try std.testing.expectEqual(
+            projectionGroupFits(topology, one, &.{false}, .{}, restricted, budget),
+            projectionGroupFits(topology, aliases, &.{ false, false }, .{}, restricted, budget),
+        );
     }
 }
 

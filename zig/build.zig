@@ -4755,6 +4755,9 @@ pub fn build(b: *std.Build) void {
 
     const serverless_default_filters = [_][]const u8{"serverless"};
     const serverless_tests = b.addTest(.{
+        // macOS ReleaseFast measured 8.09 GB for this root. Reserve realistic
+        // compiler headroom for aggregate scheduling; Linux CI stays bounded.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         .root_module = lib_test_mod,
         .filters = &serverless_default_filters,
         .test_runner = .{
@@ -8478,6 +8481,7 @@ pub fn build(b: *std.Build) void {
         "ownership state tracks lease takeover and loss",
         "ownership state renews only at the cached renewal deadline",
         "graph metric query shape bounds clauses and unique dependencies",
+        "graph metric staged",
         "borrowed graph metric names do not allocate per node",
         "graph metric column selection retains deterministic bounded top k",
         "graph metric shared column application is allocation-failure safe",
@@ -8635,6 +8639,8 @@ pub fn build(b: *std.Build) void {
         "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
     };
     const graph_metric_remote_wire_tests = b.addTest(.{
+        // macOS ReleaseFast measured 7.62 GB for the API/remote-wire root.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         .root_module = api_table_reads_docid_test_mod,
         .filters = &graph_metric_remote_wire_filters,
         .test_runner = .{
@@ -8689,6 +8695,8 @@ pub fn build(b: *std.Build) void {
         "graph metric build job cleanup",
     };
     const graph_metric_integration_tests = b.addTest(.{
+        // macOS ReleaseFast measured 7.74 GB for the lifecycle root.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         .root_module = db_test_mod,
         .filters = compileFiltersWithAnchors(
             b,
@@ -9775,6 +9783,7 @@ pub fn build(b: *std.Build) void {
         .root_module = graph_metric_prepare_bench_mod,
     });
     const run_graph_metric_prepare_bench = b.addRunArtifact(graph_metric_prepare_bench);
+    if (b.args) |args| run_graph_metric_prepare_bench.addArgs(args);
     b.step("graph-metric-preparation-bench", "Compare unpack/hash and packed ordinal graph-metric preparation").dependOn(&run_graph_metric_prepare_bench.step);
 
     const graph_pattern_bench_mod = b.createModule(.{

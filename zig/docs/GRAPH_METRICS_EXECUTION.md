@@ -4,8 +4,36 @@ Graph metrics use shared numerical semantics with backend-specific persistence.
 The production boundary is admitted, generation-fenced work—not a synchronous
 full-graph calculation hidden inside a query or maintenance tick.
 
+### Remaining architecture: cross-job stateful topology
+
+Stateful packed adjacency is still job-owned. The shared generation partition
+census and within-job iterative reuse do not imply cross-job topology sharing.
+A durable shared topology implementation must first give immutable membership,
+ordinal maps, out-degrees and adjacency their own publication owner, keyed by
+the graph snapshot, canonical edge filter, partition identity and format epoch.
+Each numerical job then pins that owner while retaining independent vector,
+attempt, progress and publication state. Adoption must be atomic with lifetime
+protection; reclamation must be bounded and resumable after crashes, including
+filter changes and removal of every consuming metric. Existing producer-attempt
+receipts cannot serve as that cross-job ownership protocol. This lifecycle is
+not implemented by the query/admission changes below.
+
 ## Non-serverless
 
+- Metric queries share a storage-independent read plan with serverless: load
+  filters, restrict stable source-row ordinals, load ordering columns, select
+  top-K, then load display-only columns. Reusable columns follow the selection
+  and public nodes move only once. Qualified nodes never probe local score keys.
+  A stateful read session validates every dependency policy up front and holds
+  one transaction across all stages, including empty selections. Publication or
+  cleanup between stages cannot mix generations or turn scores into misses.
+- Query scratch, score columns, owned status metadata and replacement output
+  allocations reserve bytes from the request's shared graph budget before
+  allocation. Scratch frees release reservations; escaping output retains its
+  request charge without retaining a pointer to a stack-owned budget allocator.
+  Budget denial reports `GraphWorkBudgetExceeded`, not allocator exhaustion.
+  Sorted score reads stop at 4,096 keys or 1 MiB of encoded keys; one oversized
+  key may progress only if its allocation fits the caller's budget.
 - Automatic and planned maintenance use resumable coordinator/worker pages.
   Standalone HITS authority/hub definitions are eligible independently; compatible
   pairs share a lifecycle as an optimization. Admission caps leave work queued
@@ -83,6 +111,15 @@ full-graph calculation hidden inside a query or maintenance tick.
 - Verified packed graph ordinals are prepared once per immutable source.
   Compatible projection requirements share preparation when the combined work
   and memory fit. Otherwise, cheaper exact requirements are admitted first.
+  Admission bounds active nodes by `min(source_nodes, 2 * selected_edges)` and
+  uses the same sparse/dense census work model as construction. It still charges
+  source-wide maps on the dense path. Identical computation aliases count once,
+  as do compatible HITS pairs. This admission pass needs no edge scan or scratch
+  allocation; exact construction admission and the live-allocation limiter
+  remain authoritative. Serverless additionally reserves local-ID adapters,
+  selection permutations and replacement-node buffers before allocation.
+  Materializer epoch 18 invalidates cached rejections made with source-wide
+  group estimates or duplicate-alias work charges.
 - Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
   census and before CSR allocation. Reserved census work remains charged when

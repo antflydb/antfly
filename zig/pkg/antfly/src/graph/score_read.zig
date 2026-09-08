@@ -18,6 +18,7 @@
 const std = @import("std");
 const keys = @import("../storage/internal_keys.zig");
 pub const max_keys_per_read = 4096;
+pub const max_key_bytes_per_read = 1024 * 1024;
 pub const Stats = struct { keys: usize = 0, batches: usize = 0 };
 
 pub fn populate(
@@ -95,14 +96,18 @@ pub fn populate(
     var stats = Stats{ .keys = total };
     var offset: usize = 0;
     while (offset < total) {
-        const len = @min(batch_capacity, total - offset);
+        var len: usize = 0;
         var bytes: usize = 0;
-        for (0..len) |i| {
+        for (0..@min(batch_capacity, total - offset)) |i| {
             const flat = offset + i;
             const prefix = prefixes[owners[flat / unique_count]].?;
             const node = nodes[unique[flat % unique_count]];
-            bytes = std.math.add(usize, bytes, prefix.len) catch return error.GraphMetricQueryBudgetExceeded;
-            bytes = std.math.add(usize, bytes, keys.encodedComponentLen(node)) catch return error.GraphMetricQueryBudgetExceeded;
+            const key_len = std.math.add(usize, prefix.len, keys.encodedComponentLen(node)) catch return error.GraphMetricQueryBudgetExceeded;
+            // One oversized key may progress, subject to the caller's live
+            // allocation budget. Never multiply long IDs by the key-count cap.
+            if (len != 0 and key_len > max_key_bytes_per_read -| bytes) break;
+            bytes = std.math.add(usize, bytes, key_len) catch return error.GraphMetricQueryBudgetExceeded;
+            len += 1;
         }
         key_bytes.clearRetainingCapacity();
         try key_bytes.ensureTotalCapacity(alloc, bytes);
@@ -141,6 +146,37 @@ pub fn populate(
         } else owner = column;
     }
     return stats;
+}
+
+test "graph metric physical score reads bound encoded bytes as well as key count" {
+    const alloc = std.testing.allocator;
+    const buffers = try alloc.alloc([4096]u8, 600);
+    defer alloc.free(buffers);
+    const nodes = try alloc.alloc([]const u8, buffers.len);
+    defer alloc.free(nodes);
+    for (buffers, nodes, 0..) |*buffer, *node, i| {
+        @memset(buffer, 'x');
+        _ = try std.fmt.bufPrint(buffer[4090..], "{d:0>6}", .{i});
+        node.* = buffer;
+    }
+    const column = try alloc.alloc(?f64, nodes.len);
+    defer alloc.free(column);
+    const Txn = struct {
+        raw: [8]u8 = @bitCast(@as(f64, 3)),
+        pub fn getManySorted(self: *@This(), requested: []const []const u8, values: []?[]const u8) !void {
+            var bytes: usize = 0;
+            for (requested, values) |key, *value| {
+                bytes += key.len;
+                value.* = &self.raw;
+            }
+            try std.testing.expect(bytes <= max_key_bytes_per_read or requested.len == 1);
+        }
+    };
+    var txn = Txn{};
+    const result = try populate(alloc, &txn, &.{"prefix/"}, nodes, &.{column});
+    try std.testing.expectEqual(@as(usize, 3), result.batches);
+    try std.testing.expectEqual(nodes.len, result.keys);
+    for (column) |value| try std.testing.expectEqual(@as(?f64, 3), value);
 }
 
 test "graph metric physical score reads deduplicate keys and retain logical ownership" {
