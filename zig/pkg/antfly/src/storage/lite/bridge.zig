@@ -20,6 +20,7 @@
 //! remains for storage-engine development and conformance tests.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -360,7 +361,7 @@ fn parseRecord(raw: []const u8, offset: usize) !ParsedRecord {
     if (encoded_len > raw.len - offset) return error.TruncatedTail;
     const end = offset + encoded_len;
 
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(header[0..record_header_no_crc_size]);
     crc.update(raw[offset + record_header_size .. end]);
     if (crc.final() != expected_crc) return error.ChecksumMismatch;
@@ -414,7 +415,7 @@ fn appendEncodedRecord(
     @memcpy(record[record_header_size + path.len ..][0..aux.len], aux);
     @memcpy(record[record_header_size + path.len + aux.len ..][0..value.len], value);
 
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(record[0..record_header_no_crc_size]);
     crc.update(record[record_header_size..]);
     std.mem.writeInt(u32, record[21..25], crc.final(), .little);
@@ -798,13 +799,13 @@ const ContainerAtomicWriteSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *ContainerAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *ContainerAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -991,7 +992,7 @@ test "aflite container storage supports rename delete tree and atomic writer" {
     var writer = try storage.beginAtomicWrite(alloc, "/root/sub/c");
     try writer.appendSlice("hello _____");
     try writer.writeAt(6, "world");
-    try std.testing.expectEqual(std.hash.Crc32.hash("hello world"), try writer.crc32Prefix(writer.len()));
+    try std.testing.expectEqual(Crc32.hash("hello world"), try writer.crc32Prefix(writer.len()));
     try writer.finish();
 
     const atomic = try storage.readFileAlloc(alloc, "/root/sub/c", 64);

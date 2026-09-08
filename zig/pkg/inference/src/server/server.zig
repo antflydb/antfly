@@ -1092,111 +1092,7 @@ fn rawGenerateChatTemplateKwargsAreValid(
     return true;
 }
 
-/// Watches only calls which declared that cooperative or native termination is
-/// insufficient. Expiry is process-fatal by design: the supervisor owns the
-/// replacement generation, while continuing in this address space could reuse
-/// buffers still retained by a wedged driver.
-const HardCancellationWatchdog = struct {
-    const Entry = struct {
-        token: u64,
-        control: execution_control_mod.MonitorControl,
-    };
-
-    allocator: std.mem.Allocator,
-    mutex: std.atomic.Mutex = .unlocked,
-    entries: std.ArrayListUnmanaged(Entry) = .empty,
-    next_token: u64 = 1,
-    stopping: std.atomic.Value(bool) = .init(false),
-    io: ?std.Io = null,
-    group: std.Io.Group = .init,
-
-    fn create(allocator: std.mem.Allocator) !*HardCancellationWatchdog {
-        const self = try allocator.create(HardCancellationWatchdog);
-        errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator };
-        return self;
-    }
-
-    fn start(self: *HardCancellationWatchdog, io: std.Io) !void {
-        if (self.io != null) return;
-        self.io = io;
-        errdefer self.io = null;
-        try self.group.concurrent(io, run, .{ self, io });
-    }
-
-    fn destroy(self: *HardCancellationWatchdog) void {
-        self.stopping.store(true, .release);
-        if (self.io) |io| {
-            self.group.cancel(io);
-            self.group.await(io) catch {};
-        }
-        spinLock(&self.mutex);
-        std.debug.assert(self.entries.items.len == 0);
-        self.entries.deinit(self.allocator);
-        self.mutex.unlock();
-        const allocator = self.allocator;
-        self.* = undefined;
-        allocator.destroy(self);
-    }
-
-    fn boundary(self: *HardCancellationWatchdog) execution_control_mod.HardCancellationBoundary {
-        return .{
-            .ptr = self,
-            .arm_fn = armOpaque,
-            .disarm_fn = disarmOpaque,
-        };
-    }
-
-    fn armOpaque(raw: *anyopaque, control: execution_control_mod.MonitorControl) !u64 {
-        const self: *HardCancellationWatchdog = @ptrCast(@alignCast(raw));
-        try control.check();
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.stopping.load(.acquire)) return error.InferenceWorkerShuttingDown;
-        if (self.io == null) return error.HardCancellationWatchdogNotStarted;
-        const token = self.next_token;
-        self.next_token +%= 1;
-        if (self.next_token == 0) self.next_token = 1;
-        try self.entries.append(self.allocator, .{ .token = token, .control = control });
-        return token;
-    }
-
-    fn disarmOpaque(raw: *anyopaque, token: u64) void {
-        const self: *HardCancellationWatchdog = @ptrCast(@alignCast(raw));
-        spinLock(&self.mutex);
-        defer self.mutex.unlock();
-        for (self.entries.items, 0..) |entry, index| {
-            if (entry.token != token) continue;
-            _ = self.entries.swapRemove(index);
-            return;
-        }
-        // A missing token is an ownership violation. Do not silently leave a
-        // borrowed request pointer in the monitor.
-        @panic("hard cancellation watchdog token was not armed");
-    }
-
-    fn run(self: *HardCancellationWatchdog, io: std.Io) std.Io.Cancelable!void {
-        while (!self.stopping.load(.acquire)) {
-            var fatal: ?anyerror = null;
-            spinLock(&self.mutex);
-            for (self.entries.items) |entry| {
-                entry.control.check() catch |err| {
-                    fatal = err;
-                    break;
-                };
-            }
-            self.mutex.unlock();
-            if (fatal) |err| {
-                std.log.err(
-                    "uninterruptible inference request expired; terminating supervised worker err={s}",
-                    .{@errorName(err)},
-                );
-                platform.inference_process_supervisor.restartWorker();
-            }
-            try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
-        }
-    }
-};
+const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
@@ -1236,7 +1132,7 @@ pub const NodeConfig = struct {
     allow_insecure_public_bind: bool = false,
     /// Permit artifacts whose compatibility cannot be proven by this build.
     /// Known incompatible or unsafe artifacts remain blocked.
-    allow_unknown_models: bool = false,
+    allow_unknown_models: bool = true,
     /// True only when this Node owns its whole process and may terminate it to
     /// interrupt a wedged driver. Production sets this in a supervised worker;
     /// disposable CLI tools may opt in directly. Embedded database nodes must

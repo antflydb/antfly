@@ -24,6 +24,7 @@
 //! CRC covers data_len + data bytes.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
@@ -1428,7 +1429,7 @@ fn decodeWalValue(value: []const u8) error{CorruptWal}![]const u8 {
     const data = value[4..data_end];
     const stored_crc = std.mem.readInt(u32, value[data_end..][0..4], .little);
 
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(value[0..4]);
     crc.update(data);
     if (crc.final() != stored_crc) return error.CorruptWal;
@@ -1443,7 +1444,7 @@ fn encodeEntryValue(dst: []u8, data_len: u32, data: []const u8, checksum: u32) v
 }
 
 fn checksumForEntry(data_len: u32, data: []const u8) u32 {
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(&std.mem.toBytes(std.mem.nativeToLittle(u32, data_len)));
     crc.update(data);
     return crc.final();

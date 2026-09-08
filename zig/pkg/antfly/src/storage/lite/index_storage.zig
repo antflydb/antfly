@@ -21,6 +21,7 @@
 //! native catalog-page layout; this adapter is not a user-visible file format.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const byte_copy = @import("../../common/byte_copy.zig");
 const docstore = @import("docstore.zig");
@@ -327,13 +328,13 @@ const NativeAtomicWriteSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -373,7 +374,7 @@ test "lite native index storage persists logical files across reopen" {
         var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/b.tbl");
         try writer.appendSlice("abc_____");
         try writer.writeAt(3, "def");
-        try std.testing.expectEqual(std.hash.Crc32.hash("abcdef__"), try writer.crc32Prefix(writer.len()));
+        try std.testing.expectEqual(Crc32.hash("abcdef__"), try writer.crc32Prefix(writer.len()));
         try writer.finish();
 
         const checkpoint = docs.file.activeCheckpoint();

@@ -346,6 +346,7 @@ pub const Detail = enum(c_int) {
     unsupported_generator_provider,
     generate_request_failed,
     generation_rate_limit,
+    unsupported_tensor_type,
 };
 
 pub const Status = extern struct {
@@ -442,6 +443,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.MethodNotAllowed => status(.unsupported, .method_not_allowed),
         error.Unsupported => status(.unsupported, .unsupported),
         error.UnsupportedOperation => status(.unsupported, .unsupported_operation),
+        error.UnsupportedTensorType => status(.unsupported, .unsupported_tensor_type),
         error.UnsupportedTransformOperation => status(.invalid_argument, .unsupported_transform_operation),
         error.InvalidGraphEdges => status(.invalid_argument, .invalid_graph_edges),
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
@@ -777,6 +779,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .method_not_allowed => "MethodNotAllowed",
         .unsupported => "Unsupported",
         .unsupported_operation => "UnsupportedOperation",
+        .unsupported_tensor_type => "UnsupportedTensorType",
         .unsupported_query_request => "UnsupportedQueryRequest",
         .unsupported_filter_query_request => "UnsupportedFilterQueryRequest",
         .unsupported_exclusion_query_request => "UnsupportedExclusionQueryRequest",

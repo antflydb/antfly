@@ -1498,6 +1498,11 @@ def test_stateful_managed_embeddings_backfill_recovers_after_rate_limited_enrich
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
         interval_s=0.5,
+    ), json.dumps(
+        {
+            "index": stateful_api.get_index(table_name, index_name),
+            "logs": stateful_api.debug_logs(),
+        }
     )
 
     batch = stateful_api.batch_write(
@@ -2005,6 +2010,8 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     stateful_api,
     openai_embedder,
 ):
+    # Poll promptly so a transient false-ready publication reaches the query
+    # assertion before the background repair can hide the admission race.
     table_name = f"stateful_corrupt_managed_embeddings_{time.time_ns()}"
     index_name = "semantic_idx"
 
@@ -2031,7 +2038,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     assert wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=0),
         timeout_s=30.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
 
     batch = stateful_api.batch_write(
@@ -2053,7 +2060,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     ready = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=2),
         timeout_s=30.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
     assert ready is not None
 
@@ -2074,7 +2081,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
         wait_until(
             lambda: _index_missing(stateful_api, table_name, index_name),
             timeout_s=30.0,
-            interval_s=0.5,
+            interval_s=0.01,
         )
         is not None
     )
@@ -2088,7 +2095,7 @@ def test_stateful_managed_embeddings_delete_recreate_recovers_after_corrupt_arti
     recovered = wait_until(
         lambda: _ready_index(stateful_api, table_name, index_name, expected_docs=2),
         timeout_s=60.0,
-        interval_s=0.5,
+        interval_s=0.01,
     )
     assert recovered is not None
 
@@ -2887,27 +2894,9 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
         == {}
     )
 
-    planned = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get(
-                    "head_republish_recommended"
-                )
-                is True
-                and current.get("next_publish_reason") == "head_republish"
-                and _named_action(current, "vector_index_actions", "semantic_idx")
-                == "rebuild"
-            )
-            else None
-        ),
-        timeout_s=30.0,
-        interval_s=0.5,
-    )
-    assert planned is not None
-    assert planned["artifact_actions"]["dense_vector"] == "rebuild"
-    assert planned["published_wal_end_lsn"] == first_published_wal_end
-
+    # Automatic publication can finish before the first status read. Its
+    # committed head records the rebuild action, so assert that durable
+    # receipt below instead of requiring the transient planned-work state.
     rebuilt = _serverless_build_or_wait_for_publish(
         serverless_api,
         table_name,

@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Crc32 = std.hash.Crc32;
+const Crc32 = @import("antfly_hash").Crc32;
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const wal_mod = @import("../wal.zig");

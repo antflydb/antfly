@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -594,7 +595,7 @@ fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
         raw[raw.len - checkpoint_checksum_len ..][0..checkpoint_checksum_len],
         .little,
     );
-    if (std.hash.Crc32.hash(body) != stored_checksum) return error.InvalidDerivedApplyState;
+    if (Crc32.hash(body) != stored_checksum) return error.InvalidDerivedApplyState;
     if (!std.mem.eql(u8, body[0..checkpoint_magic.len], checkpoint_magic)) return error.InvalidDerivedApplyState;
     var pos: usize = checkpoint_magic.len;
     const format_version = try readCheckpointInt(body, &pos, u32);
@@ -688,7 +689,7 @@ fn encodeCheckpoint(alloc: Allocator, checkpoint: *const CheckpointMap) ![]u8 {
         try appendCheckpointInt(alloc, &out, u64, value.published_count orelse 0);
         try out.appendSlice(alloc, name);
     }
-    try appendCheckpointInt(alloc, &out, u32, std.hash.Crc32.hash(out.items));
+    try appendCheckpointInt(alloc, &out, u32, Crc32.hash(out.items));
     if (out.items.len > checkpoint_max_bytes) return error.InvalidDerivedApplyState;
     return try out.toOwnedSlice(alloc);
 }
@@ -951,7 +952,7 @@ test "projection checkpoint reads v2 without inventing a publication certificate
     try appendCheckpointInt(alloc, &encoded, u64, 9);
     try appendCheckpointInt(alloc, &encoded, u64, 0x1234);
     try encoded.appendSlice(alloc, name);
-    try appendCheckpointInt(alloc, &encoded, u32, std.hash.Crc32.hash(encoded.items));
+    try appendCheckpointInt(alloc, &encoded, u32, Crc32.hash(encoded.items));
 
     var checkpoint = try decodeCheckpoint(alloc, encoded.items);
     defer checkpoint.deinit(alloc);

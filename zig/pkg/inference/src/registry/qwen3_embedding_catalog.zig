@@ -174,9 +174,10 @@ pub const bundles = [_]EmbeddingBundle{
         .id = "qwen3-embedding-0.6b-bf16-safetensors",
         .variant = safetensors_bundle_variant,
         .source_repo = safetensors_repo,
-        // Sentence-transformers sidecars (modules.json + 1_Pooling +
-        // prompts) drive detection; no synthetic manifest required.
-        .generated_model_manifest = null,
+        // The executable query/document profile is part of every managed
+        // embedding bundle, including safetensors. Pull must not replace it
+        // with generic task-only metadata before writing the final receipt.
+        .generated_model_manifest = gguf_bundle_model_manifest,
         .artifact_list = &safetensors_artifacts,
     },
 };
@@ -238,7 +239,7 @@ test "Qwen3-Embedding artifact catalog is immutable and internally consistent" {
     try std.testing.expectEqualStrings("Qwen3-Embedding-0.6B-f16.gguf", f16_bundle.artifact_list[0].path);
 
     const st = findBundleForHubRef("Qwen", "Qwen3-Embedding-0.6B", safetensors_bundle_variant).?;
-    try std.testing.expect(st.generated_model_manifest == null);
+    try std.testing.expectEqualStrings(gguf_bundle_model_manifest, st.generated_model_manifest.?);
     try std.testing.expectEqual(@as(usize, 7), st.artifact_list.len);
 
     try std.testing.expect(findBundleForHubRef("Qwen", "Qwen3-Embedding-0.6B", q8_0_bundle_variant) == null);

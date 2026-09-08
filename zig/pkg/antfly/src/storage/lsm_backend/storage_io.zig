@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
@@ -711,13 +712,13 @@ const BufferedAtomicWriteSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -2771,13 +2772,13 @@ const NativeBufferedAtomicWriteSink = struct {
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[0..len_prefix]);
+        return Crc32.hash(self.out.items[0..len_prefix]);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return std.hash.Crc32.hash(self.out.items[offset..][0..range_len]);
+        return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -2918,7 +2919,7 @@ const NativeAtomicWriteSink = struct {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (range_offset > self.bytes_written or range_len > self.bytes_written - range_offset) return error.InvalidAtomicWriteOffset;
 
-        var crc = std.hash.Crc32.init();
+        var crc = Crc32.init();
         var offset: usize = 0;
         var buf: [64 * 1024]u8 = undefined;
         while (offset < range_len) {
@@ -3448,7 +3449,7 @@ test "native atomic write sink supports patching and crc before finish" {
 
     try writer.appendSlice("hello _____");
     try writer.writeAt(6, "world");
-    try std.testing.expectEqual(std.hash.Crc32.hash("hello world"), try writer.crc32Prefix(writer.len()));
+    try std.testing.expectEqual(Crc32.hash("hello world"), try writer.crc32Prefix(writer.len()));
 
     active = false;
     try writer.finish();
@@ -4246,7 +4247,7 @@ test "native buffered atomic write sink retains invalidation state past storage 
 
     try writer.appendSlice("buffered _____");
     try writer.writeAt(9, "lease");
-    try std.testing.expectEqual(std.hash.Crc32.hash("buffered lease"), try writer.crc32Prefix(writer.len()));
+    try std.testing.expectEqual(Crc32.hash("buffered lease"), try writer.crc32Prefix(writer.len()));
     native.deinit();
 
     active = false;

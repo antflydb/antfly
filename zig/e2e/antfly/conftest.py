@@ -140,11 +140,50 @@ def maybe_preserve_tempdir(
     return True
 
 
+_DEFERRED_MODULE_TEMPDIRS = pytest.StashKey[list[tempfile.TemporaryDirectory[str]]]()
+
+
+def defer_module_tempdir_cleanup(
+    module: pytest.Module, tempdir: tempfile.TemporaryDirectory[str]
+) -> None:
+    # Keep ownership until the report for the module's last teardown is ready.
+    module.stash.setdefault(_DEFERRED_MODULE_TEMPDIRS, []).append(tempdir)
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
     outcome = yield
     report = outcome.get_result()
     setattr(item, f"rep_{report.when}", report)
+    module = item.getparent(pytest.Module)
+    if report.when != "teardown" or module is None:
+        return
+    pending = module.stash.get(_DEFERRED_MODULE_TEMPDIRS, [])
+    if not pending:
+        return
+    del module.stash[_DEFERRED_MODULE_TEMPDIRS]
+    failed = any(
+        phase_report is not None and phase_report.failed
+        for module_item in item.session.items
+        if module_item.getparent(pytest.Module) is module
+        for phase in ("setup", "call", "teardown")
+        for phase_report in (getattr(module_item, f"rep_{phase}", None),)
+    )
+    for tempdir in pending:
+        if not maybe_preserve_tempdir(tempdir, failed=failed):
+            try:
+                tempdir.cleanup()
+            except OSError as err:
+                # Cleanup now runs after fixture teardown; attach errors to its
+                # report rather than turning them into a pytest internal error.
+                diagnostic = f"E2E directory cleanup failed for {tempdir.name}: {err}"
+                report.longrepr = (
+                    f"{report.longrepr}\n{diagnostic}"
+                    if report.longrepr is not None
+                    else diagnostic
+                )
+                report.outcome = "failed"
+                failed = True
 
 
 def default_antfly_api_root(binary: str) -> str:
@@ -295,16 +334,65 @@ def _cleanup_created_tables(api: Any, table_names: set[str]) -> list[str]:
     cleanup_errors: list[str] = []
     for table_name in reversed(sorted(table_names)):
         try:
-            response = api.s.delete(
-                f"{api.url}/tables/{quote(table_name, safe='')}", timeout=30
-            )
-            if response.status_code not in (200, 202, 204, 404):
-                cleanup_errors.append(
-                    f"{table_name}: HTTP {response.status_code} {response.text[:500]}"
-                )
-        except requests.RequestException as err:
+            _delete_created_table(api, table_name)
+        except (requests.RequestException, RuntimeError) as err:
             cleanup_errors.append(f"{table_name}: {err}")
     return cleanup_errors
+
+
+def _delete_created_table(api: Any, table_name: str) -> None:
+    # DELETE is idempotent: a lost response may mean the table is already gone.
+    # Retry transport failures within one cleanup deadline, but never hide an
+    # exited server or a real HTTP error behind a later successful request.
+    deadline = time.monotonic() + 30
+    for attempt in range(3):
+        raise_if_server_process_exited(api._server)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.Timeout(
+                    "table cleanup deadline expired before request lock"
+                )
+            if not api._request_lock.acquire(timeout=remaining):
+                raise requests.Timeout(
+                    "table cleanup timed out waiting for request lock"
+                )
+            try:
+                # Lock acquisition may consume the deadline, including when
+                # the waiter is descheduled just as the lock becomes available.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise requests.Timeout(
+                        "table cleanup deadline expired before DELETE"
+                    )
+                response = api.s.delete(
+                    f"{api.url}/tables/{quote(table_name, safe='')}",
+                    timeout=remaining,
+                )
+            finally:
+                api._request_lock.release()
+        except (requests.ConnectionError, requests.Timeout) as err:
+            raise_if_server_process_exited(api._server)
+            remaining = deadline - time.monotonic()
+            if attempt == 2 or remaining <= 0.1:
+                raise_request_error_with_logs(err, api._server)
+            print(
+                f"retrying table cleanup for {table_name}: {type(err).__name__}: {err}"
+            )
+            time.sleep(0.1)
+            continue
+        except requests.RequestException as err:
+            raise_request_error_with_logs(err, api._server)
+        raise_if_server_process_exited(api._server)
+        if response.status_code not in (200, 202, 204, 404):
+            raise_request_error_with_logs(
+                requests.HTTPError(
+                    f"HTTP {response.status_code} {response.text[:500]}",
+                    response=response,
+                ),
+                api._server,
+            )
+        return
 
 
 def _created_table_from_path(path: str) -> str | None:
@@ -1257,11 +1345,13 @@ class StandaloneAntflyServer:
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
 
-    def stop(self, *, test_failed: bool = False) -> None:
+    def stop(self, *, test_failed: bool = False, cleanup_root: bool = True) -> None:
         self._stop_process()
         self.port_reservations.close()
         self.log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
+        if cleanup_root and not maybe_preserve_tempdir(
+            self.tempdir, failed=test_failed
+        ):
             self.tempdir.cleanup()
 
 
