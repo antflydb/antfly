@@ -1262,6 +1262,10 @@ fn closeWorkerCatchUpState(
         runtime.cond.broadcast(io);
         runtime.mutex.unlock(io);
     }
+    if (worker.kind.kind == .dense_vector and @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES"))
+        std.log.info("dense replay capture finish token={} sequence={} success={} applied_sequence_persisted={}", .{
+            token.value, applied_sequence, success, finish_result.applied_sequence_persisted,
+        });
     return finish_result;
 }
 
@@ -1401,9 +1405,9 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
         },
     );
     if (worker.kind.kind == .dense_vector and @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES"))
-        std.log.info("dense replay collection sequence={} records={} applied_windows={} deferred_capture={} capture_before_collection={} collect_ns={} apply_ns={}", .{
-            stats.last_sequence,       stats.scanned_entries,   stats.applied_entries, deferred_capture,
-            capture_before_collection, stats.window_collect_ns, stats.apply_ns,
+        std.log.info("dense replay collection token={} sequence={} records={} applied_windows={} deferred_capture={} capture_before_collection={} collect_ns={} apply_ns={}", .{
+            worker.catch_up_token.value, stats.last_sequence,     stats.scanned_entries, stats.applied_entries, deferred_capture,
+            capture_before_collection,   stats.window_collect_ns, stats.apply_ns,
         });
     return stats;
 }
@@ -1429,6 +1433,7 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
 const TestThreadedRuntimeCapture = struct {
     require_capture_worker: ?*Worker = null,
     fail_next_begin: bool = false,
+    empty_coverage_checks: std.atomic.Value(u64) = .init(0),
     runtime: ?*DerivedRuntime = null,
     apply_calls: std.atomic.Value(u64) = .init(0),
     begin_calls: std.atomic.Value(u64) = .init(0),
@@ -1612,6 +1617,43 @@ test "io threaded deferred source capture excludes preparation and preserves fai
         try std.testing.expect(worker.catch_up_open); // unchanged non-dense policy
         _ = try closeWorkerCatchUpState(&runtime, &worker, 0, false);
     }
+}
+
+test "io threaded deferred source capture advances empty targets only through coverage guard" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/empty-late-capture", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"text:only"},
+        .target_hints = &.{.full_text},
+    });
+    const Coverage = struct {
+        fn allow(ctx: *anyopaque, _: index_manager_mod.ManagedIndexRef, from: u64, target: u64) !bool {
+            const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(@as(u64, 0), from);
+            try std.testing.expectEqual(@as(u64, 1), target);
+            // The first guard refusal must leave the durable boundary at 0.
+            return capture.empty_coverage_checks.fetchAdd(1, .monotonic) != 0;
+        }
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    manager.dense_deferred_source_capture = true;
+    var capture: TestThreadedRuntimeCapture = .{};
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, Coverage.allow, null, &manager);
+    defer runtime.deinit();
+    try runtime.addWorker("dense", .{ .name = "dense", .kind = .dense_vector }, 0);
+    try runtime.waitForAllWithVisibilityWait(1, .none, platform_time.monotonicNs() + 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u64, 2), capture.empty_coverage_checks.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), capture.begin_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), capture.finish_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
 }
 
 test "io threaded forced persist errors unwind snapshot ownership safely" {

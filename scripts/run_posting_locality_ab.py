@@ -17,6 +17,10 @@ import time
 from pathlib import Path
 
 from projection_locality_inputs import input_paths, receipt_passed
+from source_capture_experiment import (
+    FLAG as DEFER_CAPTURE_FLAG,
+    capture_preparation_evidence,
+)
 from native_preparation_experiments import (
     REFINEMENTS as NATIVE_REFINEMENTS,
     require_disk_headroom,
@@ -254,6 +258,13 @@ def main():
         )
     if args.capture_stages and args.refinement == "capture":
         parser.error("common tracing would make the capture A/B inert")
+    capture_experiment = DEFER_CAPTURE_FLAG in candidate_flags
+    if capture_experiment and not (
+        args.capture_stages or "ANTFLY_EXPERIMENT_CAPTURE_STAGES" in common_flags
+    ):
+        parser.error(
+            "deferred capture qualification requires common capture-stage tracing"
+        )
     binary = args.binary.resolve(strict=True)
     control_binary = (
         args.control_binary.resolve(strict=True) if args.control_binary else binary
@@ -265,6 +276,7 @@ def main():
     inputs = input_paths(binary, Path(__file__).resolve())
     inputs.add(control_binary)
     inputs.add(scripts / "native_preparation_experiments.py")
+    inputs.add(scripts / "source_capture_experiment.py")
     if args.sample_process:
         inputs.add(scripts / "sample_macos_process_memory.py")
     expected = {str(path): digest(path) for path in sorted(inputs)}
@@ -448,6 +460,15 @@ def main():
                         )
                         if native_observation is not None:
                             receipt["native_treatment_observation"] = native_observation
+                        if capture_experiment:
+                            receipt["capture_preparation_observation"] = (
+                                capture_preparation_evidence(
+                                    (arm / "antfly-initial.log")
+                                    .read_text(errors="replace")
+                                    .splitlines(),
+                                    arm_environment.get(DEFER_CAPTURE_FLAG) == "1",
+                                )
+                            )
                 except RuntimeError as error:
                     receipt["invalid_reason"] = str(error)
                     save()

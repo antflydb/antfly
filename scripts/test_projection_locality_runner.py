@@ -45,6 +45,9 @@ class QualificationRunnerTest(unittest.TestCase):
         (scripts / "native_preparation_experiments.py").write_text(
             "native evidence fixture"
         )
+        (scripts / "source_capture_experiment.py").write_text(
+            "capture evidence fixture"
+        )
         unused = scripts / "run_vector_store_enrichment_ab.py"
         unused.write_text("not used by this workload")
         binary = base / "antfly"
@@ -58,11 +61,16 @@ class QualificationRunnerTest(unittest.TestCase):
             calls.append((command, kwargs["env"].copy()))
             arm = Path(command[1])
             arm.mkdir(parents=True, exist_ok=True)
+            deferred = (
+                kwargs["env"].get("ANTFLY_EXPERIMENT_DEFER_SOURCE_CAPTURE") == "1"
+            )
             (arm / "antfly-initial.log").write_text(
                 "dense checkpoint worker generation=2 readers_stage_ns=20 success=true\n"
                 "dense checkpoint rebase worker generation=2 rebase_stage_ns=20 success=true\n"
                 "dense checkpoint encoded row reuse generation=2 reused_bytes=4096\n"
                 "dense posting checkpoint published generation=2 kind=full\n"
+                f"dense replay collection token=7 sequence=12 records=4 applied_windows=1 deferred_capture={str(deferred).lower()} capture_before_collection={str(not deferred).lower()} collect_ns=30 apply_ns=60\n"
+                "dense replay capture finish token=7 sequence=12 success=true applied_sequence_persisted=true\n"
             )
             (arm / "qualification-summary.json").write_text(
                 json.dumps(
@@ -270,6 +278,25 @@ class QualificationRunnerTest(unittest.TestCase):
         for _, env in calls:
             self.assertEqual(env["ANTFLY_EXPERIMENT_CAPTURE_STAGES"], "1")
 
+    def test_deferred_capture_requires_common_tracing_and_committed_evidence(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.run_fixture(module=posting_runner, refinement="deferred_capture")
+        calls, receipts = self.run_fixture(
+            module=posting_runner,
+            refinement="deferred_capture",
+            capture_stages=True,
+            common_refinement="staged_readers",
+        )
+        for (_, env), receipt in zip(calls, receipts, strict=True):
+            self.assertEqual(env["ANTFLY_EXPERIMENT_CAPTURE_STAGES"], "1")
+            self.assertEqual(env["ANTFLY_EXPERIMENT_STAGE_POSTING_READERS"], "1")
+            observation = receipt["capture_preparation_observation"]
+            self.assertEqual(observation["committed_observations"], 1)
+            self.assertEqual(
+                observation["observations_starting_outside_capture"],
+                int(receipt["mode"] == "candidate"),
+            )
+
     def test_layout_is_isolated_with_queued_readers_in_both_arms(self):
         calls, receipts = self.run_fixture(
             module=posting_runner,
@@ -373,7 +400,10 @@ class QualificationRunnerTest(unittest.TestCase):
         for name, controls in posting_runner.REFINEMENTS.items():
             common = "subgroups_4" if name == "certified_subgroups" else None
             calls, receipts = self.run_fixture(
-                module=posting_runner, refinement=name, common_refinement=common
+                module=posting_runner,
+                refinement=name,
+                common_refinement=common,
+                capture_stages=name == "deferred_capture",
             )
             self.assertEqual(
                 [r["mode"] for r in receipts],
@@ -390,6 +420,11 @@ class QualificationRunnerTest(unittest.TestCase):
                             env[key], "1" if receipt["mode"] == "candidate" else "0"
                         )
                     elif common and key in posting_runner.REFINEMENTS[common]:
+                        self.assertEqual(env[key], "1")
+                    elif (
+                        name == "deferred_capture"
+                        and key == "ANTFLY_EXPERIMENT_CAPTURE_STAGES"
+                    ):
                         self.assertEqual(env[key], "1")
                     else:
                         self.assertNotIn(key, env)

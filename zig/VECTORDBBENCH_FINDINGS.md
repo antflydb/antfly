@@ -9404,3 +9404,44 @@ terminated, so that load sample is not clean compiler-isolated evidence. Its
 pinned binary/inputs are unchanged. Available disk meanwhile rose to about
 160 GiB without this task deleting any benchmark data; the earlier headroom
 blocker no longer applies.
+
+##### Reader-staging matrix complete; capture experiment qualification gate
+
+All eight reader-staging arms passed the archived harness's execution,
+visibility, restart, and paired recall gates. Results are preserved in
+`.benchmark-results/pr593-staged-readers-ab-20260908/full-comparison.json`.
+The second 1M candidate's load retains the compiler-overlap caveat above.
+
+| Case / reversed pair arm | Ready s | C30 QPS | C30 p95 ms | Recall % | Mixed write p95 ms | Mixed query p95 ms | Catch-up s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 50K / 1 control | 23.669 | 1437.901 | 51.859 | 98.36 | 164.888 | 73.612 | 1.357 |
+| 50K / 1 staged | 16.318 | 1375.631 | 59.973 | 98.36 | 194.209 | 87.160 | 1.459 |
+| 50K / 2 staged | 15.957 | 1653.696 | 45.467 | 98.36 | 150.201 | 58.000 | 1.038 |
+| 50K / 2 control | 15.329 | 1632.518 | 49.331 | 98.44 | 149.650 | 57.587 | 1.157 |
+| 1M / 1 control | 340.271 | 610.884 | 101.487 | 99.04 | 160.417 | 56.103 | 50.163 |
+| 1M / 1 staged | 306.589 | 836.803 | 72.747 | 99.03 | 91.437 | 42.316 | 35.592 |
+| 1M / 2 staged | 373.188 | 692.713 | 92.533 | 98.96 | 151.617 | 61.731 | 56.068 |
+| 1M / 2 control | 427.790 | 784.836 | 82.613 | 99.02 | 92.743 | 50.524 | 46.008 |
+
+The pair direction reverses for 1M QPS, query p95, mixed write p95, and
+catch-up. Even the aggregate 1M C30 improvement (697.860 to 764.758 QPS;
+92.050 to 82.640 ms p95) accompanies higher read-only RSS (4.922 to
+5.994 GB), mixed RSS (4.892 to 5.018 GB), and a worse post-restart fixed
+profile. Allocated disk is essentially unchanged (3.805 to 3.817 GB).
+This is not a promoted all-metric baseline.
+
+Deferred capture now has three passing Debug executor tests, including a real
+`std.Io` worker proving that an empty dense target advances only after the
+coverage callback permits it, without opening or finishing a mutation capture.
+The A/B runner requires common capture-stage tracing and records observations
+only when the exact source-session token successfully persists a watermark
+covering the observed window. Coalesced windows can finish at a later sequence;
+failed captures, insufficient coverage, duplicate committed tokens, and inert
+treatments do not qualify. These collection times are not claimed as saved
+wall time. Reader staging is common in both deferred-capture arms.
+
+A suspected no-copy projection-loading waste was ruled out: catalog layout
+configuration clears the projection loader when neither retention nor subgroup
+training is enabled. No redundant fix was made there. Remaining capture work
+includes mutation/application and intentional session reuse; the delayed-begin
+experiment only removes initial read-only preparation from that interval.

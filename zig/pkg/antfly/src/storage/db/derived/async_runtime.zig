@@ -794,9 +794,15 @@ fn closeWorkerCatchUpState(
     worker.last_replay_tail_records = 0;
     const token = worker.catch_up_token;
     worker.catch_up_token = .{};
-    if (runtime.finish_catch_up_fn) |finish_catch_up|
-        return try finish_catch_up(runtime.ctx, worker.kind, token, applied_sequence, success);
-    return .{};
+    const result: CatchUpFinishResult = if (runtime.finish_catch_up_fn) |finish_catch_up|
+        try finish_catch_up(runtime.ctx, worker.kind, token, applied_sequence, success)
+    else
+        .{};
+    if (worker.kind.kind == .dense_vector and @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES"))
+        std.log.info("dense replay capture finish token={} sequence={} success={} applied_sequence_persisted={}", .{
+            token.value, applied_sequence, success, result.applied_sequence_persisted,
+        });
+    return result;
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
@@ -924,9 +930,9 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
         },
     );
     if (worker.kind.kind == .dense_vector and @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES"))
-        std.log.info("dense replay collection sequence={} records={} applied_windows={} deferred_capture={} capture_before_collection={} collect_ns={} apply_ns={}", .{
-            stats.last_sequence,       stats.scanned_entries,   stats.applied_entries, deferred_capture,
-            capture_before_collection, stats.window_collect_ns, stats.apply_ns,
+        std.log.info("dense replay collection token={} sequence={} records={} applied_windows={} deferred_capture={} capture_before_collection={} collect_ns={} apply_ns={}", .{
+            worker.catch_up_token.value, stats.last_sequence,     stats.scanned_entries, stats.applied_entries, deferred_capture,
+            capture_before_collection,   stats.window_collect_ns, stats.apply_ns,
         });
     return stats;
 }

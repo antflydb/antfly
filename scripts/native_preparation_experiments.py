@@ -14,6 +14,7 @@ REFINEMENTS = {
     "staged_rebase": ["ANTFLY_EXPERIMENT_STAGE_POSTING_REBASE"],
     "certified_subgroups": ["ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS"],
     "reused_posting_rows": ["ANTFLY_EXPERIMENT_REUSE_POSTING_ROWS"],
+    "deferred_capture": ["ANTFLY_EXPERIMENT_DEFER_SOURCE_CAPTURE"],
 }
 
 
