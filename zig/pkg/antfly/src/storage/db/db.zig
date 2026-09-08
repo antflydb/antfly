@@ -60173,8 +60173,9 @@ test "generated document embeddings batch across rows and memoize retry work" {
         }
     };
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var probe = BatchProbe{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -62352,11 +62353,13 @@ test "db default primary backend survives reopen" {
 test "relational runtime-only and mixed schema epochs survive portable restore" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |upgrade| {
-        var source_buf: [256]u8 = undefined;
-        const source_path = tempPath(&source_buf);
+        var source_path_tmp = try TestDirectory.init("db");
+        defer source_path_tmp.cleanup();
+        const source_path = source_path_tmp.path().ptr;
         defer cleanupTempDir(source_path);
-        var target_buf: [256]u8 = undefined;
-        const target_path = tempPath(&target_buf);
+        var target_path_tmp = try TestDirectory.init("db");
+        defer target_path_tmp.cleanup();
+        const target_path = target_path_tmp.path().ptr;
         defer cleanupTempDir(target_path);
         var source = try DB.open(alloc, std.mem.span(source_path), .{ .start_index_workers = false });
         defer source.close();
@@ -62388,8 +62391,9 @@ test "relational runtime-only and mixed schema epochs survive portable restore" 
 
 test "relational public schema provenance rejects missing validators on reopen" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     {
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
@@ -62404,8 +62408,9 @@ test "relational public schema provenance rejects missing validators on reopen" 
 
 test "relational prepared intents reject physical overflow before voting and persist canonical rows" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -62437,8 +62442,9 @@ test "relational cumulative prepares remain committable within the preparation e
     options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 2 * 1024 * 1024 };
     var resources = resource_manager_mod.ResourceManager.init(options);
     defer resources.deinit(alloc);
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .start_optional_runtimes = false });
     defer db.close();
@@ -62475,8 +62481,9 @@ test "relational replicated admission is identical across local memory envelopes
         options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = capacity };
         var resources = resource_manager_mod.ResourceManager.init(options);
         defer resources.deinit(alloc);
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .start_optional_runtimes = false });
         defer db.close();
@@ -62508,8 +62515,9 @@ test "relational direct intents share preparation admission before the apply fen
     const alloc = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
     defer manager.deinit(alloc);
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &manager, .start_index_workers = false, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } });
     defer db.close();
@@ -62548,8 +62556,9 @@ test "relational transaction epoch survives schema publication and participant r
         \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"string"}},"required":["amount"],"additionalProperties":false}}}}
     ;
     for ([_]bool{ false, true }) |public| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var txn_ids: [2]transactions_mod.TxnId = undefined;
         {
@@ -62593,8 +62602,9 @@ test "relational transaction epoch survives schema publication and participant r
 
 test "relational durable transaction epoch does not cross whole namespace replacement" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
@@ -62633,8 +62643,9 @@ test "relational durable transaction epoch does not cross whole namespace replac
 
 test "relational initial storage mode cannot strand schemaless transaction intents" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -62653,8 +62664,9 @@ test "relational preparation budget rejects contention before commit and release
     const alloc = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
     defer manager.deinit(alloc);
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &manager, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
     defer db.close();
@@ -62681,8 +62693,9 @@ test "relational preparation budget includes expanded transform snapshots" {
     const alloc = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
     defer manager.deinit(alloc);
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &manager, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
     defer db.close();
@@ -62852,8 +62865,9 @@ test "prepared relational full text projection attaches typed root without dupli
 
 test "owned db reconciles published schema indexes on its durable worker lane" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const db = try DB.openOwned(alloc, std.mem.span(path), .{ .start_index_workers = false });
@@ -62869,8 +62883,9 @@ test "owned db reconciles published schema indexes on its durable worker lane" {
 test "relational columnar dirty scans intersect query and shard bounds before decoding" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -62910,8 +62925,9 @@ test "relational columnar dirty scans intersect query and shard bounds before de
 
 test "relational columnar existence and null projection do not fetch payload records" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } } });
     defer db.close();
@@ -62959,8 +62975,9 @@ fn drainTestRelationalMaintenance(db: *DB) !void {
 
 test "relational columnar adaptive maintenance resumes after empty coverage" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -62990,8 +63007,9 @@ test "relational columnar adaptive maintenance resumes after empty coverage" {
 
 test "relational columnar range admission ignores unrelated mutation epochs" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -63027,8 +63045,9 @@ test "relational columnar range admission ignores unrelated mutation epochs" {
 test "relational columnar selected payload pages bound wide projection reads" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63119,8 +63138,9 @@ test "relational columnar selected payload pages bound wide projection reads" {
 test "relational columnar skew pages and sparse delta merges bound physical work" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63184,8 +63204,9 @@ test "relational columnar skew pages and sparse delta merges bound physical work
 test "relational columnar merge frontier skips tombstones and unread base pages" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63225,8 +63246,9 @@ test "relational columnar tombstone costing preserves narrow projection" {
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63270,8 +63292,9 @@ test "relational columnar churn bounds retained payload storage and reads" {
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63340,8 +63363,9 @@ test "relational columnar skewed partial payload reuse follows bytes not row cou
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63379,8 +63403,9 @@ test "relational columnar shared pages bound alternating merges and survive recl
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63466,8 +63491,9 @@ test "relational columnar shared pages bound alternating merges and survive recl
 test "relational columnar row cursor skips artifact fanout and preserves binary owners" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63509,8 +63535,9 @@ test "relational columnar row cursor skips artifact fanout and preserves binary 
 test "relational columnar bootstrap yields across artifact-only owners" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |leading_row| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
         defer db.close();
@@ -63550,8 +63577,9 @@ test "relational columnar bootstrap yields across artifact-only owners" {
 
 test "relational columnar scheduler batches deferred discovery before ready work and persists timers" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -63601,8 +63629,9 @@ test "relational columnar scheduler batches deferred discovery before ready work
 
 test "relational columnar scheduler keeps merge queue separate from due timers" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -63629,8 +63658,9 @@ test "relational columnar scheduler keeps merge queue separate from due timers" 
 test "relational columnar bootstrap checkpoints coverage with fresh snapshots across restart" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63702,8 +63732,9 @@ test "relational columnar bootstrap checkpoints coverage with fresh snapshots ac
 
 test "relational columnar missing bootstrap checkpoint cannot claim complete coverage" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -63729,8 +63760,9 @@ test "relational columnar missing bootstrap checkpoint cannot claim complete cov
 
 test "relational columnar byte costing retains wide clean rows and switches for dense replacement" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -63784,8 +63816,9 @@ test "relational columnar byte costing retains wide clean rows and switches for 
 
 test "relational columnar adaptive admission preserves age across hot updates and restart" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -63839,8 +63872,9 @@ test "relational columnar adaptive admission preserves age across hot updates an
 test "relational columnar overlays merge mutations in order without scanning clean primary rows" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -63914,8 +63948,9 @@ test "relational columnar decoded cache preserves snapshots and releases visitor
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64002,8 +64037,9 @@ fn seedColumnScanPlanTest(db: *DB, alloc: Allocator) !void {
 test "relational columnar JSON numeric predicates preserve document semantics" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64040,8 +64076,9 @@ test "relational columnar bound selection and late projection match primary sema
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64097,8 +64134,9 @@ test "relational columnar late materialization pins snapshots and releases visit
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64149,8 +64187,9 @@ test "relational columnar sequential selection preserves dirty owners bounds and
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64192,8 +64231,9 @@ test "relational columnar sequential selection pins snapshots and releases failu
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64252,8 +64292,9 @@ test "relational columnar bound scan benchmark" {
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64303,8 +64344,9 @@ test "relational columnar prepared ownership aggregates and aborts atomically" {
     const payloads = @import("column_payloads.zig");
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = db_config.primary_lsm_options_default } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64367,8 +64409,9 @@ test "relational columnar production LSM staging snapshot benchmark" {
     var elapsed: [2]u64 = undefined;
     for (0..2) |mode| {
         lsm_backend_mod.Backend.test_deep_mutable_snapshots = mode == 0;
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
         defer db.close();
@@ -64410,8 +64453,9 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var options = db_config.primary_lsm_options_default;
     options.tombstone_gc_min_percent = gc_min_percent;
@@ -64505,8 +64549,9 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
 
 test "relational columnar production LSM batched cold block read benchmark" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -64564,8 +64609,9 @@ test "relational columnar production LSM batched cold block read benchmark" {
 test "relational point projection lease benchmark" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64633,8 +64679,9 @@ test "relational columnar dense nested predicate benchmark" {
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -64683,8 +64730,9 @@ test "relational columnar decoded reuse benchmark" {
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
         for ([_]bool{ true, false }) |shared| {
-            var path_buf: [256]u8 = undefined;
-            const path = tempPath(&path_buf);
+            var path_tmp = try TestDirectory.init("db");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path().ptr;
             defer cleanupTempDir(path);
             var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
             defer db.close();
@@ -64746,8 +64794,9 @@ test "relational columnar decoded reuse benchmark" {
 
 test "relational columnar wide metadata allocation benchmark" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -64797,8 +64846,9 @@ test "relational columnar wide metadata allocation benchmark" {
 
 test "relational columnar narrow projections load only selected metadata on wide rows" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -64837,8 +64887,9 @@ test "relational columnar coalescing progresses while a distant range stays hot"
     // of maintenance quanta; wall-clock scheduling must not change that shape.
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -64912,8 +64963,9 @@ test "relational columnar cleanup resumes published pages without rebuilding or 
 
 fn testRelationalCleanupBackend(backend: PrimaryBackend) !void {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
     defer db.close();
@@ -64944,8 +64996,9 @@ fn testRelationalCleanupBackend(backend: PrimaryBackend) !void {
 
 test "relational columnar delete waves coalesce adjacent underfilled ranges" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -64985,8 +65038,9 @@ test "relational columnar delete waves coalesce adjacent underfilled ranges" {
 test "relational columnar clean coalescing preserves typed cells without primary reads" {
     const alloc = std.testing.allocator;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -65051,8 +65105,9 @@ test "relational columnar clean coalescing preserves typed cells without primary
 
 test "relational columnar deleted insertion burst has bounded cleanup and complete coverage" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65089,8 +65144,9 @@ test "relational columnar deleted insertion burst has bounded cleanup and comple
 
 test "relational columnar epoch boundaries respect a one block maintenance quantum" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65114,8 +65170,9 @@ test "relational columnar epoch boundaries respect a one block maintenance quant
 
 test "relational columnar obsolete generation GC is bounded and resumes after restart" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65143,8 +65200,9 @@ test "relational columnar wide retirement is bounded durable and backpressures p
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
@@ -65193,8 +65251,9 @@ test "relational columnar wide retirement is bounded durable and backpressures p
 
 test "relational columnar maintenance survives unrelated artifact corruption and backoff" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65223,8 +65282,9 @@ test "relational columnar maintenance advances past hot ranges across restart" {
     // of debug-build speed and the production wall-clock quantum.
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65291,8 +65351,9 @@ test "relational columnar generations preserve scans and compact dirty ranges" {
     // This fixture intentionally addresses exact 256-row physical blocks.
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65435,8 +65496,9 @@ test "relational columnar generations preserve scans and compact dirty ranges" {
 
 test "relational durable preparation materializes only requested consumer ordinals" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65491,8 +65553,9 @@ test "relational durable preparation materializes only requested consumer ordina
 
 test "relational columnar typed masks avoid vector expansion and eliminated columns" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65548,8 +65611,9 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     // The explicit block limit below, not elapsed wall time, defines quanta.
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
@@ -65654,8 +65718,9 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
 test "db relational mode stores authoritative packed rows across reopen scan and delete" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     const schema_json =
@@ -65840,8 +65905,9 @@ test "db relational mode stores authoritative packed rows across reopen scan and
 test "db relational ttl cleanup preserves physical mode across reopen" {
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = std.time.ns_per_s;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -65888,8 +65954,9 @@ test "db relational ttl cleanup preserves physical mode across reopen" {
 test "db relational semantic no-op refreshes authoritative row timestamp" {
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = 10 * std.time.ns_per_s;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
@@ -65931,11 +65998,13 @@ test "db relational semantic no-op refreshes authoritative row timestamp" {
 
 test "db portable relational restore refreshes open runtime before returning" {
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var target_buf: [256]u8 = undefined;
-    const target_path = tempPath(&target_buf);
+    var target_path_tmp = try TestDirectory.init("db");
+    defer target_path_tmp.cleanup();
+    const target_path = target_path_tmp.path().ptr;
     defer cleanupTempDir(target_path);
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","enum":["active"]}},"required":["id","status"],"additionalProperties":false}}}}
@@ -65985,8 +66054,9 @@ test "db portable relational restore refreshes open runtime before returning" {
 
 test "db open recovers incomplete bounded portable publication before runtime load" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -66024,8 +66094,9 @@ test "db open recovers incomplete bounded portable publication before runtime lo
 
 test "db portable import target rejects active in-memory bulk leases" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66066,11 +66137,13 @@ test "db portable import target rejects active in-memory bulk leases" {
 
 test "db portable publication rollback preserves target routing metadata" {
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var target_buf: [256]u8 = undefined;
-    const target_path = tempPath(&target_buf);
+    var target_path_tmp = try TestDirectory.init("db");
+    defer target_path_tmp.cleanup();
+    const target_path = target_path_tmp.path().ptr;
     defer cleanupTempDir(target_path);
     var portable = std.ArrayList(u8).empty;
     defer portable.deinit(alloc);
@@ -66110,11 +66183,13 @@ test "db portable publication rollback preserves target routing metadata" {
 
 test "db portable committed sync failure retains rollback authority" {
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var target_buf: [256]u8 = undefined;
-    const target_path = tempPath(&target_buf);
+    var target_path_tmp = try TestDirectory.init("db");
+    defer target_path_tmp.cleanup();
+    const target_path = target_path_tmp.path().ptr;
     defer cleanupTempDir(target_path);
     var portable = std.ArrayList(u8).empty;
     defer portable.deinit(alloc);
@@ -66155,8 +66230,9 @@ test "db portable committed sync failure retains rollback authority" {
 
 test "db portable publication fence blocks lock-free point reads" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
@@ -66177,8 +66253,9 @@ test "db portable publication fence blocks lock-free point reads" {
 
 test "portable runtime lock helpers reject degraded work before lock admission" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66209,8 +66286,9 @@ test "db portable publication waits for admitted readers and rejects new ones" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
@@ -66275,8 +66353,9 @@ test "db portable activation gate revalidates queued and replicated writes" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
@@ -66344,8 +66423,9 @@ test "db portable activation gate revalidates queued graph reads" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
@@ -66395,8 +66475,9 @@ test "db portable activation gate revalidates profiled dense search after catalo
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66483,8 +66564,9 @@ test "portable activation retry runtime job can be restarted" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66521,8 +66603,9 @@ test "portable activation retry stop joins the runtime worker final handshake" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66602,8 +66685,9 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66703,8 +66787,9 @@ test "portable activation retry uses owner scoped runtime" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66743,8 +66828,9 @@ test "portable activation retry automatically rearms after runtime submission fa
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66785,8 +66871,9 @@ test "db searches fail fast without joining portable activation recovery" {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -66839,11 +66926,13 @@ test "db searches fail fast without joining portable activation recovery" {
 test "db portable resolver activation stops partial startup before retry reload" {
     @import("../../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var target_buf: [256]u8 = undefined;
-    const target_path = tempPath(&target_buf);
+    var target_path_tmp = try TestDirectory.init("db");
+    defer target_path_tmp.cleanup();
+    const target_path = target_path_tmp.path().ptr;
     defer cleanupTempDir(target_path);
     var portable = std.ArrayList(u8).empty;
     defer portable.deinit(alloc);
@@ -66890,11 +66979,13 @@ test "db portable resolver activation stops partial startup before retry reload"
 test "db failed portable rollback fences live access until reopen recovery" {
     @import("../../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var target_buf: [256]u8 = undefined;
-    const target_path = tempPath(&target_buf);
+    var target_path_tmp = try TestDirectory.init("db");
+    defer target_path_tmp.cleanup();
+    const target_path = target_path_tmp.path().ptr;
     defer cleanupTempDir(target_path);
     var portable = std.ArrayList(u8).empty;
     defer portable.deinit(alloc);
@@ -66950,8 +67041,9 @@ test "db failed portable rollback fences live access until reopen recovery" {
 
 test "db open preserves a committed portable generation when marker cleanup was interrupted" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     {
@@ -66997,8 +67089,9 @@ test "db portable restore rejects documents without identity coverage" {
     defer portable.deinit(alloc);
     try portable_backup.exportPortable(alloc, &source, &portable);
 
-    var target_buf: [256]u8 = undefined;
-    const target_path = tempPath(&target_buf);
+    var target_path_tmp = try TestDirectory.init("db");
+    defer target_path_tmp.cleanup();
+    const target_path = target_path_tmp.path().ptr;
     defer cleanupTempDir(target_path);
     var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false });
     defer target.close();
@@ -67013,11 +67106,13 @@ test "db portable restore rejects documents without identity coverage" {
 
 test "db portable restore rejects target with residual identity tombstones" {
     const alloc = std.testing.allocator;
-    var source_buf: [256]u8 = undefined;
-    const source_path = tempPath(&source_buf);
+    var source_path_tmp = try TestDirectory.init("db");
+    defer source_path_tmp.cleanup();
+    const source_path = source_path_tmp.path().ptr;
     defer cleanupTempDir(source_path);
-    var target_buf: [256]u8 = undefined;
-    const target_path = tempPath(&target_buf);
+    var target_path_tmp = try TestDirectory.init("db");
+    defer target_path_tmp.cleanup();
+    const target_path = target_path_tmp.path().ptr;
     defer cleanupTempDir(target_path);
     var portable = std.ArrayList(u8).empty;
     defer portable.deinit(alloc);
@@ -67119,8 +67214,9 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
     var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
     defer resources.deinit(alloc);
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .start_optional_runtimes = false });
@@ -67201,8 +67297,9 @@ test "db rejects relational storage mode transitions and physical row reinterpre
     const columns = [_]schema_mod.RelationalColumn{.{ .name = "title", .path = "title", .column_type = .string, .required = true }};
     const relational_schema = schema_mod.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
 
-    var relational_path_buf: [256]u8 = undefined;
-    const relational_path = tempPath(&relational_path_buf);
+    var relational_path_tmp = try TestDirectory.init("db");
+    defer relational_path_tmp.cleanup();
+    const relational_path = relational_path_tmp.path().ptr;
     defer cleanupTempDir(relational_path);
     {
         var db = try DB.open(alloc, std.mem.span(relational_path), .{});
@@ -67217,8 +67314,9 @@ test "db rejects relational storage mode transitions and physical row reinterpre
         }));
     }
 
-    var document_path_buf: [256]u8 = undefined;
-    const document_path = tempPath(&document_path_buf);
+    var document_path_tmp = try TestDirectory.init("db");
+    defer document_path_tmp.cleanup();
+    const document_path = document_path_tmp.path().ptr;
     defer cleanupTempDir(document_path);
     {
         var db = try DB.open(alloc, std.mem.span(document_path), .{});
@@ -67230,8 +67328,9 @@ test "db rejects relational storage mode transitions and physical row reinterpre
 
 test "legacy schema reconciliation persists catalog data-presence state atomically" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -90316,14 +90415,17 @@ test "storage.ha synchronous waits pipeline later commits by lsn" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.heap.c_allocator;
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -90424,14 +90526,17 @@ test "storage.ha synchronous waits pipeline later commits by lsn" {
 test "storage.ha durable outbox recovery does not duplicate an appended batch" {
     const alloc = std.testing.allocator;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -90504,8 +90609,9 @@ test "storage.ha durable outbox recovery does not duplicate an appended batch" {
 
 test "storage.ha durable outbox cleanup is mutation scoped" {
     const alloc = std.testing.allocator;
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
     var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
     defer db.close();
@@ -91469,14 +91575,17 @@ test "storage.ha schema wait failure reports unknown after durable local commit"
         \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
     ;
 
-    var db_path_buf: [256]u8 = undefined;
-    const db_path = tempPath(&db_path_buf);
+    var db_path_tmp = try TestDirectory.init("db");
+    defer db_path_tmp.cleanup();
+    const db_path = db_path_tmp.path().ptr;
     defer cleanupTempDir(db_path);
-    var ha_log_path_buf: [256]u8 = undefined;
-    const ha_log_path = tempPath(&ha_log_path_buf);
+    var ha_log_path_tmp = try TestDirectory.init("db");
+    defer ha_log_path_tmp.cleanup();
+    const ha_log_path = ha_log_path_tmp.path().ptr;
     defer cleanupTempDir(ha_log_path);
-    var ha_slots_path_buf: [256]u8 = undefined;
-    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    var ha_slots_path_tmp = try TestDirectory.init("db");
+    defer ha_slots_path_tmp.cleanup();
+    const ha_slots_path = ha_slots_path_tmp.path().ptr;
     defer cleanupTempDir(ha_slots_path);
 
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
@@ -112773,8 +112882,9 @@ test "db batch resolves transforms against pending same-batch writes" {
 
 test "transform preparation fences durable bases before commit" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -120162,8 +120272,9 @@ test "db scan returns hashes and projected documents" {
 test "db scan visitor streams projected rows and propagates backpressure errors" {
     const alloc = std.testing.allocator;
 
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -120195,8 +120306,9 @@ test "db scan visitor streams projected rows and propagates backpressure errors"
 
 test "db scan releases its snapshot promptly on cancellation and deadline" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
