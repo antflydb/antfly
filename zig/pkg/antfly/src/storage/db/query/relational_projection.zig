@@ -16,10 +16,13 @@ const std = @import("std");
 const codec = @import("../algebraic/relational_row_codec.zig");
 const schema = @import("../../schema.zig");
 const document_query = @import("../document_query.zig");
+const JsonView = @import("json_view.zig").View;
 
 /// Positive field selections compiled against one immutable layout. Nested
 /// paths reuse document projection semantics, but decode only selected columns.
 pub const Plan = struct {
+    pub const Source = union(enum) { logical: std.json.Value, json: *JsonView };
+    pub const Sources = std.StringArrayHashMapUnmanaged(Source);
     base: codec.OrdinalProjectionPlan,
     arena: std.heap.ArenaAllocator,
     paths: []const []const []const u8 = &.{},
@@ -72,20 +75,52 @@ pub const Plan = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var source = std.json.ObjectMap.empty;
+        var source = Sources.empty;
         for (self.base.ordinals) |ordinal| {
             const cell = (try row.findCell(ordinal)) orelse continue;
-            try source.put(scratch, row.table_schema.relational_columns[ordinal].name, try row.materializeCellAlloc(scratch, cell));
+            const value: Source = if (cell.is_json and !cell.is_null) blk: {
+                const view = try scratch.create(JsonView);
+                view.* = .init(scratch, cell.value.bytes_val);
+                break :blk .{ .json = view };
+            } else .{ .logical = try row.materializeCellAlloc(scratch, cell) };
+            try source.put(scratch, row.table_schema.relational_columns[ordinal].name, value);
         }
-        return self.projectObject(alloc, scratch, source);
+        return self.projectSources(alloc, scratch, source);
     }
 
-    /// The column reader supplies only the already-bound root ordinals.
-    pub fn projectObject(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: std.json.ObjectMap) ![]u8 {
-        if (self.paths.len == 0) return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = source }, .{});
-        var result = std.json.Value{ .object = std.json.ObjectMap.empty };
-        for (self.paths) |parts| try document_query.applyIncludePath(scratch, source, &result.object, parts);
-        return try std.json.Stringify.valueAlloc(alloc, result, .{});
+    pub fn projectSources(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources) ![]u8 {
+        var result = std.json.ObjectMap.empty;
+        if (self.paths.len == 0) {
+            var output = std.Io.Writer.Allocating.init(alloc);
+            defer output.deinit();
+            output.writer.writeByte('{') catch return error.OutOfMemory;
+            // Sources are inserted in projection ordinal order.
+            for (source.keys(), source.values(), 0..) |name, value, i| {
+                if (i != 0) output.writer.writeByte(',') catch return error.OutOfMemory;
+                std.json.Stringify.value(name, .{}, &output.writer) catch return error.OutOfMemory;
+                output.writer.writeByte(':') catch return error.OutOfMemory;
+                switch (value) {
+                    .logical => |logical| std.json.Stringify.value(logical, .{}, &output.writer) catch return error.OutOfMemory,
+                    // Whole JSON columns are already canonical API values.
+                    // Emit their bytes without constructing a throwaway DOM.
+                    .json => |view| output.writer.writeAll(view.root.raw) catch return error.OutOfMemory,
+                }
+            }
+            output.writer.writeByte('}') catch return error.OutOfMemory;
+            return output.toOwnedSlice();
+        } else for (self.paths) |parts| {
+            if (parts.len == 0) continue;
+            const value = source.get(parts[0]) orelse continue;
+            switch (value) {
+                .json => |view| try view.include(scratch, &result, parts[0], parts[1..]),
+                .logical => |logical| {
+                    var object = std.json.ObjectMap.empty;
+                    try object.put(scratch, parts[0], logical);
+                    try document_query.applyIncludePath(scratch, object, &result, parts);
+                },
+            }
+        }
+        return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = result }, .{});
     }
 };
 

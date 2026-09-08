@@ -635,7 +635,7 @@ pub const PreparedRelationalWrite = struct {
 
     pub fn requireLogicalRoot(self: *PreparedRelationalWrite) !void {
         const source = self.extracted.logical_source orelse return;
-        var iterator = relational_row_codec.OrdinalCellIterator{ .parsed = source.row.parsed, .table_schema = source.row.table_schema };
+        var iterator = try source.row.cellIterator();
         while (try iterator.next()) |cell| try self.requireLogicalField(source.row.table_schema.relational_columns[cell.ordinal].name);
     }
 

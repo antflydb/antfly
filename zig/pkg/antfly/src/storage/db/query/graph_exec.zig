@@ -32,6 +32,7 @@ const rfc3339 = @import("../../../common/rfc3339.zig");
 const doc_set = @import("../doc_set.zig");
 const pathfact_mod = @import("../algebraic/pathfact.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
+const JsonView = @import("json_view.zig").View;
 const runtime_schema = @import("../../schema.zig");
 
 const graph_document_hydration_batch_size: usize = 4096;
@@ -2779,6 +2780,35 @@ test "prepared pattern filters preserve dense vector logical array semantics" {
     try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &allocating, row });
 }
 
+test "prepared pattern filters preserve document numeric semantics in lazy ordinal cells" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true }};
+    const table = runtime_schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, table);
+    defer layout.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"fraction\":0.10000000000000001,\"large\":1e21,\"integer\":9007199254740993}", .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const canonical = try @import("../document_content_hash.zig").canonicalJsonValueAlloc(alloc, parsed.value);
+    defer alloc.free(canonical);
+    const cells = [_]relational_row_codec.Cell{.{ .ordinal = 0, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = canonical } }};
+    const encoded = try relational_row_codec.serializeOrdinal(alloc, 1, &columns, &cells, @splat(0));
+    defer alloc.free(encoded);
+    const row = try relational_row_codec.ordinalRowView(encoded, table, &layout);
+    const full = try row.reconstructValueAlloc(alloc);
+    defer alloc.free(full);
+    for ([_][]const u8{
+        "{\"term\":{\"payload.fraction\":0.1}}",
+        "{\"term\":{\"payload.large\":1e21}}",
+        "{\"term\":{\"payload.integer\":9007199254740993}}",
+        "{\"term\":{\"/payload/fraction\":0.10000000000000001}}",
+    }) |query| {
+        var filter = try PreparedPatternFilter.init(alloc, query);
+        defer filter.deinit();
+        try std.testing.expect(try filter.matchesStored(alloc, "a", full));
+        try std.testing.expect((try filter.matchesOrdinal(alloc, "a", row)).?);
+    }
+}
+
 test "prepared pattern filters evaluate scalar and nested ordinal cells" {
     const alloc = std.testing.allocator;
     const columns = [_]runtime_schema.RelationalColumn{
@@ -3187,6 +3217,17 @@ const OrdinalEvaluation = struct {
     parsed_json_cells: std.AutoHashMapUnmanaged(usize, std.json.Parsed(std.json.Value)) = .empty,
     logical_arena: ?std.heap.ArenaAllocator = null,
     logical_cells: std.AutoHashMapUnmanaged(usize, std.json.Value) = .empty,
+    json_views: std.AutoHashMapUnmanaged(usize, *JsonView) = .empty,
+
+    fn jsonView(self: *@This(), cell: relational_row_codec.Cell) !*JsonView {
+        if (self.json_views.get(cell.ordinal)) |view| return view;
+        if (self.logical_arena == null) self.logical_arena = std.heap.ArenaAllocator.init(self.alloc);
+        const arena = self.logical_arena.?.allocator();
+        const view = try arena.create(JsonView);
+        view.* = .init(arena, cell.value.bytes_val);
+        try self.json_views.put(arena, cell.ordinal, view);
+        return view;
+    }
 
     fn deinit(self: *@This()) void {
         var values = self.parsed_json_cells.valueIterator();
@@ -3296,6 +3337,13 @@ fn matcherMatchesOrdinal(
             },
             else => {},
         }
+    }
+
+    if (cell.is_json and path.remaining.len != 0) {
+        const view = try evaluation.jsonView(cell);
+        var values = std.ArrayListUnmanaged(std.json.Value).empty;
+        try view.collect(path.remaining, path.pointer, &values);
+        return try matcher.predicate.matches(alloc, values.items);
     }
 
     var number_buf: [64]u8 = undefined;

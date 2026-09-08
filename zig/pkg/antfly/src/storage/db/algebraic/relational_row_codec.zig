@@ -59,7 +59,11 @@ const ordinal_write_timestamp_offset: usize = ordinal_semantic_hash_offset + sem
 const ordinal_header_len: usize = ordinal_write_timestamp_offset + @sizeOf(u64);
 const checksum_len: usize = @sizeOf(u32);
 const capability_sparse_slots: u32 = 1;
-const known_ordinal_capabilities: u32 = capability_sparse_slots;
+const capability_checksum_groups: u32 = 2;
+const known_ordinal_capabilities: u32 = capability_sparse_slots | capability_checksum_groups;
+const checksum_group_bytes: usize = 4096;
+const checksum_group_threshold: usize = 64 * 1024;
+const checksum_group_footer_len: usize = @sizeOf(u64) + checksum_len;
 const sparse_entry_len: usize = @sizeOf(u32) * 2; // ordinal + payload start
 const sparse_null_flag: u32 = 1 << 31;
 const sparse_ordinal_mask: u32 = ~sparse_null_flag;
@@ -362,11 +366,18 @@ fn serializeOrdinalInternal(
     // making canonical re-encoding deterministic across processes.
     const dense_storage_len = try serializedLenAdd(bitmap_sections_len, dense_body_len);
     const sparse = sparse_body_len < dense_storage_len;
-    const capabilities: u32 = if (sparse) capability_sparse_slots else 0;
-    const total_len = try serializedLenAdd(
-        ordinal_header_len + checksum_len,
+    const body_len = try serializedLenAdd(
+        ordinal_header_len,
         if (sparse) sparse_body_len else dense_storage_len,
     );
+    const grouped = body_len >= checksum_group_threshold;
+    const capabilities: u32 = (if (sparse) capability_sparse_slots else @as(u32, 0)) |
+        (if (grouped) capability_checksum_groups else @as(u32, 0));
+    const trailer_len = if (grouped)
+        try serializedLenAdd(try std.math.mul(usize, checksumGroupCount(body_len), checksum_len), checksum_group_footer_len)
+    else
+        checksum_len;
+    const total_len = try serializedLenAdd(body_len, trailer_len);
     const out = try alloc.alloc(u8, total_len);
     errdefer alloc.free(out);
     var pos: usize = 0;
@@ -456,10 +467,63 @@ fn serializeOrdinalInternal(
         }
         std.debug.assert(fixed_pos == fixed_len and variable_index == variable_count and variable_pos == variable_payload_len);
     }
-    const checksum = if (finalize_checksum) std.hash.Crc32.hash(out[0..pos]) else 0;
-    writeU32(out, &pos, checksum);
-    std.debug.assert(pos == out.len);
+    std.debug.assert(pos == body_len);
+    @memset(out[pos..], 0);
+    if (grouped) std.mem.writeInt(u64, out[out.len - checksum_group_footer_len ..][0..8], body_len, .little);
+    if (finalize_checksum) try finalizeOrdinalChecksum(out);
     return out;
+}
+
+fn checksumGroupCount(body_len: usize) usize {
+    return body_len / checksum_group_bytes + @intFromBool(body_len % checksum_group_bytes != 0);
+}
+
+/// Large rows append one CRC per 4 KiB body group, then body length and a CRC
+/// over that directory. Authenticating the directory and selected groups is
+/// sufficient for projection; full reads/scrubbing verify every group. Small
+/// rows retain one CRC with no directory or extra space/CPU overhead.
+const ChecksumGroups = struct {
+    body: []const u8,
+    directory: []const u8,
+
+    fn init(value: []const u8, verify_directory: bool) !?@This() {
+        if (value.len < ordinal_header_len + checksum_len) return error.InvalidRelationalRow;
+        if (std.mem.readInt(u32, value[12..16], .little) & capability_checksum_groups == 0) return null;
+        if (value.len < ordinal_header_len + checksum_group_footer_len) return error.InvalidRelationalRow;
+        const body_len = std.math.cast(usize, std.mem.readInt(u64, value[value.len - checksum_group_footer_len ..][0..8], .little)) orelse return error.InvalidRelationalRow;
+        if (body_len < checksum_group_threshold or body_len > value.len - checksum_group_footer_len) return error.InvalidRelationalRow;
+        const directory = value[body_len .. value.len - checksum_group_footer_len];
+        if (directory.len / checksum_len != checksumGroupCount(body_len) or directory.len % checksum_len != 0) return error.InvalidRelationalRow;
+        if (verify_directory and std.hash.Crc32.hash(value[body_len .. value.len - checksum_len]) != std.mem.readInt(u32, value[value.len - checksum_len ..][0..4], .little)) return error.RelationalRowChecksumMismatch;
+        return .{ .body = value[0..body_len], .directory = directory };
+    }
+
+    fn verify(self: @This(), start: usize, end: usize) !void {
+        if (start > end or end > self.body.len) return error.InvalidRelationalRow;
+        if (start == end) return;
+        for (start / checksum_group_bytes..checksumGroupCount(end)) |i| {
+            const offset = i * checksum_group_bytes;
+            const bytes = self.body[offset..][0..@min(checksum_group_bytes, self.body.len - offset)];
+            if (std.hash.Crc32.hash(bytes) != std.mem.readInt(u32, self.directory[i * checksum_len ..][0..4], .little)) return error.RelationalRowChecksumMismatch;
+        }
+    }
+};
+
+fn verifyOrdinalChecksum(value: []const u8) !void {
+    if (try ChecksumGroups.init(value, true)) |groups| return groups.verify(0, groups.body.len);
+    const stored = std.mem.readInt(u32, value[value.len - checksum_len ..][0..4], .little);
+    if (std.hash.Crc32.hash(value[0 .. value.len - checksum_len]) != stored) return error.RelationalRowChecksumMismatch;
+}
+
+fn finalizeOrdinalChecksum(value: []u8) !void {
+    if (try ChecksumGroups.init(value, false)) |groups| {
+        for (0..checksumGroupCount(groups.body.len)) |i| {
+            const offset = i * checksum_group_bytes;
+            const bytes = groups.body[offset..][0..@min(checksum_group_bytes, groups.body.len - offset)];
+            std.mem.writeInt(u32, value[groups.body.len + i * checksum_len ..][0..4], std.hash.Crc32.hash(bytes), .little);
+        }
+        std.mem.writeInt(u32, value[value.len - checksum_len ..][0..4], std.hash.Crc32.hash(value[groups.body.len .. value.len - checksum_len]), .little);
+    } else std.mem.writeInt(u32, value[value.len - checksum_len ..][0..4], std.hash.Crc32.hash(value[0 .. value.len - checksum_len]), .little);
 }
 
 pub fn rowSchemaVersion(value: []const u8) !u32 {
@@ -477,9 +541,7 @@ pub fn rowSchemaVersion(value: []const u8) !u32 {
 /// damaged row, not mistake an intact digest header for intact payload bytes.
 pub fn rowSemanticHash(value: []const u8) ![semantic_hash_len]u8 {
     const digest = try rowSemanticHashTrusted(value);
-    const stored_checksum = std.mem.readInt(u32, value[value.len - checksum_len ..][0..checksum_len], .little);
-    if (std.hash.Crc32.hash(value[0 .. value.len - checksum_len]) != stored_checksum)
-        return error.RelationalRowChecksumMismatch;
+    try verifyOrdinalChecksum(value);
     return digest;
 }
 
@@ -504,9 +566,7 @@ pub fn rowSemanticHashTrusted(value: []const u8) ![semantic_hash_len]u8 {
 /// authenticates the complete physical row before exposing system metadata.
 pub fn rowWriteTimestampNs(value: []const u8) !u64 {
     const timestamp = try rowWriteTimestampNsTrusted(value);
-    const stored_checksum = std.mem.readInt(u32, value[value.len - checksum_len ..][0..checksum_len], .little);
-    if (std.hash.Crc32.hash(value[0 .. value.len - checksum_len]) != stored_checksum)
-        return error.RelationalRowChecksumMismatch;
+    try verifyOrdinalChecksum(value);
     return timestamp;
 }
 
@@ -541,8 +601,7 @@ pub fn finalizeOrdinalMetadata(
     if (readU32(value, &pos) & ~known_ordinal_capabilities != 0) return error.UnsupportedRelationalRowVersion;
     @memcpy(value[ordinal_semantic_hash_offset..][0..semantic_hash_len], &digest);
     std.mem.writeInt(u64, value[ordinal_write_timestamp_offset..][0..@sizeOf(u64)], timestamp_ns, .little);
-    const checksum = std.hash.Crc32.hash(value[0 .. value.len - checksum_len]);
-    std.mem.writeInt(u32, value[value.len - checksum_len ..][0..checksum_len], checksum, .little);
+    try finalizeOrdinalChecksum(value);
 }
 
 /// Install request-resolved system metadata after preparation. This remains
@@ -1121,6 +1180,8 @@ pub const OrdinalRowView = struct {
     table_schema: runtime_schema.TableSchema,
     layout: *const PhysicalLayout,
     payloads_validated: bool = false,
+    checksum_groups: ?ChecksumGroups = null,
+    verified_prefix: usize = 0,
 
     pub fn ordinalForName(self: OrdinalRowView, name: []const u8) ?usize {
         return self.layout.ordinalForName(self.table_schema.relational_columns, name);
@@ -1128,6 +1189,15 @@ pub const OrdinalRowView = struct {
 
     pub fn findCell(self: OrdinalRowView, ordinal: usize) !?Cell {
         if (ordinal >= self.table_schema.relational_columns.len) return null;
+        if (self.checksum_groups) |groups| {
+            if (!parsedHasOrdinal(self.parsed, ordinal)) return null;
+            const payload = try ordinalPayloadSliceChecked(self.parsed, self.table_schema.relational_columns[ordinal], ordinal);
+            if (payload.len != 0) {
+                const start = @intFromPtr(payload.ptr) - @intFromPtr(groups.body.ptr);
+                const end = start + payload.len;
+                if (end > self.verified_prefix) try groups.verify(@max(start, self.verified_prefix), end);
+            }
+        }
         return try findParsedOrdinalCellWithValidation(self.parsed, self.table_schema.relational_columns, ordinal, !self.payloads_validated);
     }
 
@@ -1146,14 +1216,37 @@ pub const OrdinalRowView = struct {
     }
 
     pub fn reconstructValueAlloc(self: OrdinalRowView, alloc: Allocator) ![]u8 {
+        if (self.checksum_groups) |groups| try groups.verify(0, groups.body.len);
         return try reconstructParsedOrdinalValueAlloc(alloc, self.parsed, self.table_schema);
     }
 
     pub fn materializeRootAlloc(self: OrdinalRowView, alloc: Allocator) !MaterializedOrdinalRoot {
+        if (self.checksum_groups) |groups| try groups.verify(0, groups.body.len);
         return try materializeParsedOrdinalRootAlloc(alloc, self.parsed, self.table_schema);
     }
 
+    /// Whole-row consumers must not construct an iterator from `parsed` and
+    /// accidentally discard a selective view's deferred integrity checks.
+    pub fn cellIterator(self: OrdinalRowView) !OrdinalCellIterator {
+        if (self.checksum_groups) |groups| try groups.verify(0, groups.body.len);
+        return .{ .parsed = self.parsed, .table_schema = self.table_schema };
+    }
+
     pub fn projectAlloc(self: OrdinalRowView, alloc: Allocator, plan: OrdinalProjectionPlan) ![]u8 {
+        if (self.checksum_groups != null) {
+            if (plan.schema_version != self.table_schema.version) return error.RelationalRowSchemaMismatch;
+            var output = std.ArrayListUnmanaged(u8).empty;
+            errdefer output.deinit(alloc);
+            try output.append(alloc, '{');
+            var comma = false;
+            for (plan.ordinals) |ordinal| {
+                const cell = (try self.findCell(ordinal)) orelse continue;
+                try appendValidatedCellValue(alloc, &output, cell, comma);
+                comma = true;
+            }
+            try output.append(alloc, '}');
+            return output.toOwnedSlice(alloc);
+        }
         return try projectParsedOrdinalPlanAlloc(alloc, self.parsed, self.table_schema, plan);
     }
 };
@@ -1167,6 +1260,50 @@ pub fn ordinalRowView(
         .parsed = try parseOrdinalWithLayoutRead(value, table_schema, layout),
         .table_schema = table_schema,
         .layout = layout,
+    };
+}
+
+/// A read view over canonical stored rows without backend authentication.
+/// Metadata is authenticated eagerly; each addressed value verifies its own
+/// body groups before decoding. Full materialization still verifies all groups.
+/// The view retains the checks, so using a different projection cannot bypass
+/// integrity. Ingestion/restore must continue to use strict canonical validation.
+pub fn ordinalRowViewSelective(
+    value: []const u8,
+    table_schema: runtime_schema.TableSchema,
+    layout: *const PhysicalLayout,
+) !OrdinalRowView {
+    if (layout.schema_version != table_schema.version or layout.column_count != table_schema.relational_columns.len) return error.RelationalRowSchemaMismatch;
+    const groups = (try ChecksumGroups.init(value, true)) orelse return ordinalRowView(value, table_schema, layout);
+    try groups.verify(0, ordinal_header_len);
+    const sparse = std.mem.readInt(u32, value[12..16], .little) & capability_sparse_slots != 0;
+    const metadata_len = if (sparse) blk: {
+        const entries = std.mem.readInt(u32, value[ordinal_header_len..][0..4], .little);
+        if (entries > table_schema.relational_columns.len) return error.InvalidRelationalRow;
+        break :blk try serializedLenAdd(ordinal_header_len + 8, try std.math.mul(usize, entries, sparse_entry_len));
+    } else blk: {
+        const bitmap_end = try serializedLenAdd(ordinal_header_len, try std.math.mul(usize, layout.bitmap_len, 2));
+        if (layout.variable_count != 0) {
+            const offset_start = try serializedLenAdd(bitmap_end, layout.fixed_len);
+            const offset_end = try serializedLenAdd(offset_start, try std.math.mul(usize, layout.variable_count + 1, 4));
+            try groups.verify(offset_start, offset_end);
+        }
+        // Fixed-width values are data, not metadata. In a very wide row,
+        // checking the offset table must not authenticate all intervening
+        // fixed slots; findCell verifies only the selected slots' groups.
+        break :blk bitmap_end;
+    };
+    if (metadata_len > groups.body.len) return error.InvalidRelationalRow;
+    if (metadata_len > checksum_group_bytes) try groups.verify(checksum_group_bytes, metadata_len);
+    const remainder = metadata_len % checksum_group_bytes;
+    const verified_prefix = metadata_len + @min(if (remainder == 0) 0 else checksum_group_bytes - remainder, groups.body.len - metadata_len);
+    return .{
+        .parsed = try parseOrdinalInternal(value, table_schema, layout, false, false),
+        .table_schema = table_schema,
+        .layout = layout,
+        .payloads_validated = true,
+        .checksum_groups = groups,
+        .verified_prefix = verified_prefix,
     };
 }
 
@@ -1217,17 +1354,19 @@ fn parseOrdinalWithLayoutRead(
 }
 
 fn parseOrdinalInternal(
-    value: []const u8,
+    encoded: []const u8,
     table_schema: runtime_schema.TableSchema,
     layout: ?*const PhysicalLayout,
     verify_checksum: bool,
     canonical: bool,
 ) !ParsedOrdinal {
-    if (value.len < ordinal_header_len + checksum_len or !looksLikeRow(value)) return error.InvalidRelationalRow;
-    if (verify_checksum) {
-        const stored_checksum = std.mem.readInt(u32, value[value.len - checksum_len ..][0..checksum_len], .little);
-        if (std.hash.Crc32.hash(value[0 .. value.len - checksum_len]) != stored_checksum) return error.RelationalRowChecksumMismatch;
-    }
+    if (encoded.len < ordinal_header_len + checksum_len or !looksLikeRow(encoded)) return error.InvalidRelationalRow;
+    if (verify_checksum) try verifyOrdinalChecksum(encoded);
+    const groups = try ChecksumGroups.init(encoded, false);
+    // Strip the integrity envelope once. All body offsets and payload bounds
+    // below exclude checksum words, regardless of the physical envelope shape.
+    const value = if (groups) |grouped| grouped.body else encoded[0 .. encoded.len - checksum_len];
+    if (canonical and (value.len >= checksum_group_threshold) != (groups != null)) return error.NonCanonicalRelationalRow;
     var pos: usize = magic.len;
     if (readU32(value, &pos) != ordinal_version) return error.UnsupportedRelationalRowVersion;
     if (readU32(value, &pos) != table_schema.version) return error.RelationalRowSchemaMismatch;
@@ -1252,7 +1391,7 @@ fn parseOrdinalInternal(
     var nulls: []const u8 = &.{};
     if (!sparse) {
         const bitmap_sections_len = std.math.mul(usize, 2, bitmap_len) catch return error.InvalidRelationalRow;
-        if (bitmap_sections_len > value.len - checksum_len -| pos) return error.InvalidRelationalRow;
+        if (bitmap_sections_len > value.len -| pos) return error.InvalidRelationalRow;
         present = value[pos..][0..bitmap_len];
         pos += bitmap_len;
         nulls = value[pos..][0..bitmap_len];
@@ -1267,16 +1406,16 @@ fn parseOrdinalInternal(
     }
     var parsed: ParsedOrdinal = undefined;
     if (sparse) {
-        if (@sizeOf(u32) * 2 > value.len - checksum_len -| pos) return error.InvalidRelationalRow;
+        if (@sizeOf(u32) * 2 > value.len -| pos) return error.InvalidRelationalRow;
         const entry_count: usize = readU32(value, &pos);
         if (entry_count > table_schema.relational_columns.len) return error.InvalidRelationalRow;
         const entries_len = std.math.mul(usize, entry_count, sparse_entry_len) catch return error.InvalidRelationalRow;
         const directory_len = std.math.add(usize, entries_len, @sizeOf(u32)) catch return error.InvalidRelationalRow;
-        if (directory_len > value.len - checksum_len -| pos) return error.InvalidRelationalRow;
+        if (directory_len > value.len -| pos) return error.InvalidRelationalRow;
         const entries_start = pos;
         const terminal_offset_pos = pos + entries_len;
         pos += directory_len;
-        const payload = value[pos .. value.len - checksum_len];
+        const payload = value[pos..];
         const terminal_offset = std.mem.readInt(u32, value[terminal_offset_pos..][0..4], .little);
         if (terminal_offset != payload.len) return error.InvalidRelationalRow;
         if (verify_checksum or canonical) {
@@ -1332,8 +1471,8 @@ fn parseOrdinalInternal(
         const fixed_start = pos;
         const offsets_start = std.math.add(usize, fixed_start, fixed_len) catch return error.InvalidRelationalRow;
         const payload_start = std.math.add(usize, offsets_start, offsets_len) catch return error.InvalidRelationalRow;
-        if (payload_start > value.len - checksum_len) return error.InvalidRelationalRow;
-        const payload_len = value.len - checksum_len - payload_start;
+        if (payload_start > value.len) return error.InvalidRelationalRow;
+        const payload_len = value.len - payload_start;
         if (canonical) {
             if (variable_count == 0) {
                 if (payload_len != 0) return error.InvalidRelationalRow;
@@ -2085,6 +2224,131 @@ fn readU64(data: []const u8, pos: *usize) u64 {
     const val = std.mem.readInt(u64, data[pos.*..][0..8], .little);
     pos.* += 8;
     return val;
+}
+
+test "ordinal grouped integrity verifies selected values and full reads with canonical envelopes" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "n", .path = "n", .column_type = .integer },
+        .{ .name = "wide", .path = "wide", .column_type = .string },
+        .{ .name = "tail", .path = "tail", .column_type = .string },
+    };
+    const table = runtime_schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try PhysicalLayout.init(alloc, table);
+    defer layout.deinit();
+    const wide = try alloc.alloc(u8, 128 * 1024);
+    defer alloc.free(wide);
+    @memset(wide, 'x');
+    const cells = [_]Cell{
+        .{ .ordinal = 0, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 7 } },
+        .{ .ordinal = 1, .path = "wide", .value_type = .bytes_val, .value = .{ .bytes_val = wide } },
+        .{ .ordinal = 2, .path = "tail", .value_type = .bytes_val, .value = .{ .bytes_val = "last" } },
+    };
+    const raw = try serializeOrdinal(alloc, 1, &columns, &cells, @splat(42));
+    defer alloc.free(raw);
+    try std.testing.expect((try ChecksumGroups.init(raw, true)) != null);
+    try validateOrdinalWithLayout(raw, table, &layout);
+    try setOrdinalWriteTimestampNs(raw, 1234);
+    try std.testing.expectEqual(@as(u64, 1234), try rowWriteTimestampNs(raw));
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(42))), &(try rowSemanticHash(raw)));
+    var narrow = try OrdinalProjectionPlan.init(alloc, table, &layout, &.{ "n", "tail" });
+    defer narrow.deinit();
+    var broad = try OrdinalProjectionPlan.init(alloc, table, &layout, &.{"wide"});
+    defer broad.deinit();
+    const corrupted = try alloc.dupe(u8, raw);
+    defer alloc.free(corrupted);
+    corrupted[checksum_group_bytes * 2] ^= 1;
+    const row = try ordinalRowViewSelective(corrupted, table, &layout);
+    const selected = try row.projectAlloc(alloc, narrow);
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings("{\"n\":7,\"tail\":\"last\"}", selected);
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, row.findCell(1));
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, row.projectAlloc(alloc, broad));
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, row.reconstructValueAlloc(alloc));
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, row.materializeRootAlloc(alloc));
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, row.cellIterator());
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, rowSemanticHash(corrupted));
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, validateOrdinalWithLayout(corrupted, table, &layout));
+    @memcpy(corrupted, raw);
+    corrupted[ordinal_write_timestamp_offset] ^= 1;
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, ordinalRowViewSelective(corrupted, table, &layout));
+    @memcpy(corrupted, raw);
+    const groups = (try ChecksumGroups.init(raw, true)).?;
+    corrupted[groups.body.len + 8] ^= 1;
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, ordinalRowViewSelective(corrupted, table, &layout));
+    @memcpy(corrupted, raw);
+    std.mem.writeInt(u64, corrupted[corrupted.len - checksum_group_footer_len ..][0..8], std.math.maxInt(u64), .little);
+    try std.testing.expectError(error.InvalidRelationalRow, ordinalRowViewSelective(corrupted, table, &layout));
+}
+
+test "ordinal checksum groups are canonical across thresholds and sparse layouts" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 1, 128 }) |width| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const columns = try scratch.alloc(runtime_schema.RelationalColumn, width);
+        for (columns, 0..) |*column, i| {
+            const name = try std.fmt.allocPrint(scratch, "c{d}", .{i});
+            column.* = .{ .name = name, .path = name, .column_type = .string };
+        }
+        const table = runtime_schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = columns };
+        var layout = try PhysicalLayout.init(alloc, table);
+        defer layout.deinit();
+        for ([_]usize{ 65400, 65469, 65470, 65535, 65536 }) |size| {
+            const payload = try scratch.alloc(u8, size);
+            @memset(payload, 'x');
+            const cells = [_]Cell{.{ .ordinal = @intCast(width - 1), .path = columns[width - 1].path, .value_type = .bytes_val, .value = .{ .bytes_val = payload } }};
+            const raw = try serializeOrdinal(alloc, 1, columns, &cells, @splat(0));
+            defer alloc.free(raw);
+            try validateOrdinalWithLayout(raw, table, &layout);
+            const groups = try ChecksumGroups.init(raw, true);
+            const body_size = if (width == 1) ordinal_header_len + 2 + 8 + size else ordinal_header_len + 4 + sparse_entry_len + 4 + size;
+            try std.testing.expectEqual(body_size >= checksum_group_threshold, groups != null);
+            const row = try ordinalRowViewSelective(raw, table, &layout);
+            try std.testing.expectEqualStrings(payload, (try row.findCell(width - 1)).?.value.bytes_val);
+            if (width > 1) try std.testing.expect((try row.findCell(0)) == null);
+            var plan = try OrdinalProjectionPlan.init(alloc, table, &layout, &.{columns[width - 1].name});
+            defer plan.deinit();
+            const projected = try row.projectAlloc(alloc, plan);
+            defer alloc.free(projected);
+            const strict = try ordinalRowView(raw, table, &layout);
+            const expected = try strict.projectAlloc(alloc, plan);
+            defer alloc.free(expected);
+            try std.testing.expectEqualStrings(expected, projected);
+        }
+    }
+}
+
+test "ordinal checksum groups skip unrelated fixed slots but verify distant offsets" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const columns = try scratch.alloc(runtime_schema.RelationalColumn, 8192);
+    const cells = try scratch.alloc(Cell, columns.len);
+    for (columns, cells, 0..) |*column, *cell, i| {
+        const name = try std.fmt.allocPrint(scratch, "c{d}", .{i});
+        const last = i == columns.len - 1;
+        column.* = .{ .name = name, .path = name, .column_type = if (last) .string else .integer };
+        cell.* = .{ .ordinal = @intCast(i), .path = name, .value_type = if (last) .bytes_val else .i64_val, .value = if (last) .{ .bytes_val = "tail" } else .{ .i64_val = @intCast(i) } };
+    }
+    const table = runtime_schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = columns };
+    var layout = try PhysicalLayout.init(alloc, table);
+    defer layout.deinit();
+    const raw = try serializeOrdinal(alloc, 1, columns, cells, @splat(0));
+    defer alloc.free(raw);
+    try validateOrdinalWithLayout(raw, table, &layout);
+    const corrupted = try alloc.dupe(u8, raw);
+    defer alloc.free(corrupted);
+    const fixed_start = ordinal_header_len + 2 * layout.bitmap_len;
+    corrupted[fixed_start + 1000 * 8] ^= 1;
+    const row = try ordinalRowViewSelective(corrupted, table, &layout);
+    try std.testing.expectEqual(@as(i64, 0), (try row.findCell(0)).?.value.i64_val);
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, row.findCell(1000));
+    @memcpy(corrupted, raw);
+    corrupted[fixed_start + layout.fixed_len] ^= 1;
+    try std.testing.expectError(error.RelationalRowChecksumMismatch, ordinalRowViewSelective(corrupted, table, &layout));
 }
 
 test "ordinal rows bind layout support projection checksum and canonical bytes" {

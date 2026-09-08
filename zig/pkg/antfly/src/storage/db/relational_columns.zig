@@ -28,6 +28,8 @@ const payloads = @import("column_payloads.zig");
 const read_cache = @import("column_read_cache.zig");
 const scan_plan = @import("column_scan_plan.zig");
 const graph = @import("query/graph_exec.zig");
+const JsonView = @import("query/json_view.zig").View;
+const ProjectionPlan = @import("query/relational_projection.zig").Plan;
 const types = @import("types.zig");
 const platform_time = @import("antfly_platform").time;
 const alloc_type = std.mem.Allocator;
@@ -836,7 +838,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             const scratch = self.arena.allocator();
             const id: u32 = @intCast(self.rows.items.len);
             try self.rows.append(scratch, .{ .key = (try keys.decodeStoredDocumentRowKeyAlloc(scratch, key)) orelse return error.InvalidColumnSegment, .hash = row.semanticHash(), .timestamp = row.writeTimestampNs(), .physical_bytes = value.len });
-            var cells = codec.OrdinalCellIterator{ .parsed = row.parsed, .table_schema = row.table_schema };
+            var cells = try row.cellIterator();
             while (try cells.next()) |cell| try self.addCell(id, cell);
             self.bytes +|= value.len;
             self.prepared_bytes +|= value.len;
@@ -1018,6 +1020,10 @@ pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !boo
             initial_locked = false;
             if (try drainCleanup(db, alloc, manifest.generation, namespace)) return true;
             if (try drainGarbage(db, alloc, namespace)) return true;
+            // Drain retired roots before producing more. Publication retires
+            // at most eight roots, so the durable backlog cannot grow without
+            // bound under churn, even for extremely wide schemas.
+            if (try drainRetired(db, alloc, manifest.generation, namespace)) return true;
             // Old-generation reclamation must not hold new coverage hostage
             // to a table-sized GC backlog. Abandoned current staging is still
             // reclaimed before another quantum can reuse its build namespace.
@@ -1245,29 +1251,14 @@ fn blockVersion(read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u6
     return std.mem.readInt(u32, meta[4..8], .little);
 }
 
-fn retireBlock(txn: *store_mod.DocStore.Txn, read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, block: u64) !void {
-    const key = try blockKey(alloc, generation, block, null);
-    var decoder = Decoder{ .bytes = try verified(try read.get(key)) };
-    _ = try decoder.take(8);
-    const rows = try decoder.int(u32);
-    const count = try decoder.int(u32);
-    _ = try decoder.int(u64);
-    for (0..count) |_| {
-        const page = try decoder.int(u32);
-        var mask = try decoder.int(u64);
-        if (page > std.math.maxInt(u32) / 64) return error.InvalidColumnSegment;
-        while (mask != 0) {
-            const ordinal = page * 64 + @as(u32, @intCast(@ctz(mask)));
-            mask &= mask - 1;
-            const metadata_key = try columnMetaKey(alloc, generation, block, ordinal);
-            const pages = try ColumnPages.init(try verified(try read.get(metadata_key)), rows);
-            for (0..pages.count()) |payload_page| if (pages.size(payload_page) != 0) {
-                try payloads.release(txn, alloc, generation, pages.reference(payload_page).digest);
-            };
-            try txn.delete(metadata_key);
-        }
-    }
-    try txn.delete(key);
+fn retireBlock(txn: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, block: u64) !void {
+    // Directory removal and this intent commit atomically. Payload ownership
+    // remains intact until bounded GC deletes each column's metadata and
+    // releases its references in the same transaction. Readers use MVCC.
+    const key = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:retired:{x:0>16}", .{ prefix, generation, block });
+    var identity: [8]u8 = undefined;
+    std.mem.writeInt(u64, &identity, block, .little);
+    try txn.put(key, try checked(alloc, &identity));
     const defer_key = try deferredKey(alloc, generation, block);
     const encoded = txn.get(defer_key) catch |err| switch (err) {
         error.NotFound => null,
@@ -1996,7 +1987,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
                 break;
             }
         }
-        try retireBlock(&publish, &read, scratch, manifest.generation, old_range.block);
+        try retireBlock(&publish, scratch, manifest.generation, old_range.block);
     }
     for (builder.directory.items) |entry| try publish.put(entry.key, entry.value);
     for (builder.candidates.items) |entry| {
@@ -2051,13 +2042,13 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
 fn prunePrefix(db: anytype, alloc: alloc_type, lower: []const u8, namespace: u64, generation: u64) !bool {
     const upper = (try keys.nextPrefixAlloc(alloc, lower)) orelse return error.InvalidColumnSegment;
     defer alloc.free(upper);
-    return pruneRange(db, alloc, lower, upper, namespace, generation);
+    return pruneRange(db, alloc, lower, upper, namespace, generation, null);
 }
 
 fn prune(db: anytype, alloc: alloc_type, generation: u64, namespace: u64) !bool {
     const upper = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:", .{ prefix, generation });
     defer alloc.free(upper);
-    return pruneRange(db, alloc, prefix, upper, namespace, null);
+    return pruneRange(db, alloc, prefix, upper, namespace, null, null);
 }
 
 fn drainGarbage(db: anytype, alloc: alloc_type, namespace: u64) !bool {
@@ -2082,9 +2073,62 @@ fn drainGarbage(db: anytype, alloc: alloc_type, namespace: u64) !bool {
     return true;
 }
 
+fn drainRetired(db: anytype, alloc: alloc_type, generation: u64, namespace: u64) !bool {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const lower = try std.fmt.allocPrint(scratch, "{s}{x:0>16}:retired:", .{ prefix, generation });
+    const upper = (try keys.nextPrefixAlloc(scratch, lower)).?;
+    const First = struct {
+        alloc: alloc_type,
+        key: ?[]const u8 = null,
+        value: []const u8 = "",
+        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.key = try self.alloc.dupe(u8, key);
+            self.value = try self.alloc.dupe(u8, value);
+            return .stop;
+        }
+    };
+    var first = First{ .alloc = scratch };
+    try db.core.store.scanWithContext(lower, upper, .{}, &first, First.visit);
+    const key = first.key orelse return false;
+    const body = try verified(first.value);
+    if (body.len != 8) return error.InvalidColumnSegment;
+    const block = std.mem.readInt(u64, body[0..8], .little);
+    const expected = try std.fmt.allocPrint(scratch, "{s}{x:0>16}", .{ lower, block });
+    if (!std.mem.eql(u8, key, expected)) return error.InvalidColumnSegment;
+    const retired_prefix = try std.fmt.allocPrint(scratch, "{s}{x:0>16}:{x:0>16}:", .{ prefix, generation, block });
+    const retired_upper = (try keys.nextPrefixAlloc(scratch, retired_prefix)).?;
+    // Complete the durable intent with the final metadata page, not in a
+    // separate empty maintenance turn for every small retired root.
+    return pruneRange(db, alloc, retired_prefix, retired_upper, namespace, generation, .{ .key = key, .value = first.value });
+}
+
+pub fn retiredRootsForTest(db: anytype, alloc: alloc_type) !usize {
+    const raw = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(raw);
+    const manifest = try Manifest.decode(raw);
+    const lower = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:retired:", .{ prefix, manifest.generation });
+    defer alloc.free(lower);
+    const upper = (try keys.nextPrefixAlloc(alloc, lower)).?;
+    defer alloc.free(upper);
+    const Counter = struct {
+        count: usize = 0,
+        fn visit(ptr: ?*anyopaque, _: []const u8, _: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.count += 1;
+            return .@"continue";
+        }
+    };
+    var counter = Counter{};
+    try db.core.store.scanWithContext(lower, upper, .{}, &counter, Counter.visit);
+    return counter.count;
+}
+
 /// Deletion itself is the durable GC cursor. At most one page is collected and
 /// committed; the next turn seeks directly to the first remaining record.
-fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const u8, namespace: u64, release_generation: ?u64) !bool {
+fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const u8, namespace: u64, release_generation: ?u64, completion: ?store_mod.KVPair) !bool {
     const Pruner = struct {
         db: @TypeOf(db),
         namespace: u64,
@@ -2092,10 +2136,12 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
         deletes: std.ArrayListUnmanaged([]const u8) = .empty,
         references: std.ArrayListUnmanaged([32]u8) = .empty,
         release_generation: ?u64,
+        completion: ?store_mod.KVPair,
+        exhausted: bool = true,
         bytes: usize = 0,
         deleted: usize = 0,
         fn flush(self: *@This()) !void {
-            if (self.deletes.items.len == 0) return;
+            if (self.deletes.items.len == 0 and self.completion == null) return;
             self.db.core.lockApplyShared();
             defer self.db.core.unlockApplyShared();
             if (self.namespace != self.db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -2104,6 +2150,9 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
             defer if (live) txn.abort();
             if (self.release_generation) |generation| for (self.references.items) |digest| try payloads.release(&txn, self.arena.allocator(), generation, digest);
             for (self.deletes.items) |key| try txn.delete(key);
+            if (self.exhausted) if (self.completion) |intent| {
+                if (try sameValue(&txn, intent.key, intent.value)) try txn.delete(intent.key);
+            };
             try txn.commit();
             live = false;
             self.deleted += self.deletes.items.len;
@@ -2115,6 +2164,10 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (self.db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
             const scratch = self.arena.allocator();
+            if (self.deletes.items.len != 0 and self.bytes +| key.len +| value.len > maintenance_bytes) {
+                self.exhausted = false;
+                return .stop;
+            }
             const tag = prefix.len + 16 + 1 + 16 + 1;
             if (self.release_generation != null and key.len == tag + 9 and key[tag] == 'p') {
                 const meta = try verified(value);
@@ -2122,20 +2175,34 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
                 if (meta.len < offset + 46 or (meta.len - offset) % 46 != 0) return error.InvalidColumnSegment;
                 const rows = std.mem.readInt(u16, meta[meta.len - 46 ..][0..2], .little);
                 const pages = try ColumnPages.init(meta, rows);
+                var references: usize = 0;
+                for (0..pages.count()) |page| if (pages.size(page) != 0) {
+                    references += 1;
+                };
+                // One column's ownership is indivisible. Allow that single
+                // record (at most max_rows references), but never add another
+                // record that would push the quantum beyond its operation cap.
+                if (self.deletes.items.len != 0 and self.deletes.items.len + 1 + 2 * (self.references.items.len + references) > maintenance_records) {
+                    self.exhausted = false;
+                    return .stop;
+                }
                 for (0..pages.count()) |page| if (pages.size(page) != 0) try self.references.append(scratch, pages.reference(page).digest);
             }
             try self.deletes.append(scratch, try scratch.dupe(u8, key));
-            self.bytes +|= key.len;
-            if (self.deletes.items.len + self.references.items.len >= maintenance_records or self.bytes >= maintenance_bytes) return .stop;
+            self.bytes +|= key.len +| value.len;
+            if (self.deletes.items.len + 2 * self.references.items.len >= maintenance_records or self.bytes >= maintenance_bytes) {
+                self.exhausted = false;
+                return .stop;
+            }
             return .@"continue";
         }
     };
-    var pruner = Pruner{ .db = db, .arena = std.heap.ArenaAllocator.init(alloc), .namespace = namespace, .release_generation = release_generation };
+    var pruner = Pruner{ .db = db, .arena = std.heap.ArenaAllocator.init(alloc), .namespace = namespace, .release_generation = release_generation, .completion = completion };
     defer pruner.arena.deinit();
     try db.core.store.scanWithContext(lower, upper, .{}, &pruner, Pruner.visit);
     try pruner.flush();
     _ = db.relational_column_maintenance.gc_records_deleted.fetchAdd(pruner.deleted, .monotonic);
-    return pruner.deleted != 0;
+    return pruner.deleted != 0 or completion != null;
 }
 
 const Decoder = struct {
@@ -2241,6 +2308,7 @@ const Block = struct {
         loaded_pages: std.StaticBitSet(max_rows) = .initEmpty(),
         read_payload: bool = false,
         logical: ?[]?std.json.Value = null,
+        json_views: ?[]?*JsonView = null,
 
         fn logicalSlots(self: *@This(), alloc: alloc_type, rows: usize) ![]?std.json.Value {
             if (self.logical == null) {
@@ -2377,12 +2445,38 @@ const Block = struct {
         column_view.loaded_pages.set(page);
     }
 
+    fn jsonView(self: *@This(), ordinal: u32, row: usize) !?*JsonView {
+        const column_view = try self.column(ordinal);
+        if (!column_view.present(row) or column_view.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return null;
+        if (column_view.json_views == null) {
+            const slots = try self.alloc.alloc(?*JsonView, self.rows.len);
+            @memset(slots, null);
+            column_view.json_views = slots;
+        }
+        const slot = &column_view.json_views.?[row];
+        if (slot.*) |cached| return cached;
+        const cells_view = try self.initCells(ordinal);
+        if (cells_view[row] == null) try self.loadPage(ordinal, column_view.pages.?.containing(row));
+        const cell = cells_view[row] orelse return error.InvalidColumnSegment;
+        const view = try self.alloc.create(JsonView);
+        view.* = .init(self.alloc, cell.value.bytes_val);
+        slot.* = view;
+        return view;
+    }
+
     fn logicalValue(self: *@This(), ordinal: u32, row: usize) !?std.json.Value {
         const value = try self.column(ordinal);
         if (!value.present(row)) return null;
         // Nulls are already represented in metadata; even a projected null
         // needs no decoded cells or materialized-value cache.
         if (value.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return .null;
+        if (self.table.relational_columns[ordinal].is_json) {
+            const view = (try self.jsonView(ordinal, row)).?;
+            const before = view.materialized_values;
+            const logical = try view.materialize(&view.root);
+            if (self.stats) |stats| stats.values_materialized += view.materialized_values - before;
+            return logical;
+        }
         const had_slots = value.logical != null;
         const logical_slots = try value.logicalSlots(self.alloc, self.rows.len);
         if (!had_slots) if (self.stats) |stats| {
@@ -2440,7 +2534,16 @@ const Block = struct {
                         var scratch = std.heap.ArenaAllocator.init(self.alloc);
                         defer scratch.deinit();
                         var values = std.ArrayListUnmanaged(std.json.Value).empty;
-                        if (try self.logicalValue(ordinal, i)) |logical| try path.collectValues(scratch.allocator(), logical, &values);
+                        if (self.table.relational_columns[ordinal].is_json) {
+                            if (try self.jsonView(ordinal, i)) |view| {
+                                const before = view.materialized_values;
+                                try view.collect(switch (path) {
+                                    .dotted, .json_pointer => |parts| parts,
+                                    .single => unreachable,
+                                }, path == .json_pointer, &values);
+                                if (self.stats) |stats| stats.values_materialized += view.materialized_values - before;
+                            }
+                        } else if (try self.logicalValue(ordinal, i)) |logical| try path.collectValues(scratch.allocator(), logical, &values);
                         matched.* = try matcher.predicate.matches(scratch.allocator(), values.items);
                     }
                     return;
@@ -2806,11 +2909,18 @@ pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: 
                 const row_alloc = row_arena.allocator();
                 if (opts.include_documents) {
                     if (schema_plan.projected) |projection| {
-                        var object = std.json.ObjectMap.empty;
+                        var object = ProjectionPlan.Sources.empty;
                         for (projection.base.ordinals) |ordinal| {
-                            if (try block.logicalValue(ordinal, i)) |value| try object.put(row_alloc, block.table.relational_columns[ordinal].name, value);
+                            const name = block.table.relational_columns[ordinal].name;
+                            if (block.table.relational_columns[ordinal].is_json) {
+                                if (try block.jsonView(ordinal, i)) |json_view| {
+                                    try object.put(row_alloc, name, .{ .json = json_view });
+                                    continue;
+                                }
+                            }
+                            if (try block.logicalValue(ordinal, i)) |value| try object.put(row_alloc, name, .{ .logical = value });
                         }
-                        projected = try projection.projectObject(row_alloc, row_alloc, object);
+                        projected = try projection.projectSources(row_alloc, row_alloc, object);
                     } else {
                         var primary_scope = try txn.openReadScope(row_alloc);
                         defer primary_scope.close();

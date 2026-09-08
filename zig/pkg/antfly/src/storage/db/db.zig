@@ -20250,8 +20250,15 @@ pub const DB = struct {
         defer if (schema_view) |*view| view.release();
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        const raw = try self.core.getStoreValue(alloc, store_key) orelse return null;
-        defer alloc.free(raw);
+        // Keep the probe's borrowed value pinned through projection. A full
+        // runtime snapshot would clone mutable state for a one-key lookup;
+        // an owned get would copy every unselected byte of a wide row.
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        const raw = probe.get(store_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
         const relational = internal_keys.isRelationalRowKey(store_key);
         var historical_schema_view: ?schema_registry_mod.SchemaView = null;
         defer if (historical_schema_view) |*view| view.release();
@@ -20277,7 +20284,7 @@ pub const DB = struct {
                     row_schema.physicalLayout(),
                 )
             else
-                try relational_row_codec.ordinalRowView(
+                try relational_row_codec.ordinalRowViewSelective(
                     raw,
                     row_schema.tableSchema().*,
                     row_schema.physicalLayout(),
@@ -63886,6 +63893,42 @@ fn seedColumnScanPlanTest(db: *DB, alloc: Allocator) !void {
     try drainTestRelationalMaintenance(db);
 }
 
+test "relational columnar JSON numeric predicates preserve document semantics" {
+    const alloc = std.testing.allocator;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = "{\"payload\":0.10000000000000001}" },
+            .{ .key = "b", .value = "{\"payload\":{\"n\":0.10000000000000001}}" },
+            .{ .key = "c", .value = "{\"payload\":{\"n\":9007199254740993}}" },
+        } });
+        try drainTestRelationalMaintenance(&db);
+        for ([_][]const u8{
+            "{\"term\":{\"payload\":0.1}}",
+            "{\"term\":{\"payload.n\":0.1}}",
+            "{\"term\":{\"/payload/n\":9007199254740993}}",
+        }) |query| {
+            var stats: types.ColumnarScanStats = .{};
+            var opts = types.ScanOptions{ .include_documents = true, .include_all_fields = false, .fields = &.{"payload"}, .filter_query_json = query, .columnar_stats = &stats };
+            var actual = try db.scan(alloc, "", "", opts);
+            defer actual.deinit(alloc);
+            try std.testing.expect(stats.used);
+            try std.testing.expectEqual(@as(usize, 1), actual.documents.len);
+            opts.disable_columnar_scan = true;
+            opts.columnar_stats = null;
+            var expected = try db.scan(alloc, "", "", opts);
+            defer expected.deinit(alloc);
+            try std.testing.expectEqualDeep(expected.documents, actual.documents);
+        }
+    }
+}
+
 test "relational columnar bound selection and late projection match primary semantics" {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
@@ -64150,6 +64193,72 @@ test "relational columnar bound scan benchmark" {
     }
 }
 
+test "relational point projection lease benchmark" {
+    const alloc = std.testing.allocator;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{
+            .{ .name = "n", .path = "n", .column_type = .integer },
+            .{ .name = "wide", .path = "wide", .column_type = .string },
+        };
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        const wide = try alloc.alloc(u8, 1024 * 1024);
+        defer alloc.free(wide);
+        @memset(wide, 'x');
+        const json = try std.fmt.allocPrint(alloc, "{{\"n\":7,\"wide\":\"{s}\"}}", .{wide});
+        defer alloc.free(json);
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = json }} });
+        // Measure the public API allocation, including schema and plan setup.
+        var measured = std.testing.FailingAllocator.init(alloc, .{});
+        const result = (try db.lookup(measured.allocator(), "a", .{ .fields = &.{"n"}, .include_all_fields = false })).?;
+        try std.testing.expectEqualStrings("{\"n\":7}", result.json);
+        measured.allocator().free(result.json);
+        try std.testing.expect(measured.allocated_bytes < 64 * 1024);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        const key = try internal_keys.relationalRowKeyAlloc(alloc, "a");
+        defer alloc.free(key);
+        var projection = try RelationalProjectionPlan.init(alloc, view.tableSchema().*, view.physicalLayout(), &.{"n"});
+        defer projection.deinit();
+        var samples: [4][7]u64 = undefined;
+        // Same warmed store probe and compiled projection in all modes. The
+        // fourth mode isolates the upper bound of finer-grained authentication;
+        // bypassing LMDB integrity is diagnostic only, never a production path.
+        for (0..8) |round| for (0..4) |step| {
+            const mode = (round + step) % 4;
+            const start = platform_time.monotonicNs();
+            for (0..64) |_| {
+                var probe = try db.core.store.beginProbeTxn();
+                defer probe.abort();
+                const borrowed = try probe.get(key);
+                const owned = if (mode == 0) try alloc.dupe(u8, borrowed) else null;
+                defer if (owned) |bytes| alloc.free(bytes);
+                const raw = owned orelse borrowed;
+                const row = if (mode == 3 or db.core.store.valuesAreAuthenticated())
+                    try relational_row_codec.ordinalRowViewTrusted(raw, view.tableSchema().*, view.physicalLayout())
+                else if (mode == 2)
+                    try relational_row_codec.ordinalRowViewSelective(raw, view.tableSchema().*, view.physicalLayout())
+                else
+                    try relational_row_codec.ordinalRowView(raw, view.tableSchema().*, view.physicalLayout());
+                const projected = try projection.project(alloc, row);
+                defer alloc.free(projected);
+                try std.testing.expectEqualStrings("{\"n\":7}", projected);
+            }
+            if (round != 0) samples[mode][round - 1] = platform_time.monotonicNs() - start;
+        };
+        for (&samples) |*sample| std.mem.sort(u64, sample, {}, std.sort.asc(u64));
+        std.debug.print("\npoint projection 1MiB/64 probes: backend={s}, copied ns={d}, leased ns={d}, grouped ns={d}, authenticated diagnostic ns={d}, API allocated bytes={d}\n", .{
+            @tagName(backend), samples[0][3], samples[1][3], samples[2][3], samples[3][3], measured.allocated_bytes,
+        });
+    }
+}
+
 test "relational columnar dense nested predicate benchmark" {
     const alloc = std.testing.allocator;
     relational_columns.test_disable_deadline = true;
@@ -64396,7 +64505,14 @@ test "relational columnar coalescing progresses while a distant range stays hot"
     try Hot.run(&db);
     relational_columns.test_before_publish = .{ .context = &db, .run = Hot.run };
     defer relational_columns.test_before_publish = null;
-    for (0..16) |_| _ = try db.rebuildRelationalColumns();
+    // Retirement is now its own bounded quantum. Compare the same number of
+    // publications while also bounding the intervening reclamation work.
+    var turns: usize = 0;
+    while (db.relational_column_maintenance.ranges_compacted.load(.monotonic) < 16) {
+        _ = try db.rebuildRelationalColumns();
+        turns += 1;
+        try std.testing.expect(turns < 160);
+    }
     var stats: types.ColumnarScanStats = .{};
     var cold = try db.scan(alloc, "", "k0768", .{ .exclusive_to = true, .columnar_stats = &stats });
     defer cold.deinit(alloc);
@@ -64638,18 +64754,72 @@ test "relational columnar obsolete generation GC is bounded and resumes after re
     try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} });
     try drainTestRelationalMaintenance(&db);
+    const already_deleted = db.relational_column_maintenance.gc_records_deleted.load(.monotonic);
     for (0..260) |i| {
         const key = try std.fmt.allocPrint(alloc, "\x00\x00__columnar__:blocks:0000000000000000:{d:0>4}", .{i});
         defer alloc.free(key);
         try db.core.store.put(key, "obsolete");
     }
     try std.testing.expect(try db.rebuildRelationalColumns());
-    try std.testing.expectEqual(@as(u64, 256), db.relational_column_maintenance.gc_records_deleted.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 256), db.relational_column_maintenance.gc_records_deleted.load(.monotonic) - already_deleted);
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     try drainTestRelationalMaintenance(&db);
     try std.testing.expectEqual(@as(u64, 4), db.relational_column_maintenance.gc_records_deleted.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), db.relational_column_maintenance.blocks_written.load(.monotonic));
+}
+
+test "relational columnar wide retirement is bounded durable and backpressures publication" {
+    const alloc = std.testing.allocator;
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const columns = try scratch.alloc(schema_mod.RelationalColumn, 600);
+        var object = std.json.ObjectMap.empty;
+        for (columns, 0..) |*column, i| {
+            const name = try std.fmt.allocPrint(scratch, "c{d:0>3}", .{i});
+            column.* = .{ .name = name, .path = name, .column_type = .integer };
+            try object.put(scratch, name, .{ .integer = 1 });
+        }
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = columns });
+        const first = try std.json.Stringify.valueAlloc(scratch, std.json.Value{ .object = object }, .{});
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = first }} });
+        try drainTestRelationalMaintenance(&db);
+        try object.put(scratch, "c000", .{ .integer = 2 });
+        const second = try std.json.Stringify.valueAlloc(scratch, std.json.Value{ .object = object }, .{});
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = second }} });
+        const before = db.relational_column_maintenance.gc_records_deleted.load(.monotonic);
+        try std.testing.expect(try db.rebuildRelationalColumns());
+        // Publication does no per-column retirement work at all.
+        try std.testing.expectEqual(before, db.relational_column_maintenance.gc_records_deleted.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 1), try relational_columns.retiredRootsForTest(&db, alloc));
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        const published = db.relational_column_maintenance.blocks_written.load(.monotonic);
+        try db.batch(.{ .writes = &.{.{ .key = "b", .value = first }} });
+        try std.testing.expect(try db.rebuildRelationalColumns());
+        try std.testing.expect(db.relational_column_maintenance.gc_records_deleted.load(.monotonic) - before <= 256);
+        try std.testing.expectEqual(published, db.relational_column_maintenance.blocks_written.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 1), try relational_columns.retiredRootsForTest(&db, alloc));
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        db.close();
+        db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        try drainTestRelationalMaintenance(&db);
+        try std.testing.expectEqual(@as(usize, 0), try relational_columns.retiredRootsForTest(&db, alloc));
+        try relational_columns.validatePayloadOwnershipForTest(&db, alloc);
+        var result = try db.scan(alloc, "", "", .{ .include_documents = true, .include_all_fields = false, .fields = &.{"c000"} });
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), result.documents.len);
+        try std.testing.expectEqualStrings("{\"c000\":2}", result.documents[0].json);
+        try std.testing.expectEqualStrings("{\"c000\":1}", result.documents[1].json);
+    }
 }
 
 test "relational columnar maintenance survives unrelated artifact corruption and backoff" {
@@ -65077,6 +65247,9 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
             owner.artifact_repair_metadata_stop.store(true, .release);
         }
     };
+    // Reach the next publication boundary before injecting cancellation;
+    // retirement-only quanta intentionally never call the publication hook.
+    while (try relational_columns.retiredRootsForTest(&db, alloc) != 0) try std.testing.expect(try db.rebuildRelationalColumns());
     relational_columns.test_before_publish = .{ .context = &db, .run = Cancel.run };
     try std.testing.expectError(error.Canceled, db.rebuildRelationalColumns());
     relational_columns.test_before_publish = null;

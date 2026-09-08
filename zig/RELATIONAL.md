@@ -74,6 +74,25 @@ directory whose ordinal word carries the null bit for wide sparse schemas. The
 sparse representation has no schema-width section. Both support direct
 projection without reconstructing the whole document.
 
+Bodies of at least 64 KiB use the checksum-groups capability (bit 1): one
+little-endian CRC32 per 4 KiB body group, followed by the body length (`u64`)
+and a CRC32 of that directory including its length. The body still starts with
+the ordinary schema-bound AROW header; group boundaries are physical, not
+column boundaries. Smaller bodies retain their single trailing CRC32. This is
+a deterministic encoding choice, with approximately 0.1% large-row overhead.
+Finalization visits each body byte once, then checksums the small directory.
+No legacy encoding of this unreleased feature is required during restore.
+
+Point lookups pin their store probe until projection is complete, rather than
+copying the full row. On LMDB, large-row views check the directory and metadata
+groups before use and check each selected value's groups before decoding it.
+The view retains that obligation across different projections; full reads,
+semantic no-op verification, scrubbing, and restore check every group. Backend-
+authenticated LSM values do not need redundant AROW checks. CRC32 detects
+accidental corruption; it is not cryptographic tamper authentication. Unselected
+group damage is detected when that group is read or during full verification,
+not by an unrelated narrow projection.
+
 Segment-level typed columns remain a derived acceleration structure. They can
 be added for scans, predicates, sorts, and aggregations without changing point
 lookup, transaction, backup, or recovery semantics because the packed base row
@@ -382,8 +401,10 @@ the payload CRC independently checks physical integrity. Reads validate both.
 Block metadata owns durable reference counts and encoded sizes in separate
 checksummed small records, so
 retaining a page never rewrites its payload. Staging atomically retains all
-references with its column metadata; publication releases retired metadata's
-references, deleting payloads only when their final reference disappears.
+references with its column metadata; publication atomically removes old roots
+from the directory and enqueues durable retirement intents. Bounded maintenance
+releases retired metadata's references, deleting payloads only when their final
+reference disappears.
 Store MVCC preserves deleted payloads for already-pinned readers. Abandoned
 staging GC releases references in the same transaction that deletes its
 metadata. Old-generation GC can delete its entire namespace incrementally,
@@ -459,6 +480,34 @@ setup, compared with `b021b89de` before selection reuse/borrowed materialization
 | --- | ---: | ---: |
 | LMDB | 81.230 → 29.733 | 263,149,212 → 82,092,620 |
 | LSM | 78.278 → 31.151 | 275,850,442 → 102,463,108 |
+
+The subsequent lazy-JSON read path indexes only visited containers' raw child
+spans, caches requested scalar/subtree values, and shares navigation between
+column predicates and projection. Numeric array lookup caches only the requested
+position; whole selected JSON columns are emitted directly. Escaped object keys,
+exact number lexemes, dotted array fanout, JSON pointer indices, missing/null
+values, and ordered projection replacement retain their existing semantics.
+Navigation still scans skipped bytes; it avoids their DOM/string allocations,
+not the need to locate their boundaries. The same fixture measured 21.440/23.072
+ms and approximately 3.1 MB allocated on LMDB/LSM, versus 29.733/31.151 ms and
+82.1/102.5 MB immediately before this change. A deterministic allocation test
+projects a leaf and the last index of a 131,073-element array using 16 KiB of
+scratch, with no index allocation proportional to the array length.
+
+`--test-filter 'relational point projection lease benchmark'` alternates seven
+measured rounds after warmup on a 1 MiB row with one selected integer. It measures
+64 warmed store probes with the same compiled projection (milliseconds):
+
+| Backend | Copied + full verification | Leased + full verification | Leased + selected-group verification |
+| --- | ---: | ---: | ---: |
+| LMDB | 138.309 | 133.781 | 8.129 |
+| LSM | 11.604 | 7.609 | 7.665 |
+
+LSM already authenticates its values; its last two modes deliberately follow
+the same path. A separate integrity-bypassing **diagnostic only** measured
+6.216 ms on LMDB, motivating grouped checks rather than accepting the remaining
+full-row verification cost. Public `DB.lookup` allocation is 209 bytes on both
+backends; timing above isolates store/projection work, not request/network cost.
 
 All 512 primary owners are still read and checked; the already-evaluated
 predicate is reused, not run twice. Allocation totals are allocator traffic,
@@ -615,7 +664,14 @@ time target). Dirty-image capture is independently capped at 1,024 records or 25
 large delete bursts therefore yield even when there are no live output rows.
 Large insertion bursts split into bounded passes while the
 uncovered suffix retains its old block and dirty markers. Publication replaces
-the affected directory entries and retires old blocks atomically. Compare-and-
+the affected directory entries and enqueues old blocks for retirement atomically.
+The publication transaction performs no per-column retirement work. The durable
+retirement queue is drained before another compaction can publish, bounding the
+backlog to the at-most-eight roots removed by one publication. Each GC quantum
+deletes column metadata and releases its payload references transactionally;
+the last page also deletes the intent. This survives interruption/restart and
+backpressures derived compaction, not foreground mutations. Partial suffix roots
+remain live and are never retired prematurely. Compare-and-
 clear removes only dirty images represented by the published snapshot: a
 racing write keeps its marker. Checksummed cleanup pages are staged before
 publication; the directory and cleanup job become visible in one transaction.
@@ -693,8 +749,12 @@ starving later candidates. Only selected clean neighbors must be clean, not the
 whole table; reaching idle does not discard occupancy information.
 Later delete waves can merge with earlier underfilled neighbors. Coalescing
 uses compatible schema epochs, the same bounded builder and atomic directory
-publication as dirty compaction. GC deletes at most 256 records or 256 KiB of
-keys per quantum; revoked staging tokens remain in a durable garbage job until
+publication as dirty compaction. GC targets at most 256 operations or 256 KiB of
+key/value metadata per quantum, counting payload-reference release operations.
+A single store record can exceed the byte target. A column's metadata and
+references are also indivisible: that one record can exceed the operation
+target, but contains at most 256 references (513 key operations plus intent
+completion). Revoked staging tokens remain in a durable garbage job until
 their entire prefix is reclaimed. The deletion itself is the resumable cursor.
 
 Artifact metadata repair and column maintenance have independent failure and
