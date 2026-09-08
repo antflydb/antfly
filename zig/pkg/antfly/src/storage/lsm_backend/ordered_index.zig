@@ -214,6 +214,10 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
                     root.entry = entry.retainShared();
                 },
             }
+            return self.rebalance(allocator, root);
+        }
+
+        fn rebalance(self: *Self, allocator: std.mem.Allocator, root: *Node) *Node {
             root.refresh();
             const balance = @as(i16, depth(root.left)) - @as(i16, depth(root.right));
             if (balance > 1) {
@@ -233,6 +237,35 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
         /// here, so the ordered and hash indexes can publish atomically.
         pub fn putPrepared(self: *Self, allocator: std.mem.Allocator, entry: Entry) void {
             self.root = self.insert(allocator, self.root, entry);
+        }
+
+        fn remove(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry) ?*Node {
+            const root = self.unique(allocator, old orelse return null);
+            switch (compare(entry, root.entry)) {
+                .lt => root.left = self.remove(allocator, root.left, entry),
+                .gt => root.right = self.remove(allocator, root.right, entry),
+                .eq => {
+                    if (root.left == null or root.right == null) {
+                        const child = root.left orelse root.right;
+                        root.left = null;
+                        root.right = null;
+                        root.release(allocator);
+                        return child;
+                    }
+                    var successor = root.right.?;
+                    while (successor.left) |left| successor = left;
+                    const replacement = successor.entry.retainShared();
+                    root.entry.deinit(allocator);
+                    root.entry = replacement;
+                    root.right = self.remove(allocator, root.right, replacement);
+                },
+            }
+            return self.rebalance(allocator, root);
+        }
+
+        /// Like insertion, removal consumes only the nodes reserved by prepare.
+        pub fn removePrepared(self: *Self, allocator: std.mem.Allocator, entry: Entry) void {
+            self.root = self.remove(allocator, self.root, entry);
         }
     };
 }

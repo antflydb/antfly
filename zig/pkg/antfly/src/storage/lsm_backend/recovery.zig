@@ -226,6 +226,9 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
         compaction_mod.sortRuns(backend.runs.items);
         if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+        // Build cold metadata before publishing the opened backend. Subsequent
+        // writes maintain this root incrementally, including before first read.
+        if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();
         if (loaded_manifest and @hasDecl(BackendType, "cleanupOrphanedRunFilesForManifest")) {
             if (backend.cleanupOrphanedRunFilesForManifest()) |orphan_stats| {
                 if (orphan_stats.cleaned()) {
@@ -332,6 +335,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         backend.mutable_snapshot_reader_ref_by_state.deinit(backend.allocator);
     }
     if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
+    if (@hasDecl(BackendType, "destroyRunMetadata")) backend.destroyRunMetadata();
     for (backend.runs.items) |*run| {
         if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
         if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);

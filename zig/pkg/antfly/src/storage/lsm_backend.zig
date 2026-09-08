@@ -26,6 +26,7 @@ const lsm_table_file = @import("lsm/table_file.zig");
 const state_mod = @import("lsm_backend/state.zig");
 const repository_mod = @import("lsm_backend/repository.zig");
 const runtime_mod = @import("lsm_backend/runtime.zig");
+const RunDirectory = @import("lsm_backend/run_directory.zig").Directory;
 const compaction_mod = @import("lsm_backend/compaction.zig");
 const compaction_scheduler_mod = @import("lsm_backend/compaction_scheduler.zig");
 const background_runtime_mod = @import("background_runtime.zig");
@@ -628,6 +629,8 @@ pub const Backend = struct {
     const ReclaimingMemory = struct {
         states: ?*State,
         next: ?*ReclaimingMemory,
+        directories: ?*RunDirectory = null,
+        versions: ?*runtime_mod.ReadVersion = null,
     };
     pub var test_deep_mutable_snapshots: bool = false;
     pub const OpenPhase = enum {
@@ -1466,6 +1469,10 @@ pub const Backend = struct {
 
     allocator: Allocator,
     mu: std.atomic.Mutex = .unlocked,
+    // Only one reader prepares an epoch's shared projection. Wait outside mu
+    // so a cold-read fanout neither duplicates O(SSTs) work nor stalls writers.
+    read_version_build_mu: std.Io.Mutex = .init,
+    read_version_build_fallback_mu: std.atomic.Mutex = .unlocked,
     // Cached score used by best-effort maintenance scheduling and metrics.
     // A value of 1 can still mean "known debt, exact score not refreshed yet".
     cached_maintenance_hint: CounterU64 = .init(1),
@@ -1568,6 +1575,12 @@ pub const Backend = struct {
     recovery_replaying_wal: bool = false,
     runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty,
     read_version: ?*runtime_mod.ReadVersion = null,
+    run_directory: ?*RunDirectory = null,
+    run_directory_dirty: bool = true,
+    run_directory_generation: u64 = 0,
+    retired_run_directories: ?*RunDirectory = null,
+    retired_read_versions: ?*runtime_mod.ReadVersion = null,
+    live_read_versions: ?*runtime_mod.ReadVersion = null,
     retired_memory_head: ?*State = null,
     reclaiming_memory: ?*ReclaimingMemory = null,
     gc_maintenance_turn: u8 = 0,
@@ -2102,7 +2115,12 @@ pub const Backend = struct {
         };
         const obsolete_now_ns = self.nowNs();
         for (self.obsolete_paths.items) |obsolete| {
-            if (run_snapshot_refs.isRetained(obsolete.path)) {
+            // An open manifest independently pins the file even when its run
+            // directory also owns a shared metadata pin. Attribute that case
+            // to the manifest, not to a nonexistent active transaction.
+            if (obsolete_path_refs.isRetained(obsolete.path)) {
+                stats.obsolete_paths_pinned_by_versions +|= 1;
+            } else if (run_snapshot_refs.isRetained(obsolete.path)) {
                 stats.obsolete_paths_pinned_by_readers +|= 1;
                 for (self.active_readers_by_kind, 0..) |active, kind_index| {
                     if (active != 0) stats.obsolete_paths_pinned_by_reader_kind[kind_index] +|= 1;
@@ -2476,6 +2494,10 @@ pub const Backend = struct {
     fn estimateInMemoryStateBytesWithCandidateLocked(self: *const Backend, candidate: ?*const ActiveMemTable) u64 {
         const pass = state_mod.memory_account.nextPass();
         var bytes = self.mutable.accountedMemoryBytes(pass);
+        if (self.run_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
+        var live_version = self.live_read_versions;
+        while (live_version) |version| : (live_version = version.live_next) bytes +|= version.accountedMemoryBytes(pass);
+        bytes +|= runMetadataMemoryBytes(self.retired_run_directories, self.retired_read_versions, pass);
         if (self.domain_index) |index| bytes +|= index.memoryBytes();
         for (self.activeImmutableMemtables()) |state| {
             bytes +|= state.accountedMemoryBytes(pass);
@@ -2493,11 +2515,21 @@ pub const Backend = struct {
         while (retired) |state| : (retired = state.retired_next) bytes +|= state.accountedMemoryBytes(pass);
         var reclaiming = self.reclaiming_memory;
         while (reclaiming) |batch| : (reclaiming = batch.next) {
+            bytes +|= runMetadataMemoryBytes(batch.directories, batch.versions, pass);
             var state = batch.states;
             while (state) |pending| : (state = pending.retired_next) {
                 bytes +|= if (pending.account) |account| account.chargeOnce(pass) else pending.frozen_memory_bytes.?;
             }
         }
+        return bytes;
+    }
+
+    fn runMetadataMemoryBytes(directories: ?*RunDirectory, versions: ?*runtime_mod.ReadVersion, pass: u64) u64 {
+        var bytes: u64 = 0;
+        var directory = directories;
+        while (directory) |item| : (directory = item.retired_next) bytes +|= item.accountedMemoryBytes(pass);
+        var version = versions;
+        while (version) |item| : (version = item.retired_next) bytes +|= item.accountedMemoryBytes(pass);
         return bytes;
     }
 
@@ -2993,9 +3025,21 @@ pub const Backend = struct {
     /// large subtrees outside the writer lock. A lifecycle pin protects close.
     pub fn unlockWithReclamation(self: *Backend) void {
         var turns: usize = 0;
-        while (self.retired_memory_head != null and turns < 8) : (turns += 1) {
-            var batch = ReclaimingMemory{ .states = self.retired_memory_head, .next = self.reclaiming_memory };
+        while ((self.retired_memory_head != null or self.retired_run_directories != null or self.retired_read_versions != null) and turns < 8) : (turns += 1) {
+            var batch = ReclaimingMemory{ .states = self.retired_memory_head, .next = self.reclaiming_memory, .directories = self.retired_run_directories, .versions = self.retired_read_versions };
             self.retired_memory_head = null;
+            self.retired_run_directories = null;
+            self.retired_read_versions = null;
+            var directory = batch.directories;
+            while (directory) |item| : (directory = item.retired_next) {
+                if (item.tree.account) |account| _ = account.retain();
+            }
+            var version = batch.versions;
+            while (version) |item| : (version = item.retired_next) {
+                if (item.directory) |dir| if (dir.tree.account) |account| {
+                    _ = account.retain();
+                };
+            }
             // Keep accounting handles reachable even if another operation
             // replaces the live memtable while this batch is being reclaimed.
             var retired = batch.states;
@@ -3005,6 +3049,13 @@ pub const Backend = struct {
             self.reclaiming_memory = &batch;
             self.retainReaderKind(.other);
             self.mu.unlock();
+            directory = batch.directories;
+            while (directory) |item| : (directory = item.retired_next) {
+                var tree = item.tree;
+                tree.deinit(self.allocator);
+            }
+            version = batch.versions;
+            while (version) |item| : (version = item.retired_next) item.destroyContents(self);
             retired = batch.states;
             while (retired) |state| : (retired = state.retired_next) {
                 // Leave the small header immutable for concurrent accounting.
@@ -3015,13 +3066,30 @@ pub const Backend = struct {
             var link = &self.reclaiming_memory;
             while (link.*.? != &batch) link = &link.*.?.next;
             link.* = batch.next;
+            directory = batch.directories;
+            while (directory) |item| {
+                directory = item.retired_next;
+                if (item.tree.account) |account| account.release();
+                self.allocator.destroy(item);
+            }
+            version = batch.versions;
+            while (version) |item| {
+                version = item.retired_next;
+                if (item.directory) |dir| {
+                    if (dir.tree.account) |account| account.release();
+                    item.allocator.destroy(dir);
+                }
+                item.allocator.destroy(item);
+            }
             retired = batch.states;
             while (retired) |state| {
                 retired = state.retired_next;
                 if (state.account) |account| account.release();
                 self.allocator.destroy(state);
             }
-            self.releaseReaderKind(.other);
+            // File pins held by retired metadata have now been released. Run
+            // the usual reader-release checkpoint only after reclamation.
+            self.finalizeReadReaderReleaseKind(.other);
             self.syncTrackedInMemoryStateUsageCurrentLocked();
         }
         self.mu.unlock();
@@ -3781,8 +3849,12 @@ pub const Backend = struct {
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
         try self.reserveImmutableMemtableRetirement(state);
+        var directory = try self.prepareRunDirectoryChange(null, new_runs.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
         self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        self.publishRunDirectory(directory);
+        directory = null;
         self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
         self.retireImmutableMemtable(state);
@@ -3862,8 +3934,12 @@ pub const Backend = struct {
         // retirement, publication is allocation-free except for installing
         // the new run pointers themselves.
         try self.reserveImmutableMemtableRetirement(state);
+        var directory = try self.prepareRunDirectoryChange(null, build_result.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
         self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &build_result);
+        self.publishRunDirectory(directory);
+        directory = null;
         self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
         self.retireImmutableMemtable(state);
@@ -4026,8 +4102,12 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        var directory = try self.prepareRunDirectoryChange(null, new_runs.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
         self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        self.publishRunDirectory(directory);
+        directory = null;
 
         compaction_mod.sortRuns(self.runs.items);
         if (self.root_dir != null) {
@@ -4059,8 +4139,12 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        var directory = try self.prepareRunDirectoryChange(null, new_runs.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
         self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        self.publishRunDirectory(directory);
+        directory = null;
         self.unpublished_wal_logical_bytes +|= input_logical_bytes;
         self.unpublished_wal_max_batch_logical_bytes = @max(
             self.unpublished_wal_max_batch_logical_bytes,
@@ -4114,8 +4198,12 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
+        var directory = try self.prepareRunDirectoryChange(null, new_runs.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
         self.invalidateReadVersion();
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        self.publishRunDirectory(directory);
+        directory = null;
 
         compaction_mod.sortRuns(self.runs.items);
         if (self.bulkIngestActive() and self.writePressureDuringBulkIngestEnabled()) {
@@ -4602,11 +4690,153 @@ pub const Backend = struct {
     }
 
     pub fn invalidateReadVersion(self: *Backend) void {
+        self.run_directory_dirty = true;
+        self.run_directory_generation +%= 1;
         if (self.domain_index) |index| index.destroy(self.allocator);
         self.domain_index = null;
         const version = self.read_version orelse return;
         self.read_version = null;
         version.release(self);
+    }
+
+    pub fn retireReadVersion(self: *Backend, version: *runtime_mod.ReadVersion) void {
+        if (version.registered) {
+            var link = &self.live_read_versions;
+            while (link.* != version) link = &link.*.?.live_next;
+            link.* = version.live_next;
+            version.registered = false;
+        }
+        version.retired_next = self.retired_read_versions;
+        self.retired_read_versions = version;
+    }
+
+    pub fn destroyRunMetadata(self: *Backend) void {
+        if (self.run_directory) |directory| directory.destroy(self.allocator);
+        self.run_directory = null;
+        while (self.retired_run_directories) |directory| {
+            self.retired_run_directories = directory.retired_next;
+            directory.destroy(self.allocator);
+        }
+        while (self.retired_read_versions) |version| {
+            self.retired_read_versions = version.retired_next;
+            version.destroy(self);
+        }
+    }
+
+    fn retireRunDirectory(self: *Backend, directory: *RunDirectory) void {
+        directory.retired_next = self.retired_run_directories;
+        self.retired_run_directories = directory;
+    }
+
+    pub fn prepareRunDirectoryChange(self: *Backend, removed: ?compaction_mod.CompactionPlan, added: []const Run) !?*RunDirectory {
+        // Seed on the first SST publication even if the table has never been
+        // read. Otherwise write-only ingestion would defer a full rebuild to
+        // its first reader. Empty stores themselves need no directory charge.
+        if (self.run_directory_dirty and self.runs.items.len != 0) return null;
+        const prepared = if (self.runs.items.len == 0)
+            try RunDirectory.create(self.allocator)
+        else if (self.run_directory) |directory|
+            try directory.fork(self.allocator)
+        else
+            return null;
+        errdefer prepared.destroy(self.allocator);
+        if (removed) |plan| {
+            for (0..plan.source_len) |i| try prepared.remove(self.allocator, &self.runs.items[plan.sourceIndex(i)]);
+            for (0..plan.target_len) |i| try prepared.remove(self.allocator, &self.runs.items[plan.targetIndex(i)]);
+        }
+        for (added) |run| try prepared.put(self, run);
+        return prepared;
+    }
+
+    pub fn prepareRunDirectoryMove(self: *Backend, run_index: usize, level: u32) !?*RunDirectory {
+        if (self.run_directory_dirty) return null;
+        const directory = self.run_directory orelse return null;
+        const prepared = try directory.fork(self.allocator);
+        errdefer prepared.destroy(self.allocator);
+        var run = self.runs.items[run_index];
+        try prepared.remove(self.allocator, &run);
+        run.level = level;
+        try prepared.put(self, run);
+        return prepared;
+    }
+
+    pub fn publishRunDirectory(self: *Backend, prepared: ?*RunDirectory) void {
+        const directory = prepared orelse return;
+        if (self.run_directory) |old| self.retireRunDirectory(old);
+        self.run_directory = directory;
+        self.run_directory_dirty = false;
+    }
+
+    /// Cold initialization/full administrative rewrites rebuild once. Normal
+    /// flushes, compactions and level moves publish only their metadata delta.
+    fn ensureRunDirectory(self: *Backend) !void {
+        if (!self.run_directory_dirty) if (self.run_directory) |directory| {
+            if (directory.count() == self.runs.items.len) return;
+        };
+        const directory = try RunDirectory.create(self.allocator);
+        errdefer directory.destroy(self.allocator);
+        for (self.runs.items) |run| try directory.put(self, run);
+        self.publishRunDirectory(directory);
+    }
+
+    pub fn createReadVersionFromDirectory(self: *Backend) !*runtime_mod.ReadVersion {
+        if (self.read_version) |version| return version;
+        self.retainReaderKind(.other);
+        runtime_mod.unlockBackend(Backend, self, true);
+        const build_io: ?std.Io = if (comptime builtin.os.tag == .freestanding) null else if (self.options.read_runtime) |read_runtime| read_runtime.io else null;
+        if (build_io) |io| {
+            self.read_version_build_mu.lockUncancelable(io);
+        } else {
+            platform.sync.lockYielding(&self.read_version_build_fallback_mu);
+        }
+        _ = runtime_mod.lockBackend(Backend, self);
+        defer self.releaseReaderKind(.other);
+        defer if (build_io) |io| self.read_version_build_mu.unlock(io) else self.read_version_build_fallback_mu.unlock();
+        while (true) {
+            if (self.read_version) |version| return version;
+            try self.ensureRunDirectory();
+            const directory = try self.run_directory.?.fork(self.allocator);
+            const generation = self.run_directory_generation;
+            self.retainReaderKind(.other);
+            const build_started = self.readStatsNowNs();
+            runtime_mod.unlockBackend(Backend, self, true);
+            var reservation: ?resource_manager_mod.Reservation = null;
+            const built = blk: {
+                if (self.options.resource_manager) |manager| {
+                    reservation = manager.reserve(.lsm_in_memory_state, runtime_mod.ReadVersion.buildMemoryBound(directory.count())) catch |err| break :blk @as(anyerror!*runtime_mod.ReadVersion, err);
+                }
+                break :blk runtime_mod.ReadVersion.createFromDirectory(self.allocator, directory);
+            };
+            _ = runtime_mod.lockBackend(Backend, self);
+            defer if (reservation) |*lease| lease.release();
+            defer self.releaseReaderKind(.other);
+            const version = built catch |err| {
+                self.retireRunDirectory(directory);
+                return err;
+            };
+            self.recordRunGroupBuild(version.runs.len, if (version.levels.len != 0) version.levels[0].start_index else version.runs.len, self.readStatsElapsedNs(build_started));
+            if (self.read_version) |current| {
+                version.release(self);
+                return current;
+            }
+            if (generation != self.run_directory_generation) {
+                version.release(self);
+                continue;
+            }
+            self.read_version = version;
+            self.read_version_builds +|= 1;
+            version.live_next = self.live_read_versions;
+            version.registered = true;
+            self.live_read_versions = version;
+            self.syncTrackedInMemoryStateUsageCurrentLocked();
+            return version;
+        }
+    }
+
+    pub fn mountRunDirectory(self: *Backend) !void {
+        if (self.runs.items.len == 0) return;
+        try self.ensureRunDirectory();
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
     pub fn domainIndex(self: *Backend) !*const compaction_mod.DomainIndex {
@@ -4616,7 +4846,6 @@ pub const Backend = struct {
             } else {
                 if (self.read_version == null) {
                     self.read_version = try runtime_mod.ReadVersion.create(self);
-                    self.read_version_builds +|= 1;
                 }
                 const version = self.read_version.?;
                 _ = version.references.fetchAdd(1, .monotonic);
@@ -4653,6 +4882,10 @@ pub const Backend = struct {
     }
 
     pub fn releaseRunSnapshotRef(_: *Backend, run: *Run) void {
+        releaseDirectoryRunSnapshotRef(run);
+    }
+
+    pub fn releaseDirectoryRunSnapshotRef(run: *Run) void {
         if (!run.version_ref_pinned) return;
         if (run.path) |path| run_snapshot_refs.release(path);
         run.version_ref_pinned = false;
@@ -7766,6 +7999,8 @@ test "lsm aged GC below irreducible input budget schedules a retry instead of sp
     run.oldest_tombstone_unix_ns = 1;
     try backend.runs.append(alloc, run);
     try backend.persistManifest();
+    // The first pass durably records the pending collection objective.
+    try std.testing.expect(try backend.runMaintenanceStep());
     try std.testing.expect(!try backend.runMaintenanceStep());
     try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
     const deadline = backend.tombstone_gc_retry_after_ns;
@@ -7836,9 +8071,12 @@ test "lsm GC checkpoints bounded level progress while preserving old readers" {
 }
 
 test "lsm backend resource manager throttles projected immutable state" {
+    // Include enough payload for the budget to distinguish one versus two
+    // memtables while still admitting the now-accounted SST directory.
+    const value: [4096]u8 = @splat('a');
     var sample: ActiveMemTable = .{};
     defer sample.deinit(std.testing.allocator);
-    try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
+    try sample.upsert(std.testing.allocator, .{}, "key:a", &value, false);
     const one_memtable_bytes = Backend.estimateStateBytes(&sample);
     try std.testing.expect(one_memtable_bytes > 0);
 
@@ -7862,7 +8100,7 @@ test "lsm backend resource manager throttles projected immutable state" {
 
     {
         var txn = try backend.beginWrite();
-        try txn.put(.{}, "key:a", "a");
+        try txn.put(.{}, "key:a", &value);
         try txn.commit();
     }
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
@@ -7870,11 +8108,14 @@ test "lsm backend resource manager throttles projected immutable state" {
 
     {
         var txn = try backend.beginWrite();
-        try txn.put(.{}, "key:b", "b");
+        try txn.put(.{}, "key:b", &value);
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    // Admission must drain at least the first generation. Retired metadata
+    // stays charged until the commit releases the lock, which can require
+    // draining the second generation too; no write may be lost or rejected.
+    try std.testing.expect(backend.activeImmutableMemtableCount() <= 1);
+    try std.testing.expectEqual(@as(usize, 2), backend.activeImmutableMemtableCount() + backend.runs.items.len);
     const stats = manager.sliceStats(.lsm_in_memory_state);
     try std.testing.expect(stats.used_bytes <= one_memtable_bytes + one_memtable_bytes / 2);
     try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_rejections);
@@ -10491,10 +10732,9 @@ test "lsm backend reclaims a retired immutable when its exact reader exits" {
     // The newer reader never borrowed the old immutable generation. Releasing
     // the old reader must reclaim it even though another reader remains open.
     try std.testing.expectEqual(@as(usize, 0), backend.retired_immutable_memtables.items.len);
-    try std.testing.expectEqual(
-        before_old_release -| retired_bytes,
-        manager.sliceStats(.lsm_in_memory_state).used_bytes,
-    );
+    // Releasing the old epoch can additionally reclaim its read projection.
+    try std.testing.expect(manager.sliceStats(.lsm_in_memory_state).used_bytes <= before_old_release -| retired_bytes);
+    try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), manager.sliceStats(.lsm_in_memory_state).used_bytes);
     try std.testing.expectEqualStrings(value_a[0..], try newer_reader.get(.{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings(value_b[0..], try newer_reader.get(.{ .name = "docs" }, "doc:b"));
 }
@@ -13259,6 +13499,70 @@ test "lsm backend multi-block point read skips directly to one candidate block" 
     try std.testing.expectEqual(@as(usize, 1), ctx.run_file_size_reads);
 }
 
+test "lsm lazy level cursor bounds sources and IO across forward reverse and namespace boundaries" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+    var backend = try Backend.open(alloc, "/lsm-lazy-level-cursor", .{ .storage = backing.storage(), .cache = &cache, .compact_threshold_runs = 10000 });
+    defer backend.close();
+    for (0..257) |i| {
+        var state: State = .{};
+        errdefer state.deinit(alloc);
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}", .{i});
+        try state.upsert(alloc, .{ .name = if (i == 256) "other" else "docs" }, key, "base", false);
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 1);
+        state = .{};
+        errdefer run.deinit(alloc);
+        try backend.runs.append(alloc, run);
+    }
+    var overlay: State = .{};
+    errdefer overlay.deinit(alloc);
+    try overlay.upsert(alloc, .{ .name = "docs" }, "doc:00128", "new", false);
+    try overlay.upsert(alloc, .{ .name = "docs" }, "doc:00129", "", true);
+    var newest = try compaction_mod.makeRunAtLevel(Backend, &backend, overlay, 0);
+    overlay = .{};
+    var newest_owned = true;
+    errdefer if (newest_owned) newest.deinit(alloc);
+    try backend.runs.append(alloc, newest);
+    newest_owned = false;
+    compaction_mod.sortRuns(backend.runs.items);
+    try backend.persistManifest();
+    var read = try backend.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor(.{ .name = "docs" });
+    defer cursor.close();
+    try std.testing.expectEqual(@as(usize, 3), cursor.positions.len);
+    try std.testing.expect(cursor.cursor_storage.len < 1024);
+    cursor.setUpperBound("doc:00131");
+    const before = backend.snapshotReadStats();
+    const first = (try cursor.seekAtOrAfter("doc:00128")).?;
+    try std.testing.expectEqualStrings("new", first.value);
+    const after = backend.snapshotReadStats();
+    try std.testing.expect(after.table_index_loads - before.table_index_loads <= 2);
+    try std.testing.expect(after.cursor_block_loads - before.cursor_block_loads <= 2);
+    try std.testing.expectEqualStrings("doc:00130", (try cursor.next()).?.key);
+    try std.testing.expect((try cursor.next()) == null);
+    try std.testing.expectEqualStrings("doc:00130", (try cursor.last()).?.key);
+    try std.testing.expectEqualStrings("doc:00128", (try cursor.prev()).?.key);
+    cursor.setUpperBound(null);
+    var count: usize = 0;
+    var entry = try cursor.first();
+    while (entry != null) : (entry = try cursor.next()) count += 1;
+    try std.testing.expectEqual(@as(usize, 255), count);
+    count = 0;
+    entry = try cursor.last();
+    while (entry != null) : (entry = try cursor.prev()) count += 1;
+    try std.testing.expectEqual(@as(usize, 255), count);
+    cursor.setUpperBound("doc:00005");
+    try std.testing.expectEqualStrings("doc:00004", (try cursor.last()).?.key);
+    try std.testing.expectEqualStrings("doc:00004", (try cursor.seekAtOrBefore("doc:99999")).?.key);
+    const borrowed = (try cursor.first()).?.key;
+    try std.testing.expectEqualStrings("doc:00000", (try cursor.seekAtOrAfter(borrowed)).?.key);
+}
+
 test "lsm backend cached cursor scan avoids whole-run table reads" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
@@ -15270,7 +15574,9 @@ test "lsm backend resource manager accounts pinned mutable read snapshots" {
     try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
 
     const with_snapshot = manager.sliceStats(.lsm_in_memory_state).used_bytes;
-    try std.testing.expectEqual(base_bytes, with_snapshot);
+    const pass = state_mod.memory_account.nextPass();
+    const metadata_bytes = backend.run_directory.?.accountedMemoryBytes(pass) + backend.read_version.?.accountedMemoryBytes(pass);
+    try std.testing.expectEqual(base_bytes + metadata_bytes, with_snapshot);
 
     {
         var txn = try backend.beginWrite();
@@ -15290,7 +15596,8 @@ test "lsm backend resource manager accounts pinned mutable read snapshots" {
     const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(after_release < with_retired);
     try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
-    try std.testing.expectEqual(maintenance.mutable_bytes +| maintenance.immutable_bytes, after_release);
+    try std.testing.expect(after_release >= maintenance.mutable_bytes +| maintenance.immutable_bytes);
+    try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), after_release);
 }
 
 test "lsm backend reclaims mutable generations independently of unrelated probe readers" {
@@ -17446,6 +17753,119 @@ test "lsm tombstone GC bounds unique key churn and preserves old readers across 
         }
     }
     std.debug.print("\nLSM unique-key churn: 24 generations, settled SSTs=0, peak retained file bytes={d}\n", .{retained_peak});
+}
+
+test "lsm concurrent first readers share one off-lock epoch projection" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/single-flight-read-version", .{
+        .storage = storage.storage(),
+        .read_runtime = storage_io.ReadRuntime.init(io),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+    });
+    defer backend.close();
+    const Worker = struct {
+        fn run(target: *Backend, task_io: std.Io, start: *std.Io.Event, failed: *std.atomic.Value(bool)) void {
+            start.waitUncancelable(task_io);
+            var read = target.beginRead() catch {
+                failed.store(true, .release);
+                return;
+            };
+            read.abort();
+        }
+    };
+    for (0..2) |_| {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "key", "value");
+        try write.commit();
+        try backend.finalizeDeferredStorageWork();
+        try std.testing.expect(backend.run_directory != null);
+        try std.testing.expectEqual(backend.runs.items.len, backend.run_directory.?.count());
+        const before = backend.read_version_builds;
+        const groups_before = backend.snapshotReadStats().run_group_builds;
+        var start: std.Io.Event = .unset;
+        var failed = std.atomic.Value(bool).init(false);
+        var readers: std.Io.Group = .init;
+        defer {
+            start.set(io);
+            readers.await(io) catch {};
+        }
+        for (0..8) |_| try readers.concurrent(io, Worker.run, .{ &backend, io, &start, &failed });
+        start.set(io);
+        try readers.await(io);
+        try std.testing.expect(!failed.load(.acquire));
+        try std.testing.expectEqual(before + 1, backend.read_version_builds);
+        try std.testing.expectEqual(groups_before + 1, backend.snapshotReadStats().run_group_builds);
+    }
+}
+
+test "lsm persistent directory and lazy cursor scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const Fixture = struct {
+        allocator: Allocator = std.heap.smp_allocator,
+        retained: usize = 0,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), run: *Run) !void {
+            self.retained += 1;
+            self.pins += 1;
+            run.version_ref_pinned = true;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), run: *Run) void {
+            self.pins -= 1;
+            run.version_ref_pinned = false;
+        }
+    };
+    for ([_]usize{ 1000, 10000, 100000 }) |count| {
+        var fixture: Fixture = .{};
+        const alloc = fixture.allocator;
+        const directory = try RunDirectory.create(alloc);
+        defer directory.destroy(alloc);
+        for (0..count) |i| {
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try directory.put(&fixture, .{ .id = i + 1, .level = 1, .size_bytes = 1024, .path = @constCast("/benchmark/run.sst"), .smallest_namespace_name = @constCast("docs"), .smallest_key = &key, .largest_namespace_name = @constCast("docs"), .largest_key = &key, .entry_count = 10, .bloom_filter = null, .state = null });
+        }
+        const runs = try directory.project(alloc);
+        defer alloc.free(runs);
+        var projection_ns: [3]u64 = undefined;
+        var pin_ns: [3]u64 = undefined;
+        var update_ns: [3]u64 = undefined;
+        for (0..3) |sample| {
+            var started = platform_time.monotonicNs();
+            for (0..1000) |_| {
+                const pin = try directory.fork(alloc);
+                pin.destroy(alloc);
+            }
+            pin_ns[sample] = (platform_time.monotonicNs() - started) / 1000;
+            const pin = try directory.fork(alloc);
+            started = platform_time.monotonicNs();
+            const version = try runtime_mod.ReadVersion.createFromDirectory(alloc, pin);
+            projection_ns[sample] = platform_time.monotonicNs() - started;
+            version.destroy(&fixture);
+            const candidate = try directory.fork(alloc);
+            const before = fixture.retained;
+            started = platform_time.monotonicNs();
+            try candidate.put(&fixture, runs[count / 2]);
+            update_ns[sample] = platform_time.monotonicNs() - started;
+            try std.testing.expectEqual(before + 1, fixture.retained);
+            candidate.destroy(alloc);
+        }
+        var empty: State = .{};
+        const started = platform_time.monotonicNs();
+        var cursor = try runtime_mod.MergeCursor(Fixture, State).init(alloc, &fixture, &empty, &.{}, runs, &.{}, &.{.{ .level = 1, .start_index = 0, .len = count }}, .{ .name = "docs" }, false);
+        const setup_ns = platform_time.monotonicNs() - started;
+        defer cursor.close();
+        try std.testing.expectEqual(@as(usize, 2), cursor.positions.len);
+        try std.testing.expectEqual(count, fixture.pins);
+        std.debug.print("\nLSM directory runs={d} directory_bytes={d} pin_ns={any} one_run_update_ns={any} off_lock_projection_ns={any} cursor_bytes={d} cursor_setup_ns={d}\n", .{ count, directory.accountedMemoryBytes(1), pin_ns, update_ns, projection_ns, cursor.cursor_storage.len, setup_ns });
+    }
 }
 
 test "lsm shared read version point setup benchmark" {

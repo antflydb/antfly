@@ -627,6 +627,7 @@ pub fn BoundCursor(comptime StateType: type) type {
 pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type {
     return struct {
         const Self = @This();
+        const RunSpan = struct { start: usize = 0, end: usize = 0, current: usize = 0 };
         const SourceEntry = struct {
             namespace_name: ?[]const u8,
             key: []const u8,
@@ -663,6 +664,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         advance_sources: []usize,
         source_heap: []usize,
         source_heap_positions: []?usize,
+        run_spans: []RunSpan = &.{},
         source_heap_len: usize = 0,
         cursor_storage: []align(cursor_storage_alignment) u8 = &.{},
         visible_entry_bytes: VisibleBytes = .none,
@@ -685,7 +687,23 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             cursorStorageAdvance(usize, &offset, source_count);
             cursorStorageAdvance(usize, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
+            cursorStorageAdvance(RunSpan, &offset, source_count);
             return offset;
+        }
+
+        /// L0 inputs may overlap. Each lower level is a sorted, disjoint run
+        /// sequence and needs only one active SST, not one source per file.
+        fn spanEnd(runs: []const Run, levels: []const RunLevel, start: usize) usize {
+            if (runs[start].level == 0) return start + 1;
+            for (levels) |level| if (level.start_index == start) return start + level.len;
+            var end = start + 1;
+            while (end < runs.len and runs[end].level == runs[start].level) : (end += 1) {}
+            return end;
+        }
+
+        fn spanContainsNamespace(runs: []const Run, start: usize, end: usize, namespace: backend_types.Namespace) bool {
+            return compareNamespace(.{ .name = runs[start].smallest_namespace_name }, namespace) != .gt and
+                compareNamespace(.{ .name = runs[end - 1].largest_namespace_name }, namespace) != .lt;
         }
 
         fn cursorStorageAdvance(comptime T: type, offset: *usize, count: usize) void {
@@ -723,7 +741,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             namespace: backend_types.Namespace,
             backend_locked: bool,
         ) !Self {
-            const source_count = 1 + immutable_memtables.len + runs.len;
+            var source_count = 1 + immutable_memtables.len;
+            var run_start: usize = 0;
+            while (run_start < runs.len) {
+                const end = spanEnd(runs, levels, run_start);
+                if (spanContainsNamespace(runs, run_start, end, namespace)) source_count += 1;
+                run_start = end;
+            }
             const storage = try allocCursorStorage(allocator, source_count);
             errdefer allocator.free(storage);
 
@@ -744,6 +768,18 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const source_heap = cursorStorageSlice(usize, storage, &offset, source_count);
             const source_heap_positions = cursorStorageSlice(?usize, storage, &offset, source_count);
             @memset(source_heap_positions, null);
+            const run_spans = cursorStorageSlice(RunSpan, storage, &offset, source_count);
+            @memset(run_spans, .{});
+            run_start = 0;
+            var source_index = 1 + immutable_memtables.len;
+            while (run_start < runs.len) {
+                const end = spanEnd(runs, levels, run_start);
+                if (spanContainsNamespace(runs, run_start, end, namespace)) {
+                    run_spans[source_index] = .{ .start = run_start, .end = end, .current = run_start };
+                    source_index += 1;
+                }
+                run_start = end;
+            }
 
             return .{
                 .allocator = allocator,
@@ -763,6 +799,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .advance_sources = advance_sources,
                 .source_heap = source_heap,
                 .source_heap_positions = source_heap_positions,
+                .run_spans = run_spans,
                 .cursor_storage = storage,
                 .backend_locked = backend_locked,
             };
@@ -852,8 +889,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn initForwardPositions(self: *@This(), target: []const u8, inclusive: bool) !void {
+            // A public seek may reuse the previous entry's borrowed key. A
+            // source switch can release its backing block before other spans
+            // have sought, so stabilize nonempty seek keys across all sources.
+            const stable_target = try self.allocator.dupe(u8, target);
+            defer self.allocator.free(stable_target);
             for (0..self.positions.len) |source_index| {
-                try self.setSourceAtOrAfter(source_index, target, inclusive);
+                try self.setSourceAtOrAfter(source_index, stable_target, inclusive);
             }
             self.rebuildForwardHeap();
         }
@@ -1078,9 +1120,47 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn runForSource(self: *@This(), source_index: usize) !*Run {
             const offset = self.runSourceOffset();
             if (source_index < offset) return error.RunStateUnavailable;
-            const run_index = source_index - offset;
+            const run_index = self.run_spans[source_index].current;
             if (run_index >= self.runs.len) return error.RunStateUnavailable;
             return &self.runs[run_index];
+        }
+
+        fn selectSpanRun(self: *@This(), source_index: usize, run_index: usize) void {
+            const span = &self.run_spans[source_index];
+            if (span.current == run_index) return;
+            self.clearSourceBlock(source_index);
+            if (self.source_table_index_handles[source_index]) |*handle| handle.release();
+            self.source_table_index_handles[source_index] = null;
+            self.source_table_indices[source_index] = null;
+            self.source_entries[source_index] = null;
+            self.positions[source_index] = null;
+            span.current = run_index;
+        }
+
+        fn runStartsPastUpper(self: *const @This(), run: Run) bool {
+            const ns = compareNamespace(.{ .name = run.smallest_namespace_name }, self.namespace);
+            return ns == .gt or (ns == .eq and !self.keyBeforeUpper(run.smallest_key));
+        }
+
+        fn seekRunSpan(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            const span = self.run_spans[source_index];
+            var lo = span.start;
+            var hi = span.end;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const run = self.runs[mid];
+                const order = compareRunBound(run.largest_namespace_name, run.largest_key, self.namespace.name, target);
+                if (order == .lt or (!inclusive and order == .eq)) lo = mid + 1 else hi = mid;
+            }
+            self.positions[source_index] = null;
+            self.source_entries[source_index] = null;
+            while (lo < span.end) : (lo += 1) {
+                if (self.runStartsPastUpper(self.runs[lo])) break;
+                self.selectSpanRun(source_index, lo);
+                try self.setSingleRunAtOrAfter(source_index, target, inclusive);
+                if (self.positions[source_index] != null) return;
+            }
+            self.clearSourceBlock(source_index);
         }
 
         fn tableIndexForRunSource(self: *@This(), source_index: usize, run: *Run) !*const lsm_table_file.TableIndex {
@@ -1157,6 +1237,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 try self.setMutableSourceAtOrAfter(target, inclusive);
                 return;
             }
+            if (source_index < self.runSourceOffset()) return try self.setSingleRunAtOrAfter(source_index, target, inclusive);
+            try self.seekRunSpan(source_index, target, inclusive);
+        }
+
+        fn setSingleRunAtOrAfter(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
             if (source_index == 0 or self.immutableForSource(source_index) != null) {
                 self.positions[source_index] = try self.sourceLowerBound(source_index, target, inclusive);
                 self.source_entries[source_index] = if (self.positions[source_index]) |idx|
@@ -1208,6 +1293,19 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceSource(self: *@This(), source_index: usize, current: usize) !void {
+            try self.advanceSingleSource(source_index, current);
+            if (source_index < self.runSourceOffset() or self.positions[source_index] != null) return;
+            const span = self.run_spans[source_index];
+            var next_run = span.current + 1;
+            while (next_run < span.end) : (next_run += 1) {
+                if (self.runStartsPastUpper(self.runs[next_run])) break;
+                self.selectSpanRun(source_index, next_run);
+                try self.setSingleRunAtOrAfter(source_index, "", true);
+                if (self.positions[source_index] != null) return;
+            }
+        }
+
+        fn advanceSingleSource(self: *@This(), source_index: usize, current: usize) !void {
             if (source_index == 0 and comptime MutableType == ActiveMemTable) {
                 try self.advanceMutableSource();
                 return;
@@ -1297,6 +1395,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             var owned_probe: ?[]u8 = null;
             defer if (owned_probe) |bytes| self.allocator.free(bytes);
             var include_probe = inclusive;
+            if (self.upper_bound) |upper| if (std.mem.order(u8, probe, upper) != .lt) {
+                probe = upper;
+                include_probe = false;
+            };
             while (true) {
                 const maybe_candidate = blk: {
                     const stable_probe = try self.allocator.dupe(u8, probe);
@@ -1317,19 +1419,14 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn findLast(self: *@This()) !?backend_adapter.Entry {
+            if (self.upper_bound) |upper| return try self.findAtOrBefore(upper, false);
             var best: ?[]const u8 = try self.mutableLastKeyStable();
             for (self.immutable_memtables) |state| {
                 const concrete = mutableLastKey(state, self.namespace) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
-            for (self.runs, 0..) |*run, run_i| {
-                const source_index = self.runSourceOffset() + run_i;
-                const candidate = if (run.state) |*state|
-                    mutableLastKey(state, self.namespace)
-                else if (run.path != null) blk: {
-                    break :blk try self.sourceLastKeyFromLocalIndex(source_index, run);
-                } else null;
-                const concrete = candidate orelse continue;
+            for (self.runSourceOffset()..self.positions.len) |source_index| {
+                const concrete = (try self.spanPrevKey(source_index, null, true)) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
             const key = best orelse return null;
@@ -1344,17 +1441,40 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const concrete = prevStateKey(state, self.namespace, target, inclusive) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
-            for (self.runs, 0..) |*run, run_i| {
-                const source_index = self.runSourceOffset() + run_i;
-                const candidate = if (run.state) |*state|
-                    prevStateKey(state, self.namespace, target, inclusive)
-                else if (run.path != null) blk: {
-                    break :blk try self.sourcePrevKeyFromLocalIndex(source_index, run, target, inclusive);
-                } else null;
-                const concrete = candidate orelse continue;
+            for (self.runSourceOffset()..self.positions.len) |source_index| {
+                const concrete = (try self.spanPrevKey(source_index, target, inclusive)) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
             return best;
+        }
+
+        fn spanPrevKey(self: *@This(), source_index: usize, target: ?[]const u8, inclusive: bool) !?[]const u8 {
+            const span = self.run_spans[source_index];
+            var lo = span.start;
+            var hi = span.end;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const run = self.runs[mid];
+                const order = if (target) |key|
+                    compareRunBound(run.smallest_namespace_name, run.smallest_key, self.namespace.name, key)
+                else
+                    compareNamespace(.{ .name = run.smallest_namespace_name }, self.namespace);
+                if (order == .lt or (order == .eq and (target == null or inclusive))) lo = mid + 1 else hi = mid;
+            }
+            while (lo > span.start) {
+                lo -= 1;
+                if (compareNamespace(.{ .name = self.runs[lo].largest_namespace_name }, self.namespace) == .lt) break;
+                self.selectSpanRun(source_index, lo);
+                const run = &self.runs[lo];
+                const candidate = if (run.state) |*state|
+                    if (target) |key| prevStateKey(state, self.namespace, key, inclusive) else mutableLastKey(state, self.namespace)
+                else if (run.path != null)
+                    if (target) |key| try self.sourcePrevKeyFromLocalIndex(source_index, run, key, inclusive) else try self.sourceLastKeyFromLocalIndex(source_index, run)
+                else
+                    null;
+                if (candidate) |key| return key;
+            }
+            return null;
         }
 
         fn visibleEntryAtKey(self: *@This(), key: []const u8) !?backend_adapter.Entry {
@@ -2452,12 +2572,18 @@ fn lowerBoundRunStart(keys: []const []const u8, namespace: backend_types.Namespa
 /// under the backend mutex; lazy Bloom ownership is disabled for these runs.
 pub const ReadVersion = struct {
     references: std.atomic.Value(usize) = .init(1),
+    retired_next: ?*ReadVersion = null,
+    live_next: ?*ReadVersion = null,
+    registered: bool = false,
+    directory: ?*@import("run_directory.zig").Directory = null,
+    projection_bytes: u64 = 0,
     allocator: Allocator,
     runs: []Run,
     l0_groups: []RunGroup,
     levels: []RunLevel,
 
     pub fn create(backend: anytype) !*ReadVersion {
+        if (comptime @hasDecl(@TypeOf(backend.*), "createReadVersionFromDirectory")) return try backend.createReadVersionFromDirectory();
         const allocator = runtimeScratchAllocator(backend.allocator);
         const version = try allocator.create(ReadVersion);
         errdefer allocator.destroy(version);
@@ -2483,17 +2609,63 @@ pub const ReadVersion = struct {
         return version;
     }
 
+    /// Ownership of directory transfers only on success. The immutable root
+    /// owns metadata and file pins; the projection contains only borrowed data
+    /// and per-version cache hints. All O(number-of-runs) work is off-lock.
+    pub fn createFromDirectory(allocator: Allocator, directory: *@import("run_directory.zig").Directory) !*ReadVersion {
+        const version = try allocator.create(ReadVersion);
+        errdefer allocator.destroy(version);
+        const runs = try directory.project(allocator);
+        errdefer allocator.free(runs);
+        const groups = try buildL0RunGroups(allocator, runs);
+        errdefer deinitRunGroups(allocator, groups);
+        const levels = try buildLowerLevels(allocator, runs);
+        var projection_bytes: u64 = runs.len * @sizeOf(Run) + groups.len * @sizeOf(RunGroup) + levels.len * @sizeOf(RunLevel);
+        for (groups) |group| projection_bytes += group.run_indices.len * @sizeOf(usize);
+        version.* = .{ .allocator = allocator, .runs = runs, .l0_groups = groups, .levels = levels, .directory = directory, .projection_bytes = projection_bytes };
+        return version;
+    }
+
+    pub fn buildMemoryBound(run_count: usize) u64 {
+        // Flat descriptors, sort scratch, per-component groups/indices and
+        // geometric ArrayList slack. All temporary metadata is admitted before
+        // allocating the projection, not merely observed after it is built.
+        return @sizeOf(ReadVersion) + @as(u64, @intCast(run_count)) *
+            (@sizeOf(Run) + 4 * @sizeOf(RunGroup) + 8 * @sizeOf(usize) + 2 * @sizeOf(RunLevel));
+    }
+
+    /// Caller holds the backend mutex when using backend-owned retirement.
+    /// The last reference queues reclamation; it does not free metadata here.
     pub fn release(self: *ReadVersion, backend: anytype) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        if (comptime @hasDecl(@TypeOf(backend.*), "retireReadVersion")) return backend.retireReadVersion(self);
+        self.destroy(backend);
+    }
+
+    pub fn destroy(self: *ReadVersion, backend: anytype) void {
+        self.destroyContents(backend);
+        if (self.directory) |directory| self.allocator.destroy(directory);
+        self.allocator.destroy(self);
+    }
+
+    pub fn accountedMemoryBytes(self: *const ReadVersion, pass: u64) u64 {
+        return @sizeOf(ReadVersion) + self.projection_bytes + (if (self.directory) |directory| directory.accountedMemoryBytes(pass) else 0);
+    }
+
+    /// Reclamation keeps these small headers immutable until the backend
+    /// reacquires its lock, allowing concurrent memory-accounting passes.
+    pub fn destroyContents(self: *ReadVersion, backend: anytype) void {
         const allocator = self.allocator;
-        for (self.runs) |*run| {
+        if (self.directory) |directory| {
+            var tree = directory.tree;
+            tree.deinit(allocator);
+        } else for (self.runs) |*run| {
             backend.releaseRunSnapshotRef(run);
             run.deinit(allocator);
         }
         allocator.free(self.runs);
         deinitRunGroups(allocator, self.l0_groups);
         allocator.free(self.levels);
-        allocator.destroy(self);
     }
 };
 
@@ -2510,7 +2682,7 @@ const RunReadView = struct {
         if (comptime @hasField(@TypeOf(backend.*), "read_version")) if (!(builtin.is_test and test_private_read_versions)) {
             if (backend.read_version == null) {
                 backend.read_version = try ReadVersion.create(backend);
-                backend.read_version_builds +|= 1;
+                if (comptime !@hasDecl(@TypeOf(backend.*), "createReadVersionFromDirectory")) backend.read_version_builds +|= 1;
             }
             const version = backend.read_version.?;
             _ = version.references.fetchAdd(1, .monotonic);
@@ -2575,14 +2747,13 @@ fn CurrentReadLayout(comptime BackendType: type) type {
             self.* = undefined;
         }
 
-        /// Run refs use their own registry lock, while immutable-generation
-        /// pins are backend-owned. Release the expensive metadata outside the
-        /// writer lock and reacquire it only for the exact pin handoff.
+        /// Retire the epoch under the backend lock; unlockBackend reclaims
+        /// its expensive metadata outside the lock after the pin handoff.
         fn deinitAfterUnlockedRead(self: *@This()) void {
             const backend = self.backend;
-            self.read_view.release(backend);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            self.read_view.release(backend);
             releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
             self.* = undefined;
         }
@@ -2767,11 +2938,11 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 owned.deinit(self.allocator);
                 self.allocator.destroy(owned);
             }
-            self.read_view.release(backend);
             releaseHeldBlocks(&self.held_blocks, backend.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            self.read_view.release(backend);
             releaseMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
             releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
             releaseReadReader(BackendType, backend, .bound_read_txn);
@@ -4221,12 +4392,12 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
                 owned.deinit(self.allocator);
                 self.allocator.destroy(owned);
             }
-            self.read_view.release(backend);
             if (self.snapshot) |*snapshot| snapshot.deinit(self.allocator);
             releaseHeldBlocks(&self.held_blocks, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            self.read_view.release(backend);
             releaseMutableReadSnapshot(BackendType, backend, self.mutable_snapshot, self.owns_mutable_snapshot);
             releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
             releaseReadReader(BackendType, backend, .namespace_read_txn);

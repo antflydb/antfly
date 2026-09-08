@@ -26,6 +26,13 @@ fn gcNowNs() u64 {
 }
 
 pub fn nextTombstoneGcDelay(backend: anytype) ?u64 {
+    // A denied, already-eligible job is independent of the age trigger. In
+    // particular, disabling age-based GC must not disable admission retries.
+    if (comptime @hasField(@TypeOf(backend.*), "tombstone_gc_retry_after_ns")) {
+        if (backend.tombstone_gc_retry_after_ns != 0)
+            return backend.tombstone_gc_retry_after_ns -| backend.nowNs();
+    }
+    for (backend.runs.items) |run| if (run.gc_requested and (run.tombstone_count orelse 0) != 0) return 0;
     if (comptime !@hasField(@TypeOf(backend.options), "tombstone_gc_max_age_ns")) return null;
     if (backend.options.tombstone_gc_max_age_ns == 0) return null;
     const now = gcNowNs();
@@ -36,9 +43,6 @@ pub fn nextTombstoneGcDelay(backend: anytype) ?u64 {
         const due = if (run.oldest_tombstone_unix_ns == 0 or run.oldest_tombstone_unix_ns > now) 0 else run.oldest_tombstone_unix_ns +| backend.options.tombstone_gc_max_age_ns;
         const candidate = due -| now;
         delay = if (delay) |current| @min(current, candidate) else candidate;
-    }
-    if (comptime @hasField(@TypeOf(backend.*), "tombstone_gc_retry_after_ns")) {
-        if (delay) |due| return @max(due, backend.tombstone_gc_retry_after_ns -| backend.nowNs());
     }
     return delay;
 }
@@ -88,12 +92,12 @@ pub const CompactionPlan = struct {
     tombstone_gc: bool = false,
     split_gc: bool = false,
 
-    fn sourceIndex(self: @This(), i: usize) usize {
+    pub fn sourceIndex(self: @This(), i: usize) usize {
         const index = self.source_start + i;
         return if (self.run_indices) |indices| indices[index] else index;
     }
 
-    fn targetIndex(self: @This(), i: usize) usize {
+    pub fn targetIndex(self: @This(), i: usize) usize {
         const index = self.target_start + i;
         return if (self.run_indices) |indices| indices[index] else index;
     }
@@ -248,6 +252,42 @@ fn wholeKeyspace(_: []const u8) []const u8 {
 
 const GcCandidate = struct { indices: []const usize, level: u32 };
 
+fn gcComponentEligible(backend: anytype, indices: []const usize) bool {
+    var tombstones: u64 = 0;
+    var entries: u64 = 0;
+    var requested = false;
+    for (indices) |i| {
+        const run = backend.runs.items[i];
+        const deletes = run.tombstone_count orelse 0;
+        tombstones +|= deletes;
+        entries = @max(entries, run.entry_count);
+        if (deletes != 0) requested = requested or run.gc_requested or tombstoneAgeDue(backend, run);
+    }
+    const percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) @min(@as(u8, 100), backend.options.tombstone_gc_min_percent) else 50;
+    return tombstones != 0 and (requested or @as(u128, tombstones) * 100 >= @as(u128, entries) * percent);
+}
+
+/// Persist the collection objective on every delete-bearing input, not just
+/// the next admitted window. Output runs inherit it until their deletes have
+/// actually been collected, so splits, ordinary compaction and restart cannot
+/// silently revoke a component's eligibility.
+fn requestEligibleGcComponents(backend: anytype, index: *const DomainIndex) void {
+    var start: usize = 0;
+    var changed = false;
+    for (index.gc_ends) |end| {
+        defer start = end;
+        const indices = index.gc_order[start..end];
+        if (!gcComponentEligible(backend, indices)) continue;
+        for (indices) |i| {
+            const run = &backend.runs.items[i];
+            if ((run.tombstone_count orelse 0) == 0 or run.gc_requested) continue;
+            run.gc_requested = true;
+            changed = true;
+        }
+    }
+    if (changed) if (comptime @hasDecl(@TypeOf(backend.*), "markManifestDirty")) backend.markManifestDirty();
+}
+
 fn tombstoneGcCandidate(backend: anytype, index: *const DomainIndex, max_bytes: u64) ?GcCandidate {
     var start: usize = 0;
     var best: []const usize = &.{};
@@ -257,24 +297,13 @@ fn tombstoneGcCandidate(backend: anytype, index: *const DomainIndex, max_bytes: 
         defer start = end;
         const indices = index.gc_order[start..end];
         var bytes: u64 = 0;
-        var tombstones: u64 = 0;
-        var entries: u64 = 0;
         var level: u32 = 1;
-        var aged = false;
         for (indices) |i| {
             const run = backend.runs.items[i];
             bytes +|= run.size_bytes;
-            tombstones +|= run.tombstone_count orelse 0;
-            if ((run.tombstone_count orelse 0) != 0) aged = aged or tombstoneAgeDue(backend, run);
-            // Each input has unique keys, but inputs can contain many old
-            // versions of the same keys. The maximum is a conservative lower
-            // bound on the component's distinct keys; their sum is not.
-            entries = @max(entries, run.entry_count);
             level = @max(level, run.level);
         }
-        if (tombstones == 0 or bytes >= best_bytes) continue;
-        const min_percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) @min(@as(u8, 100), backend.options.tombstone_gc_min_percent) else 50;
-        if (!aged and @as(u128, tombstones) * 100 < @as(u128, entries) * min_percent) continue;
+        if (bytes >= best_bytes or !gcComponentEligible(backend, indices)) continue;
         if (max_bytes != 0 and bytes > max_bytes) continue;
         best = indices;
         best_bytes = bytes;
@@ -298,6 +327,7 @@ fn selectTombstoneGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
         return err;
     } else try DomainIndex.create(backend);
     defer if (comptime !@hasDecl(@TypeOf(backend.*), "domainIndex")) index.destroy(backend.allocator);
+    requestEligibleGcComponents(backend, index);
     const configured = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_max_input_bytes")) backend.options.tombstone_gc_max_input_bytes else max_bytes;
     const limit = if (max_bytes == 0) configured else if (configured == 0) max_bytes else @min(max_bytes, configured);
     const candidate = tombstoneGcCandidate(backend, index, limit) orelse {
@@ -324,7 +354,9 @@ fn selectGcProgress(backend: anytype, index: *const DomainIndex, limit: u64) !?S
             const deletes = run.tombstone_count orelse 0;
             if (deletes == 0 or run.level == std.math.maxInt(u32)) continue;
             const percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) backend.options.tombstone_gc_min_percent else 50;
-            if (!tombstoneAgeDue(backend, run) and @as(u64, deletes) * 100 < @as(u64, run.entry_count) * percent) continue;
+            // The projection may predate the request bit; use the live input.
+            const live_index = if (index.mixed) i else index.order[start + i];
+            if (!backend.runs.items[live_index].gc_requested and !tombstoneAgeDue(backend, run) and @as(u64, deletes) * 100 < @as(u64, run.entry_count) * percent) continue;
             var plan = buildPlanForSourceRange(runs, run.level, i, 1) orelse continue;
             var priority: u64 = if (tombstoneAgeDue(backend, run)) 3 else 2;
             if (!planWithinInputBudget(runs, plan, limit)) {
@@ -357,6 +389,7 @@ fn selectGcProgress(backend: anytype, index: *const DomainIndex, limit: u64) !?S
 pub fn compactTombstonesScheduled(comptime BackendType: type, backend: *BackendType, score: u64) !bool {
     if (comptime @hasField(BackendType, "tombstone_gc_retry_after_ns")) {
         if (backend.nowNs() < backend.tombstone_gc_retry_after_ns) return false;
+        backend.tombstone_gc_retry_after_ns = 0;
     }
     const selected = try selectTombstoneGc(backend, backend.options.max_compaction_input_bytes) orelse {
         if ((nextTombstoneGcDelay(backend) orelse 1) == 0) deferTombstoneGc(backend);
@@ -553,8 +586,12 @@ pub fn flushMutable(comptime BackendType: type, backend: *BackendType) !void {
         const elapsed_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) elapsedNs(BackendType, backend, start_ns) else 0;
         backend.recordFlushWriteStats(input_entries, new_runs.items, elapsed_ns);
     }
+    var directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryChange")) try backend.prepareRunDirectoryChange(null, new_runs.items) else null;
+    errdefer if (directory) |owned| owned.destroy(backend.allocator);
     if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
     try appendOwnedRuns(&backend.runs, backend.allocator, &new_runs);
+    if (comptime @hasDecl(BackendType, "publishRunDirectory")) backend.publishRunDirectory(directory);
+    directory = null;
     sortRuns(backend.runs.items);
     if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
         if (@hasDecl(BackendType, "markManifestDirty")) backend.markManifestDirty();
@@ -1023,11 +1060,13 @@ fn compactPlanAt(comptime BackendType: type, backend: *BackendType, plan: Compac
         // A closed, nonoverlapping domain needs only a manifest-level move.
         // SST bytes and file identity are immutable; do not decode/re-encode
         // a cold payload just to change its level.
+        const directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryMove")) try backend.prepareRunDirectoryMove(plan.sourceIndex(0), plan.output_level) else null;
         if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
         const run = &backend.runs.items[plan.sourceIndex(0)];
         const bytes = run.size_bytes;
         run.level = plan.output_level;
         sortRuns(backend.runs.items);
+        if (comptime @hasDecl(BackendType, "publishRunDirectory")) backend.publishRunDirectory(directory);
         if (@hasDecl(BackendType, "markManifestDirty")) backend.markManifestDirty();
         if (@hasField(BackendType, "compaction_stats")) {
             backend.compaction_stats.compactions += 1;
@@ -1118,6 +1157,8 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     }
     try backend.reserveObsoletePublication(obsolete_paths.items.len, @intFromBool(selected_len > 0));
 
+    const directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryChange")) try backend.prepareRunDirectoryChange(plan, compacted_runs.items) else null;
+
     for (backend.runs.items, 0..) |*run, i| {
         if (remove[i]) {
             obsolete_runs.appendAssumeCapacity(run.*);
@@ -1151,6 +1192,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     backend.runs.deinit(backend.allocator);
     backend.runs = retained;
     retained = .empty;
+    if (comptime @hasDecl(BackendType, "publishRunDirectory")) backend.publishRunDirectory(directory);
     for (obsolete_paths.items) |*path| {
         backend.queueObsoleteFilePathAssumeCapacity(path.*);
         path.* = &.{};
@@ -1475,6 +1517,8 @@ fn installCompactedRuns(
     }
     try backend.reserveObsoletePublication(obsolete_paths.items.len, @intFromBool(selected_len > 0));
 
+    const directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryChange")) try backend.prepareRunDirectoryChange(plan, compacted_runs.items) else null;
+
     for (backend.runs.items, 0..) |*run, i| {
         if (remove[i]) {
             obsolete_runs.appendAssumeCapacity(run.*);
@@ -1508,6 +1552,7 @@ fn installCompactedRuns(
     backend.runs.deinit(backend.allocator);
     backend.runs = retained;
     retained = .empty;
+    if (comptime @hasDecl(BackendType, "publishRunDirectory")) backend.publishRunDirectory(directory);
     for (obsolete_paths.items) |*path| {
         backend.queueObsoleteFilePathAssumeCapacity(path.*);
         path.* = &.{};
@@ -2405,6 +2450,52 @@ test "tombstone GC density bounds garbage without stranding duplicate older vers
     const oversized = (try selectTombstoneGc(&backend, 20)).?;
     defer oversized.deinit(backend.allocator);
     try std.testing.expect(compactionInputBytes(&runs, oversized.plan) <= 20);
+}
+
+test "bounded GC carries aggregate eligibility across windows and retries independently of age" {
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        runs: std.ArrayListUnmanaged(Run),
+        tombstone_gc_retry_after_ns: u64 = 250 * std.time.ns_per_ms,
+        options: struct {
+            run_partition_key: PartitionKey = null,
+            level_target_runs_base: usize = 32,
+            level_target_runs_multiplier: usize = 4,
+            level_target_bytes_base: usize = 0,
+            level_target_bytes_multiplier: usize = 8,
+            tombstone_gc_min_percent: u8 = 50,
+            tombstone_gc_max_age_ns: u64 = std.time.ns_per_hour,
+        } = .{},
+        pub fn nowNs(_: *@This()) u64 {
+            return 0;
+        }
+    };
+    var runs = [_]Run{ testRun(2, 1, "a", "z", 1024), testRun(1, 2, "a", "z", 1024) };
+    for (&runs) |*run| {
+        run.entry_count = 100;
+        run.tombstone_count = 30;
+        run.oldest_tombstone_unix_ns = gcNowNs();
+    }
+    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
+    try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), nextTombstoneGcDelay(&backend));
+    backend.options.tombstone_gc_max_age_ns = 0;
+    try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), nextTombstoneGcDelay(&backend));
+    backend.tombstone_gc_retry_after_ns = 0;
+    const selected = (try selectTombstoneGc(&backend, 1536)).?;
+    defer selected.deinit(backend.allocator);
+    try std.testing.expect(compactionInputBytes(&runs, selected.plan) <= 1536);
+    try std.testing.expect(runs[0].gc_requested and runs[1].gc_requested);
+    // Even if a preceding job lowers density, the outstanding objective stays.
+    runs[0].tombstone_count = 1;
+    runs[1].tombstone_count = 1;
+    const next = (try selectTombstoneGc(&backend, 1536)).?;
+    defer next.deinit(backend.allocator);
+    try std.testing.expectEqual(@as(?u64, 0), nextTombstoneGcDelay(&backend));
+    var outputs = [_]Run{ runs[0], runs[1] };
+    outputs[1].tombstone_count = 0;
+    inheritTombstoneAge(&outputs, &.{&runs[0]});
+    try std.testing.expect(outputs[0].gc_requested);
+    try std.testing.expect(!outputs[1].gc_requested);
 }
 
 test "domain compaction maps interleaved inputs and revalidates concurrent publication" {
@@ -3574,10 +3665,16 @@ fn countTombstones(entries: anytype) u32 {
 
 fn inheritTombstoneAge(outputs: []Run, inputs: []const *Run) void {
     var oldest = gcNowNs();
+    var requested = false;
     for (inputs) |run| if ((run.tombstone_count orelse 0) != 0) {
         oldest = @min(oldest, run.oldest_tombstone_unix_ns);
+        requested = requested or run.gc_requested;
     };
-    for (outputs) |*run| run.oldest_tombstone_unix_ns = if ((run.tombstone_count orelse 0) != 0) oldest else 0;
+    for (outputs) |*run| {
+        const has_deletes = (run.tombstone_count orelse 0) != 0;
+        run.oldest_tombstone_unix_ns = if (has_deletes) oldest else 0;
+        run.gc_requested = has_deletes and requested;
+    }
 }
 
 fn countStateTombstones(state: *const State) u32 {

@@ -61,6 +61,7 @@ pub const Run = struct {
     tombstone_count: ?u32 = null,
     oldest_tombstone_unix_ns: u64 = 0,
     visibility_id: u64 = 0,
+    gc_requested: bool = false,
     bloom_filter: ?bloom.OwnedFilter,
     owns_metadata: bool = true,
     owns_path: bool = false,
@@ -176,6 +177,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
         .tombstone_count = source.tombstone_count,
         .oldest_tombstone_unix_ns = source.oldest_tombstone_unix_ns,
         .visibility_id = source.visibility_id,
+        .gc_requested = source.gc_requested,
         .bloom_filter = if (source.bloom_filter) |filter| try filter.clone(allocator) else null,
         .cached_state_index = null,
         .cached_index_index = null,
@@ -216,6 +218,7 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
         .tombstone_count = source.tombstone_count,
         .oldest_tombstone_unix_ns = source.oldest_tombstone_unix_ns,
         .visibility_id = source.visibility_id,
+        .gc_requested = source.gc_requested,
         .bloom_filter = null,
         .owns_bloom_filter = false,
         .cached_state_index = null,
@@ -304,6 +307,7 @@ pub fn loadManifestIfPresentWithStorage(
             .tombstone_count = meta.tombstone_count,
             .oldest_tombstone_unix_ns = meta.oldest_tombstone_unix_ns,
             .visibility_id = meta.visibility_id,
+            .gc_requested = meta.gc_requested,
             .bloom_filter = null,
             .owns_metadata = false,
             .owns_path = true,
@@ -523,6 +527,7 @@ pub fn persistManifestWithStorageCount(
             .tombstone_count = run.tombstone_count,
             .oldest_tombstone_unix_ns = run.oldest_tombstone_unix_ns,
             .visibility_id = run.visibility_id,
+            .gc_requested = run.gc_requested,
         };
     }
 

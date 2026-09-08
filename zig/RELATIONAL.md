@@ -1213,6 +1213,61 @@ physical representation and backfill plan are compatible.
   uncovered generations use authoritative AROW. Specialized aggregate/sort
   execution can extend this without introducing another row authority.
 
+## LSM metadata epochs and bounded scan sources
+
+SST metadata now has a persistent, reference-counted run directory, separate
+from mutable cache hints. Recovery constructs its initial root before exposing
+the backend; an empty store seeds it on its first flush. Normal flush,
+compaction, and trivial-level-move publications copy only changed tree paths
+and payloads. Capturing the immutable root is O(1), without cloning each run or
+taking a file-registry reference for each reader.
+
+Readers share a flat search projection for each published epoch. Projection
+allocation and L0 topology construction happen outside the writer mutex, with
+working-memory admission and generation revalidation before installation.
+Concurrent first readers share one build; the build gate waits through
+`std.Io.Mutex` when a read runtime is available, with the platform mutex helper
+for manual/no-runtime backends. Writers never acquire that gate. Old directory
+roots and read projections remain accounted and keep their files pinned until
+their last reader exits; reclamation runs outside the backend mutex.
+
+Merge cursors retain one source per overlapping L0 file and one concatenating
+source per nonoverlapping lower level, plus the mutable/immutable memtables.
+They binary-search file bounds and open SST indexes/blocks lazily. Forward and
+reverse scans honor namespace and exclusive upper bounds without opening every
+file in a level. Cursor memory is O(memtable generations + L0 files + levels),
+not O(all SSTs). The shared projection is still O(all SSTs), and existing flat
+run-vector publication and full administrative rewrites are not O(1).
+
+GC eligibility is a durable objective: an eligible overlap component marks all
+of its delete-bearing inputs in the manifest. Bounded windows and subsequent
+compactions propagate that request until the surviving deletes are collected.
+A denied job retries on its admission deadline independently of the age
+trigger, including when age-based GC is disabled. This prevents a component
+from losing eligibility as partial progress lowers its density. The new PR's
+manifest-v10 format includes this flag; intermediate PR-only v10 layouts are
+not a compatibility contract.
+
+The checked-in ReleaseFast scaling fixture measured the following on an
+Apple Silicon development host (three samples; not an end-to-end latency SLA):
+
+| Lower-level SSTs | Shared directory bytes | One-run update, median | Off-lock projection, median | Per-cursor bookkeeping |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 628,888 | 2 µs | 46 µs | 512 bytes |
+| 10,000 | 6,263,752 | 1 µs | 404 µs | 512 bytes |
+| 100,000 | 62,604,760 | 3 µs | 4.97 ms | 512 bytes |
+
+The previous cursor layout required 23,200,232 bytes at 100,000 SSTs. The new
+directory adds shared metadata memory (about 626 bytes/SST in this fixture),
+charged to the resource manager, in exchange for cheap epoch pins and avoiding
+per-reader metadata clones. The physical churn benchmark remained at roughly
+23.6–23.7 ms median per batch; SST bytes written were 29.3 MB with a zero-density
+GC threshold and 17.3 MB with the 50% threshold. This validates retention of the
+existing churn behavior, not a new SST write-amplification improvement from the
+directory itself. Both benchmarks are reproducible via `lib-storage-test` with
+`-Doptimize=ReleaseFast` and filters `persistent directory and lazy cursor scaling
+benchmark` and `production LSM physical churn benchmark`.
+
 ## Related docs
 
 - [SCHEMA.md](SCHEMA.md) — schema contract and compiled runtime schema
