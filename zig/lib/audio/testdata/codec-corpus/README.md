@@ -20,9 +20,8 @@ Current status:
   in the shared passing table and that the fixture list documented in this file
   stays aligned with the files on disk.
 - `zig build lib-audio-conformance` runs the external Xiph-family and
-  MP3/AAC/MP4 conformance sweeps against already-fetched corpora. Use
-  `../scripts/fetch-conformance-fixtures.sh --suite audio` once to populate the external
-  fixtures, or `zig build lib-audio-conformance` to fetch and run them.
+  MP3/AAC/MP4 conformance sweeps, fetching missing corpora and reusing cached
+  fixtures. Use `-Dconformance-fetch=false` for an offline run.
 
 - `tone-stereo.aac`
   - generated as ADTS AAC-LC at 16 kHz stereo

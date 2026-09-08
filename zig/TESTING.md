@@ -133,28 +133,27 @@ zig build recall-harness && ./zig-out/bin/recall_harness
 
 ## Conformance And Soak
 
-Prepare external fixtures explicitly, then run the conformance suites:
+Conformance targets fetch missing external fixtures, reuse cached corpora, and run
+the suite. Setup failures fail the target. These suites remain opt-in; ordinary
+library tests do not download external corpora.
 
 ```sh
-../scripts/fetch-conformance-fixtures.sh --dest /tmp
 zig build conformance-test
-```
-
-`conformance-test` is opt-in and performs no fixture downloading. Library suite
-names follow `lib-<library>-conformance`, alongside `lib-<library>-test` and
-`lib-<library>-bench`. Existing suites are:
-
-```sh
 zig build lib-toon-conformance
 zig build lib-image-conformance
 zig build lib-audio-conformance
 ```
 
-Use `--suite toon|image|audio` on the setup script to fetch only one corpus group.
-For a custom fixture location, pass the same absolute directory to the script's
-`--dest` and the build's `-Dconformance-fixtures=/absolute/path` option.
-`conformance-tools` installs the setup/inspection binaries for direct use.
-Missing-fixture behavior remains suite-specific (some external tests skip).
+Library suite names follow `lib-<library>-conformance`, alongside
+`lib-<library>-test` and `lib-<library>-bench`.
+
+Fixtures are cached under `/tmp` by default. Use
+`-Dconformance-fixtures=/absolute/path` to choose another cache directory.
+For offline runs, disable fixture fetching explicitly (missing fixtures fail):
+
+```sh
+zig build conformance-test -Dconformance-fetch=false -Dconformance-fixtures=/absolute/path
+```
 
 Run long-running soak aggregates:
 

@@ -1442,7 +1442,8 @@ fn addOpenApiRegenStep(
 }
 
 pub fn build(b: *std.Build) void {
-    const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Directory populated by scripts/fetch-conformance-fixtures.sh") orelse "/tmp";
+    const conformance_fetch = b.option(bool, "conformance-fetch", "Fetch missing external conformance fixtures") orelse true;
+    const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Cache directory for external conformance fixtures") orelse "/tmp";
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils
     // builds may include .sframe sections with relocation types that Zig's
@@ -2890,8 +2891,9 @@ pub fn build(b: *std.Build) void {
     lib_toon_conformance.root_module.addImport("antfly_toon", toon_mod);
 
     const run_lib_toon_conformance = b.addRunArtifact(lib_toon_conformance);
-    run_lib_toon_conformance.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "toon-format-spec" }), "--no-fetch" });
-    const lib_toon_conformance_step = b.step("lib-toon-conformance", "Run lib/toon conformance against prepared fixtures");
+    run_lib_toon_conformance.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "toon-format-spec" }) });
+    if (!conformance_fetch) run_lib_toon_conformance.addArg("--no-fetch");
+    const lib_toon_conformance_step = b.step("lib-toon-conformance", "Run lib/toon conformance (fetch missing fixtures)");
     lib_toon_conformance_step.dependOn(&run_lib_toon_conformance.step);
 
     const httpx_json_test_mod = b.createModule(.{
@@ -3286,7 +3288,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"conformance corpus"},
     });
     const run_lib_image_conformance_tests = addFilteredTestRunArtifact(b, lib_image_conformance_tests);
-    const lib_image_conformance_run_step = b.step("lib-image-conformance", "Run lib/image conformance against prepared fixtures");
+    const lib_image_conformance_run_step = b.step("lib-image-conformance", "Run lib/image conformance (fetch missing fixtures)");
     lib_image_conformance_run_step.dependOn(&run_lib_image_conformance_tests.step);
 
     const lib_image_corpus_build_options = b.addOptions();
@@ -3346,7 +3348,8 @@ pub fn build(b: *std.Build) void {
     image_jpeg_seed_corpora_e2e_step.dependOn(&b.addInstallArtifact(image_jpeg_seed_corpora_e2e, .{}).step);
 
     const run_image_jpeg_seed_corpora_e2e = b.addRunArtifact(image_jpeg_seed_corpora_e2e);
-    run_image_jpeg_seed_corpora_e2e.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "libjpeg-turbo-seed-corpora" }), "--no-fetch" });
+    run_image_jpeg_seed_corpora_e2e.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "libjpeg-turbo-seed-corpora" }) });
+    if (!conformance_fetch) run_image_jpeg_seed_corpora_e2e.addArg("--no-fetch");
     lib_image_conformance_run_step.dependOn(&run_image_jpeg_seed_corpora_e2e.step);
 
     const jpeg2000_fuzz = b.addExecutable(.{
@@ -3373,6 +3376,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const prepare_lib_image_conformance = b.addRunArtifact(lib_image_conformance_fetcher);
+    prepare_lib_image_conformance.addArgs(&.{ "fetch", b.pathJoin(&.{ conformance_fixtures, "openjpeg-data" }) });
+    if (!conformance_fetch) prepare_lib_image_conformance.addArg("--no-fetch");
+    run_lib_image_conformance_tests.step.dependOn(&prepare_lib_image_conformance.step);
     run_lib_image_conformance_tests.setEnvironmentVariable("OPENJPEG_DATA_DIR", b.pathJoin(&.{ conformance_fixtures, "openjpeg-data" }));
 
     const lib_generating_runtime_tests = b.addTest(.{
@@ -4521,7 +4528,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run default package test aggregates");
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
-    const conformance_test_step = b.step("conformance-test", "Run conformance suites against explicitly prepared fixtures");
+    const conformance_test_step = b.step("conformance-test", "Run conformance suites (fetch missing fixtures)");
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
 
     dependOnAll(conformance_test_step, &.{ lib_toon_conformance_step, lib_image_conformance_run_step });
@@ -7669,10 +7676,12 @@ pub fn build(b: *std.Build) void {
     lib_audio_misc_conformance.root_module.link_libc = true;
 
     const run_lib_audio_xiph_conformance = b.addRunArtifact(lib_audio_xiph_conformance);
-    run_lib_audio_xiph_conformance.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "audio-xiph-corpora" }), "--no-fetch" });
+    run_lib_audio_xiph_conformance.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "audio-xiph-corpora" }) });
+    if (!conformance_fetch) run_lib_audio_xiph_conformance.addArg("--no-fetch");
     const run_lib_audio_misc_conformance = b.addRunArtifact(lib_audio_misc_conformance);
-    run_lib_audio_misc_conformance.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "audio-misc-corpora" }), "--no-fetch" });
-    const lib_audio_conformance_step = b.step("lib-audio-conformance", "Run lib/audio conformance against prepared fixtures");
+    run_lib_audio_misc_conformance.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "audio-misc-corpora" }) });
+    if (!conformance_fetch) run_lib_audio_misc_conformance.addArg("--no-fetch");
+    const lib_audio_conformance_step = b.step("lib-audio-conformance", "Run lib/audio conformance (fetch missing fixtures)");
     lib_audio_conformance_step.dependOn(&run_lib_audio_xiph_conformance.step);
     lib_audio_conformance_step.dependOn(&run_lib_audio_misc_conformance.step);
     conformance_test_step.dependOn(lib_audio_conformance_step);
@@ -10705,9 +10714,5 @@ pub fn build(b: *std.Build) void {
     if (b.option(bool, "test-progress", "Label existing antfly-unit-test run nodes without changing test selection or scheduling") orelse false) {
         antfly_tests_build.labelTestRuns(b, unit_test_step);
         antfly_tests_build.labelTestRuns(b, lib_test_step);
-    }
-    const conformance_tools_step = b.step("conformance-tools", "Build and install conformance fixture and corpus tools");
-    for ([_]*std.Build.Step.Compile{ lib_toon_conformance, lib_image_conformance_fetcher, image_jpeg_seed_corpora_e2e, lib_image_corpus, lib_audio_xiph_conformance, lib_audio_misc_conformance }) |tool| {
-        conformance_tools_step.dependOn(&b.addInstallArtifact(tool, .{}).step);
     }
 }
