@@ -85,7 +85,7 @@ curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
   -d '{"value": "postgres://antfly:secret@pg-host:5432/mydb?sslmode=require"}'
 ```
 
-Use the direct connection, never a pooler. PgBouncer and Supavisor do not speak the replication protocol, and a DSN that points at one reconnects forever without an obvious error.
+Use the direct connection, never a pooler. PgBouncer and Supavisor do not speak the replication protocol, and a DSN that points at one reconnects forever without an obvious error. The secrets API writes to the local store, so it answers in standalone mode; on a multi-node cluster it returns 503, and the DSN goes in the secret store file each node is started with instead.
 
 ### 3. Create the Replicated Table
 
@@ -118,13 +118,13 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/users \
   }'
 ```
 
-Antfly creates a replication slot and a publication, snapshots the rows already in the table through the normal batch path, then polls the slot for changes. The source's `status` in the table detail moves from `snapshot` to `streaming`:
+Antfly creates a replication slot and a publication, snapshots the rows already in the table through the normal batch path, then polls the slot for changes. The source's `status.phase` in the table detail moves from `snapshot` to `streaming`:
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/tables/users -u admin:admin
 ```
 
-Three errors show up here and nowhere else. `permission denied to create replication slot` means the user lacks `REPLICATION` (or the managed-service role); pre-create the slot and pass `slot_name`. `publication does not exist` means the user cannot create publications; have the table owner create one and pass `publication_name`. `wal_level is not logical` means step 1 did not take effect, usually because the restart is still pending.
+Three failures show up here. `status.last_error` names the Antfly error, such as `ForeignQueryFailed`; PostgreSQL's own message is in the Antfly log. `permission denied to create replication slot` means the user lacks `REPLICATION` (or the managed-service role); pre-create the slot and pass `slot_name`. `publication does not exist` means the user cannot create publications; have the table owner create one and pass `publication_name`. `wal_level is not logical` means step 1 did not take effect, usually because the restart is still pending.
 
 ### 4. Watch a Row Arrive
 
@@ -226,7 +226,7 @@ Several PostgreSQL tables can feed one Antfly table. Give each source its own `o
 
 ### Managed PostgreSQL Setup
 
-Every provider needs the same two things, `wal_level = logical` and a user allowed to replicate, and each exposes them differently. Pre-create the publication as the table owner whenever the replication user does not own the table, then pass `publication_name`:
+Every provider needs the same two things, `wal_level = logical` and a user allowed to replicate, and each exposes them differently. Pre-create the publication as the table owner whenever the replication user does not own the table, then pass `publication_name`. Antfly still checks for the named publication on every poll and creates it if it is missing, so the name has to exist before the replication user connects:
 
 ```sql
 CREATE PUBLICATION antfly_pub_users FOR TABLE users;

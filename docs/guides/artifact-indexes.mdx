@@ -30,6 +30,7 @@ One document-level embedding captures the whole; the chunks that document extrac
 {
   "type": "embeddings",
   "dimension": 768,
+  "embedder": { "provider": "antfly", "model": "BAAI/bge-base-en-v1.5" },
   "sources": [
     { "artifact": "document_dense_v1" },
     { "artifact": "document_chunk_dense_v1" }
@@ -105,7 +106,7 @@ Creation starts materialization and replay; it does not mean coverage is complet
 
 - `readiness.queryable` is the serving authority: the index can answer queries.
 - `readiness.complete` is the convergence authority: every source is fully covered.
-- `pending_reasons` gives typed aggregate blockers or failure reasons.
+- `readiness.pending_reasons` gives typed aggregate blockers or failure reasons.
 - `readiness.sources` lists each artifact stream in configuration order with its state, completeness, and typed blockers, so document-vector lag and chunk-vector lag show up separately.
 
 Every index kind also reports a catalog-assigned `incarnation`, at the status root and inside `readiness`. A waiter succeeds only on a runtime observation of that same definition, so dropping and recreating an index under the same name cannot reuse stale readiness or searchable counts.

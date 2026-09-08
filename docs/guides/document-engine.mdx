@@ -34,7 +34,6 @@ Use `text` for analyzed search and an exact scalar mapping for exact filters and
 
 ```json
 {
-  "version": 1,
   "default_type": "doc",
   "document_schemas": {
     "doc": {
@@ -124,7 +123,7 @@ The planner normalizes the request into one execution shape. Full-text and seman
     "query": "body:database"
   },
   "filter_query": {
-    "query": "+published:true +created_at:>2026-01-01"
+    "query": "+published:true +created_at:[2026-01-01T00:00:00Z TO *]"
   },
   "order_by": [
     {"field": "created_at", "desc": true}

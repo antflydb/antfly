@@ -161,7 +161,7 @@ antfly standalone
 npm run dev
 ```
 
-Type into the search box and watch the results and facet counts move. Then ask a full question in the ask box and press Ask. If search works and the ask box does nothing, it is a `searchBoxId` typo. If both are silent, open the network tab: an empty multiquery means no widget is contributing a query.
+Type into the search box and watch the results and facet counts move. Before the first keystroke the page shows no results and no facet counts, because a semantic `Results` with an empty query contributes nothing to the batched request; that is expected, not a wiring fault. Then ask a full question in the ask box and press Ask. If search works and the ask box does nothing, it is a `searchBoxId` typo. If both are silent, open the network tab: an empty multiquery means no widget is contributing a query.
 
 ## Tradeoffs
 

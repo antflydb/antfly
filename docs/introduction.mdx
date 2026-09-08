@@ -34,6 +34,7 @@ Homebrew works too: `brew install antflydb/taps/antfly`.
   <TabsContent value="linux">
 ```bash
 curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
 antfly standalone
 ```
 
@@ -70,7 +71,7 @@ The [Quickstart](/docs/guides/quickstart) does the same with 10,000 Wikipedia ar
 
 ## Where to go next
 
-- [Quickstart](/docs/guides/quickstart), with every step in the CLI, cURL, TypeScript, Python, Go, and Rust
+- [Quickstart](/docs/guides/quickstart), with every step in the CLI, cURL, TypeScript, Python, and Go
 - [Guides](/docs/guides) that each end in one working thing: a support answer agent, site search with an answer box, ticket routing from Postgres, a copilot's retrieval, and more
 - Concept pages on the [document engine](/docs/guides/document-engine), [Antfly Inference](/docs/guides/inference), and [Antfly Lite](/docs/guides/lite)
 - [API reference](/docs/api) for the CLI and REST surface

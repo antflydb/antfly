@@ -56,7 +56,7 @@ antfly lite status app.aflite
 
 An `.afb` bundle's manifest names its representation: `portable` (logical records) or `native` (physical generations). Lite writes and reads the portable representation; a normal instance can also package native generations in the same envelope. AFB1 portable archives remain readable, and new bundles use AFB2, which declares the representation explicitly. The Lite `backup` and `export` commands emit a self-contained `full` bundle. AFB2 also defines `delta` bundles against an exact base for incremental repository workflows; a delta is never treated as a self-contained archive.
 
-Never treat `.aflite` as the backup format. A normal Antfly can restore directly from one, but that is a convenience for promotion, not an archive. The `.aflite` open path accepts the documented v1 native format and fails explicitly on unknown versions or invalid headers; pre-release directory and LSM-container experiments are not read. To keep one of those, export it with the matching development build and restore the resulting portable AFB1 or AFB2 bundle.
+Never treat `.aflite` as the backup format. A normal Antfly can restore directly from one, but that is a convenience for promotion, not an archive. The `.aflite` open path accepts the documented native single-file format and fails explicitly on unknown versions or invalid headers; pre-release directory and LSM-container experiments are not read. To keep one of those, export it with the matching development build and restore the resulting portable AFB1 or AFB2 bundle.
 
 ## Writes, Reads, and Indexes
 
@@ -188,16 +188,18 @@ Both directions are logical backup and restore. The portable stream carries docu
 antfly lite promote app.aflite \
   --target http://127.0.0.1:8080 \
   --table docs \
+  --connection archive-writer \
   --location file:///tmp/antfly_backups
 ```
 
-`antfly restore --input app.aflite --table docs --url http://127.0.0.1:8080` does the same thing through the normal restore command. Either way, omitting `--location` stages the backup under `~/.antfly/lite/backups`; pass it when the target needs a shared `file://`, `s3://`, or `gs://` location. For a repeatable release or disaster-recovery workflow, make the `.afb` explicit first:
+`antfly restore --input app.aflite --table docs --connection archive-writer --location file:///tmp/antfly_backups --url http://127.0.0.1:8080` does the same thing through the normal restore command. Either way `--connection` and `--location` are required: the target server reads the staged backup through that named connection, from a shared `file://`, `s3://`, or `gs://` location it can reach. For a repeatable release or disaster-recovery workflow, make the `.afb` explicit first:
 
 ```bash
 antfly lite backup app.aflite --out app.afb
 antfly restore \
   --input app.afb \
   --table docs \
+  --connection archive-writer \
   --location file:///tmp/antfly_backups \
   --url http://127.0.0.1:8080
 ```

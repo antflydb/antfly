@@ -99,7 +99,8 @@ model during index creation and records its dimension, so omit `dimension`
 unless you want creation to verify an expected value.
 
 For remote URLs, configure `remote_content` with the narrowest required host or
-object-store allowlist. Remote access is denied by default; private and special
+object-store allowlist. An omitted allowlist leaves template fetches
+unrestricted rather than denied, so set one deliberately; private and special
 IP addresses remain blocked unless explicitly enabled. Data URIs do not require
 network access, but they are still subject to request and decoded-media limits.
 

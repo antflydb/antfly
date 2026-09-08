@@ -27,7 +27,7 @@ An Antfly Cloud instance with an indexed table (the examples use `docs` with an 
 
 In the Antfly Cloud console, create an API key on the instance n8n should read, with key type **read only**. Copy it when it is shown; it is displayed once. Cloud keys carry an `antflydb_` prefix.
 
-The key type decides what the agent can do. A read-only key makes the instance filter its own tool list: the agent is offered the read tools (`query`, `get_document`, `describe_table`, `list_indexes`, `describe_indexes`, `sample_documents`, `describe_query_request`, `describe_mcp_capabilities`, and `list_tables` on an unscoped key) and never sees `batch`, `create_table`, or `drop_index`. The agent cannot write to your data because the tools to do it are never sent to it.
+The key type decides what the agent can do. A read-only key makes the instance filter its own tool list: the agent is offered the read tools (`query`, `get_document`, `describe_table`, `list_indexes`, `describe_indexes`, `sample_documents`, `describe_query_request`, `describe_mcp_capabilities`, and `list_tables` on an unscoped key) and never sees `batch`, `create_table`, or `drop_index`. The agent cannot write to your data: the tools to do it are never sent to it, and the instance re-checks the key's permissions before dispatching any call it does receive.
 
 Your MCP endpoint is your instance id dropped into the hosted path. Confirm the pair works before opening n8n:
 

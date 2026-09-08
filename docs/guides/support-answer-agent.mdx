@@ -25,8 +25,7 @@ antfly agents retrieval --table help \
                "field": "content", "candidate_count": 50}' \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{"provider": "ollama", "model": "gemma3:4b"}' \
-  --max-context-tokens 512 \
-  --generate
+  --no-streaming --generate
 ```
 
 ```json
@@ -53,10 +52,12 @@ antfly agents retrieval --table help \
 
 ## Before You Start
 
-Antfly running in standalone mode (the [Quickstart](/docs/guides/quickstart) leaves you there) and Ollama with a small model pulled:
+Antfly running in standalone mode with the embedding and reranking models pulled (the [Quickstart](/docs/guides/quickstart) leaves you there), and Ollama with a small model pulled:
 
 ```bash
 curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
 ollama pull gemma3:4b
 ```
 
@@ -115,7 +116,11 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/help/batch \
   }'
 ```
 
-Each article is chunked and embedded as it lands. Re-insert an article under the same key to update it.
+Each article is chunked and embedded in the background. Wait for the index before querying it; re-insert an article under the same key to update it.
+
+```bash
+antfly index wait --table help --index title_content --until complete --timeout 10m
+```
 
 ### 3. Retrieve, Rerank, Prune, Answer
 
@@ -145,8 +150,7 @@ antfly agents retrieval --table help \
     "provider": "ollama",
     "model": "gemma3:4b"
   }' \
-  --max-context-tokens 512 \
-  --generate
+  --no-streaming --generate
 ```
   </TabsContent>
 
@@ -174,7 +178,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
       "provider": "ollama",
       "model": "gemma3:4b"
     },
-    "max_context_tokens": 512,
+    "stream": false,
     "steps": {
       "generation": {"enabled": true}
     }
@@ -183,7 +187,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   </TabsContent>
 </Tabs>
 
-The response carries `generation`, the answer in markdown with the article ids it drew on, and `hits`, the articles that survived pruning. Render the answer, link the hits as sources. Add `"stream": true` to get the answer as server-sent events instead of one JSON body.
+The response carries `generation`, the answer in markdown with the article ids it drew on, and `hits`, the articles that survived pruning. Render the answer, link the hits as sources. Streaming is the default: drop `"stream": false` (or `--no-streaming`) and the answer arrives as server-sent events instead of one JSON body.
 
 The generator here is Ollama on the same machine. Gemini, Vertex, OpenAI, and Antfly Inference work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
 

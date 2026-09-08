@@ -22,7 +22,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
     "query": "Checkout fails with a 502 after entering card details",
     "queries": [{
       "table": "tickets",
-      "full_text_search": {"query": "status:resolved"},
+      "filter_query": {"query": "status:resolved"},
       "semantic_search": "Checkout fails with a 502 after entering card details",
       "indexes": ["subject_body"],
       "fields": ["subject", "team", "resolution"],
@@ -36,7 +36,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
       "pruner": {"min_score_ratio": 0.6}
     }],
     "generator": {"provider": "ollama", "model": "gemma3:4b"},
-    "max_context_tokens": 512,
+    "stream": false,
     "steps": {
       "generation": {
         "enabled": true,
@@ -72,7 +72,12 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 
 ## Before You Start
 
-Antfly running, a Postgres with `wal_level = logical`, and its connection string stored as a secret:
+Antfly running with the embedding and reranking models pulled (the [Quickstart](/docs/guides/quickstart) leaves you there), a Postgres with `wal_level = logical`, and its connection string stored as a secret:
+
+```bash
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+```
 
 ```bash
 curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
@@ -113,7 +118,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/tickets \
   }'
 ```
 
-Every `INSERT` and `UPDATE` on the Postgres table now flows in, resolved tickets included, with their `team` and `resolution` columns intact. Confirm the stream is live:
+Every `INSERT` and `UPDATE` on the Postgres table now flows in, resolved tickets included, with their `team` and `resolution` columns intact. The source table needs `subject`, `body`, `status`, `team`, and `resolution` columns for the rest of this guide; a missing `body` gives the reranker empty text to score and no error. Antfly snapshots the existing rows first, so `status.phase` in the table detail moves from `snapshot` to `streaming`; once it does, confirm the rows arrived:
 
 ```bash
 antfly query --table tickets --full-text-search 'status:resolved' --fields subject,team --limit 3
@@ -130,7 +135,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "tickets",
-    "full_text_search": {"query": "status:resolved"},
+    "filter_query": {"query": "status:resolved"},
     "semantic_search": "Checkout fails with a 502 after entering card details",
     "indexes": ["subject_body"],
     "fields": ["subject", "team", "resolution"],
@@ -145,7 +150,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
   }'
 ```
 
-The keyword side restricts the pool to resolved tickets. The semantic side finds the ones that read like this one. The reranker orders them by how well the full body matches, and the pruner drops the ones that only loosely do. Whatever survives is the evidence the routing decision rests on.
+The filter restricts the pool to resolved tickets before anything is scored. The semantic side finds the ones that read like this one. The reranker orders them by how well the full body matches, and the pruner drops the ones that only loosely do. Whatever survives is the evidence the routing decision rests on.
 
 ### 3. Classify the Ticket
 

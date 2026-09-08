@@ -86,7 +86,7 @@ Hosted generation providers (OpenAI and Gemini/Vertex), Ollama, and Antfly's gen
 | State | Meaning | Behavior |
 |---|---|---|
 | `compatible` | Static checks found a viable runtime path for this artifact and build. | May load, subject to resource admission. |
-| `unknown` | Antfly cannot prove compatibility or incompatibility without trying an unrecognized contract. | Rejected by default; opt in with `--allow-unknown-models`. |
+| `unknown` | Antfly cannot prove compatibility or incompatibility without trying an unrecognized contract. | Attempted by default; the selected backend validates it at load time. |
 | `incompatible` | A required artifact or backend is missing, a tensor contract cannot be materialized, or the path is known unsafe or unusable. | Always rejected before load; the unknown-model opt-in cannot override it. |
 
 A known-incompatible generation request returns HTTP 400:
@@ -98,13 +98,13 @@ A known-incompatible generation request returns HTTP 400:
 }
 ```
 
-An artifact whose compatibility cannot be determined returns `UNKNOWN_MODEL_COMPATIBILITY` instead. To try it deliberately:
+An artifact whose compatibility cannot be determined is attempted anyway, and the backend validates it when it loads. Under a strict policy the same artifact returns `UNKNOWN_MODEL_COMPATIBILITY` instead:
 
 ```bash
 antfly inference run --allow-unknown-models
 ```
 
-The flag does not bypass `INCOMPATIBLE_MODEL` or resource limits.
+The flag is accepted for compatibility and selects what is already the default. Nothing lifts `INCOMPATIBLE_MODEL` or resource limits.
 
 ## Resource Fit Is a Separate Check
 
@@ -189,7 +189,7 @@ Rejected with HTTP 400 before any load. Some of these do not merely fail; they w
 
 **Mixed-variant model directories.** Pulling a second variant into a directory that already holds another leaves both in place, and different parts of a model can then resolve to different variants. ClipClap in particular fails this way. Keep one variant per directory; if in doubt, delete and re-pull.
 
-**Chunk overlap.** `/chunk` returns `InvalidChunkOverlap` when `target_tokens` is smaller than `overlap_tokens`. Set both together when using small chunks.
+**Chunk overlap.** `/chunk` returns `InvalidChunkOverlap` when `target_tokens` is not larger than `overlap_tokens`; equal values fail too. Set both together when using small chunks.
 
 ## Checking a Model Before Running It
 

@@ -123,7 +123,7 @@ An embeddings index reports its own backlog. Inspect it while enrichment is pend
 curl http://127.0.0.1:8080/db/v1/tables/TABLE/indexes/INDEX
 ```
 
-The `enrichment_runtime` object carries sequence progress, retry and failure counters, the active batch, and worker lifecycle state. `worker_started` says whether the background worker is running. `stalled` is the narrower condition: work is pending, no worker is running, and no retry or terminal failure already explains the backlog.
+The `enrichment_runtime` object carries sequence progress, retry and failure counters, the active batch, and worker lifecycle state. `worker_started` says whether the background worker is running. `stalled` is the narrower condition: work is pending, no retry or terminal failure already explains the backlog, and either no worker is running or the active batch has passed its deadline without progress. `stall_reason` says which (`worker_missing`, `model_loading`, `embedding_overdue`, or `publishing_overdue`).
 
 For keys that have reached the durable repair queues, ask the bounded operator endpoint:
 
