@@ -9113,3 +9113,50 @@ It is reserved for a separate matched comparison, not substituted into the
 running baseline matrix. No new experiment is promoted. True reusable
 physical checkpoint chunks remain unimplemented: folding a delta suffix
 retains the base but still rewrites the selected suffix's serving rows.
+
+The reversed 1M pair subsequently completed and passed the same qualification
+and recall gates. Full results are in `full-comparison.json` under that matrix:
+
+| Reversed 1M pair | Ready s | C30 QPS | C30 p95 ms | Live recall | Mixed write p95 ms | Mixed query p95 ms | Mixed catch-up s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Current checkpoint default | 290.453 | 873.8 | 65.104 | 99.07% | 90.157 | 45.287 | 31.528 |
+| Preserved no-copy | 281.802 | 894.1 | 66.010 | 99.00% | 90.779 | 39.306 | 31.235 |
+
+Current/baseline sampled load/read-only RSS is 6.146/6.118 GB, mixed RSS is
+6.447/6.335 GB, live physical-footprint ledger peak is 0.524/0.537 GB and
+allocated disk after restart is 3.799/3.804 GB. The large first-pair regression
+does not repeat at the same magnitude, but current still does not win across
+load, read-only, mixed, memory and disk. Approximate candidate work remains
+about 239K–240K vectors/query in all four 1M fixed profiles. A scheduling fix
+cannot be credited with reducing that routing work.
+
+The dedicated completion-lane A/B is running independently under
+`pr593-completion-lane-ab-20260908-retry`, against the pre-lane current binary.
+The initial sandboxed attempt failed to bind the health server and is retained
+as failed evidence, not a performance arm. The retry uses the same public API
+contract outside the sandbox. No performance result for the lane is claimed
+until the paired run finishes.
+
+Follow-up review found that `decodeOwnedEntry` reused a mmap verification bit
+to authenticate bytes from a separate cold-read buffer. Private checkpoint
+reads now always authenticate their own candidate bytes with `antfly_hash.Crc32`
+and validate projection rows; successful private reads no longer mark the
+different mmap buffer as verified. A warm-mapping/corrupted-private-read test
+guards against silently republishing corruption. This changes maintenance,
+not the warm query fast path. The fix is committed as `16a18eb38`; the running
+lane A/B deliberately retains the earlier binary to isolate that treatment.
+
+Seven focused Debug storage checks pass, now including publication deferral
+under the catalog barrier used by native backup. The standalone quantized
+directory suite also passes, including the new private-read checks. The
+benchmark launcher was paused only between timed arms for these compiles,
+then resumed; no owned compiler overlapped measured server work.
+
+`scripts/summarize_posting_reuse.py` adds a post-run evidence gate for the
+separate suffix experiment, with six passing Python tests. It requires an
+actual `compact_deltas` publication, not merely an enabled flag or a completed
+worker, and retains repeated retained-byte samples rather than counting them
+as cumulative disk savings. On the first pre-lane 1M candidate it finds 11
+delta and two full handoffs, writing 1.631 GB and 0.422 GB respectively, and
+no suffix publication (the flag was off, as intended). These are checkpoint
+write totals, not total primary/source/WAL amplification or peak disk usage.
