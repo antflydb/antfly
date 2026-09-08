@@ -8500,6 +8500,16 @@ pub fn build(b: *std.Build) void {
     sim_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "db reverse graph probe rejects a deleted or replaced index incarnation",
+        "graph pagerank planned scan page writes durable out-degree intermediates",
+        "graph pagerank contribution and reduce pages resume",
+        "graph pagerank later iteration pages resume",
+        "graph pagerank convergence page reclaim",
+        "graph eigenvector contribution and reduce pages resume",
+        "graph eigenvector convergence page reclaim",
+        "graph hits contribution and reduce pages resume",
+        "graph hits hub contribution and hub reduce pages resume",
+        "graph hits convergence page reclaim",
         "graph metric runtime config rejects",
         "graph metric runtime role gates apply",
         "graph metric runtime worker pool identity",
@@ -8581,6 +8591,7 @@ pub fn build(b: *std.Build) void {
     );
     const graph_metric_unit_test_step = b.step("graph-metric-unit-test", "Run cheap graph metric runtime, ownership, and query tests");
     graph_metric_unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
+    b.step("graph-metric-core-test", "Run graph metric core unit tests without rebuilding API/wire harnesses").dependOn(&run_graph_metric_unit_tests.step);
     const graph_metric_topology_filters = [_][]const u8{"graph metric shared topology"};
     const graph_metric_topology_tests = b.addTest(.{
         .root_module = db_test_mod,

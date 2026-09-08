@@ -6329,15 +6329,7 @@ pub const IndexManager = struct {
                             if (failed_generation >= status.target_edge_generation) continue;
                         }
                         if (options.auto_idle_options) |auto_options| {
-                            if (!graphMetricShouldAutoStartQueuedBuild(
-                                entry.metric_configs,
-                                cfg,
-                                auto_options,
-                                active_builds_before_start,
-                                scheduled_builds,
-                                index_active_builds,
-                                index_scheduled_builds,
-                            )) continue;
+                            if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, auto_options)) continue;
                         } else if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
                         if (!try entry.index.prepareGraphMetricPartitionStep(4096)) {
                             result.planning_steps += 1;
@@ -6354,6 +6346,17 @@ pub const IndexManager = struct {
                                 continue;
                             },
                             .waiting => continue,
+                        }
+                        if (options.auto_idle_options) |auto_options| {
+                            if (!graphMetricShouldAutoStartQueuedBuild(
+                                entry.metric_configs,
+                                cfg,
+                                auto_options,
+                                active_builds_before_start,
+                                scheduled_builds,
+                                index_active_builds,
+                                index_scheduled_builds,
+                            )) continue;
                         }
                         var started = entry.index.ensureGraphMetricPlannedBuildFromCachedPlan(cfg.name, status.target_edge_generation) catch |err| switch (err) {
                             error.GraphMetricDisabled => continue,

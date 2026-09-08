@@ -217,6 +217,25 @@ const RankedScoreBoundaryValidator = struct {
     }
 };
 const ScoreFetchRange = struct { first_block: usize, last_block: usize, offset: u64, len: usize };
+
+// Covers an authenticated fill/lease plus its contiguous output (or origin
+// temporary), and the block descriptors used while both are live.
+fn transportMemoryBytes(bytes: usize, blocks: usize) !usize {
+    const payload = std.math.mul(usize, bytes, 2) catch return error.GraphMetricQueryBudgetExceeded;
+    const metadata = std.math.mul(usize, blocks, 256) catch return error.GraphMetricQueryBudgetExceeded;
+    return std.math.add(usize, payload, metadata) catch return error.GraphMetricQueryBudgetExceeded;
+}
+
+const OwnedMetricRange = struct {
+    bytes: []u8,
+    memory: runtime_mod.GraphMetricReadBudget.Reservation = .{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.bytes);
+        self.memory.deinit();
+        self.* = undefined;
+    }
+};
 // Default used by isolated planner tests. Production derives this from the
 // whole query's remaining budget after preparing every column's routing.
 const max_score_range_requests: usize = 60;
@@ -243,6 +262,40 @@ fn metricRangeBatchEnd(ranges: []const ScoreFetchRange, start: usize) usize {
         bytes = next_bytes;
     }
     return end;
+}
+
+fn admittedMetricRangeBatchEnd(session: *runtime_mod.QuerySession, ranges: []const ScoreFetchRange, start: usize) !usize {
+    const available = if (session.graph_metric_transport_credit != 0) session.graph_metric_transport_credit else session.graphMetricMemoryAvailable();
+    const cap = metricRangeBatchEnd(ranges, start);
+    var used: usize = 0;
+    var end = start;
+    while (end < cap) : (end += 1) {
+        const range = ranges[end];
+        const bytes = try transportMemoryBytes(range.len, range.last_block -| range.first_block + 1);
+        if (bytes > available -| used) break;
+        used += bytes;
+    }
+    if (end == start) return error.GraphMetricQueryBudgetExceeded;
+    return end;
+}
+
+fn minimumPlanTransportMemory(plan: PointScorePlan) !usize {
+    var minimum: usize = 0;
+    for (plan.ranges) |range| minimum = @max(minimum, try transportMemoryBytes(range.len, range.last_block -| range.first_block + 1));
+    return minimum;
+}
+
+fn preferredPlanTransportMemory(plan: PointScorePlan) !usize {
+    var preferred: usize = 0;
+    var start: usize = 0;
+    while (start < plan.ranges.len) {
+        const end = metricRangeBatchEnd(plan.ranges, start);
+        var bytes: usize = 0;
+        for (plan.ranges[start..end]) |range| bytes = std.math.add(usize, bytes, try transportMemoryBytes(range.len, range.last_block -| range.first_block + 1)) catch return error.GraphMetricQueryBudgetExceeded;
+        preferred = @max(preferred, bytes);
+        start = end;
+    }
+    return preferred;
 }
 
 pub fn scoreAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph_index_name: []const u8, metric_name: []const u8, node_id: []const u8) !?Score {
@@ -425,7 +478,31 @@ fn scoreColumnsWithScopeAlloc(
         if (pass == .execute) try admitPointPlans(alloc, session, plans[0..physical_count]);
         var start: usize = 0;
         while (start < physical_count) {
-            const end = @min(start + max_parallel_point_score_columns, physical_count);
+            var end = @min(start + max_parallel_point_score_columns, physical_count);
+            var transport: runtime_mod.GraphMetricReadBudget.Reservation = .{};
+            defer transport.deinit();
+            var transport_credit: usize = 0;
+            if (pass == .execute) {
+                const available = session.graphMetricMemoryAvailable();
+                // Reserve the whole execution group before launching children.
+                // Reduce fanout before rejecting a request which fits serially.
+                while (true) {
+                    var minimum: usize = 0;
+                    var preferred: usize = 0;
+                    for (plans[start..end]) |plan| {
+                        minimum = @max(minimum, try minimumPlanTransportMemory(plan.?));
+                        preferred = @max(preferred, try preferredPlanTransportMemory(plan.?));
+                    }
+                    const share = available / (end - start);
+                    if (minimum <= share) {
+                        transport_credit = @min(share, preferred);
+                        transport = try session.reserveGraphMetricMemory(transport_credit * (end - start));
+                        break;
+                    }
+                    if (end == start + 1) return error.GraphMetricQueryBudgetExceeded;
+                    end -= 1;
+                }
+            }
             const count = end - start;
             var children: [max_parallel_point_score_columns]runtime_mod.QuerySession = undefined;
             var diagnostics: [max_parallel_point_score_columns]operation.RequestDiagnostics = @splat(.{});
@@ -436,6 +513,7 @@ fn scoreColumnsWithScopeAlloc(
             // Every fallible allocation happened before launching these workers.
             for (physical_names[start..end], 0..) |metric_name, i| {
                 children[i] = session.forkGraphMetricRead(std.heap.smp_allocator);
+                if (pass == .execute) children[i].graph_metric_transport_credit = transport_credit;
                 cancellations[i] = .{ .parent = session.cancellation, .sibling_failure = &sibling_failure };
                 children[i].cancellation = cancellations[i].token();
                 if (session.diagnostics != null) children[i].setDiagnostics(&diagnostics[i]);
@@ -807,7 +885,7 @@ fn executePointScores(session: *runtime_mod.QuerySession, plan: *const PointScor
     const fetch_ranges = plan.ranges;
     var fetch_start: usize = 0;
     while (fetch_start < fetch_ranges.len) {
-        const fetch_end = metricRangeBatchEnd(fetch_ranges, fetch_start);
+        const fetch_end = try admittedMetricRangeBatchEnd(session, fetch_ranges, fetch_start);
         const range_batch = fetch_ranges[fetch_start..fetch_end];
         var fetched_ranges = try fetchMetricRangeBatchAlloc(
             alloc,
@@ -1186,19 +1264,26 @@ fn fetchMetadataRangeAlloc(session: *runtime_mod.QuerySession, metric_index: usi
     const end = std.math.add(u64, last.offset, last.len) catch return error.InvalidGraphMetricSegment;
     const extent = std.math.sub(u64, end, entries[0].offset) catch return error.InvalidGraphMetricSegment;
     const len = std.math.cast(usize, extent) orelse return error.InvalidGraphMetricSegment;
+    // Metadata output is retained by its read scope; transport temporaries
+    // have a separate live reservation. Never charge network bytes as memory.
+    try session.chargeGraphMetricRetained(len);
     // Large valid metadata can exceed the canonical memory pool's per-fill
     // limit. Authenticate it directly; optional disk retention must not become
     // a synchronous fallback on the serving path.
     if (len > coalesced_score_window_bytes) {
+        var memory = try session.reserveGraphMetricMemory(try transportMemoryBytes(len, entries.len));
+        defer memory.deinit();
         try session.chargeGraphMetricRange(len);
         return fetchCanonicalRunAlloc(session.alloc, session, metric_index, entries);
     }
-    return fetchMetricRangeAlloc(session.alloc, session, metric_index, metric_segment.wire_version, entries, .{
+    var fetched = try fetchMetricRangeAlloc(session.alloc, session, metric_index, metric_segment.wire_version, entries, .{
         .offset = entries[0].offset,
         .len = len,
         .first_block = 0,
         .last_block = entries.len - 1,
     }, .metadata);
+    defer fetched.memory.deinit();
+    return fetched.bytes;
 }
 
 const DirectoryRead = struct {
@@ -1382,7 +1467,7 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
         defer alloc.free(ranges);
         var start: usize = 0;
         while (start < ranges.len) {
-            const end = metricRangeBatchEnd(ranges, start);
+            const end = try admittedMetricRangeBatchEnd(session, ranges, start);
             var fetched = try fetchMetricRangeBatchAlloc(alloc, session, metric_index, control.header.version, directory.entries, ranges[start..end], .routing);
             defer fetched.deinit(alloc);
             for (ranges[start..end], fetched.payloads) |range, *payload| {
@@ -1666,6 +1751,24 @@ fn fetchMetricRangeAlloc(
     entries: []const metric_segment.codec.RoutingEntry,
     range: ScoreFetchRange,
     kind: MetricRangeKind,
+) !OwnedMetricRange {
+    const memory_bytes = try transportMemoryBytes(range.len, range.last_block -| range.first_block + 1);
+    var memory: runtime_mod.GraphMetricReadBudget.Reservation = .{};
+    if (session.graph_metric_transport_credit == 0) {
+        memory = try session.reserveGraphMetricMemory(memory_bytes);
+    } else if (memory_bytes > session.graph_metric_transport_credit) return error.GraphMetricQueryBudgetExceeded;
+    errdefer memory.deinit();
+    return .{ .bytes = try fetchMetricRangeBytesAlloc(alloc, session, metric_index, segment_version, entries, range, kind), .memory = memory };
+}
+
+fn fetchMetricRangeBytesAlloc(
+    alloc: Allocator,
+    session: *runtime_mod.QuerySession,
+    metric_index: usize,
+    segment_version: u16,
+    entries: []const metric_segment.codec.RoutingEntry,
+    range: ScoreFetchRange,
+    kind: MetricRangeKind,
 ) ![]u8 {
     if (kind != .reserved_score) try session.chargeGraphMetricRange(range.len);
     if (segment_version != metric_segment.wire_version) return error.InvalidGraphMetricSegment;
@@ -1781,10 +1884,12 @@ fn fetchCanonicalRunAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
 
 const FetchedMetricRanges = struct {
     payloads: [][]u8,
+    memory: runtime_mod.GraphMetricReadBudget.Reservation = .{},
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.payloads) |payload| if (payload.len > 0) std.heap.smp_allocator.free(payload);
         alloc.free(self.payloads);
+        self.memory.deinit();
     }
 };
 
@@ -1798,7 +1903,7 @@ fn fetchMetricRangeWorker(
     failure: *?anyerror,
     kind: MetricRangeKind,
 ) void {
-    output.* = fetchMetricRangeAlloc(
+    const fetched = fetchMetricRangeAlloc(
         std.heap.smp_allocator,
         child,
         metric_index,
@@ -1810,6 +1915,9 @@ fn fetchMetricRangeWorker(
         failure.* = err;
         return;
     };
+    // The joined batch owns the reservation for every child output.
+    std.debug.assert(fetched.memory.budget == null);
+    output.* = fetched.bytes;
 }
 
 /// Fetch independent immutable routing or score ranges with bounded fanout.
@@ -1833,6 +1941,13 @@ fn fetchMetricRangeBatchAlloc(
     }
     if (requested_bytes > max_parallel_metric_range_bytes)
         return error.GraphMetricQueryBudgetExceeded;
+    var memory_bytes: usize = 0;
+    for (ranges) |range| memory_bytes = std.math.add(usize, memory_bytes, try transportMemoryBytes(range.len, range.last_block -| range.first_block + 1)) catch return error.GraphMetricQueryBudgetExceeded;
+    var memory: runtime_mod.GraphMetricReadBudget.Reservation = .{};
+    if (session.graph_metric_transport_credit == 0) {
+        memory = try session.reserveGraphMetricMemory(memory_bytes);
+    } else if (memory_bytes > session.graph_metric_transport_credit) return error.GraphMetricQueryBudgetExceeded;
+    errdefer memory.deinit();
     const payloads = try alloc.alloc([]u8, ranges.len);
     @memset(payloads, @constCast((&[_]u8{})[0..]));
     errdefer {
@@ -1846,6 +1961,7 @@ fn fetchMetricRangeBatchAlloc(
         var group: std.Io.Group = .init;
         for (ranges, 0..) |range, index| {
             children[index] = session.forkGraphMetricRead(std.heap.smp_allocator);
+            children[index].graph_metric_transport_credit = transportMemoryBytes(range.len, range.last_block -| range.first_block + 1) catch unreachable;
             group.async(io, fetchMetricRangeWorker, .{
                 &children[index], metric_index, segment_version, entries, range, &payloads[index], &failures[index], kind,
             });
@@ -1856,6 +1972,7 @@ fn fetchMetricRangeBatchAlloc(
     } else {
         for (ranges, 0..) |range, index| {
             children[index] = session.forkGraphMetricRead(std.heap.smp_allocator);
+            children[index].graph_metric_transport_credit = transportMemoryBytes(range.len, range.last_block -| range.first_block + 1) catch unreachable;
             fetchMetricRangeWorker(
                 &children[index],
                 metric_index,
@@ -1870,7 +1987,7 @@ fn fetchMetricRangeBatchAlloc(
         for (children[0..ranges.len]) |*child| child.deinit();
     }
     for (failures[0..ranges.len]) |failure| if (failure) |err| return err;
-    return .{ .payloads = payloads };
+    return .{ .payloads = payloads, .memory = memory };
 }
 
 fn fetchRankedScoreBlocksAlloc(
@@ -1879,8 +1996,8 @@ fn fetchRankedScoreBlocksAlloc(
     metric_index: usize,
     entries: []const metric_segment.codec.RankedRoutingEntry,
     first_block: usize,
-) ![]u8 {
-    if (entries.len == 0) return try session.alloc.alloc(u8, 0);
+) !OwnedMetricRange {
+    if (entries.len == 0) return .{ .bytes = try session.alloc.alloc(u8, 0) };
     const canonical = try alloc.alloc(metric_segment.codec.RoutingEntry, entries.len);
     defer alloc.free(canonical);
     var len: usize = 0;
@@ -2033,8 +2150,9 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
                 range_bytes = std.math.add(usize, range_bytes, entry_len) catch return error.GraphMetricQueryBudgetExceeded;
             }
             const range_entries = routing.ranked_entries[block_cursor..range_end];
-            const ranked_payload = try fetchRankedScoreBlocksAlloc(alloc, session, metric_index, range_entries, block_cursor);
-            defer session.alloc.free(ranked_payload);
+            var fetched = try fetchRankedScoreBlocksAlloc(alloc, session, metric_index, range_entries, block_cursor);
+            defer fetched.deinit(session.alloc);
+            const ranked_payload = fetched.bytes;
             for (range_entries) |entry| {
                 try session.checkCancellation();
                 const relative_offset = std.math.cast(usize, entry.offset -| range_entries[0].offset) orelse return error.InvalidGraphMetricSegment;
@@ -2251,6 +2369,28 @@ test "serverless graph metric candidate prefix keys preserve binary ties and all
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "serverless graph metric transport admission bounds cache copies and adapts batch width" {
+    const alloc = std.testing.allocator;
+    var session = runtime_mod.QuerySession{ .alloc = alloc, .artifacts = undefined, .manifest = undefined };
+    const range = ScoreFetchRange{ .first_block = 0, .last_block = 0, .offset = 0, .len = 4096 };
+    const ranges = [_]ScoreFetchRange{range} ** 8;
+    const peak = try transportMemoryBytes(range.len, 1);
+    session.graph_metric_read_budget.limits.max_retained_bytes = peak;
+    try std.testing.expectEqual(@as(usize, 1), try admittedMetricRangeBatchEnd(&session, &ranges, 0));
+    var owned = OwnedMetricRange{ .bytes = try alloc.alloc(u8, range.len), .memory = try session.reserveGraphMetricMemory(peak) };
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, admittedMetricRangeBatchEnd(&session, &ranges, 0));
+    // Admission must fail before touching artifact metadata or issuing I/O.
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, fetchMetricRangeAlloc(alloc, &session, 0, metric_segment.wire_version, &.{}, range, .score));
+    owned.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), session.graph_metric_read_budget.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), try admittedMetricRangeBatchEnd(&session, &ranges, 0));
+    session.graph_metric_read_budget.limits.max_retained_bytes = 2 * peak;
+    try std.testing.expectEqual(@as(usize, 2), try admittedMetricRangeBatchEnd(&session, &ranges, 0));
+    // Children consume only their pre-reserved share, not siblings' capacity.
+    session.graph_metric_transport_credit = peak;
+    try std.testing.expectEqual(@as(usize, 1), try admittedMetricRangeBatchEnd(&session, &ranges, 0));
 }
 
 test "serverless graph metric top result admission bounds descriptors and incremental node ownership" {
@@ -3057,8 +3197,9 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
     session.graph_metric_read_budget = .{ .limits = .{ .max_retained_bytes = routing_retained } };
     state.range_calls.store(0, .monotonic);
     try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, topAlloc(alloc, &session, "graph_idx", "rank", 1));
-    // Shared result admission must stop before the ranked score fetch too.
-    try std.testing.expectEqual(@as(usize, 2), state.range_calls.load(.monotonic));
+    // The final retained routing fits, but its transient transport copies do
+    // not. Reject before the routing fetch, and therefore before score I/O.
+    try std.testing.expectEqual(@as(usize, 1), state.range_calls.load(.monotonic));
     session.graph_metric_read_budget = .{};
     state.range_calls.store(0, .monotonic);
     var top = try topWithLimitsAlloc(alloc, &session, "graph_idx", "rank", metric_segment.score_block_entries + 1, .{});
@@ -3156,15 +3297,15 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         defer for (&children) |*child| child.deinit();
         for (&children) |*child| child.io = io;
         const Worker = struct {
-            fn run(child: *runtime_mod.QuerySession, entries: []const metric_segment.codec.RankedRoutingEntry, output: *?[]u8, failure: *?anyerror) void {
+            fn run(child: *runtime_mod.QuerySession, entries: []const metric_segment.codec.RankedRoutingEntry, output: *?OwnedMetricRange, failure: *?anyerror) void {
                 output.* = fetchRankedScoreBlocksAlloc(std.heap.smp_allocator, child, 1, entries, 0) catch |err| {
                     failure.* = err;
                     return;
                 };
             }
         };
-        var outputs: [2]?[]u8 = @splat(null);
-        defer for (outputs) |output| if (output) |bytes| std.heap.smp_allocator.free(bytes);
+        var outputs: [2]?OwnedMetricRange = @splat(null);
+        defer for (&outputs) |*output| if (output.*) |*range| range.deinit(std.heap.smp_allocator);
         var failures: [2]?anyerror = @splat(null);
         var group: std.Io.Group = .init;
         // Always unblock and join before destroying any worker-owned state.
@@ -3189,7 +3330,11 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         try std.testing.expectEqual(@as(usize, 1), shared);
         for (failures) |failure| if (failure) |err| return err;
         try std.testing.expectEqual(@as(usize, 1), state.range_calls.load(.monotonic));
-        try std.testing.expectEqualSlices(u8, outputs[0].?, outputs[1].?);
+        try std.testing.expectEqualSlices(u8, outputs[0].?.bytes, outputs[1].?.bytes);
+        for (&outputs) |*output| {
+            output.*.?.deinit(std.heap.smp_allocator);
+            output.* = null;
+        }
 
         // Changing K must download only the newly needed canonical block.
         state.range_bytes.store(0, .monotonic);

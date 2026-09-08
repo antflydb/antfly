@@ -12303,6 +12303,67 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[1].scores[0].node);
 }
 
+test "db graph metric runtime default gate prepares topology while numerical capacity is occupied" {
+    const DB = @import("../mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json =
+        \\{"metrics":{"degree":{"enabled":true,"kind":"degree","refresh":"manual"},"rank":{"enabled":true,"kind":"pagerank","refresh":"background","max_iterations":2}}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "a", .value = "{\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"b\"}]}}}" },
+            .{ .key = "b", .value = "{}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+    var active = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", entry.index.edge_generation);
+    defer active.deinit(alloc);
+    const cfg = for (entry.metric_configs) |cfg| {
+        if (std.mem.eql(u8, cfg.name, "rank")) break cfg;
+    } else return error.MetricNotConfigured;
+    const options = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions{
+        .max_metrics = 8,
+        .auto_idle_options = .{ .max_active_builds = 1, .max_active_builds_per_index = 1 },
+    };
+    // Keep the degree job active: only preparation workers are advanced.
+    var admitted = false;
+    for (0..16) |_| {
+        const sweep = try db.runGraphMetricPlannedCoordinatorSweep(options);
+        try std.testing.expectEqual(@as(usize, 0), sweep.builds_started);
+        if (try entry.index.runGraphMetricTopologyPreparationStep("prepare-at-cap")) {
+            admitted = true;
+            break;
+        }
+    }
+    try std.testing.expect(admitted);
+    for (0..128) |_| {
+        if (try entry.index.prepareGraphMetricTopology(cfg, entry.index.edge_generation)) break;
+        _ = try entry.index.runGraphMetricTopologyPreparationStep("prepare-at-cap");
+    } else return error.TopologyPreparationDidNotSeal;
+    const sweep = try db.runGraphMetricPlannedCoordinatorSweep(options);
+    try std.testing.expectEqual(@as(usize, 0), sweep.builds_started);
+    var waiting = try entry.index.graphMetricStatus("rank");
+    defer waiting.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), waiting.build_job_id);
+    var degree = try entry.index.graphMetricStatus("degree");
+    defer degree.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, degree.state);
+}
+
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance defers queued work at per-index cap" {
     const DB = @import("../mod.zig").DB;
     const alloc = std.testing.allocator;

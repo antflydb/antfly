@@ -22,13 +22,18 @@ discovery and adjacency production, reads the shared canonical membership for
 its own seed/initialization, and uses shared packed tiles for every iteration.
 HITS topology can serve PageRank or eigenvector; a forward-only owner cannot
 satisfy HITS. Published scores keep their existing format; intermediate jobs
-from execution schemas before v16 restart.
+from execution schemas before v17 restart.
 
 Cold scheduled builds first enqueue an index-scoped preparation task keyed by
 generation, filter and required orientation. Concurrent PageRank/eigenvector
 requests share it; queued HITS requirements select a bidirectional task. The
 task has its own control namespace, page leases and recovery checkpoints, and
-one independently admitted execution slot per index. It builds membership and
+one independently admitted execution slot per index. At most 16 distinct cold
+tasks are admitted per index; compatible consumers join an existing task without
+using another slot. Admission precedes the numerical active-build cap, so ready
+topology can be prepared while numerical slots are occupied. Each bounded
+checkpoint rotates to the next task. The rotation cursor is an in-memory fairness
+hint, while task incarnations and leases provide durable recovery. It builds membership and
 packed adjacency without rank vectors or score publication. Waiting metrics
 retain durable requests, but hold no numerical lease or admission slot.
 Only after the owner seals does the coordinator admit numerical jobs. Explicit
@@ -40,9 +45,13 @@ durably marked before bounded control-key deletion, so a crash cannot resurrect
 a partially deleted task. A durable monotonic incarnation gives each retry a
 separate control namespace. Admission, failure delivery and retirement validate
 that incarnation, including across reopened handles. Failure delivery is
-idempotent per task/dependent so a delayed reporter cannot consume a new manual
-retry request. Generation changes and loss of all eligible consumers
+idempotent per task/canonical lifecycle owner so a delayed reporter cannot consume
+a new manual retry request. Paired HITS failures use the authority owner even when
+the hub alias reports first; both lanes receive the same root cause atomically.
+Generation changes and loss of all eligible consumers
 retire preparation; independent numerical/publication lifetimes are unchanged.
+Inline numerical drains propagate coordinator terminal failures as failed status,
+preserving the durable root cause instead of replacing it with an idle-page error.
 Intermediate partition-plan v7 uses 4,096-unit scheduling ranges (capped at 256
 partitions), with byte/work-bounded checkpoints within each range. Canonical
 256-entry membership/vector chunks remain separate from scheduling page size.
@@ -125,6 +134,12 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   iteration-zero producer barriers. No metadata-only producer pages, claims,
   or completion transactions are scheduled for later iterations, and progress
   fractions use only the phases that actually run.
+- Numerical folds, normalization and convergence enumerate dense ordinal slots
+  from a checksummed active-node plan and sealed membership-leaf counts. Their
+  durable completed-unit count is the resume cursor: they do not decode node IDs
+  or join the node dictionary on each iteration. Range boundaries are reloaded
+  in the current transaction. Initialization and publication still validate
+  membership and the dictionary; missing required vector values fail closed.
 - Numerical folds validate and borrow each immutable 256-edge tile from the read
   transaction. One checkpoint-local scratch buffer gathers vector values and
   maps chunk-local target slots directly to compensated accumulators. Warm vector
@@ -146,7 +161,7 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   HITS lanes are bulk-read before either lane stages mutations. Primary scores,
   ordered staging keys, and the attempt-fenced page cursor commit atomically.
   The coordinator checkpoints the bounded top-K prefix before pointer publication.
-- Execution schema 15 fences older intermediate jobs. Published score epochs
+- Execution schema 17 fences older intermediate jobs. Published score epochs
   retain their existing read contract; an execution-format change does not hide
   previously published results.
 
@@ -256,6 +271,13 @@ Public output APIs detach the reservation because their results may outlive the
 session; those escaping results retain a conservative request charge. Network
 requests/bytes, decoded blocks and work remain cumulative and cannot be refunded
 by dropping a stage. The complete transport plan is admitted before score I/O.
+
+Live transport buffers also reserve this shared memory budget, including
+authenticated cache-fill/lease bytes, the contiguous output and block descriptors.
+The reservation survives until decoding releases the range. Column execution
+reserves its joined group before launching workers and reduces column/range
+fanout when only serial execution fits. The eight-range/32 MiB transport cap is
+an additional ceiling, not a substitute for request-wide memory admission.
 
 Within an authenticated score block, sparse candidates use binary lookup while
 dense sorted candidates merge once through the block. Original row ordinals

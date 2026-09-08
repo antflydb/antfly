@@ -122,6 +122,12 @@ pub const GraphMetricReadBudget = struct {
         return .{ .budget = self, .bytes = bytes };
     }
 
+    pub fn remainingMemory(self: *@This()) usize {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return std.math.cast(usize, self.limits.max_retained_bytes -| self.retained_bytes) orelse std.math.maxInt(usize);
+    }
+
     fn checkedCharge(current: u64, amount: u64, limit: u64) !u64 {
         const next = std.math.add(u64, current, amount) catch return error.GraphMetricQueryBudgetExceeded;
         if (next > limit) return error.GraphMetricQueryBudgetExceeded;
@@ -357,6 +363,8 @@ pub const QuerySession = struct {
     // Borrowed read-lifetime scratch reservation, propagated to joined child
     // reads. Output reservations are independent and may outlive this scope.
     graph_metric_retained_scope: ?*GraphMetricReadBudget.Reservation = null,
+    // Pre-admitted transport workspace owned by a joined parent execution.
+    graph_metric_transport_credit: usize = 0,
 
     pub fn deinit(self: *QuerySession) void {
         if (self.owns_graph_metric_specs) self.clearGraphMetricSpecs();
@@ -432,6 +440,7 @@ pub const QuerySession = struct {
             .owns_graph_metric_specs = false,
             .graph_metric_read_budget_shared = self.effectiveGraphMetricReadBudget(),
             .graph_metric_retained_scope = self.graph_metric_retained_scope,
+            .graph_metric_transport_credit = self.graph_metric_transport_credit,
         };
     }
 
@@ -477,6 +486,10 @@ pub const QuerySession = struct {
 
     pub fn reserveGraphMetricMemory(self: *QuerySession, bytes: usize) !GraphMetricReadBudget.Reservation {
         return self.effectiveGraphMetricReadBudget().reserveRetained(bytes);
+    }
+
+    pub fn graphMetricMemoryAvailable(self: *QuerySession) usize {
+        return self.effectiveGraphMetricReadBudget().remainingMemory();
     }
 
     pub fn findArtifactIndex(self: *const QuerySession, kind: manifest_mod.ArtifactKind) ?usize {

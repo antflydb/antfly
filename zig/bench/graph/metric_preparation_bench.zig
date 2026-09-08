@@ -195,10 +195,12 @@ pub fn main(init: std.process.Init) !void {
     var staged_only = false;
     var topology_only = false;
     var score_join_only = false;
+    var ordinal_cursors_only = false;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--staged-only")) staged_only = true else if (std.mem.eql(u8, arg, "--topology-only")) topology_only = true else if (std.mem.eql(u8, arg, "--score-join-only")) score_join_only = true else return error.InvalidArgument;
+        if (std.mem.eql(u8, arg, "--ordinal-cursors-only")) ordinal_cursors_only = true else if (std.mem.eql(u8, arg, "--staged-only")) staged_only = true else if (std.mem.eql(u8, arg, "--topology-only")) topology_only = true else if (std.mem.eql(u8, arg, "--score-join-only")) score_join_only = true else return error.InvalidArgument;
     }
     if (score_join_only) return benchmarkScoreJoin(&output);
+    if (ordinal_cursors_only) return benchmarkOrdinalCursors(init.io, &output);
     if (topology_only) return benchmarkSharedTopology(init.io, &output);
     try benchmarkStagedQueries(init.io, &output);
     if (staged_only) return;
@@ -373,6 +375,55 @@ pub fn main(init: std.process.Init) !void {
             try output.interface.writeAll(json);
             try output.interface.writeByte('\n');
             try output.flush();
+        }
+    }
+}
+
+fn benchmarkOrdinalCursors(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    for ([_]usize{ 16, 4096 }) |id_len| {
+        const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-ordinal-cursor-bench-{d}", .{antfly.platform_time.monotonicNs()});
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        const store_path = try std.fmt.allocPrint(fixture, "{s}/store\x00", .{root});
+        const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
+        var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
+        defer store.close();
+        const configs = [_]antfly.graph.GraphMetricConfig{.{ .name = "rank", .kind = .pagerank, .refresh = .manual, .max_iterations = 1 }};
+        var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "links", .{ .metric_configs = &configs });
+        defer index.close();
+        var ids: [256][]const u8 = undefined;
+        for (&ids, 0..) |*id, i| {
+            const bytes = try fixture.alloc(u8, id_len);
+            @memset(bytes, 'x');
+            _ = try std.fmt.bufPrint(bytes[0..8], "{d:0>8}", .{i});
+            id.* = bytes;
+        }
+        for (ids, 0..) |id, i| try index.addEdge(id, ids[(i + 1) % ids.len], "cites", 1, 0, 0, "");
+        try index.benchmarkPrepareOrdinalCursor("rank");
+        const expected = try index.benchmarkOrdinalCursorRead("rank", true);
+        for ([_]bool{ true, false }) |reference| {
+            var samples: [5]u64 = undefined;
+            for (0..6) |sample| {
+                const started = antfly.platform_time.monotonicNs();
+                for (0..64) |_| if (try index.benchmarkOrdinalCursorRead("rank", reference) != expected) return error.InvalidBenchmarkResult;
+                const elapsed = (antfly.platform_time.monotonicNs() - started) / 64;
+                if (sample != 0) samples[sample - 1] = elapsed;
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            const encoded = try std.json.Stringify.valueAlloc(fixture, .{
+                .mode = if (reference) "stateful_string_cursor" else "stateful_ordinal_cursor",
+                .nodes = ids.len,
+                .node_id_bytes = id_len,
+                .median_ns = samples[2],
+                .note = "same sealed topology; exact ordinal checksum parity; cursor traversal only, excludes numeric kernel and writes; 64 repetitions; six samples, first discarded",
+            }, .{});
+            try out.interface.writeAll(encoded);
+            try out.interface.writeByte('\n');
+            try out.flush();
         }
     }
 }

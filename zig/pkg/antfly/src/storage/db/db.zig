@@ -95245,9 +95245,9 @@ test "db unfiltered graph search retains algebraic execution" {
 
 test "db reverse graph probe rejects a deleted or replaced index incarnation" {
     const alloc = std.testing.allocator;
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    var directory = try TestDirectory.init("graph-incarnation");
+    defer directory.cleanup();
+    const path = directory.path().ptr;
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
     const cfg = types.IndexConfig{ .name = "graph_idx", .kind = .graph, .config_json = "{}" };

@@ -6,17 +6,44 @@ measured samples per case; tables report medians. This was a shared development
 host, not an isolated benchmark machine.
 The compact-query comparison below uses 21 measured samples instead of five.
 
+## Ordinal-only numerical cursors
+
+Measured 2026-09-08 on the same host/toolchain with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --ordinal-cursors-only
+```
+
+Each fixture is a 256-node cycle in the default durable storage backend. Both
+paths read the same sealed initialization and verify identical ordinal checksums.
+The reference decodes membership IDs and validates their dictionary mappings;
+the numerical path reads checksummed coverage and sealed leaf bounds, then
+enumerates dense slots. Initialization and final publication retain dictionary
+validation. Six samples per case, first discarded, 64 repetitions per sample:
+
+| Node ID bytes | String/dictionary traversal | Ordinal traversal | Improvement |
+| --- | ---: | ---: | ---: |
+| 16 | 211.796 µs | 101.843 µs | 2.08× |
+| 4,096 | 1,180.156 µs | 207.796 µs | 5.68× |
+
+These are cursor traversal medians, including read transactions, control-record
+validation and allocation. They exclude graph setup, numerical kernels, writes
+and publication; they are not whole-build speedups. The 4 KiB IDs exercise a
+long-ID workload rather than representing typical IDs. Other development work
+was running on this shared host.
+
 ## Durable cross-job topology reuse
 
 After increasing default scheduling spans to 4,096 records, the same fixture
-and command measured the following on 2026-09-08:
+and command measured the following on 2026-09-08, before the ordinal-only cursor
+change above:
 
 | Complete numerical job | Physical edge records read | Checkpoints | Median time (range) |
 | --- | ---: | ---: | ---: |
 | Independent topology | 32,768 | 36 | 1.612 s (1.415–1.887 s) |
 | Shared topology | 0 | 22 | 0.834 s (0.811–0.892 s) |
 
-The current shared case is 1.93× faster on this fixture. Against the earlier
+The shared case in that measurement is 1.93× faster. Against the earlier
 small-page run below, independent/shared checkpoint counts fall 638 → 36 and
 110 → 22. Those work counts are directly checked. The historical wall times
 were not collected in a controlled same-run comparison: storage compaction and
