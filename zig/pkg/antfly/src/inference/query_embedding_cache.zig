@@ -503,13 +503,19 @@ pub fn testConcurrentCoalescing() !void {
     var first = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = key };
     var second = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = key };
 
-    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
+    defer {
+        first_thread.await(std.testing.io);
+        if (first.result) |result| std.heap.page_allocator.free(result);
+    }
     while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
-    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
-    first_thread.join();
-    second_thread.join();
-    defer if (first.result) |result| std.heap.page_allocator.free(result);
-    defer if (second.result) |result| std.heap.page_allocator.free(result);
+    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
+    defer {
+        second_thread.await(std.testing.io);
+        if (second.result) |result| std.heap.page_allocator.free(result);
+    }
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
 
     try std.testing.expectEqual(@as(?anyerror, null), first.err);
     try std.testing.expectEqual(@as(?anyerror, null), second.err);
@@ -569,9 +575,15 @@ pub fn testInflightAdmissionBound() !void {
     defer cache.deinit(&budget);
     var compute = BlockingCompute{ .io = compute_io.io() };
     var producer = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = [_]u8{1} ** 32 };
-    const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&producer});
+    var producer_thread = try std.testing.io.concurrent(Worker.run, .{&producer});
+    defer {
+        compute.release.store(true, .release);
+        producer_thread.await(std.testing.io);
+        if (producer.result) |result| std.heap.page_allocator.free(result);
+    }
     while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
-    const releaser_thread = try std.Thread.spawn(.{}, Releaser.run, .{&compute});
+    var releaser_thread = try std.testing.io.concurrent(Releaser.run, .{&compute});
+    defer releaser_thread.await(std.testing.io);
 
     const producer_key: Key = [_]u8{1} ** 32;
     try std.testing.expectError(
@@ -602,9 +614,8 @@ pub fn testInflightAdmissionBound() !void {
     try std.testing.expectEqual(@as(u64, 1), compute.calls.load(.monotonic));
 
     compute.release.store(true, .release);
-    releaser_thread.join();
-    producer_thread.join();
-    defer if (producer.result) |result| std.heap.page_allocator.free(result);
+    releaser_thread.await(std.testing.io);
+    producer_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(?anyerror, null), producer.err);
 
     const uncached = try cache.computeUncached(std.testing.allocator, null, &compute, BlockingCompute.run);
@@ -659,7 +670,12 @@ pub fn testDisabledCacheRetainsAdmissionBound() !void {
     defer cache.deinit(&budget);
     var compute = BlockingCompute{};
     var worker = Worker{ .cache = &cache, .budget = &budget, .compute = &compute };
-    const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var producer_thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    defer {
+        compute.release.store(true, .release);
+        producer_thread.await(std.testing.io);
+        if (worker.result) |result| std.heap.page_allocator.free(result);
+    }
     while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
 
     try std.testing.expectError(
@@ -669,8 +685,7 @@ pub fn testDisabledCacheRetainsAdmissionBound() !void {
     try std.testing.expectEqual(@as(usize, 1), cache.stats(&budget).inflight);
 
     compute.release.store(true, .release);
-    producer_thread.join();
-    defer if (worker.result) |result| std.heap.page_allocator.free(result);
+    producer_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(?anyerror, null), worker.err);
     try std.testing.expectEqual(@as(usize, 0), cache.stats(&budget).entries);
 }

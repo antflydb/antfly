@@ -528,7 +528,7 @@ const LaneLeaseGate = struct {
         // Manual runtimes have no executor to park on. They ordinarily have
         // no successful lane leases; retain an executor-independent fallback
         // for a close racing an unavailable acquisition.
-        while (self.active() != 0) std.Thread.yield() catch {};
+        while (self.active() != 0) @import("antfly_platform").time.yieldNow();
     }
 };
 
@@ -637,7 +637,9 @@ const OwnerRegistry = struct {
     };
 
     alloc: Allocator,
-    mutex: std.atomic.Mutex = .unlocked,
+    sync_io: Io = if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io(),
+    mutex: Io.Mutex = .init,
+    idle: Io.Condition = .init,
     states: std.AutoHashMapUnmanaged(u64, State) = .empty,
 
     fn init(alloc: Allocator) OwnerRegistry {
@@ -653,15 +655,15 @@ const OwnerRegistry = struct {
 
     fn register(self: *OwnerRegistry, owner_id: u64) !void {
         if (owner_id == 0) return error.InvalidBackgroundOwner;
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         if (self.states.contains(owner_id)) return error.BackgroundOwnerIdExhausted;
         try self.states.putNoClobber(self.alloc, owner_id, .{});
     }
 
     fn beginJob(self: *OwnerRegistry, owner_id: u64) !void {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse return error.BackgroundOwnerClosed;
         if (state.closing) return error.BackgroundOwnerClosing;
         if (state.in_flight == std.math.maxInt(usize)) return error.BackgroundOwnerCapacityExceeded;
@@ -669,43 +671,36 @@ const OwnerRegistry = struct {
     }
 
     fn finishJob(self: *OwnerRegistry, owner_id: u64) void {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse {
             std.debug.panic("background owner {} retired with a job in flight", .{owner_id});
         };
         std.debug.assert(state.in_flight > 0);
         state.in_flight -= 1;
+        if (state.in_flight == 0) self.idle.broadcast(self.sync_io);
     }
 
     fn beginClose(self: *OwnerRegistry, owner_id: u64) bool {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse return false;
         state.closing = true;
         return true;
     }
 
     fn waitIdle(self: *OwnerRegistry, owner_id: u64) void {
-        while (true) {
-            lockAtomic(&self.mutex);
-            const idle = if (self.states.getPtr(owner_id)) |state|
-                state.in_flight == 0
-            else
-                true;
-            self.mutex.unlock();
-            if (idle) return;
-            if (builtin.os.tag == .freestanding or builtin.single_threaded) {
-                std.atomic.spinLoopHint();
-            } else {
-                std.Thread.yield() catch {};
-            }
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (self.states.getPtr(owner_id)) |state| {
+            if (state.in_flight == 0) return;
+            self.idle.waitUncancelable(self.sync_io, &self.mutex);
         }
     }
 
     fn retireClosed(self: *OwnerRegistry, owner_id: u64) void {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse return;
         std.debug.assert(state.closing);
         std.debug.assert(state.in_flight == 0);
@@ -1529,13 +1524,7 @@ const threaded_vtable = DurableJobLane.VTable{
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (builtin.os.tag == .freestanding or builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 test "lane lease gate closes admission and drains a committed borrower" {
@@ -1545,19 +1534,25 @@ test "lane lease gate closes admission and drains a committed borrower" {
     try std.testing.expectEqual(@as(?usize, 1), gate.tryAcquire());
 
     var drained = std.atomic.Value(bool).init(false);
-    const closer = try std.Thread.spawn(.{}, struct {
+    var closer = try std.testing.io.concurrent(struct {
         fn run(g: *LaneLeaseGate, done: *std.atomic.Value(bool)) void {
             g.close();
             g.waitDrained(null);
             done.store(true, .release);
         }
     }.run, .{ &gate, &drained });
+    var closer_awaited = false;
+    defer if (!closer_awaited) {
+        gate.release(null);
+        closer.await(std.testing.io);
+    };
 
-    while (!gate.isClosed()) std.Thread.yield() catch {};
+    while (!gate.isClosed()) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(?usize, null), gate.tryAcquire());
     try std.testing.expect(!drained.load(.acquire));
     gate.release(null);
-    closer.join();
+    closer.await(std.testing.io);
+    closer_awaited = true;
     try std.testing.expect(drained.load(.acquire));
 }
 
@@ -2109,18 +2104,24 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     const runtime = handle.ptr();
     var lease = try runtime.acquireApiLane();
     var deinitialized = std.atomic.Value(bool).init(false);
-    const deinit_thread = try std.Thread.spawn(.{}, struct {
+    var deinit_thread = try std.testing.io.concurrent(struct {
         fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
             h.deinit();
             done.store(true, .release);
         }
     }.run, .{ &handle, &deinitialized });
+    var deinit_thread_awaited = false;
+    defer if (!deinit_thread_awaited) {
+        lease.release();
+        deinit_thread.await(std.testing.io);
+    };
 
-    while (!runtime.api_lane_gate.isClosed()) std.Thread.yield() catch {};
+    while (!runtime.api_lane_gate.isClosed()) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireApiLane());
     try std.testing.expect(!deinitialized.load(.acquire));
     lease.release();
-    deinit_thread.join();
+    deinit_thread.await(std.testing.io);
+    deinit_thread_awaited = true;
     try std.testing.expect(deinitialized.load(.acquire));
 }
 

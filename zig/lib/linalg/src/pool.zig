@@ -12,118 +12,62 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Process-wide worker pool used by sgemm and other linalg kernels that want
-// short, latency-sensitive parallel work without paying spawn+join costs.
-//
-// Implemented with raw Linux futexes (futex_wait / futex_wake) for parking
-// idle workers without burning CPU.  Outside Linux we fall back to running
-// jobs sequentially -- Zig 0.16 moved Mutex/Condition into std.Io which
-// would require plumbing an Io context through every kernel call, defeating
-// the point of the *Sync escape hatches.
-//
-// This file holds only the dispatch/worker/futex primitives.  Callers (e.g.
-// `mod.zig`, `attention.zig`) decide their own work-size threshold and the
-// shape of each job.
+//! Bounded Io scheduling for synchronous kernel entry points. The legacy
+//! Sync API keeps a process-lifetime owner on Linux; other platforms retain
+//! their sequential fallback. Io-aware callers use their own scheduling owner.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const linux = std.os.linux;
 
-pub const have_futex = builtin.os.tag == .linux;
-
-/// Hard cap on worker threads.  Beyond ~8, the bandwidth-limited kernels in
-/// transformer inference saturate the memory bus.
 pub const max_workers: usize = 8;
-
+pub const supports_sync_parallelism = !builtin.single_threaded and builtin.os.tag == .linux;
 pub const Job = struct {
     fn_ptr: *const fn (*anyopaque) void,
     ctx: *anyopaque,
 };
 
-const Worker = struct {
-    thread: std.Thread = undefined,
-    // 0 = idle (waiting for work), 1 = job pending, 2 = shutdown.
-    state: std.atomic.Value(u32) = .{ .raw = 0 },
-    job: Job = undefined,
-    pool: *Pool = undefined,
-};
+const SyncPool = struct {
+    io_impl: std.Io.Threaded,
+    submit_mutex: std.Io.Mutex = .init,
+    capacity: usize,
 
-// Small futex-backed mutex.  std.Thread.Mutex was removed in Zig 0.16
-// (mutex primitives moved to std.Io.Mutex which requires an Io to lock).
-// The Sync path explicitly has no Io so we roll one inline using the same
-// futex helpers the worker pool already uses.  On non-Linux the futex
-// helpers are no-ops; in that case the pool itself won't initialize
-// (have_futex=false short-circuits to sequential execution) and this
-// mutex is never actually contended.
-const SubmitMutex = struct {
-    state: std.atomic.Value(u32) = .{ .raw = 0 }, // 0 = free, 1 = locked
+    fn init(capacity: usize) SyncPool {
+        const bounded = @min(capacity, max_workers - 1);
+        return .{
+            .capacity = bounded,
+            .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{
+                .async_limit = .limited(bounded),
+                .concurrent_limit = .limited(bounded),
+            }),
+        };
+    }
 
-    fn lock(self: *SubmitMutex) void {
-        while (true) {
-            if (@cmpxchgWeak(u32, &self.state.raw, 0, 1, .acquire, .monotonic) == null) return;
-            futexWait(&self.state, 1);
+    fn deinit(self: *SyncPool) void {
+        self.io_impl.deinit();
+    }
+
+    fn dispatch(self: *SyncPool, jobs: []const Job) void {
+        if (jobs.len <= 1 or jobs.len - 1 > self.capacity) {
+            for (jobs) |job| job.fn_ptr(job.ctx);
+            return;
         }
-    }
-
-    fn unlock(self: *SubmitMutex) void {
-        self.state.store(0, .release);
-        futexWake(&self.state, 1);
+        const io = self.io_impl.io();
+        // Sync kernels promise completed output and have no cancellation
+        // result. Keep all jobs and caller-owned buffers alive through drain.
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        self.submit_mutex.lockUncancelable(io);
+        defer self.submit_mutex.unlock(io);
+        dispatchJobsIo(io, jobs) catch unreachable;
     }
 };
 
-const Pool = struct {
-    workers: [max_workers - 1]Worker = undefined,
-    worker_count: usize = 0,
-    initialized: std.atomic.Value(bool) = .{ .raw = false },
-    init_started: std.atomic.Value(bool) = .{ .raw = false },
-    completion: std.atomic.Value(u32) = .{ .raw = 0 },
-    // Serializes concurrent dispatch calls.  The shared worker job slots
-    // and completion counter are not safe for simultaneous writers;
-    // production servers that thread-per-request and call *Sync without
-    // an Io would otherwise corrupt each other's state.  The lock spans
-    // only the dispatch+wait window, so within a single dispatch the
-    // workers still run in parallel.
-    submit_mu: SubmitMutex = .{},
-};
-
-var pool_storage: Pool = .{};
-
-inline fn futexWait(ptr: *const std.atomic.Value(u32), expected: u32) void {
-    if (!have_futex) return;
-    const rc = linux.futex_4arg(&ptr.raw, .{ .cmd = .WAIT, .private = true }, expected, null);
-    switch (linux.errno(rc)) {
-        .SUCCESS, .AGAIN, .INTR => {},
-        else => |err| std.debug.panic("linalg futex WAIT failed: {}", .{err}),
-    }
-}
-
-inline fn futexWake(ptr: *const std.atomic.Value(u32), max: u32) void {
-    if (!have_futex) return;
-    const rc = linux.futex_3arg(&ptr.raw, .{ .cmd = .WAKE, .private = true }, max);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        else => |err| std.debug.panic("linalg futex WAKE failed: {}", .{err}),
-    }
-}
-
-fn workerLoop(w: *Worker) void {
-    while (true) {
-        // Park until state != 0.
-        while (true) {
-            const s = w.state.load(.acquire);
-            if (s != 0) break;
-            futexWait(&w.state, 0);
-        }
-        const s = w.state.load(.acquire);
-        if (s == 2) return;
-        // s == 1: run the job and reset to idle.
-        w.job.fn_ptr(w.job.ctx);
-        w.state.store(0, .release);
-        // Decrement completion; main thread is futex-waiting on it.
-        const remaining = w.pool.completion.fetchSub(1, .acq_rel) - 1;
-        if (remaining == 0) futexWake(&w.pool.completion, 1);
-    }
-}
+// The Sync compatibility API has no lifecycle parameter. As with the old
+// kernel pool, this owner lives until process exit and retains at most seven
+// background workers. Local SyncPool owners in tests exercise explicit drain.
+var pool_storage: SyncPool = undefined;
+var pool_initialized: std.atomic.Value(bool) = .init(false);
+var pool_init_mutex: std.Io.Mutex = .init;
 
 pub inline fn cachedCpuCount() usize {
     const Once = struct {
@@ -136,44 +80,20 @@ pub inline fn cachedCpuCount() usize {
     return @max(detected, 1);
 }
 
-fn sleepNs(ns: u64) void {
-    var req = std.posix.timespec{
-        .sec = @intCast(ns / std.time.ns_per_s),
-        .nsec = @intCast(ns % std.time.ns_per_s),
-    };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
-}
-
-/// Lazy-init the global pool.  Returns the actual number of background
-/// workers available (which may be 0 on platforms without futex support).
+/// Return the bounded background capacity for the Sync compatibility path.
+/// Individual async launches may still fall back inline on resource pressure.
 pub fn ensurePool(worker_count: usize) usize {
-    if (builtin.single_threaded or !have_futex) return 0;
-    if (worker_count == 0) return 0;
-    if (pool_storage.initialized.load(.acquire)) {
-        return @min(worker_count, pool_storage.worker_count);
+    if (!supports_sync_parallelism or worker_count == 0) return 0;
+    if (!pool_initialized.load(.acquire)) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pool_init_mutex.lockUncancelable(io);
+        defer pool_init_mutex.unlock(io);
+        if (!pool_initialized.load(.monotonic)) {
+            pool_storage = SyncPool.init(cachedCpuCount() -| 1);
+            pool_initialized.store(true, .release);
+        }
     }
-    // Race the init: only the first thread that sets init_started actually
-    // does the spawning; everyone else spins until initialized is observed.
-    if (pool_storage.init_started.swap(true, .acq_rel)) {
-        while (!pool_storage.initialized.load(.acquire)) std.Thread.yield() catch {};
-        return @min(worker_count, pool_storage.worker_count);
-    }
-
-    const cpu = cachedCpuCount();
-    const max_bg = @min(max_workers - 1, cpu -| 1);
-    var spawned: usize = 0;
-    while (spawned < max_bg) : (spawned += 1) {
-        const w = &pool_storage.workers[spawned];
-        w.* = .{ .pool = &pool_storage };
-        w.thread = std.Thread.spawn(.{}, workerLoop, .{w}) catch break;
-    }
-    pool_storage.worker_count = spawned;
-    pool_storage.initialized.store(true, .release);
-    return @min(worker_count, spawned);
+    return @min(worker_count, pool_storage.capacity);
 }
 
 /// Async wrapper that std.Io.Group.async can dispatch.  The `Job.fn_ptr`
@@ -207,48 +127,14 @@ pub fn dispatchJobsIo(io: std.Io, jobs: []const Job) std.Io.Cancelable!void {
     try g.await(io);
 }
 
-/// Submit `n_jobs` jobs.  Last job runs on the calling thread; the rest are
-/// dispatched to pool workers.  Falls back to fully-synchronous execution if
-/// the pool didn't initialize.
+/// Run the final job on the caller and drain bounded async jobs before return.
+/// Preserve the existing sequential fallback outside Linux or over capacity.
 pub fn dispatchJobs(jobs: []const Job) void {
-    if (jobs.len == 0) return;
-    if (jobs.len == 1) {
-        jobs[0].fn_ptr(jobs[0].ctx);
+    if (jobs.len <= 1 or ensurePool(jobs.len - 1) < jobs.len - 1) {
+        for (jobs) |job| job.fn_ptr(job.ctx);
         return;
     }
-    const bg_jobs = jobs.len - 1;
-    const available = ensurePool(bg_jobs);
-    if (available < bg_jobs) {
-        // Pool unavailable (e.g., non-Linux) or undersized: run sequentially.
-        for (jobs) |j| j.fn_ptr(j.ctx);
-        return;
-    }
-
-    // Concurrent *Sync callers must not overlap their pool usage; see
-    // Pool.submit_mu.  Held across the dispatch+wait window.
-    pool_storage.submit_mu.lock();
-    defer pool_storage.submit_mu.unlock();
-
-    // Set the completion counter before signalling so a worker that finishes
-    // immediately doesn't observe a stale zero.
-    pool_storage.completion.store(@intCast(bg_jobs), .release);
-
-    for (0..bg_jobs) |i| {
-        const w = &pool_storage.workers[i];
-        w.job = jobs[i];
-        w.state.store(1, .release);
-        futexWake(&w.state, 1);
-    }
-
-    // Run the last job inline on the main thread.
-    jobs[bg_jobs].fn_ptr(jobs[bg_jobs].ctx);
-
-    // Wait for all background workers via futex-wait on the counter.
-    while (true) {
-        const remaining = pool_storage.completion.load(.acquire);
-        if (remaining == 0) break;
-        futexWait(&pool_storage.completion, remaining);
-    }
+    pool_storage.dispatch(jobs);
 }
 
 const TestCtx = struct {
@@ -260,37 +146,6 @@ const TestCtx = struct {
         _ = self.counter.fetchAdd(self.contribution, .acq_rel);
     }
 };
-
-test "futexWait parks until futexWake" {
-    if (!have_futex) return error.SkipZigTest;
-
-    const Waiter = struct {
-        fn run(
-            state: *std.atomic.Value(u32),
-            entered: *std.atomic.Value(u32),
-            returned: *std.atomic.Value(u32),
-        ) void {
-            entered.store(1, .release);
-            while (state.load(.acquire) == 0) futexWait(state, 0);
-            returned.store(1, .release);
-        }
-    };
-
-    var state: std.atomic.Value(u32) = .{ .raw = 0 };
-    var entered: std.atomic.Value(u32) = .{ .raw = 0 };
-    var returned: std.atomic.Value(u32) = .{ .raw = 0 };
-
-    const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &state, &entered, &returned });
-    while (entered.load(.acquire) == 0) std.Thread.yield() catch {};
-
-    sleepNs(10 * std.time.ns_per_ms);
-    try std.testing.expectEqual(@as(u32, 0), returned.load(.acquire));
-
-    state.store(1, .release);
-    futexWake(&state, 1);
-    thread.join();
-    try std.testing.expectEqual(@as(u32, 1), returned.load(.acquire));
-}
 
 test "dispatchJobs runs every submitted job exactly once" {
     var counter: std.atomic.Value(u32) = .{ .raw = 0 };
@@ -334,4 +189,64 @@ test "dispatchJobs is reentry-safe across repeated submissions" {
     }
     for (0..16) |_| dispatchJobs(&jobs);
     try std.testing.expectEqual(@as(u32, 48), counter.load(.acquire));
+}
+
+test "Sync pool drains concurrent callers with bounded and unavailable capacity" {
+    const Caller = struct {
+        owner: *SyncPool,
+        total: std.atomic.Value(u32) = .init(0),
+        fn run(self: *@This()) void {
+            var contexts: [3]TestCtx = undefined;
+            var jobs: [3]Job = undefined;
+            for (&contexts, &jobs) |*ctx, *job| {
+                ctx.* = .{ .counter = &self.total, .contribution = 1 };
+                job.* = .{ .fn_ptr = TestCtx.run, .ctx = ctx };
+            }
+            for (0..32) |_| self.owner.dispatch(&jobs);
+        }
+    };
+    for ([_]usize{ 0, 2 }) |capacity| {
+        var owner = SyncPool.init(capacity);
+        defer owner.deinit();
+        var callers: [4]Caller = undefined;
+        var futures: [4]std.Io.Future(void) = undefined;
+        var started: usize = 0;
+        defer for (futures[0..started]) |*future| future.await(std.testing.io);
+        for (&callers, &futures) |*caller, *future| {
+            caller.* = .{ .owner = &owner };
+            future.* = try std.testing.io.concurrent(Caller.run, .{caller});
+            started += 1;
+        }
+        for (futures[0..started]) |*future| future.await(std.testing.io);
+        started = 0;
+        for (&callers) |*caller| try std.testing.expectEqual(@as(u32, 96), caller.total.load(.acquire));
+    }
+}
+
+test "Sync pool completes inline while its only worker is occupied" {
+    var owner = SyncPool.init(1);
+    defer owner.deinit();
+    const io = owner.io_impl.io();
+    const Waiter = struct {
+        fn run(active_io: std.Io, release: *std.Io.Event) void {
+            release.waitUncancelable(active_io);
+        }
+    };
+    var release: std.Io.Event = .unset;
+    var occupied = try io.concurrent(Waiter.run, .{ io, &release });
+    defer {
+        release.set(io);
+        occupied.await(io);
+    }
+    var total: std.atomic.Value(u32) = .init(0);
+    var contexts = [_]TestCtx{
+        .{ .counter = &total, .contribution = 2 },
+        .{ .counter = &total, .contribution = 3 },
+    };
+    const jobs = [_]Job{
+        .{ .fn_ptr = TestCtx.run, .ctx = &contexts[0] },
+        .{ .fn_ptr = TestCtx.run, .ctx = &contexts[1] },
+    };
+    owner.dispatch(&jobs);
+    try std.testing.expectEqual(@as(u32, 5), total.load(.acquire));
 }

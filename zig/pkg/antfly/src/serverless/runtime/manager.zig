@@ -61,20 +61,25 @@ pub const ManagedRuntime = struct {
     stats_mu: std.atomic.Mutex = .unlocked,
     run_mu: std.atomic.Mutex = .unlocked,
     cumulative_stats: RuntimeRunStats = .{},
-    thread: ?std.Thread = null,
+    io: std.Io,
+    lifecycle_mutex: std.Io.Mutex = .init,
+    future: ?std.Io.Future(void) = null,
+    stop_event: std.Io.Event = .unset,
     stop_requested: std.atomic.Value(bool) = .init(false),
 
     pub fn init(
         alloc: Allocator,
+        io: std.Io,
         cfg: RuntimeConfig,
         catalog: *catalog_mod.CatalogService,
         pruner: build_mod.Pruner,
     ) ManagedRuntime {
         return .{
             .alloc = alloc,
+            .io = io,
             .cfg = cfg,
             .catalog = catalog,
-            .publisher = build_mod.BackgroundPublisher.init(alloc, catalog, cfg.tick_interval_ms),
+            .publisher = build_mod.BackgroundPublisher.init(alloc, io, catalog, cfg.tick_interval_ms),
             .pruner = pruner,
         };
     }
@@ -87,17 +92,23 @@ pub const ManagedRuntime = struct {
     }
 
     pub fn start(self: *ManagedRuntime) !void {
-        if (self.thread != null) return error.AlreadyStarted;
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
+        if (self.future != null) return error.AlreadyStarted;
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return;
         self.stop_requested.store(false, .monotonic);
-        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        self.stop_event.reset();
+        self.future = try self.io.concurrent(runLoop, .{self});
     }
 
     pub fn stop(self: *ManagedRuntime) void {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
         self.stop_requested.store(true, .monotonic);
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        self.stop_event.set(self.io);
+        if (self.future) |*future| {
+            future.await(self.io);
+            self.future = null;
         }
     }
 
@@ -256,7 +267,13 @@ pub const ManagedRuntime = struct {
     fn runLoop(self: *ManagedRuntime) void {
         while (!self.stop_requested.load(.monotonic)) {
             _ = self.runOnce() catch RuntimeRunStats{};
-            sleepMs(@max(self.cfg.tick_interval_ms, 1));
+            self.stop_event.waitTimeout(self.io, .{ .duration = .{
+                .raw = .fromNanoseconds(@as(i96, @max(self.cfg.tick_interval_ms, 1)) * std.time.ns_per_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return,
+            };
         }
     }
 };
@@ -380,7 +397,7 @@ test "managed runtime publishes and prunes based on namespace policy" {
     var ingest_c = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 300, .mutations = &batch_c });
     defer ingest_c.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
     const stats = try runtime.runOnce();
@@ -397,6 +414,25 @@ test "managed runtime publishes and prunes based on namespace policy" {
     const cumulative = runtime.metricsSnapshot();
     try std.testing.expectEqual(stats.published_namespaces, cumulative.published_namespaces);
     try std.testing.expectEqual(stats.pruned_namespaces, cumulative.pruned_namespaces);
+
+    {
+        var unavailable = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
+        defer unavailable.deinit();
+        runtime.io = unavailable.io();
+        defer {
+            runtime.stop();
+            runtime.io = std.testing.io;
+        }
+        try std.testing.expectError(error.ConcurrencyUnavailable, runtime.start());
+        try std.testing.expect(runtime.future == null);
+    }
+    runtime.cfg.tick_interval_ms = 60_000;
+    for (0..2) |_| {
+        try runtime.start();
+        try std.testing.expectError(error.AlreadyStarted, runtime.start());
+        runtime.stop();
+        try std.testing.expect(runtime.future == null);
+    }
 }
 
 test "managed runtime query-only role skips maintenance work" {
@@ -447,7 +483,7 @@ test "managed runtime query-only role skips maintenance work" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .role = .query_only,
     }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
@@ -506,7 +542,7 @@ test "managed runtime api-only role skips maintenance work" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .role = .api_only,
     }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
@@ -514,7 +550,7 @@ test "managed runtime api-only role skips maintenance work" {
 
     try runtime.start();
     defer runtime.stop();
-    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(runtime.future == null);
 
     const stats = try runtime.runOnce();
     try std.testing.expectEqual(@as(usize, 0), stats.published_namespaces);
@@ -569,7 +605,7 @@ test "managed runtime honors maintenance feature flags" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .publish_enabled = false,
         .compaction_enabled = false,
@@ -647,7 +683,7 @@ test "managed runtime compacts head when namespace exceeds compaction threshold"
     var build_second = try builder.publishNamespace("docs");
     defer build_second.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setCompactor(build_mod.Compactor.init(alloc, &artifact_store, &manifest_store, &progress_store));
     defer runtime.deinit();
 
@@ -715,7 +751,7 @@ test "managed runtime runs sparse enrichment for opted-in namespaces" {
     var build = try builder.publishNamespace("docs");
     defer build.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setEnricher(enrichment_mod.SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
@@ -756,15 +792,6 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
-}
-
-fn sleepMs(ms: u64) void {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    std.Io.Clock.Duration.sleep(.{
-        .clock = .awake,
-        .raw = .fromMilliseconds(@intCast(if (ms == 0) @as(u64, 1) else ms)),
-    }, io_impl.io()) catch {};
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {

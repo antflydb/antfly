@@ -2672,10 +2672,11 @@ test "retired generation cleanup is idempotent across concurrent workers" {
     };
     var first = Worker{ .path = retired, .parent = parent };
     var second = Worker{ .path = retired, .parent = parent };
-    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
-    first_thread.join();
-    second_thread.join();
+    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
+    defer first_thread.await(std.testing.io);
+    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
 
     try std.testing.expect(first.err == null);
     try std.testing.expect(second.err == null);

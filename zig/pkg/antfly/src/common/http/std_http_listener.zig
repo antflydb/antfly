@@ -1372,10 +1372,10 @@ test "std http executor cancels an in-flight production request and retires its 
         .uri = uri,
         .cancellation = &cancellation,
     };
-    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request_state});
+    var request_thread = try std.testing.io.concurrent(RequestThread.run, .{&request_state});
     defer {
         app.release.store(true, .release);
-        request_thread.join();
+        request_thread.await(std.testing.io);
     }
 
     for (0..10_000) |_| {
@@ -1465,8 +1465,8 @@ test "std http executor deinit drains the complete timed operation" {
 
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
     var request = RequestThread{ .executor = executor.executor(), .uri = base_uri };
-    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request});
-    defer request_thread.join();
+    var request_thread = try std.testing.io.concurrent(RequestThread.run, .{&request});
+    defer request_thread.await(std.testing.io);
 
     var entered = false;
     for (0..1_000) |_| {
@@ -1479,8 +1479,8 @@ test "std http executor deinit drains the complete timed operation" {
     try std.testing.expect(entered);
 
     var shutdown = DeinitThread{ .executor = &executor };
-    const shutdown_thread = try std.Thread.spawn(.{}, DeinitThread.run, .{&shutdown});
-    defer shutdown_thread.join();
+    var shutdown_thread = try std.testing.io.concurrent(DeinitThread.run, .{&shutdown});
+    defer shutdown_thread.await(std.testing.io);
 
     for (0..1_000) |_| {
         if (shutdown.done.load(.acquire)) break;
@@ -2227,8 +2227,8 @@ test "std http listener saturated connection slots queue instead of resetting" {
     defer std.testing.allocator.free(fast_uri);
 
     var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
-    const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
-    defer slow_thread.join();
+    var slow_thread = try std.testing.io.concurrent(RequestThread.run, .{&slow_req});
+    defer slow_thread.await(std.testing.io);
     defer app.release_slow.store(true, .release);
 
     var saw_slow = false;
@@ -2242,8 +2242,8 @@ test "std http listener saturated connection slots queue instead of resetting" {
     try std.testing.expect(saw_slow);
 
     var fast_req = RequestThread{ .uri = fast_uri, .executor = request_executor };
-    const fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});
-    defer fast_thread.join();
+    var fast_thread = try std.testing.io.concurrent(RequestThread.run, .{&fast_req});
+    defer fast_thread.await(std.testing.io);
 
     // While the slot is saturated the second request must not be reset.
     sleepMs(50);
@@ -2707,8 +2707,8 @@ test "std http listener stop interrupts accepted header read" {
     try std.testing.expect(saw_slot);
 
     var stop_thread_state = StopThread{ .listener = &listener };
-    const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});
-    defer stop_thread.join();
+    var stop_thread = try std.testing.io.concurrent(StopThread.run, .{&stop_thread_state});
+    defer stop_thread.await(std.testing.io);
 
     var stopped = false;
     for (0..10_000) |_| {
@@ -2787,8 +2787,8 @@ test "std http listener stop interrupts accepted body read" {
     try std.testing.expect(saw_slot);
 
     var stop_thread_state = StopThread{ .listener = &listener };
-    const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});
-    defer stop_thread.join();
+    var stop_thread = try std.testing.io.concurrent(StopThread.run, .{&stop_thread_state});
+    defer stop_thread.await(std.testing.io);
 
     var stopped = false;
     for (0..10_000) |_| {
@@ -2876,8 +2876,8 @@ test "std http listener stop returns while saturated with a headerless connectio
     defer std.testing.allocator.free(slow_uri);
 
     var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
-    const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
-    defer slow_thread.join();
+    var slow_thread = try std.testing.io.concurrent(RequestThread.run, .{&slow_req});
+    defer slow_thread.await(std.testing.io);
     defer app.release_slow.store(true, .release);
 
     var saw_slow = false;
@@ -2899,8 +2899,8 @@ test "std http listener stop returns while saturated with a headerless connectio
     sleepMs(20);
 
     var stop_thread_state = StopThread{ .listener = &listener };
-    const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});
-    defer stop_thread.join();
+    var stop_thread = try std.testing.io.concurrent(StopThread.run, .{&stop_thread_state});
+    defer stop_thread.await(std.testing.io);
 
     // stop() waits for in-flight requests; release the slow one and the
     // whole shutdown must then complete promptly even though the headerless
@@ -3029,23 +3029,23 @@ test "std http executor runs timed requests concurrently" {
     defer std.testing.allocator.free(fast_uri);
 
     var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
-    var slow_thread: ?std.Thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
-    var fast_thread: ?std.Thread = null;
+    var slow_thread: ?std.Io.Future(void) = try std.testing.io.concurrent(RequestThread.run, .{&slow_req});
+    var fast_thread: ?std.Io.Future(void) = null;
     defer {
         app.release_slow.set(event_io);
-        if (fast_thread) |thread| thread.join();
-        if (slow_thread) |thread| thread.join();
+        if (fast_thread) |*thread| thread.await(std.testing.io);
+        if (slow_thread) |*thread| thread.await(std.testing.io);
     }
     try std.testing.expect(Wait.event(&app.entered_slow, event_io));
 
     var fast_req = RequestThread{ .uri = fast_uri, .executor = request_executor };
-    fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});
+    fast_thread = try std.testing.io.concurrent(RequestThread.run, .{&fast_req});
     const fast_admitted = Wait.event(&app.entered_fast, event_io);
 
     app.release_slow.set(event_io);
-    fast_thread.?.join();
+    fast_thread.?.await(std.testing.io);
     fast_thread = null;
-    slow_thread.?.join();
+    slow_thread.?.await(std.testing.io);
     slow_thread = null;
 
     try std.testing.expect(fast_admitted);

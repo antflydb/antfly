@@ -568,19 +568,27 @@ test "remote content runtime publishes validated snapshots and retains readers" 
         }
     };
     var concurrent_reader = ConcurrentReader{ .facade = &facade };
-    const first_thread = try std.Thread.spawn(.{}, ConcurrentReader.run, .{&concurrent_reader});
-    const second_thread = try std.Thread.spawn(.{}, ConcurrentReader.run, .{&concurrent_reader});
-    while (concurrent_reader.reads.load(.acquire) < 20) std.Thread.yield() catch {};
+    var first_thread = try std.testing.io.concurrent(ConcurrentReader.run, .{&concurrent_reader});
+    defer {
+        concurrent_reader.stop.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
+    var second_thread = try std.testing.io.concurrent(ConcurrentReader.run, .{&concurrent_reader});
+    defer {
+        concurrent_reader.stop.store(true, .release);
+        second_thread.await(std.testing.io);
+    }
+    while (concurrent_reader.reads.load(.acquire) < 20) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try writeTestConfigAtomically(path,
         \\{"remote_content":{"default_s3":"primary","s3":{"primary":{"access_key_id":"access","secret_access_key":"secret"}}}}
     );
     try std.testing.expect(runtime.refreshIfChanged());
     var published_again = facade.acquire();
     published_again.deinit();
-    while (concurrent_reader.reads.load(.acquire) < 40) std.Thread.yield() catch {};
+    while (concurrent_reader.reads.load(.acquire) < 40) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     concurrent_reader.stop.store(true, .release);
-    first_thread.join();
-    second_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
     try std.testing.expect(!concurrent_reader.invalid.load(.acquire));
 
     try writeTestConfigAtomically(path, "{not-json");

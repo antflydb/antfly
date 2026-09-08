@@ -524,10 +524,11 @@ test "fs progress store allows exactly one concurrent head CAS winner" {
     };
 
     var state = RaceState{ .store = &fs };
-    const thread_a = try std.Thread.spawn(.{}, RaceState.race, .{&state});
-    const thread_b = try std.Thread.spawn(.{}, RaceState.race, .{&state});
-    thread_a.join();
-    thread_b.join();
+    var thread_a = try std.testing.io.concurrent(RaceState.race, .{&state});
+    defer thread_a.await(std.testing.io);
+    var thread_b = try std.testing.io.concurrent(RaceState.race, .{&state});
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
 
     try std.testing.expectEqual(@as(u32, 1), state.winner_count.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), try fs.getHead("docs"));

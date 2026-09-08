@@ -633,17 +633,22 @@ test "sgemmTransBSync is safe under concurrent callers" {
         }
     };
 
-    var threads: [num_threads]std.Thread = undefined;
+    var threads: [num_threads]std.Io.Future(void) = undefined;
     var per_thread_outputs: [num_threads][]f32 = undefined;
     for (0..num_threads) |i| {
         per_thread_outputs[i] = try allocator.alloc(f32, m * n);
     }
     defer for (per_thread_outputs) |buf| allocator.free(buf);
 
-    for (0..num_threads) |i| {
-        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{ a, b, per_thread_outputs[i], m, n, k, calls_per_thread });
+    var started_tasks: usize = 0;
+    defer {
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
     }
-    for (threads) |t| t.join();
+    for (0..num_threads) |i| {
+        threads[i] = try std.testing.io.concurrent(Worker.run, .{ a, b, per_thread_outputs[i], m, n, k, calls_per_thread });
+        started_tasks += 1;
+    }
+    for (&threads) |*t| t.await(std.testing.io);
 
     for (per_thread_outputs) |buf| {
         for (c_ref, buf) |x, y| try std.testing.expect(@abs(x - y) < 1e-3);

@@ -252,12 +252,17 @@ test "ensureCompatible tolerates concurrent marker creation" {
     };
 
     var workers: [8]Worker = undefined;
-    var threads: [8]std.Thread = undefined;
+    var threads: [8]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
     for (&workers, &threads) |*worker, *thread| {
         worker.* = .{ .data_dir = data_dir };
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        thread.* = try std.testing.io.concurrent(Worker.run, .{worker});
+        started_tasks += 1;
     }
-    for (&threads) |*thread| thread.join();
+    for (&threads) |*thread| thread.await(std.testing.io);
     for (&workers) |worker| {
         if (worker.result) |err| return err;
     }

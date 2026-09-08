@@ -293,12 +293,12 @@ pub const PersistentObjectRangeCache = struct {
             .alloc = internal_alloc,
             .root_dir = owned_root,
             .policy = policy,
-            .io_impl = std.Io.Threaded.init(internal_alloc, .{}),
+            .io_impl = std.Io.Threaded.init(internal_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) }),
         };
         errdefer state.io_impl.deinit();
         try state.initializeInventory();
         errdefer state.deinitInventory();
-        state.worker = try std.Thread.spawn(.{}, persistentObjectRangeWorkerMain, .{state});
+        state.worker = try state.io_impl.io().concurrent(persistentObjectRangeWorkerMain, .{state});
         return .{ .state = state };
     }
 
@@ -309,7 +309,7 @@ pub const PersistentObjectRangeCache = struct {
         state.closing = true;
         state.condition.broadcast(io);
         state.mutex.unlock(io);
-        if (state.worker) |worker| worker.join();
+        if (state.worker) |*worker| worker.await(io);
         state.deinitInventory();
         state.pending.deinit(state.alloc);
         state.queue.deinit(state.alloc);
@@ -441,7 +441,7 @@ const PersistentObjectRangeCacheState = struct {
     io_impl: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
-    worker: ?std.Thread = null,
+    worker: ?std.Io.Future(void) = null,
     closing: bool = false,
     queue: std.ArrayListUnmanaged(PersistentObjectRangeCacheWrite) = .empty,
     queue_head: usize = 0,

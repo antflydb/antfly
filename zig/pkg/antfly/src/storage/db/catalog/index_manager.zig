@@ -573,7 +573,7 @@ fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 }
@@ -2542,7 +2542,7 @@ pub const IndexManager = struct {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 
@@ -5871,26 +5871,14 @@ pub const IndexManager = struct {
             .results = results,
         };
 
-        const spawned_count = parallelism - 1;
-        var threads = try self.alloc.alloc(std.Thread, spawned_count);
-        defer self.alloc.free(threads);
-
-        var spawned: usize = 0;
-        var threads_joined = false;
-        errdefer {
-            if (!threads_joined) {
-                for (threads[0..spawned]) |*thread| thread.join();
-            }
-        }
-        for (threads) |*thread| {
-            thread.* = try std.Thread.spawn(.{}, WorkerState.run, .{&state});
-            spawned += 1;
-        }
-
+        // Detached read-only opens are safe to execute inline if the caller's
+        // Io cannot schedule more work. Each worker claims disjoint results.
+        const io = self.checkpointIo();
+        var workers: std.Io.Group = .init;
+        defer workers.cancel(io);
+        for (0..parallelism - 1) |_| workers.async(io, WorkerState.run, .{&state});
         WorkerState.run(&state);
-
-        for (threads[0..spawned]) |*thread| thread.join();
-        threads_joined = true;
+        try workers.await(io);
 
         // A failed index load quarantines that index instead of failing the
         // whole table open; the other indexes stay usable and the failure is
@@ -26587,12 +26575,18 @@ test "observed analyzer publication waits for active analysis readers" {
     };
 
     entry.lockAnalysisShared();
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var thread_awaited = false;
+    defer if (!thread_awaited) {
+        entry.unlockAnalysisShared();
+        thread.await(std.testing.io);
+    };
     while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..128) |_| std.Thread.yield() catch {};
+    for (0..128) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!worker.finished.load(.acquire));
     entry.unlockAnalysisShared();
-    thread.join();
+    thread.await(std.testing.io);
+    thread_awaited = true;
 
     if (worker.err) |err| return err;
     try std.testing.expect(worker.finished.load(.acquire));
@@ -28046,22 +28040,25 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
         try setup_manager.openConfiguredIndex(&store, configs[0], false, false);
     }
 
-    var manager = try IndexManager.init(alloc, path);
-    defer manager.deinit();
-    manager.updateRange(.{ .start = "", .end = "" });
+    for ([_]?std.Io{ std.testing.io, null }) |scheduling_io| {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.setIo(scheduling_io);
+        manager.updateRange(.{ .start = "", .end = "" });
 
-    for (configs) |cfg| {
-        try manager.ensureConfiguredIndexDir(cfg);
+        for (configs) |cfg| {
+            try manager.ensureConfiguredIndexDir(cfg);
+        }
+
+        // A worker error no longer fails the load: the failing index is
+        // quarantined (config retained, error recorded) while the healthy one
+        // loads normally. Both concurrent and inline execution drain all work.
+        try manager.loadConfiguredIndexesParallel(&store, &configs, 2);
+        try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
+        try std.testing.expect(manager.denseIndex("dv_bad") == null);
+        const recorded = manager.loadFailure("dv_bad") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("InvalidIndexConfig", recorded);
     }
-
-    // A worker error no longer fails the load: the failing index is
-    // quarantined (config retained, error recorded) while the healthy one
-    // loads normally — and the worker threads still join exactly once.
-    try manager.loadConfiguredIndexesParallel(&store, &configs, 2);
-    try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
-    try std.testing.expect(manager.denseIndex("dv_bad") == null);
-    const recorded = manager.loadFailure("dv_bad") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("InvalidIndexConfig", recorded);
 }
 
 test "dense apply resource manager accounts working bytes and releases them" {

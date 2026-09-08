@@ -1907,13 +1907,7 @@ pub const ResolutionRuntime = struct {
 };
 
 fn lockMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 const testing = std.testing;

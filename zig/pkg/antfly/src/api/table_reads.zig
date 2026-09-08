@@ -29954,7 +29954,7 @@ test "provisioned read cache exclusive access drains active read leases" {
     try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
 
     var ctx = ExclusiveThread{ .cache = &cache };
-    const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
+    var thread = try std.testing.io.concurrent(ExclusiveThread.run, .{&ctx});
 
     var observed_exclusive = false;
     var observed_retired_count: usize = 0;
@@ -29969,7 +29969,7 @@ test "provisioned read cache exclusive access drains active read leases" {
     }
 
     lease.release();
-    thread.join();
+    thread.await(std.testing.io);
     if (ctx.err) |err| return err;
     try std.testing.expect(observed_exclusive);
     try std.testing.expectEqual(@as(usize, 1), observed_retired_count);
@@ -30053,7 +30053,7 @@ test "provisioned read cache group exclusive drains only the published group" {
     const table_epoch = cache.table_epochs.get("docs").?;
 
     var ctx = ExclusiveThread{ .cache = &cache };
-    const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
+    var thread = try std.testing.io.concurrent(ExclusiveThread.run, .{&ctx});
     var observed = false;
     for (0..100) |_| {
         const io = cache.threaded.io();
@@ -30067,7 +30067,7 @@ test "provisioned read cache group exclusive drains only the published group" {
     }
 
     lease_one.release();
-    thread.join();
+    thread.await(std.testing.io);
     if (ctx.err) |err| return err;
     try std.testing.expect(observed);
     try std.testing.expectEqual(table_epoch, cache.table_epochs.get("docs").?);

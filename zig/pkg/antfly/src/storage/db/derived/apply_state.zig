@@ -1165,7 +1165,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -1192,8 +1192,15 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
 
     var barrier = Barrier{};
     var workers: [worker_count]Worker = undefined;
-    var threads: [worker_count]std.Thread = undefined;
+    var threads: [worker_count]std.Io.Future(void) = undefined;
     const names = [_][]const u8{ "idx0", "idx1", "idx2", "idx3", "idx4", "idx5" };
+    var started_tasks: usize = 0;
+    defer {
+        lockAtomicMutex(&barrier.mutex);
+        barrier.open = true;
+        barrier.mutex.unlock();
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
     for (&workers, 0..) |*worker, i| {
         worker.* = .{
             .alloc = alloc,
@@ -1203,9 +1210,10 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
             .sequence = @intCast(i + 1),
             .barrier = &barrier,
         };
-        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        threads[i] = try std.testing.io.concurrent(Worker.run, .{worker});
+        started_tasks += 1;
     }
-    for (&threads) |thread| thread.join();
+    for (&threads) |*thread| thread.await(std.testing.io);
     for (&workers) |*worker| {
         if (worker.err) |err| return err;
     }

@@ -3725,7 +3725,7 @@ fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
     while (true) {
         if (platform_time.monotonicNs() >= deadline) return false;
         if (mutex.tryLock()) return true;
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
@@ -4948,6 +4948,8 @@ const EmbeddedInferenceProviderLifetime = struct {
     // shutdown could observe zero and destroy the node before that borrower
     // committed its reference.
     state: std.atomic.Value(usize) = .init(0),
+    drain_mutex: std.Io.Mutex = .init,
+    drained: std.Io.Condition = .init,
 
     const CallGuard = struct {
         owner: *EmbeddedInferenceProviderLifetime,
@@ -4955,8 +4957,14 @@ const EmbeddedInferenceProviderLifetime = struct {
 
         fn deinit(self: *@This()) void {
             if (!self.active) return;
+            const io = std.Io.Threaded.global_single_threaded.io();
+            self.owner.drain_mutex.lockUncancelable(io);
             const previous = self.owner.state.fetchSub(1, .acq_rel);
             std.debug.assert(previous & count_mask > 0);
+            if (previous & closed_bit != 0 and previous & count_mask == 1) {
+                self.owner.drained.broadcast(io);
+            }
+            self.owner.drain_mutex.unlock(io);
             self.active = false;
         }
     };
@@ -4977,10 +4985,10 @@ const EmbeddedInferenceProviderLifetime = struct {
 
     fn quiesce(self: *EmbeddedInferenceProviderLifetime) void {
         _ = self.state.fetchOr(closed_bit, .acq_rel);
-        while (self.activeCallCount() != 0) {
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
-        }
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.drain_mutex.lockUncancelable(io);
+        defer self.drain_mutex.unlock(io);
+        while (self.activeCallCount() != 0) self.drained.waitUncancelable(io, &self.drain_mutex);
     }
 
     fn isAccepting(self: *const EmbeddedInferenceProviderLifetime) bool {
@@ -5007,13 +5015,17 @@ test "embedded provider lifetime rejects new calls and joins admitted calls" {
         }
     };
     var quiesce = Quiesce{ .lifetime = &lifetime };
-    const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});
+    var thread = try std.testing.io.concurrent(Quiesce.run, .{&quiesce});
+    defer {
+        guard.deinit();
+        thread.await(std.testing.io);
+    }
     while (lifetime.isAccepting()) std.atomic.spinLoopHint();
 
     try std.testing.expect(!quiesce.returned.load(.acquire));
     try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
     guard.deinit();
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(quiesce.returned.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());

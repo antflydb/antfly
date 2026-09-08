@@ -4959,9 +4959,7 @@ fn findMatchingIndexStatus(
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn freeAlgebraicCandidateStatuses(alloc: std.mem.Allocator, candidates: []const db_mod.types.AlgebraicCandidateStatus) void {
@@ -5649,17 +5647,17 @@ test "runtime status snapshots never wait for mutable cache ownership" {
     };
     var snapshot = Snapshot{ .cache = &cache };
     lockAtomic(&cache.mutex);
-    const thread = try std.Thread.spawn(.{}, Snapshot.run, .{&snapshot});
+    var thread = try std.testing.io.concurrent(Snapshot.run, .{&snapshot});
     var completed_while_locked = false;
     for (0..10_000) |_| {
         if (snapshot.done.load(.acquire)) {
             completed_while_locked = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     cache.mutex.unlock();
-    thread.join();
+    thread.await(std.testing.io);
     try std.testing.expect(completed_while_locked);
     try std.testing.expect(!snapshot.failed.load(.acquire));
 }
@@ -5752,7 +5750,7 @@ test "blocked read payload preparation does not convoy an unrelated table" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const Publish = struct {
@@ -5782,20 +5780,24 @@ test "blocked read payload preparation does not convoy an unrelated table" {
     defer test_read_group_preparation_hook = null;
     var publish_a = Publish{ .cache = &cache, .token = token_a, .table_name = "table-a", .group_id = 1 };
     var publish_b = Publish{ .cache = &cache, .token = token_b, .table_name = "table-b", .group_id = 2 };
-    const thread_a = try std.Thread.spawn(.{}, Publish.run, .{&publish_a});
-    while (!blocker.entered.load(.acquire)) std.Thread.yield() catch {};
-    const thread_b = try std.Thread.spawn(.{}, Publish.run, .{&publish_b});
+    var thread_a = try std.testing.io.concurrent(Publish.run, .{&publish_a});
+    defer {
+        blocker.release.store(true, .release);
+        thread_a.await(std.testing.io);
+    }
+    while (!blocker.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    var thread_b = try std.testing.io.concurrent(Publish.run, .{&publish_b});
     var unrelated_completed = false;
     for (0..100_000) |_| {
         if (publish_b.done.load(.acquire)) {
             unrelated_completed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     blocker.release.store(true, .release);
-    thread_a.join();
-    thread_b.join();
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
     try std.testing.expect(unrelated_completed);
     try std.testing.expect(!publish_a.failed.load(.acquire));
     try std.testing.expect(!publish_b.failed.load(.acquire));
@@ -5837,7 +5839,7 @@ test "blocked table refresh preparation does not convoy unrelated publication" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const Refresh = struct {
@@ -5879,33 +5881,33 @@ test "blocked table refresh preparation does not convoy unrelated publication" {
     defer test_read_group_preparation_hook = null;
     var refresh = Refresh{ .cache = &cache, .token = &refresh_token, .snapshots = snapshots };
     var publish = Publish{ .cache = &cache, .token = token_b };
-    const refresh_thread = try std.Thread.spawn(.{}, Refresh.run, .{&refresh});
+    var refresh_thread = try std.testing.io.concurrent(Refresh.run, .{&refresh});
     var preparation_entered = false;
     for (0..100_000) |_| {
         if (blocker.entered.load(.acquire)) {
             preparation_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!preparation_entered) {
         blocker.release.store(true, .release);
-        refresh_thread.join();
+        refresh_thread.await(std.testing.io);
         try std.testing.expect(preparation_entered);
         return;
     }
-    const publish_thread = try std.Thread.spawn(.{}, Publish.run, .{&publish});
+    var publish_thread = try std.testing.io.concurrent(Publish.run, .{&publish});
     var unrelated_completed = false;
     for (0..100_000) |_| {
         if (publish.done.load(.acquire)) {
             unrelated_completed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     blocker.release.store(true, .release);
-    refresh_thread.join();
-    publish_thread.join();
+    refresh_thread.await(std.testing.io);
+    publish_thread.await(std.testing.io);
     try std.testing.expect(unrelated_completed);
     try std.testing.expect(!refresh.failed.load(.acquire));
     try std.testing.expect(!publish.failed.load(.acquire));

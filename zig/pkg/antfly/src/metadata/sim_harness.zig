@@ -11961,6 +11961,13 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
 }
 
 test "metadata http cluster simulation load balanced backup retries a real election" {
+    var barrier_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .stack_size = lean_sim_thread_stack_size,
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(2),
+    });
+    defer barrier_io.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12072,20 +12079,18 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     var scheduler_locked = true;
     defer if (scheduler_locked) cluster.scheduler_gate.unlock();
     const baseline_contentions = cluster.scheduler_gate.contentions.load(.acquire);
-    var external_thread = try std.Thread.spawn(
-        .{ .stack_size = lean_sim_thread_stack_size },
+    var external_thread = try barrier_io.io().concurrent(
         ConcurrentBarrierWorker.run,
         .{&external_barrier},
     );
-    var internal_thread = std.Thread.spawn(
-        .{ .stack_size = lean_sim_thread_stack_size },
+    var internal_thread = barrier_io.io().concurrent(
         ConcurrentBarrierWorker.run,
         .{&internal_barrier},
     ) catch |err| {
         start.set(std.Options.debug_io);
         cluster.scheduler_gate.unlock();
         scheduler_locked = false;
-        external_thread.join();
+        external_thread.await(barrier_io.io());
         return err;
     };
     start.set(std.Options.debug_io);
@@ -12101,8 +12106,8 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     const both_barriers_blocked = completed.load(.acquire) == 0;
     cluster.scheduler_gate.unlock();
     scheduler_locked = false;
-    external_thread.join();
-    internal_thread.join();
+    external_thread.await(barrier_io.io());
+    internal_thread.await(barrier_io.io());
 
     try std.testing.expect(both_barriers_entered);
     try std.testing.expect(both_barriers_contended);

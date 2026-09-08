@@ -335,7 +335,11 @@ pub const WAL = struct {
     sync_after_commit: bool,
     clock: storage_sim.Clock,
     commit_scheduler: storage_sim.CompletionScheduler,
-    mutex: std.atomic.Mutex = .unlocked,
+    // WAL's synchronous API has no scheduling dependency. This context parks
+    // callers without starting executor workers; all condition users share it.
+    sync_io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    mutex: std.Io.Mutex = .init,
+    completed: std.Io.Condition = .init,
     coordinator_active: bool = false,
     pending_head: ?*AppendRequest = null,
     pending_tail: ?*AppendRequest = null,
@@ -555,7 +559,7 @@ pub const WAL = struct {
         const wait_started = self.nowNs();
         var request = AppendRequest{ .entries = entries };
 
-        lockAtomic(&self.mutex);
+        self.mutex.lockUncancelable(self.sync_io);
 
         if (entries.len == 1) {
             self.stats.append_calls += 1;
@@ -569,19 +573,17 @@ pub const WAL = struct {
             self.coordinator_active = true;
             break :blk true;
         } else false;
-        self.mutex.unlock();
+        self.mutex.unlock(self.sync_io);
 
         if (leader) {
             self.driveAppendCoordinator();
         }
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
 
         while (!request.done) {
-            self.mutex.unlock();
-            std.Thread.yield() catch {};
-            lockAtomic(&self.mutex);
+            self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
 
         self.stats.total_wait_ns += self.elapsedSince(wait_started);
@@ -606,12 +608,10 @@ pub const WAL = struct {
         const metadata_key = try idempotencyMetadataKeyAlloc(idempotency_key);
         defer std.heap.page_allocator.free(metadata_key);
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         while (self.coordinator_active or self.pending_head != null) {
-            self.mutex.unlock();
-            std.Thread.yield() catch {};
-            lockAtomic(&self.mutex);
+            self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
 
         var txn = try self.beginWriteTxn();
@@ -645,12 +645,10 @@ pub const WAL = struct {
     pub fn injectCorruptEntryForTest(self: *WAL, lsn: u64) !void {
         if (!builtin.is_test) return error.Unsupported;
         if (lsn == 0 or lsn > self.lastLsn()) return error.InvalidLsn;
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         while (self.coordinator_active or self.pending_head != null) {
-            self.mutex.unlock();
-            std.Thread.yield() catch {};
-            lockAtomic(&self.mutex);
+            self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
         var txn = try self.beginWriteTxn();
         errdefer txn.abort();
@@ -661,8 +659,8 @@ pub const WAL = struct {
     }
 
     pub fn statsSnapshot(self: *WAL) WalStats {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         return self.stats;
     }
 
@@ -685,12 +683,10 @@ pub const WAL = struct {
     /// Native capture uses the resulting immutable runs and deliberately omits
     /// the appendable physical WAL payloads.
     pub fn checkpointLsmWalAfterDurableBoundary(self: *WAL) !void {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         while (self.coordinator_active or self.pending_head != null) {
-            self.mutex.unlock();
-            std.Thread.yield() catch {};
-            lockAtomic(&self.mutex);
+            self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
         try self.store_owner.checkpointLsmWalAfterDurableBoundary();
     }
@@ -698,8 +694,8 @@ pub const WAL = struct {
     /// Retains an immutable physical generation after all logical WAL writes
     /// admitted before the caller's revision fence have completed.
     pub fn pinNativeCheckpoint(self: *WAL) !lsm_backend.Backend.NativeCheckpoint {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
         // Native capture reaches this method only after backend-runtime replay
         // admission and the DB revision fence have drained prior append work.
         // Never spin or sleep an OS thread if that contract is violated.
@@ -756,13 +752,11 @@ pub const WAL = struct {
     /// cursor back to keep_lsn + 1. Used by timeline rewind workflows that must
     /// discard divergent suffix records before following a promoted timeline.
     pub fn truncateAfter(self: *WAL, keep_lsn: u64) !void {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
 
         while (self.coordinator_active or self.pending_head != null) {
-            self.mutex.unlock();
-            std.Thread.yield() catch {};
-            lockAtomic(&self.mutex);
+            self.completed.waitUncancelable(self.sync_io, &self.mutex);
         }
 
         const next_lsn = try std.math.add(u64, keep_lsn, 1);
@@ -961,10 +955,10 @@ pub const WAL = struct {
     fn driveAppendCoordinator(self: *WAL) void {
         while (true) {
             var coalesce_ns: u64 = 0;
-            lockAtomic(&self.mutex);
+            self.mutex.lockUncancelable(self.sync_io);
             const should_wait = self.shouldCoalesceWaitLocked();
             const wait_ns = if (should_wait) self.effectiveCoalesceWindowNsLocked() else 0;
-            self.mutex.unlock();
+            self.mutex.unlock(self.sync_io);
 
             if (wait_ns > 0) {
                 const coalesce_started = self.nowNs();
@@ -972,20 +966,21 @@ pub const WAL = struct {
                 coalesce_ns = self.elapsedSince(coalesce_started);
             }
 
-            lockAtomic(&self.mutex);
+            self.mutex.lockUncancelable(self.sync_io);
             const batch = self.drainPendingRequestsLocked();
-            self.mutex.unlock();
+            self.mutex.unlock(self.sync_io);
 
             if (batch.head == null) {
-                lockAtomic(&self.mutex);
+                self.mutex.lockUncancelable(self.sync_io);
                 self.coordinator_active = false;
-                self.mutex.unlock();
+                self.completed.broadcast(self.sync_io);
+                self.mutex.unlock(self.sync_io);
                 return;
             }
 
             const attempt = self.commitAppendBatch(batch);
 
-            lockAtomic(&self.mutex);
+            self.mutex.lockUncancelable(self.sync_io);
             self.recordCommitStatsLocked(batch, attempt.stats, coalesce_ns);
 
             var current = batch.head;
@@ -1010,7 +1005,8 @@ pub const WAL = struct {
                 self.coordinator_active = false;
             }
             const should_continue = self.coordinator_active;
-            self.mutex.unlock();
+            self.completed.broadcast(self.sync_io);
+            self.mutex.unlock(self.sync_io);
 
             if (!should_continue) return;
         }
@@ -1338,9 +1334,7 @@ fn initialCommitWindowNs(configured_window_ns: u64) u64 {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn putWalValue(txn: anytype, key: []const u8, value: []const u8) !void {
@@ -1694,7 +1688,7 @@ fn applyWalSimAction(
                         const ready = self.open;
                         self.mutex.unlock();
                         if (ready) return;
-                        std.Thread.yield() catch {};
+                        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                     }
                 }
             };
@@ -1724,10 +1718,11 @@ fn applyWalSimAction(
             var left = Worker{ .wal = wal, .barrier = &barrier, .payload = left_payload };
             var right = Worker{ .wal = wal, .barrier = &barrier, .payload = right_payload };
 
-            const left_thread = try std.Thread.spawn(.{}, Worker.run, .{&left});
-            const right_thread = try std.Thread.spawn(.{}, Worker.run, .{&right});
-            left_thread.join();
-            right_thread.join();
+            var left_thread = try std.testing.io.concurrent(Worker.run, .{&left});
+            defer left_thread.await(std.testing.io);
+            var right_thread = try std.testing.io.concurrent(Worker.run, .{&right});
+            left_thread.await(std.testing.io);
+            right_thread.await(std.testing.io);
 
             if (left.err) |err| return err;
             if (right.err) |err| return err;
@@ -3477,13 +3472,13 @@ test "wal group commit coalesces concurrent appends" {
     var request_a = AppendRequest{ .entries = &alpha_entries };
     var request_b = AppendRequest{ .entries = &beta_entries };
 
-    lockAtomic(&wal.mutex);
+    wal.mutex.lockUncancelable(wal.sync_io);
     wal.stats.append_calls += 2;
     wal.stats.logical_entries += 2;
     wal.enqueueAppendRequestLocked(&request_a);
     wal.enqueueAppendRequestLocked(&request_b);
     wal.coordinator_active = true;
-    wal.mutex.unlock();
+    wal.mutex.unlock(wal.sync_io);
 
     wal.driveAppendCoordinator();
 
@@ -3533,7 +3528,7 @@ test "wal async-io group commit coalesces concurrent appends" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -3571,10 +3566,11 @@ test "wal async-io group commit coalesces concurrent appends" {
         var worker_a = Worker{ .wal = &wal, .barrier = &barrier, .payload = "alpha" };
         var worker_b = Worker{ .wal = &wal, .barrier = &barrier, .payload = "beta" };
 
-        const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});
-        const thread_b = try std.Thread.spawn(.{}, Worker.run, .{&worker_b});
-        thread_a.join();
-        thread_b.join();
+        var thread_a = try std.testing.io.concurrent(Worker.run, .{&worker_a});
+        defer thread_a.await(std.testing.io);
+        var thread_b = try std.testing.io.concurrent(Worker.run, .{&worker_b});
+        thread_a.await(std.testing.io);
+        thread_b.await(std.testing.io);
 
         if (worker_a.err) |err| return err;
         if (worker_b.err) |err| return err;
@@ -3674,7 +3670,7 @@ test "wal async-io survives concurrent append burst" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -3706,11 +3702,19 @@ test "wal async-io survives concurrent append burst" {
         .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
     };
 
-    var threads: [workers.len]std.Thread = undefined;
-    for (&workers, 0..) |*worker, idx| {
-        threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, workers.len });
+    var threads: [workers.len]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        lockAtomic(&barrier.mutex);
+        barrier.open = true;
+        barrier.mutex.unlock();
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
     }
-    for (threads) |thread| thread.join();
+    for (&workers, 0..) |*worker, idx| {
+        threads[idx] = try std.testing.io.concurrent(Worker.run, .{ worker, workers.len });
+        started_tasks += 1;
+    }
+    for (&threads) |*thread| thread.await(std.testing.io);
     for (workers) |worker| {
         if (worker.err) |err| return err;
     }
@@ -3751,7 +3755,7 @@ test "wal async-io survives grouped concurrent append burst" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -3783,11 +3787,19 @@ test "wal async-io survives grouped concurrent append burst" {
         .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
     };
 
-    var threads: [workers.len]std.Thread = undefined;
-    for (&workers, 0..) |*worker, idx| {
-        threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, workers.len });
+    var threads: [workers.len]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        lockAtomic(&barrier.mutex);
+        barrier.open = true;
+        barrier.mutex.unlock();
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
     }
-    for (threads) |thread| thread.join();
+    for (&workers, 0..) |*worker, idx| {
+        threads[idx] = try std.testing.io.concurrent(Worker.run, .{ worker, workers.len });
+        started_tasks += 1;
+    }
+    for (&threads) |*thread| thread.await(std.testing.io);
     for (workers) |worker| {
         if (worker.err) |err| return err;
     }
@@ -3828,7 +3840,7 @@ test "wal async-io survives plain then grouped concurrent runs in one process" {
                         const ready = self.open;
                         self.mutex.unlock();
                         if (ready) return;
-                        std.Thread.yield() catch {};
+                        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                     }
                 }
             };
@@ -3860,11 +3872,19 @@ test "wal async-io survives plain then grouped concurrent runs in one process" {
                 .{ .wal = &wal, .barrier = &barrier, .payload = payload, .appends = 64 },
             };
 
-            var threads: [workers.len]std.Thread = undefined;
-            for (&workers, 0..) |*worker, idx| {
-                threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, workers.len });
+            var threads: [workers.len]std.Io.Future(void) = undefined;
+            var started_tasks: usize = 0;
+            defer {
+                lockAtomic(&barrier.mutex);
+                barrier.open = true;
+                barrier.mutex.unlock();
+                for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
             }
-            for (threads) |thread| thread.join();
+            for (&workers, 0..) |*worker, idx| {
+                threads[idx] = try std.testing.io.concurrent(Worker.run, .{ worker, workers.len });
+                started_tasks += 1;
+            }
+            for (&threads) |*thread| thread.await(std.testing.io);
             for (workers) |worker| {
                 if (worker.err) |err| return err;
             }

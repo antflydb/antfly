@@ -851,13 +851,23 @@ pub const EmbeddingPipeline = struct {
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
             ),
-            .clip => try image.preprocessClipBatch(
-                alloc,
-                images,
-                img_size,
-                image.IMAGENET_MEAN,
-                image.IMAGENET_STD,
-            ),
+            .clip => blk: {
+                // The synchronous pipeline owns only the preprocessing phase;
+                // release its bounded workers before entering the model session.
+                var preprocess_io = std.Io.Threaded.init(alloc, .{
+                    .async_limit = .limited(8),
+                    .concurrent_limit = .limited(8),
+                });
+                defer preprocess_io.deinit();
+                break :blk try image.preprocessClipBatch(
+                    preprocess_io.io(),
+                    alloc,
+                    images,
+                    img_size,
+                    image.IMAGENET_MEAN,
+                    image.IMAGENET_STD,
+                );
+            },
         };
         defer alloc.free(pixel_values);
         logEmbedTiming("image.preprocess", batch, preprocess_start);

@@ -56,7 +56,7 @@ pub const RuntimeCadence = struct {
 
 /// Owns the dedicated scheduling lane for one Raft runtime. The source retains
 /// semantic ownership of the Raft service and its synchronization; this driver
-/// owns only cadence, failure propagation, cancellation, and thread lifetime.
+/// owns only cadence, failure propagation, cancellation, and task lifetime.
 /// A driver is one-shot: construct a new driver for a new runtime generation.
 pub const ManagedProgressDriver = struct {
     const State = enum {
@@ -68,7 +68,9 @@ pub const ManagedProgressDriver = struct {
     io: std.Io,
     source: ProgressSource,
     interval_ns: u64,
-    thread: ?std.Thread = null,
+    // Progress must remain independent of capacity in the caller's executor.
+    progress_io: ?std.Io.Threaded = null,
+    future: ?std.Io.Future(void) = null,
     state: State = .initialized,
     stop_event: std.Io.Event = .unset,
     failure_event: std.Io.Event = .unset,
@@ -109,7 +111,15 @@ pub const ManagedProgressDriver = struct {
         if (self.interval_ns == 0) return error.InvalidInterval;
         if (comptime builtin.single_threaded) return error.UnsupportedPlatform;
 
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.progress_io = std.Io.Threaded.init(std.heap.page_allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(1),
+        });
+        errdefer {
+            self.progress_io.?.deinit();
+            self.progress_io = null;
+        }
+        self.future = try self.progress_io.?.io().concurrent(run, .{self});
         self.state = .running;
     }
 
@@ -148,8 +158,10 @@ pub const ManagedProgressDriver = struct {
     pub fn stop(self: *ManagedProgressDriver) void {
         if (self.state != .running) return;
         self.stop_event.set(self.io);
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
+        if (self.future) |*future| future.await(self.progress_io.?.io());
+        self.future = null;
+        self.progress_io.?.deinit();
+        self.progress_io = null;
         self.state = .stopped;
     }
 
@@ -460,7 +472,10 @@ test "managed raft progress driver advances independently and joins on stop" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
     defer io_impl.deinit();
     var counter = Counter{};
     var driver = ManagedProgressDriver.init(io_impl.io(), .{

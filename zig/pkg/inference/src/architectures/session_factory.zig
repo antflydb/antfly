@@ -822,7 +822,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     {
         var lazy_it = impl.backend_data.native.lazy_weights.iterator();
         while (lazy_it.next()) |entry| {
-            entry.value_ptr.guard = impl.backend_data.native.prefetch.mutexPtr();
+            entry.value_ptr.guard = impl.backend_data.native.prefetch.lockHandle();
         }
     }
     if (impl.backend_data.native.lazy_weights.count() > 0) {
@@ -1102,7 +1102,7 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     {
         var lazy_it = impl.backend_data.pjrt.native.lazy_weights.iterator();
         while (lazy_it.next()) |entry| {
-            entry.value_ptr.guard = impl.backend_data.pjrt.native.prefetch.mutexPtr();
+            entry.value_ptr.guard = impl.backend_data.pjrt.native.prefetch.lockHandle();
         }
     }
     if (impl.backend_data.pjrt.native.lazy_weights.count() > 0) {

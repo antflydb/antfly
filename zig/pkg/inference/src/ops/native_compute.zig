@@ -742,7 +742,7 @@ pub const LazyWeightEntry = struct {
     pin_count: usize = 0,
     pending_prefetch: bool = false,
     prefetch_score: u64 = 0,
-    guard: ?*std.atomic.Mutex = null,
+    guard: ?prefetch_mod.LockHandle = null,
     placement: PlacementPlan = .{
         .class = .other,
         .preferred_tier = .host,
@@ -3037,7 +3037,7 @@ fn q4q5PreparedQ8KColumnParallelMaxRowsForShape(
 }
 
 fn quantParallelDispatchAvailable(io: ?std.Io) bool {
-    return io != null or linalg.pool.have_futex;
+    return io != null or linalg.pool.supports_sync_parallelism;
 }
 
 fn quantParallelDebugRequested() bool {
@@ -4184,7 +4184,7 @@ pub fn initPrefetchQueue(data: *WeightStore, allocator: std.mem.Allocator) void 
     data.prefetch_initialized = true;
     var lazy_it = data.lazy_weights.iterator();
     while (lazy_it.next()) |entry| {
-        entry.value_ptr.guard = data.prefetch.mutexPtr();
+        entry.value_ptr.guard = data.prefetch.lockHandle();
     }
 }
 
@@ -4199,6 +4199,9 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
     deinitGlinerHeadDenseCache(data);
     if (!data.prefetch_initialized) return;
+    data.prefetch.stop();
+    var lazy_it = data.lazy_weights.iterator();
+    while (lazy_it.next()) |entry| entry.value_ptr.guard = null;
     data.prefetch.deinit();
     data.prefetch_initialized = false;
 }
@@ -4523,9 +4526,7 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     const b = toBuf(tensor);
     if (b.lazy_entry) |entry| {
         if (entry.guard) |guard| {
-            while (!guard.tryLock()) {
-                platform.time.yieldBriefly();
-            }
+            guard.lock();
             defer guard.unlock();
             releaseLazyEntryPinLocked(self.data, entry);
         } else {

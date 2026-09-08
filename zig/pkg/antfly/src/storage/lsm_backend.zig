@@ -471,6 +471,9 @@ pub const BackgroundExecutor = lsm_background_mod.Executor;
 pub const BackendHandleConfig = struct {
     background_runtime: ?background_runtime_mod.Config = null,
     internal_flush_worker: bool = false,
+    /// Borrowed scheduling capacity for internal maintenance. Must outlive
+    /// this handle; otherwise use its owned backend runtime or a one-task Io.
+    maintenance_io: ?std.Io = null,
 };
 const max_local_cached_run_blocks: usize = 64;
 const root_writer_lock_file_name = "writer.lock";
@@ -6171,6 +6174,7 @@ pub const Backend = struct {
 
 const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.single_threaded) struct {
     backend: *Backend,
+    borrowed_io: ?std.Io,
 
     const Stats = struct {
         wakeups: u64 = 0,
@@ -6179,8 +6183,8 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         joined: bool = false,
     };
 
-    fn init(backend: *Backend) InternalFlushWorker {
-        return .{ .backend = backend };
+    fn init(backend: *Backend, scheduling_io: ?std.Io) InternalFlushWorker {
+        return .{ .backend = backend, .borrowed_io = scheduling_io };
     }
 
     fn start(_: *InternalFlushWorker) !void {
@@ -6188,6 +6192,8 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     }
 
     fn stopAndJoin(_: *InternalFlushWorker, _: bool) void {}
+
+    fn deinit(_: *InternalFlushWorker) void {}
 
     fn waker(self: *InternalFlushWorker) MaintenanceWaker {
         return .{ .ptr = self, .wake_fn = wake };
@@ -6200,8 +6206,11 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     }
 } else struct {
     backend: *Backend,
-    mutex: std.atomic.Mutex = .unlocked,
-    thread: ?std.Thread = null,
+    borrowed_io: ?std.Io,
+    mutex: std.Io.Mutex = .init,
+    wake_event: std.Io.Event = .unset,
+    owned_io: ?std.Io.Threaded = null,
+    future: ?std.Io.Future(void) = null,
     stop_requested: bool = false,
     drain_on_stop: bool = false,
     wake_requested: bool = false,
@@ -6210,8 +6219,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     errors: u64 = 0,
     joined: bool = false,
 
-    const idle_obsolete_reclaim_poll_ns = 250 * std.time.ns_per_ms;
-    const idle_wake_poll_ns = 2 * std.time.ns_per_ms;
+    const Work = enum { run, drain, stop };
 
     const Stats = struct {
         wakeups: u64 = 0,
@@ -6220,24 +6228,39 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         joined: bool = false,
     };
 
-    fn init(backend: *Backend) InternalFlushWorker {
-        return .{ .backend = backend };
+    fn init(backend: *Backend, scheduling_io: ?std.Io) InternalFlushWorker {
+        return .{ .backend = backend, .borrowed_io = scheduling_io };
+    }
+
+    fn io(self: *InternalFlushWorker) std.Io {
+        return self.borrowed_io orelse self.owned_io.?.io();
     }
 
     fn start(self: *InternalFlushWorker) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        if (self.borrowed_io == null) {
+            self.owned_io = std.Io.Threaded.init(self.backend.allocator, .{
+                .async_limit = .nothing,
+                .concurrent_limit = .limited(1),
+            });
+        }
+        self.future = try self.io().concurrent(run, .{self});
+    }
+
+    fn deinit(self: *InternalFlushWorker) void {
+        if (self.owned_io) |*io_impl| io_impl.deinit();
     }
 
     fn stopAndJoin(self: *InternalFlushWorker, drain: bool) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.stop_requested = true;
         self.drain_on_stop = self.drain_on_stop or drain;
         self.wake_requested = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
 
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        self.wake_event.set(self.io());
+        if (self.future) |*future| {
+            future.await(self.io());
+            self.future = null;
             self.joined = true;
         }
     }
@@ -6248,15 +6271,16 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
 
     fn wake(ptr: *anyopaque) void {
         const self: *InternalFlushWorker = @ptrCast(@alignCast(ptr));
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.wake_requested = true;
         self.wakeups +|= 1;
-        self.mutex.unlock();
+        self.wake_event.set(self.io());
+        self.mutex.unlock(self.io());
     }
 
     fn snapshotStats(self: *InternalFlushWorker) Stats {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
         return .{
             .wakeups = self.wakeups,
             .maintenance_steps = self.maintenance_steps,
@@ -6268,36 +6292,50 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     fn run(self: *InternalFlushWorker) void {
         var next_reclaim_delay_ns: ?u64 = null;
         while (true) {
-            const drain_then_stop = self.waitForWork(next_reclaim_delay_ns);
-            if (drain_then_stop) {
-                _ = self.drainMaintenance();
-                return;
+            switch (self.waitForWork(next_reclaim_delay_ns)) {
+                .stop => return,
+                .drain => {
+                    _ = self.drainMaintenance();
+                    return;
+                },
+                .run => next_reclaim_delay_ns = self.drainMaintenance(),
             }
-            next_reclaim_delay_ns = self.drainMaintenance();
         }
     }
 
-    fn waitForWork(self: *InternalFlushWorker, initial_reclaim_delay_ns: ?u64) bool {
-        var reclaim_delay_ns = initial_reclaim_delay_ns;
+    fn waitForWork(self: *InternalFlushWorker, reclaim_delay_ns: ?u64) Work {
+        const io_ctx = self.io();
+        const deadline_ns = if (reclaim_delay_ns) |delay| platform.time.monotonicNs() +| delay else null;
         while (true) {
-            lockWorkerMutex(&self.mutex);
-            if (self.stop_requested or self.wake_requested) break;
-            self.mutex.unlock();
-
-            if (reclaim_delay_ns) |delay_ns| {
-                if (delay_ns == 0) return false;
-                const sleep_ns = @min(delay_ns, idle_obsolete_reclaim_poll_ns);
-                sleepForTest(sleep_ns);
-                reclaim_delay_ns = if (delay_ns <= sleep_ns) 0 else delay_ns - sleep_ns;
+            self.mutex.lockUncancelable(io_ctx);
+            if (self.stop_requested) {
+                const work: Work = if (self.drain_on_stop) .drain else .stop;
+                self.mutex.unlock(io_ctx);
+                return work;
+            }
+            if (self.wake_requested) {
+                self.wake_requested = false;
+                self.mutex.unlock(io_ctx);
+                return .run;
+            }
+            // Reset under the same mutex used to publish wakes. A wake
+            // arriving before wait remains latched and cannot be lost.
+            self.wake_event.reset();
+            self.mutex.unlock(io_ctx);
+            if (deadline_ns) |deadline| {
+                const now = platform.time.monotonicNs();
+                if (now >= deadline) return .run;
+                self.wake_event.waitTimeout(io_ctx, .{ .duration = .{
+                    .raw = .fromNanoseconds(deadline - now),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return .stop,
+                };
             } else {
-                sleepForTest(idle_wake_poll_ns);
+                self.wake_event.waitUncancelable(io_ctx);
             }
         }
-        defer self.mutex.unlock();
-        const drain_then_stop = self.stop_requested and self.drain_on_stop;
-        if (self.stop_requested and !drain_then_stop) return true;
-        self.wake_requested = false;
-        return drain_then_stop;
     }
 
     fn drainMaintenance(self: *InternalFlushWorker) ?u64 {
@@ -6310,22 +6348,22 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
             if (!progressed) return self.backend.nextMaintenanceWakeDelayNsBestEffort();
             self.recordStep();
         }
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.wake_requested = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
         return null;
     }
 
     fn recordStep(self: *InternalFlushWorker) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.maintenance_steps +|= 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
     }
 
     fn recordError(self: *InternalFlushWorker, err: anyerror) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.errors +|= 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
         std.log.warn("lsm internal flush worker failed root={?s} err={}", .{ self.backend.root_dir, err });
     }
 };
@@ -6355,6 +6393,7 @@ pub const BackendHandle = struct {
         var internal_flush_worker: ?*InternalFlushWorker = null;
         errdefer if (internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
+            worker.deinit();
             allocator.destroy(worker);
         };
 
@@ -6371,8 +6410,9 @@ pub const BackendHandle = struct {
         }
 
         backend.* = Backend.init(allocator, resolved_options);
+        errdefer backend.close();
         if (config.internal_flush_worker) {
-            internal_flush_worker = try startInternalFlushWorker(allocator, backend);
+            internal_flush_worker = try startInternalFlushWorker(allocator, backend, config.maintenance_io orelse if (owned_runtime) |*runtime| runtime.ptr().io() else null);
         }
         return .{
             .allocator = allocator,
@@ -6395,6 +6435,7 @@ pub const BackendHandle = struct {
         var internal_flush_worker: ?*InternalFlushWorker = null;
         errdefer if (internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
+            worker.deinit();
             allocator.destroy(worker);
         };
 
@@ -6411,8 +6452,9 @@ pub const BackendHandle = struct {
         }
 
         try backend.openInto(allocator, root_dir, resolved_options);
+        errdefer backend.close();
         if (config.internal_flush_worker) {
-            internal_flush_worker = try startInternalFlushWorker(allocator, backend);
+            internal_flush_worker = try startInternalFlushWorker(allocator, backend, config.maintenance_io orelse if (owned_runtime) |*runtime| runtime.ptr().io() else null);
         }
         return .{
             .allocator = allocator,
@@ -6426,6 +6468,7 @@ pub const BackendHandle = struct {
         if (self.internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
             self.backend.options.maintenance_waker = null;
+            worker.deinit();
             self.allocator.destroy(worker);
             self.internal_flush_worker = null;
         }
@@ -6439,6 +6482,7 @@ pub const BackendHandle = struct {
         if (self.internal_flush_worker) |worker| {
             worker.stopAndJoin(false);
             self.backend.options.maintenance_waker = null;
+            worker.deinit();
             self.allocator.destroy(worker);
             self.internal_flush_worker = null;
         }
@@ -6472,11 +6516,12 @@ pub const BackendHandle = struct {
         return worker.snapshotStats();
     }
 
-    fn startInternalFlushWorker(allocator: Allocator, backend: *Backend) !*InternalFlushWorker {
+    fn startInternalFlushWorker(allocator: Allocator, backend: *Backend, io: ?std.Io) !*InternalFlushWorker {
         if (backend.options.maintenance_waker != null) return error.MaintenanceWakerAlreadyConfigured;
         const worker = try allocator.create(InternalFlushWorker);
         errdefer allocator.destroy(worker);
-        worker.* = InternalFlushWorker.init(backend);
+        worker.* = InternalFlushWorker.init(backend, io);
+        errdefer worker.deinit();
         backend.options.maintenance_waker = worker.waker();
         errdefer backend.options.maintenance_waker = null;
         try worker.start();
@@ -7694,13 +7739,14 @@ test "lsm backend deferred immutable backpressure waits for in-flight build" {
             target.finishImmutableFlushBuildLocked();
         }
     };
-    const clear_thread = try std.Thread.spawn(.{}, ClearBuild.run, .{&backend});
+    var clear_thread = try std.testing.io.concurrent(ClearBuild.run, .{&backend});
+    defer clear_thread.await(std.testing.io);
     {
         var txn = try backend.beginWrite();
         try txn.put(.{}, "key:b", "b");
         try txn.commit();
     }
-    clear_thread.join();
+    clear_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
 
@@ -10465,7 +10511,7 @@ test "lsm backend public maintenance mutators serialize on backend mutex" {
             };
 
             const locked = runtime_mod.lockBackend(Backend, backend);
-            const thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+            var thread = try std.testing.io.concurrent(Worker.run, .{&ctx});
 
             while (stage.load(.acquire) == 0) {
                 platform.time.yieldBriefly();
@@ -10477,7 +10523,7 @@ test "lsm backend public maintenance mutators serialize on backend mutex" {
             const blocked_stage = stage.load(.acquire);
 
             if (locked) runtime_mod.unlockBackend(Backend, backend, locked);
-            thread.join();
+            thread.await(std.testing.io);
             try std.testing.expectEqual(@as(u8, 1), blocked_stage);
             try std.testing.expectEqual(@as(u8, 2), stage.load(.acquire));
         }
@@ -14334,16 +14380,16 @@ test "lsm backend cache-backed batch probes do not require the backend mutex" {
 
     var ctx = Worker.Context{ .txn = &read };
     const locked = runtime_mod.lockBackend(Backend, &backend);
-    var thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&ctx});
     var joined = false;
-    defer if (!joined) thread.join();
+    defer if (!joined) thread.await(std.testing.io);
 
     while (ctx.stage.load(.acquire) == 0) platform.time.yieldBriefly();
     sleepForTest(100 * std.time.ns_per_ms);
     const completed_without_backend_lock = ctx.stage.load(.acquire) == 2;
 
     runtime_mod.unlockBackend(Backend, &backend, locked);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
 
     try std.testing.expect(completed_without_backend_lock);
@@ -14651,9 +14697,9 @@ test "lsm backend close drains generation readers before teardown" {
     var read = try backend.beginRead();
     var read_released = false;
     var state = CloseState{ .backend = &backend };
-    var thread = try std.Thread.spawn(.{}, CloseState.run, .{&state});
+    var thread = try std.testing.io.concurrent(CloseState.run, .{&state});
     var thread_joined = false;
-    defer if (!thread_joined) thread.join();
+    defer if (!thread_joined) thread.await(std.testing.io);
     defer if (!read_released) read.abort();
 
     while (!state.started.load(.acquire)) platform.time.yieldBriefly();
@@ -14663,7 +14709,7 @@ test "lsm backend close drains generation readers before teardown" {
 
     read.abort();
     read_released = true;
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(state.finished.load(.acquire));
 }
@@ -17832,4 +17878,53 @@ test "lsm backend obsolete publication is allocation free after reservation" {
         failing.resize_fail_index = std.math.maxInt(usize);
     }
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "lsm internal flush worker scheduling failure releases an opened backend" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-flush-start-failure",
+        .{ .storage = storage.storage() },
+        .{ .internal_flush_worker = true, .maintenance_io = unavailable.io() },
+    ));
+    // Failed startup must also release writer ownership so the root reopens.
+    var reopened = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-flush-start-failure",
+        .{ .storage = storage.storage() },
+        .{ .internal_flush_worker = true, .maintenance_io = std.testing.io },
+    );
+    defer reopened.close();
+    try std.testing.expect(reopened.internal_flush_worker.?.owned_io == null);
+}
+
+test "lsm internal flush worker distinguishes stop from drain" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend: Backend = undefined;
+    try backend.openInto(std.testing.allocator, "/lsm-flush-stop-drain", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+    });
+    defer backend.close();
+    var txn = try backend.beginWrite();
+    try txn.put(.{}, "key", "value");
+    try txn.commit();
+
+    var worker = InternalFlushWorker.init(&backend, std.testing.io);
+    defer worker.deinit();
+    worker.stopAndJoin(false);
+    worker.run();
+    try std.testing.expectEqual(@as(u64, 1), backend.snapshotMaintenanceStats().immutable_memtables);
+    worker.stopAndJoin(true);
+    worker.run();
+    try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().immutable_memtables);
+    try std.testing.expect(backend.snapshotMaintenanceStats().total_runs > 0);
 }

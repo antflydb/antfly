@@ -3425,7 +3425,7 @@ fn spinOrYield() void {
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
@@ -3492,7 +3492,7 @@ fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             continue;
         }
         const backoff_step = @min(attempts - 128, 5);
@@ -3512,7 +3512,7 @@ fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: types.Canc
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         } else {
             const backoff_step = @min(attempts - 128, 5);
             sleepNs(@min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000)));
@@ -3572,7 +3572,7 @@ fn lockAtomicWithBackoffProfiled(mutex: *std.atomic.Mutex, stats: *MutexContenti
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             yield_loops += 1;
             continue;
         }
@@ -3638,7 +3638,7 @@ fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: 
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             yield_loops += 1;
             continue;
         }
@@ -4045,7 +4045,8 @@ pub const DB = struct {
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
-    quarantine_retry_thread: ?std.Thread = null,
+    quarantine_retry_future: ?std.Io.Future(void) = null,
+    quarantine_retry_stop_event: Io.Event = .unset,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     artifact_repair_metadata_future: ?Io.Future(void) = null,
@@ -6550,7 +6551,7 @@ pub const DB = struct {
             if (attempts >= 2000) {
                 return std.testing.expectEqual(expected, backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
             }
-            std.Thread.yield() catch {};
+            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }
 
@@ -9028,7 +9029,7 @@ pub const DB = struct {
         if (builtin.is_test and test_block_generated_artifact_finalization.load(.acquire)) {
             test_generated_artifact_finalization_entered.store(true, .release);
             while (!test_release_generated_artifact_finalization.load(.acquire)) {
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
         try finalizeRetiredIndexCleanupContext(ctx, index_name, cleanup_key);
@@ -23751,7 +23752,6 @@ pub const DB = struct {
     }
 
     const quarantine_retry_poll_ns: u64 = 10 * std.time.ns_per_s;
-    const quarantine_retry_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
     const artifact_repair_metadata_poll_ns: u64 = 5 * std.time.ns_per_s;
     const artifact_repair_metadata_active_poll_ns: u64 = 100 * std.time.ns_per_ms;
     const artifact_repair_metadata_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
@@ -23806,7 +23806,7 @@ pub const DB = struct {
     }
 
     /// Start only after the DB has reached its final address. The spawned
-    /// thread retains `self` after this call returns.
+    /// task retains `self` after this call returns.
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         // Tests drive retries deterministically via retryQuarantinedIndexLoads;
         // a background worker racing them turns every quarantine-shaped test
@@ -23819,9 +23819,12 @@ pub const DB = struct {
         }
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
         if (!self.optional_runtime_workers_enabled or self.open_mode != .writer) return;
-        if (self.quarantine_retry_thread != null) return;
+        if (self.quarantine_retry_future != null) return;
         if (!self.core.index_manager.hasLoadFailures()) return;
-        self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
+        const io = self.backend_runtime.io() orelse return;
+        self.quarantine_retry_stop.store(false, .release);
+        self.quarantine_retry_stop_event.reset();
+        self.quarantine_retry_future = io.concurrent(quarantineRetryWorkerMain, .{self}) catch |err| {
             // Self-healing is best-effort: the quarantine still recovers on
             // the next open or via drop+recreate.
             std.log.warn("quarantine retry worker spawn failed: {}", .{err});
@@ -23839,18 +23842,28 @@ pub const DB = struct {
 
     fn stopQuarantineRetryWorker(self: *DB) void {
         self.quarantine_retry_stop.store(true, .release);
-        if (self.quarantine_retry_thread) |thread| {
-            thread.join();
-            self.quarantine_retry_thread = null;
+        if (self.quarantine_retry_future) |*future| {
+            const io = self.backend_runtime.io().?;
+            self.quarantine_retry_stop_event.set(io);
+            future.await(io);
+            self.quarantine_retry_future = null;
         }
     }
 
     fn quarantineRetryWorkerMain(self: *DB) void {
+        const io = self.backend_runtime.io().?;
         while (true) {
-            var slept: u64 = 0;
-            while (slept < quarantine_retry_poll_ns) : (slept += quarantine_retry_sleep_slice_ns) {
-                if (self.quarantine_retry_stop.load(.acquire)) return;
-                sleepNs(quarantine_retry_sleep_slice_ns);
+            const deadline_ns = platform_time.monotonicNs() +| quarantine_retry_poll_ns;
+            while (!self.quarantine_retry_stop.load(.acquire)) {
+                const now_ns = platform_time.monotonicNs();
+                if (now_ns >= deadline_ns) break;
+                self.quarantine_retry_stop_event.waitTimeout(io, .{ .duration = .{
+                    .raw = .fromNanoseconds(deadline_ns - now_ns),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return,
+                };
             }
             if (self.quarantine_retry_stop.load(.acquire)) return;
             const result = self.retryQuarantinedIndexLoads(false) catch |err| {
@@ -31265,7 +31278,7 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         return true;
@@ -31292,7 +31305,7 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         return true;
@@ -31445,7 +31458,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (builtin.is_test and test_block_match_all_ordinal_lookup.load(.acquire)) {
             test_match_all_ordinal_lookup_entered.store(true, .release);
-            while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.Thread.yield() catch {};
+            while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
         return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
@@ -42919,8 +42932,8 @@ test "external dense bulk waiter owns admission across catch-up handoff" {
         }
     };
     var waiter = Waiter{ .ctx = &ctx };
-    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
-    defer waiter_thread.join();
+    var waiter_thread = try std.testing.io.concurrent(Waiter.run, .{&waiter});
+    defer waiter_thread.await(std.testing.io);
 
     const wait_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (ctx.waiting_external_dense_bulk_sessions.load(.acquire) == 0) {
@@ -43353,11 +43366,11 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
         .resolution_key = resolution_key,
         .pause = &pause,
     };
-    const thread = try std.Thread.spawn(.{}, WriteProbe.run, .{&probe});
+    var thread = try std.testing.io.concurrent(WriteProbe.run, .{&probe});
     var thread_joined = false;
     errdefer {
         pause.release.set(pause.io);
-        if (!thread_joined) thread.join();
+        if (!thread_joined) thread.await(std.testing.io);
     }
 
     pause.reached.waitUncancelable(pause.io);
@@ -43378,7 +43391,7 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
     public_gate.publishPrimaryFence(true);
     pause.release.set(pause.io);
     transition_mutex.unlock();
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
 
     try std.testing.expectEqual(@as(u8, 1), probe.result.load(.acquire));
@@ -68870,7 +68883,7 @@ test "index repair advance lease covers cancellation and deletion" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn run(self: *@This()) void {
@@ -68887,11 +68900,11 @@ test "index repair advance lease covers cancellation and deletion" {
     };
     defer DB.test_index_repair_advance_lease_hook = null;
 
-    var advance_thread = try std.Thread.spawn(.{}, Race.run, .{&race});
+    var advance_thread = try std.testing.io.concurrent(Race.run, .{&race});
     var joined = false;
     defer if (!joined) {
         race.release.store(true, .release);
-        advance_thread.join();
+        advance_thread.await(std.testing.io);
     };
     var entered = false;
     for (0..100_000) |_| {
@@ -68899,7 +68912,7 @@ test "index repair advance lease covers cancellation and deletion" {
             entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!entered) return error.TestTimeout;
 
@@ -68913,7 +68926,7 @@ test "index repair advance lease covers cancellation and deletion" {
     );
 
     race.release.store(true, .release);
-    advance_thread.join();
+    advance_thread.await(std.testing.io);
     joined = true;
     DB.test_index_repair_advance_lease_hook = null;
     try std.testing.expect(race.err == null);
@@ -72081,14 +72094,14 @@ test "db dense checkpoint persistence serializes with index apply" {
         }
     };
     var persist = Persist{ .db = &db };
-    const thread = try std.Thread.spawn(.{}, Persist.run, .{&persist});
+    var thread = try std.testing.io.concurrent(Persist.run, .{&persist});
     while (!persist.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(25 * std.time.ns_per_ms);
     const completed_while_apply_active = persist.done.load(.acquire);
 
     apply_guard.unlock();
     apply_locked = false;
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(!completed_while_apply_active);
     if (persist.err) |err| return err;
@@ -72399,11 +72412,11 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     lockApplyShared(&db);
     var apply_shared_held = true;
     var retry_state = RetryState{ .db = &db };
-    var retry_thread = try std.Thread.spawn(.{}, RetryState.run, .{&retry_state});
+    var retry_thread = try std.testing.io.concurrent(RetryState.run, .{&retry_state});
     var retry_thread_joined = false;
     defer {
         if (apply_shared_held) db.core.unlockApplyShared();
-        if (!retry_thread_joined) retry_thread.join();
+        if (!retry_thread_joined) retry_thread.await(std.testing.io);
     }
 
     const publication_deadline = monotonicTimeNs() +| 30 * std.time.ns_per_s;
@@ -72414,7 +72427,7 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     const publication_waited_for_reader = publication_fence_entered and !retry_state.completed.load(.acquire);
     db.core.unlockApplyShared();
     apply_shared_held = false;
-    retry_thread.join();
+    retry_thread.await(std.testing.io);
     retry_thread_joined = true;
 
     try std.testing.expect(publication_fence_entered);
@@ -78759,17 +78772,17 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
 
     var capture = barrier.acquireExclusive();
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     errdefer {
         capture.release();
-        write_thread.join();
+        write_thread.await(std.testing.io);
     }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
     var attempts: usize = 0;
     while (attempts < 10_000) : (attempts += 1) {
         if (barrier.pendingSharedAcquisitions() > 0) break;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     try std.testing.expect(barrier.pendingSharedAcquisitions() > 0);
@@ -78779,7 +78792,7 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     try std.testing.expect((try db.get(alloc, "doc:b")) == null);
 
     capture.release();
-    write_thread.join();
+    write_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
@@ -78923,11 +78936,11 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     lockAtomic(&transition_mutex);
     var transition_locked = true;
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     var thread_joined = false;
     errdefer {
         if (transition_locked) transition_mutex.unlock();
-        if (!thread_joined) write_thread.join();
+        if (!thread_joined) write_thread.await(std.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
     var local_commit_observed = false;
@@ -78937,7 +78950,7 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
             local_commit_observed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(local_commit_observed);
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
@@ -78945,7 +78958,7 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     public_gate.publishPrimaryFence(true);
     transition_mutex.unlock();
     transition_locked = false;
-    write_thread.join();
+    write_thread.await(std.testing.io);
     thread_joined = true;
 
     try std.testing.expectEqual(@as(u8, 1), write_probe.failed.load(.monotonic));
@@ -79002,18 +79015,18 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
             self.started.store(1, .release);
             var capture = self.barrier.acquireExclusive();
             self.acquired.store(1, .release);
-            while (self.release.load(.acquire) == 0) std.Thread.yield() catch {};
+            while (self.release.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             capture.release();
         }
     };
 
     var outer = barrier.acquireShared();
     var probe = CaptureProbe{ .barrier = &barrier };
-    const capture_thread = try std.Thread.spawn(.{}, CaptureProbe.run, .{&probe});
+    var capture_thread = try std.testing.io.concurrent(CaptureProbe.run, .{&probe});
     errdefer {
         outer.release();
         probe.release.store(1, .release);
-        capture_thread.join();
+        capture_thread.await(std.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&probe.started, 1, 10_000));
     var capture_queued = false;
@@ -79022,7 +79035,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
             capture_queued = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(capture_queued);
 
@@ -79033,7 +79046,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     outer.release();
     try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
     probe.release.store(1, .release);
-    capture_thread.join();
+    capture_thread.await(std.testing.io);
 
     const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
     defer alloc.free(stored);
@@ -83311,7 +83324,7 @@ fn waitForAtomicFlag(flag: *const std.atomic.Value(u8), expected: u8, max_attemp
     var attempts: usize = 0;
     while (attempts < max_attempts) : (attempts += 1) {
         if (flag.load(.monotonic) == expected) return true;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     return flag.load(.monotonic) == expected;
 }
@@ -83325,7 +83338,7 @@ const SharedReadLockHold = struct {
         self.db.core.lockApplyShared();
         self.acquired.store(1, .monotonic);
         while (self.release.load(.monotonic) == 0) {
-            std.Thread.yield() catch {};
+            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
         self.db.core.unlockApplyShared();
     }
@@ -85676,7 +85689,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
         terminal_error: ?anyerror = null,
 
         fn terminal(ptr: *@This()) void {
-            while (!ptr.observed.load(.acquire)) std.Thread.yield() catch {};
+            while (!ptr.observed.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             ptr.terminal_attempted.store(true, .release);
             ptr.db.recordIndexRepairAttemptFailure(
                 ptr.db.alloc,
@@ -85692,18 +85705,18 @@ test "quarantine binding reconciliation serializes with terminal transition" {
             const ptr: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(ptr.repair_id, observed_repair_id);
             ptr.observed.store(true, .release);
-            while (!ptr.terminal_attempted.load(.acquire)) std.Thread.yield() catch {};
+            while (!ptr.terminal_attempted.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             // The terminal thread is now waiting on repair-control ownership.
             // Returning lets discovery finish its pending binding transaction;
             // terminalization must then release that exact binding.
         }
     };
     var context = Context{ .db = &reopened, .repair_id = repair_id };
-    var terminal_thread = try std.Thread.spawn(.{}, Context.terminal, .{&context});
+    var terminal_thread = try std.testing.io.concurrent(Context.terminal, .{&context});
     var terminal_thread_joined = false;
     defer if (!terminal_thread_joined) {
         context.observed.store(true, .release);
-        terminal_thread.join();
+        terminal_thread.await(std.testing.io);
     };
     DB.test_index_repair_discovery_observation_hook = .{
         .ptr = &context,
@@ -85711,7 +85724,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
     };
     defer DB.test_index_repair_discovery_observation_hook = null;
     const discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
-    terminal_thread.join();
+    terminal_thread.await(std.testing.io);
     terminal_thread_joined = true;
     try std.testing.expect(context.terminal_error == null);
     try std.testing.expectEqual(@as(usize, 1), discovery.already_pending);
@@ -85828,7 +85841,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn reconcile(self: *@This()) void {
@@ -85852,11 +85865,11 @@ test "db restart reconciles activated dense repair without rebuilding" {
     };
     defer DB.test_index_repair_reconcile_fence_hook = null;
 
-    var reconcile_thread = try std.Thread.spawn(.{}, ReconcileRace.reconcile, .{&race});
+    var reconcile_thread = try std.testing.io.concurrent(ReconcileRace.reconcile, .{&race});
     var reconcile_joined = false;
     defer if (!reconcile_joined) {
         race.release.store(true, .release);
-        reconcile_thread.join();
+        reconcile_thread.await(std.testing.io);
     };
     var reconcile_entered = false;
     for (0..100_000) |_| {
@@ -85864,15 +85877,15 @@ test "db restart reconciles activated dense repair without rebuilding" {
             reconcile_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!reconcile_entered) return error.TestTimeout;
 
-    var structural_thread = try std.Thread.spawn(.{}, ReconcileRace.structural, .{&race});
+    var structural_thread = try std.testing.io.concurrent(ReconcileRace.structural, .{&race});
     var structural_joined = false;
     defer if (!structural_joined) {
         race.release.store(true, .release);
-        structural_thread.join();
+        structural_thread.await(std.testing.io);
     };
     var structural_started = false;
     for (0..100_000) |_| {
@@ -85880,16 +85893,16 @@ test "db restart reconciles activated dense repair without rebuilding" {
             structural_started = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!structural_started) return error.TestTimeout;
-    for (0..256) |_| std.Thread.yield() catch {};
+    for (0..256) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!race.structural_acquired.load(.acquire));
 
     race.release.store(true, .release);
-    reconcile_thread.join();
+    reconcile_thread.await(std.testing.io);
     reconcile_joined = true;
-    structural_thread.join();
+    structural_thread.await(std.testing.io);
     structural_joined = true;
     DB.test_index_repair_reconcile_fence_hook = null;
     try std.testing.expect(race.err == null);
@@ -88877,7 +88890,7 @@ test "db generated artifact finalization releases page arbitration and preserves
     var wait_attempts: usize = 0;
     while (!DB.test_generated_artifact_finalization_entered.load(.acquire)) : (wait_attempts += 1) {
         try std.testing.expect(wait_attempts < 100_000);
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     try std.testing.expect(db.async_context.index_artifact_cleanup_mutex.tryLock());
@@ -88901,7 +88914,7 @@ test "db generated artifact finalization releases page arbitration and preserves
                 break;
             },
             .progressed => {},
-            .busy => std.Thread.yield() catch {},
+            .busy => std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {},
         }
     }
     try std.testing.expect(second_drained);
@@ -88981,7 +88994,7 @@ test "db managed admission materialization serializes with index deletion" {
         fn afterConfigLookup(ptr: *anyopaque, _: *DB, _: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn materialize(self: *@This()) void {
@@ -89009,24 +89022,24 @@ test "db managed admission materialization serializes with index deletion" {
     };
     defer DB.test_managed_admission_materialization_hook = null;
 
-    var materialize_thread = try std.Thread.spawn(.{}, Race.materialize, .{&race});
+    var materialize_thread = try std.testing.io.concurrent(Race.materialize, .{&race});
     var entered = false;
     for (0..100_000) |_| {
         if (race.entered.load(.acquire)) {
             entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!entered) {
         race.release.store(true, .release);
-        materialize_thread.join();
+        materialize_thread.await(std.testing.io);
         return error.TestTimeout;
     }
 
-    var delete_thread = std.Thread.spawn(.{}, Race.delete, .{&race}) catch |err| {
+    var delete_thread = std.testing.io.concurrent(Race.delete, .{&race}) catch |err| {
         race.release.store(true, .release);
-        materialize_thread.join();
+        materialize_thread.await(std.testing.io);
         return err;
     };
     var delete_started = false;
@@ -89035,19 +89048,19 @@ test "db managed admission materialization serializes with index deletion" {
             delete_started = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!delete_started) {
         race.release.store(true, .release);
-        materialize_thread.join();
-        delete_thread.join();
+        materialize_thread.await(std.testing.io);
+        delete_thread.await(std.testing.io);
         return error.TestTimeout;
     }
-    for (0..256) |_| std.Thread.yield() catch {};
+    for (0..256) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const deletion_crossed_materialization = race.delete_completed.load(.acquire);
     race.release.store(true, .release);
-    materialize_thread.join();
-    delete_thread.join();
+    materialize_thread.await(std.testing.io);
+    delete_thread.await(std.testing.io);
 
     try std.testing.expect(!deletion_crossed_materialization);
     try std.testing.expect(race.materialize_err == null);
@@ -95131,11 +95144,11 @@ test "db delete full text index drains active merge before closing generation" {
         }
     };
     var deletion = Delete{ .db = &db };
-    var delete_thread = try std.Thread.spawn(.{}, Delete.run, .{&deletion});
+    var delete_thread = try std.testing.io.concurrent(Delete.run, .{&deletion});
     var joined = false;
     defer if (!joined) {
         text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
-        delete_thread.join();
+        delete_thread.await(std.testing.io);
     };
 
     var stop_entered = false;
@@ -95154,7 +95167,7 @@ test "db delete full text index drains active merge before closing generation" {
     try std.testing.expect(!deletion.completed.load(.acquire));
 
     text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
-    delete_thread.join();
+    delete_thread.await(std.testing.io);
     joined = true;
     try std.testing.expect(deletion.err == null);
     try std.testing.expect(deletion.removed);
@@ -95278,11 +95291,11 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
         }
     };
     var reader = Reader{ .db = &db };
-    var reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_thread = try std.testing.io.concurrent(Reader.run, .{&reader});
     var reader_joined = false;
     defer if (!reader_joined) {
         test_release_match_all_ordinal_lookup.store(true, .release);
-        reader_thread.join();
+        reader_thread.await(std.testing.io);
     };
     var lookup_entered = false;
     for (0..200_000) |_| {
@@ -95290,7 +95303,7 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
             lookup_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!lookup_entered) return error.TestTimeout;
 
@@ -95305,11 +95318,11 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
         }
     };
     var writer = Writer{ .db = &db };
-    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
     var writer_joined = false;
     defer if (!writer_joined) {
         test_release_match_all_ordinal_lookup.store(true, .release);
-        writer_thread.join();
+        writer_thread.await(std.testing.io);
     };
 
     // Wait until a cleanup-style writer owns the reader gate and is blocked on
@@ -95323,16 +95336,16 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
             break;
         }
         db.core.unlockApplyShared();
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_queued) return error.TestTimeout;
     try std.testing.expect(!reader.completed.load(.acquire));
     try std.testing.expect(!writer.completed.load(.acquire));
 
     test_release_match_all_ordinal_lookup.store(true, .release);
-    reader_thread.join();
+    reader_thread.await(std.testing.io);
     reader_joined = true;
-    writer_thread.join();
+    writer_thread.await(std.testing.io);
     writer_joined = true;
     if (reader.err) |err| return err;
     try std.testing.expectEqual(doc_count, reader.total_hits);
@@ -95848,14 +95861,14 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
         }
     };
     var stop = Stop{ .runtime = &runtime };
-    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+    var stop_thread = try std.testing.io.concurrent(Stop.run, .{&stop});
     var stop_joined = false;
     defer if (!stop_joined) {
         if (held_descriptors) {
             pool.releaseDescriptorsForTest(io, 2);
             held_descriptors = false;
         }
-        stop_thread.join();
+        stop_thread.await(std.testing.io);
     };
 
     for (0..1_000) |_| {
@@ -95863,7 +95876,7 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
         try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     if (!stop.completed.load(.acquire)) return error.TestTimeout;
-    stop_thread.join();
+    stop_thread.await(std.testing.io);
     stop_joined = true;
 
     try std.testing.expect(stop.stopped);
@@ -96107,19 +96120,19 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     };
     var waiter = Waiter{ .runtime = &admission_runtime };
     const events_before = admission_runtime.stats().backpressure_events;
-    var waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var waiter_thread = try std.testing.io.concurrent(Waiter.run, .{&waiter});
     var waiter_joined = false;
     defer if (!waiter_joined) {
         held_permit.release();
-        waiter_thread.join();
+        waiter_thread.await(std.testing.io);
     };
     const waiter_deadline = monotonicTimeNs() +| std.time.ns_per_s;
     while (admission_runtime.stats().backpressure_events == events_before and monotonicTimeNs() < waiter_deadline) {
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(admission_runtime.stats().backpressure_events > events_before);
     held_permit.release();
-    waiter_thread.join();
+    waiter_thread.await(std.testing.io);
     waiter_joined = true;
     try std.testing.expect(waiter.acquired.load(.acquire));
     try std.testing.expect(!waiter.failed.load(.acquire));
@@ -96158,20 +96171,20 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     };
     var cross_index_waiter = CrossIndexWaiter{ .runtime = &fair_runtime, .acquired = &cross_index_acquired };
     const cross_events_before = fair_runtime.stats().backpressure_events;
-    const cross_index_thread = try std.Thread.spawn(.{}, CrossIndexWaiter.run, .{&cross_index_waiter});
+    var cross_index_thread = try std.testing.io.concurrent(CrossIndexWaiter.run, .{&cross_index_waiter});
     var cross_index_joined = false;
     defer if (!cross_index_joined) {
         cross_index_blocker.release();
-        cross_index_thread.join();
+        cross_index_thread.await(std.testing.io);
     };
     const cross_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events > cross_events_before);
     var independent_index_permit = try fair_runtime.acquireProducerPermit("admission-b", 100, 0);
     independent_index_permit.release();
     try std.testing.expect(!cross_index_acquired.load(.acquire));
     cross_index_blocker.release();
-    cross_index_thread.join();
+    cross_index_thread.await(std.testing.io);
     cross_index_joined = true;
     try std.testing.expect(cross_index_acquired.load(.acquire));
 
@@ -96217,7 +96230,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
                 return;
             };
             self.acquisition_order.store(self.acquisition_counter.fetchAdd(1, .acq_rel) + 1, .release);
-            while (!self.release_gate.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release_gate.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             permit.release();
         }
     };
@@ -96238,7 +96251,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .failed = &mixed_older_failed,
     };
     const mixed_events_before = mixed_runtime.stats().backpressure_events;
-    const mixed_older_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_older});
+    var mixed_older_thread = try std.testing.io.concurrent(MixedWaiter.run, .{&mixed_older});
     var mixed_older_joined = false;
     defer if (!mixed_older_joined) {
         if (mixed_segment_blocker_active) {
@@ -96250,10 +96263,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             mixed_byte_blocker_active = false;
         }
         mixed_release.store(true, .release);
-        mixed_older_thread.join();
+        mixed_older_thread.await(std.testing.io);
     };
     const mixed_older_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.Thread.yield() catch {};
+    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(mixed_runtime.stats().backpressure_events > mixed_events_before);
 
     var mixed_younger = MixedWaiter{
@@ -96266,7 +96279,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .release_gate = &mixed_release,
         .failed = &mixed_younger_failed,
     };
-    const mixed_younger_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_younger});
+    var mixed_younger_thread = try std.testing.io.concurrent(MixedWaiter.run, .{&mixed_younger});
     var mixed_younger_joined = false;
     defer if (!mixed_younger_joined) {
         if (mixed_segment_blocker_active) {
@@ -96278,10 +96291,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             mixed_byte_blocker_active = false;
         }
         mixed_release.store(true, .release);
-        mixed_younger_thread.join();
+        mixed_younger_thread.await(std.testing.io);
     };
     const mixed_younger_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.Thread.yield() catch {};
+    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(mixed_runtime.stats().backpressure_events >= mixed_events_before + 2);
     try std.testing.expectEqual(@as(u32, 0), mixed_older_order.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
@@ -96291,18 +96304,18 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     mixed_byte_blocker.release();
     mixed_byte_blocker_active = false;
     const mixed_older_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.Thread.yield() catch {};
+    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(u32, 1), mixed_older_order.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
     try std.testing.expect(!mixed_older_failed.load(.acquire));
     try std.testing.expect(!mixed_younger_failed.load(.acquire));
     mixed_release.store(true, .release);
-    mixed_older_thread.join();
+    mixed_older_thread.await(std.testing.io);
     mixed_older_joined = true;
     const mixed_younger_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.Thread.yield() catch {};
+    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(u32, 2), mixed_younger_order.load(.acquire));
-    mixed_younger_thread.join();
+    mixed_younger_thread.await(std.testing.io);
     mixed_younger_joined = true;
 
     var blocking_permit = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
@@ -96319,7 +96332,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             var permit = self.runtime.acquireProducerPermit("admission-test", self.segment_count, 0) catch return;
             self.acquired.store(true, .release);
             if (self.release_gate) |gate| {
-                while (!gate.load(.acquire)) std.Thread.yield() catch {};
+                while (!gate.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             permit.release();
         }
@@ -96334,7 +96347,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .acquired = &large_acquired,
         .release_gate = &release_large,
     };
-    const large_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&large_waiter});
+    var large_thread = try std.testing.io.concurrent(FairWaiter.run, .{&large_waiter});
     var large_joined = false;
     defer if (!large_joined) {
         if (blocking_active) {
@@ -96342,10 +96355,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             blocking_active = false;
         }
         release_large.store(true, .release);
-        large_thread.join();
+        large_thread.await(std.testing.io);
     };
     const large_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 1);
 
     var small_waiter = FairWaiter{
@@ -96354,7 +96367,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .acquired = &small_acquired,
         .release_gate = null,
     };
-    const small_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&small_waiter});
+    var small_thread = try std.testing.io.concurrent(FairWaiter.run, .{&small_waiter});
     var small_joined = false;
     defer if (!small_joined) {
         if (blocking_active) {
@@ -96362,23 +96375,23 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             blocking_active = false;
         }
         release_large.store(true, .release);
-        small_thread.join();
+        small_thread.await(std.testing.io);
     };
     const small_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 2);
     try std.testing.expect(!small_acquired.load(.acquire));
 
     blocking_permit.release();
     blocking_active = false;
     const fair_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.Thread.yield() catch {};
+    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(large_acquired.load(.acquire));
     try std.testing.expect(!small_acquired.load(.acquire));
     release_large.store(true, .release);
-    large_thread.join();
+    large_thread.await(std.testing.io);
     large_joined = true;
-    small_thread.join();
+    small_thread.await(std.testing.io);
     small_joined = true;
     try std.testing.expect(small_acquired.load(.acquire));
 
@@ -96410,7 +96423,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var cancel_group_active = true;
     defer if (cancel_group_active) cancel_group.cancel(fair_io);
     const cancel_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events > cancel_events_before);
     cancel_group.cancel(fair_io);
     cancel_group_active = false;
@@ -105914,7 +105927,13 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     };
     defer DB.test_snapshot_fence_hook = null;
     var worker = SnapshotWorker{ .db = &db };
-    const snapshot_thread = try std.Thread.spawn(.{}, SnapshotWorker.run, .{&worker});
+    var snapshot_thread = try std.testing.io.concurrent(SnapshotWorker.run, .{&worker});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        snapshot_thread.await(std.testing.io);
+    }
     while (!fence.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     // Maintenance-owned replay production is not a client mutation and must
@@ -105927,9 +105946,15 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // selected revision. It resumes immediately after staging, before manifest
     // hashing and publication complete.
     var writer = Writer{ .db = &db };
-    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        writer_thread.await(std.testing.io);
+    }
     while (!writer.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..1024) |_| std.Thread.yield() catch {};
+    for (0..1024) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!writer.done.load(.acquire));
     fence.release.store(true, .release);
     while (!fence.copy_entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -105937,9 +105962,15 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // Apply release alone is not the publication boundary: the short metadata
     // pin still excludes physical index maintenance.
     var maintenance = Maintenance{ .db = &db };
-    const maintenance_thread = try std.Thread.spawn(.{}, Maintenance.run, .{&maintenance});
+    var maintenance_thread = try std.testing.io.concurrent(Maintenance.run, .{&maintenance});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        maintenance_thread.await(std.testing.io);
+    }
     while (!maintenance.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..1024) |_| std.Thread.yield() catch {};
+    for (0..1024) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!maintenance.done.load(.acquire));
     fence.release_copy.store(true, .release);
     while (!fence.materialize_entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -105949,14 +105980,14 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     const outside_fence_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (monotonicTimeNs() < outside_fence_deadline) {
         if (writer.done.load(.acquire) and maintenance.done.load(.acquire)) break;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     const writer_finished_outside_fence = writer.done.load(.acquire);
     const maintenance_finished_outside_fence = maintenance.done.load(.acquire);
     fence.release_materialize.store(true, .release);
-    snapshot_thread.join();
-    maintenance_thread.join();
-    writer_thread.join();
+    snapshot_thread.await(std.testing.io);
+    maintenance_thread.await(std.testing.io);
+    writer_thread.await(std.testing.io);
     if (worker.err) |err| return err;
     if (maintenance.err) |err| return err;
     if (writer.err) |err| return err;
@@ -107843,26 +107874,38 @@ test "db rw lock allows search and scan while shared read lock is held" {
     });
 
     var held = SharedReadLockHold{ .db = &db };
-    const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
+    var held_thread = try std.testing.io.concurrent(SharedReadLockHold.run, .{&held});
+    defer {
+        held.release.store(1, .release);
+        held_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
 
     var search_probe = ConcurrentReadProbe{ .db = &db };
-    const search_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runSearch, .{&search_probe});
+    var search_thread = try std.testing.io.concurrent(ConcurrentReadProbe.runSearch, .{&search_probe});
+    defer {
+        held.release.store(1, .release);
+        search_thread.await(std.testing.io);
+    }
 
     try std.testing.expect(waitForAtomicFlag(&search_probe.started, 1, 10_000));
     try std.testing.expect(waitForAtomicFlag(&search_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), search_probe.failed.load(.monotonic));
-    search_thread.join();
+    search_thread.await(std.testing.io);
 
     var scan_probe = ConcurrentReadProbe{ .db = &db };
-    const scan_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runScan, .{&scan_probe});
+    var scan_thread = try std.testing.io.concurrent(ConcurrentReadProbe.runScan, .{&scan_probe});
+    defer {
+        held.release.store(1, .release);
+        scan_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&scan_probe.started, 1, 10_000));
     try std.testing.expect(waitForAtomicFlag(&scan_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), scan_probe.failed.load(.monotonic));
-    scan_thread.join();
+    scan_thread.await(std.testing.io);
 
     held.release.store(1, .monotonic);
-    held_thread.join();
+    held_thread.await(std.testing.io);
 }
 
 test "db rw lock keeps batch writes blocked behind shared read lock" {
@@ -107882,11 +107925,19 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
     });
 
     var held = SharedReadLockHold{ .db = &db };
-    const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
+    var held_thread = try std.testing.io.concurrent(SharedReadLockHold.run, .{&held});
+    defer {
+        held.release.store(1, .release);
+        held_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
 
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
+    defer {
+        held.release.store(1, .release);
+        write_thread.await(std.testing.io);
+    }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
 
@@ -107897,13 +107948,13 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
             still_blocked = false;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(still_blocked);
 
     held.release.store(1, .monotonic);
-    held_thread.join();
-    write_thread.join();
+    held_thread.await(std.testing.io);
+    write_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
 

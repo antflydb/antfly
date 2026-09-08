@@ -3468,7 +3468,7 @@ test "data server repair owner cancels and drains through backend runtime" {
         fn run(ptr: *anyopaque) !void {
             const data_server: *DataServer = @ptrCast(@alignCast(ptr));
             while (!data_server.provisioned_index_repair_shutdown.load(.acquire)) {
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
 
@@ -4669,7 +4669,7 @@ test "runtime status disk scan retries across a reallocation fence and group inv
             const call = self.calls.fetchAdd(1, .acq_rel);
             if (call == 0) {
                 self.entered.store(true, .release);
-                while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+                while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 return 111;
             }
             return 222;
@@ -4717,14 +4717,14 @@ test "runtime status disk scan retries across a reallocation fence and group inv
 
     var controlled = ControlledScanner{};
     var scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
-    const thread = try std.Thread.spawn(.{}, ScanThread.run, .{&scan_thread});
-    while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
+    var thread = try std.testing.io.concurrent(ScanThread.run, .{&scan_thread});
+    while (!controlled.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     // A request arriving during the scan fences its observation and
     // invalidates the entry. Only the retry may acknowledge the request.
     server.observeReallocationRequest(.{ .request_id = 44, .requested_at_ms = 55 });
     controlled.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expectEqual(@as(u64, 222), scan_thread.result.?.disk_bytes);
     try std.testing.expect(
@@ -4757,11 +4757,11 @@ test "runtime status disk scan retries across a reallocation fence and group inv
     controlled.release.store(false, .release);
     controlled.calls.store(0, .release);
     var unrelated_scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
-    const unrelated_thread = try std.Thread.spawn(.{}, ScanThread.run, .{&unrelated_scan_thread});
-    while (!controlled.entered.load(.acquire)) std.Thread.yield() catch {};
+    var unrelated_thread = try std.testing.io.concurrent(ScanThread.run, .{&unrelated_scan_thread});
+    while (!controlled.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     server.invalidateRuntimeStatusDiskUsageCacheForGroup(8);
     controlled.release.store(true, .release);
-    unrelated_thread.join();
+    unrelated_thread.await(std.testing.io);
 
     try std.testing.expectEqual(@as(u64, 111), unrelated_scan_thread.result.?.disk_bytes);
     try std.testing.expectEqual(@as(u32, 1), controlled.calls.load(.acquire));
@@ -5350,7 +5350,7 @@ pub const DataServer = struct {
     last_provision_metadata_epoch: ?u64 = null,
     last_provision_head_check_at_ms: u64 = 0,
     provisioned_root_refresh_mutex: std.atomic.Mutex = .unlocked,
-    provisioned_root_refresh_thread: ?std.Thread = null,
+    provisioned_root_refresh_future: ?std.Io.Future(void) = null,
     provisioned_root_refresh_active: std.atomic.Value(bool) = .init(false),
     provisioned_root_refresh_dirty: std.atomic.Value(bool) = .init(true),
     provisioned_root_refresh_started: std.atomic.Value(u64) = .init(0),
@@ -5362,10 +5362,10 @@ pub const DataServer = struct {
     local_group_status_cache_mutex: std.atomic.Mutex = .unlocked,
     local_group_status_cache: LocalGroupStatusCache = .{},
     local_group_status_refresh_mutex: std.atomic.Mutex = .unlocked,
-    local_group_status_refresh_thread: ?std.Thread = null,
+    local_group_status_refresh_future: ?std.Io.Future(void) = null,
     local_group_status_refresh_active: std.atomic.Value(bool) = .init(false),
     runtime_status_refresh_mutex: std.atomic.Mutex = .unlocked,
-    runtime_status_refresh_thread: ?std.Thread = null,
+    runtime_status_refresh_future: ?std.Io.Future(void) = null,
     runtime_status_refresh_active: std.atomic.Value(bool) = .init(false),
     runtime_status_refresh_started: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_completed: std.atomic.Value(u64) = .init(0),
@@ -5392,7 +5392,7 @@ pub const DataServer = struct {
     auto_bulk_finish_last_duration_ns: std.atomic.Value(u64) = .init(0),
     auto_bulk_finish_last_run_at_ms: std.atomic.Value(u64) = .init(0),
     provisioned_warmup_mutex: std.atomic.Mutex = .unlocked,
-    provisioned_warmup_thread: ?std.Thread = null,
+    provisioned_warmup_future: ?std.Io.Future(void) = null,
     provisioned_warmup_active: std.atomic.Value(bool) = .init(false),
     provisioned_warmup_started: std.atomic.Value(u64) = .init(0),
     provisioned_warmup_completed: std.atomic.Value(u64) = .init(0),
@@ -5400,8 +5400,15 @@ pub const DataServer = struct {
     provisioned_warmup_last_group_count: std.atomic.Value(u64) = .init(0),
     provisioned_warmup_last_duration_ns: std.atomic.Value(u64) = .init(0),
     provisioned_startup_catch_up_mutex: std.atomic.Mutex = .unlocked,
-    provisioned_startup_catch_up_thread: ?std.Thread = null,
+    provisioned_startup_catch_up_future: ?std.Io.Future(void) = null,
     provisioned_startup_catch_up_active: std.atomic.Value(bool) = .init(false),
+    // Six independently single-flight workers: maintenance, warmup, root
+    // refresh, catch-up, runtime status, and local-group status. Reserving one
+    // slot per worker keeps status independent of expensive storage work and
+    // of the backend jobs that these workers may synchronously drain.
+    background_worker_mutex: std.atomic.Mutex = .unlocked,
+    background_worker_io: ?*std.Io.Threaded = null,
+    background_worker_closing: bool = false,
     background_work_quiesced: bool = false,
     external_provider_users_quiesced: bool = false,
     provisioned_startup_catch_up_target_mutex: std.atomic.Mutex = .unlocked,
@@ -5550,7 +5557,8 @@ pub const DataServer = struct {
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
-    lsm_maintenance_thread: ?std.Thread = null,
+    lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
+    lsm_maintenance_future: ?std.Io.Future(void) = null,
     lsm_maintenance_stop: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_wake: std.atomic.Value(bool) = .init(false),
     lsm_maintenance_active: std.atomic.Value(bool) = .init(false),
@@ -7337,15 +7345,11 @@ pub const DataServer = struct {
         if (self.store_registration != null) {
             self.store_status_dirty.store(true, .release);
         }
-        self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
-            => std.log.warn("runtime status refresh start deferred err={}", .{err}),
-            else => return err,
-        };
+        self.requestRuntimeStatusRefresh() catch |err| std.log.warn("runtime status refresh start deferred err={}", .{err});
         self.requestProvisionedStartupCatchUp() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
+            error.ConcurrencyUnavailable,
+            error.OutOfMemory,
+            error.BackgroundOwnerClosing,
             => std.log.warn("provisioned startup catch-up start deferred err={}", .{err}),
             else => return err,
         };
@@ -7624,15 +7628,23 @@ pub const DataServer = struct {
     ) void {
         if (self.background_work_quiesced) return;
         self.background_work_quiesced = true;
+        lockAtomic(&self.background_worker_mutex);
+        self.background_worker_closing = true;
+        self.background_worker_mutex.unlock();
         self.unregisterMetadataLocalProviders();
         if (self.data_raft) |raft| raft.stop();
         self.stopLsmMaintenanceBackground();
-        self.joinProvisionedRootRefreshThread();
-        self.joinLocalGroupStatusRefreshThread();
-        self.joinRuntimeStatusRefreshThread();
+        self.joinProvisionedRootRefreshTask();
+        self.joinLocalGroupStatusRefreshTask();
+        self.joinRuntimeStatusRefreshTask();
         self.joinAutoBulkFinishTask();
-        self.joinProvisionedWarmupThread();
-        self.joinProvisionedStartupCatchUpThread();
+        self.joinProvisionedWarmupTask();
+        self.joinProvisionedStartupCatchUpTask();
+        if (self.background_worker_io) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+            self.background_worker_io = null;
+        }
         self.stopProvisionedIndexRepair();
         self.stopReplicatedTransitionActions();
         self.clearProvisionedStartupCatchUpTarget();
@@ -7813,6 +7825,21 @@ pub const DataServer = struct {
         };
     }
 
+    fn ensureBackgroundWorkerIo(self: *DataServer) !std.Io {
+        lockAtomic(&self.background_worker_mutex);
+        defer self.background_worker_mutex.unlock();
+        if (self.background_worker_closing) return error.BackgroundOwnerClosing;
+        if (self.background_worker_io == null) {
+            const io_impl = try self.alloc.create(std.Io.Threaded);
+            io_impl.* = std.Io.Threaded.init(self.alloc, .{
+                .async_limit = .nothing,
+                .concurrent_limit = .limited(6),
+            });
+            self.background_worker_io = io_impl;
+        }
+        return self.background_worker_io.?.io();
+    }
+
     fn requestLsmMaintenanceBackground(self: *DataServer) !void {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         const now_ns = platform_time.monotonicNs();
@@ -7823,10 +7850,12 @@ pub const DataServer = struct {
             return;
         }
         if (!self.backgroundMaintenanceDue(now_ns)) return;
+        lockAtomic(&self.lsm_maintenance_mutex);
+        defer self.lsm_maintenance_mutex.unlock();
         self.lsm_maintenance_wake.store(true, .release);
-        if (self.lsm_maintenance_thread == null) {
+        if (self.lsm_maintenance_future == null) {
             self.lsm_maintenance_stop.store(false, .release);
-            self.lsm_maintenance_thread = try std.Thread.spawn(.{}, lsmMaintenanceWorkerMain, .{self});
+            self.lsm_maintenance_future = try (try self.ensureBackgroundWorkerIo()).concurrent(lsmMaintenanceWorkerMain, .{self});
         }
     }
 
@@ -7928,11 +7957,13 @@ pub const DataServer = struct {
     }
 
     fn stopLsmMaintenanceBackground(self: *DataServer) void {
+        lockAtomic(&self.lsm_maintenance_mutex);
+        defer self.lsm_maintenance_mutex.unlock();
         self.lsm_maintenance_stop.store(true, .release);
         self.lsm_maintenance_wake.store(true, .release);
-        if (self.lsm_maintenance_thread) |thread| {
-            thread.join();
-            self.lsm_maintenance_thread = null;
+        if (self.lsm_maintenance_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.lsm_maintenance_future = null;
         }
         self.lsm_maintenance_active.store(false, .release);
     }
@@ -9939,8 +9970,9 @@ pub const DataServer = struct {
             // periodic control loop remain the lost-notification fallback.
             self.provisioned_startup_catch_up_dirty.store(true, .release);
             self.maybeRequestProvisionedStartupCatchUp() catch |err| switch (err) {
-                error.ThreadQuotaExceeded,
-                error.SystemResources,
+                error.ConcurrencyUnavailable,
+                error.OutOfMemory,
+                error.BackgroundOwnerClosing,
                 => std.log.debug("startup catch-up admission wake deferred table={s} err={s}", .{ table_name, @errorName(err) }),
                 else => std.log.warn("startup catch-up admission wake failed table={s} err={s}", .{ table_name, @errorName(err) }),
             };
@@ -9950,12 +9982,7 @@ pub const DataServer = struct {
             self.markRuntimeStatusDirty(table_name, kind);
             self.embedding_activity_status_dirty.store(true, .release);
             if (self.store_registration != null) {
-                self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-                    error.ThreadQuotaExceeded,
-                    error.SystemResources,
-                    => std.log.warn("runtime activity refresh deferred table={s} err={s}", .{ table_name, @errorName(err) }),
-                    else => std.log.warn("runtime activity refresh failed table={s} err={s}", .{ table_name, @errorName(err) }),
-                };
+                self.requestRuntimeStatusRefresh() catch |err| std.log.warn("runtime activity refresh deferred table={s} err={s}", .{ table_name, @errorName(err) });
             }
             return;
         }
@@ -9963,12 +9990,7 @@ pub const DataServer = struct {
             self.markRuntimeStatusDirty(table_name, kind);
             self.markStoreStatusDirtyImmediate();
             if (self.store_registration != null) {
-                self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-                    error.ThreadQuotaExceeded,
-                    error.SystemResources,
-                    => std.log.warn("runtime status hook refresh deferred table={s} err={s}", .{ table_name, @errorName(err) }),
-                    else => std.log.warn("runtime status hook refresh failed table={s} err={s}", .{ table_name, @errorName(err) }),
-                };
+                self.requestRuntimeStatusRefresh() catch |err| std.log.warn("runtime status hook refresh deferred table={s} err={s}", .{ table_name, @errorName(err) });
             }
             return;
         }
@@ -13733,45 +13755,45 @@ pub const DataServer = struct {
         }
     }
 
-    fn joinLocalGroupStatusRefreshThread(self: *DataServer) void {
+    fn joinLocalGroupStatusRefreshTask(self: *DataServer) void {
         lockAtomic(&self.local_group_status_refresh_mutex);
         defer self.local_group_status_refresh_mutex.unlock();
-        if (self.local_group_status_refresh_thread) |thread| {
-            thread.join();
-            self.local_group_status_refresh_thread = null;
+        if (self.local_group_status_refresh_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.local_group_status_refresh_future = null;
         }
         self.local_group_status_refresh_active.store(false, .release);
     }
 
-    fn reapLocalGroupStatusRefreshThread(self: *DataServer) void {
+    fn reapLocalGroupStatusRefreshTask(self: *DataServer) void {
         if (self.local_group_status_refresh_active.load(.acquire)) return;
         lockAtomic(&self.local_group_status_refresh_mutex);
         defer self.local_group_status_refresh_mutex.unlock();
         if (self.local_group_status_refresh_active.load(.acquire)) return;
-        if (self.local_group_status_refresh_thread) |thread| {
-            thread.join();
-            self.local_group_status_refresh_thread = null;
+        if (self.local_group_status_refresh_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.local_group_status_refresh_future = null;
         }
     }
 
-    fn joinRuntimeStatusRefreshThread(self: *DataServer) void {
+    fn joinRuntimeStatusRefreshTask(self: *DataServer) void {
         lockAtomic(&self.runtime_status_refresh_mutex);
         defer self.runtime_status_refresh_mutex.unlock();
-        if (self.runtime_status_refresh_thread) |thread| {
-            thread.join();
-            self.runtime_status_refresh_thread = null;
+        if (self.runtime_status_refresh_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.runtime_status_refresh_future = null;
         }
         self.runtime_status_refresh_active.store(false, .release);
     }
 
-    fn reapRuntimeStatusRefreshThread(self: *DataServer) void {
+    fn reapRuntimeStatusRefreshTask(self: *DataServer) void {
         if (self.runtime_status_refresh_active.load(.acquire)) return;
         lockAtomic(&self.runtime_status_refresh_mutex);
         defer self.runtime_status_refresh_mutex.unlock();
         if (self.runtime_status_refresh_active.load(.acquire)) return;
-        if (self.runtime_status_refresh_thread) |thread| {
-            thread.join();
-            self.runtime_status_refresh_thread = null;
+        if (self.runtime_status_refresh_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.runtime_status_refresh_future = null;
         }
     }
 
@@ -13792,45 +13814,45 @@ pub const DataServer = struct {
         }
     }
 
-    fn joinProvisionedWarmupThread(self: *DataServer) void {
+    fn joinProvisionedWarmupTask(self: *DataServer) void {
         lockAtomic(&self.provisioned_warmup_mutex);
         defer self.provisioned_warmup_mutex.unlock();
-        if (self.provisioned_warmup_thread) |thread| {
-            thread.join();
-            self.provisioned_warmup_thread = null;
+        if (self.provisioned_warmup_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.provisioned_warmup_future = null;
         }
         self.provisioned_warmup_active.store(false, .release);
     }
 
-    fn reapProvisionedWarmupThread(self: *DataServer) void {
+    fn reapProvisionedWarmupTask(self: *DataServer) void {
         if (self.provisioned_warmup_active.load(.acquire)) return;
         lockAtomic(&self.provisioned_warmup_mutex);
         defer self.provisioned_warmup_mutex.unlock();
         if (self.provisioned_warmup_active.load(.acquire)) return;
-        if (self.provisioned_warmup_thread) |thread| {
-            thread.join();
-            self.provisioned_warmup_thread = null;
+        if (self.provisioned_warmup_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.provisioned_warmup_future = null;
         }
     }
 
-    fn joinProvisionedStartupCatchUpThread(self: *DataServer) void {
+    fn joinProvisionedStartupCatchUpTask(self: *DataServer) void {
         lockAtomic(&self.provisioned_startup_catch_up_mutex);
         defer self.provisioned_startup_catch_up_mutex.unlock();
-        if (self.provisioned_startup_catch_up_thread) |thread| {
-            thread.join();
-            self.provisioned_startup_catch_up_thread = null;
+        if (self.provisioned_startup_catch_up_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.provisioned_startup_catch_up_future = null;
         }
         self.provisioned_startup_catch_up_active.store(false, .release);
     }
 
-    fn reapProvisionedStartupCatchUpThread(self: *DataServer) void {
+    fn reapProvisionedStartupCatchUpTask(self: *DataServer) void {
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
         lockAtomic(&self.provisioned_startup_catch_up_mutex);
         defer self.provisioned_startup_catch_up_mutex.unlock();
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
-        if (self.provisioned_startup_catch_up_thread) |thread| {
-            thread.join();
-            self.provisioned_startup_catch_up_thread = null;
+        if (self.provisioned_startup_catch_up_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.provisioned_startup_catch_up_future = null;
         }
     }
 
@@ -14256,24 +14278,24 @@ pub const DataServer = struct {
         entry.identity_range_id = identity_range_id;
     }
 
-    fn joinProvisionedRootRefreshThread(self: *DataServer) void {
+    fn joinProvisionedRootRefreshTask(self: *DataServer) void {
         lockAtomic(&self.provisioned_root_refresh_mutex);
         defer self.provisioned_root_refresh_mutex.unlock();
-        if (self.provisioned_root_refresh_thread) |thread| {
-            thread.join();
-            self.provisioned_root_refresh_thread = null;
+        if (self.provisioned_root_refresh_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.provisioned_root_refresh_future = null;
         }
         self.provisioned_root_refresh_active.store(false, .release);
     }
 
-    fn reapProvisionedRootRefreshThread(self: *DataServer) void {
+    fn reapProvisionedRootRefreshTask(self: *DataServer) void {
         if (self.provisioned_root_refresh_active.load(.acquire)) return;
         lockAtomic(&self.provisioned_root_refresh_mutex);
         defer self.provisioned_root_refresh_mutex.unlock();
         if (self.provisioned_root_refresh_active.load(.acquire)) return;
-        if (self.provisioned_root_refresh_thread) |thread| {
-            thread.join();
-            self.provisioned_root_refresh_thread = null;
+        if (self.provisioned_root_refresh_future) |*future| {
+            future.await(self.background_worker_io.?.io());
+            self.provisioned_root_refresh_future = null;
         }
     }
 
@@ -14283,14 +14305,15 @@ pub const DataServer = struct {
             return;
         }
 
-        self.reapProvisionedWarmupThread();
+        self.reapProvisionedWarmupTask();
         if (self.provisioned_warmup_active.load(.acquire)) return;
 
         lockAtomic(&self.provisioned_warmup_mutex);
         defer self.provisioned_warmup_mutex.unlock();
         if (self.provisioned_warmup_active.load(.acquire)) return;
         self.provisioned_warmup_active.store(true, .release);
-        self.provisioned_warmup_thread = try std.Thread.spawn(.{}, provisionedCacheWarmupWorkerMain, .{self});
+        errdefer self.provisioned_warmup_active.store(false, .release);
+        self.provisioned_warmup_future = try (try self.ensureBackgroundWorkerIo()).concurrent(provisionedCacheWarmupWorkerMain, .{self});
     }
 
     fn provisionedCacheWarmupWorkerMain(self: *DataServer) void {
@@ -14308,8 +14331,9 @@ pub const DataServer = struct {
         // Otherwise a harmless early warmup miss can leave the process serving
         // only its stale persisted status until unrelated traffic wakes it.
         defer self.requestProvisionedStartupCatchUp() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
+            error.ConcurrencyUnavailable,
+            error.OutOfMemory,
+            error.BackgroundOwnerClosing,
             => std.log.warn("provisioned cache warmup startup catch-up deferred err={}", .{err}),
             else => {
                 _ = self.provisioned_warmup_failed.fetchAdd(1, .monotonic);
@@ -14354,15 +14378,7 @@ pub const DataServer = struct {
             };
             stats.warmed_group_count += warmed_groups;
         }
-        self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-            error.ThreadQuotaExceeded,
-            error.SystemResources,
-            => std.log.warn("provisioned cache warmup runtime status refresh deferred err={}", .{err}),
-            else => {
-                _ = self.provisioned_warmup_failed.fetchAdd(1, .monotonic);
-                std.log.warn("provisioned cache warmup runtime status refresh failed err={}", .{err});
-            },
-        };
+        self.requestRuntimeStatusRefresh() catch |err| std.log.warn("provisioned cache warmup runtime status refresh deferred err={}", .{err});
         _ = self.provisioned_warmup_completed.fetchAdd(1, .monotonic);
         return stats;
     }
@@ -14682,12 +14698,7 @@ pub const DataServer = struct {
             self.runtime_status_dirty.store(true, .release);
             self.store_status_dirty.store(true, .release);
             self.provisioned_root_refresh_dirty.store(true, .release);
-            self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-                error.ThreadQuotaExceeded,
-                error.SystemResources,
-                => std.log.warn("provisioned startup catch-up runtime status refresh deferred err={}", .{err}),
-                else => std.log.warn("provisioned startup catch-up runtime status refresh failed err={}", .{err}),
-            };
+            self.requestRuntimeStatusRefresh() catch |err| std.log.warn("provisioned startup catch-up runtime status refresh deferred err={}", .{err});
         }
         return stats;
     }
@@ -15387,8 +15398,8 @@ pub const DataServer = struct {
         try self.requestProvisionedStartupCatchUp();
     }
 
-    const ProvisionedRootRefreshThreadSpawner = *const fn (*DataServer) anyerror!std.Thread;
-    const ProvisionedStartupCatchUpThreadSpawner = *const fn (*DataServer) anyerror!std.Thread;
+    const ProvisionedRootRefreshTaskSpawner = *const fn (*DataServer) anyerror!std.Io.Future(void);
+    const ProvisionedStartupCatchUpTaskSpawner = *const fn (*DataServer) anyerror!std.Io.Future(void);
 
     fn requestAutoBulkFinishBackground(self: *DataServer) !void {
         if (@import("builtin").is_test) {
@@ -15417,29 +15428,30 @@ pub const DataServer = struct {
             return;
         }
 
-        self.reapRuntimeStatusRefreshThread();
+        self.reapRuntimeStatusRefreshTask();
         if (self.runtime_status_refresh_active.load(.acquire)) return;
 
         lockAtomic(&self.runtime_status_refresh_mutex);
         defer self.runtime_status_refresh_mutex.unlock();
         if (self.runtime_status_refresh_active.load(.acquire)) return;
         self.runtime_status_refresh_active.store(true, .release);
-        self.runtime_status_refresh_thread = try std.Thread.spawn(.{}, runtimeStatusRefreshWorkerMain, .{self});
+        errdefer self.runtime_status_refresh_active.store(false, .release);
+        self.runtime_status_refresh_future = try (try self.ensureBackgroundWorkerIo()).concurrent(runtimeStatusRefreshWorkerMain, .{self});
     }
 
     fn requestProvisionedRootRefresh(self: *DataServer) !void {
         const registration = self.store_registration orelse return;
         _ = registration;
-        try self.requestProvisionedRootRefreshWithSpawner(spawnProvisionedRootRefreshThreadMain);
+        try self.requestProvisionedRootRefreshWithSpawner(spawnProvisionedRootRefreshTaskMain);
     }
 
     fn requestProvisionedRootRefreshWithSpawner(
         self: *DataServer,
-        spawner: ProvisionedRootRefreshThreadSpawner,
+        spawner: ProvisionedRootRefreshTaskSpawner,
     ) !void {
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 
-        self.reapProvisionedRootRefreshThread();
+        self.reapProvisionedRootRefreshTask();
         if (self.provisioned_root_refresh_active.load(.acquire)) return;
 
         lockAtomic(&self.provisioned_root_refresh_mutex);
@@ -15447,7 +15459,7 @@ pub const DataServer = struct {
         if (self.provisioned_root_refresh_active.load(.acquire)) return;
         self.provisioned_root_refresh_active.store(true, .release);
         errdefer self.provisioned_root_refresh_active.store(false, .release);
-        self.provisioned_root_refresh_thread = try spawner(self);
+        self.provisioned_root_refresh_future = try spawner(self);
         self.provisioned_root_refresh_last_run_at_ms.store(now_ms, .monotonic);
     }
 
@@ -15459,7 +15471,7 @@ pub const DataServer = struct {
             return;
         }
 
-        try self.requestProvisionedStartupCatchUpWithSpawner(spawnProvisionedStartupCatchUpThreadMain);
+        try self.requestProvisionedStartupCatchUpWithSpawner(spawnProvisionedStartupCatchUpTaskMain);
     }
 
     pub fn requestProvisionedStartupCatchUpNow(self: *DataServer) !void {
@@ -15478,11 +15490,11 @@ pub const DataServer = struct {
 
     fn requestProvisionedStartupCatchUpWithSpawner(
         self: *DataServer,
-        spawner: ProvisionedStartupCatchUpThreadSpawner,
+        spawner: ProvisionedStartupCatchUpTaskSpawner,
     ) !void {
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 
-        self.reapProvisionedStartupCatchUpThread();
+        self.reapProvisionedStartupCatchUpTask();
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
 
         lockAtomic(&self.provisioned_startup_catch_up_mutex);
@@ -15490,7 +15502,7 @@ pub const DataServer = struct {
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
         self.provisioned_startup_catch_up_active.store(true, .release);
         errdefer self.provisioned_startup_catch_up_active.store(false, .release);
-        self.provisioned_startup_catch_up_thread = try spawner(self);
+        self.provisioned_startup_catch_up_future = try spawner(self);
         self.provisioned_startup_catch_up_last_run_at_ms.store(now_ms, .monotonic);
     }
 
@@ -15539,12 +15551,12 @@ pub const DataServer = struct {
 
     fn deinitProvisionedIndexRepairJob(_: *anyopaque) void {}
 
-    fn spawnProvisionedStartupCatchUpThreadMain(self: *DataServer) !std.Thread {
-        return try std.Thread.spawn(.{}, provisionedStartupCatchUpWorkerMain, .{self});
+    fn spawnProvisionedStartupCatchUpTaskMain(self: *DataServer) !std.Io.Future(void) {
+        return try (try self.ensureBackgroundWorkerIo()).concurrent(provisionedStartupCatchUpWorkerMain, .{self});
     }
 
-    fn spawnProvisionedRootRefreshThreadMain(self: *DataServer) !std.Thread {
-        return try std.Thread.spawn(.{}, provisionedRootRefreshWorkerMain, .{self});
+    fn spawnProvisionedRootRefreshTaskMain(self: *DataServer) !std.Io.Future(void) {
+        return try (try self.ensureBackgroundWorkerIo()).concurrent(provisionedRootRefreshWorkerMain, .{self});
     }
 
     fn runtimeStatusRefreshWorkerMain(self: *DataServer) void {
@@ -15594,15 +15606,7 @@ pub const DataServer = struct {
         if (finished) {
             self.runtime_status_dirty.store(true, .release);
             self.store_status_dirty.store(true, .release);
-            self.requestRuntimeStatusRefresh() catch |err| switch (err) {
-                error.ThreadQuotaExceeded,
-                error.SystemResources,
-                => std.log.warn("auto bulk ingest finish runtime status refresh deferred err={}", .{err}),
-                else => {
-                    _ = self.auto_bulk_finish_failed.fetchAdd(1, .monotonic);
-                    std.log.warn("auto bulk ingest finish runtime status refresh failed err={}", .{err});
-                },
-            };
+            self.requestRuntimeStatusRefresh() catch |err| std.log.warn("auto bulk ingest finish runtime status refresh deferred err={}", .{err});
         }
         _ = self.auto_bulk_finish_completed.fetchAdd(1, .monotonic);
     }
@@ -16230,7 +16234,7 @@ pub const DataServer = struct {
             return;
         }
 
-        self.reapLocalGroupStatusRefreshThread();
+        self.reapLocalGroupStatusRefreshTask();
         if (self.local_group_status_refresh_active.load(.acquire)) return;
 
         const refresh = try self.alloc.create(OwnedLocalGroupStatusRefresh);
@@ -16264,7 +16268,8 @@ pub const DataServer = struct {
             return;
         }
         self.local_group_status_refresh_active.store(true, .release);
-        self.local_group_status_refresh_thread = try std.Thread.spawn(.{}, localGroupStatusRefreshWorkerMain, .{refresh});
+        errdefer self.local_group_status_refresh_active.store(false, .release);
+        self.local_group_status_refresh_future = try (try self.ensureBackgroundWorkerIo()).concurrent(localGroupStatusRefreshWorkerMain, .{refresh});
     }
 
     fn runOwnedLocalGroupStatusRefresh(self: *DataServer, refresh: *OwnedLocalGroupStatusRefresh) void {
@@ -25251,7 +25256,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
 
     try std.testing.expectEqual(@as(usize, 1), stale.len);
     try std.testing.expectEqual(@as(u64, 999), stale[0].doc_count);
-    server.joinLocalGroupStatusRefreshThread();
+    server.joinLocalGroupStatusRefreshTask();
     try std.testing.expect(server.store_status_dirty.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), server.local_group_status_cache.group_statuses.len);
     try std.testing.expectEqual(@as(u64, 0), server.local_group_status_cache.group_statuses[0].doc_count);
@@ -25641,7 +25646,7 @@ test "data runtime store status cold miss schedules a nonblocking refresh" {
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
-    server.joinLocalGroupStatusRefreshThread();
+    server.joinLocalGroupStatusRefreshTask();
     try std.testing.expect(server.store_status_dirty.load(.acquire));
     try std.testing.expect(server.local_group_status_cache.collected_at_ms != 0);
 }
@@ -25716,7 +25721,7 @@ test "data runtime metadata local group status provider does not cold-open inlin
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
-    server.joinLocalGroupStatusRefreshThread();
+    server.joinLocalGroupStatusRefreshTask();
     try std.testing.expect(server.store_status_dirty.load(.acquire));
 }
 
@@ -29470,19 +29475,19 @@ test "data runtime provisioned root refresh spawn failure preserves retry bookke
     defer server.deinit();
 
     const FailingSpawner = struct {
-        fn run(_: *DataServer) !std.Thread {
-            return error.ThreadQuotaExceeded;
+        fn run(_: *DataServer) !std.Io.Future(void) {
+            return error.ConcurrencyUnavailable;
         }
     };
 
     server.provisioned_root_refresh_dirty.store(true, .release);
     try std.testing.expectError(
-        error.ThreadQuotaExceeded,
+        error.ConcurrencyUnavailable,
         server.requestProvisionedRootRefreshWithSpawner(FailingSpawner.run),
     );
     try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
     try std.testing.expect(!server.provisioned_root_refresh_active.load(.acquire));
-    try std.testing.expect(server.provisioned_root_refresh_thread == null);
+    try std.testing.expect(server.provisioned_root_refresh_future == null);
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_root_refresh_last_run_at_ms.load(.monotonic));
 }
 
@@ -29796,18 +29801,18 @@ test "data runtime startup catch-up spawn failure preserves retry bookkeeping" {
     server.provisioned_startup_catch_up_last_run_at_ms.store(77, .monotonic);
 
     const FailingSpawner = struct {
-        fn run(_: *DataServer) !std.Thread {
-            return error.ThreadQuotaExceeded;
+        fn run(_: *DataServer) !std.Io.Future(void) {
+            return error.ConcurrencyUnavailable;
         }
     };
 
     try std.testing.expectError(
-        error.ThreadQuotaExceeded,
+        error.ConcurrencyUnavailable,
         server.requestProvisionedStartupCatchUpWithSpawner(FailingSpawner.run),
     );
     try std.testing.expectEqual(@as(u64, 77), server.provisioned_startup_catch_up_last_run_at_ms.load(.monotonic));
     try std.testing.expect(!server.provisioned_startup_catch_up_active.load(.acquire));
-    try std.testing.expect(server.provisioned_startup_catch_up_thread == null);
+    try std.testing.expect(server.provisioned_startup_catch_up_future == null);
 }
 
 test "data runtime local group status reflects active transition readiness" {
@@ -32882,7 +32887,7 @@ test "data server propagates standby HA write gate into provisioned write source
     try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
     try server.runLsmMaintenanceForegroundRound();
     try server.requestLsmMaintenanceBackground();
-    try std.testing.expect(server.lsm_maintenance_thread == null);
+    try std.testing.expect(server.lsm_maintenance_future == null);
 }
 
 test "storage.ha data server rejects writes and owner jobs after primary promotion fence" {
@@ -33499,7 +33504,7 @@ test "data server HA replication network wait leaves state mutex available" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (std.mem.endsWith(u8, req.uri, antfly.internal.routes.ha_replication_start)) {
                 self.entered.store(true, .release);
-                while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+                while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             return try self.upstream.execute(alloc_arg, req);
         }
@@ -33584,16 +33589,16 @@ test "data server HA replication network wait leaves state mutex available" {
     try server.initApiServer();
 
     var replication_thread = ReplicationThread{ .server = &server };
-    const thread = try std.Thread.spawn(.{}, ReplicationThread.run, .{&replication_thread});
+    var thread = try std.testing.io.concurrent(ReplicationThread.run, .{&replication_thread});
     var joined = false;
     defer if (!joined) {
         blocking_executor.release.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
 
     var spins: usize = 0;
     while (!blocking_executor.entered.load(.acquire) and spins < 1_000_000) : (spins += 1) {
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(blocking_executor.entered.load(.acquire));
 
@@ -33610,7 +33615,7 @@ test "data server HA replication network wait leaves state mutex available" {
         server.ha_state_mutex.unlock();
     }
     blocking_executor.release.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
 
     try std.testing.expect(mutex_available);
@@ -35507,4 +35512,49 @@ test "remote catalog watches reserve the outer deadline for replica failover" {
             25 * std.time.ns_per_ms,
         ),
     );
+}
+
+test "data runtime background worker capacity is reserved and closes with its owner" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            "/tmp/unused-data-worker-capacity",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            "/tmp/unused-data-worker-capacity",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .nothing,
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+    const io = try server.ensureBackgroundWorkerIo();
+    var release: std.Io.Event = .unset;
+    const Worker = struct {
+        fn run(task_io: std.Io, event: *std.Io.Event) void {
+            event.waitUncancelable(task_io);
+        }
+    };
+    {
+        var tasks: [6]std.Io.Future(void) = undefined;
+        var started: usize = 0;
+        defer {
+            release.set(io);
+            for (tasks[0..started]) |*task| task.await(io);
+        }
+        for (&tasks) |*task| {
+            task.* = try io.concurrent(Worker.run, .{ io, &release });
+            started += 1;
+        }
+        try std.testing.expectError(error.ConcurrencyUnavailable, io.concurrent(Worker.run, .{ io, &release }));
+    }
+    server.quiesceBackgroundWork();
+    try std.testing.expect(server.background_worker_io == null);
+    try std.testing.expectError(error.BackgroundOwnerClosing, server.ensureBackgroundWorkerIo());
 }

@@ -940,13 +940,19 @@ test "reranking execution gate blocks the session forward pass" {
     };
 
     var worker = Worker{ .pipeline = &pipeline };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    while (!worker.started.load(.acquire)) std.Thread.yield() catch {};
-    for (0..64) |_| std.Thread.yield() catch {};
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var thread_awaited = false;
+    defer if (!thread_awaited) {
+        gate.unlock();
+        thread.await(std.testing.io);
+    };
+    while (!worker.started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    for (0..64) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(usize, 0), session_state.run_count.load(.acquire));
 
     gate.unlock();
-    thread.join();
+    thread.await(std.testing.io);
+    thread_awaited = true;
     try std.testing.expect(!worker.failed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
 }

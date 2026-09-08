@@ -13895,6 +13895,9 @@ test "distributed graph traverse routes cross-table frontier by table generation
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }

@@ -547,18 +547,12 @@ fn requestGeneratedTextBatchPolicy(alloc: Allocator, request: enrichment_types.G
 
 fn backoffWriterLockRetry() void {
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Thread.yield() catch {};
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(writer_locked_retry_sleep_ns);
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
 }
 
 fn sleepRetryBackoff(sleep_ns: u64) void {
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Thread.yield() catch {};
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(sleep_ns);
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
 }
 
 fn transientEmbedRetrySleepNs(attempt: u32) u64 {

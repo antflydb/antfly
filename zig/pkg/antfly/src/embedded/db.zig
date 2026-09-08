@@ -691,7 +691,7 @@ test "embedded db openLite can run ttl cleanup over aflite file" {
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
     while ((stats.ttl_cleanup.deleted_docs == 0 or stats.ttl_cleanup.scanned_timestamps == 0) and attempts < 200) : (attempts += 1) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std.testing.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }

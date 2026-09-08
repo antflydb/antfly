@@ -3841,16 +3841,16 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     try server.post("/upload", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("deadline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -3895,16 +3895,16 @@ test "H1 oversized content length returns 413 before handler admission" {
     try server.post("/upload", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("oversized-body listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
 
@@ -4032,16 +4032,16 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
     try server.use(.{ .name = "policy", .handler = State.policy });
     try server.get("/stream", State.handler);
     try server.bind();
-    const thread = try std.Thread.spawn(.{}, struct {
+    var thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("header test listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        thread.join();
+        thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     for ([_]bool{ false, true }) |http2| {
         var stream = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example");
         defer stream.deinit();
@@ -4092,16 +4092,16 @@ test "H1 handler failure after stream commit closes without a second response" {
     try server.get("/stream", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("stream failure listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -4625,14 +4625,14 @@ test "cross-thread stop wakes an ephemeral listener" {
     try server.bind();
     try std.testing.expect(server.wake_port.load(.acquire) != 0);
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("ephemeral listener failed: {}", .{err});
         }
     }.run, .{&server});
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     server.stop();
-    listener_thread.join();
+    listener_thread.await(std.testing.io);
     try std.testing.expect(!server.running);
 }
 
@@ -4660,24 +4660,32 @@ test "multiple listeners share one HTTP runtime lifecycle" {
     });
     defer second.deinit();
 
-    const first_thread = try std.Thread.spawn(.{}, struct {
+    var first_thread = try std.testing.io.concurrent(struct {
         fn run(server: *Server) void {
             server.listen() catch |err| std.debug.panic("first shared-runtime listener failed: {}", .{err});
         }
     }.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, struct {
+    defer {
+        first.stop();
+        first_thread.await(std.testing.io);
+    }
+    var second_thread = try std.testing.io.concurrent(struct {
         fn run(server: *Server) void {
             server.listen() catch |err| std.debug.panic("second shared-runtime listener failed: {}", .{err});
         }
     }.run, .{&second});
+    defer {
+        second.stop();
+        second_thread.await(std.testing.io);
+    }
     while (!first.listen_started.load(.acquire) or !second.listen_started.load(.acquire))
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     try std.testing.expectEqual(@as(usize, 2), http_runtime.stats().active_listener_leases);
     first.stop();
     second.stop();
-    first_thread.join();
-    second_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().active_listener_leases);
 }
 
@@ -4799,16 +4807,16 @@ test "bounded control listener serves without H1 observer capacity" {
     }.handle);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("control listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -4853,14 +4861,14 @@ test "HTTP runtime tasks do not consume the nested-operation executor" {
     var application_task = try io_impl.io().concurrent(struct {
         fn run(started: *std.atomic.Value(bool), release: *const std.atomic.Value(bool)) void {
             started.store(true, .release);
-            while (!release.load(.acquire)) std.Thread.yield() catch {};
+            while (!release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }.run, .{ &application_task_started, &release_application_task });
     defer {
         release_application_task.store(true, .release);
         application_task.await(io_impl.io());
     }
-    while (!application_task_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!application_task_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -4881,7 +4889,7 @@ test "HTTP runtime tasks do not consume the nested-operation executor" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -4905,7 +4913,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
         fn handler(ctx: *Context) anyerror!Response {
             _ = handler_calls.fetchAdd(1, .acq_rel);
             first_started.store(true, .release);
-            while (!release_first.load(.acquire)) std.Thread.yield() catch {};
+            while (!release_first.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             return ctx.text("complete");
         }
     };
@@ -4932,7 +4940,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     defer State.release_first.store(true, .release);
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
@@ -4940,7 +4948,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
     defer first_client.close();
     try first_client.setRecvTimeout(5_000);
     try first_client.sendAll("GET /work HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
-    while (!State.first_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!State.first_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     var second_client = try Socket.connect(server.boundAddress().?, client_io);
     defer second_client.close();
@@ -5006,7 +5014,7 @@ test "canceled route is a response-free terminal transport outcome" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -5145,21 +5153,21 @@ test "cross-thread graceful shutdown is listener-owned" {
     try server.bind();
     const address = server.boundAddress().?;
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("graceful listener failed: {}", .{err});
         }
     }.run, .{&server});
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     // An idle keep-alive connection is not an active request and must not
     // consume the graceful request deadline.
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
     defer client.close();
-    while (server.active_connections.load(.acquire) == 0) std.Thread.yield() catch {};
+    while (server.active_connections.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const started = Io.Clock.awake.now(client_io).nanoseconds;
     server.shutdown(5000);
-    listener_thread.join();
+    listener_thread.await(std.testing.io);
     const elapsed = Io.Clock.awake.now(client_io).nanoseconds - started;
     try std.testing.expect(!server.running);
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
@@ -5198,16 +5206,16 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     try server.bind();
     const address = server.boundAddress().?;
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("pipeline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
@@ -5262,16 +5270,16 @@ test "H1 orderly half close does not cancel an active response" {
     try server.get("/slow", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("half-close listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -5321,24 +5329,24 @@ test "H1 hard disconnect remains observable behind pipelined input" {
     try server.get("/slow", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("hard-disconnect listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     var client_open = true;
     defer if (client_open) client.close();
     try client.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\n\r\n");
-    while (!State.started.load(.acquire)) std.Thread.yield() catch {};
-    while (server.httpRuntimeStats().active_h1_cancellation_observers != 1) std.Thread.yield() catch {};
+    while (!State.started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (server.httpRuntimeStats().active_h1_cancellation_observers != 1) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     // Leave a partial next request unread while the active handler owns the
     // connection, then abort. Readability must be suppressed without dropping
@@ -5391,16 +5399,16 @@ test "H1 context does not treat a partial pipeline suffix as buffered input" {
     try server.bind();
     const address = server.boundAddress().?;
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("partial-pipeline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
@@ -5452,7 +5460,7 @@ test "immediate stop preempts graceful request drain" {
     server.active_requests.store(1, .release);
     server.shutdown(10_000);
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("draining listener failed: {}", .{err});
         }
@@ -5461,7 +5469,7 @@ test "immediate stop preempts graceful request drain" {
     caller_io.sleep(Io.Duration.fromMilliseconds(20), .awake) catch {};
     const started = Io.Clock.awake.now(caller_io).nanoseconds;
     server.stop();
-    listener_thread.join();
+    listener_thread.await(std.testing.io);
     const elapsed = Io.Clock.awake.now(caller_io).nanoseconds - started;
     server.active_requests.store(0, .release);
     try std.testing.expect(elapsed < std.time.ns_per_s);

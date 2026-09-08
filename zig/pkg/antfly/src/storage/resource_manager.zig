@@ -785,7 +785,7 @@ pub const ResourceManager = struct {
             if (comptime builtin.os.tag == .freestanding) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
     }
@@ -2815,13 +2815,7 @@ fn cacheBenefitPerByte(sample: HbcCacheBenefitSample, miss_service_ns_per_miss: 
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (comptime builtin.os.tag == .freestanding) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 test "resource manager tracks reservations and releases" {

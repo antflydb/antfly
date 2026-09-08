@@ -26,12 +26,16 @@ pub const BackgroundPublisher = struct {
     alloc: Allocator,
     catalog: *catalog_service.CatalogService,
     poll_interval_ms: u64,
-    thread: ?std.Thread = null,
+    io: std.Io,
+    lifecycle_mutex: std.Io.Mutex = .init,
+    future: ?std.Io.Future(void) = null,
+    stop_event: std.Io.Event = .unset,
     stop_requested: std.atomic.Value(bool) = .init(false),
 
-    pub fn init(alloc: Allocator, catalog: *catalog_service.CatalogService, poll_interval_ms: u64) BackgroundPublisher {
+    pub fn init(alloc: Allocator, io: std.Io, catalog: *catalog_service.CatalogService, poll_interval_ms: u64) BackgroundPublisher {
         return .{
             .alloc = alloc,
+            .io = io,
             .catalog = catalog,
             .poll_interval_ms = poll_interval_ms,
         };
@@ -43,16 +47,22 @@ pub const BackgroundPublisher = struct {
     }
 
     pub fn start(self: *BackgroundPublisher) !void {
-        if (self.thread != null) return error.AlreadyStarted;
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
+        if (self.future != null) return error.AlreadyStarted;
         self.stop_requested.store(false, .monotonic);
-        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        self.stop_event.reset();
+        self.future = try self.io.concurrent(runLoop, .{self});
     }
 
     pub fn stop(self: *BackgroundPublisher) void {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
         self.stop_requested.store(true, .monotonic);
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        self.stop_event.set(self.io);
+        if (self.future) |*future| {
+            future.await(self.io);
+            self.future = null;
         }
     }
 
@@ -103,7 +113,13 @@ pub const BackgroundPublisher = struct {
     fn runLoop(self: *BackgroundPublisher) void {
         while (!self.stop_requested.load(.monotonic)) {
             _ = self.runOnce() catch PublishRunStats{};
-            sleepMs(@max(self.poll_interval_ms, 1));
+            self.stop_event.waitTimeout(self.io, .{ .duration = .{
+                .raw = .fromNanoseconds(@as(i96, @max(self.poll_interval_ms, 1)) * std.time.ns_per_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return,
+            };
         }
     }
 };
@@ -160,7 +176,7 @@ test "background publisher runOnce publishes namespaces with pending WAL" {
     });
     defer ingest.deinit(alloc);
 
-    var publisher = BackgroundPublisher.init(alloc, &catalog, 1);
+    var publisher = BackgroundPublisher.init(alloc, std.testing.io, &catalog, 1);
     const published = try publisher.runOnce();
     try std.testing.expectEqual(@as(usize, 1), published.published_namespaces);
     try std.testing.expectEqual(@as(usize, 0), published.head_conflicts);
@@ -231,9 +247,22 @@ test "background publisher loop publishes asynchronously and latest reads remain
     });
     defer next_ingest.deinit(alloc);
 
-    var publisher = BackgroundPublisher.init(alloc, &catalog, 1);
+    var publisher = BackgroundPublisher.init(alloc, std.testing.io, &catalog, 1);
     defer publisher.deinit();
+    {
+        var unavailable = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
+        defer unavailable.deinit();
+        publisher.io = unavailable.io();
+        defer {
+            publisher.stop();
+            publisher.io = std.testing.io;
+        }
+        try std.testing.expectError(error.ConcurrencyUnavailable, publisher.start());
+        try std.testing.expect(publisher.future == null);
+    }
+    publisher.poll_interval_ms = 60_000;
     try publisher.start();
+    try std.testing.expectError(error.AlreadyStarted, publisher.start());
 
     var query = @import("../query/mod.zig").QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
     defer query.deinit();
@@ -253,6 +282,11 @@ test "background publisher loop publishes asynchronously and latest reads remain
 
     try std.testing.expect(latest_seen_tail);
     try std.testing.expectEqual(@as(u64, 2), try progress_store.getHead("docs"));
+    publisher.stop();
+    publisher.poll_interval_ms = 60_000;
+    try publisher.start();
+    publisher.stop();
+    try std.testing.expect(publisher.future == null);
 }
 
 test "concurrent background publishers yield a single publish winner" {
@@ -326,13 +360,14 @@ test "concurrent background publishers yield a single publish winner" {
     };
 
     var state = RaceState{
-        .pub_a = BackgroundPublisher.init(alloc, &catalog_a, 1),
-        .pub_b = BackgroundPublisher.init(alloc, &catalog_b, 1),
+        .pub_a = BackgroundPublisher.init(alloc, std.testing.io, &catalog_a, 1),
+        .pub_b = BackgroundPublisher.init(alloc, std.testing.io, &catalog_b, 1),
     };
-    const thread_a = try std.Thread.spawn(.{}, RaceState.runA, .{&state});
-    const thread_b = try std.Thread.spawn(.{}, RaceState.runB, .{&state});
-    thread_a.join();
-    thread_b.join();
+    var thread_a = try std.testing.io.concurrent(RaceState.runA, .{&state});
+    defer thread_a.await(std.testing.io);
+    var thread_b = try std.testing.io.concurrent(RaceState.runB, .{&state});
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
 
     try std.testing.expectEqual(@as(usize, 1), state.stats_a.published_namespaces + state.stats_b.published_namespaces);
     try std.testing.expectEqual(@as(usize, 1), state.stats_a.head_conflicts + state.stats_b.head_conflicts + state.stats_a.idle_namespaces + state.stats_b.idle_namespaces);

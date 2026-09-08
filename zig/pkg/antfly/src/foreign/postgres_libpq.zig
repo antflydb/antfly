@@ -3820,7 +3820,7 @@ fn spinOrYield() void {
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
@@ -4093,7 +4093,7 @@ test "postgres libpq global permit wait observes cancellation without a deadline
     var cancellation = std.atomic.Value(bool).init(false);
     var cancelled = std.atomic.Value(bool).init(false);
     var failed = std.atomic.Value(bool).init(false);
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{
+    var thread = try std.testing.io.concurrent(Worker.run, .{
         &executor,
         &cancellation,
         &cancelled,
@@ -4101,7 +4101,7 @@ test "postgres libpq global permit wait observes cancellation without a deadline
     });
     while (executor.permit_waiter_count.load(.acquire) == 0) spinOrYield();
     cancellation.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(cancelled.load(.acquire));
     try std.testing.expect(!failed.load(.acquire));
@@ -4145,7 +4145,7 @@ test "postgres libpq pool wait observes cancellation without a deadline" {
     var cancellation = std.atomic.Value(bool).init(false);
     var cancelled = std.atomic.Value(bool).init(false);
     var failed = std.atomic.Value(bool).init(false);
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{
+    var thread = try std.testing.io.concurrent(Worker.run, .{
         &executor,
         dsn,
         &cancellation,
@@ -4154,7 +4154,7 @@ test "postgres libpq pool wait observes cancellation without a deadline" {
     });
     platform_time.sleepNs(cancellation_poll_interval_ns);
     cancellation.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(cancelled.load(.acquire));
     try std.testing.expect(!failed.load(.acquire));
@@ -4324,15 +4324,14 @@ test "postgres libpq weighted FIFO preserves a queued two-permit cutover" {
         }
     };
     const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-    const large = try std.Thread.spawn(
-        .{},
+    var large = try std.testing.io.concurrent(
         Contender.run,
         .{ &executor, 2, deadline_ns, &large_acquired, &allow_release, &failed },
     );
     var large_joined = false;
     defer {
         allow_release.store(true, .release);
-        if (!large_joined) large.join();
+        if (!large_joined) large.await(std.testing.io);
         const remaining = executor.total_connections.load(.acquire);
         if (remaining > 0) executor.releaseGlobalConnections(remaining);
     }
@@ -4341,15 +4340,14 @@ test "postgres libpq weighted FIFO preserves a queued two-permit cutover" {
         try ensureDeadline(deadline_ns);
         spinOrYield();
     }
-    const small = try std.Thread.spawn(
-        .{},
+    var small = try std.testing.io.concurrent(
         Contender.run,
         .{ &executor, 1, deadline_ns, &small_acquired, &allow_release, &failed },
     );
     var small_joined = false;
     defer {
         allow_release.store(true, .release);
-        if (!small_joined) small.join();
+        if (!small_joined) small.await(std.testing.io);
     }
     while (executor.permit_waiter_count.load(.acquire) != 2) {
         try ensureDeadline(deadline_ns);
@@ -4373,9 +4371,9 @@ test "postgres libpq weighted FIFO preserves a queued two-permit cutover" {
     try std.testing.expectEqual(@as(usize, 1), executor.permit_waiter_count.load(.acquire));
 
     allow_release.store(true, .release);
-    large.join();
+    large.await(std.testing.io);
     large_joined = true;
-    small.join();
+    small.await(std.testing.io);
     small_joined = true;
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expect(small_acquired.load(.acquire));
@@ -4428,14 +4426,13 @@ test "postgres libpq timed out weighted head hands released capacity to follower
 
     const head_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
     const test_deadline_ns = head_deadline_ns + 5 * std.time.ns_per_s;
-    const head = try std.Thread.spawn(
-        .{},
+    var head = try std.testing.io.concurrent(
         Head.run,
         .{ &executor, head_deadline_ns, &head_timed_out, &failed },
     );
     var head_joined = false;
     defer {
-        if (!head_joined) head.join();
+        if (!head_joined) head.await(std.testing.io);
         const remaining = executor.total_connections.load(.acquire);
         if (remaining > 0) executor.releaseGlobalConnections(remaining);
     }
@@ -4444,13 +4441,12 @@ test "postgres libpq timed out weighted head hands released capacity to follower
         try ensureDeadline(test_deadline_ns);
         spinOrYield();
     }
-    const follower = try std.Thread.spawn(
-        .{},
+    var follower = try std.testing.io.concurrent(
         Follower.run,
         .{ &executor, test_deadline_ns, &follower_acquired, &failed },
     );
     var follower_joined = false;
-    defer if (!follower_joined) follower.join();
+    defer if (!follower_joined) follower.await(std.testing.io);
 
     while (executor.permit_waiter_count.load(.acquire) != 2) {
         try ensureDeadline(test_deadline_ns);
@@ -4463,9 +4459,9 @@ test "postgres libpq timed out weighted head hands released capacity to follower
     // two-permit owner must roll back exactly once and the one-permit follower
     // must receive the available slot.
     executor.releaseGlobalConnections(1);
-    head.join();
+    head.await(std.testing.io);
     head_joined = true;
-    follower.join();
+    follower.await(std.testing.io);
     follower_joined = true;
 
     try std.testing.expect(head_timed_out.load(.acquire));
@@ -4622,8 +4618,7 @@ test "postgres libpq reclamation leaves permit scheduling responsive" {
             inner.releaseGlobalConnections(2);
         }
     };
-    const head = try std.Thread.spawn(
-        .{},
+    var head = try std.testing.io.concurrent(
         Head.run,
         .{ &executor, &head_acquired, &release_head, &head_failed },
     );
@@ -4631,7 +4626,7 @@ test "postgres libpq reclamation leaves permit scheduling responsive" {
     defer {
         Fake.allow_finish.store(true, .release);
         release_head.store(true, .release);
-        if (!head_joined) head.join();
+        if (!head_joined) head.await(std.testing.io);
     }
 
     const deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
@@ -4682,7 +4677,7 @@ test "postgres libpq reclamation leaves permit scheduling responsive" {
     executor.cancelGlobalPermitWaiter(&next);
     next_cancelled = true;
     release_head.store(true, .release);
-    head.join();
+    head.await(std.testing.io);
     head_joined = true;
 }
 
@@ -4709,16 +4704,21 @@ test "postgres libpq availability broadcast wakes every waiter" {
     const observed = availability.snapshot();
     var completed: std.atomic.Value(usize) = .init(0);
     var failed: std.atomic.Value(bool) = .init(false);
-    var waiters: [waiter_count]std.Thread = undefined;
+    var waiters: [waiter_count]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        availability.advanceAll();
+        for (waiters[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
     for (&waiters) |*waiter| {
-        waiter.* = try std.Thread.spawn(
-            .{},
+        waiter.* = try std.testing.io.concurrent(
             Waiter.run,
             .{ &availability, observed, &completed, &failed },
         );
+        started_tasks += 1;
     }
     availability.advanceAll();
-    for (waiters) |waiter| waiter.join();
+    for (&waiters) |*waiter| waiter.await(std.testing.io);
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expectEqual(waiter_count, completed.load(.acquire));
 }
@@ -5049,15 +5049,14 @@ test "postgres libpq live deadline cancels slow query and pool remains reusable"
         };
         var acquired: std.atomic.Value(bool) = .init(false);
         var failed: std.atomic.Value(bool) = .init(false);
-        const waiter = try std.Thread.spawn(
-            .{},
+        var waiter = try std.testing.io.concurrent(
             SignaledWaiter.run,
             .{ &executor, dsn, &acquired, &failed },
         );
         platform_time.sleepNs(25 * std.time.ns_per_ms);
         initialized -= 1;
         saturation_leases[initialized].release();
-        waiter.join();
+        waiter.await(std.testing.io);
         try std.testing.expect(acquired.load(.acquire));
         try std.testing.expect(!failed.load(.acquire));
     }

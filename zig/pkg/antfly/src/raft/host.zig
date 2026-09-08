@@ -121,6 +121,9 @@ pub fn stableRandomSeed(group_id: u64, local_node_id: u64) u64 {
 }
 
 pub const HostDeps = struct {
+    /// Borrowed synchronization context; must outlive the host. The default
+    /// supports blocking mutex waits without allocating a worker pool.
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
     replica_catalog: ?catalog.ReplicaCatalog = null,
     peer_resolver: ?peer_resolver.PeerResolver = null,
     runtime_hooks: RuntimeHooks = .{},
@@ -397,7 +400,7 @@ pub const Host = struct {
     runtime_host: raft_engine.runtime.MultiRaft,
     bootstrap_statuses: std.AutoHashMapUnmanaged(u64, OwnedBootstrapStatus) = .empty,
     admission_conflicts: std.AutoHashMapUnmanaged(u64, raft_engine.runtime.group.ReplicaAdmissionConflict) = .empty,
-    inbound_mutex: std.atomic.Mutex = .unlocked,
+    inbound_mutex: std.Io.Mutex = .init,
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
@@ -419,7 +422,7 @@ pub const Host = struct {
         var pending = self.pending_inbound;
         self.pending_inbound = .empty;
         self.metrics.pending_inbound_messages = 0;
-        self.inbound_mutex.unlock();
+        self.inbound_mutex.unlock(self.deps.io);
         for (pending.items) |*item| item.deinit(self.alloc);
         pending.deinit(self.alloc);
         var bootstrap_it = self.bootstrap_statuses.valueIterator();
@@ -1014,7 +1017,7 @@ pub const Host = struct {
 
         if (pending.items.len > 0) {
             self.lockInbound();
-            defer self.inbound_mutex.unlock();
+            defer self.inbound_mutex.unlock(self.deps.io);
 
             try self.pending_inbound.ensureUnusedCapacity(self.alloc, pending.items.len);
             for (pending.items) |item| self.pending_inbound.appendAssumeCapacity(item);
@@ -1036,7 +1039,7 @@ pub const Host = struct {
         const drain_count = @min(max_messages, self.pending_inbound.items.len);
         if (drain_count > 0) {
             pending.ensureTotalCapacity(self.alloc, drain_count) catch |err| {
-                self.inbound_mutex.unlock();
+                self.inbound_mutex.unlock(self.deps.io);
                 return err;
             };
             pending.appendSliceAssumeCapacity(self.pending_inbound.items[0..drain_count]);
@@ -1053,7 +1056,7 @@ pub const Host = struct {
             }
         }
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
-        self.inbound_mutex.unlock();
+        self.inbound_mutex.unlock(self.deps.io);
 
         var drained: usize = 0;
         for (pending.items) |item| {
@@ -1070,9 +1073,7 @@ pub const Host = struct {
     }
 
     fn lockInbound(self: *Host) void {
-        while (!self.inbound_mutex.tryLock()) {
-            std.Thread.yield() catch {};
-        }
+        self.inbound_mutex.lockUncancelable(self.deps.io);
     }
 
     fn mapGroupActivityError(err: anyerror) anyerror {
@@ -1164,7 +1165,7 @@ pub const Host = struct {
         errdefer msg.deinit(self.alloc);
 
         self.lockInbound();
-        defer self.inbound_mutex.unlock();
+        defer self.inbound_mutex.unlock(self.deps.io);
         try self.pending_inbound.append(self.alloc, .{
             .group_id = upload.group_id,
             .message = msg,

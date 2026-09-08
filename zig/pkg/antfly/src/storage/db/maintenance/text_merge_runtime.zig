@@ -388,7 +388,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
         if (builtin.is_test and test_block_after_task_begin.load(.acquire)) {
             test_task_begin_entered.store(true, .release);
-            while (!test_release_after_task_begin.load(.acquire)) std.Thread.yield() catch {};
+            while (!test_release_after_task_begin.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         const execute_fd_epoch = self.native_storage_pool.admissionEpoch();
@@ -970,7 +970,7 @@ fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
 }
 
 fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.Thread.yield() catch {};
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn consumeTestStartFailure() bool {

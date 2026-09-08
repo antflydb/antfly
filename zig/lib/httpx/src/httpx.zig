@@ -106,15 +106,11 @@ pub const common = @import("util/common.zig");
 
 pub const testing_mod = @import("testing.zig");
 
-pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
 
 pub const RequestSpec = concurrency.RequestSpec;
 pub const RequestResult = concurrency.RequestResult;
 pub const BatchBuilder = concurrency.BatchBuilder;
-
-pub const Executor = executor.Executor;
-pub const Task = executor.Task;
 
 pub const Method = types.Method;
 pub const Version = types.Version;

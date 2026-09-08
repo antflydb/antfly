@@ -664,10 +664,7 @@ fn normalizeInPlace(vec: []f32) void {
 
 fn sleepMs(duration_ms: u64) void {
     if (duration_ms == 0) return;
-    const deadline = nowNs() +| (duration_ms * std.time.ns_per_ms);
-    while (nowNs() < deadline) {
-        std.Thread.yield() catch {};
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@as(i96, duration_ms) * std.time.ns_per_ms), .awake) catch {};
 }
 
 fn tempPath(buf: []u8) [*:0]const u8 {

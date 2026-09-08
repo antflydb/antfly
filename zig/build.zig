@@ -4704,6 +4704,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime background worker capacity is reserved and closes with its owner",
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
         "enrichment index status encodes worker lifecycle diagnostics",
@@ -9667,6 +9668,13 @@ pub fn build(b: *std.Build) void {
         .root_module = wal_bench_mod,
     });
 
+    const benchmark_io_test_step = b.step("benchmark-io-test", "Check benchmark partial-start cleanup under Io capacity exhaustion");
+    const wal_bench_io_tests = b.addTest(.{
+        .root_module = wal_bench_mod,
+        .filters = &.{"benchmark partial startup"},
+    });
+    benchmark_io_test_step.dependOn(&b.addRunArtifact(wal_bench_io_tests).step);
+
     const run_wal_bench = b.addRunArtifact(wal_bench);
     const wal_bench_step = b.step("wal-bench", "Benchmark WAL append throughput with and without group commit");
     wal_bench_step.dependOn(&run_wal_bench.step);
@@ -9765,6 +9773,12 @@ pub fn build(b: *std.Build) void {
         .name = "derived_log_bench",
         .root_module = derived_log_bench_mod,
     });
+
+    const derived_log_bench_io_tests = b.addTest(.{
+        .root_module = derived_log_bench_mod,
+        .filters = &.{"benchmark partial startup"},
+    });
+    benchmark_io_test_step.dependOn(&b.addRunArtifact(derived_log_bench_io_tests).step);
 
     const run_derived_log_bench = b.addRunArtifact(derived_log_bench);
     const derived_log_bench_step = b.step("derived-log-bench", "Benchmark derived log throughput with and without group commit");
@@ -10377,7 +10391,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    capi_bench_mod.addImport("antfly-zig", lib_mod);
+    capi_bench_mod.addImport("antfly_storage_root", lib_mod);
+    capi_bench_mod.addImport("antfly_vector", vector_mod);
+    capi_bench_mod.addImport("structlog", structlog_mod);
     dense_stack_bench_mod.addImport("antfly_capi", capi_bench_mod);
 
     const dense_stack_bench = b.addExecutable(.{
@@ -10426,6 +10442,7 @@ pub fn build(b: *std.Build) void {
     replay_bench_root_mod.addImport("antfly_regex", regex_mod);
     replay_bench_root_mod.addImport("antfly_reranking", reranking_mod);
     replay_bench_root_mod.addImport("antfly_scraping", scraping_mod);
+    replay_bench_root_mod.addImport("antfly_reader_config", reader_config_mod);
     replay_bench_root_mod.addImport("antfly_platform", platform_mod);
     addSnowballModule(b, replay_bench_root_mod);
     replay_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
