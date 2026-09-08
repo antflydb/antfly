@@ -10880,6 +10880,9 @@ pub const HBCIndex = struct {
             if (try experimentalPostingCheckpointValue(alloc, reconstructed_values, &latest, root, node_id, .quantized_checkpoint)) |quantized| {
                 if (posting_rows.isManifest(quantized)) {
                     try appendRowCheckpoint(alloc, writer, null, generation, node_id, covered_source_sequence, quantized, &row_chunks, null, null);
+                    const cost = try resolvedExperimentalPostingLeafScan(generation, node_id, metadata.dims, metadata.use_quantization);
+                    quantized_directory.admission_stats.observeLeaf(cost.vector_count, cost.bytes);
+                    quantized_directory_entry_written = true;
                 } else if (node_id == metadata.root_node) {
                     try writer.appendValueBorrowedAt(node_id, .quantized_checkpoint, covered_source_sequence, quantized);
                 } else {
@@ -11209,7 +11212,8 @@ pub const HBCIndex = struct {
             const packed_node = packed_node_value.bytes;
             const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
             if (row_leaves.contains(node_id)) {
-                quantized_directory.observeFallbackLeaf(decoded_node.ids_bytes.len / @sizeOf(u64));
+                const cost = try resolvedExperimentalPostingLeafScan(generation, node_id, metadata.dims, metadata.use_quantization);
+                quantized_directory.admission_stats.observeLeaf(cost.vector_count, cost.bytes);
                 base_reclaimer.observe(packed_node);
                 continue;
             }
@@ -28831,6 +28835,12 @@ test "native posting row integration survives mutation checkpoint and reopen" {
             try std.testing.expect(row_count > 0);
             try Fixture.check(&idx, &.{});
             try Fixture.checkpoint(&idx, .full);
+            {
+                const serving = idx.retainCurrentExperimentalPostingReadGeneration().?;
+                defer serving.release();
+                const stats = serving.scan_admission;
+                try std.testing.expect(stats.max_unfiltered_scan_bytes <= stats.max_leaf_vectors * rabitq.codeWidth(config.dims) * @sizeOf(u64));
+            }
             try idx.beginExperimentalPostingMutationCapture();
             try idx.batchApplyOptions(&.{}, &.{ 1, 2, 3, 4 }, .{ .preserve_delete_rows = true, .skip_vector_store = true });
             try idx.persistExperimentalPostingSidecarAtAppliedSequence(65, .{});

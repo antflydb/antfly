@@ -9825,3 +9825,7 @@ even when the VectorDBBench client process eventually exits successfully.
 Matched public-API 50K/1M performance qualification is still pending. The
 standalone microbenchmark numbers above must not be presented as integrated
 latency, RSS, or disk improvements.
+Pre-qualification review also caught an admission overestimate: row-native
+leaves must publish their RaBitQ scan-byte cost, not the float32 fallback cost
+merely because they live outside the aggregate directory. Both checkpoint
+encoders now preserve that distinction, with an integrated regression assertion.

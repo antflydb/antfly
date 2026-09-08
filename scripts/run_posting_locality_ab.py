@@ -334,6 +334,7 @@ def main():
                 if args.refinement in (
                     "coalesced_deletes", "reused_delete_vectors", "dense_delete_plan",
                     "stable_posting_origins",
+                    "posting_row_deltas",
                 ):
                     # Identical stage instrumentation in control and treatment.
                     arm_environment["ANTFLY_BENCH_BATCH_PROFILE"] = "1"
