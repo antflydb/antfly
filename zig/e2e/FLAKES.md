@@ -94,9 +94,10 @@ default policy allows six worker attempts, each with six provider attempts:
 The assertion now has a named, finite 90-second allowance for that policy. It
 still requires a terminal source failure, repeated provider calls, a healthy
 shared worker and text index, and later successful image work. The test reports
-elapsed retry time and provider-request count. The CLI fixture also passes test
-failure status into server teardown so the regression script can retain failed
-runtime roots and logs.
+elapsed retry time and provider-request count. The CLI fixture stops the server
+during teardown and defers the directory cleanup decision until the completed
+teardown report, so the regression script can retain failed runtime roots and
+logs, including failures in the module's last fixture teardown.
 
 The unchanged 30-second test failed in all three workers against the existing
 PR #659 executable, reproducing the CI signature. This demonstrates a test budget
@@ -167,6 +168,11 @@ counts, failing node IDs, and preserved diagnostics when adding a new result.
   after the fix). Both used the existing PR #659 executable from
   `.worktrees/std-io-migration-audit/zig/zig-out/bin/antfly`, exercising real
   retry sleeps. The 105 fast regressions also passed with this change.
+- Review correction [`d058ddb2f`](https://github.com/antflydb/antfly/commit/d058ddb2ff4e478f1b539774cf3938a3d711cf9d):
+  **113 fast regressions passed**, including eight real-pytest lifecycle cases
+  covering setup, call, final teardown, earlier-test failures, preservation
+  settings, successful cleanup, and directory cleanup errors. These tests use
+  the real CLI fixture and server shutdown method without launching a server.
 
 Both soaks used `scripts/ci/zig-e2e-regression-loop.sh` with `SKIP_BUILD=1`,
 `ANTFLY_BIN` set to the executable above, and the corresponding test node ID.
