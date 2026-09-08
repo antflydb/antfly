@@ -327,16 +327,47 @@ def _cleanup_created_tables(api: Any, table_names: set[str]) -> list[str]:
     cleanup_errors: list[str] = []
     for table_name in reversed(sorted(table_names)):
         try:
-            response = api.s.delete(
-                f"{api.url}/tables/{quote(table_name, safe='')}", timeout=30
-            )
-            if response.status_code not in (200, 202, 204, 404):
-                cleanup_errors.append(
-                    f"{table_name}: HTTP {response.status_code} {response.text[:500]}"
-                )
-        except requests.RequestException as err:
+            _delete_created_table(api, table_name)
+        except (requests.RequestException, RuntimeError) as err:
             cleanup_errors.append(f"{table_name}: {err}")
     return cleanup_errors
+
+
+def _delete_created_table(api: Any, table_name: str) -> None:
+    # DELETE is idempotent: a lost response may mean the table is already gone.
+    # Retry transport failures within one cleanup deadline, but never hide an
+    # exited server or a real HTTP error behind a later successful request.
+    deadline = time.monotonic() + 30
+    for attempt in range(3):
+        raise_if_server_process_exited(api._server)
+        try:
+            with api._request_lock:
+                response = api.s.delete(
+                    f"{api.url}/tables/{quote(table_name, safe='')}",
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+        except (requests.ConnectionError, requests.Timeout) as err:
+            raise_if_server_process_exited(api._server)
+            remaining = deadline - time.monotonic()
+            if attempt == 2 or remaining <= 0.1:
+                raise_request_error_with_logs(err, api._server)
+            print(
+                f"retrying table cleanup for {table_name}: {type(err).__name__}: {err}"
+            )
+            time.sleep(0.1)
+            continue
+        except requests.RequestException as err:
+            raise_request_error_with_logs(err, api._server)
+        raise_if_server_process_exited(api._server)
+        if response.status_code not in (200, 202, 204, 404):
+            raise_request_error_with_logs(
+                requests.HTTPError(
+                    f"HTTP {response.status_code} {response.text[:500]}",
+                    response=response,
+                ),
+                api._server,
+            )
+        return
 
 
 def _created_table_from_path(path: str) -> str | None:

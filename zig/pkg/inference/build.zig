@@ -2322,6 +2322,7 @@ pub fn build(b: *std.Build) void {
     chunker_tests.root_module.addImport("inference_audio", inference_audio_mod);
     chunker_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     chunker_tests.root_module.addImport("antfly_image", antfly_image_mod);
+    chunker_tests.root_module.addImport("antfly_hash", inference_chunker_mod.import_table.get("antfly_hash").?);
     chunker_tests.root_module.link_libc = true;
     const run_chunker_tests = b.addRunArtifact(chunker_tests);
     const chunker_test_step = b.step("test-chunker", "Run chunker tests");
@@ -2399,6 +2400,12 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .single_threaded = true,
         });
+        const wasm_hash_mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/hash/src/mod.zig", .{shared_lib_root})),
+            .target = wasm_target,
+            .optimize = .ReleaseSafe,
+        });
+        wasm_image_mod.addImport("antfly_hash", wasm_hash_mod);
         const wasm_platform_mod = b.dependency("antfly_platform", .{
             .target = wasm_target,
             .optimize = .ReleaseSafe,

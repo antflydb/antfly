@@ -2,6 +2,9 @@
 
 This directory holds portable end-to-end tests for Antfly Zig.
 
+See [FLAKES.md](../FLAKES.md) for intermittent failures, CI evidence, fix commits,
+and regression-soak commands and results.
+
 Use product-area names for test files. Do not use migration labels like `*_parity.py`.
 
 ## Current Coverage
