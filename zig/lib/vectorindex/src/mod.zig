@@ -33,6 +33,7 @@ pub const store = @import("store.zig");
 pub const posting = @import("posting.zig");
 pub const checked_region = @import("checked_region.zig");
 pub const posting_segment = @import("posting_segment.zig");
+pub const posting_row_delta = @import("posting_row_delta.zig");
 pub const centroid_directory = @import("centroid_directory.zig");
 pub const quantized_directory = @import("quantized_directory.zig");
 pub const posting_subgroups = @import("posting_subgroups.zig");
@@ -48,6 +49,7 @@ comptime {
         _ = @import("antfly_hash");
         _ = @import("posting_wal.zig");
         _ = @import("posting_segment.zig");
+        _ = @import("posting_row_delta.zig");
         _ = @import("vector_block_wal.zig");
         _ = @import("vector_block_manifest.zig");
         _ = @import("hbc_vector_directory.zig");

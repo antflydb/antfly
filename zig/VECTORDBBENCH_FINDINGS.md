@@ -9668,3 +9668,105 @@ necessary to complete the requested shape; the current mutation-count cap is
 only an experimental guard, not that production policy. The mixed p99 regression
 still needs attribution rather than an assumption that all remaining latency
 belongs to HBC maintenance.
+
+#### Revision-aware posting row-store component experiment (2026-09-08)
+
+Implementation status: **component experiment, not an activated HBC backend**.
+`lib/vectorindex/src/posting_row_delta.zig` now implements immutable AFRC
+RaBitQ chunks, ordered AFRM row-reference manifests, and a native fused range
+scanner. A deletion copies references rather than survivor codes. Replacement
+rows get a new physical chunk identity; a stale old-row tombstone cannot
+delete the new revision of the same vector ID. Source coverage, logical
+revision, leaf incarnation and scoring-origin identity are explicit.
+
+Chunks reuse the existing aligned AFQD codec without a float16 projection
+plane. Immutable references hold heap buffers or mapping leases through the
+last query/manifest reference. Manifest decoding validates dependency identity,
+length, checksum, row ranges, live-ID uniqueness and compatible origins before
+exposing any scan. CRC remains `antfly_hash.Crc32`, not a new scalar checksum.
+Chunk serial allocation/uniqueness remains the responsibility of the eventual
+durable owner; CRC is not a substitute for revision identity.
+
+The leaf-scoped repacker prepares from a pinned view, then rebases newer rows
+outside publication. It rejects replaced reader/chunk identities, avoids
+resurrecting deleted revisions, and does not read authoritative survivor vectors
+or recenter implicitly. Soft maintenance debt is based on retained bytes,
+fragment count, chunk count, tombstone density and age; hard bounds reject
+excess debt rather than perform synchronous repacking. These are a policy/API
+for the future resource-manager integration, **not a newly wired background
+scheduler or filesystem reclamation implementation**.
+
+One immediately integrated improvement removes the unnecessary whole-payload
+clone before `prepareDeletedLeafRows` selects survivors: it now holds the
+existing transaction/cache read lease for that read-only operation. The selected
+aggregate is still copied/serialized by the current backend. This does not
+silently activate row manifests or change defaults.
+
+Correctness checks:
+
+- Debug row/WAL tests: 26 passed, one ReleaseFast-only microbenchmark skipped.
+  Coverage includes all three metrics, bit-exact scores/error bounds across
+  repacking, canonical order, cancellation, stale/duplicate tombstones, changed
+  vector revisions, missing/corrupt chunks, truncated manifests, source-sequence
+  regressions, allocation-failure cleanup, empty views and last-lease release.
+- A real `std.Io` worker prepares/rebases while the writer mutates and an older
+  query keeps its rows. Both observation waits have five-second deadlines;
+  worker join/cancellation precedes snapshot and I/O-runtime destruction.
+- A framed posting-WAL fixture verifies every truncated suffix of a second
+  transaction leaves the first manifest visible until commit. This is a
+  transaction-codec test, **not a disk/fsync/CURRENT crash qualification**.
+- The three existing HBC stable-origin tests passed after clone removal.
+  Indexed overwrite/reopen (including durable LSM primary) and the 1,000-row,
+  batch-100 native streaming/reopen test also passed in Debug.
+
+The ReleaseFast component test uses one synthetic 1,024-row, 768-dimensional
+leaf, removes 32 distributed rows, and optionally replaces all 32. It repeats
+49 or 977 leaf operations, labelled `work_rows=50000/1000000`, in four reversed
+control/candidate rounds. **These are work counts, not fresh 50K/1M datasets.**
+Both arms include new-row quantization; the candidate also includes append-chunk
+encoding/validation. The control starts with a borrowed decoded payload, then
+selects survivors and encodes the replacement protobuf. Neither arm includes
+HTTP, source artifacts, generic WAL-patch generation, fsync, routing, admission,
+checkpoints, or exact completion.
+
+For the 977-leaf work count:
+
+| Component | Aggregate control | Row-reference candidate |
+| --- | --- | --- |
+| Delete preparation/encoding per leaf | 18.23–18.51 µs | 0.512–0.521 µs |
+| Delete cumulative requested allocation bytes | 221.20 MB | 2.93 MB |
+| Replace preparation/encoding per leaf | 40.40–41.35 µs | 30.25–30.77 µs |
+| Replace cumulative requested allocation bytes | 324.18 MB | 138.96 MB |
+| Replace encoded output, before WAL compression | 113.08 MB | 8.41 MB |
+
+The first prototype rebuilt a survivor-sized validation table on every delete,
+costing 14–15 µs/leaf. Validating the immutable parent once, then checking only
+new append/survivor ID collisions, removed that remaining metadata allocation.
+Delete-only mutations now perform four allocations per leaf versus seven in
+the optimistic aggregate control. Replacement still performs 33 versus eight:
+its byte savings are real but append construction has further allocator work.
+
+Fused scanning of 33 retained runs within one chunk is nearly equal to a
+single repacked run (roughly 7.7–8.0 ns/live row). **Two chunks after replacement
+cost about 3–5% more** than repacking: 8.12–8.19 versus 7.76–7.91 ns/live row.
+The dirty two-chunk leaf retains 133,384 encoded bytes versus 126,212 after
+repack. Deferred maintenance is therefore not free; fan-out and reclaim debt
+must remain bounded. Requested bytes are not peak RSS, and encoded bytes are
+not total allocated disk or savings versus the existing AFPD-compressed WAL.
+
+Raw output: `.benchmark-results/pr593-posting-row-store-20260908/component-final.log`.
+Measured module SHA256:
+`dcb1e30537db469701cb00251f6eaceacd57184dcf302305bfc0cc448c224dd1`.
+Reproduce with `zig build lib-vectorindex-test -Doptimize=ReleaseFast --summary all -- 'posting row representation microbenchmark'`.
+
+**Remaining integration before public qualification:** allocate immutable chunk
+identities through the durable index owner; stage/fsync chunks and commit row
+manifests with membership, routing, mappings and source coverage in the native
+capture; bootstrap/recover the representation without treating AFRM as the
+existing quantized protobuf; connect complete SearchView leases and query
+filters/coverage/exact completion; publish prepared repacks under the existing
+generation-token validation; connect resource-manager admission and durable
+file-reference reclamation. Then run matched public-API 50K and 1M read-only
+and mixed qualification. No such qualification or default promotion is claimed
+for this component checkpoint; the requested whole production shape is not yet
+complete.

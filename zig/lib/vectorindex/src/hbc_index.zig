@@ -7086,9 +7086,12 @@ fn prepareDeletedLeafRows(self: anytype, txn: anytype, leaf: *const types.Node, 
         if (std.mem.indexOfScalar(u64, deletes, id) == null) rows.appendAssumeCapacity(row);
     }
     if (rows.items.len == 0 or rows.items.len == leaf.members.len) return null;
-    var old = (try loadQuantizedOwned(self, txn, leaf.id, usesNonQuantizedPayload(leaf), leaf.members.len, isNotFoundGeneric)) orelse return null;
+    // Selection never modifies the source planes. Borrow the transaction/cache
+    // lease instead of first cloning the entire old payload and then copying
+    // its survivors into a second allocation. Release before any mutation.
+    var old = (try loadQuantizedReadHandle(self, txn, leaf.id, usesNonQuantizedPayload(leaf), leaf.members.len, isNotFoundGeneric)) orelse return null;
     defer old.deinit(self.alloc);
-    return try old.selectRows(self.alloc, rows.items);
+    return try old.ptr().selectRows(self.alloc, rows.items);
 }
 
 fn saveDeletedLeafRows(self: anytype, txn: anytype, leaf: *types.Node, rows: *const hbc_runtime.QuantizedSet) !void {
