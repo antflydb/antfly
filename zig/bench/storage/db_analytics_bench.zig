@@ -553,9 +553,9 @@ const adaptive_count_requests = [_]aggregations.SearchAggregationRequest{.{
     .size = 16,
 }};
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.c_allocator;
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
 
     if (cfg.algebraic_backend == .all) {
         const backends = [_]AlgebraicBackendKind{ .mem, .lmdb, .lsm };
@@ -655,7 +655,8 @@ const algebraic_hll_config =
     \\  ],
     \\  "hll_cardinalities": [
     \\    {"name":"customers_by_region","group_by":["region"],"value_field":"customer"},
-    \\    {"name":"customers_by_product","group_by":["product"],"value_field":"customer"}
+    \\    {"name":"customers_by_product","group_by":["product"],"value_field":"customer"},
+    \\    {"name":"customers_total","group_by":[],"value_field":"customer"}
     \\  ]
     \\}
 ;
@@ -668,7 +669,7 @@ const region_customer_cardinality_requests = [_]aggregations.SearchAggregationRe
 }};
 
 // Demonstrates materialized per-bucket HyperLogLog cardinality: it reads one
-// sketch per region (O(groups)) and compares latency and accuracy against the
+// sketch per region and the root sketch, comparing latency and accuracy against the
 // exact doc-scan distinct count (terms(region) -> cardinality(customer_id)).
 fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !void {
     var dataset = try buildDataset(alloc, cfg);
@@ -680,18 +681,9 @@ fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !voi
     var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
     defer store.close();
 
-    var manager = try db_mod.IndexManager.init(alloc, ".");
+    var manager = try openAlgebraicManager(alloc, algebraic_hll_config);
     defer manager.deinit();
-    const mutex = try alloc.create(std.atomic.Mutex);
-    mutex.* = .unlocked;
-    const config = try db_mod.types.IndexConfig.clone(alloc, .{
-        .name = "alg",
-        .kind = .algebraic,
-        .config_json = algebraic_hll_config,
-    });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", algebraic_hll_config);
-    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
-    const index = &manager.algebraic_indexes.items[0].index;
+    const index = manager.algebraic_indexes.items[0].index;
 
     const build_start = nowNs();
     var start: usize = 0;
@@ -704,6 +696,12 @@ fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !voi
     // Exact distinct customers across the order documents (the ground truth).
     var exact_customers = std.AutoHashMapUnmanaged(i64, void).empty;
     defer exact_customers.deinit(alloc);
+    var region_keys = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var keys = region_keys.keyIterator();
+        while (keys.next()) |key| alloc.free(key.*);
+        region_keys.deinit(alloc);
+    }
     for (dataset.hits) |hit| {
         const stored = hit.stored_data orelse continue;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
@@ -712,7 +710,18 @@ fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !voi
             .object => |object| object,
             else => continue,
         };
-        if (obj.get("region") == null) continue; // only order docs carry a region
+        const region = switch (obj.get("region") orelse continue) {
+            .string => |value| value,
+            else => continue,
+        };
+        const scalar = try index.constraintTokenAlloc(alloc, "region", region);
+        defer alloc.free(scalar);
+        const group_key = try index.approxCardinalityGroupKeyForScalarAlloc(scalar);
+        const entry = region_keys.getOrPut(alloc, group_key) catch |err| {
+            alloc.free(group_key);
+            return err;
+        };
+        if (entry.found_existing) alloc.free(group_key);
         const customer = switch (obj.get("customer_id") orelse continue) {
             .integer => |value| value,
             else => continue,
@@ -720,6 +729,10 @@ fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !voi
         try exact_customers.put(alloc, customer, {});
     }
     const exact_total: u64 = exact_customers.count();
+    const group_keys = try alloc.alloc([]const u8, region_keys.count());
+    defer alloc.free(group_keys);
+    var keys = region_keys.keyIterator();
+    for (group_keys) |*key| key.* = keys.next().?.*;
 
     const result = db_mod.types.SearchResult{
         .alloc = alloc,
@@ -739,14 +752,28 @@ fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !voi
         aggregations.deinitResults(alloc, rows);
     }
 
-    // Materialized HLL read: one sketch per region plus the cross-region union.
+    // Materialized HLL read: requested region sketches plus the root sketch.
     var approx_stats = QueryStats{};
     var bucket_count: usize = 0;
     var approx_total: u64 = 0;
     for (0..cfg.repeats) |i| {
         const started = nowNs();
-        const entries = try index.approxCardinalityEntriesAlloc(&store, "customers_by_region");
-        const total = try index.approxCardinalityTotalAlloc(&store, "customers_by_region");
+        const entries = (try index.approxCardinalityEstimatesForGroupKeysAlloc(
+            &store,
+            &.{"region"},
+            "customer_id",
+            group_keys,
+            &.{},
+            null,
+        )) orelse return error.HllCardinalityUnavailable;
+        defer alloc.free(entries);
+        for (entries) |entry| if (entry == null) return error.HllCardinalityUnavailable;
+        const total = (try index.approxCardinalityTotalForFieldAlloc(
+            &store,
+            "customer_id",
+            &.{},
+            null,
+        )) orelse return error.HllCardinalityUnavailable;
         const elapsed = elapsedSince(started);
         approx_stats.total_ns += elapsed;
         approx_stats.min_ns = @min(approx_stats.min_ns, elapsed);
@@ -755,8 +782,6 @@ fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !voi
             bucket_count = entries.len;
             approx_total = total;
         }
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
     }
 
     const exact_f: f64 = @floatFromInt(exact_total);
@@ -985,22 +1010,8 @@ fn runBenchmarkCase(
     var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
     defer store.close();
 
-    var manager = try db_mod.IndexManager.init(alloc, ".");
+    var manager = try openAlgebraicManager(alloc, options.config_json);
     defer manager.deinit();
-    const mutex = try alloc.create(std.atomic.Mutex);
-    mutex.* = .unlocked;
-    const config = try db_mod.types.IndexConfig.clone(alloc, .{
-        .name = "alg",
-        .kind = .algebraic,
-        .config_json = options.config_json,
-    });
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", options.config_json);
-    try manager.algebraic_indexes.append(alloc, .{
-        .apply_mutex = mutex,
-        .config = config,
-        .index = alg_index,
-    });
-
     const build_start = nowNs();
     var bulk_active = false;
     if (cfg.algebraic_bulk_ingest) {
@@ -1048,13 +1059,13 @@ fn runBenchmarkCase(
 
     if (options.adaptive_warmup) {
         const warmup_start = nowNs();
-        const changed = try warmAdaptiveComparisonMaterializations(&manager.algebraic_indexes.items[0].index, &store, options.adaptive_coverage_queries);
+        const changed = try warmAdaptiveComparisonMaterializations(manager.algebraic_indexes.items[0].index, &store, options.adaptive_coverage_queries);
         const warmup_ns = elapsedSince(warmup_start);
-        const counts = try collectAdaptiveWarmupCounts(alloc, &manager.algebraic_indexes.items[0].index, &store);
+        const counts = try collectAdaptiveWarmupCounts(alloc, manager.algebraic_indexes.items[0].index, &store);
         printAdaptiveWarmup(case_name, cfg, manager.algebraic_indexes.items[0].index.status(), counts, warmup_ns, changed);
     }
 
-    var sidecar = try collectSidecarStats(alloc, &manager.algebraic_indexes.items[0].index, &store);
+    var sidecar = try collectSidecarStats(alloc, manager.algebraic_indexes.items[0].index, &store);
     defer sidecar.deinit(alloc);
 
     printDataset(case_name, cfg, dataset, algebraic_build_ns, sidecar, manager.algebraic_indexes.items[0].index.config().materializations.len, manager.algebraic_indexes.items[0].index.status(), text_stats, algebraic_backend.path(), algebraic_backend_path_bytes, algebraic_backend.lsmWriteStats());
@@ -1097,7 +1108,7 @@ fn runBenchmarkCase(
         printCorrectness(case_name, "adaptive_terms_count", adaptive_doc, adaptive_text, adaptive_alg, true);
     }
     if (options.adaptive_coverage_queries) {
-        try runAdaptiveCoverageQueries(alloc, cfg, case_name, &text_db, result, algebraic_result, algebraic_ctx, &manager.algebraic_indexes.items[0].index, options.adaptive_warmup);
+        try runAdaptiveCoverageQueries(alloc, cfg, case_name, &text_db, result, algebraic_result, algebraic_ctx, manager.algebraic_indexes.items[0].index, options.adaptive_warmup);
     }
     if (options.cold_warm_queries) {
         try runColdWarmQueries(alloc, cfg, case_name, &text_db, result, algebraic_result, algebraic_ctx);
@@ -1626,7 +1637,9 @@ fn runGraphTraversalGuardrail(
         rejected_result.deinit();
     }
 
-    const stats = try db.stats(alloc);
+    // Benchmark evidence needs a complete snapshot; operational stats may
+    // intentionally omit indexes while background work holds the apply lock.
+    const stats = try db.runtimeStatusStatsConsistent(alloc);
     defer db_mod.types.freeDBStats(alloc, stats);
     const graph_stats = findIndexStats(stats, "graph_alg") orelse return error.IndexNotFound;
     const path_bytes = try directorySizeBytes(alloc, io, path);
@@ -1782,10 +1795,8 @@ fn appendWriteAmpMaterialization(
     }
 }
 
-fn parseArgs(args_in: std.process.Args) !Config {
+fn parseArgs(args: *std.process.Args.Iterator) !Config {
     var cfg = Config{};
-    var args = std.process.Args.Iterator.init(args_in);
-    _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--mode")) {
             cfg.mode = args.next() orelse {
@@ -1813,61 +1824,61 @@ fn parseArgs(args_in: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--algebraic-bulk-no-flush")) {
             cfg.algebraic_bulk_flush = false;
         } else if (std.mem.eql(u8, arg, "--algebraic-bulk-max-deferred-l0-runs")) {
-            cfg.algebraic_bulk_max_deferred_l0_runs = try parseNextUsize(&args, "--algebraic-bulk-max-deferred-l0-runs");
+            cfg.algebraic_bulk_max_deferred_l0_runs = try parseNextUsize(args, "--algebraic-bulk-max-deferred-l0-runs");
         } else if (std.mem.eql(u8, arg, "--algebraic-bulk-max-foreground-compaction-steps")) {
-            cfg.algebraic_bulk_max_foreground_compaction_steps = try parseNextUsize(&args, "--algebraic-bulk-max-foreground-compaction-steps");
+            cfg.algebraic_bulk_max_foreground_compaction_steps = try parseNextUsize(args, "--algebraic-bulk-max-foreground-compaction-steps");
         } else if (std.mem.eql(u8, arg, "--algebraic-bulk-max-foreground-compaction-input-bytes")) {
-            cfg.algebraic_bulk_max_foreground_compaction_input_bytes = try parseNextU64(&args, "--algebraic-bulk-max-foreground-compaction-input-bytes");
+            cfg.algebraic_bulk_max_foreground_compaction_input_bytes = try parseNextU64(args, "--algebraic-bulk-max-foreground-compaction-input-bytes");
         } else if (std.mem.eql(u8, arg, "--algebraic-bulk-max-foreground-compaction-ns")) {
-            cfg.algebraic_bulk_max_foreground_compaction_ns = try parseNextU64(&args, "--algebraic-bulk-max-foreground-compaction-ns");
+            cfg.algebraic_bulk_max_foreground_compaction_ns = try parseNextU64(args, "--algebraic-bulk-max-foreground-compaction-ns");
         } else if (std.mem.eql(u8, arg, "--lsm-flush-threshold")) {
-            cfg.lsm_flush_threshold = try parseNextUsize(&args, "--lsm-flush-threshold");
+            cfg.lsm_flush_threshold = try parseNextUsize(args, "--lsm-flush-threshold");
         } else if (std.mem.eql(u8, arg, "--lsm-flush-threshold-bytes")) {
-            cfg.lsm_flush_threshold_bytes = try parseNextU64(&args, "--lsm-flush-threshold-bytes");
+            cfg.lsm_flush_threshold_bytes = try parseNextU64(args, "--lsm-flush-threshold-bytes");
         } else if (std.mem.eql(u8, arg, "--lsm-bulk-ingest-flush-threshold-multiplier")) {
-            cfg.lsm_bulk_ingest_flush_threshold_multiplier = try parseNextUsize(&args, "--lsm-bulk-ingest-flush-threshold-multiplier");
+            cfg.lsm_bulk_ingest_flush_threshold_multiplier = try parseNextUsize(args, "--lsm-bulk-ingest-flush-threshold-multiplier");
         } else if (std.mem.eql(u8, arg, "--lsm-bulk-ingest-flush-threshold-bytes-multiplier")) {
-            cfg.lsm_bulk_ingest_flush_threshold_bytes_multiplier = try parseNextUsize(&args, "--lsm-bulk-ingest-flush-threshold-bytes-multiplier");
+            cfg.lsm_bulk_ingest_flush_threshold_bytes_multiplier = try parseNextUsize(args, "--lsm-bulk-ingest-flush-threshold-bytes-multiplier");
         } else if (std.mem.eql(u8, arg, "--lsm-direct-bulk-ingest")) {
             cfg.lsm_direct_bulk_ingest = true;
         } else if (std.mem.eql(u8, arg, "--lsm-no-direct-bulk-ingest")) {
             cfg.lsm_direct_bulk_ingest = false;
         } else if (std.mem.eql(u8, arg, "--lsm-compact-threshold-runs")) {
-            cfg.lsm_compact_threshold_runs = try parseNextUsize(&args, "--lsm-compact-threshold-runs");
+            cfg.lsm_compact_threshold_runs = try parseNextUsize(args, "--lsm-compact-threshold-runs");
         } else if (std.mem.eql(u8, arg, "--lsm-level-target-runs-base")) {
-            cfg.lsm_level_target_runs_base = try parseNextUsize(&args, "--lsm-level-target-runs-base");
+            cfg.lsm_level_target_runs_base = try parseNextUsize(args, "--lsm-level-target-runs-base");
         } else if (std.mem.eql(u8, arg, "--lsm-level-target-runs-multiplier")) {
-            cfg.lsm_level_target_runs_multiplier = try parseNextUsize(&args, "--lsm-level-target-runs-multiplier");
+            cfg.lsm_level_target_runs_multiplier = try parseNextUsize(args, "--lsm-level-target-runs-multiplier");
         } else if (std.mem.eql(u8, arg, "--lsm-level-target-bytes-base")) {
-            cfg.lsm_level_target_bytes_base = try parseNextUsize(&args, "--lsm-level-target-bytes-base");
+            cfg.lsm_level_target_bytes_base = try parseNextUsize(args, "--lsm-level-target-bytes-base");
         } else if (std.mem.eql(u8, arg, "--lsm-level-target-bytes-multiplier")) {
-            cfg.lsm_level_target_bytes_multiplier = try parseNextUsize(&args, "--lsm-level-target-bytes-multiplier");
+            cfg.lsm_level_target_bytes_multiplier = try parseNextUsize(args, "--lsm-level-target-bytes-multiplier");
         } else if (std.mem.eql(u8, arg, "--docs")) {
-            cfg.docs = try parseNextUsize(&args, "--docs");
+            cfg.docs = try parseNextUsize(args, "--docs");
         } else if (std.mem.eql(u8, arg, "--repeats")) {
-            cfg.repeats = try parseNextUsize(&args, "--repeats");
+            cfg.repeats = try parseNextUsize(args, "--repeats");
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
-            cfg.batch_size = try parseNextUsize(&args, "--batch-size");
+            cfg.batch_size = try parseNextUsize(args, "--batch-size");
         } else if (std.mem.eql(u8, arg, "--regions")) {
-            cfg.region_cardinality = try parseNextUsize(&args, "--regions");
+            cfg.region_cardinality = try parseNextUsize(args, "--regions");
         } else if (std.mem.eql(u8, arg, "--products")) {
-            cfg.product_cardinality = try parseNextUsize(&args, "--products");
+            cfg.product_cardinality = try parseNextUsize(args, "--products");
         } else if (std.mem.eql(u8, arg, "--customers")) {
-            cfg.customer_cardinality = try parseNextUsize(&args, "--customers");
+            cfg.customer_cardinality = try parseNextUsize(args, "--customers");
         } else if (std.mem.eql(u8, arg, "--segments")) {
-            cfg.segment_cardinality = try parseNextUsize(&args, "--segments");
+            cfg.segment_cardinality = try parseNextUsize(args, "--segments");
         } else if (std.mem.eql(u8, arg, "--tenants")) {
-            cfg.tenant_cardinality = try parseNextUsize(&args, "--tenants");
+            cfg.tenant_cardinality = try parseNextUsize(args, "--tenants");
         } else if (std.mem.eql(u8, arg, "--stores")) {
-            cfg.store_cardinality = try parseNextUsize(&args, "--stores");
+            cfg.store_cardinality = try parseNextUsize(args, "--stores");
         } else if (std.mem.eql(u8, arg, "--channels")) {
-            cfg.channel_cardinality = try parseNextUsize(&args, "--channels");
+            cfg.channel_cardinality = try parseNextUsize(args, "--channels");
         } else if (std.mem.eql(u8, arg, "--days")) {
-            cfg.days = try parseNextUsize(&args, "--days");
+            cfg.days = try parseNextUsize(args, "--days");
         } else if (std.mem.eql(u8, arg, "--fanout")) {
-            cfg.fanout = try parseNextUsize(&args, "--fanout");
+            cfg.fanout = try parseNextUsize(args, "--fanout");
         } else if (std.mem.eql(u8, arg, "--churn-ops")) {
-            cfg.churn_ops = try parseNextUsize(&args, "--churn-ops");
+            cfg.churn_ops = try parseNextUsize(args, "--churn-ops");
         } else {
             std.debug.print("invalid argument: {s}\n", .{arg});
             return error.InvalidArgument;
@@ -2288,6 +2299,7 @@ fn openAlgebraicManager(alloc: std.mem.Allocator, config_json: []const u8) !db_m
     var manager = try db_mod.IndexManager.init(alloc, ".");
     errdefer manager.deinit();
     const mutex = try alloc.create(std.atomic.Mutex);
+    errdefer alloc.destroy(mutex);
     mutex.* = .unlocked;
     const config = try db_mod.types.IndexConfig.clone(alloc, .{
         .name = "alg",
@@ -2298,7 +2310,8 @@ fn openAlgebraicManager(alloc: std.mem.Allocator, config_json: []const u8) !db_m
         var tmp = config;
         tmp.deinit(alloc);
     }
-    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", config_json);
+    const alg_index = try algebraic_mod.index.Index.create(alloc, "alg", config_json);
+    errdefer alg_index.destroy();
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
@@ -2318,7 +2331,7 @@ fn runChurnScenario(
 ) !void {
     var algebraic_total_ns: u64 = 0;
     var text_total_ns: u64 = 0;
-    var sidecar_before = try collectSidecarStats(alloc, &manager.algebraic_indexes.items[0].index, store);
+    var sidecar_before = try collectSidecarStats(alloc, manager.algebraic_indexes.items[0].index, store);
     defer sidecar_before.deinit(alloc);
     const start_status = manager.algebraic_indexes.items[0].index.status();
     var op_start: usize = 0;
@@ -2371,13 +2384,15 @@ fn runChurnScenario(
         text_total_ns += elapsedSince(text_start);
     }
     try text_db.runUntilIdle();
-    var sidecar = try collectSidecarStats(alloc, &manager.algebraic_indexes.items[0].index, store);
+    var sidecar = try collectSidecarStats(alloc, manager.algebraic_indexes.items[0].index, store);
     defer sidecar.deinit(alloc);
     const end_status = manager.algebraic_indexes.items[0].index.status();
     std.debug.print(
-        "{{\"event\":\"churn\",\"case\":\"{s}\",\"docs\":{d},\"ops\":{d},\"batch_size\":{d},\"algebraic_bulk_ingest\":{},\"algebraic_update_ms\":{d:.3},\"full_text_update_ms\":{d:.3},\"algebraic_sidecar_entries\":{d},\"algebraic_sidecar_bytes_estimate\":{d},\"algebraic_adaptive_maintenance_plan_build_count\":{d},\"algebraic_adaptive_maintenance_cached_spec_count\":{d},\"algebraic_adaptive_maintenance_disabled_count\":{d}}}\n",
+        "{{\"event\":\"churn\",\"case\":\"{s}\",\"algebraic_backend\":\"{s}\",\"algebraic_profile\":\"{s}\",\"docs\":{d},\"ops\":{d},\"batch_size\":{d},\"algebraic_bulk_ingest\":{},\"algebraic_update_ms\":{d:.3},\"full_text_update_ms\":{d:.3},\"algebraic_sidecar_entries\":{d},\"algebraic_sidecar_bytes_estimate\":{d},\"algebraic_adaptive_maintenance_plan_build_count\":{d},\"algebraic_adaptive_maintenance_cached_spec_count\":{d},\"algebraic_adaptive_maintenance_disabled_count\":{d}}}\n",
         .{
             case_name,
+            cfg.algebraic_backend.label(),
+            cfg.algebraic_profile,
             cfg.docs,
             cfg.churn_ops,
             cfg.batch_size,

@@ -160,7 +160,7 @@ Artifact targets build and install into `zig-out/bin`. Run binaries directly,
 so a comparison can build once and execute several workloads:
 
 ```sh
-zig build graph-pattern-bench antfly-storage-db-bench
+zig build graph-pattern-bench antfly-storage-bench
 ./zig-out/bin/graph_pattern_query_bench --mode exact --fanout 10000 --target-degree 100000
 ./zig-out/bin/graph_pattern_query_bench --mode generic --fanout 10000 --target-degree 100000
 ```

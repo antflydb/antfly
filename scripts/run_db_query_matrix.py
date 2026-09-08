@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare storage query paths and public query shapes, building each tool once."""
+"""Compare DB query, analytics, and public query workloads, building once."""
 
 import argparse
 from datetime import datetime, timezone
@@ -12,7 +12,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def cases(profile, suite, public_docs=None):
+def cases(profile, suite, public_docs=None, analytics_docs=None):
     """Preserve the bounded/smoke storage comparisons and 100k public workload."""
     result = []
     if suite in ("all", "storage"):
@@ -44,7 +44,9 @@ def cases(profile, suite, public_docs=None):
                 "1.25",
                 "--require-public-resolution-delta",
             ]
-            result.append((name, "db_query_bench", args, "docid_query_bench_summary"))
+            result.append(
+                (name, "storage_bench", ["query", *args], "docid_query_bench_summary")
+            )
     if suite in ("all", "public"):
         docs = (
             public_docs
@@ -82,28 +84,156 @@ def cases(profile, suite, public_docs=None):
             result.append(
                 (
                     shape.replace("-", "_"),
-                    "public_query_guardrail",
+                    "api_bench",
                     common + ["--query-shape", shape] + extra,
+                    "public_query_guardrail_summary",
+                )
+            )
+    if suite in ("all", "analytics"):
+        smoke = profile == "smoke"
+        docs = (
+            analytics_docs if analytics_docs is not None else (100 if smoke else 50000)
+        )
+        common = [
+            "--algebraic-profile",
+            "production_hardening",
+            "--docs",
+            str(docs),
+            "--repeats",
+            "1" if smoke else "5",
+            "--batch-size",
+            "25" if smoke else "1000",
+            "--churn-ops",
+            "4" if smoke else "5000",
+            "--customers",
+            "16" if smoke else "4096",
+            "--products",
+            "8" if smoke else "128",
+        ]
+        for name, mode, backend in (
+            ("analytics", "lsm-analytics", "lsm"),
+            ("adaptive_coverage", "adaptive-coverage", "mem" if smoke else "lsm"),
+            ("cold_warm_reads", "cold", "lsm"),
+        ):
+            result.append(
+                (
+                    name,
+                    "storage_bench",
+                    ["analytics", *common]
+                    + [
+                        "--mode",
+                        mode,
+                        "--algebraic-backend",
+                        backend,
+                        "--fanout",
+                        "2" if smoke else "4",
+                    ],
+                    "dataset",
+                )
+            )
+        result.append(
+            (
+                "graph_traversal",
+                "storage_bench",
+                ["analytics", *common]
+                + [
+                    "--mode",
+                    "graph-traversal",
+                    "--algebraic-backend",
+                    "mem" if smoke else "lsm",
+                    "--docs",
+                    str(min(docs, 10000)),
+                    "--fanout",
+                    "2" if smoke else "4",
+                ],
+                "graph_algebraic_traversal",
+            )
+        )
+        public = [
+            "--mode",
+            "handler",
+            "--query-shape",
+            "hybrid-filter-exclude-project",
+            "--docs",
+            str(public_docs if public_docs is not None else (200 if smoke else 10000)),
+            "--dims",
+            "32" if smoke else "128",
+            "--queries",
+            "1" if smoke else "10",
+            "--repeats",
+            "1" if smoke else "3",
+            "--k",
+            "5" if smoke else "25",
+            "--search-threads",
+            "2" if smoke else "8",
+        ]
+        for name, flags in (
+            ("no_schema", []),
+            ("schema_only", ["--with-schema"]),
+            ("schema_algebraic", ["--with-schema", "--with-algebraic"]),
+        ):
+            result.append(
+                (
+                    f"compare_{name}",
+                    "api_bench",
+                    public + flags,
                     "public_query_guardrail_summary",
                 )
             )
     return result
 
 
+def summary_args():
+    # Preserve the production sweep's coverage and correctness gates. Measured
+    # performance limits and baseline ratios remain explicit caller arguments.
+    result = ["--require-performance-evidence"]
+    for metric in (
+        "dataset-cases",
+        "lsm-dataset-cases",
+        "algebraic-query-records",
+        "doc-scan-query-records",
+        "full-text-query-records",
+        "lsm-query-records",
+        "cold-query-records",
+        "warm-query-records",
+        "constrained-query-records",
+        "wide-query-records",
+        "stats-query-records",
+        "cardinality-query-records",
+        "range-query-records",
+        "histogram-query-records",
+        "fanout-dataset-cases",
+        "churn-records",
+    ):
+        result.extend((f"--min-{metric}", "1"))
+    return result + [
+        "--min-public-query-comparison-pairs",
+        "2",
+        "--max-correctness-failures",
+        "0",
+        "--max-unclassified-algebraic-comparisons",
+        "0",
+    ]
+
+
 def run_matrix(args):
-    selected = cases(args.profile, args.suite, args.public_docs)
+    selected = cases(args.profile, args.suite, args.public_docs, args.analytics_docs)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     binaries = args.bin_dir.resolve()
     targets = []
-    if args.suite in ("all", "storage"):
-        targets.append("antfly-storage-db-bench")
-    if args.suite in ("all", "public"):
-        targets.append("public-query-guardrail")
+    if args.suite in ("all", "storage", "analytics"):
+        targets.append("antfly-storage-bench")
+    if args.suite in ("all", "public", "analytics"):
+        targets.append("antfly-api-bench")
     metadata = {
         "root": str(ROOT),
         "profile": args.profile,
         "suite": args.suite,
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
         "platform": platform.platform(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "commit": subprocess.check_output(
@@ -125,8 +255,8 @@ def run_matrix(args):
             commands.write("build\t" + shlex.join(command) + "\n")
             commands.flush()
             subprocess.run(command, cwd=ROOT / "zig", check=True)
-        for name, binary, flags, summary_event in selected:
-            extra = args.storage_arg if binary == "db_query_bench" else args.public_arg
+
+        def run_case(name, binary, flags, summary_event, extra):
             command = [str(binaries / binary), *flags, *extra]
             commands.write(name + "\t" + shlex.join(command) + "\n")
             commands.flush()
@@ -146,7 +276,7 @@ def run_matrix(args):
                             continue
                         if not isinstance(record, dict):
                             continue
-                        record["case"] = name
+                        record["matrix_case"] = name
                         encoded = json.dumps(record) + "\n"
                         combined.write(encoded)
                         if record.get("event") == summary_event:
@@ -159,17 +289,63 @@ def run_matrix(args):
                 raise SystemExit(
                     f"{name} failed (exit={proc.returncode}, summary={found_summary}); see {out}"
                 )
+
+        for name, binary, flags, summary_event in selected:
+            extra = (
+                args.public_arg
+                if binary == "api_bench"
+                else args.storage_arg
+                if flags[0] == "query"
+                else args.analytics_arg
+            )
+            run_case(name, binary, flags, summary_event, extra)
+        if args.suite in ("all", "analytics"):
+            combined.flush()
+            flags = ["summary", "--input", str(out / "combined.jsonl"), *summary_args()]
+            if args.baseline:
+                flags += ["--baseline", str(args.baseline.resolve())]
+            run_case(
+                "comparison",
+                "storage_bench",
+                flags,
+                "performance_evidence_summary",
+                args.summary_arg,
+            )
     print(f"wrote {out}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=("smoke", "bounded"), default="bounded")
-    parser.add_argument("--suite", choices=("all", "storage", "public"), default="all")
+    parser.add_argument(
+        "--suite", choices=("all", "storage", "public", "analytics"), default="all"
+    )
     parser.add_argument(
         "--public-docs",
         type=int,
         help="override the public workload's 100k default (200 in smoke)",
+    )
+    parser.add_argument(
+        "--analytics-docs",
+        type=int,
+        help="analytics scale (50k bounded, 100 smoke; graph capped at 10k)",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="prior DB comparison JSONL for analytics baseline ratios",
+    )
+    parser.add_argument(
+        "--analytics-arg",
+        action="append",
+        default=[],
+        help="append a DB analytics driver argument, including LSM bulk/tuning options",
+    )
+    parser.add_argument(
+        "--summary-arg",
+        action="append",
+        default=[],
+        help="append a comparison threshold; use --summary-arg=--flag",
     )
     parser.add_argument(
         "--out",
@@ -197,6 +373,8 @@ def main():
     args = parser.parse_args()
     if args.public_docs is not None and args.public_docs <= 0:
         parser.error("--public-docs must be positive")
+    if args.analytics_docs is not None and args.analytics_docs <= 0:
+        parser.error("--analytics-docs must be positive")
     if args.bin_dir != ROOT / "zig/zig-out/bin" and not args.skip_build:
         parser.error("--bin-dir requires --skip-build")
     run_matrix(args)

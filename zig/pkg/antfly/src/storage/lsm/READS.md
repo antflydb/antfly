@@ -50,7 +50,7 @@ zig build lsm-backend-bench-compare && ./zig-out/bin/lsm_backend_bench_compare -
 
 ### HBC Query Reads
 
-`zig build hbc-read-bench && ./zig-out/bin/hbc_read_bench --samples 3 --vectors 10000 --dims 128 --queries 200 --k 10 --batch-size 1000 --leaf-size 128 --storage host --build both` benchmarks the dense-vector query path after building an HBC index.
+`zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-read --samples 3 --vectors 10000 --dims 128 --queries 200 --k 10 --batch-size 1000 --leaf-size 128 --storage host --build both` benchmarks the dense-vector query path after building an HBC index.
 
 Build modes:
 
@@ -75,8 +75,8 @@ Metrics:
 Useful commands:
 
 ```sh
-zig build hbc-read-bench && ./zig-out/bin/hbc_read_bench --samples 3 --vectors 100000 --dims 128 --queries 1000 --k 10 --batch-size 5000 --leaf-size 128 --storage native --build both
-zig build hbc-read-bench && ./zig-out/bin/hbc_read_bench --samples 3 --vectors 100000 --dims 128 --queries 1000 --k 50 --batch-size 5000 --leaf-size 128 --storage host --build online_coalesced
+zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-read --samples 3 --vectors 100000 --dims 128 --queries 1000 --k 10 --batch-size 5000 --leaf-size 128 --storage native --build both
+zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-read --samples 3 --vectors 100000 --dims 128 --queries 1000 --k 50 --batch-size 5000 --leaf-size 128 --storage host --build online_coalesced
 ```
 
 ## Read-Side Questions To Answer
@@ -89,7 +89,7 @@ zig build hbc-read-bench && ./zig-out/bin/hbc_read_bench --samples 3 --vectors 1
 
 ## Near-Term Work
 
-- Capture `hbc-read-bench` and `lsm-backend-bench` baselines under `bench/baselines/`.
+- Capture `antfly-storage-bench` and `lsm-backend-bench` baselines under `bench/baselines/`.
 - Add HBC read counters for namespace-level read calls and bytes, mirroring the write counters for `nodes`, `meta`, `quant`, and `vecs`.
 - Add an LSM read benchmark mode that intentionally leaves deferred bulk-ingest L0 runs uncompacted, then compares read behavior before and after maintenance compaction.
 - Add full-text query/segment read benchmarks beside the full-text write benchmark: term lookup, conjunction, top-k, cold reopen, post-merge, and corrupt-segment isolation.

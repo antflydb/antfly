@@ -364,3 +364,11 @@ List all available steps with:
 ```sh
 zig build --help
 ```
+
+## DB analytics and planner coverage
+
+Algebraic behavior uses the normal DB, API, metadata, and graph owner suites.
+`antfly-storage-db-test` includes the planner-ownership regression, and
+`antfly-unit-test` retains the dynamic-template/cardinality-cache selections.
+There are no separate algebraic test or guardrail targets. Benchmark sweeps use
+`scripts/run_db_query_matrix.py --suite analytics`; see [BENCHMARKS.md](BENCHMARKS.md#analytics-comparisons).

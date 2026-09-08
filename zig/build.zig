@@ -1442,6 +1442,7 @@ fn addOpenApiRegenStep(
 }
 
 pub fn build(b: *std.Build) void {
+    const api_bench_standalone = b.option(bool, "api-bench-standalone", "Build only the API benchmark for an existing server process") orelse false;
     const conformance_fetch = b.option(bool, "conformance-fetch", "Fetch missing external conformance fixtures") orelse true;
     const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Cache directory for external conformance fixtures") orelse "/tmp";
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
@@ -5840,12 +5841,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_algebraic_dynamic_template_tests = b.addRunArtifact(algebraic_dynamic_template_tests);
     run_algebraic_dynamic_template_tests.step.dependOn(&openapi_root_check.step);
-    const algebraic_dynamic_template_test_step = b.step(
-        "algebraic-dynamic-template-test",
-        "Run focused algebraic dynamic-template and cardinality-cache safety tests",
-    );
-    algebraic_dynamic_template_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
-
     const lib_storage_maintenance_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
@@ -9073,39 +9068,39 @@ pub fn build(b: *std.Build) void {
     const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_c);
     const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod);
-    const lmdb_bench_mod_c = b.createModule(.{
+    const lmstorage_bench_mod_c = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    lmdb_bench_mod_c.addImport("lmdb", lmdb_bench_wrapper_mod_c);
-    lmdb_bench_mod_c.addImport("lmdb_engine", lmdb_bench_engine_mod_c);
+    lmstorage_bench_mod_c.addImport("lmdb", lmdb_bench_wrapper_mod_c);
+    lmstorage_bench_mod_c.addImport("lmdb_engine", lmdb_bench_engine_mod_c);
 
     const lmdb_bench_c = b.addExecutable(.{
         .name = "lmdb_bench_c",
-        .root_module = lmdb_bench_mod_c,
+        .root_module = lmstorage_bench_mod_c,
     });
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
     const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
     const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_zig);
     const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod);
-    const lmdb_bench_mod_zig = b.createModule(.{
+    const lmstorage_bench_mod_zig = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    lmdb_bench_mod_zig.addImport("lmdb", lmdb_bench_wrapper_mod_zig);
-    lmdb_bench_mod_zig.addImport("lmdb_engine", lmdb_bench_engine_mod_zig);
+    lmstorage_bench_mod_zig.addImport("lmdb", lmdb_bench_wrapper_mod_zig);
+    lmstorage_bench_mod_zig.addImport("lmdb_engine", lmdb_bench_engine_mod_zig);
 
     const lmdb_bench_zig = b.addExecutable(.{
         .name = "lmdb_bench_zig",
-        .root_module = lmdb_bench_mod_zig,
+        .root_module = lmstorage_bench_mod_zig,
     });
 
-    const lmdb_bench_step = b.step("lmdb-bench", "Build and install both C and Zig LMDB benchmark binaries");
-    lmdb_bench_step.dependOn(&b.addInstallArtifact(lmdb_bench_c, .{}).step);
-    lmdb_bench_step.dependOn(&b.addInstallArtifact(lmdb_bench_zig, .{}).step);
+    const lmstorage_bench_step = b.step("lmdb-bench", "Build and install both C and Zig LMDB benchmark binaries");
+    lmstorage_bench_step.dependOn(&b.addInstallArtifact(lmdb_bench_c, .{}).step);
+    lmstorage_bench_step.dependOn(&b.addInstallArtifact(lmdb_bench_zig, .{}).step);
 
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true, antfly_version);
@@ -9141,26 +9136,7 @@ pub fn build(b: *std.Build) void {
     const db_split_bench_step = b.step("db-split-bench", "Build and install db_split_bench");
     db_split_bench_step.dependOn(&b.addInstallArtifact(db_split_bench, .{}).step);
 
-    const docid_doc_set_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/docid_doc_set_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const docid_doc_set_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/docid_doc_set_bench_root.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    docid_doc_set_bench_root_mod.addImport("antfly_platform", platform_mod);
-    docid_doc_set_bench_mod.addImport("docid_doc_set_bench_root", docid_doc_set_bench_root_mod);
-
-    const docid_doc_set_bench = b.addExecutable(.{
-        .name = "db_doc_set_bench",
-        .root_module = docid_doc_set_bench_mod,
-    });
-
-    const db_bench_step = b.step("antfly-storage-db-bench", "Build and install DB query, write, and document-set benchmarks");
-    db_bench_step.dependOn(&b.addInstallArtifact(docid_doc_set_bench, .{}).step);
+    const storage_bench_step = b.step("antfly-storage-bench", "Build and install storage benchmarks and comparisons");
 
     const backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/backend_bench.zig"),
@@ -9680,65 +9656,6 @@ pub fn build(b: *std.Build) void {
     const hbc_parity_step = b.step("hbc-parity", "Build and install hbc_parity");
     hbc_parity_step.dependOn(&b.addInstallArtifact(hbc_parity, .{}).step);
 
-    const hbc_bench_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/bench/hbc_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_bench_mod.addImport("antfly-zig", antfly_mod);
-
-    const hbc_bench = b.addExecutable(.{
-        .name = "hbc_bench",
-        .root_module = hbc_bench_mod,
-    });
-
-    const hbc_bench_step = b.step("hbc-bench", "Build and install hbc_bench");
-    hbc_bench_step.dependOn(&b.addInstallArtifact(hbc_bench, .{}).step);
-
-    const hbc_write_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/hbc_write_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_write_bench_mod.addImport("antfly-zig", antfly_mod);
-
-    const hbc_write_bench = b.addExecutable(.{
-        .name = "hbc_write_bench",
-        .root_module = hbc_write_bench_mod,
-    });
-
-    const hbc_write_bench_step = b.step("hbc-write-bench", "Build and install hbc_write_bench");
-    hbc_write_bench_step.dependOn(&b.addInstallArtifact(hbc_write_bench, .{}).step);
-
-    const run_hbc_write_guardrail = b.addRunArtifact(hbc_write_bench);
-    if (b.args) |args| {
-        run_hbc_write_guardrail.addArgs(args);
-    } else {
-        run_hbc_write_guardrail.addArgs(&.{
-            "--samples",    "1",
-            "--vectors",    "5000",
-            "--dims",       "1536",
-            "--batch-size", "500",
-            "--leaf-size",  "168",
-            "--storage",    "host",
-        });
-    }
-
-    const hbc_read_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/hbc_read_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_read_bench_mod.addImport("antfly-zig", antfly_mod);
-
-    const hbc_read_bench = b.addExecutable(.{
-        .name = "hbc_read_bench",
-        .root_module = hbc_read_bench_mod,
-    });
-
-    const hbc_read_bench_step = b.step("hbc-read-bench", "Build and install hbc_read_bench");
-    hbc_read_bench_step.dependOn(&b.addInstallArtifact(hbc_read_bench, .{}).step);
-
     const hbc_isolate_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_isolate.zig"),
         .target = target,
@@ -9847,19 +9764,6 @@ pub fn build(b: *std.Build) void {
     const replay_bench_step = b.step("replay-bench", "Build and install replay_bench");
     replay_bench_step.dependOn(&b.addInstallArtifact(replay_bench, .{}).step);
 
-    const dense_ingest_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/dense_ingest_guardrail.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    dense_ingest_guardrail_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const dense_ingest_guardrail = b.addExecutable(.{
-        .name = "dense_ingest_guardrail",
-        .root_module = dense_ingest_guardrail_mod,
-    });
-    const install_dense_ingest_guardrail = b.addInstallArtifact(dense_ingest_guardrail, .{});
-
     const batch_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/batch_bench.zig"),
         .target = target,
@@ -9875,210 +9779,26 @@ pub fn build(b: *std.Build) void {
     const batch_bench_step = b.step("batch-bench", "Build and install batch_bench");
     batch_bench_step.dependOn(&b.addInstallArtifact(batch_bench, .{}).step);
 
-    const docid_write_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/docid_write_bench.zig"),
+    const storage_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage_bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    docid_write_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const docid_write_bench = b.addExecutable(.{
-        .name = "db_write_bench",
-        .root_module = docid_write_bench_mod,
-    });
-
-    db_bench_step.dependOn(&b.addInstallArtifact(docid_write_bench, .{}).step);
-
-    const docid_query_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/docid_query_bench.zig"),
+    const storage_bench_root_mod = b.createModule(.{
+        .root_source_file = b.path(antfly_benches_build.storage_bench_root),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    docid_query_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
+    antfly_imports.configureRuntime(b, storage_bench_root_mod, false, true, false);
+    storage_bench_mod.addImport("antfly-zig", storage_bench_root_mod);
+    storage_bench_mod.addImport("antfly_platform", platform_mod);
 
-    const docid_query_bench = b.addExecutable(.{
-        .name = "db_query_bench",
-        .root_module = docid_query_bench_mod,
+    const storage_bench = b.addExecutable(.{
+        .name = "storage_bench",
+        .root_module = storage_bench_mod,
     });
 
-    db_bench_step.dependOn(&b.addInstallArtifact(docid_query_bench, .{}).step);
-
-    const algebraic_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/algebraic_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const algebraic_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path(antfly_benches_build.algebraic_bench_root),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    algebraic_bench_root_mod.addOptions("build_options", replay_bench_build_options);
-    algebraic_bench_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
-    algebraic_bench_root_mod.addImport("antfly-json", json_mod);
-    algebraic_bench_root_mod.addImport("bloom", bloom_mod);
-    algebraic_bench_root_mod.addImport("antfly_vector", vector_mod);
-    algebraic_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    algebraic_bench_root_mod.addImport("antfly_matcher", matcher_mod);
-    algebraic_bench_root_mod.addImport("antfly_vellum", vellum_mod);
-    algebraic_bench_root_mod.addImport("antfly_regex", regex_mod);
-    algebraic_bench_root_mod.addImport("antfly_platform", platform_mod);
-    algebraic_bench_root_mod.addImport("antfly_reranking", reranking_mod);
-    algebraic_bench_root_mod.addImport("antfly_resolver", resolver_mod);
-    algebraic_bench_root_mod.addImport("antfly_reader_config", reader_config_mod);
-    addSnowballModule(b, algebraic_bench_root_mod);
-    algebraic_bench_mod.addImport("antfly-zig", algebraic_bench_root_mod);
-
-    const algebraic_bench = b.addExecutable(.{
-        .name = "algebraic_bench",
-        .root_module = algebraic_bench_mod,
-    });
-
-    const algebraic_bench_step = b.step("algebraic-bench", "Build and install algebraic_bench");
-    algebraic_bench_step.dependOn(&b.addInstallArtifact(algebraic_bench, .{}).step);
-
-    const algebraic_summary_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/algebraic_summary.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const algebraic_summary = b.addExecutable(.{
-        .name = "algebraic_summary",
-        .root_module = algebraic_summary_mod,
-    });
-
-    const algebraic_summary_step = b.step("algebraic-summary", "Build and install algebraic_summary");
-    algebraic_summary_step.dependOn(&b.addInstallArtifact(algebraic_summary, .{}).step);
-
-    const run_algebraic_performance_guardrail = b.addRunArtifact(algebraic_summary);
-    if (b.args) |args| {
-        run_algebraic_performance_guardrail.addArgs(args);
-    } else {
-        run_algebraic_performance_guardrail.addArgs(&.{
-            "--input",
-            "bench/storage/algebraic_performance_guardrail_fixture.jsonl",
-            "--baseline",
-            "bench/storage/algebraic_performance_guardrail_baseline.jsonl",
-            "--require-performance-evidence",
-            "--min-lsm-dataset-cases",
-            "1",
-            "--min-lsm-query-records",
-            "3",
-            "--min-cold-query-records",
-            "2",
-            "--min-warm-query-records",
-            "2",
-            "--min-constrained-query-records",
-            "3",
-            "--min-wide-query-records",
-            "3",
-            "--min-stats-query-records",
-            "3",
-            "--min-cardinality-query-records",
-            "3",
-            "--min-range-query-records",
-            "3",
-            "--min-histogram-query-records",
-            "3",
-            "--min-fanout-dataset-cases",
-            "1",
-            "--min-public-query-comparison-pairs",
-            "2",
-            "--min-lsm-sorted-ingest-runs",
-            "1",
-            "--max-lsm-flushes",
-            "0",
-            "--max-lsm-write-pressure-compactions",
-            "0",
-            "--max-correctness-failures",
-            "0",
-            "--max-algebraic-query-ms",
-            "2",
-            "--max-public-query-http-us",
-            "100",
-            "--max-algebraic-bytes-per-doc",
-            "10",
-            "--max-symbol-bytes-per-doc",
-            "0",
-            "--max-support-bytes-per-doc",
-            "0",
-            "--max-accumulator-flush-count",
-            "0",
-            "--max-path-dictionary-fst-rebuild-count",
-            "1",
-            "--max-public-query-load-rss-peak-bytes",
-            "0",
-            "--max-public-query-search-rss-peak-bytes",
-            "0",
-            "--max-churn-algebraic-update-ms",
-            "2",
-            "--max-algebraic-query-ms-ratio-vs-baseline",
-            "1.0",
-            "--max-public-query-http-us-ratio-vs-baseline",
-            "1.0",
-            "--max-algebraic-bytes-per-doc-ratio-vs-baseline",
-            "1.0",
-            "--max-churn-algebraic-update-ms-ratio-vs-baseline",
-            "1.0",
-        });
-    }
-    const algebraic_performance_guardrail_step = b.step("algebraic-performance-guardrail", "Run the algebraic benchmark summary coverage and baseline-ratio guardrail fixture");
-    algebraic_performance_guardrail_step.dependOn(&run_algebraic_performance_guardrail.step);
-
-    const algebraic_planner_ownership_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("tools/guardrails/algebraic_planner_ownership_guardrail.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const algebraic_planner_ownership_guardrail = b.addExecutable(.{
-        .name = "algebraic_planner_ownership_guardrail",
-        .root_module = algebraic_planner_ownership_guardrail_mod,
-    });
-    const run_algebraic_planner_ownership_guardrail = b.addRunArtifact(algebraic_planner_ownership_guardrail);
-    if (b.args) |args| {
-        run_algebraic_planner_ownership_guardrail.addArgs(args);
-    }
-    const algebraic_planner_ownership_guardrail_step = b.step("algebraic-planner-ownership-guardrail", "Verify algebraic tensor programs are built by the planner layer outside tests");
-    algebraic_planner_ownership_guardrail_step.dependOn(&run_algebraic_planner_ownership_guardrail.step);
-
-    const algebraic_archive_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/algebraic_archive_guardrail.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const algebraic_archive_guardrail = b.addExecutable(.{
-        .name = "algebraic_archive_guardrail",
-        .root_module = algebraic_archive_guardrail_mod,
-    });
-    const run_algebraic_archive_guardrail = b.addRunArtifact(algebraic_archive_guardrail);
-    if (b.args) |args| {
-        run_algebraic_archive_guardrail.addArgs(args);
-    } else {
-        run_algebraic_archive_guardrail.addArgs(&.{
-            "--archive",
-            "bench/storage/algebraic_production_archive_fixture",
-            "--require-thresholds",
-            "--require-baseline",
-            "--require-non-smoke",
-            "--min-docs",
-            "100",
-            "--min-repeats",
-            "1",
-            "--min-churn-ops",
-            "1",
-            "--min-public-docs",
-            "100",
-            "--min-graph-docs",
-            "100",
-        });
-    }
-    const algebraic_archive_guardrail_step = b.step("algebraic-archive-guardrail", "Verify archived algebraic production-hardening run evidence");
-    algebraic_archive_guardrail_step.dependOn(&run_algebraic_archive_guardrail.step);
-
-    const algebraic_roadmap_guardrail_step = b.step("algebraic-roadmap-guardrail", "Run CI-safe algebraic roadmap guardrails");
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_performance_guardrail.step);
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_planner_ownership_guardrail.step);
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_archive_guardrail.step);
+    storage_bench_step.dependOn(&b.addInstallArtifact(storage_bench, .{}).step);
 
     const rw_lock_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/rw_lock_bench.zig"),
@@ -10140,23 +9860,6 @@ pub fn build(b: *std.Build) void {
     const provisioned_warmup_bench_step = b.step("provisioned-warmup-bench", "Build and install provisioned_warmup_bench");
     provisioned_warmup_bench_step.dependOn(&b.addInstallArtifact(provisioned_warmup_bench, .{}).step);
 
-    const provisioned_dense_ingest_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/provisioned_dense_ingest_guardrail.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    provisioned_dense_ingest_guardrail_mod.addImport("antfly-zig", antfly_mod);
-    provisioned_dense_ingest_guardrail_mod.addImport("antfly_platform", platform_mod);
-
-    const provisioned_dense_ingest_guardrail = b.addExecutable(.{
-        .name = "provisioned_dense_ingest_guardrail",
-        .root_module = provisioned_dense_ingest_guardrail_mod,
-    });
-    const install_provisioned_dense_ingest_guardrail = b.addInstallArtifact(provisioned_dense_ingest_guardrail, .{});
-
-    const provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail", "Build and install provisioned_dense_ingest_guardrail");
-    provisioned_dense_ingest_guardrail_step.dependOn(&install_provisioned_dense_ingest_guardrail.step);
-
     const public_query_guardrail_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/public_query_guardrail.zig"),
         .target = target,
@@ -10169,17 +9872,16 @@ pub fn build(b: *std.Build) void {
     public_query_guardrail_mod.addOptions("public_query_guardrail_build_options", public_query_guardrail_build_options);
 
     const public_query_guardrail = b.addExecutable(.{
-        .name = "public_query_guardrail",
+        .name = "api_bench",
         .root_module = public_query_guardrail_mod,
     });
 
-    const public_query_guardrail_step = b.step("public-query-guardrail", "Build and install public_query_guardrail");
-    public_query_guardrail_step.dependOn(&b.addInstallArtifact(public_query_guardrail, .{}).step);
+    const api_bench_step = b.step("antfly-api-bench", "Build and install API benchmarks");
+    if (!api_bench_standalone) api_bench_step.dependOn(&b.addInstallArtifact(public_query_guardrail, .{}).step);
 
-    // The direct handler compatibility lane still intentionally exercises
-    // internal API construction. Production scale qualification needs only
-    // the standalone process boundary, so keep a build that does not compile
-    // unreachable direct-executor code into the rollout harness.
+    // Internal stage measurements own a concrete server. The standalone driver
+    // reuses the production executable and its compiled runtime kernels, so
+    // it omits in-process handler code.
     const public_query_standalone_guardrail_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/public_query_guardrail.zig"),
         .target = target,
@@ -10191,12 +9893,11 @@ pub fn build(b: *std.Build) void {
     public_query_standalone_guardrail_build_options.addOption(bool, "standalone_only", true);
     public_query_standalone_guardrail_mod.addOptions("public_query_guardrail_build_options", public_query_standalone_guardrail_build_options);
     const public_query_standalone_guardrail = b.addExecutable(.{
-        .name = "public_query_standalone_guardrail",
+        .name = "api_standalone_bench",
         .root_module = public_query_standalone_guardrail_mod,
     });
 
-    const public_query_standalone_guardrail_step = b.step("public-query-standalone-guardrail", "Build and install public_query_standalone_guardrail");
-    public_query_standalone_guardrail_step.dependOn(&b.addInstallArtifact(public_query_standalone_guardrail, .{}).step);
+    if (api_bench_standalone) api_bench_step.dependOn(&b.addInstallArtifact(public_query_standalone_guardrail, .{}).step);
     const raft_apply_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/raft_apply_bench.zig"),
         .target = target,
@@ -10229,37 +9930,6 @@ pub fn build(b: *std.Build) void {
     const managed_host_wal_bench_step = b.step("managed-host-wal-bench", "Build and install managed_host_wal_bench");
     managed_host_wal_bench_step.dependOn(&b.addInstallArtifact(managed_host_wal_bench, .{}).step);
 
-    const dense_ingest_guardrail_step = b.step("dense-ingest-guardrail", "Build and install dense_ingest_guardrail");
-    dense_ingest_guardrail_step.dependOn(&install_dense_ingest_guardrail.step);
-
-    const run_dense_ingest_guardrail = b.addRunArtifact(dense_ingest_guardrail);
-    if (b.args) |args| {
-        run_dense_ingest_guardrail.addArgs(args);
-    } else {
-        run_dense_ingest_guardrail.addArgs(&.{
-            "--docs",
-            "5000",
-            "--dims",
-            "1536",
-            "--batch-size",
-            "500",
-            "--sync-level",
-            "write",
-            "--status-probe-every",
-            "1",
-            "--max-dense-lsm-run-bytes",
-            "1073741824",
-            "--max-dense-l0-runs",
-            "64",
-            "--max-status-probe-ns",
-            "500000000",
-        });
-    }
-
-    const vector_write_guardrails_step = b.step("antfly-storage-vectorindex-write-test", "Run bounded HBC and dense vector write regression checks");
-    vector_write_guardrails_step.dependOn(&run_hbc_write_guardrail.step);
-    vector_write_guardrails_step.dependOn(&run_dense_ingest_guardrail.step);
-
     const dense_profile_summary = b.addExecutable(.{
         .name = "dense_profile_summary",
         .root_module = b.createModule(.{
@@ -10286,21 +9956,6 @@ pub fn build(b: *std.Build) void {
 
     const lmdb_commit_compare_step = b.step("lmdb-commit-compare", "Build and install lmdb_commit_compare");
     lmdb_commit_compare_step.dependOn(&b.addInstallArtifact(lmdb_commit_compare, .{}).step);
-
-    const hbc_split_bench_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/bench/hbc_split_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_split_bench_mod.addImport("antfly-zig", antfly_mod);
-
-    const hbc_split_bench = b.addExecutable(.{
-        .name = "hbc_split_bench",
-        .root_module = hbc_split_bench_mod,
-    });
-
-    const hbc_split_bench_step = b.step("hbc-split-bench", "Build and install hbc_split_bench");
-    hbc_split_bench_step.dependOn(&b.addInstallArtifact(hbc_split_bench, .{}).step);
 
     const sparse_split_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/sparse_split_bench.zig"),

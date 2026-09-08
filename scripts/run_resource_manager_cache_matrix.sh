@@ -134,7 +134,7 @@ run_case() {
   local stdout_file="$OUT/$name.stdout"
   local stderr_file="$OUT/$name.stderr"
   local cmd=(
-    "$ZIG_ROOT/zig-out/bin/public_query_standalone_guardrail"
+    "$ZIG_ROOT/zig-out/bin/api_standalone_bench"
     --mode standalone
     --server-kind zig
     --standalone-binary "$ZIG_ROOT/zig-out/bin/antfly"
@@ -186,7 +186,8 @@ if [[ "$RUN_BUILD" == "1" ]]; then
     --cache-dir "$ZIG_CACHE_DIR" \
     --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
     -Doptimize="$OPTIMIZE" \
-    antfly public-query-standalone-guardrail release-blocker-regression-test)
+    -Dapi-bench-standalone=true \
+    antfly antfly-api-bench release-blocker-regression-test)
 fi
 
 FAILURES="$(awk -F '\t' '$2 != 0 { count += 1 } END { print count + 0 }' "$STATUS_FILE")"

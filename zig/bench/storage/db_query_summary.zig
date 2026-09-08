@@ -113,6 +113,10 @@ const CorrectnessRecord = struct {
 
 const ChurnRecord = struct {
     case_name: []u8,
+    algebraic_backend: []u8,
+    algebraic_profile: []u8,
+    matrix_case: []u8,
+    algebraic_bulk_ingest: bool,
     docs: u64,
     ops: u64,
     batch_size: u64,
@@ -126,6 +130,9 @@ const ChurnRecord = struct {
 
     fn deinit(self: *ChurnRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.case_name);
+        alloc.free(self.algebraic_backend);
+        alloc.free(self.algebraic_profile);
+        alloc.free(self.matrix_case);
         self.* = undefined;
     }
 };
@@ -362,8 +369,15 @@ const PerformanceEvidenceMetrics = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer args.deinit();
+    _ = args.skip();
+    try run(init, &args);
+}
+
+pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.c_allocator;
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
     const raw = try std.Io.Dir.cwd().readFileAlloc(init.io, cfg.input_path, alloc, .limited(1024 * 1024 * 1024));
     defer alloc.free(raw);
 
@@ -508,6 +522,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, event, "churn")) {
             try churn.append(alloc, .{
                 .case_name = try alloc.dupe(u8, jsonString(obj, "case") orelse "unknown"),
+                .algebraic_backend = try alloc.dupe(u8, jsonString(obj, "algebraic_backend") orelse "unknown"),
+                .algebraic_profile = try alloc.dupe(u8, jsonString(obj, "algebraic_profile") orelse "default"),
+                .matrix_case = try alloc.dupe(u8, jsonString(obj, "matrix_case") orelse ""),
+                .algebraic_bulk_ingest = jsonBool(obj, "algebraic_bulk_ingest") orelse false,
                 .docs = jsonU64(obj, "docs") orelse 0,
                 .ops = jsonU64(obj, "ops") orelse 0,
                 .batch_size = jsonU64(obj, "batch_size") orelse 0,
@@ -871,10 +889,10 @@ fn printAdaptiveChurnComparisons(items: []const ChurnRecord) void {
         if (!isAdaptiveMaterializedCase(materialized.case_name)) continue;
         const static_case = adaptiveBaselineCase(materialized.case_name, "static");
         const fallback_case = adaptiveBaselineCase(materialized.case_name, "fallback");
-        if (findChurn(items, static_case)) |static| {
+        if (findChurn(items, static_case, materialized)) |static| {
             printAdaptiveChurnCompare(materialized, static, static_case);
         }
-        if (findChurn(items, fallback_case)) |fallback| {
+        if (findChurn(items, fallback_case, materialized)) |fallback| {
             printAdaptiveChurnCompare(materialized, fallback, fallback_case);
         }
     }
@@ -883,10 +901,12 @@ fn printAdaptiveChurnComparisons(items: []const ChurnRecord) void {
 fn printAdaptiveChurnCompare(materialized: ChurnRecord, baseline: ChurnRecord, baseline_case: []const u8) void {
     const baseline_sidecar_bytes = if (baseline.algebraic_sidecar_bytes == 0) 1 else baseline.algebraic_sidecar_bytes;
     std.debug.print(
-        "{{\"event\":\"adaptive_churn_compare\",\"baseline_case\":\"{s}\",\"materialized_case\":\"{s}\",\"docs\":{d},\"ops\":{d},\"batch_size\":{d},\"materialized_update_ms\":{d:.3},\"baseline_update_ms\":{d:.3},\"speedup_vs_baseline\":{d:.3},\"update_ms_ratio_vs_baseline\":{d:.3},\"full_text_update_ms\":{d:.3},\"materialized_sidecar_entries\":{d},\"baseline_sidecar_entries\":{d},\"sidecar_bytes_ratio_vs_baseline\":{d:.3},\"adaptive_maintenance_plan_build_count\":{d},\"adaptive_maintenance_cached_spec_count\":{d},\"adaptive_maintenance_disabled_count\":{d}}}\n",
+        "{{\"event\":\"adaptive_churn_compare\",\"baseline_case\":\"{s}\",\"materialized_case\":\"{s}\",\"algebraic_backend\":\"{s}\",\"algebraic_profile\":\"{s}\",\"docs\":{d},\"ops\":{d},\"batch_size\":{d},\"materialized_update_ms\":{d:.3},\"baseline_update_ms\":{d:.3},\"speedup_vs_baseline\":{d:.3},\"update_ms_ratio_vs_baseline\":{d:.3},\"full_text_update_ms\":{d:.3},\"materialized_sidecar_entries\":{d},\"baseline_sidecar_entries\":{d},\"sidecar_bytes_ratio_vs_baseline\":{d:.3},\"adaptive_maintenance_plan_build_count\":{d},\"adaptive_maintenance_cached_spec_count\":{d},\"adaptive_maintenance_disabled_count\":{d}}}\n",
         .{
             baseline_case,
             materialized.case_name,
+            materialized.algebraic_backend,
+            materialized.algebraic_profile,
             materialized.docs,
             materialized.ops,
             materialized.batch_size,
@@ -1584,9 +1604,7 @@ fn tuningBaselineProfile(profile: []const u8) []const u8 {
     return "normal";
 }
 
-fn parseArgs(args_in: std.process.Args) !CliConfig {
-    var args = std.process.Args.Iterator.init(args_in);
-    _ = args.skip();
+fn parseArgs(args: *std.process.Args.Iterator) !CliConfig {
     var cfg = CliConfig{ .input_path = "" };
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--input")) {
@@ -1604,121 +1622,121 @@ fn parseArgs(args_in: std.process.Args) !CliConfig {
             cfg.guardrail.max_unclassified_algebraic_comparisons = @min(cfg.guardrail.max_unclassified_algebraic_comparisons, 0);
         } else if (std.mem.eql(u8, arg, "--min-dataset-cases")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_dataset_cases = try parseNextU64(&args, arg);
+            cfg.guardrail.min_dataset_cases = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-lsm-dataset-cases")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_lsm_dataset_cases = try parseNextU64(&args, arg);
+            cfg.guardrail.min_lsm_dataset_cases = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-algebraic-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_algebraic_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_algebraic_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-doc-scan-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_doc_scan_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_doc_scan_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-full-text-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_full_text_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_full_text_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-lsm-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_lsm_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_lsm_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-cold-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_cold_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_cold_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-warm-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_warm_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_warm_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-constrained-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_constrained_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_constrained_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-wide-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_wide_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_wide_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-stats-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_stats_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_stats_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-cardinality-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_cardinality_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_cardinality_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-range-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_range_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_range_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-histogram-query-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_histogram_query_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_histogram_query_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-fanout-dataset-cases")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_fanout_dataset_cases = try parseNextU64(&args, arg);
+            cfg.guardrail.min_fanout_dataset_cases = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-churn-records")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_churn_records = try parseNextU64(&args, arg);
+            cfg.guardrail.min_churn_records = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-public-query-comparison-pairs")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_public_query_comparison_pairs = try parseNextU64(&args, arg);
+            cfg.guardrail.min_public_query_comparison_pairs = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-lsm-sorted-ingest-runs")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_lsm_sorted_ingest_runs = try parseNextU64(&args, arg);
+            cfg.guardrail.min_lsm_sorted_ingest_runs = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-lsm-flushes")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_lsm_flushes = try parseNextU64(&args, arg);
+            cfg.guardrail.max_lsm_flushes = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-lsm-write-pressure-compactions")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_lsm_write_pressure_compactions = try parseNextU64(&args, arg);
+            cfg.guardrail.max_lsm_write_pressure_compactions = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-correctness-failures")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_correctness_failures = try parseNextU64(&args, arg);
+            cfg.guardrail.max_correctness_failures = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-unclassified-algebraic-comparisons")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_unclassified_algebraic_comparisons = try parseNextU64(&args, arg);
+            cfg.guardrail.max_unclassified_algebraic_comparisons = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-algebraic-bytes-per-doc")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_algebraic_bytes_per_doc = try parseNextF64(&args, arg);
+            cfg.guardrail.max_algebraic_bytes_per_doc = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-algebraic-bytes-per-materialization")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_algebraic_bytes_per_materialization = try parseNextF64(&args, arg);
+            cfg.guardrail.max_algebraic_bytes_per_materialization = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-symbol-bytes-per-doc")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_symbol_bytes_per_doc = try parseNextF64(&args, arg);
+            cfg.guardrail.max_symbol_bytes_per_doc = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-support-bytes-per-doc")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_support_bytes_per_doc = try parseNextF64(&args, arg);
+            cfg.guardrail.max_support_bytes_per_doc = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-accumulator-flush-count")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_accumulator_flush_count = try parseNextU64(&args, arg);
+            cfg.guardrail.max_accumulator_flush_count = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-path-dictionary-fst-rebuild-count")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_path_dictionary_fst_rebuild_count = try parseNextU64(&args, arg);
+            cfg.guardrail.max_path_dictionary_fst_rebuild_count = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-public-query-http-us")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_public_query_http_us = try parseNextF64(&args, arg);
+            cfg.guardrail.max_public_query_http_us = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-public-query-load-rss-peak-bytes")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_public_query_load_rss_peak_bytes = try parseNextU64(&args, arg);
+            cfg.guardrail.max_public_query_load_rss_peak_bytes = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-public-query-search-rss-peak-bytes")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_public_query_search_rss_peak_bytes = try parseNextU64(&args, arg);
+            cfg.guardrail.max_public_query_search_rss_peak_bytes = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--min-public-query-http-speedup")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.min_public_query_http_speedup = try parseNextF64(&args, arg);
+            cfg.guardrail.min_public_query_http_speedup = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-churn-algebraic-update-ms")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_churn_algebraic_update_ms = try parseNextF64(&args, arg);
+            cfg.guardrail.max_churn_algebraic_update_ms = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-churn-sidecar-bytes")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_churn_sidecar_bytes = try parseNextU64(&args, arg);
+            cfg.guardrail.max_churn_sidecar_bytes = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-algebraic-query-ms")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_algebraic_query_ms = try parseNextF64(&args, arg);
+            cfg.guardrail.max_algebraic_query_ms = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-algebraic-query-ms-ratio-vs-baseline")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_algebraic_query_ms_ratio_vs_baseline = try parseNextF64(&args, arg);
+            cfg.guardrail.max_algebraic_query_ms_ratio_vs_baseline = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-public-query-http-us-ratio-vs-baseline")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_public_query_http_us_ratio_vs_baseline = try parseNextF64(&args, arg);
+            cfg.guardrail.max_public_query_http_us_ratio_vs_baseline = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-algebraic-bytes-per-doc-ratio-vs-baseline")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_algebraic_bytes_per_doc_ratio_vs_baseline = try parseNextF64(&args, arg);
+            cfg.guardrail.max_algebraic_bytes_per_doc_ratio_vs_baseline = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-churn-algebraic-update-ms-ratio-vs-baseline")) {
             cfg.guardrail.enabled = true;
-            cfg.guardrail.max_churn_algebraic_update_ms_ratio_vs_baseline = try parseNextF64(&args, arg);
+            cfg.guardrail.max_churn_algebraic_update_ms_ratio_vs_baseline = try parseNextF64(args, arg);
         } else {
             std.debug.print("unknown argument: {s}\n", .{arg});
             printUsage();
@@ -1756,7 +1774,7 @@ fn parseNextF64(args: *std.process.Args.Iterator, flag: []const u8) !f64 {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: algebraic-summary --input <jsonl> [--baseline <summary-jsonl>] [guardrail thresholds]
+        \\usage: storage_bench summary --input <jsonl> [--baseline <summary-jsonl>] [guardrail thresholds]
         \\
         \\guardrail thresholds:
         \\  --require-performance-evidence
@@ -1928,11 +1946,21 @@ fn findQuery(
     return null;
 }
 
-fn findChurn(items: []const ChurnRecord, case_name: []const u8) ?ChurnRecord {
+fn findChurn(items: []const ChurnRecord, case_name: []const u8, measured: ChurnRecord) ?ChurnRecord {
+    var match: ?ChurnRecord = null;
     for (items) |item| {
-        if (std.mem.eql(u8, item.case_name, case_name)) return item;
+        if (!std.mem.eql(u8, item.case_name, case_name)) continue;
+        if (!std.mem.eql(u8, item.algebraic_backend, measured.algebraic_backend)) continue;
+        if (!std.mem.eql(u8, item.algebraic_profile, measured.algebraic_profile)) continue;
+        if (!std.mem.eql(u8, item.matrix_case, measured.matrix_case)) continue;
+        if (item.docs != measured.docs or item.ops != measured.ops or item.batch_size != measured.batch_size) continue;
+        if (item.algebraic_bulk_ingest != measured.algebraic_bulk_ingest) continue;
+        // Repeated/legacy runs with ambiguous identity cannot establish a
+        // baseline. Do not silently compare against the first matching row.
+        if (match != null) return null;
+        match = item;
     }
-    return null;
+    return match;
 }
 
 fn findWarmup(items: []const WarmupRecord, case_name: []const u8, algebraic_backend: []const u8, algebraic_profile: []const u8) ?WarmupRecord {

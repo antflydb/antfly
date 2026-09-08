@@ -1450,15 +1450,15 @@ Status as of 2026-05-19:
   ordinal-native. The focused DOCID gate now includes the ordinal-bitmap
   promotion regression, so the large-set representation and promotion counter
   remain covered alongside the query execution boundaries. `zig build
-  antfly-storage-db-bench` now provides a repeatable ReleaseFast benchmark for raw
+  antfly-storage-bench` now provides a repeatable ReleaseFast benchmark for raw
   sorted `u32` ordinal arrays, direct roaring bitmaps, the current compact
   ordinal-list/bitmap document-set operators, sorted sparse `u64` IDs, and
   public DOCID-key baselines across small, medium, large, dense, and sparse
-  layouts. `zig build antfly-storage-db-bench && ./zig-out/bin/db_write_bench --docs 512 --batch-size 128 --body-repeat 1` measures insert, update, and delete
+  layouts. `zig build antfly-storage-bench && ./zig-out/bin/storage_bench write --docs 512 --batch-size 128 --body-repeat 1` measures insert, update, and delete
   phases across write consistency levels and reports the isolated
   extraction, artifact-cleanup, identity-capacity, identity-metadata,
   derived-payload, and store-write timings from `BatchProfile` alongside
-  resulting identity-table stats. `zig build antfly-storage-db-bench && ./zig-out/bin/db_query_bench --docs 4096 --queries 16 --repeats 8 --filter-size 256 --limit 32` now benchmarks
+  resulting identity-table stats. `zig build antfly-storage-bench && ./zig-out/bin/storage_bench query --docs 4096 --queries 16 --repeats 8 --filter-size 256 --limit 32` now benchmarks
   direct DB query shapes that exercise the real filter bridges: match-all with a
   doc filter, full-text with a doc filter, and sparse-vector search with a doc
   filter. Each shape runs `public_ids` mode, where public document IDs are
@@ -2095,7 +2095,7 @@ Status as of 2026-05-19:
   longer pre-materialize a broad all-live-doc vector-ID filter; visibility is
   left to normal result postprocessing unless the caller supplied a real
   document constraint.
-  In the 100k `public-query-guardrail --mode handler
+  In the 100k `antfly-api-bench --mode handler
   --query-shape hybrid-filter-exclude-project` profile, these changes moved the
   handler path from roughly 570ms before this pass to roughly 55ms while
   preserving the filled `k=20` correctness guardrail.

@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const bench_root = @import("docid_doc_set_bench_root");
-const doc_set = bench_root.doc_set;
+const bench_root = @import("antfly-zig");
+const doc_set = bench_root.db.doc_set;
 const roaring = bench_root.roaring;
 
 const Config = struct {
@@ -46,9 +46,9 @@ const Result = struct {
     result_cardinality: usize,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.page_allocator;
-    const cfg = try parseArgs(alloc, init.minimal.args);
+    const cfg = try parseArgs(args);
     const scenarios = [_]Scenario{
         .{ .name = "small_dense", .cardinality = cfg.small_cardinality, .stride = cfg.dense_stride },
         .{ .name = "small_sparse", .cardinality = cfg.small_cardinality, .stride = cfg.sparse_stride },
@@ -473,29 +473,26 @@ fn printResult(writer: anytype, sample: usize, result: Result) !void {
     );
 }
 
-fn parseArgs(alloc: std.mem.Allocator, proc_args: std.process.Args) !Config {
+fn parseArgs(args: *std.process.Args.Iterator) !Config {
     var cfg = Config{};
-    var args = try std.process.Args.Iterator.initAllocator(proc_args, alloc);
-    defer args.deinit();
-    _ = args.next();
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--samples")) {
-            cfg.samples = try parseNextUsize(&args, arg);
+            cfg.samples = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--repeats")) {
-            cfg.repeats = try parseNextUsize(&args, arg);
+            cfg.repeats = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--small")) {
-            cfg.small_cardinality = try parseNextUsize(&args, arg);
+            cfg.small_cardinality = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--medium")) {
-            cfg.medium_cardinality = try parseNextUsize(&args, arg);
+            cfg.medium_cardinality = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--large")) {
-            cfg.large_cardinality = try parseNextUsize(&args, arg);
+            cfg.large_cardinality = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--dense-stride")) {
-            cfg.dense_stride = try parseNextU64(&args, arg);
+            cfg.dense_stride = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--sparse-stride")) {
-            cfg.sparse_stride = try parseNextU64(&args, arg);
+            cfg.sparse_stride = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--max-doc-key-cardinality")) {
-            cfg.max_doc_key_cardinality = try parseNextUsize(&args, arg);
+            cfg.max_doc_key_cardinality = try parseNextUsize(args, arg);
         } else {
             return error.InvalidArgument;
         }
