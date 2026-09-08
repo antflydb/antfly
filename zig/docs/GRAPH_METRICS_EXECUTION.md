@@ -4,19 +4,44 @@ Graph metrics use shared numerical semantics with backend-specific persistence.
 The production boundary is admitted, generation-fenced work—not a synchronous
 full-graph calculation hidden inside a query or maintenance tick.
 
-### Remaining architecture: cross-job stateful topology
+### Durable cross-job stateful topology
 
-Stateful packed adjacency is still job-owned. The shared generation partition
-census and within-job iterative reuse do not imply cross-job topology sharing.
-A durable shared topology implementation must first give immutable membership,
-ordinal maps, out-degrees and adjacency their own publication owner, keyed by
-the graph snapshot, canonical edge filter, partition identity and format epoch.
-Each numerical job then pins that owner while retaining independent vector,
-attempt, progress and publication state. Adoption must be atomic with lifetime
-protection; reclamation must be bounded and resumable after crashes, including
-filter changes and removal of every consuming metric. Existing producer-attempt
-receipts cannot serve as that cross-job ownership protocol. This lifecycle is
-not implemented by the query/admission changes below.
+Membership blocks, ordinal dictionaries, exact out-degree totals, and packed
+adjacency have an independent durable owner. Its SHA-256 identity binds the
+topology format epoch, canonical edge-filter set, and complete checksummed
+generation partition plan. Metric names, damping, tolerance, and iteration
+limits do not enter that identity. Numeric vectors (including the PageRank
+degree-vector accelerator), folds, seeds, page attempts, and publication remain
+job-local.
+
+The first complete forward reduction seals the forward topology; HITS seals
+both orientations after its first reverse reduction. Only complete phase
+barriers can publish an owner. An adopting job validates the sealed owner and
+writes its binding and lifetime pin in one transaction. It skips physical edge
+discovery and adjacency production, reads the shared canonical membership for
+its own seed/initialization, and uses shared packed tiles for every iteration.
+HITS topology can serve PageRank or eigenvector; a forward-only owner cannot
+satisfy HITS. Published scores keep their existing format; intermediate jobs
+from execution schemas before v15 restart.
+
+Concurrent cold producers have distinct owner and staging namespaces. They may
+duplicate initial preparation, but never share partial attempts or wait on
+another numerical job. The first sealed owner wins each reuse directory entry;
+losing owners are reclaimed after their own jobs release their pins. This avoids
+introducing producer dependencies into worker-pool admission or recovery.
+
+Reclamation is index-scoped, including indexes with zero configured metrics.
+Each transaction examines at most 64 pins and deletes at most 512 topology
+records. Current configured filters retain reusable owners; active job pins
+protect older generations. Removed filters, removed metrics, failed producers,
+obsolete format epochs, and unreferenced concurrent owners become reclaimable.
+A durable deleting tombstone atomically unpublishes the owner and fences late
+writes/adoption; deletion resumes after crashes by removing the next key page.
+Superseded packing attempts have a separate bounded retirement queue so a
+retained owner does not retain abandoned tiles indefinitely.
+Cursor-only census advances do not count as eligible worker work: periodic
+wakeups continue scanning without keeping idle worker pools busy. Actual
+reclamation consumes the normal worker-page budget.
 
 ## Non-serverless
 
@@ -102,7 +127,7 @@ not implemented by the query/admission changes below.
   HITS lanes are bulk-read before either lane stages mutations. Primary scores,
   ordered staging keys, and the attempt-fenced page cursor commit atomically.
   The coordinator checkpoints the bounded top-K prefix before pointer publication.
-- Execution schema 14 fences older intermediate jobs. Published score epochs
+- Execution schema 15 fences older intermediate jobs. Published score epochs
   retain their existing read contract; an execution-format change does not hide
   previously published results.
 

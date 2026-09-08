@@ -33,6 +33,7 @@ const partition_census = @import("partition_census.zig");
 const membership = @import("membership.zig");
 const ordinal_blocks = @import("ordinal.zig");
 const adjacency_blocks = @import("adjacency.zig");
+const topology_owner = @import("topology_owner.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
@@ -3437,6 +3438,7 @@ pub const GraphIndex = struct {
                 .total_units = graphMetricBuildManifestPhaseUnits(phase, self.edge_count, self.node_count),
             });
         }
+        try self.ensureTopologyBindingInBatch(batch, metric_name, cfg, job);
     }
 
     /// A bounded, metric-specific work plan. Original leaf IDs remain stable
@@ -4585,6 +4587,7 @@ pub const GraphIndex = struct {
             .converged = phase == .check_convergence and state == .complete and all_completed_pages_converged and total_delta <= cfg.tolerance,
         };
         try self.putGraphMetricBuildPhaseSummaryInBatch(batch, metric_name, summary);
+        try self.sealTopologyInBatch(batch, metric_name, cfg, job, summary);
         return summary;
     }
 
@@ -5138,6 +5141,14 @@ pub const GraphIndex = struct {
         encodeGraphMetricBuildPage(page, encoded);
         try batch.put(page_key, encoded);
         try self.putGraphMetricBuildPhaseProgressInBatch(batch, metric_name, progress);
+        if (page.phase == .initialize_ranks and page.page_id >= graph_metric_build_summary_leaf_base and page.state == .complete) {
+            if (try self.topologyBinding(batch, metric_name, page.job_id)) |binding| if (!binding.adopted) {
+                try self.requireMutableTopology(batch, metric_name, page.job_id);
+                const key = try self.topologyKey(batch, metric_name, page.job_id, try self.alloc.dupe(u8, page_key));
+                defer self.alloc.free(key);
+                try batch.put(key, encoded);
+            };
+        }
     }
 
     fn updateGraphMetricBuildPhaseProgress(progress: *GraphMetricBuildPhaseProgress, page: GraphMetricBuildPage, add: bool) !void {
@@ -7077,7 +7088,7 @@ pub const GraphIndex = struct {
         }
     };
 
-    // Execution rows carry their immutable job-local ordinal through vector
+    // Execution rows carry their immutable topology ordinal through job-local vector
     // reads and writes. Never expose these ordinals as public score identity.
     const OrdinalMetricScore = struct { node: []const u8, score: f64, slot: u64 };
 
@@ -7184,8 +7195,9 @@ pub const GraphIndex = struct {
     // v12 stages ordered publication runs; v13 seals metric-specific node work
     // plans so later iterations omit empty leaves without changing ordinals.
     // v14 removes later producer phases; reducers reuse iteration-zero adjacency.
+    // v15 separates durable topology ownership from numerical job lifetimes.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 14;
+    const graph_metric_build_execution_schema_version: u64 = 15;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -8964,7 +8976,7 @@ pub const GraphIndex = struct {
         job_id: u64,
         node: []const u8,
     ) !u64 {
-        const total_key = try self.graphMetricBuildPageRankOutDegreeKeyAlloc(metric_name, job_id, node);
+        const total_key = try self.topologyKey(txn, metric_name, job_id, try self.graphMetricBuildPageRankOutDegreeKeyAlloc(metric_name, job_id, node));
         defer self.alloc.free(total_key);
         return try readU64OrZero(txn, total_key);
     }
@@ -9052,6 +9064,10 @@ pub const GraphIndex = struct {
     fn validateGraphMetricVectorManifest(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64) !void {
         const manifest = try self.metricBuildManifest(txn, metric_name, job_id) orelse return error.GraphMetricBuildManifestNotFound;
         if (manifest.execution_schema_version != graph_metric_build_execution_schema_version) return error.InvalidGraphMetricBuildManifest;
+        if (try self.metricBuildJob(txn, metric_name)) |job| {
+            if (job.job_id == job_id and try self.topologyBinding(txn, metric_name, job_id) == null)
+                return error.InvalidGraphMetricBuildManifest;
+        }
     }
 
     fn graphMetricNodeSlotKey(alloc: Allocator, metric_name: []const u8, job_id: u64, node: []const u8) ![]u8 {
@@ -9069,8 +9085,12 @@ pub const GraphIndex = struct {
     fn graphMetricNodeSlotsAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, nodes: []const []const u8) ![]u64 {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
+        const prefix = try self.topologyComponentPrefix(txn, metric_name, job_id, "node_slot");
+        defer self.alloc.free(prefix);
         const keys = try arena.allocator().alloc([]const u8, nodes.len);
-        for (nodes, 0..) |node, i| keys[i] = try graphMetricNodeSlotKey(arena.allocator(), metric_name, job_id, node);
+        for (nodes, 0..) |node, i| {
+            keys[i] = try topologyComponentKey(arena.allocator(), prefix, node);
+        }
         const slots = try self.readU64KeysAlloc(txn, keys);
         errdefer self.alloc.free(slots);
         for (slots) |slot| if (slot == 0) return error.InvalidGraphMetricBuildManifest;
@@ -9088,7 +9108,7 @@ pub const GraphIndex = struct {
 
     fn validateGraphMetricOrdinalDictionary(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, nodes: []const []const u8, slots: []const u64) !void {
         if (nodes.len == 0) return;
-        const start = try graphMetricNodeSlotKey(self.alloc, metric_name, job_id, nodes[0]);
+        const start = try self.topologyKey(txn, metric_name, job_id, try graphMetricNodeSlotKey(self.alloc, metric_name, job_id, nodes[0]));
         defer self.alloc.free(start);
         const prefix_len = start.len - internal_keys.encodedComponentLen(nodes[0]);
         var component = std.ArrayListUnmanaged(u8).empty;
@@ -9164,13 +9184,14 @@ pub const GraphIndex = struct {
     }
 
     fn writeGraphMetricMembership(self: *GraphIndex, batch: anytype, metric: []const u8, job_id: u64, leaf: u64, start: u64, nodes: []const []const u8) !void {
+        try self.requireMutableTopology(batch, metric, job_id);
         var offset: usize = 0;
         while (offset < nodes.len) {
             const row = start + offset;
             const block_id = row / membership.capacity;
             const within: usize = @intCast(row % membership.capacity);
             const count = @min(nodes.len - offset, membership.capacity - within);
-            const key = try self.graphMetricMembershipKey(metric, job_id, leaf, block_id);
+            const key = try self.topologyKey(batch, metric, job_id, try self.graphMetricMembershipKey(metric, job_id, leaf, block_id));
             defer self.alloc.free(key);
             var block = if (batch.get(key)) |raw| try membership.decode(raw) else |err| switch (err) {
                 error.NotFound => membership.Block{},
@@ -9202,22 +9223,22 @@ pub const GraphIndex = struct {
         var end = leaf_count;
         while (first < end) {
             const mid = first + (end - first) / 2;
-            const leaf = try self.metricBuildPage(txn, metric, job_id, .initialize_ranks, 0, graph_metric_build_summary_leaf_base + mid) orelse return error.InvalidGraphMetricBuildManifest;
+            const leaf = try self.topologyMembershipLeaf(txn, metric, job_id, graph_metric_build_summary_leaf_base + mid) orelse return error.InvalidGraphMetricBuildManifest;
             if (leaf.range_upper.len != 0 and std.mem.order(u8, leaf.range_upper, seek) != .gt) first = mid + 1 else end = mid;
         }
         for (first..leaf_count) |leaf_index| {
-            const leaf = try self.metricBuildPage(txn, metric, job_id, .initialize_ranks, 0, graph_metric_build_summary_leaf_base + leaf_index) orelse return error.InvalidGraphMetricBuildManifest;
+            const leaf = try self.topologyMembershipLeaf(txn, metric, job_id, graph_metric_build_summary_leaf_base + leaf_index) orelse return error.InvalidGraphMetricBuildManifest;
             if (leaf.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
             if (upper.len != 0 and std.mem.order(u8, leaf.range_lower, upper) != .lt) return true;
             var position: u64 = 0;
             if (leaf_index == first and resume_node.len != 0) {
-                const key = try graphMetricNodeSlotKey(self.alloc, metric, job_id, resume_node);
+                const key = try self.topologyKey(txn, metric, job_id, try graphMetricNodeSlotKey(self.alloc, metric, job_id, resume_node));
                 defer self.alloc.free(key);
                 const slot = try readU64OrZero(txn, key);
                 if (slot == 0 or slot >> 32 != leaf_index + 1) return error.InvalidGraphMetricBuildManifest;
                 position = (slot & std.math.maxInt(u32)) + 1;
                 if (position > leaf.completed_units) return error.InvalidGraphMetricBuildManifest;
-                const resume_key = try self.graphMetricMembershipKey(metric, job_id, leaf_index, (position - 1) / membership.capacity);
+                const resume_key = try self.topologyKey(txn, metric, job_id, try self.graphMetricMembershipKey(metric, job_id, leaf_index, (position - 1) / membership.capacity));
                 defer self.alloc.free(resume_key);
                 const resume_raw = txn.get(resume_key) catch |err| switch (err) {
                     error.NotFound => return error.InvalidGraphMetricBuildManifest,
@@ -9230,7 +9251,7 @@ pub const GraphIndex = struct {
             }
             while (position < leaf.completed_units) {
                 const block_id = position / membership.capacity;
-                const key = try self.graphMetricMembershipKey(metric, job_id, leaf_index, block_id);
+                const key = try self.topologyKey(txn, metric, job_id, try self.graphMetricMembershipKey(metric, job_id, leaf_index, block_id));
                 defer self.alloc.free(key);
                 const raw = txn.get(key) catch |err| switch (err) {
                     error.NotFound => return error.InvalidGraphMetricBuildManifest,
@@ -9500,7 +9521,7 @@ pub const GraphIndex = struct {
         return std.fmt.allocPrint(self.alloc, "{s}ordinal/{d:0>20}/", .{ namespace, chunk });
     }
 
-    /// Compile each bounded edge checkpoint once per job. Subsequent power
+    /// Compile each bounded edge checkpoint once per cold topology producer. Subsequent power
     /// iterations read numeric topology and vector blocks without parsing edge
     /// keys, hashing document IDs, or resolving the ordinal dictionary again.
     fn ordinalTopologyAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, cfg: GraphMetricConfig, job_id: u64, page: GraphMetricBuildPage, limit: usize) !ordinal_blocks.Topology {
@@ -9630,13 +9651,18 @@ pub const GraphIndex = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const temp = arena.allocator();
-        const base = try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk);
+        const base = blk: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            break :blk try self.topologyKey(&txn, metric_name, job.job_id, try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk));
+        };
         defer self.alloc.free(base);
         const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
         const state_key = try std.fmt.allocPrint(temp, "{s}state", .{base});
         const input_prefix = try self.ordinalAdjacencyPrefixAlloc(metric_name, job.job_id, producer_phase, chunk);
         defer self.alloc.free(input_prefix);
         var state = adjacency_blocks.State{ .attempt = claimed.attempt };
+        var retired_attempt: ?u64 = null;
         var old_state: []const u8 = "";
         var outputs = std.ArrayListUnmanaged([]const u8).empty;
         var first_block: u64 = 0;
@@ -9658,7 +9684,7 @@ pub const GraphIndex = struct {
             if (txn.get(state_key)) |raw| {
                 old_state = try temp.dupe(u8, raw);
                 const saved = try adjacency_blocks.State.decode(old_state);
-                if (saved.attempt == claimed.attempt) state = saved;
+                if (saved.attempt == claimed.attempt) state = saved else retired_attempt = saved.attempt;
             } else |err| if (err != error.NotFound) return err;
             first_block = state.blocks;
             if (state.cursor.len != 0 and !std.mem.startsWith(u8, state.cursor, input_prefix)) return error.InvalidGraphMetricBuildManifest;
@@ -9725,6 +9751,17 @@ pub const GraphIndex = struct {
             else => return err,
         };
         if (!std.mem.eql(u8, latest, old_state)) return error.GraphMetricBuildPageOutputMismatch;
+        try self.requireMutableTopology(&batch, metric_name, job.job_id);
+        if (retired_attempt) |attempt| {
+            if (try self.topologyBinding(&batch, metric_name, job.job_id)) |binding| {
+                const data = try topology_owner.dataPrefix(temp, binding.id);
+                const retired = try std.fmt.allocPrint(temp, "{s}data/{d:0>20}/", .{ base, attempt });
+                var digest: topology_owner.Digest = undefined;
+                std.crypto.hash.sha2.Sha256.hash(retired, &digest, .{});
+                const task = try std.fmt.allocPrint(temp, "{s}retired/{s}", .{ data, std.fmt.bytesToHex(digest, .lower) });
+                try batch.put(task, retired);
+            }
+        }
         for (outputs.items, 0..) |output, i| {
             const key = try std.fmt.allocPrint(temp, "{s}data/{d:0>20}/{d:0>20}", .{ base, state.attempt, first_block + i });
             try batch.put(key, output);
@@ -9994,8 +10031,10 @@ pub const GraphIndex = struct {
         defer key_arena.deinit();
         const keys = try self.alloc.alloc([]u8, nodes.len);
         defer self.alloc.free(keys);
+        const prefix = try self.topologyComponentPrefix(txn, metric_name, job_id, "pagerank_out_degree_total");
+        defer self.alloc.free(prefix);
         for (nodes, 0..) |node, i| {
-            keys[i] = try graphMetricBuildPageRankOutDegreeKeyWithAllocator(key_arena.allocator(), metric_name, job_id, node);
+            keys[i] = try topologyComponentKey(key_arena.allocator(), prefix, node);
         }
         return try self.readU64KeysAlloc(txn, keys);
     }
@@ -10076,7 +10115,7 @@ pub const GraphIndex = struct {
                 const chunk = slot / vector_chunk.entries;
                 if (previous_chunk == chunk) continue;
                 previous_chunk = chunk;
-                const base = try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk);
+                const base = try self.topologyKey(&txn, metric_name, job.job_id, try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk));
                 defer self.alloc.free(base);
                 const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
                 if (txn.get(receipt_key)) |raw| {
@@ -10105,7 +10144,7 @@ pub const GraphIndex = struct {
             while (compaction_chunk == null and fold.position < slots.len and records < record_limit) {
                 const chunk = slots[fold.position] / vector_chunk.entries;
                 scratch.prepareTargets(slots, chunk);
-                const base = try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk);
+                const base = try self.topologyKey(&txn, metric_name, job.job_id, try self.packedAdjacencyBaseAlloc(metric_name, job.job_id, producer_phase, chunk));
                 defer self.alloc.free(base);
                 const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
                 const receipt_raw = txn.get(receipt_key) catch |err| switch (err) {
@@ -10291,9 +10330,14 @@ pub const GraphIndex = struct {
             for (nodes.items) |node| self.alloc.free(node);
             nodes.deinit(self.alloc);
         }
+        var adopted_topology = false;
         const reached_end = blk: {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
+            if (page.phase == .initialize_ranks) {
+                if (try self.topologyBinding(&txn, metric_name, job.job_id)) |binding| adopted_topology = binding.adopted;
+                if (adopted_topology) break :blk try self.collectGraphMetricInitializedNodesInRange(&txn, metric_name, job.job_id, range_lower, range_upper, resume_cursor, max_nodes, &nodes);
+            }
             break :blk switch (cfg.kind) {
                 .degree => try self.collectDegreePartialNodesInRange(
                     &txn,
@@ -10318,18 +10362,21 @@ pub const GraphIndex = struct {
             };
         };
 
-        if (page.phase == .initialize_ranks and page.page_id >= graph_metric_build_summary_leaf_base) {
+        if (!adopted_topology and page.phase == .initialize_ranks and page.page_id >= graph_metric_build_summary_leaf_base) {
             var batch = try self.beginWriteReverseBatch();
             errdefer batch.abort();
             const current = try self.metricBuildPage(&batch, metric_name, job.job_id, page.phase, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
             try self.validateGraphMetricBuildPageExecutionLease(page, current);
+            try self.requireMutableTopology(&batch, metric_name, job.job_id);
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
+            const prefix = try self.topologyComponentPrefix(&batch, metric_name, job.job_id, "node_slot");
+            defer self.alloc.free(prefix);
             for (nodes.items, 0..) |node, i| {
                 const local_slot = std.math.add(u64, prior_completed_units, i) catch return error.GraphMetricBuildBudgetExceeded;
                 if (local_slot > std.math.maxInt(u32)) return error.GraphMetricBuildBudgetExceeded;
                 const ordinal = ((page.page_id - graph_metric_build_summary_leaf_base + 1) << 32) | local_slot;
-                const key = try graphMetricNodeSlotKey(arena.allocator(), metric_name, job.job_id, node);
+                const key = try topologyComponentKey(arena.allocator(), prefix, node);
                 const prior = try readU64OrZero(&batch, key);
                 if (prior != 0 and prior != ordinal) return error.InvalidGraphMetricBuildManifest;
                 try putU64(&batch, key, ordinal);
@@ -13566,6 +13613,355 @@ pub const GraphIndex = struct {
         };
     }
 
+    fn topologyBindingKey(self: *GraphIndex, metric: []const u8, job_id: u64) ![]u8 {
+        const prefix = try self.graphMetricBuildJobNamespacePrefixAlloc(metric, job_id);
+        defer self.alloc.free(prefix);
+        return std.fmt.allocPrint(self.alloc, "{s}topology-owner", .{prefix});
+    }
+
+    fn topologyComponentPrefix(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, component: []const u8) ![]u8 {
+        var job_buf: [20]u8 = undefined;
+        return self.topologyKey(txn, metric, job_id, try self.graphMetricControlKeyAlloc(&.{ metric, "job", try std.fmt.bufPrint(&job_buf, "{d}", .{job_id}), component }));
+    }
+
+    fn topologyComponentKey(alloc: Allocator, prefix: []const u8, component: []const u8) ![]u8 {
+        var key = std.ArrayListUnmanaged(u8).empty;
+        defer key.deinit(alloc);
+        try key.appendSlice(alloc, prefix);
+        try internal_keys.appendEncodedComponent(&key, alloc, component);
+        return key.toOwnedSlice(alloc);
+    }
+
+    fn topologyBinding(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64) !?topology_owner.Binding {
+        const key = try self.topologyBindingKey(metric, job_id);
+        defer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const binding = try topology_owner.Binding.decode(raw);
+        const owner_key = try topology_owner.catalogKey(self.alloc, binding.id);
+        defer self.alloc.free(owner_key);
+        const owner = try topology_owner.Record.decode(txn.get(owner_key) catch |err| switch (err) {
+            error.NotFound => return error.GraphMetricBuildSuperseded,
+            else => return err,
+        });
+        if (owner.state == .deleting) return error.GraphMetricBuildSuperseded;
+        if (owner.format_epoch != topology_owner.epoch) return error.InvalidGraphMetricBuildManifest;
+        if (binding.adopted and owner.state != .sealed) return error.InvalidGraphMetricBuildManifest;
+        return binding;
+    }
+
+    /// Takes ownership of a job-local key and resolves just the immutable
+    /// topology part. Numeric vectors, producer staging, and folds stay local.
+    fn topologyKey(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, local: []u8) ![]u8 {
+        defer self.alloc.free(local);
+        const binding = try self.topologyBinding(txn, metric, job_id) orelse return self.alloc.dupe(u8, local);
+        const job_prefix = try self.graphMetricBuildJobNamespacePrefixAlloc(metric, job_id);
+        defer self.alloc.free(job_prefix);
+        if (!std.mem.startsWith(u8, local, job_prefix)) return error.InvalidGraphMetricBuildManifest;
+        const prefix = try topology_owner.dataPrefix(self.alloc, binding.id);
+        defer self.alloc.free(prefix);
+        return std.fmt.allocPrint(self.alloc, "{s}{s}", .{ prefix, local[job_prefix.len..] });
+    }
+
+    fn requireMutableTopology(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64) !void {
+        const binding = try self.topologyBinding(txn, metric, job_id) orelse return;
+        if (binding.adopted) return error.InvalidGraphMetricBuildManifest;
+        const key = try topology_owner.catalogKey(self.alloc, binding.id);
+        defer self.alloc.free(key);
+        const owner = try topology_owner.Record.decode(try txn.get(key));
+        if (owner.state != .building) return error.GraphMetricBuildSuperseded;
+        if (owner.generation != try readU64OrZero(txn, graph_edge_generation_key)) return error.GraphMetricBuildSnapshotChanged;
+    }
+
+    fn ensureTopologyBindingInBatch(self: *GraphIndex, batch: anytype, metric: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob) !void {
+        if (!graphMetricKindUsesIterativeBuild(cfg.kind)) return;
+        if (try self.topologyBinding(batch, metric, job.job_id) != null) return;
+        const filter = try topology_owner.filterDigest(self.alloc, cfg.edge_filter);
+        const digest = topology_owner.identity(filter, try batch.get(graph_metric_partition_plan_key));
+        const bidirectional = cfg.kind == .hits_authority or cfg.kind == .hits_hub;
+        const ready_key = try topology_owner.readyKey(self.alloc, digest, bidirectional);
+        defer self.alloc.free(ready_key);
+        const namespace = try self.graphMetricBuildJobNamespacePrefixAlloc(metric, job.job_id);
+        defer self.alloc.free(namespace);
+        var binding = topology_owner.Binding{ .id = topology_owner.ownerId(digest, namespace, job.score_generation), .adopted = false };
+        if (batch.get(ready_key)) |raw| {
+            if (raw.len != 64) return error.InvalidGraphMetricBuildManifest;
+            const id: topology_owner.Id = raw[0..64].*;
+            const key = try topology_owner.catalogKey(self.alloc, id);
+            defer self.alloc.free(key);
+            const owner = try topology_owner.Record.decode(try batch.get(key));
+            if (owner.state != .sealed or owner.format_epoch != topology_owner.epoch or owner.generation != job.target_generation or
+                !std.mem.eql(u8, &owner.identity, &digest) or (bidirectional and !owner.bidirectional))
+                return error.InvalidGraphMetricBuildManifest;
+            binding = .{ .id = id, .adopted = true };
+        } else |err| if (err != error.NotFound) return err;
+        if (!binding.adopted) {
+            const key = try topology_owner.catalogKey(self.alloc, binding.id);
+            defer self.alloc.free(key);
+            const owner = topology_owner.Record{ .generation = job.target_generation, .filter = filter, .identity = digest, .bidirectional = bidirectional };
+            // Never resurrect a tombstoned owner with the same producer ID.
+            if (batch.get(key)) |_| return error.GraphMetricBuildSuperseded else |err| if (err != error.NotFound) return err;
+            try batch.put(key, &owner.encode());
+        }
+        const binding_key = try self.topologyBindingKey(metric, job.job_id);
+        defer self.alloc.free(binding_key);
+        const pins = try topology_owner.pinsPrefix(self.alloc, binding.id);
+        defer self.alloc.free(pins);
+        const pin_key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ pins, topology_owner.ownerId(digest, namespace, job.score_generation) });
+        defer self.alloc.free(pin_key);
+        const pin = try self.alloc.alloc(u8, 16 + metric.len);
+        defer self.alloc.free(pin);
+        std.mem.writeInt(u64, pin[0..8], job.job_id, .little);
+        std.mem.writeInt(u64, pin[8..16], graphMetricConfigFingerprint(cfg), .little);
+        @memcpy(pin[16..], metric);
+        // Owner validation, pin, and job binding are one serializable commit.
+        try batch.put(pin_key, pin);
+        try batch.put(binding_key, &binding.encode());
+        if (binding.adopted) {
+            const plan_raw = try batch.get(graph_metric_partition_plan_key);
+            var plan = (try self.decodeGraphMetricPartitionPlanAlloc(plan_raw)) orelse return error.InvalidGraphMetricBuildManifest;
+            defer plan.deinit(self.alloc);
+            for ([_]GraphMetricBuildPhase{ .scan_edges_and_out_degree, .iterate_contributions, .hits_hub_contributions }) |phase| {
+                if (phase == .hits_hub_contributions and !bidirectional) continue;
+                for (0..plan.edge_page_count) |i| {
+                    const page_id = graphMetricBuildPhasePageIdBase(cfg.kind, phase) + i;
+                    var page = try self.metricBuildPage(batch, metric, job.job_id, phase, 0, page_id) orelse return error.InvalidGraphMetricBuildManifest;
+                    page.state = .complete;
+                    page.completed_units = page.total_units;
+                    page.output_fingerprint = job.target_generation;
+                    try self.putGraphMetricBuildPageInBatch(batch, metric, page);
+                }
+            }
+        }
+    }
+
+    fn topologyMembershipLeaf(self: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, leaf_id: u64) !?GraphMetricBuildPage {
+        if (try self.topologyBinding(txn, metric, job_id)) |binding| if (binding.adopted) {
+            const key = try self.topologyKey(txn, metric, job_id, try self.graphMetricBuildPageKeyAlloc(metric, job_id, .initialize_ranks, 0, leaf_id));
+            defer self.alloc.free(key);
+            return decodeGraphMetricBuildPage(try txn.get(key)) orelse error.InvalidGraphMetricBuildManifest;
+        };
+        return self.metricBuildPage(txn, metric, job_id, .initialize_ranks, 0, leaf_id);
+    }
+
+    fn sealTopologyInBatch(self: *GraphIndex, batch: anytype, metric: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob, summary: GraphMetricBuildPhaseSummary) !void {
+        if (summary.iteration != 0 or summary.state != .complete or !graphMetricKindUsesIterativeBuild(cfg.kind)) return;
+        const bidirectional = cfg.kind == .hits_authority or cfg.kind == .hits_hub;
+        if (summary.phase != (if (bidirectional) GraphMetricBuildPhase.hits_hub_reduce_ranks else .reduce_ranks)) return;
+        const binding = try self.topologyBinding(batch, metric, job.job_id) orelse return;
+        if (binding.adopted) return;
+        const key = try topology_owner.catalogKey(self.alloc, binding.id);
+        defer self.alloc.free(key);
+        var owner = try topology_owner.Record.decode(try batch.get(key));
+        if (owner.state == .sealed) return;
+        try self.requireMutableTopology(batch, metric, job.job_id);
+        // These phase barriers prove every membership leaf and every target
+        // chunk receipt is durable. A partial packing attempt is never exposed.
+        const initialized = try self.metricBuildPhaseSummary(batch, metric, job.job_id, .initialize_ranks, 0) orelse return error.InvalidGraphMetricBuildManifest;
+        const produced = try self.metricBuildPhaseSummary(batch, metric, job.job_id, .iterate_contributions, 0) orelse return error.InvalidGraphMetricBuildManifest;
+        if (initialized.state != .complete or produced.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
+        if (bidirectional) {
+            const forward = try self.metricBuildPhaseSummary(batch, metric, job.job_id, .reduce_ranks, 0) orelse return error.InvalidGraphMetricBuildManifest;
+            const reverse = try self.metricBuildPhaseSummary(batch, metric, job.job_id, .hits_hub_contributions, 0) orelse return error.InvalidGraphMetricBuildManifest;
+            if (forward.state != .complete or reverse.state != .complete) return error.GraphMetricBuildPhaseNotComplete;
+        }
+        owner.state = .sealed;
+        try batch.put(key, &owner.encode());
+        for ([_]bool{ false, true }) |reverse| {
+            if (reverse and !bidirectional) continue;
+            const ready = try topology_owner.readyKey(self.alloc, owner.identity, reverse);
+            defer self.alloc.free(ready);
+            // Concurrent producers keep distinct staging/attempt spaces. The
+            // first sealed owner wins; losing owners live only while pinned.
+            if (batch.get(ready)) |_| continue else |err| if (err != error.NotFound) return err;
+            try batch.put(ready, &binding.id);
+        }
+    }
+
+    /// Index-scoped maintenance, including indexes with zero configured metrics.
+    /// Deletes at most 512 data records and examines 64 pins in one transaction.
+    /// A durable deleting tombstone prevents adoption or late producer writes.
+    pub const TopologyCleanupResult = struct {
+        progressed: bool = false,
+        removed: usize = 0,
+    };
+
+    pub fn cleanupGraphMetricTopologyPage(self: *GraphIndex) !bool {
+        return (try self.cleanupGraphMetricTopologyPageDetailed()).progressed;
+    }
+
+    pub fn cleanupGraphMetricTopologyPageDetailed(self: *GraphIndex) !TopologyCleanupResult {
+        // Most graph indexes have no iterative topology. Do not acquire their
+        // writer lock merely because they participate in the worker sweep.
+        {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            if (!try self.hasKeysWithPrefixInBatch(&txn, topology_owner.catalog_prefix)) return .{};
+        }
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const resume_key = batch.get(topology_owner.gc_cursor_key) catch |err| switch (err) {
+            error.NotFound => "",
+            else => return err,
+        };
+        var cur = try batch.openCursor();
+        var cur_open = true;
+        defer if (cur_open) cur.close();
+        var entry = try cur.seekAtOrAfter(if (resume_key.len == 0) topology_owner.catalog_prefix else resume_key);
+        if (entry) |e| if (std.mem.eql(u8, e.key, resume_key)) {
+            entry = try cur.next();
+        };
+        if (entry == null or !std.mem.startsWith(u8, entry.?.key, topology_owner.catalog_prefix)) {
+            cur.close();
+            cur_open = false;
+            if (resume_key.len != 0) try batch.delete(topology_owner.gc_cursor_key);
+            try batch.commit();
+            return .{};
+        }
+        const key = try temp.dupe(u8, entry.?.key);
+        if (key.len != topology_owner.catalog_prefix.len + 64) return error.InvalidGraphMetricBuildManifest;
+        const id: topology_owner.Id = key[topology_owner.catalog_prefix.len..][0..64].*;
+        var owner = try topology_owner.Record.decode(entry.?.value);
+        cur.close();
+        cur_open = false;
+        if (owner.state != .deleting) {
+            var retained = false;
+            const current_plan = batch.get(graph_metric_partition_plan_key) catch |err| switch (err) {
+                error.NotFound => "",
+                else => return err,
+            };
+            const current_identity = topology_owner.identity(owner.filter, current_plan);
+            if (owner.state == .sealed and owner.format_epoch == topology_owner.epoch and
+                owner.generation == try readU64OrZero(&batch, graph_edge_generation_key) and std.mem.eql(u8, &current_identity, &owner.identity))
+            {
+                for (self.metric_configs) |cfg| {
+                    if (!graphMetricKindUsesIterativeBuild(cfg.kind)) continue;
+                    const filter = try topology_owner.filterDigest(temp, cfg.edge_filter);
+                    if (!std.mem.eql(u8, &filter, &owner.filter)) continue;
+                    const reverse = cfg.kind == .hits_authority or cfg.kind == .hits_hub;
+                    const ready = try topology_owner.readyKey(temp, owner.identity, reverse);
+                    if (batch.get(ready)) |raw| {
+                        if (std.mem.eql(u8, raw, &id)) {
+                            retained = true;
+                            break;
+                        }
+                    } else |err| if (err != error.NotFound) return err;
+                }
+            }
+            const pins = try topology_owner.pinsPrefix(temp, id);
+            var pin_cur = try batch.openCursor();
+            var pin_cur_open = true;
+            defer if (pin_cur_open) pin_cur.close();
+            var pin_entry = try pin_cur.seekAtOrAfter(pins);
+            var stale = std.ArrayListUnmanaged([]const u8).empty;
+            var examined: usize = 0;
+            var live = false;
+            while (pin_entry) |pin| : (pin_entry = try pin_cur.next()) {
+                if (!std.mem.startsWith(u8, pin.key, pins) or examined == 64) break;
+                examined += 1;
+                if (pin.value.len <= 16) return error.InvalidGraphMetricBuildManifest;
+                const job_id = std.mem.readInt(u64, pin.value[0..8], .little);
+                const fingerprint = std.mem.readInt(u64, pin.value[8..16], .little);
+                const metric = try temp.dupe(u8, pin.value[16..]);
+                var active = false;
+                if (self.metricConfig(metric)) |cfg| if (graphMetricConfigFingerprint(cfg) == fingerprint) {
+                    if (try self.metricBuildJob(&batch, metric)) |job| {
+                        active = owner.format_epoch == topology_owner.epoch and job.job_id == job_id and job.target_generation == owner.generation and
+                            job.phase != .complete and job.last_error.len == 0 and job.phase != .cleanup_old_generations;
+                        if (active) {
+                            const binding = try self.topologyBinding(&batch, metric, job_id);
+                            active = if (binding) |b| std.mem.eql(u8, &b.id, &id) else false;
+                        }
+                    }
+                };
+                if (active) {
+                    live = true;
+                    break;
+                }
+                try stale.append(temp, try temp.dupe(u8, pin.key));
+            }
+            const more_pins = pin_entry != null and std.mem.startsWith(u8, pin_entry.?.key, pins);
+            pin_cur.close();
+            pin_cur_open = false;
+            for (stale.items) |stale_key| try batch.delete(stale_key);
+            if (live or retained) {
+                const pruned = try self.cleanupTopologyAttemptInBatch(&batch, temp, id);
+                try batch.put(topology_owner.gc_cursor_key, key);
+                try batch.commit();
+                // Cursor-only census progress is not eligible work: reporting
+                // it keeps multi-worker idle loops alive indefinitely as they
+                // wrap the catalog. Periodic sweeps continue the census even
+                // when there are no numerical jobs or reclamation writes.
+                return .{ .progressed = stale.items.len + pruned != 0, .removed = stale.items.len + pruned };
+            }
+            if (more_pins) {
+                // Resume this owner, not the next one, after a bounded pin page.
+                try batch.commit();
+                return .{ .progressed = stale.items.len != 0, .removed = stale.items.len };
+            }
+            owner.state = .deleting;
+            try batch.put(key, &owner.encode());
+            for ([_]bool{ false, true }) |reverse| {
+                const ready = try topology_owner.readyKey(temp, owner.identity, reverse);
+                if (batch.get(ready)) |raw| {
+                    if (std.mem.eql(u8, raw, &id)) try batch.delete(ready);
+                } else |err| if (err != error.NotFound) return err;
+            }
+        }
+        const prefix = try topology_owner.dataPrefix(temp, id);
+        var deleted = try self.deleteKeysWithPrefixPageInBatch(&batch, prefix, "", graph_metric_build_cleanup_delete_page_units);
+        defer deleted.deinit(self.alloc);
+        // Deleting from the beginning is a durable resume cursor: removed keys
+        // cannot reappear, and no job can bind to or write a deleting owner.
+        if (deleted.reached_end) {
+            try batch.delete(key);
+            try batch.put(topology_owner.gc_cursor_key, key);
+        }
+        try batch.commit();
+        return .{ .progressed = true, .removed = deleted.removed + @intFromBool(deleted.reached_end) };
+    }
+
+    fn cleanupTopologyAttemptInBatch(self: *GraphIndex, batch: anytype, temp: Allocator, id: topology_owner.Id) !usize {
+        const data = try topology_owner.dataPrefix(temp, id);
+        const tasks = try std.fmt.allocPrint(temp, "{s}retired/", .{data});
+        const task = blk: {
+            var cur = try batch.openCursor();
+            defer cur.close();
+            const entry = try cur.seekAtOrAfter(tasks) orelse return 0;
+            if (!std.mem.startsWith(u8, entry.key, tasks)) return 0;
+            break :blk .{ .key = try temp.dupe(u8, entry.key), .prefix = try temp.dupe(u8, entry.value) };
+        };
+        const packed_prefix = try std.fmt.allocPrint(temp, "{s}adjacency-packed/", .{data});
+        if (!std.mem.startsWith(u8, task.prefix, packed_prefix) or !std.mem.endsWith(u8, task.prefix, "/") or
+            std.mem.indexOf(u8, task.prefix[packed_prefix.len..], "/data/") == null)
+            return error.InvalidGraphMetricBuildManifest;
+        const separator = packed_prefix.len + std.mem.indexOf(u8, task.prefix[packed_prefix.len..], "/data/").?;
+        const attempt_text = task.prefix[separator + 6 .. task.prefix.len - 1];
+        if (attempt_text.len != 20) return error.InvalidGraphMetricBuildManifest;
+        const attempt = std.fmt.parseInt(u64, attempt_text, 10) catch return error.InvalidGraphMetricBuildManifest;
+        const base = task.prefix[0 .. separator + 1];
+        const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
+        if (batch.get(receipt_key)) |raw| {
+            if ((try adjacency_blocks.Receipt.decode(raw)).attempt == attempt) return error.InvalidGraphMetricBuildManifest;
+        } else |err| switch (err) {
+            error.NotFound => {
+                const state_key = try std.fmt.allocPrint(temp, "{s}state", .{base});
+                const state = try adjacency_blocks.State.decode(try batch.get(state_key));
+                if (state.attempt == attempt) return error.InvalidGraphMetricBuildManifest;
+            },
+            else => return err,
+        }
+        var deleted = try self.deleteKeysWithPrefixPageInBatch(batch, task.prefix, "", graph_metric_build_cleanup_delete_page_units);
+        defer deleted.deinit(self.alloc);
+        if (deleted.reached_end) try batch.delete(task.key);
+        return deleted.removed + @intFromBool(deleted.reached_end);
+    }
+
     fn graphMetricBuildJobNamespacePrefixAlloc(self: *GraphIndex, metric_name: []const u8, job_id: u64) ![]u8 {
         const job_id_text = try std.fmt.allocPrint(self.alloc, "{d}", .{job_id});
         defer self.alloc.free(job_id_text);
@@ -13718,6 +14114,7 @@ pub const GraphIndex = struct {
     ) !GraphMetricAttemptAdoptionResult {
         const current_page = try self.metricBuildPage(batch, metric_name, job_id, .scan_edges_and_out_degree, page.iteration, page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(page, current_page);
+        try self.requireMutableTopology(batch, metric_name, job_id);
         const out_degree_prefix = try self.graphMetricBuildAttemptPageRankOutDegreePartialPrefixAlloc(metric_name, job_id, .scan_edges_and_out_degree, page.iteration, page.page_id, page.attempt);
         defer self.alloc.free(out_degree_prefix);
         const node_prefix = try self.graphMetricBuildAttemptPageRankNodePartialPrefixAlloc(metric_name, job_id, .scan_edges_and_out_degree, page.iteration, page.page_id, page.attempt);
@@ -13789,10 +14186,12 @@ pub const GraphIndex = struct {
             self.alloc.free(total_keys);
             self.alloc.free(replacements);
         }
+        const total_prefix = try self.topologyComponentPrefix(batch, metric_name, job_id, "pagerank_out_degree_total");
+        defer self.alloc.free(total_prefix);
         for (out_degrees.items, 0..) |entry, i| {
             partial_keys[i] = try self.graphMetricBuildPageRankOutDegreePartialKeyAlloc(metric_name, job_id, entry.node, page.page_id);
             errdefer self.alloc.free(partial_keys[i]);
-            total_keys[i] = try self.graphMetricBuildPageRankOutDegreeKeyAlloc(metric_name, job_id, entry.node);
+            total_keys[i] = try topologyComponentKey(self.alloc, total_prefix, entry.node);
             replacements[i] = entry.value;
             initialized_keys += 1;
         }
@@ -15043,6 +15442,52 @@ pub const GraphIndex = struct {
         try self.releaseGraphMetricBuildLease(metric_name);
         release_needed = false;
         return try self.graphMetricStatus(metric_name);
+    }
+
+    pub const TopologyBuildBenchmark = struct {
+        physical_edge_units: u64 = 0,
+        checkpoints: usize = 0,
+        adopted: bool = false,
+    };
+
+    /// Benchmark fixture only. The reference removes the reuse directory entry
+    /// (not source data) to measure an independent build against an adopted one.
+    pub fn benchmarkTopologyBuild(self: *GraphIndex, metric: []const u8, reuse: bool) !TopologyBuildBenchmark {
+        const cfg = self.metricConfig(metric) orelse return error.InvalidBenchmarkResult;
+        if (!reuse) {
+            var batch = try self.beginWriteReverseBatch();
+            errdefer batch.abort();
+            const filter = try topology_owner.filterDigest(self.alloc, cfg.edge_filter);
+            const digest = topology_owner.identity(filter, try batch.get(graph_metric_partition_plan_key));
+            for ([_]bool{ false, true }) |reverse| {
+                const key = try topology_owner.readyKey(self.alloc, digest, reverse);
+                defer self.alloc.free(key);
+                batch.delete(key) catch |err| if (err != error.NotFound) return err;
+            }
+            try batch.commit();
+        }
+        var status = try self.ensureGraphMetricPlannedBuild(metric, self.edge_generation);
+        status.deinit(self.alloc);
+        var result = TopologyBuildBenchmark{};
+        const job_id = blk: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            const job = (try self.metricBuildJob(&txn, metric)).?;
+            result.adopted = (try self.topologyBinding(&txn, metric, job.job_id)).?.adopted;
+            break :blk job.job_id;
+        };
+        for (0..1_000_000) |_| {
+            const step = try self.runGraphMetricPlannedWorkerStep(metric, cfg, graph_metric_local_build_worker_id);
+            result.checkpoints += 1;
+            if (step.completed_page and (step.phase == .scan_edges_and_out_degree or step.phase == .iterate_contributions or step.phase == .hits_hub_contributions)) {
+                var txn = try self.beginReadReverseTxn();
+                defer txn.abort();
+                const page = (try self.metricBuildPage(&txn, metric, job_id, step.phase, 0, step.page_id)).?;
+                result.physical_edge_units += page.completed_units;
+            }
+            if (step.completed_build and step.phase == .cleanup_old_generations) return result;
+        }
+        return error.InvalidBenchmarkResult;
     }
 
     pub fn runEigenvectorMetricPlanned(self: *GraphIndex, metric_name: []const u8) !GraphMetricStatus {
@@ -17784,7 +18229,11 @@ test "graph metric ordinal iterations reuse immutable adjacency without numeric 
     };
     try drainGraphMetricBuildToPublishForTest(&graph, cfg.name, cfg, "worker", &.{ .prepare_generation, .scan_edges_and_out_degree, .initialize_ranks });
     {
-        const key = try graph.graphMetricMembershipKey(cfg.name, job.job_id, 0, 0);
+        const key = blk: {
+            var txn = try graph.beginReadReverseTxn();
+            defer txn.abort();
+            break :blk try graph.topologyKey(&txn, cfg.name, job.job_id, try graph.graphMetricMembershipKey(cfg.name, job.job_id, 0, 0));
+        };
         defer alloc.free(key);
         const saved = blk: {
             var batch = try graph.beginWriteReverseBatch();
@@ -17812,7 +18261,11 @@ test "graph metric ordinal iterations reuse immutable adjacency without numeric 
         try batch.commit();
     }
     {
-        const missing_key = try GraphIndex.graphMetricNodeSlotKey(alloc, cfg.name, job.job_id, "b");
+        const missing_key = blk: {
+            var txn = try graph.beginReadReverseTxn();
+            defer txn.abort();
+            break :blk try graph.topologyKey(&txn, cfg.name, job.job_id, try GraphIndex.graphMetricNodeSlotKey(alloc, cfg.name, job.job_id, "b"));
+        };
         defer alloc.free(missing_key);
         var saved: [8]u8 = undefined;
         {
@@ -17841,7 +18294,11 @@ test "graph metric ordinal iterations reuse immutable adjacency without numeric 
     }
     const namespace = try graph.graphMetricBuildJobNamespacePrefixAlloc(cfg.name, job.job_id);
     defer alloc.free(namespace);
-    const prefix = try std.fmt.allocPrint(alloc, "{s}adjacency-packed/", .{namespace});
+    const prefix = blk: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        break :blk try graph.topologyKey(&txn, cfg.name, job.job_id, try std.fmt.allocPrint(alloc, "{s}adjacency-packed/", .{namespace}));
+    };
     defer alloc.free(prefix);
     var first_digest: ?u64 = null;
     for (0..3) |iteration| {
@@ -17961,6 +18418,218 @@ test "graph metric ordinal fold bounds hot shards and resumes across reopen and 
     const raw = try graph.pageRankContributionsForNodesAlloc(&txn, "rank", 1, 0, &nodes);
     defer alloc.free(raw);
     try std.testing.expectEqualSlices(f64, &.{ 10 * 256, 15 * 256 }, raw);
+}
+
+test "graph metric shared topology survives producer cleanup and reopen across numerical kinds" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-shared-topology");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-shared-topology");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{
+        .{ .name = "authority", .kind = .hits_authority, .refresh = .manual, .max_iterations = 2 },
+        .{ .name = "rank", .kind = .pagerank, .refresh = .manual, .max_iterations = 2 },
+        .{ .name = "eigen", .kind = .eigenvector, .refresh = .manual, .max_iterations = 2 },
+    };
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
+    try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
+    try graph.addEdge("c", "a", "cites", 1, 0, 0, "");
+    var started = try graph.ensureGraphMetricPlannedBuild("authority", graph.edge_generation);
+    started.deinit(alloc);
+    const owner = blk: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const job = (try graph.metricBuildJob(&txn, "authority")).?;
+        const binding = (try graph.topologyBinding(&txn, "authority", job.job_id)).?;
+        try std.testing.expect(!binding.adopted);
+        break :blk binding.id;
+    };
+    var published = try graph.runGraphMetricPlannedActive("authority", configs[0]);
+    published.deinit(alloc);
+    graph.close();
+    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    for (configs[1..]) |cfg| {
+        var building = try graph.ensureGraphMetricPlannedBuild(cfg.name, graph.edge_generation);
+        building.deinit(alloc);
+        {
+            var txn = try graph.beginReadReverseTxn();
+            defer txn.abort();
+            const job = (try graph.metricBuildJob(&txn, cfg.name)).?;
+            const binding = (try graph.topologyBinding(&txn, cfg.name, job.job_id)).?;
+            try std.testing.expect(binding.adopted);
+            try std.testing.expectEqualSlices(u8, &owner, &binding.id);
+            for ([_]GraphIndex.GraphMetricBuildPhase{ .scan_edges_and_out_degree, .iterate_contributions }) |phase| {
+                const page = (try graph.metricBuildPage(&txn, cfg.name, job.job_id, phase, 0, GraphIndex.graphMetricBuildPhasePageIdBase(cfg.kind, phase))).?;
+                try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
+                try std.testing.expectEqual(@as(u64, 0), page.attempt);
+            }
+        }
+        var result = try graph.runGraphMetricPlannedActive(cfg.name, cfg);
+        result.deinit(alloc);
+        const expected: f64 = if (cfg.kind == .pagerank) 1.0 / 3.0 else 1.0 / @sqrt(@as(f64, 3));
+        for ([_][]const u8{ "a", "b", "c" }) |node| try std.testing.expectApproxEqAbs(expected, (try graph.graphMetricScore(cfg.name, node)).?, 1e-12);
+    }
+    // Empty configuration must not leave the owner or stale job pins behind.
+    const saved_configs = graph.metric_configs;
+    graph.metric_configs = &.{};
+    defer graph.metric_configs = saved_configs;
+    for (0..8) |_| _ = try graph.cleanupGraphMetricTopologyPage();
+    var txn = try graph.beginReadReverseTxn();
+    defer txn.abort();
+    const key = try topology_owner.catalogKey(alloc, owner);
+    defer alloc.free(key);
+    try std.testing.expectError(error.NotFound, txn.get(key));
+    const pins = try topology_owner.pinsPrefix(alloc, owner);
+    defer alloc.free(pins);
+    try std.testing.expect(!try graph.hasKeysWithPrefixInBatch(&txn, pins));
+}
+
+test "graph metric shared topology isolates concurrent producers and fences bounded reclamation" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-topology-fencing");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-topology-fencing");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{
+        .{ .name = "first", .kind = .pagerank, .refresh = .manual, .max_iterations = 1 },
+        .{ .name = "second", .kind = .pagerank, .refresh = .manual, .max_iterations = 1, .damping = 0.5 },
+        .{ .name = "consumer", .kind = .eigenvector, .refresh = .manual, .max_iterations = 1 },
+    };
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
+    var owners: [2]topology_owner.Id = undefined;
+    for (configs[0..2], 0..) |cfg, i| {
+        var started = try graph.ensureGraphMetricPlannedBuild(cfg.name, graph.edge_generation);
+        started.deinit(alloc);
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const job = (try graph.metricBuildJob(&txn, cfg.name)).?;
+        const binding = (try graph.topologyBinding(&txn, cfg.name, job.job_id)).?;
+        try std.testing.expect(!binding.adopted);
+        owners[i] = binding.id;
+    }
+    try std.testing.expect(!std.mem.eql(u8, &owners[0], &owners[1]));
+    for (configs[0..2]) |cfg| {
+        var result = try graph.runGraphMetricPlannedActive(cfg.name, cfg);
+        result.deinit(alloc);
+    }
+    var started = try graph.ensureGraphMetricPlannedBuild("consumer", graph.edge_generation);
+    started.deinit(alloc);
+    const consumer = blk: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const job = (try graph.metricBuildJob(&txn, "consumer")).?;
+        const binding = (try graph.topologyBinding(&txn, "consumer", job.job_id)).?;
+        try std.testing.expect(binding.adopted);
+        try std.testing.expectEqualSlices(u8, &owners[0], &binding.id);
+        break :blk try graph.cloneGraphMetricBuildJobAlloc(job);
+    };
+    defer graph.deinitClonedGraphMetricBuildJob(consumer);
+    // A graph mutation invalidates reuse but cannot reclaim an active pin.
+    try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
+    for (0..8) |_| _ = try graph.cleanupGraphMetricTopologyPage();
+    const owner_key = try topology_owner.catalogKey(alloc, owners[0]);
+    defer alloc.free(owner_key);
+    const data = try topology_owner.dataPrefix(alloc, owners[0]);
+    defer alloc.free(data);
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        _ = try batch.get(owner_key);
+        var completed = consumer;
+        completed.phase = .complete;
+        try graph.putGraphMetricBuildJobInBatch(&batch, "consumer", completed);
+        for (0..5000) |i| {
+            const key = try std.fmt.allocPrint(alloc, "{s}gc-fixture/{d:0>8}", .{ data, i });
+            defer alloc.free(key);
+            try batch.put(key, "x");
+        }
+        batch.delete(topology_owner.gc_cursor_key) catch |err| if (err != error.NotFound) return err;
+        try batch.commit();
+    }
+    try std.testing.expect(try graph.cleanupGraphMetricTopologyPage());
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        const record = try topology_owner.Record.decode(try txn.get(owner_key));
+        try std.testing.expectEqual(topology_owner.State.deleting, record.state);
+        try std.testing.expect(try graph.hasKeysWithPrefixInBatch(&txn, data));
+        try std.testing.expectError(error.GraphMetricBuildSuperseded, graph.topologyBinding(&txn, "consumer", consumer.job_id));
+    }
+    graph.close();
+    graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    for (0..32) |_| _ = try graph.cleanupGraphMetricTopologyPage();
+    var txn = try graph.beginReadReverseTxn();
+    defer txn.abort();
+    try std.testing.expectError(error.NotFound, txn.get(owner_key));
+    try std.testing.expect(!try graph.hasKeysWithPrefixInBatch(&txn, data));
+}
+
+test "graph metric shared topology canonicalizes filters and retires removed filters without graph writes" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-topology-filters");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-topology-filters");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{
+        .{ .name = "first", .kind = .pagerank, .refresh = .manual, .max_iterations = 1, .edge_filter = .{ .mode = .types, .types = &.{ "mentions", "cites" } } },
+        .{ .name = "alias", .kind = .pagerank, .refresh = .manual, .max_iterations = 2, .damping = 0.5, .edge_filter = .{ .mode = .types, .types = &.{ "cites", "mentions" } } },
+        .{ .name = "changed", .kind = .pagerank, .refresh = .manual, .max_iterations = 1, .edge_filter = .{ .mode = .types, .types = &.{"cites"} } },
+    };
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
+    try graph.addEdge("b", "a", "mentions", 1, 0, 0, "");
+    try graph.addEdge("c", "a", "excluded", 1, 0, 0, "");
+    var owners: [3]topology_owner.Id = undefined;
+    for (configs, 0..) |cfg, i| {
+        var started = try graph.ensureGraphMetricPlannedBuild(cfg.name, graph.edge_generation);
+        started.deinit(alloc);
+        {
+            var txn = try graph.beginReadReverseTxn();
+            defer txn.abort();
+            const job = (try graph.metricBuildJob(&txn, cfg.name)).?;
+            const binding = (try graph.topologyBinding(&txn, cfg.name, job.job_id)).?;
+            try std.testing.expectEqual(i == 1, binding.adopted);
+            owners[i] = binding.id;
+        }
+        var result = try graph.runGraphMetricPlannedActive(cfg.name, cfg);
+        result.deinit(alloc);
+        try std.testing.expect((try graph.graphMetricScore(cfg.name, "c")) == null);
+    }
+    try std.testing.expectEqualSlices(u8, &owners[0], &owners[1]);
+    try std.testing.expect(!std.mem.eql(u8, &owners[0], &owners[2]));
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), (try graph.graphMetricScore("alias", "a")).?, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2875), (try graph.graphMetricScore("changed", "a")).?, 1e-12);
+    const saved_configs = graph.metric_configs;
+    graph.metric_configs = saved_configs[2..];
+    defer graph.metric_configs = saved_configs;
+    for (0..16) |_| _ = try graph.cleanupGraphMetricTopologyPage();
+    // Retained-owner census work must not keep a worker pool busy forever.
+    for (0..4) |_| try std.testing.expect(!(try graph.cleanupGraphMetricTopologyPageDetailed()).progressed);
+    var txn = try graph.beginReadReverseTxn();
+    defer txn.abort();
+    const obsolete = try topology_owner.catalogKey(alloc, owners[0]);
+    defer alloc.free(obsolete);
+    try std.testing.expectError(error.NotFound, txn.get(obsolete));
+    const retained = try topology_owner.catalogKey(alloc, owners[2]);
+    defer alloc.free(retained);
+    _ = try topology_owner.Record.decode(try txn.get(retained));
 }
 
 test "graph metric membership initializes all vector lanes without producer rediscovery" {
@@ -18298,6 +18967,7 @@ test "graph metric ordinal packing densifies fragmented output and fences incomp
     const options = GraphIndexOptions{ .metric_configs = &.{cfg}, .reverse_lsm_options = .{ .flush_threshold = 8192 } };
     const job = GraphIndex.GraphMetricBuildJob{ .job_id = 1, .phase = .reduce_ranks };
     const page = GraphIndex.GraphMetricBuildPage{ .job_id = 1, .phase = .reduce_ranks, .page_id = graph_metric_build_summary_leaf_base, .state = .leased, .range_kind = .summary, .worker_id = "original", .attempt = 1, .lease_expires_at_ms = 100, .total_units = 1 };
+    const owner_id: topology_owner.Id = @splat('c');
     const slot: u64 = @as(u64, 1) << 32;
     const chunk = slot / vector_chunk.entries;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -18309,12 +18979,19 @@ test "graph metric ordinal packing densifies fragmented output and fences incomp
         {
             var batch = try graph.beginWriteReverseBatch();
             errdefer batch.abort();
+            const owner = topology_owner.Record{ .generation = 0, .identity = @splat(3), .filter = try topology_owner.filterDigest(temp, cfg.edge_filter), .bidirectional = false };
+            try batch.put(try topology_owner.catalogKey(temp, owner_id), &owner.encode());
+            const binding_key = try graph.topologyBindingKey("rank", 1);
+            defer alloc.free(binding_key);
+            try batch.put(binding_key, &(topology_owner.Binding{ .id = owner_id, .adopted = false }).encode());
             try graph.putGraphMetricBuildManifestInBatch(&batch, "rank", .{ .job_id = 1, .node_count = 1 });
             try graph.putGraphMetricBuildPageInBatch(&batch, "rank", .{ .job_id = 1, .phase = .initialize_ranks, .page_id = graph_metric_build_summary_leaf_base, .range_kind = .summary, .state = .complete, .completed_units = 1, .total_units = 1 });
             try graph.writeGraphMetricMembership(&batch, "rank", 1, 0, 0, &.{"a"});
             try graph.putGraphMetricBuildPageInBatch(&batch, "rank", page);
             try graph.putGraphMetricBuildPageInBatch(&batch, "rank", .{ .job_id = 1, .phase = .iterate_contributions, .page_id = 3, .state = .complete, .attempt = 2 });
-            try GraphIndex.putU64(&batch, try GraphIndex.graphMetricNodeSlotKey(temp, "rank", 1, "a"), slot);
+            const slot_key = try graph.topologyKey(&batch, "rank", 1, try GraphIndex.graphMetricNodeSlotKey(alloc, "rank", 1, "a"));
+            defer alloc.free(slot_key);
+            try GraphIndex.putU64(&batch, slot_key, slot);
             const node_key = try graph.graphMetricBuildPageRankNodePartialKeyAlloc("rank", 1, "a", 0);
             defer alloc.free(node_key);
             try GraphIndex.putU64(&batch, node_key, 1);
@@ -18334,7 +19011,11 @@ test "graph metric ordinal packing densifies fragmented output and fences incomp
     }
     var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
     defer graph.close();
-    const base = try graph.packedAdjacencyBaseAlloc("rank", 1, .iterate_contributions, chunk);
+    const base = blk: {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        break :blk try graph.topologyKey(&txn, "rank", 1, try graph.packedAdjacencyBaseAlloc("rank", 1, .iterate_contributions, chunk));
+    };
     defer alloc.free(base);
     const receipt_key = try std.fmt.allocPrint(temp, "{s}complete", .{base});
     try std.testing.expectEqual(@as(usize, 512), try graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
@@ -18349,6 +19030,24 @@ test "graph metric ordinal packing densifies fragmented output and fences incomp
     const replacement = (try graph.claimGraphMetricBuildPageAt("rank", 1, .reduce_ranks, 0, page.page_id, "replacement", 101)).?;
     try std.testing.expectError(error.GraphMetricBuildPageNotLeased, graph.compactOrdinalAdjacencyChunk("rank", job, page, .iterate_contributions, chunk, 512));
     for ([_]usize{ 512, 512, 2 }) |count| try std.testing.expectEqual(count, try graph.compactOrdinalAdjacencyChunk("rank", job, replacement, .iterate_contributions, chunk, 512));
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const abandoned = try std.fmt.allocPrint(temp, "{s}data/{d:0>20}/", .{ base, page.attempt });
+        const winning = try std.fmt.allocPrint(temp, "{s}data/{d:0>20}/", .{ base, replacement.attempt });
+        const data = try topology_owner.dataPrefix(temp, owner_id);
+        var digest: topology_owner.Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(abandoned, &digest, .{});
+        const task = try std.fmt.allocPrint(temp, "{s}retired/{s}", .{ data, std.fmt.bytesToHex(digest, .lower) });
+        try batch.put(task, winning);
+        try std.testing.expectError(error.InvalidGraphMetricBuildManifest, graph.cleanupTopologyAttemptInBatch(&batch, temp, owner_id));
+        try batch.put(task, abandoned);
+        // Three abandoned tiles plus their queue marker, never the winner.
+        try std.testing.expectEqual(@as(usize, 4), try graph.cleanupTopologyAttemptInBatch(&batch, temp, owner_id));
+        try std.testing.expectEqual(@as(usize, 0), try GraphIndex.countKeysWithPrefix(&batch, abandoned));
+        try std.testing.expectEqual(@as(usize, 5), try GraphIndex.countKeysWithPrefix(&batch, winning));
+        try batch.commit();
+    }
     const missing_key = try std.fmt.allocPrint(temp, "{s}data/{d:0>20}/{d:0>20}", .{ base, replacement.attempt, 2 });
     var saved: []const u8 = undefined;
     {
@@ -18784,13 +19483,13 @@ test "graph pagerank planned scan page writes durable out-degree intermediates" 
         const filtered_rank_key = graphMetricVectorSlotForTest(&graph, "pagerank", active_job.job_id, "rank", 0, "doc-d");
         try std.testing.expectEqual(@as(f64, 0.0), try filtered_rank_key.read(&txn));
 
-        const doc_a_out_total_key = try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, "doc-a");
+        const doc_a_out_total_key = try graph.topologyKey(&txn, "pagerank", active_job.job_id, try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, "doc-a"));
         defer alloc.free(doc_a_out_total_key);
         try std.testing.expectEqual(@as(u64, 2), try GraphIndex.readU64OrZero(&txn, doc_a_out_total_key));
-        const doc_b_out_total_key = try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, "doc-b");
+        const doc_b_out_total_key = try graph.topologyKey(&txn, "pagerank", active_job.job_id, try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, "doc-b"));
         defer alloc.free(doc_b_out_total_key);
         try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, doc_b_out_total_key));
-        const doc_c_out_total_key = try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, "doc-c");
+        const doc_c_out_total_key = try graph.topologyKey(&txn, "pagerank", active_job.job_id, try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, "doc-c"));
         defer alloc.free(doc_c_out_total_key);
         try std.testing.expectEqual(@as(u64, 0), try GraphIndex.readU64OrZero(&txn, doc_c_out_total_key));
     }
@@ -19125,7 +19824,7 @@ test "graph pagerank reclaimed initialize page overwrites stale rank output" {
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
-        const out_degree_key = try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, "doc-a");
+        const out_degree_key = try graph.topologyKey(&txn, "pagerank", active_job.job_id, try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, "doc-a"));
         defer alloc.free(out_degree_key);
         try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, out_degree_key));
         const rank_key = graphMetricVectorSlotForTest(&graph, "pagerank", active_job.job_id, "rank", 0, "doc-a");
@@ -19144,7 +19843,7 @@ test "graph pagerank reclaimed initialize page overwrites stale rank output" {
 
         const expected_rank = 1.0 / 3.0;
         inline for (.{ "doc-a", "doc-b", "doc-c" }) |node| {
-            const out_degree_key = try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, node);
+            const out_degree_key = try graph.topologyKey(&txn, "pagerank", active_job.job_id, try graph.graphMetricBuildPageRankOutDegreeKeyAlloc("pagerank", active_job.job_id, node));
             defer alloc.free(out_degree_key);
             const out_degree = try GraphIndex.readU64OrZero(&txn, out_degree_key);
             if (std.mem.eql(u8, node, "doc-b")) {
@@ -19855,7 +20554,7 @@ test "graph pagerank convergence page reclaim recomputes without stale partial s
 }
 
 fn graphMetricOrdinalValueForTest(graph: *GraphIndex, txn: anytype, metric: []const u8, job_id: u64, phase: GraphIndex.GraphMetricBuildPhase, iteration: u32, node: []const u8) !f64 {
-    const slot_key = try GraphIndex.graphMetricNodeSlotKey(graph.alloc, metric, job_id, node);
+    const slot_key = try graph.topologyKey(txn, metric, job_id, try GraphIndex.graphMetricNodeSlotKey(graph.alloc, metric, job_id, node));
     defer graph.alloc.free(slot_key);
     if (try GraphIndex.readU64OrZero(txn, slot_key) == 0) return 0;
     const values = graph.ordinalContributionsForNodesAlloc(txn, metric, job_id, phase, iteration, &.{node}) catch |err| switch (err) {
@@ -19875,7 +20574,7 @@ const GraphMetricVectorSlotForTest = struct {
     node: []const u8,
 
     fn read(self: @This(), txn: anytype) !f64 {
-        const key = try GraphIndex.graphMetricNodeSlotKey(self.graph.alloc, self.metric, self.job_id, self.node);
+        const key = try self.graph.topologyKey(txn, self.metric, self.job_id, try GraphIndex.graphMetricNodeSlotKey(self.graph.alloc, self.metric, self.job_id, self.node));
         defer self.graph.alloc.free(key);
         const slot = try GraphIndex.readU64OrZero(txn, key);
         if (slot == 0) return 0;

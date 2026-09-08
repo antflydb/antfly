@@ -145,10 +145,11 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next();
     var staged_only = false;
+    var topology_only = false;
     while (args.next()) |arg| {
-        if (!std.mem.eql(u8, arg, "--staged-only")) return error.InvalidArgument;
-        staged_only = true;
+        if (std.mem.eql(u8, arg, "--staged-only")) staged_only = true else if (std.mem.eql(u8, arg, "--topology-only")) topology_only = true else return error.InvalidArgument;
     }
+    if (topology_only) return benchmarkSharedTopology(init.io, &output);
     try benchmarkStagedQueries(init.io, &output);
     if (staged_only) return;
     try benchmarkStateful(&output);
@@ -322,6 +323,60 @@ pub fn main(init: std.process.Init) !void {
             try output.interface.writeByte('\n');
             try output.flush();
         }
+    }
+}
+
+fn benchmarkSharedTopology(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-shared-topology-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const store_path = try std.fmt.allocPrint(fixture, "{s}/store\x00", .{root});
+    const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
+    var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
+    defer store.close();
+    const configs = [_]antfly.graph.GraphMetricConfig{
+        .{ .name = "seed", .kind = .pagerank, .refresh = .manual, .max_iterations = 1 },
+        .{ .name = "candidate", .kind = .pagerank, .refresh = .manual, .max_iterations = 1, .damping = 0.5 },
+    };
+    var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "links", .{ .metric_configs = &configs });
+    defer index.close();
+    const ids = try fixture.alloc([]const u8, 1024);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
+    for (ids, 0..) |source, i| for (1..17) |offset| try index.addEdge(source, ids[(i + offset) % ids.len], "cites", 1, 0, 0, "");
+    var seed = try index.runPageRankMetricPlanned("seed");
+    seed.deinit(alloc);
+    for ([_]bool{ false, true }) |reuse| {
+        var samples: [5]u64 = undefined;
+        var measured: antfly.graph.GraphIndex.TopologyBuildBenchmark = undefined;
+        for (0..6) |sample| {
+            const start = antfly.platform_time.monotonicNs();
+            measured = try index.benchmarkTopologyBuild("candidate", reuse);
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (measured.adopted != reuse or measured.physical_edge_units != (if (reuse) @as(u64, 0) else 2 * 16 * ids.len)) return error.InvalidBenchmarkResult;
+            if (sample != 0) samples[sample - 1] = elapsed;
+            for (ids) |id| if (@abs((try index.graphMetricScore("candidate", id)).? - 1.0 / @as(f64, @floatFromInt(ids.len))) > 1e-12) return error.InvalidBenchmarkResult;
+            while (try index.cleanupRetiredGraphMetricScoreGenerationPage("candidate")) {}
+            for (0..16) |_| _ = try index.cleanupGraphMetricTopologyPage();
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const encoded = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reuse) "stateful_shared_topology" else "stateful_independent_topology",
+            .nodes = ids.len,
+            .edges = ids.len * 16,
+            .physical_edge_units = measured.physical_edge_units,
+            .checkpoints = measured.checkpoints,
+            .median_ns = samples[2],
+            .min_ns = samples[0],
+            .max_ns = samples[4],
+            .note = "default storage; complete one-iteration numerical job including publication and job cleanup; six samples, first discarded; excludes fixture writes, verification and topology GC; verifies every score and physical edge work",
+        }, .{});
+        try out.interface.writeAll(encoded);
+        try out.interface.writeByte('\n');
+        try out.flush();
     }
 }
 

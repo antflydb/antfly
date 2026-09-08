@@ -4755,9 +4755,9 @@ pub fn build(b: *std.Build) void {
 
     const serverless_default_filters = [_][]const u8{"serverless"};
     const serverless_tests = b.addTest(.{
-        // macOS ReleaseFast measured 8.09 GB for this root. Reserve realistic
+        // macOS ReleaseFast measured 10.74 GB for this root. Reserve realistic
         // compiler headroom for aggregate scheduling; Linux CI stays bounded.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
         .root_module = lib_test_mod,
         .filters = &serverless_default_filters,
         .test_runner = .{
@@ -8507,6 +8507,8 @@ pub fn build(b: *std.Build) void {
         "graph metric vector chunks",
         "graph metric ordinal",
         "graph metric membership",
+        "graph metric shared topology",
+        "topology receipts",
         "graph metric edge scan",
         "graph metric consumer barrier",
         "ordinal blocks",
@@ -8639,8 +8641,8 @@ pub fn build(b: *std.Build) void {
         "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
     };
     const graph_metric_remote_wire_tests = b.addTest(.{
-        // macOS ReleaseFast measured 7.62 GB for the API/remote-wire root.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+        // macOS ReleaseFast measured 10.80 GB with durable topology ownership.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
         .root_module = api_table_reads_docid_test_mod,
         .filters = &graph_metric_remote_wire_filters,
         .test_runner = .{

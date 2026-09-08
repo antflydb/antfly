@@ -5832,7 +5832,8 @@ pub const IndexManager = struct {
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        const entry_count = self.graphMetricScheduleEntryCount();
+        const metric_count = self.graphMetricScheduleEntryCount();
+        const entry_count = metric_count + self.graph_indexes.items.len;
         const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, entry_count);
         errdefer self.alloc.free(entries);
         var names_len: usize = 0;
@@ -5841,11 +5842,12 @@ pub const IndexManager = struct {
         }
         const names = try self.alloc.alloc(u8, names_len);
         errdefer self.alloc.free(names);
-        if (entry_count != 0) {
-            const start = self.graph_metric_worker_cursor.fetchAdd(1, .monotonic) % entry_count;
-            var schedule = GraphMetricScheduleIterator.init(self, start);
+        const start = if (entry_count == 0) 0 else self.graph_metric_worker_cursor.fetchAdd(1, .monotonic) % entry_count;
+        if (metric_count != 0) {
+            var schedule = GraphMetricScheduleIterator.init(self, 0);
             var names_offset: usize = 0;
-            for (entries) |*snapshot_entry| {
+            for (0..metric_count) |i| {
+                const snapshot_entry = &entries[(i + start) % entry_count];
                 const scheduled = schedule.next();
                 const metric_name = names[names_offset..][0..scheduled.config.name.len];
                 @memcpy(metric_name, scheduled.config.name);
@@ -5857,6 +5859,15 @@ pub const IndexManager = struct {
                 };
             }
             std.debug.assert(names_offset == names.len);
+        }
+        // Index-scoped topology reclamation must survive removal of the last
+        // metric. Rotate these entries with numerical work to avoid starvation.
+        for (self.graph_indexes.items, 0..) |*entry, i| {
+            entries[(metric_count + i + start) % entry_count] = .{
+                .entry = entry,
+                .metric_name = "",
+                .lifecycle_canonical = false,
+            };
         }
         _ = self.graph_metric_schedule_pins.fetchAdd(1, .acq_rel);
         return .{ .manager = self, .entries = entries, .names = names };
@@ -6397,6 +6408,15 @@ pub const IndexManager = struct {
                 return result;
             }
 
+            if (metric_name.len == 0) {
+                const topology = try entry.index.cleanupGraphMetricTopologyPageDetailed();
+                if (topology.removed != 0) {
+                    result.worker_steps += 1;
+                    result.pages_completed += 1;
+                    result.retired_input_records += topology.removed;
+                }
+                continue;
+            }
             if (try entry.index.cleanupDeletedGraphMetricMaterializationPage(metric_name)) {
                 result.metrics_scanned += 1;
                 result.worker_steps += 1;

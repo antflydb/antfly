@@ -6,6 +6,41 @@ measured samples per case; tables report medians. This was a shared development
 host, not an isolated benchmark machine.
 The compact-query comparison below uses 21 measured samples instead of five.
 
+## Durable cross-job topology reuse
+
+Measured 2026-09-08 with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --topology-only
+```
+
+The real default-storage fixture has 1,024 nodes and 16,384 directed edges,
+with 16 neighbors per node. A first PageRank job prepares topology; a differently
+configured PageRank job then executes one numerical iteration. The independent
+reference forces a reuse-directory miss; the shared case adopts the sealed
+owner. Both use the same implementation, numerical seed, and graph, and verify
+every published score equals `1/1024`. Six samples per case, first discarded:
+
+| Complete numerical job | Physical edge records read | Worker/coordinator checkpoints | Median time |
+| --- | ---: | ---: | ---: |
+| Independent topology | 32,768 | 638 | 79.346 s |
+| Shared topology | 0 | 110 | 18.573 s |
+
+This is a 4.27× median improvement on this fixture, with 82.8% fewer checkpoints.
+Times include planning, initialization, numerical reduction, publication and
+job cleanup. They exclude fixture writes, score verification, and maintenance
+of retired score generations and topology owners between samples. The reference
+also includes the constant-size transaction forcing a directory miss. Sample
+ranges were 58.172–105.075 s and 17.436–19.115 s. Compilers were running on the
+shared development host; a profile of an independent build showed substantial
+native LSM compaction work. These times are not an isolated-host throughput
+claim, and longer numerical runs amortize preparation over more iterations.
+
+Lifecycle tests additionally cover HITS-to-PageRank/eigenvector adoption,
+producer cleanup and reopen, filter-set canonicalization, independent concurrent
+producers, generation pins, deleted filters/metrics, bounded crash-resumable
+reclamation, and rejection of retirement tasks targeting winning packed tiles.
+
 ## Shared admission, sparse work, and publication checkpoints
 
 Measured 2026-09-08 on the same host/toolchain with

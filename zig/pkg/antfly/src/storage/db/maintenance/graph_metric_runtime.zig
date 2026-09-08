@@ -8663,14 +8663,24 @@ test "db graph metric runtime planned maintenance reports budget exhaustion and 
     try std.testing.expect(saw_budget_exhausted);
     try std.testing.expect(finished);
 
-    const no_work = try db.runGraphMetricPlannedMaintenanceForIdle(.{
-        .worker_id = "planned-maintenance-budgeted",
-        .max_rounds = 1,
-        .max_metrics_per_round = 8,
-        .max_pages_per_round = 1,
-    });
-    try std.testing.expect(!no_work.budget_exhausted);
-    try std.testing.expect(!no_work.durableProgressed());
+    // The numerical job is complete, but its topology pin can still require a
+    // bounded reclamation checkpoint. Drain that independent lifecycle too.
+    var maintenance_idle = false;
+    for (0..8) |_| {
+        const no_work = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+            .worker_id = "planned-maintenance-budgeted",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        });
+        try std.testing.expect(no_work.worker_steps <= 1);
+        if (!no_work.durableProgressed()) {
+            try std.testing.expect(!no_work.budget_exhausted);
+            maintenance_idle = true;
+            break;
+        }
+    }
+    try std.testing.expect(maintenance_idle);
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(!pending.hasWork());
