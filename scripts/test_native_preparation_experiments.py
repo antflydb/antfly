@@ -10,6 +10,18 @@ from native_preparation_experiments import (
 
 
 class NativePreparationTests(unittest.TestCase):
+    def test_stable_origin_treatment_requires_preserved_rows(self):
+        flags = {"ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS": "1"}
+        result = delete_preparation_evidence(
+            ["dense delete preserved rows index=vec rows=40"], flags
+        )
+        self.assertEqual(40, result["preserved_vector_rows"]["sum"])
+        for value in ("0", "-1", "nan"):
+            with self.assertRaises(RuntimeError):
+                delete_preparation_evidence(
+                    [f"dense delete preserved rows index=vec rows={value}"], flags
+                )
+
     def test_delete_treatments_require_saved_work(self):
         flags = {
             "ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES": "1",

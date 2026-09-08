@@ -73,6 +73,7 @@ class QualificationRunnerTest(unittest.TestCase):
                 "dense replay capture finish token=7 sequence=12 success=true applied_sequence_persisted=true\n"
                 "dense replay delete plan sequence=12 requested=8 unique=4\n"
                 "dense delete apply index=vector keys=4 vectors=4 reused_rows=120\n"
+                "dense delete preserved rows index=vector rows=120\n"
             )
             (arm / "qualification-summary.json").write_text(
                 json.dumps(

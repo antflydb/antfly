@@ -114,6 +114,9 @@ pub const HBCConfig = struct {
     no_meta_sync: bool = false,
     defer_page_mutation: bool = false,
     lazy_posting_maintenance: bool = false,
+    /// Default-off stable-origin experiment. Bounds remain conservative while
+    /// centroid statistics lag; this cap forces refresh under sustained churn.
+    stable_posting_origin_max_mutations: u32 = 0,
     auto_posting_maintenance_max_postings: usize = 0,
     centroid_directory_mode: CentroidDirectoryMode = .auto,
     flat_exact_min_postings: usize = 1024,

@@ -28030,6 +28030,138 @@ test "hbc reused delete vectors preserve eager payloads bounds and reopen" {
     }
 }
 
+test "hbc stable origins preserve rows without survivor reads and retain repair debt" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        calls: usize = 0,
+        fn vector(id: u64) [4]f32 {
+            return .{ @floatFromInt(id), 1, @floatFromInt(id % 7), @floatFromInt(id % 3) };
+        }
+        fn load(ctx: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return a.dupe(f32, &vector(id));
+        }
+    };
+    for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
+        for ([_]usize{ 8, 64 }) |count| {
+            var tp: TestPath = .{};
+            const path = tp.init();
+            defer tp.cleanup();
+            const config: HBCConfig = .{ .dims = 4, .metric = metric, .leaf_size = 16, .max_cached_vectors = 0, .stable_posting_origin_max_mutations = 4 };
+            var loader = Loader{};
+            var removed: u64 = 0;
+            var leaf_id: u64 = 0;
+            var saved_origin: [4]f32 = undefined;
+            var saved_radius: f32 = undefined;
+            {
+                var idx = try HBCIndex.open(alloc, path, config);
+                defer idx.close();
+                idx.setExternalVectorLoader(&loader, Loader.load);
+                for (1..count + 1) |id| {
+                    const v = Loader.vector(id);
+                    try idx.batchInsertWithMetadataOptions(&.{.{ .vector_id = id, .vector = &v, .metadata = "member" }}, .{ .skip_vector_store = true });
+                }
+                var original: QuantizedSet = undefined;
+                var expected: QuantizedSet = undefined;
+                {
+                    var txn = try idx.beginReadTxn();
+                    defer txn.abort();
+                    leaf_id = try idx.getVecLeaf(&txn, 1);
+                    var leaf = try idx.loadNode(&txn, leaf_id);
+                    defer leaf.deinit(alloc);
+                    try std.testing.expect(leaf.members.len >= 3);
+                    removed = leaf.members[0];
+                    @memcpy(&saved_origin, leaf.centroid);
+                    saved_radius = leaf.covering_radius;
+                    original = try idx.loadQuantized(&txn, leaf.id, leaf.parent == 0, leaf.members.len);
+                    defer original.deinit(alloc);
+                    const rows = try alloc.alloc(usize, leaf.members.len - 1);
+                    defer alloc.free(rows);
+                    for (rows, 0..) |*row, i| row.* = i + 1;
+                    expected = try original.selectRows(alloc, rows);
+                }
+                defer expected.deinit(alloc);
+                loader.calls = 0;
+                try idx.batchApplyOptions(&.{}, &.{removed}, .{ .preserve_delete_rows = true });
+                try std.testing.expectEqual(@as(usize, 0), loader.calls);
+                try std.testing.expect(idx.write_profile.delete_preserved_vector_rows > 0);
+                var txn = try idx.beginReadTxn();
+                defer txn.abort();
+                var leaf = try idx.loadNode(&txn, leaf_id);
+                defer leaf.deinit(alloc);
+                var actual = try idx.loadQuantized(&txn, leaf.id, leaf.parent == 0, leaf.members.len);
+                defer actual.deinit(alloc);
+                try std.testing.expectEqualDeep(expected, actual);
+                try std.testing.expect(leaf.posting_state.centroid_dirty);
+                try std.testing.expect(!leaf.posting_state.payload_dirty);
+            }
+            var idx = try HBCIndex.open(alloc, path, config);
+            defer idx.close();
+            idx.setExternalVectorLoader(&loader, Loader.load);
+            {
+                var txn = try idx.beginReadTxn();
+                defer txn.abort();
+                var leaf = try idx.loadNode(&txn, leaf_id);
+                defer leaf.deinit(alloc);
+                try std.testing.expectEqualSlices(f32, &saved_origin, leaf.centroid);
+                try std.testing.expectEqual(@as(u32, @bitCast(saved_radius)), @as(u32, @bitCast(leaf.covering_radius)));
+                try std.testing.expect(leaf.posting_state.centroid_dirty);
+                try std.testing.expectEqual(leaf.posting_state.mutation_version, leaf.posting_state.payload_version);
+            }
+            var results = try idx.search(&Loader.vector(removed), count);
+            defer results.deinit();
+            for (results.getHits()) |hit| try std.testing.expect(hit.vector_id != removed);
+            const repaired = try idx.repairDirtyPostings();
+            try std.testing.expect(repaired.centroid_refreshed > 0);
+            try std.testing.expectEqual(@as(u64, 0), (try idx.postingBacklogStats()).dirty_postings);
+        }
+    }
+}
+
+test "hbc stable origin churn bounds debt and disabling experiment repairs statistics" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    {
+        var idx = try HBCIndex.open(alloc, path, .{ .dims = 2, .leaf_size = 32, .metric = .l2_squared, .stable_posting_origin_max_mutations = 4 });
+        defer idx.close();
+        for (1..9) |id| try idx.insert(id, &.{ @floatFromInt(id), 0 });
+        for (0..12) |round| {
+            const replacement = [_]f32{ @floatFromInt(round + 10), 1 };
+            // Exercise the true mixed transaction, not only catalog's split
+            // delete/insert calls. A duplicate eager delete loses this path.
+            try idx.batchApplyOptions(&.{.{ .vector_id = 1, .vector = &replacement, .metadata = "replacement" }}, &.{1}, .{ .preserve_delete_rows = true });
+            var txn = try idx.beginReadTxn();
+            defer txn.abort();
+            var leaf = try idx.loadNode(&txn, idx.metadata.root_node);
+            defer leaf.deinit(alloc);
+            try std.testing.expect(leaf.posting_state.mutation_version -| leaf.posting_state.centroid_version <= 4);
+            for (leaf.members) |id| {
+                const v = if (id == 1) replacement else [_]f32{ @floatFromInt(id), 0 };
+                const distance = @sqrt(vec.distance(leaf.centroid, &v, .l2_squared));
+                try std.testing.expect(distance <= leaf.covering_radius + 0.0001);
+            }
+        }
+        try std.testing.expect(idx.write_profile.delete_preserved_vector_rows > 0);
+        // Leave one durable, serviceable but stale centroid for a reader that
+        // restarts without the experiment flag.
+        try idx.batchApplyOptions(&.{}, &.{2}, .{ .preserve_delete_rows = true });
+    }
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2, .leaf_size = 32, .metric = .l2_squared });
+    defer idx.close();
+    try idx.insert(9, &.{ 9, 0 });
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    var leaf = try idx.loadNode(&txn, idx.metadata.root_node);
+    defer leaf.deinit(alloc);
+    try std.testing.expect(!leaf.posting_state.centroid_dirty);
+    // Final members: replacement (21,1), originals 3..8, and new (9,0).
+    try std.testing.expectApproxEqAbs(@as(f32, 63.0 / 8.0), leaf.centroid[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 8.0), leaf.centroid[1], 0.0001);
+}
+
 test "delete removes vector" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};

@@ -9510,3 +9510,97 @@ reusable physical checkpoint chunks. Same-vector replacement elision is also
 intentionally excluded: the latest primary artifact is not proof of the vector
 revision represented by the existing HBC payload. Matched public batch-100
 50K/1M and mixed-workload results remain required before promotion.
+
+The subsequent combined-treatment 50K reversed pairs all passed qualification
+under `.benchmark-results/pr593-dense-delete-plan-ab-20260908/`. Both arms used
+staged readers, capture tracing, public batch 100 and 1,000 mixed write rows/s.
+The ReleaseFast binary SHA256 was
+`bc38c484dc43cfdcbf897ffd779db1a57a409a32c21180a5db8d85098e6c6c76`.
+Results below are control to candidate within each pair, not cross-pair bests.
+
+| Metric | Pair 1 | Pair 2 (candidate ran first) |
+| --- | --- | --- |
+| Ready seconds | 14.612 → 17.624 | 15.687 → 15.898 |
+| C30 QPS | 1,165.0 → 1,241.6 | 1,655.9 → 1,730.7 |
+| C30 p95 ms | 72.439 → 68.254 | 46.755 → 44.963 |
+| Live recall % | 98.42 → 98.30 | 98.47 → 98.41 |
+| Mixed write p95 ms | 287.183 → 199.270 | 150.672 → 152.332 |
+| Mixed query p95 ms | 75.822 → 68.066 | 58.615 → 61.154 |
+| Mixed QPS | 308.90 → 344.43 | 404.37 → 383.79 |
+| Mixed catch-up seconds | 1.395 → 0.841 | 0.944 → 0.626 |
+| Read-only phase peak RSS GB | 1.512 → 1.581 | 1.484 → 1.500 |
+| Mixed phase peak RSS GB | 1.548 → 1.437 | 1.192 → 1.378 |
+| Apply ms / 1,000 replayed rows | 838.90 → 688.80 | 794.92 → 692.70 |
+
+`scripts/summarize_dense_delete_experiment.py` attributes mixed apply through
+the final covered source sequence, excluding fresh insertion and later churn.
+It rejects failed/incomplete arms and duplicate replay sequences. Normalized
+apply work fell 17.9% and 12.9%; window counts changed from 24 to 43 and 32 to 44,
+so comparing individual windows alone would exaggerate the improvement.
+In pair 1, cumulative delta completed-worker wait was essentially unchanged
+(805.7 versus 796.8 ms), despite lower maximum individual stalls. Pair 2 totals
+were 1,390.8 versus 758.4 ms. These intervals are not additive with capture
+overlap or apply timers.
+
+Three Debug DB integration tests passed with both treatments enabled, including
+1,000-document batch-100 streaming activation/reopen. Thirty-three runner tests
+and three attribution tests passed. The earlier cold-client connection failure
+did not recur, but its precise cause was not established. Other builds/tests
+were active on this host; the reversed pairs do not establish an all-metric
+win, and no 1M qualification or default promotion is claimed.
+
+The remaining structural cost is eager whole-leaf refresh: pair 1's candidate
+still processed 1,647,680 surviving vector rows for 30,000 mixed updates.
+The proposed next design is stable, explicitly identified scoring origins,
+revision-aware row deletion/addition deltas, and bounded background recentering
+and repacking. Deletion can retain a conservative bound about an unchanged
+origin; insertion must expand it or disable pruning until safe. This requires
+coherent publication of row revisions, routing bounds and source coverage,
+bounded delta scan/recovery debt, and lease-safe reclamation. It is not yet
+implemented, and is distinct from merely moving the current rebuild to another
+thread or delaying maintenance without a debt limit.
+
+#### Stable scoring origins: first integrated mutation experiment (2026-09-08)
+
+`ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS` is default off. The first integrated
+stage selects surviving rows from a payload bound to the pre-delete membership
+and posting mutation version. Codes, per-row error metadata and scoring origin
+are copied unchanged; the old conservative routing sphere still covers the
+remaining subset. Membership, payload, mappings and posting state commit through
+the existing native capture/WAL and coherent search publication. No new float16
+plane or source-vector cache is introduced.
+
+Centroid statistics remain explicitly dirty while the payload version advances.
+Subsequent appends use the existing quantizer's scoring origin and expand the
+routing sphere about its unchanged anchor. A stale anchor is never weighted as
+an exact mean. The experiment caps centroid-version lag at 64 mutations; an
+exhausted cap falls back to authoritative refresh. Existing resource-governed
+posting/layout maintenance also drains debt. Single-row deletion defers the
+underfilled-leaf merge when rows were preserved, matching the background layout
+path instead of immediately rereading survivors. Disabling the experiment after
+restart refreshes stale statistics before incremental centroid arithmetic.
+
+Review also found a duplicate delete in the true mixed HBC transaction: an eager
+default-options pass preceded the intended options-aware pass. The first pass
+was removed; the retained pass preserves the full delete-before-insert contract.
+
+Debug coverage includes all three metrics and root/split leaves, bitwise selected
+payload parity, zero survivor loader calls during row-preserving deletion,
+reopen with explicit centroid debt, bounded repair, mixed replacement churn,
+radius coverage, cap enforcement and flag-off restart. Row selection rejects
+unordered/duplicate/out-of-range offsets and passes allocator-failure sweeps.
+Public storage integration tests passed for indexed overwrite/reopen and the
+1,000-document batch-100 native streaming/reopen path with the flag enabled.
+
+This is deliberately NOT yet the full requested long-term format: surviving
+rows are still compacted/copied into an aggregate payload, and generic WAL
+patch reconstruction still materializes aggregates. The cap can still force a
+foreground refresh. The remaining stage is revision-aware base-row references
+plus inserted row blocks, query-side bounded selection under generation leases,
+and off-writer chunk repacking with explicit admission/backpressure. Those pieces
+must replace, not merely hide, the remaining copy/rewrite work. The existing WAL
+has source-coverage/checksum identities and bounded delta chains, but those are
+not substitutes for row-level revision identity or chunk-level reclamation.
+
+Qualification is pending under
+`.benchmark-results/pr593-stable-origins-ab-20260908/`; no default is promoted.

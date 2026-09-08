@@ -17,6 +17,7 @@ REFINEMENTS = {
     "deferred_capture": ["ANTFLY_EXPERIMENT_DEFER_SOURCE_CAPTURE"],
     "coalesced_deletes": ["ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES"],
     "reused_delete_vectors": ["ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS"],
+    "stable_posting_origins": ["ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS"],
     "dense_delete_plan": [
         "ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES",
         "ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS",
@@ -151,6 +152,11 @@ def delete_preparation_evidence(lines, environment):
             "dense delete apply ",
             "reused_vector_rows",
         ),
+        (
+            "ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS",
+            "dense delete preserved rows ",
+            "preserved_vector_rows",
+        ),
     ):
         if environment.get(flag) != "1":
             continue
@@ -159,7 +165,7 @@ def delete_preparation_evidence(lines, environment):
             values = [
                 int(row["requested"]) - int(row["unique"])
                 if key == "deduplicated_keys"
-                else int(row["reused_rows"])
+                else int(row["rows"] if key == "preserved_vector_rows" else row["reused_rows"])
                 for row in rows
             ]
         except (KeyError, ValueError) as error:

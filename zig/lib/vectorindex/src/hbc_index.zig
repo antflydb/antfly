@@ -1276,10 +1276,11 @@ fn hasFreshStoredPayload(node: *const types.Node) bool {
 }
 
 fn shouldDeferPostingCentroidRefresh(self: anytype, node: *const types.Node) bool {
-    return node.is_leaf and
-        self.config.lazy_posting_maintenance and
-        node.centroid.len > 0 and
-        node.posting_state.centroid_dirty;
+    if (!node.is_leaf or node.centroid.len == 0 or !node.posting_state.centroid_dirty) return false;
+    const lag = node.posting_state.mutation_version -| node.posting_state.centroid_version;
+    const cap = self.config.stable_posting_origin_max_mutations;
+    if (cap != 0 and lag > cap) return false;
+    return self.config.lazy_posting_maintenance or (cap != 0 and lag > 1);
 }
 
 fn shouldDeferPostingPayloadRefresh(self: anytype, node: *const types.Node) bool {
@@ -6733,6 +6734,18 @@ fn expandL2RadiusAfterAppend(node: *types.Node, appended: []const f32) void {
     node.covering_radius = @max(node.covering_radius + @sqrt(shift_squared), @sqrt(appended_squared));
 }
 
+fn expandStableOriginRadius(metric: vec.DistanceMetric, node: *types.Node, appended: []const f32, added_count: usize) void {
+    // The routing anchor did not move. Never reconstruct a fictitious old
+    // mean and accumulate its shift into the sphere. Unknown old/new bounds
+    // remain unknown; @max must not silently hide a NaN and enable pruning.
+    const added_radius = coveringRadiusForMatrix(metric, node.centroid, appended, added_count);
+    node.covering_radius = if (std.math.isFinite(node.covering_radius) and node.covering_radius >= 0 and
+        std.math.isFinite(added_radius) and added_radius >= 0)
+        @max(node.covering_radius, added_radius)
+    else
+        std.math.nan(f32);
+}
+
 fn expandL2RadiusAfterBatchAppend(node: *types.Node, appended: []const f32, added_count: usize) void {
     if (added_count == 0) return;
     if (node.members.len == added_count) {
@@ -6877,6 +6890,7 @@ pub fn recomputeLeafCentroid(self: anytype, txn: anytype, leaf: *types.Node) !vo
 }
 
 fn applyLeafCentroidDelta(self: anytype, leaf: *types.Node, delta: []const f32) !void {
+    if (leaf.posting_state.mutation_version -| leaf.posting_state.centroid_version > 1) return error.StalePostingCentroid;
     if (leaf.members.len == 0) {
         @memset(leaf.centroid, 0);
         return;
@@ -7055,6 +7069,42 @@ fn batchDeleteTxn(self: anytype, txn: anytype, vector_ids: []const u64) !void {
     try batchDeleteTxnOptions(self, txn, vector_ids, .{});
 }
 
+/// Prepare against the OLD membership and payload version, before deleting
+/// keys or changing row positions. Publication remains in the same transaction
+/// as membership, routing and vector-to-leaf mappings. No source artifact reads.
+fn prepareDeletedLeafRows(self: anytype, txn: anytype, leaf: *const types.Node, deletes: []const u64, options: hbc_runtime.BatchInsertOptions) !?hbc_runtime.QuantizedSet {
+    if (!options.preserve_delete_rows or !self.config.use_quantization or
+        options.defer_quantized_rebuild or options.suppress_quantized_payload_persist or
+        leaf.posting_state.payload_dirty or leaf.members.len == 0 or
+        leaf.posting_state.payload_version != leaf.posting_state.mutation_version) return null;
+    if (self.config.stable_posting_origin_max_mutations == 0 or
+        leaf.posting_state.mutation_version -| leaf.posting_state.centroid_version >= self.config.stable_posting_origin_max_mutations) return null;
+    var rows = std.ArrayListUnmanaged(usize).empty;
+    defer rows.deinit(self.alloc);
+    try rows.ensureTotalCapacity(self.alloc, leaf.members.len);
+    for (leaf.members, 0..) |id, row| {
+        if (std.mem.indexOfScalar(u64, deletes, id) == null) rows.appendAssumeCapacity(row);
+    }
+    if (rows.items.len == 0 or rows.items.len == leaf.members.len) return null;
+    var old = (try loadQuantizedOwned(self, txn, leaf.id, usesNonQuantizedPayload(leaf), leaf.members.len, isNotFoundGeneric)) orelse return null;
+    defer old.deinit(self.alloc);
+    return try old.selectRows(self.alloc, rows.items);
+}
+
+fn saveDeletedLeafRows(self: anytype, txn: anytype, leaf: *types.Node, rows: *const hbc_runtime.QuantizedSet) !void {
+    if (rows.getCount() != leaf.members.len) return error.InvalidPostingRows;
+    try savePackedNodeValue(self, txn, leaf);
+    try self.putQuantizedCached(txn, leaf.id, rows);
+    try self.cacheQuantized(leaf.id, rows);
+    // Only the scoring payload is current. The centroid is a valid routing
+    // anchor, not the mean of the remaining membership; retain that debt.
+    posting.PostingStore.notePayloadRefreshed(leaf);
+    try posting.PostingStore.saveState(self, txn, leaf.id, leaf.posting_state);
+    try self.cacheNode(leaf);
+    try saveNodeSplitRange(self, txn, leaf, isNotFoundGeneric);
+    self.write_profile.delete_preserved_vector_rows += @intCast(leaf.members.len);
+}
+
 /// Eager deletion used to load every surviving vector twice: once for the
 /// centroid/radius and again for the scoring payload. Keep one leaf-scoped
 /// matrix, preserving the exact arithmetic, member order and dirty versions.
@@ -7144,13 +7194,18 @@ fn batchDeleteTxnOptions(self: anytype, txn: anytype, vector_ids: []const u64, o
         const remove_ids = try self.alloc.alloc(u64, group.len);
         defer self.alloc.free(remove_ids);
         for (group, 0..) |entry, i| remove_ids[i] = entry.vector_id;
+        var preserved_rows = try prepareDeletedLeafRows(self, txn, &leaf, remove_ids, options);
+        defer if (preserved_rows) |*rows| rows.deinit(self.alloc);
         const removed_count = try posting.PostingStore.removeMembers(self.alloc, &leaf, remove_ids);
         if (removed_count == 0) {
             group_start = group_end;
             continue;
         }
 
-        const leaf_refreshed = try tryRefreshDeletedLeaf(self, txn, &leaf, options);
+        const leaf_refreshed = if (preserved_rows) |*rows| blk: {
+            try saveDeletedLeafRows(self, txn, &leaf, rows);
+            break :blk true;
+        } else try tryRefreshDeletedLeaf(self, txn, &leaf, options);
         if (leaf_refreshed) {
             // Centroid, bounds, payload and state were saved together above.
         } else if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
@@ -7547,10 +7602,15 @@ fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_ru
     defer leaf.deinit(self.alloc);
     try leaf.ensureUnbacked(self.alloc);
 
+    var preserved_rows = try prepareDeletedLeafRows(self, txn, &leaf, &.{vector_id}, options);
+    defer if (preserved_rows) |*rows| rows.deinit(self.alloc);
     try posting.PostingStore.removeMember(self.alloc, &leaf, vector_id);
-    leaf.covering_radius = if (leaf.members.len == 0) 0 else std.math.nan(f32);
+    if (preserved_rows == null) leaf.covering_radius = if (leaf.members.len == 0) 0 else std.math.nan(f32);
 
-    const leaf_refreshed = try tryRefreshDeletedLeaf(self, txn, &leaf, options);
+    const leaf_refreshed = if (preserved_rows) |*rows| blk: {
+        try saveDeletedLeafRows(self, txn, &leaf, rows);
+        break :blk true;
+    } else try tryRefreshDeletedLeaf(self, txn, &leaf, options);
     if (leaf_refreshed) {
         // Centroid, bounds, payload and state were saved together above.
     } else if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
@@ -7586,7 +7646,10 @@ fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_ru
     } else {
         if (!leaf_refreshed) try self.saveNodeWithOptions(txn, &leaf, options);
 
-        if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) skip_merge: {
+        // Row-preserving deletion keeps the leaf serviceable and its centroid
+        // debt visible. The bounded layout-maintenance pass may merge it; do
+        // not immediately undo the read-free mutation with an eager merge.
+        if (preserved_rows == null and leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) skip_merge: {
             var parent = loadNode(self, txn, leaf.parent) catch |err| {
                 if (!isNotFoundGeneric(err)) return err;
                 // Dangling parent pointer: the leaf is already saved; skip
@@ -7903,6 +7966,10 @@ pub fn insertWithMetadataTxnOptions(
     var cosine_centroid_shift: f32 = 0;
     if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
+    } else if (leaf.posting_state.mutation_version -| leaf.posting_state.centroid_version > 1) {
+        // A stale anchor is not an exact mean. At the debt limit reconstruct
+        // statistics from authoritative members instead of weighting it.
+        try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
     } else if (leaf.centroid.len == 0) {
         leaf.centroid = try self.alloc.dupe(f32, effective_transformed);
         normalizeCentroidForMetric(self, leaf.centroid);
@@ -7918,7 +7985,9 @@ pub fn insertWithMetadataTxnOptions(
         );
         posting.PostingStore.noteCentroidRefreshed(&leaf);
     }
-    switch (self.config.metric) {
+    if (self.config.stable_posting_origin_max_mutations != 0 and leaf.posting_state.centroid_dirty) {
+        expandStableOriginRadius(self.config.metric, &leaf, effective_transformed, 1);
+    } else switch (self.config.metric) {
         .l2_squared => expandL2RadiusAfterAppend(&leaf, effective_transformed),
         .cosine => expandCosineRadiusAfterBatchAppend(&leaf, effective_transformed, 1, cosine_centroid_shift),
         .inner_product => leaf.covering_radius = std.math.nan(f32),
@@ -8979,7 +9048,7 @@ pub fn batchApplyOptions(
 ) !void {
     if (writes.len == 0 and deletes.len == 0) return;
     if (writes.len == 0) {
-        if (deletes.len == 1 and !options.defer_quantized_rebuild and !options.reuse_delete_vectors) return self.delete(deletes[0]);
+        if (deletes.len == 1 and !options.defer_quantized_rebuild and !options.reuse_delete_vectors and !options.preserve_delete_rows) return self.delete(deletes[0]);
 
         const Index = comptime childType(@TypeOf(self));
         const publishing = try beginPublishSearchStateIfSupported(self);
@@ -9016,8 +9085,6 @@ pub fn batchApplyOptions(
         try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
     errdefer abortVectorCacheMutationsIfSupported(self);
-
-    try batchDeleteTxn(self, &batch, deletes);
 
     var insert_options = options;
     // Replacement batches change membership before adding vectors back. Do
@@ -9607,6 +9674,8 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         var cosine_centroid_shift: f32 = 0;
         if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
             self.write_profile.posting_lazy_centroid_deferrals += 1;
+        } else if (leaf.posting_state.mutation_version -| leaf.posting_state.centroid_version > 1) {
+            try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
         } else if (leaf.centroid.len == 0) {
             leaf.centroid = try self.alloc.alloc(f32, dims);
             const denom: f32 = @floatFromInt(group_len);
@@ -9625,7 +9694,9 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             );
             posting.PostingStore.noteCentroidRefreshed(&leaf);
         }
-        switch (self.config.metric) {
+        if (self.config.stable_posting_origin_max_mutations != 0 and leaf.posting_state.centroid_dirty) {
+            expandStableOriginRadius(self.config.metric, &leaf, added_vectors, group_len);
+        } else switch (self.config.metric) {
             .l2_squared => expandL2RadiusAfterBatchAppend(&leaf, added_vectors, group_len),
             .cosine => expandCosineRadiusAfterBatchAppend(&leaf, added_vectors, group_len, cosine_centroid_shift),
             .inner_product => leaf.covering_radius = std.math.nan(f32),

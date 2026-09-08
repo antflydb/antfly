@@ -38,6 +38,59 @@ pub const QuantizedSet = union(enum) {
         };
     }
 
+    /// Copy an ordered subset without changing its scoring origin or error
+    /// metadata. The caller binds row offsets to one posting mutation version;
+    /// offsets from another membership revision must never be reused here.
+    pub fn selectRows(self: *const QuantizedSet, alloc: Allocator, rows: []const usize) !QuantizedSet {
+        const count = switch (self.*) {
+            .rabit => |set| set.getCount(),
+            .nonquant => |set| std.math.cast(usize, set.vectors.count) orelse return error.InvalidPostingRows,
+        };
+        for (rows, 0..) |row, i| {
+            if (row >= count or (i != 0 and row <= rows[i - 1])) return error.InvalidPostingRows;
+        }
+        var result: QuantizedSet = switch (self.*) {
+            .nonquant => .{ .nonquant = .{} },
+            .rabit => .{ .rabit = .{} },
+        };
+        errdefer result.deinit(alloc);
+        switch (self.*) {
+            .nonquant => |set| {
+                const dims = std.math.cast(usize, set.vectors.dims) orelse return error.InvalidPostingRows;
+                if (set.vectors.data.len != try std.math.mul(usize, count, dims)) return error.InvalidPostingRows;
+                result.nonquant.vectors = .{
+                    .dims = set.vectors.dims,
+                    .count = @intCast(rows.len),
+                    .data = try selectRowPlane(f32, alloc, set.vectors.data, dims, rows),
+                };
+            },
+            .rabit => |set| {
+                const width = std.math.cast(usize, set.codes.width) orelse return error.InvalidPostingRows;
+                if (width == 0 or set.codes.count != count or
+                    set.codes.data.len != try std.math.mul(usize, count, width) or
+                    set.centroid_distances.len != count or set.quantized_dot_products.len != count or
+                    (set.centroid_dot_products.len != 0 and set.centroid_dot_products.len != count) or
+                    (set.metric != .l2_squared and set.centroid_dot_products.len != count)) return error.InvalidPostingRows;
+                const out = &result.rabit;
+                out.metric = set.metric;
+                out.centroid_norm = set.centroid_norm;
+                out.centroid = try alloc.dupe(f32, set.centroid);
+                out.codes = .{ .count = @intCast(rows.len), .width = set.codes.width, .data = try selectRowPlane(u64, alloc, set.codes.data, width, rows) };
+                out.code_counts = try selectRowPlane(u32, alloc, set.code_counts, 1, rows);
+                out.centroid_distances = try selectRowPlane(f32, alloc, set.centroid_distances, 1, rows);
+                out.quantized_dot_products = try selectRowPlane(f32, alloc, set.quantized_dot_products, 1, rows);
+                if (set.centroid_dot_products.len != 0) out.centroid_dot_products = try selectRowPlane(f32, alloc, set.centroid_dot_products, 1, rows);
+            },
+        }
+        return result;
+    }
+
+    fn selectRowPlane(comptime T: type, alloc: Allocator, data: []const T, width: usize, rows: []const usize) ![]T {
+        const out = try alloc.alloc(T, try std.math.mul(usize, rows.len, width));
+        for (rows, 0..) |row, i| @memcpy(out[i * width ..][0..width], data[row * width ..][0..width]);
+        return out;
+    }
+
     pub fn deinit(self: *QuantizedSet, alloc: Allocator) void {
         switch (self.*) {
             .rabit => |*set| set.deinit(alloc),
@@ -46,6 +99,48 @@ pub const QuantizedSet = union(enum) {
         self.* = undefined;
     }
 };
+
+test "posting row selection preserves scoring origin and is allocation safe" {
+    const alloc = std.testing.allocator;
+    const Attempt = struct {
+        fn run(a: Allocator, source: *const QuantizedSet) !void {
+            var selected = try source.selectRows(a, &.{ 0, 2 });
+            defer selected.deinit(a);
+            switch (source.*) {
+                .nonquant => |set| {
+                    try std.testing.expectEqualSlices(f32, set.vectors.data[0..2], selected.nonquant.vectors.data[0..2]);
+                    try std.testing.expectEqualSlices(f32, set.vectors.data[4..6], selected.nonquant.vectors.data[2..4]);
+                },
+                .rabit => |set| {
+                    try std.testing.expectEqualSlices(f32, set.centroid, selected.rabit.centroid);
+                    try std.testing.expectEqual(set.centroid_norm, selected.rabit.centroid_norm);
+                    for ([_]usize{ 0, 2 }, 0..) |row, i| {
+                        try std.testing.expectEqualSlices(u64, set.codes.atConst(row), selected.rabit.codes.atConst(i));
+                        try std.testing.expectEqual(set.code_counts[row], selected.rabit.code_counts[i]);
+                        try std.testing.expectEqual(set.centroid_distances[row], selected.rabit.centroid_distances[i]);
+                        try std.testing.expectEqual(set.quantized_dot_products[row], selected.rabit.quantized_dot_products[i]);
+                    }
+                },
+            }
+        }
+    };
+    for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
+        var q = try @import("antfly_vector").quantizer.RaBitQuantizer.init(alloc, 2, 42, metric);
+        defer q.deinit();
+        var source: QuantizedSet = .{ .rabit = try q.quantize(&.{ 0.5, 0.5 }, &.{ 1, 2, 3, 4, 5, 6 }, 3) };
+        defer source.deinit(alloc);
+        try std.testing.checkAllAllocationFailures(alloc, Attempt.run, .{&source});
+        try std.testing.expectError(error.InvalidPostingRows, source.selectRows(alloc, &.{ 1, 1 }));
+        try std.testing.expectError(error.InvalidPostingRows, source.selectRows(alloc, &.{ 2, 0 }));
+        try std.testing.expectError(error.InvalidPostingRows, source.selectRows(alloc, &.{3}));
+        var empty = try source.selectRows(alloc, &.{});
+        defer empty.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), empty.getCount());
+    }
+    var source: QuantizedSet = .{ .nonquant = .{ .vectors = .{ .dims = 2, .count = 3, .data = try alloc.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 }) } } };
+    defer source.deinit(alloc);
+    try std.testing.checkAllAllocationFailures(alloc, Attempt.run, .{&source});
+}
 
 /// One immutable leaf scoring row borrowed from a generation lease. Keeping
 /// membership beside the fixed-width candidate plane removes the packed-node
@@ -193,6 +288,7 @@ pub const WriteProfile = struct {
     external_vector_cache_misses: u64 = 0,
     centroid_recompute_calls: u64 = 0,
     delete_reused_vector_rows: u64 = 0,
+    delete_preserved_vector_rows: u64 = 0,
     centroid_recompute_members_total: u64 = 0,
     centroid_recompute_members_max: u64 = 0,
     save_split_range_ns: u64 = 0,
@@ -294,6 +390,7 @@ pub const BatchInsertOptions = struct {
     /// Share one authoritative transformed leaf matrix between centroid and
     /// payload refresh on eager batch deletes. Does not defer either refresh.
     reuse_delete_vectors: bool = false,
+    preserve_delete_rows: bool = false,
     defer_quantized_rebuild: bool = false,
     defer_quantized_rebuild_to_bulk_finish: bool = false,
     centroid_only_routing: bool = false,
