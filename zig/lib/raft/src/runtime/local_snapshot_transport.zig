@@ -215,7 +215,10 @@ test "local snapshot transport sends and fetches snapshot bytes" {
         }
     };
 
-    const root_dir = "/tmp/antflydb-raft-local-snapshot-transport";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var transport = try LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer transport.deinit();
     const snapshot_bytes = try std.testing.allocator.dupe(u8, "snap-bytes");
