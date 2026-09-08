@@ -5049,7 +5049,18 @@ if the second attempt still exceeds the cap, it remains a failure. Both grants
 are released when rendering finishes, including cancellation/error cleanup.
 Regressions cover both output representations, denied growth, repeated failure,
 and cancellation. The newspaper renders at its existing 256 MiB ceiling in the
-isolated render-window probe; this alone is not end-to-end OCR qualification.
+isolated render-window probe. End-to-end verification of `afd021e81` with Metal
+and the pinned OHR fixtures additionally passes the three-document, nine-page
+forced-OCR text suite, including the newspaper, with no OCR failures and complete
+chunk/vector coverage. All three previously failing multi-table E2E cases pass.
+These are correctness checks, not an RC-versus-branch throughput comparison.
+
+The additional four-document, ten-page suite is not qualified: its required-OCR
+administrative scan produces no chunks or searchable vectors. The same scan
+fails in a fresh one-document process, without a reported OCR execution error;
+the failure does not require cross-document batching. Rendering, decoded OCR
+content and text-selection behavior still need separate diagnosis for that
+fixture. Successful admission must not be treated as proof of useful OCR output.
 
 `BackendRuntime` lazily owns one maintenance scheduler. TTL, transaction recovery,
 text merging, sparse compaction, enrichment, resolution/promotion, derived-index
