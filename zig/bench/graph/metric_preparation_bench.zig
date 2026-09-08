@@ -99,6 +99,7 @@ pub fn main(init: std.process.Init) !void {
     try benchmarkQuerySnapshots(init.io, &output);
     try benchmarkMembership(init.io, &output);
     try benchmarkOrdinalFold(&output);
+    try benchmarkSealedVectors(init.io, &output);
     try benchmarkCandidatePlanning(&output);
     try benchmarkAuthenticatedCache(init.io, &output);
     try benchmarkTopOwnership(&output);
@@ -131,6 +132,42 @@ pub fn main(init: std.process.Init) !void {
         }
         const segment = graph.Segment{ .adjacencies = adjacencies };
         const payload = try graph.encodeAlloc(alloc, segment);
+        if (nodes == 50_000) {
+            var expected: ?usize = null;
+            for ([_]bool{ true, false }) |reference| {
+                var times: [5]u64 = undefined;
+                var last = PhaseAllocStats{};
+                for (0..6) |sample| {
+                    var stats = PhaseAllocStats{};
+                    var tracking = PhaseTrackingAllocator{ .backing = std.heap.smp_allocator, .stats = &stats };
+                    const start = antfly.platform_time.monotonicNs();
+                    const checksum = try metric.benchmarkProjection(tracking.allocator(), payload, reference);
+                    const elapsed = antfly.platform_time.monotonicNs() - start;
+                    if (expected) |value| {
+                        if (value != checksum) return error.InvalidBenchmarkResult;
+                    } else expected = checksum;
+                    if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+                    if (sample != 0) times[sample - 1] = elapsed;
+                    last = stats;
+                }
+                std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+                const json = try std.json.Stringify.valueAlloc(alloc, .{
+                    .mode = if (reference) "projection_edge_copy_reference" else "projection_direct_csr",
+                    .nodes = nodes,
+                    .edges = nodes * degree,
+                    .median_ns = times[2],
+                    .min_ns = times[0],
+                    .max_ns = times[4],
+                    .allocation_count = last.alloc_count,
+                    .allocated_bytes = last.total_alloc_bytes,
+                    .peak_bytes = last.peak_bytes,
+                    .note = "source preparation and PageRank projection; exact CSR checksum equality; excludes fetch, kernels and upload",
+                }, .{});
+                try output.interface.writeAll(json);
+                try output.interface.writeByte('\n');
+                try output.flush();
+            }
+        }
         if (nodes == 50_000) for ([_]bool{ true, false }) |reference| {
             var times: [5]u64 = undefined;
             var last = PhaseAllocStats{};
@@ -633,6 +670,58 @@ fn benchmarkOrdinalFold(out: anytype) !void {
             .peak_bytes = last.peak_bytes,
             .sum = expected.?,
             .note = "warm vector cache; validates and folds the same tile repeatedly; includes constant fixture setup in time but excludes fixture allocations; no storage I/O or checkpoint commit",
+        }, .{});
+        defer alloc.free(json);
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkSealedVectors(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const root = try std.fmt.allocPrint(alloc, "/tmp/antfly-sealed-vector-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    defer alloc.free(root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const primary = try std.fmt.allocPrintSentinel(alloc, "{s}/primary", .{root}, 0);
+    defer alloc.free(primary);
+    const reverse = try std.fmt.allocPrintSentinel(alloc, "{s}/reverse", .{root}, 0);
+    defer alloc.free(reverse);
+    var store = try antfly.docstore.DocStore.open(alloc, primary, .{});
+    defer store.close();
+    var index = try antfly.graph.GraphIndex.open(alloc, &store, reverse, "links", .{});
+    defer index.close();
+    try index.prepareSealedVectorBenchmark();
+    for ([_]bool{ true, false }) |reference| {
+        var times: [5]u64 = undefined;
+        var last = PhaseAllocStats{};
+        var reads: usize = 0;
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            index.alloc = tracking.allocator();
+            defer index.alloc = alloc;
+            const start = antfly.platform_time.monotonicNs();
+            reads = try index.benchmarkSealedVectorGather(256, reference);
+            const elapsed = antfly.platform_time.monotonicNs() - start;
+            if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) times[sample - 1] = elapsed;
+            last = stats;
+        }
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(alloc, .{
+            .mode = if (reference) "vector_checkpoint_local_reference" else "vector_sealed_cross_checkpoint",
+            .nodes = 32768,
+            .gathers = 256 * 2048,
+            .checkpoints = 256,
+            .storage_chunks = reads,
+            .median_ns = times[2],
+            .min_ns = times[0],
+            .max_ns = times[4],
+            .allocation_count = last.alloc_count,
+            .allocated_bytes = last.total_alloc_bytes,
+            .peak_bytes = last.peak_bytes,
+            .note = "real default storage; uniform-source gathers and new read transactions; sealed cache starts empty; excludes fixture writes and fold/checkpoint commits; tracking excludes backend-owned allocations",
         }, .{});
         defer alloc.free(json);
         try out.interface.writeAll(json);

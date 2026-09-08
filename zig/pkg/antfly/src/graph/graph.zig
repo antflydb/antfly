@@ -795,6 +795,7 @@ pub const ReverseBackend = enum {
 };
 
 pub const GraphIndex = struct {
+    sealed_vectors: @import("sealed_vector_cache.zig").Cache = .{},
     alloc: Allocator,
     index_name: []const u8,
     outgoing_store: backend_erased.Store,
@@ -5737,6 +5738,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn close(self: *GraphIndex) void {
+        self.sealed_vectors.deinit(self.alloc);
         self.outgoing_store.deinit();
         self.outgoing_owner.close(self.alloc);
         self.reverse_store.deinit();
@@ -5746,6 +5748,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn abandonAfterCrash(self: *GraphIndex) void {
+        self.sealed_vectors.deinit(self.alloc);
         self.outgoing_store.deinit();
         self.outgoing_owner.abandonAfterCrash(self.alloc);
         self.reverse_store.deinit();
@@ -7080,7 +7083,7 @@ pub const GraphIndex = struct {
     // v9 packs producer fragments into dense, receipt-selected adjacency tiles.
     // v10 bounds partition census work; v11 seals canonical membership blocks.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 11;
+    const graph_metric_build_execution_schema_version: u64 = 12;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -7222,6 +7225,7 @@ pub const GraphIndex = struct {
     };
 
     pub const GraphMetricBuildWorkerStepResult = struct {
+        checkpointed_publication: bool = false,
         retired_input_records: usize = 0,
         phase: GraphMetricBuildPhase = .idle,
         page_id: u64 = 0,
@@ -9153,7 +9157,31 @@ pub const GraphIndex = struct {
 
     // Cached bytes belong to one read transaction and one vector lane/epoch.
     // A production fold reads at most 4096 edges, bounding this map as well.
-    const VectorReadCache = std.AutoHashMapUnmanaged(u64, ?[]const u8);
+    const VectorReadCache = struct {
+        const Map = std.AutoHashMapUnmanaged(u64, ?[]const u8);
+        pub const empty: @This() = .{};
+        map: Map = .empty,
+        owned: std.ArrayListUnmanaged([]u8) = .empty,
+        sealed: ?*@import("sealed_vector_cache.zig").Cache = null,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            for (self.owned.items) |bytes| alloc.free(bytes);
+            self.owned.deinit(alloc);
+            self.map.deinit(alloc);
+        }
+        fn contains(self: *@This(), chunk: u64) bool {
+            return self.map.contains(chunk);
+        }
+        fn count(self: *@This()) u32 {
+            return self.map.count();
+        }
+        fn get(self: *@This(), chunk: u64) ??[]const u8 {
+            return self.map.get(chunk);
+        }
+        fn put(self: *@This(), alloc: Allocator, chunk: u64, bytes: ?[]const u8) !void {
+            try self.map.put(alloc, chunk, bytes);
+        }
+    };
 
     fn readGraphMetricVectorSlotsAlloc(self: *GraphIndex, txn: anytype, metric_name: []const u8, job_id: u64, lane: []const u8, iteration: u32, slots: []const u64, required: bool) ![]f64 {
         var cache = VectorReadCache.empty;
@@ -9188,13 +9216,31 @@ pub const GraphIndex = struct {
         for (slots) |slot| {
             const chunk = slot / vector_chunk.entries;
             if (cache.contains(chunk) or (try missing.getOrPut(temp, chunk)).found_existing) continue;
+            const key = try graphMetricVectorChunkKey(temp, metric_name, job_id, lane, iteration, chunk);
+            if (cache.sealed) |sealed| {
+                var copied: vector_chunk.Chunk = undefined;
+                if (sealed.copy(@import("sealed_vector_cache.zig").Cache.key(key), &copied)) {
+                    const owned = try self.alloc.dupe(u8, &copied);
+                    cache.owned.append(self.alloc, owned) catch |err| {
+                        self.alloc.free(owned);
+                        return err;
+                    };
+                    try cache.put(self.alloc, chunk, owned);
+                    continue;
+                }
+            }
             try chunk_ids.append(temp, chunk);
-            try keys.append(temp, try graphMetricVectorChunkKey(temp, metric_name, job_id, lane, iteration, chunk));
+            try keys.append(temp, key);
         }
         if (keys.items.len != 0) {
             const chunks = try self.getManyValuesAlloc(txn, keys.items);
             defer self.alloc.free(chunks);
-            for (chunk_ids.items, chunks) |chunk, raw| try cache.put(self.alloc, chunk, raw);
+            for (chunk_ids.items, keys.items, chunks) |chunk, key, raw| {
+                try cache.put(self.alloc, chunk, raw);
+                if (cache.sealed) |sealed| if (raw) |bytes| {
+                    sealed.put(self.alloc, @import("sealed_vector_cache.zig").Cache.key(key), bytes);
+                };
+            }
         }
         for (slots, 0..) |slot, i| {
             const raw = cache.get(slot / vector_chunk.entries).?;
@@ -9282,6 +9328,51 @@ pub const GraphIndex = struct {
             } else try graph.foldOrdinalAdjacency(&txn, "rank", 1, "factor", 0, 0.85, raw, &cache, &scratch, &fold, 0, edges.len);
         }
         return fold.sums[0] + fold.corrections[0];
+    }
+
+    pub fn prepareSealedVectorBenchmark(self: *GraphIndex) !void {
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        var chunk: vector_chunk.Chunk = @splat(0);
+        for (0..vector_chunk.entries) |slot| try vector_chunk.put(&chunk, slot, 0.5);
+        for (0..128) |i| {
+            const key = try graphMetricVectorChunkKey(self.alloc, "rank", 1, "rank", 0, i);
+            defer self.alloc.free(key);
+            try batch.put(key, &chunk);
+        }
+        try batch.commit();
+    }
+
+    pub fn benchmarkSealedVectorGather(self: *GraphIndex, checkpoints: usize, reference: bool) !usize {
+        defer self.sealed_vectors.deinit(self.alloc);
+        var seed: u32 = 123456789;
+        var reads: usize = 0;
+        const Txn = struct {
+            inner: *backend_erased.ReadTxn,
+            reads: *usize,
+            pub fn getManySorted(ctx: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+                ctx.reads.* += keys.len;
+                try ctx.inner.getManySorted(keys, values);
+            }
+        };
+        for (0..checkpoints) |_| {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            var counted = Txn{ .inner = &txn, .reads = &reads };
+            var cache = VectorReadCache{ .sealed = if (reference) null else &self.sealed_vectors };
+            defer cache.deinit(self.alloc);
+            var slots: [2048]u64 = undefined;
+            for (&slots) |*slot| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                slot.* = seed % (128 * vector_chunk.entries);
+            }
+            const values = try self.readGraphMetricVectorSlotsCachedAlloc(&counted, "rank", 1, "rank", 0, &slots, true, &cache);
+            defer self.alloc.free(values);
+            for (values) |value| if (value != 0.5) return error.InvalidBenchmarkResult;
+        }
+        return reads;
     }
 
     fn ordinalContributionPrefixAlloc(self: *GraphIndex, metric_name: []const u8, job_id: u64, phase: GraphMetricBuildPhase, iteration: u32, chunk: u64) ![]u8 {
@@ -9893,7 +9984,9 @@ pub const GraphIndex = struct {
                     else => return err,
                 }
             }
-            var vector_cache = VectorReadCache.empty;
+            // The phase barrier seals this source lane before reducers run.
+            // Only this path may reuse owned bytes across read transactions.
+            var vector_cache = VectorReadCache{ .sealed = &self.sealed_vectors };
             defer vector_cache.deinit(self.alloc);
             var scratch = OrdinalFoldScratch{ .arena = std.heap.ArenaAllocator.init(self.alloc) };
             defer scratch.arena.deinit();
@@ -12420,7 +12513,7 @@ pub const GraphIndex = struct {
         try self.validateGraphMetricBuildPageExecutionLease(expected_page, page);
         if (page.total_units != 0 and completed_units > page.total_units) return error.InvalidGraphMetricBuildProgress;
 
-        try self.putGraphMetricScorePageInBatch(&batch, metric_name, job.score_generation, scores);
+        try self.putPlannedGraphMetricScorePageInBatch(&batch, metric_name, job, metric_name, scores);
 
         page.state = if (complete_page) .complete else .leased;
         page.worker_id = worker_id;
@@ -12526,8 +12619,8 @@ pub const GraphIndex = struct {
         errdefer batch.abort();
         var page = try self.metricBuildPage(&batch, metric_name, job.job_id, .publish_generation, claimed_page.iteration, claimed_page.page_id) orelse return error.GraphMetricBuildPageNotFound;
         try self.validateGraphMetricBuildPageExecutionLease(claimed_page, page);
-        try self.putGraphMetricScorePageInBatch(&batch, metric_name, job.score_generation, primary_scores.items);
-        if (pair_cfg) |pair| try self.putGraphMetricScorePageInBatch(&batch, pair.name, job.score_generation, pair_scores.items);
+        try self.putPlannedGraphMetricScorePageInBatch(&batch, metric_name, job, metric_name, primary_scores.items);
+        if (pair_cfg) |pair| try self.putPlannedGraphMetricScorePageInBatch(&batch, metric_name, job, pair.name, pair_scores.items);
 
         page.completed_units = completed_units;
         page.total_units = total_units;
@@ -14008,18 +14101,6 @@ pub const GraphIndex = struct {
         const verification = try self.verifyGraphMetricBuildPublishReady(metric_name, job_id);
         if (verification.config_fingerprint != meta.config_fingerprint) return error.InvalidGraphMetricBuildManifest;
 
-        const rank_count = @min(score_count, graph_metric_rank_entry_limit);
-        const ranked_scores = try self.selectGraphMetricTopKFromScoresAlloc(
-            metric_name,
-            verification.score_generation,
-            rank_count,
-        );
-        defer {
-            for (ranked_scores) |*score| score.deinit(self.alloc);
-            self.alloc.free(ranked_scores);
-        }
-        if (ranked_scores.len != rank_count) return error.GraphMetricBuildPublishNotReady;
-
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         const job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
@@ -14030,12 +14111,7 @@ pub const GraphIndex = struct {
         if (job.phase != .publish_generation) return error.GraphMetricBuildPublishNotReady;
         var published_meta = meta;
         published_meta.target_edge_generation = verification.target_generation;
-        try self.putExactGraphMetricRankPrefixInBatch(
-            &batch,
-            metric_name,
-            verification.score_generation,
-            ranked_scores,
-        );
+        try self.verifyGraphMetricRankReady(&batch, metric_name, job, metric_name, score_count);
         try self.publishGraphMetricPointerInBatch(&batch, metric_name, verification.score_generation, published_meta);
         try self.appendGraphMetricEvent(&batch, metric_name, .{
             .kind = .publish,
@@ -14141,10 +14217,8 @@ pub const GraphIndex = struct {
         try self.mergeGraphMetricRankPrefixInBatch(batch, metric_name, target_generation, scores);
     }
 
-    /// Writes one unpublished score page without repeatedly rebuilding the
-    /// generation-wide top-K index. Planned builds finalize that secondary
-    /// index once, atomically with publication, after every score page is
-    /// immutable and verified.
+    /// Writes the node-keyed primary lane. Planned builds also co-write an
+    /// ordered staging run; direct small builds maintain their bounded tier.
     fn putGraphMetricScorePageInBatch(
         self: *GraphIndex,
         batch: anytype,
@@ -14165,6 +14239,152 @@ pub const GraphIndex = struct {
             try self.writeGraphMetricKey(&score_key, &.{ metric_name, "score", generation_text, score.node });
             try putF64(batch, score_key.items, score.score);
         }
+    }
+
+    fn graphMetricRankStagePrefixAlloc(self: *GraphIndex, owner: []const u8, job_id: u64, metric: []const u8, lane: []const u8) ![]u8 {
+        var job_buf: [20]u8 = undefined;
+        const job_text = try std.fmt.bufPrint(&job_buf, "{d}", .{job_id});
+        return self.graphMetricControlKeyAlloc(&.{ owner, "job", job_text, lane, metric });
+    }
+
+    /// Small, sorted producer runs use the backend's existing ordered merge.
+    /// Score, staging key, and page-attempt checkpoint share one transaction.
+    /// Reclaimed attempts can replace a value without leaving a stale rank key.
+    fn putPlannedGraphMetricScorePageInBatch(self: *GraphIndex, batch: anytype, owner: []const u8, job: GraphMetricBuildJob, metric: []const u8, scores: []const GraphMetricScore) !void {
+        const stage = try self.graphMetricRankStagePrefixAlloc(owner, job.job_id, metric, "rank-run");
+        defer self.alloc.free(stage);
+        const rank_prefix = try self.graphMetricRankPrefixAlloc(metric, job.score_generation);
+        defer self.alloc.free(rank_prefix);
+        var key = std.ArrayListUnmanaged(u8).empty;
+        defer key.deinit(self.alloc);
+        for (scores) |score| {
+            const primary = try self.graphMetricScoreKeyAlloc(metric, job.score_generation, score.node);
+            defer self.alloc.free(primary);
+            if (batch.get(primary)) |raw| {
+                const old = decodeF64(raw) orelse return error.InvalidGraphMetricScore;
+                if (old != score.score) {
+                    const old_rank = try self.graphMetricRankKeyAlloc(metric, job.score_generation, old, score.node);
+                    defer self.alloc.free(old_rank);
+                    key.clearRetainingCapacity();
+                    try key.appendSlice(self.alloc, stage);
+                    try key.appendSlice(self.alloc, old_rank[rank_prefix.len..]);
+                    batch.delete(key.items) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                }
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+            const rank = try self.graphMetricRankKeyAlloc(metric, job.score_generation, score.score, score.node);
+            defer self.alloc.free(rank);
+            key.clearRetainingCapacity();
+            try key.appendSlice(self.alloc, stage);
+            try key.appendSlice(self.alloc, rank[rank_prefix.len..]);
+            try putF64(batch, key.items, score.score);
+        }
+        try self.putGraphMetricScorePageInBatch(batch, metric, job.score_generation, scores);
+    }
+
+    const graph_metric_rank_checkpoint_entries = 256;
+
+    /// The producer barrier makes the staging lane immutable. Each transaction
+    /// copies at most 256 ordered winners and persists its cursor atomically.
+    /// Only the final receipt authorizes publication; both HITS lanes require
+    /// receipts. Temporary runs live in the already bounded-cleanup job tree.
+    fn checkpointGraphMetricRankPrefix(self: *GraphIndex, owner: []const u8, cfg: GraphMetricConfig, job: GraphMetricBuildJob, metric: []const u8, score_count: usize) !bool {
+        const limit = @min(score_count, graph_metric_rank_entry_limit);
+        const stage = try self.graphMetricRankStagePrefixAlloc(owner, job.job_id, metric, "rank-run");
+        defer self.alloc.free(stage);
+        const progress_key = try self.graphMetricRankStagePrefixAlloc(owner, job.job_id, metric, "rank-progress");
+        defer self.alloc.free(progress_key);
+        const ready_key = try self.graphMetricRankStagePrefixAlloc(owner, job.job_id, metric, "rank-ready");
+        defer self.alloc.free(ready_key);
+        const output = try self.graphMetricRankPrefixAlloc(metric, job.score_generation);
+        defer self.alloc.free(output);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const persisted = try self.metricBuildJob(&batch, owner) orelse return error.GraphMetricBuildJobNotFound;
+        if (persisted.job_id != job.job_id or persisted.phase != .publish_generation or persisted.iteration != job.iteration) return error.GraphMetricBuildJobMismatch;
+        try self.validateGraphMetricBuildExecutionInTxn(&batch, owner, persisted, cfg);
+        if (try self.metricDisabled(&batch, metric)) return error.GraphMetricDisabled;
+        if (batch.get(ready_key)) |raw| {
+            if (raw.len != 8 or std.mem.readInt(u64, raw[0..8], .little) != limit) return error.InvalidGraphMetricRankEntry;
+            try batch.commit();
+            return true;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+        var count: usize = 0;
+        var cursor: []const u8 = "";
+        if (batch.get(progress_key)) |raw| {
+            if (raw.len <= 8) return error.InvalidGraphMetricRankEntry;
+            count = std.math.cast(usize, std.mem.readInt(u64, raw[0..8], .little)) orelse return error.InvalidGraphMetricRankEntry;
+            cursor = try temp.dupe(u8, raw[8..]);
+            if (count == 0 or count >= limit or !std.mem.startsWith(u8, cursor, stage)) return error.InvalidGraphMetricRankEntry;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+        const Pending = struct { key: []const u8, value: []const u8 };
+        var pending = std.ArrayListUnmanaged(Pending).empty;
+        {
+            var cur = try batch.openCursor();
+            defer cur.close();
+            var next = try cur.seekAtOrAfter(if (cursor.len == 0) stage else cursor);
+            if (next) |entry| if (std.mem.eql(u8, entry.key, cursor)) {
+                next = try cur.next();
+            };
+            while (count < limit and pending.items.len < graph_metric_rank_checkpoint_entries) {
+                const entry = next orelse return error.GraphMetricBuildPublishNotReady;
+                if (!std.mem.startsWith(u8, entry.key, stage)) return error.GraphMetricBuildPublishNotReady;
+                const score = decodeF64(entry.value) orelse return error.InvalidGraphMetricScore;
+                if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
+                const node = (try self.graphMetricNodeFromRankKeyAlloc(entry.key, stage)) orelse return error.InvalidGraphMetricRankEntry;
+                defer self.alloc.free(node);
+                const canonical = try self.graphMetricRankKeyAlloc(metric, job.score_generation, score, node);
+                defer self.alloc.free(canonical);
+                if (!std.mem.eql(u8, canonical[output.len..], entry.key[stage.len..])) return error.InvalidGraphMetricRankEntry;
+                const primary_key = try self.graphMetricScoreKeyAlloc(metric, job.score_generation, node);
+                defer self.alloc.free(primary_key);
+                const primary = batch.get(primary_key) catch |err| switch (err) {
+                    error.NotFound => return error.GraphMetricBuildPublishNotReady,
+                    else => return err,
+                };
+                if (!std.mem.eql(u8, primary, entry.value)) return error.InvalidGraphMetricScore;
+                const key = try std.mem.concat(temp, u8, &.{ output, entry.key[stage.len..] });
+                try pending.append(temp, .{ .key = key, .value = try temp.dupe(u8, entry.value) });
+                cursor = try temp.dupe(u8, entry.key);
+                count += 1;
+                next = try cur.next();
+            }
+        }
+        for (pending.items) |entry| try batch.put(entry.key, entry.value);
+        if (count == limit) {
+            try putU64(&batch, ready_key, count);
+        } else {
+            const progress = try temp.alloc(u8, 8 + cursor.len);
+            std.mem.writeInt(u64, progress[0..8], count, .little);
+            @memcpy(progress[8..], cursor);
+            try batch.put(progress_key, progress);
+        }
+        try batch.commit();
+        return count == limit;
+    }
+
+    fn verifyGraphMetricRankReady(self: *GraphIndex, txn: anytype, owner: []const u8, job: GraphMetricBuildJob, metric: []const u8, score_count: usize) !void {
+        const key = try self.graphMetricRankStagePrefixAlloc(owner, job.job_id, metric, "rank-ready");
+        defer self.alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return error.GraphMetricBuildPublishNotReady,
+            else => return err,
+        };
+        if (raw.len != 8 or std.mem.readInt(u64, raw[0..8], .little) != @min(score_count, graph_metric_rank_entry_limit)) return error.InvalidGraphMetricRankEntry;
     }
 
     const RankIndexCandidate = struct {
@@ -14481,6 +14701,7 @@ pub const GraphIndex = struct {
                 worker_step.completed_page or
                 worker_step.advanced_phase or
                 coordinator_step.advanced_phase or
+                coordinator_step.checkpointed_publication or
                 coordinator_step.retired_input_records != 0;
             // A bounded checkpoint keeps its lease. A different worker can
             // legitimately have no eligible page until the owner runs again.
@@ -14698,7 +14919,7 @@ pub const GraphIndex = struct {
         while (true) {
             const step = try self.runGraphMetricPlannedWorkerStep(metric_name, cfg, graph_metric_local_build_worker_id);
             if (step.completed_build and step.phase == .cleanup_old_generations) return try self.graphMetricStatus(metric_name);
-            if (!step.claimed_page and !step.advanced_phase and step.retired_input_records == 0) return error.GraphMetricBuildNoEligiblePage;
+            if (!step.claimed_page and !step.advanced_phase and !step.checkpointed_publication and step.retired_input_records == 0) return error.GraphMetricBuildNoEligiblePage;
         }
     }
 
@@ -14724,12 +14945,13 @@ pub const GraphIndex = struct {
                 const advanced = try self.runGraphMetricPlannedCoordinatorStep(metric_name, cfg);
                 page_step.advanced_phase = advanced.advanced_phase;
                 page_step.retired_input_records = advanced.retired_input_records;
+                page_step.checkpointed_publication = advanced.checkpointed_publication;
             }
             return page_step;
         }
         if (page_step.phase == .cleanup_old_generations) return page_step;
         const advanced = try self.runGraphMetricPlannedCoordinatorStep(metric_name, cfg);
-        if (advanced.advanced_phase or advanced.completed_build or advanced.retired_input_records != 0) return advanced;
+        if (advanced.advanced_phase or advanced.completed_build or advanced.checkpointed_publication or advanced.retired_input_records != 0) return advanced;
         return page_step;
     }
 
@@ -14895,12 +15117,12 @@ pub const GraphIndex = struct {
                 const summary = try self.summarizeGraphMetricBuildPhase(metric_name, job.job_id, .publish_generation, job.iteration);
                 if (summary.state != .complete) return .{ .phase = .publish_generation };
             }
-            self.publishGraphMetricBuildFromCoordinator(metric_name, cfg, job) catch |err| {
+            const published = self.publishGraphMetricBuildFromCoordinator(metric_name, cfg, job) catch |err| {
                 var failed = try self.failGraphMetricPlannedBuild(metric_name, err);
                 defer failed.deinit(self.alloc);
                 return .{ .phase = .publish_generation, .failed_build = true };
             };
-            return .{ .phase = .publish_generation, .advanced_phase = true };
+            return .{ .phase = .publish_generation, .advanced_phase = published, .checkpointed_publication = !published };
         }
         if (job.phase == .cleanup_old_generations) return .{ .phase = .cleanup_old_generations };
         if (!graphMetricBuildPhaseHasPageExecutor(cfg.kind, job.phase)) return error.UnsupportedGraphMetricBuildPhase;
@@ -14939,7 +15161,13 @@ pub const GraphIndex = struct {
         metric_name: []const u8,
         cfg: GraphMetricConfig,
         job: GraphMetricBuildJob,
-    ) !void {
+    ) !bool {
+        _ = try self.verifyGraphMetricBuildPublishReady(metric_name, job.job_id);
+        const planned_count = try self.graphMetricBuildPlannedScoreCount(metric_name, cfg, job);
+        if (!try self.checkpointGraphMetricRankPrefix(metric_name, cfg, job, metric_name, planned_count)) return false;
+        if (self.pairedHitsMetricConfig(cfg)) |pair| {
+            if (!try self.checkpointGraphMetricRankPrefix(metric_name, cfg, job, pair.name, planned_count)) return false;
+        }
         switch (cfg.kind) {
             .degree => {
                 const score_count = try self.graphMetricBuildPlannedScoreCount(metric_name, cfg, job);
@@ -14988,6 +15216,7 @@ pub const GraphIndex = struct {
                 status.deinit(self.alloc);
             },
         }
+        return true;
     }
 
     fn graphMetricBuildPlannedScoreCount(
@@ -15056,28 +15285,6 @@ pub const GraphIndex = struct {
         var pair_meta = meta;
         pair_meta.config_fingerprint = graphMetricConfigFingerprint(pair);
 
-        const rank_count = @min(score_count, graph_metric_rank_entry_limit);
-        const ranked_scores = try self.selectGraphMetricTopKFromScoresAlloc(
-            metric_name,
-            verification.score_generation,
-            rank_count,
-        );
-        defer {
-            for (ranked_scores) |*score| score.deinit(self.alloc);
-            self.alloc.free(ranked_scores);
-        }
-        if (ranked_scores.len != rank_count) return error.GraphMetricBuildPublishNotReady;
-        const pair_ranked_scores = try self.selectGraphMetricTopKFromScoresAlloc(
-            pair.name,
-            verification.score_generation,
-            rank_count,
-        );
-        defer {
-            for (pair_ranked_scores) |*score| score.deinit(self.alloc);
-            self.alloc.free(pair_ranked_scores);
-        }
-        if (pair_ranked_scores.len != rank_count) return error.GraphMetricBuildPublishNotReady;
-
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         const persisted_job = try self.metricBuildJob(&batch, metric_name) orelse return error.GraphMetricBuildJobNotFound;
@@ -15086,8 +15293,8 @@ pub const GraphIndex = struct {
         if (persisted_job.phase != .publish_generation) return error.GraphMetricBuildPublishNotReady;
         const prior_published = try self.metricPublishedGeneration(&batch, metric_name);
         const pair_prior_published = try self.metricPublishedGeneration(&batch, pair.name);
-        try self.putExactGraphMetricRankPrefixInBatch(&batch, metric_name, verification.score_generation, ranked_scores);
-        try self.putExactGraphMetricRankPrefixInBatch(&batch, pair.name, verification.score_generation, pair_ranked_scores);
+        try self.verifyGraphMetricRankReady(&batch, metric_name, persisted_job, metric_name, score_count);
+        try self.verifyGraphMetricRankReady(&batch, metric_name, persisted_job, pair.name, score_count);
         try self.publishGraphMetricPointerInBatch(&batch, metric_name, verification.score_generation, meta);
         try self.publishGraphMetricPointerInBatch(&batch, pair.name, verification.score_generation, pair_meta);
         try self.appendGraphMetricEvent(&batch, metric_name, .{
@@ -17707,6 +17914,108 @@ test "graph metric vector chunks cache gathers across a bounded fold" {
     try std.testing.expectEqual(@as(usize, 1), txn.calls);
     try std.testing.expectEqual(@as(u32, 1), cache.count());
     try std.testing.expectError(error.InvalidGraphMetricScore, graph.readGraphMetricVectorSlotsCachedAlloc(&txn, "rank", 1, "rank", 0, &.{3}, true, &cache));
+}
+
+test "graph metric vector chunks sealed cache survives checkpoints without borrowing transactions" {
+    const alloc = std.testing.allocator;
+    var graph: GraphIndex = undefined;
+    graph.alloc = alloc;
+    var sealed = @import("sealed_vector_cache.zig").Cache{};
+    defer sealed.deinit(alloc);
+    const Txn = struct {
+        chunk: vector_chunk.Chunk = @splat(0),
+        calls: usize = 0,
+        pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            self.calls += keys.len;
+            for (values) |*value| value.* = &self.chunk;
+        }
+    };
+    var txn = Txn{};
+    try vector_chunk.put(&txn.chunk, 1, 3);
+    for (0..16) |_| {
+        var cache = GraphIndex.VectorReadCache{ .sealed = &sealed };
+        defer cache.deinit(alloc);
+        const values = try graph.readGraphMetricVectorSlotsCachedAlloc(&txn, "rank", 1, "rank", 0, &.{1}, true, &cache);
+        defer alloc.free(values);
+        try std.testing.expectEqualSlices(f64, &.{3}, values);
+        // The next transaction reuses/invalidates the previous read buffer.
+        @memset(&txn.chunk, 0);
+    }
+    try std.testing.expectEqual(@as(usize, 1), txn.calls);
+    var next_epoch = GraphIndex.VectorReadCache{ .sealed = &sealed };
+    defer next_epoch.deinit(alloc);
+    try std.testing.expectError(error.InvalidGraphMetricScore, graph.readGraphMetricVectorSlotsCachedAlloc(&txn, "rank", 1, "rank", 1, &.{1}, true, &next_epoch));
+    try std.testing.expectEqual(@as(usize, 2), txn.calls);
+}
+
+test "graph metric ordinal publication checkpoints ordered runs and resumes before pointer swap" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-rank-checkpoint");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-rank-checkpoint");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const cfg = GraphMetricConfig{ .name = "degree", .kind = .degree, .refresh = .manual };
+    const options = GraphIndexOptions{ .metric_configs = &.{cfg} };
+    const job = GraphIndex.GraphMetricBuildJob{ .job_id = 1, .score_generation = 1, .phase = .publish_generation };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    var scores: [600]GraphIndex.GraphMetricScore = undefined;
+    for (&scores, 0..) |*score, i| score.* = .{ .node = try std.fmt.allocPrint(temp, "node-{d:0>4}", .{i}), .score = @floatFromInt(i % 17) };
+    {
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+        defer graph.close();
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        try graph.putGraphMetricBuildJobInBatch(&batch, cfg.name, job);
+        try graph.putGraphMetricBuildManifestInBatch(&batch, cfg.name, .{ .job_id = 1, .score_generation = 1, .config_fingerprint = GraphIndex.graphMetricConfigFingerprint(cfg) });
+        try graph.putPlannedGraphMetricScorePageInBatch(&batch, cfg.name, job, cfg.name, &scores);
+        // A replacement attempt updates one row without leaving a second
+        // ordered key for the node in the unpublished staging run.
+        scores[0].score = 100;
+        try graph.putPlannedGraphMetricScorePageInBatch(&batch, cfg.name, job, cfg.name, scores[0..1]);
+        try batch.commit();
+        try std.testing.expect(!try graph.checkpointGraphMetricRankPrefix(cfg.name, cfg, job, cfg.name, scores.len));
+        var read = try graph.beginReadReverseTxn();
+        defer read.abort();
+        const prefix = try graph.graphMetricRankPrefixAlloc(cfg.name, job.score_generation);
+        defer alloc.free(prefix);
+        try std.testing.expectEqual(@as(usize, GraphIndex.graph_metric_rank_checkpoint_entries), try GraphIndex.countKeysWithPrefix(&read, prefix));
+        const stage = try graph.graphMetricRankStagePrefixAlloc(cfg.name, job.job_id, cfg.name, "rank-run");
+        defer alloc.free(stage);
+        try std.testing.expectEqual(scores.len, try GraphIndex.countKeysWithPrefix(&read, stage));
+        try std.testing.expectEqual(@as(u64, 0), try graph.metricPublishedGeneration(&read, cfg.name));
+        try std.testing.expectError(error.GraphMetricBuildPublishNotReady, graph.verifyGraphMetricRankReady(&read, cfg.name, job, cfg.name, scores.len));
+    }
+    {
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", options);
+        defer graph.close();
+        try std.testing.expect(!try graph.checkpointGraphMetricRankPrefix(cfg.name, cfg, job, cfg.name, scores.len));
+        try std.testing.expect(try graph.checkpointGraphMetricRankPrefix(cfg.name, cfg, job, cfg.name, scores.len));
+        // A duplicate coordinator observes the durable completion receipt.
+        try std.testing.expect(try graph.checkpointGraphMetricRankPrefix(cfg.name, cfg, job, cfg.name, scores.len));
+        var stale = job;
+        stale.job_id += 1;
+        try std.testing.expectError(error.GraphMetricBuildJobMismatch, graph.checkpointGraphMetricRankPrefix(cfg.name, cfg, stale, cfg.name, scores.len));
+        var read = try graph.beginReadReverseTxn();
+        defer read.abort();
+        try graph.verifyGraphMetricRankReady(&read, cfg.name, job, cfg.name, scores.len);
+        const actual = try graph.graphMetricTopKInTxnAlloc(&read, cfg.name, job.score_generation, scores.len);
+        defer {
+            for (actual) |*score| score.deinit(alloc);
+            alloc.free(actual);
+        }
+        std.mem.sort(GraphIndex.GraphMetricScore, &scores, {}, GraphIndex.graphMetricScoreLessThan);
+        try std.testing.expectEqual(scores.len, actual.len);
+        for (scores, actual) |expected, score| {
+            try std.testing.expectEqualStrings(expected.node, score.node);
+            try std.testing.expectEqual(expected.score, score.score);
+        }
+    }
 }
 
 test "graph metric ordinal packing densifies fragmented output and fences incomplete attempts" {

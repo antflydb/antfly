@@ -762,6 +762,7 @@ fn admitPointPlans(alloc: Allocator, session: *runtime_mod.QuerySession, plans: 
         const inputs = try temp.alloc(RangePlanningColumn, plans.len);
         for (plans, inputs) |*maybe_plan, *input| {
             const plan = &maybe_plan.*.?;
+            if (plan.point_routing) |*routing| try routing.expandForCoalescing(session, plan.touched_blocks);
             const entries = if (plan.point_routing) |routing| routing.routing.entries else &.{};
             try session.checkCancellation();
             try session.chargeGraphMetricRetained(std.math.mul(usize, entries.len, @sizeOf(usize)) catch return error.GraphMetricQueryBudgetExceeded);
@@ -1112,11 +1113,43 @@ const PointRouting = struct {
     payloads: std.ArrayListUnmanaged([]u8) = .empty,
     routing: metric_segment.codec.RoutingIndex,
     lease: ?routing_cache.Lease = null,
+    page_leases: []?routing_cache.Lease = &.{},
+
+    /// Only request-budget pressure needs intervening block locators. Ordinary
+    /// sparse reads retain selected locators; the exact coalescer can lazily
+    /// expand already leased pages without another fetch or decode.
+    fn expandForCoalescing(self: *@This(), session: *runtime_mod.QuerySession, touched: []TouchedBlock) !void {
+        if (self.page_leases.len == 0) return;
+        var count: usize = 0;
+        for (self.page_leases) |lease| count += lease.?.entry.routing.entries.len;
+        if (count == self.routing.entries.len) return;
+        try session.chargeGraphMetricRetained(count * @sizeOf(metric_segment.codec.RoutingEntry));
+        try session.chargeGraphMetricDecode(0, count);
+        const expanded = try self.alloc.alloc(metric_segment.codec.RoutingEntry, count);
+        errdefer self.alloc.free(expanded);
+        var offset: usize = 0;
+        for (self.page_leases) |lease| {
+            const entries = lease.?.entry.routing.entries;
+            @memcpy(expanded[offset..][0..entries.len], entries);
+            offset += entries.len;
+        }
+        var index: usize = 0;
+        for (touched) |*block| {
+            const global = self.routing.entries[block.block_index].block_index;
+            while (index < expanded.len and expanded[index].block_index < global) : (index += 1) {}
+            if (index == expanded.len or expanded[index].block_index != global) return error.InvalidGraphMetricSegment;
+            block.block_index = index;
+        }
+        self.alloc.free(self.routing.entries);
+        self.routing.entries = expanded;
+    }
 
     fn deinit(self: *@This()) void {
         if (self.lease) |*lease| lease.deinit() else self.routing.deinit(self.alloc);
         for (self.payloads.items) |payload| self.payload_alloc.free(payload);
         self.payloads.deinit(self.alloc);
+        for (self.page_leases) |*lease| if (lease.*) |*held| held.deinit();
+        self.alloc.free(self.page_leases);
     }
 };
 
@@ -1160,11 +1193,14 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
     errdefer entries.deinit(alloc);
     var entry_count: usize = 0;
     for (selected.items) |i| entry_count += @min(codec.routing_page_entries, block_count - directory.entries[i].block_index);
-    try session.chargeGraphMetricRetained(entry_count * @sizeOf(codec.RoutingEntry) + selected.items.len * (@sizeOf([]u8) + @sizeOf(usize)));
+    // A sparse plan retains one locator per candidate block, not every entry
+    // of its routing page. Node IDs borrow immutable decoded-page leases.
+    entry_count = @min(entry_count, node_ids.len);
+    try session.chargeGraphMetricRetained(2 * entry_count * @sizeOf(codec.RoutingEntry) + selected.items.len * (@sizeOf([]u8) + @sizeOf(usize)));
     try entries.ensureTotalCapacityPrecise(alloc, entry_count);
     const payload_alloc = std.heap.smp_allocator;
     var payloads = std.ArrayListUnmanaged([]u8).empty;
-    errdefer {
+    defer {
         for (payloads.items) |payload| payload_alloc.free(payload);
         payloads.deinit(alloc);
     }
@@ -1175,14 +1211,28 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
     const page_views = try alloc.alloc(?[]const u8, selected.items.len);
     defer alloc.free(page_views);
     @memset(page_views, null);
+    try session.chargeGraphMetricRetained(selected.items.len * @sizeOf(?routing_cache.Lease));
+    const page_leases = try alloc.alloc(?routing_cache.Lease, selected.items.len);
+    @memset(page_leases, null);
+    errdefer {
+        for (page_leases) |*lease| if (lease.*) |*held| held.deinit();
+        alloc.free(page_leases);
+    }
     var misses = std.ArrayListUnmanaged(usize).empty;
     defer misses.deinit(alloc);
     try misses.ensureTotalCapacityPrecise(alloc, selected.items.len);
     for (selected.items, 0..) |i, view_index| {
         const page = directory.entries[i];
         const count = @min(codec.routing_page_entries, block_count - page.block_index);
+        const key = pointPageCacheKey(artifact, page, block_count, root);
+        if (session.cache) |cache| if (cache.graph_metric_routing.acquire(key)) |cached| {
+            page_leases[view_index] = cached;
+            try session.chargeGraphMetricRetained(cached.entry.bytes());
+            try session.chargeGraphMetricDecode(0, 1);
+            continue;
+        };
         try session.chargeGraphMetricDecode(1, count);
-        try session.chargeGraphMetricRetained(page.len + count * @sizeOf(codec.RoutingEntry));
+        try session.chargeGraphMetricRetained(2 * page.len + count * @sizeOf(codec.RoutingEntry) + @sizeOf(routing_cache.Entry));
         var id_buf: [64]u8 = undefined;
         const id = try metricBlockId(&id_buf, .routing, page.block_index);
         if (try session.readCachedAuthenticatedBlockAlloc(payload_alloc, metric_index, id, page.offset, page.len, &page.checksum)) |bytes| {
@@ -1220,20 +1270,49 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
         }
         start = end;
     }
+    pages.position = 0;
     for (selected.items, 0..) |i, view_index| {
         const page = directory.entries[i];
-        const bytes = page_views[view_index] orelse return error.InvalidGraphMetricSegment;
-        const decoded = try codec.decodePointPageAlloc(alloc, bytes, page, block_count, root.primary_data_offset, root.primary_data_end, session.cancellation);
-        defer alloc.free(decoded);
+        if (page_leases[view_index] == null) {
+            const bytes = page_views[view_index] orelse return error.InvalidGraphMetricSegment;
+            const owner = if (session.cache) |cache| cache.alloc else alloc;
+            const owned = try owner.dupe(u8, bytes);
+            errdefer owner.free(owned);
+            const decoded = try codec.decodePointPageAlloc(owner, owned, page, block_count, root.primary_data_offset, root.primary_data_end, session.cancellation);
+            errdefer owner.free(decoded);
+            if (i + 1 < directory.entries.len and std.mem.order(u8, decoded[decoded.len - 1].first_node_id, directory.entries[i + 1].first_node_id) != .lt) return error.InvalidGraphMetricSegment;
+            const entry = try owner.create(routing_cache.Entry);
+            entry.* = .{
+                .key = pointPageCacheKey(artifact, page, block_count, root),
+                .alloc = owner,
+                .footer = owned,
+                .routing = .{ .entries = decoded, .ranked_entries = &.{}, .top_score_count = 0, .footer_offset = footer_offset },
+            };
+            page_leases[view_index] = if (session.cache) |cache|
+                cache.graph_metric_routing.adopt(entry, cache.cfg.max_graph_metric_routing_bytes)
+            else
+                .{ .entry = entry };
+        }
+        const decoded = page_leases[view_index].?.entry.routing.entries;
         if (i + 1 < directory.entries.len and std.mem.order(u8, decoded[decoded.len - 1].first_node_id, directory.entries[i + 1].first_node_id) != .lt) return error.InvalidGraphMetricSegment;
-        try entries.appendSlice(alloc, decoded);
+        const span = pages.next() orelse return error.InvalidGraphMetricSegment;
+        std.debug.assert(span.block_index == i);
+        var candidates = CandidateBlocks{
+            .node_ids = node_ids,
+            .order = candidate_order[span.first_pending..][0..span.pending_count],
+            .routing = page_leases[view_index].?.entry.routing,
+        };
+        while (candidates.next()) |candidate| {
+            try session.checkCancellation();
+            entries.appendAssumeCapacity(decoded[candidate.block_index]);
+        }
     }
     const owned_entries = try entries.toOwnedSlice(alloc);
     errdefer alloc.free(owned_entries);
     return .{
         .alloc = alloc,
         .payload_alloc = payload_alloc,
-        .payloads = payloads,
+        .page_leases = page_leases,
         .routing = .{
             .entries = owned_entries,
             .ranked_entries = try alloc.alloc(codec.RankedRoutingEntry, 0),
@@ -1243,6 +1322,25 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
             .primary_data_end = root.primary_data_end,
         },
     };
+}
+
+fn pointPageCacheKey(artifact: manifest_mod.ArtifactRef, page: metric_segment.codec.RoutingEntry, block_count: usize, root: metric_segment.codec.RoutingIndex) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("graph-metric-decoded-point-page-v1");
+    hash.update(artifact.artifact_id);
+    hash.update(&.{0});
+    hash.update(artifact.checksum);
+    hash.update(&artifact.graph_metric_point_index_checksum);
+    hash.update(&page.checksum);
+    for ([_]u64{ artifact.byte_len, page.offset, page.len, page.block_index, block_count, root.primary_data_offset, root.primary_data_end }) |value| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, value, .little);
+        hash.update(&bytes);
+    }
+    hash.update(page.first_node_id);
+    var key: [32]u8 = undefined;
+    hash.final(&key);
+    return key;
 }
 
 /// Contiguous selected routing pages share one authenticated range. Independent
@@ -2865,14 +2963,14 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
     session.graph_metric_read_budget = .{};
     var first_cached = try scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids);
     defer first_cached.deinit(alloc);
-    // A warm lookup decodes one bounded routing page and one score block.
-    // Root and directory are leased from the decoded routing cache.
-    session.graph_metric_read_budget = .{ .limits = .{ .max_decoded_blocks = if (paged) 2 else 1 } };
+    // Every routing level is leased decoded, including a large-index page.
+    // A warm sparse lookup admits only the score block's decode.
+    session.graph_metric_read_budget = .{ .limits = .{ .max_decoded_blocks = 1 } };
     var second_cached = try scoresAlloc(alloc, &session, "graph_idx", "rank", &node_ids);
     defer second_cached.deinit(alloc);
     try std.testing.expectEqual(@as(?f64, last_value), second_cached.scores[0]);
-    try std.testing.expectEqual(@as(u64, if (paged) 2 else 1), cache.graph_metric_routing.hits);
-    try std.testing.expectEqual(@as(u64, if (paged) 2 else 1), session.graph_metric_read_budget.decoded_blocks);
+    try std.testing.expectEqual(@as(u64, if (paged) 3 else 1), cache.graph_metric_routing.hits);
+    try std.testing.expectEqual(@as(u64, 1), session.graph_metric_read_budget.decoded_blocks);
     if (score_count == metric_segment.score_block_entries + 1) {
         var ranked = try metric_segment.codec.decodeRoutingRootAlloc(alloc, payload[state.root_offset..], payload.len, metric_segment.wire_version, .none);
         defer ranked.deinit(alloc);

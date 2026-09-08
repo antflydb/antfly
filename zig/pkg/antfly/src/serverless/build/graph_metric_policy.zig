@@ -24,7 +24,7 @@ const bounded_decode = @import("../bounded_decode.zig");
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
 // Epoch 15 rejects impossible output before kernels and atomically reserves HITS outputs.
-pub const materializer_epoch: u32 = 15;
+pub const materializer_epoch: u32 = 16;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {

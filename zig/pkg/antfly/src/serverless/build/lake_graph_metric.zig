@@ -341,7 +341,10 @@ pub fn prepareGraphArtifactAlloc(
     try cancellation.check();
     try graph_metric_policy.validateLimits(limits);
     if (source_graph.kind != .graph_segment or source_graph.byte_len == 0) return error.InvalidGraphMetricBuildOptions;
-    if (source_graph.byte_len > limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+    // Payload residency is part of the peak, not merely an independent wire
+    // limit. Reject impossible builds before any object-store read/allocation.
+    if (source_graph.byte_len > limits.max_graph_payload_bytes or
+        source_graph.byte_len >= limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
     const graph_payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
         alloc,
         source_graph.artifact_id,
@@ -1456,6 +1459,10 @@ fn buildAdmittedProjectionFromTopologyAlloc(
     decoded_retained_bytes: usize,
     options: BuildOptions,
 ) !Projection {
+    return buildProjectionWithEdgeCopyAlloc(alloc, topology, decoded_retained_bytes, options, false);
+}
+
+fn buildProjectionWithEdgeCopyAlloc(alloc: Allocator, topology: CompiledTopology, decoded_retained_bytes: usize, options: BuildOptions, comptime copy_edges: bool) !Projection {
     try options.cancellation.check();
     if (topology.edge_type_offsets.len != topology.edge_types.len + 1 or
         @as(usize, topology.edge_type_offsets[topology.edge_types.len]) != topology.edges.len)
@@ -1521,9 +1528,7 @@ fn buildAdmittedProjectionFromTopologyAlloc(
     try addPeakArrayBytes(&construction_peak, active_node_word_count, usize);
     try addPeakArrayBytes(&construction_peak, topology.node_ids.len, u32);
     try addPeakArrayBytes(&construction_peak, projected_node_count, []const u8);
-    // Exact temporary edge pairs coexist only while building the required
-    // compact adjacency lanes.
-    try addPeakArrayBytes(&construction_peak, projected_edge_count, metrics.Edge);
+    if (copy_edges) try addPeakArrayBytes(&construction_peak, projected_edge_count, metrics.Edge);
     const projected_offset_count = std.math.add(usize, projected_node_count, 1) catch
         return error.GraphMetricBuildBudgetExceeded;
     if (requirements.incoming != .none) try addPeakArrayBytes(&construction_peak, projected_offset_count, u32);
@@ -1544,9 +1549,6 @@ fn buildAdmittedProjectionFromTopologyAlloc(
     defer alloc.free(global_to_local);
     @memset(global_to_local, unassigned);
     try projection.node_ids.ensureTotalCapacityPrecise(alloc, projected_node_count);
-    var projected_edges = std.ArrayListUnmanaged(metrics.Edge).empty;
-    defer projected_edges.deinit(alloc);
-    try projected_edges.ensureTotalCapacityPrecise(alloc, projected_edge_count);
     for (topology.node_ids, 0..) |node_id, global_ordinal| {
         if (!active_nodes.isSet(global_ordinal)) continue;
         if (projection.node_ids.items.len > std.math.maxInt(u32)) return error.GraphMetricBuildBudgetExceeded;
@@ -1555,28 +1557,69 @@ fn buildAdmittedProjectionFromTopologyAlloc(
         projection.node_id_bytes = std.math.add(usize, projection.node_id_bytes, node_id.len) catch
             return error.GraphMetricBuildBudgetExceeded;
     }
-    inspected_edges = 0;
-    for (allowed_edge_types, 0..) |allowed, edge_type_id| {
-        if (!allowed) continue;
-        const range_start: usize = @intCast(topology.edge_type_offsets[edge_type_id]);
-        const range_end: usize = @intCast(topology.edge_type_offsets[edge_type_id + 1]);
-        for (topology.edges[range_start..range_end]) |edge| {
-            inspected_edges += 1;
-            if (inspected_edges % 4096 == 0) try options.cancellation.check();
-            const source = global_to_local[edge.source];
-            const target = global_to_local[edge.target];
-            if (source == unassigned or target == unassigned) return error.InvalidGraphMetricBuildOptions;
-            projected_edges.appendAssumeCapacity(.{ .source = source, .target = target });
-        }
-    }
-    projection.topology = try metrics.Topology.initAllocFor(
+    const source = ProjectedEdges{ .topology = topology, .allowed = allowed_edge_types, .ordinals = global_to_local };
+    projection.topology = if (copy_edges) blk: {
+        const copied = try alloc.alloc(metrics.Edge, projected_edge_count);
+        defer alloc.free(copied);
+        var iterator = source;
+        for (copied) |*edge| edge.* = iterator.next() orelse return error.InvalidGraphMetricBuildOptions;
+        break :blk try metrics.Topology.initAllocFor(alloc, projected_node_count, copied, requirements, options.cancellation);
+    } else try metrics.Topology.initFromSourceAlloc(
         alloc,
         projection.node_ids.items.len,
-        projected_edges.items,
+        projected_edge_count,
+        source,
         requirements,
         options.cancellation,
     );
     return projection;
+}
+
+/// Replays selected immutable type runs in their original order, retaining
+/// only the ordinal map. Both CSR passes therefore preserve summation order.
+const ProjectedEdges = struct {
+    topology: CompiledTopology,
+    allowed: []const bool,
+    ordinals: []const u32,
+    type_index: usize = 0,
+    edge_index: usize = 0,
+
+    pub fn next(self: *@This()) ?metrics.Edge {
+        while (self.type_index < self.allowed.len) {
+            const end = self.topology.edge_type_offsets[self.type_index + 1];
+            if (!self.allowed[self.type_index] or self.edge_index == end) {
+                self.edge_index = end;
+                self.type_index += 1;
+                continue;
+            }
+            const edge = self.topology.edges[self.edge_index];
+            self.edge_index += 1;
+            return .{ .source = self.ordinals[edge.source], .target = self.ordinals[edge.target] };
+        }
+        return null;
+    }
+};
+
+/// Exact former edge-copy oracle; source preparation is common to both paths.
+pub fn benchmarkProjection(alloc: Allocator, payload: []const u8, reference: bool) !usize {
+    var topology = try prepareTopologyFromPackedAlloc(alloc, payload, .none, .{});
+    defer topology.deinit(alloc);
+    const options = BuildOptions{
+        .graph_index_name = "bench",
+        .config = .{ .name = "rank", .kind = .pagerank },
+        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "fixture", .byte_len = payload.len },
+    };
+    var projection = if (reference)
+        try buildProjectionWithEdgeCopyAlloc(alloc, topology, 0, options, true)
+    else
+        try buildProjectionFromTopologyAlloc(alloc, topology, 0, options);
+    defer projection.deinit(alloc);
+    // Check a stable checksum over the exact adjacency, not merely row count.
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(std.mem.sliceAsBytes(projection.topology.?.incoming_offsets));
+    hash.update(std.mem.sliceAsBytes(projection.topology.?.incoming_sources));
+    hash.update(std.mem.sliceAsBytes(projection.topology.?.outgoing_offsets));
+    return @intCast(hash.final());
 }
 
 /// Degree-only materializations do not need edge ordinals after counting.
@@ -2349,6 +2392,53 @@ test "serverless graph metric decode admission includes the live source payload"
         error.GraphMetricBuildBudgetExceeded,
         admitGraphDecodePeak(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
     );
+}
+
+test "serverless graph metric impossible payload is rejected before artifact IO" {
+    const State = struct {
+        calls: usize = 0,
+        fn fail(ptr: *anyopaque) anyerror {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedArtifactIO;
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(ptr: *anyopaque, _: Allocator, _: []const u8) !artifact_store.ArtifactMetadata {
+            return fail(ptr);
+        }
+        fn get(ptr: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return fail(ptr);
+        }
+        fn range(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+            return fail(ptr);
+        }
+        fn stat(ptr: *anyopaque, _: Allocator, _: []const u8) !artifact_store.ArtifactMetadata {
+            return fail(ptr);
+        }
+        fn delete(ptr: *anyopaque, _: []const u8) !void {
+            return fail(ptr);
+        }
+    };
+    var state = State{};
+    var store = artifact_store.ArtifactStore{ .allocator = std.testing.allocator, .ptr = &state, .vtable = &.{
+        .deinit = State.deinit,
+        .put = State.put,
+        .get_alloc = State.get,
+        .get_range_alloc = State.range,
+        .stat = State.stat,
+        .delete = State.delete,
+    } };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    for ([_]u64{ 1024, 1025 }) |bytes| {
+        try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareGraphArtifactAlloc(failing.allocator(), &store, .{
+            .kind = .graph_segment,
+            .artifact_id = "sha256:" ++ "0" ** 64,
+            .checksum = "0" ** 64,
+            .byte_len = bytes,
+        }, .none, .{ .max_graph_payload_bytes = 2048, .max_peak_memory_bytes = 1024 }));
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }
 
 test "serverless graph metric topology does not alias qualified endpoints with local nodes" {

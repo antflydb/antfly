@@ -5911,6 +5911,7 @@ pub const IndexManager = struct {
         planning_steps: usize = 0,
         worker_steps: usize = 0,
         coordinator_steps: usize = 0,
+        publication_checkpoints: usize = 0,
         retired_input_records: usize = 0,
         pages_claimed: usize = 0,
         pages_completed: usize = 0,
@@ -5933,7 +5934,7 @@ pub const IndexManager = struct {
         }
 
         pub fn durableProgressed(self: @This()) bool {
-            return self.planning_steps != 0 or self.builds_started != 0 or
+            return self.publication_checkpoints != 0 or self.planning_steps != 0 or self.builds_started != 0 or
                 self.retired_input_records != 0 or
                 self.pages_claimed != 0 or
                 self.pages_completed != 0 or
@@ -5950,6 +5951,7 @@ pub const IndexManager = struct {
             self.worker_steps += other.worker_steps;
             self.coordinator_steps += other.coordinator_steps;
             self.retired_input_records += other.retired_input_records;
+            self.publication_checkpoints += other.publication_checkpoints;
             self.pages_claimed += other.pages_claimed;
             self.pages_completed += other.pages_completed;
             self.phases_advanced += other.phases_advanced;
@@ -6348,6 +6350,7 @@ pub const IndexManager = struct {
                 else => return err,
             };
             result.coordinator_steps += 1;
+            if (step.checkpointed_publication) result.publication_checkpoints += 1;
             result.retired_input_records += step.retired_input_records;
             if (step.advanced_phase) result.phases_advanced += 1;
             if (step.published or (step.advanced_phase and step.phase == .publish_generation)) {

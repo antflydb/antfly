@@ -87,7 +87,33 @@ pub const Topology = struct {
         requirements: TopologyRequirements,
         cancellation: CancellationToken,
     ) !Topology {
-        if (node_count > std.math.maxInt(u32) or edges.len > std.math.maxInt(u32))
+        return initFromSourceAlloc(alloc, node_count, edges.len, SliceEdges{ .edges = edges }, requirements, cancellation);
+    }
+
+    const SliceEdges = struct {
+        edges: []const Edge,
+        index: usize = 0,
+
+        pub fn next(self: *@This()) ?Edge {
+            if (self.index == self.edges.len) return null;
+            defer self.index += 1;
+            return self.edges[self.index];
+        }
+    };
+
+    /// Two deterministic passes over a replayable edge source. The source is
+    /// copied for each pass and must yield the same immutable, ordered edges.
+    /// Projections can remap ordinals here without retaining an O(E) edge copy.
+    pub fn initFromSourceAlloc(
+        alloc: Allocator,
+        node_count: usize,
+        edge_count: usize,
+        source: anytype,
+        requirements: TopologyRequirements,
+        cancellation: CancellationToken,
+    ) !Topology {
+        try cancellation.check();
+        if (node_count > std.math.maxInt(u32) or edge_count > std.math.maxInt(u32))
             return error.GraphMetricBuildBudgetExceeded;
         const offset_count = std.math.add(usize, node_count, 1) catch
             return error.GraphMetricBuildBudgetExceeded;
@@ -99,14 +125,19 @@ pub const Topology = struct {
         errdefer if (has_outgoing) alloc.free(outgoing_offsets);
         if (has_incoming) @memset(incoming_offsets, 0);
         if (has_outgoing) @memset(outgoing_offsets, 0);
-        for (edges, 0..) |edge, i| {
-            if (i % 4096 == 0) try cancellation.check();
+        var census = source;
+        var edge_index: usize = 0;
+        while (census.next()) |edge| : (edge_index += 1) {
+            if (edge_index % 4096 == 0) try cancellation.check();
+            if (edge_index == edge_count) return error.InvalidGraphMetricEdge;
             if (@as(usize, edge.source) >= node_count or @as(usize, edge.target) >= node_count)
                 return error.InvalidGraphMetricEdge;
             if (has_incoming) incoming_offsets[@as(usize, edge.target) + 1] += 1;
             if (has_outgoing) outgoing_offsets[@as(usize, edge.source) + 1] += 1;
         }
+        if (edge_index != edge_count) return error.InvalidGraphMetricEdge;
         for (1..offset_count) |i| {
+            if (i % 4096 == 0) try cancellation.check();
             if (has_incoming) incoming_offsets[i] = std.math.add(u32, incoming_offsets[i], incoming_offsets[i - 1]) catch
                 return error.GraphMetricBuildBudgetExceeded;
             if (has_outgoing) outgoing_offsets[i] = std.math.add(u32, outgoing_offsets[i], outgoing_offsets[i - 1]) catch
@@ -114,32 +145,38 @@ pub const Topology = struct {
         }
         const owns_incoming_sources = requirements.incoming == .neighbors;
         const owns_outgoing_targets = requirements.outgoing == .neighbors;
-        const incoming_sources = if (owns_incoming_sources) try alloc.alloc(u32, edges.len) else @constCast(&[_]u32{});
+        const incoming_sources = if (owns_incoming_sources) try alloc.alloc(u32, edge_count) else @constCast(&[_]u32{});
         errdefer if (owns_incoming_sources) alloc.free(incoming_sources);
-        const outgoing_targets = if (owns_outgoing_targets) try alloc.alloc(u32, edges.len) else @constCast(&[_]u32{});
+        const outgoing_targets = if (owns_outgoing_targets) try alloc.alloc(u32, edge_count) else @constCast(&[_]u32{});
         errdefer if (owns_outgoing_targets) alloc.free(outgoing_targets);
         const incoming_cursors = if (owns_incoming_sources) try alloc.dupe(u32, incoming_offsets[0..node_count]) else @constCast(&[_]u32{});
         defer if (owns_incoming_sources) alloc.free(incoming_cursors);
         const outgoing_cursors = if (owns_outgoing_targets) try alloc.dupe(u32, outgoing_offsets[0..node_count]) else @constCast(&[_]u32{});
         defer if (owns_outgoing_targets) alloc.free(outgoing_cursors);
         if (owns_incoming_sources or owns_outgoing_targets) {
-            for (edges, 0..) |edge, i| {
-                if (i % 4096 == 0) try cancellation.check();
+            var fill = source;
+            edge_index = 0;
+            while (fill.next()) |edge| : (edge_index += 1) {
+                if (edge_index % 4096 == 0) try cancellation.check();
+                if (edge_index == edge_count or edge.source >= node_count or edge.target >= node_count) return error.InvalidGraphMetricEdge;
                 if (owns_incoming_sources) {
                     const incoming_position = incoming_cursors[edge.target];
+                    if (incoming_position >= incoming_offsets[edge.target + 1]) return error.InvalidGraphMetricEdge;
                     incoming_sources[incoming_position] = edge.source;
                     incoming_cursors[edge.target] += 1;
                 }
                 if (owns_outgoing_targets) {
                     const outgoing_position = outgoing_cursors[edge.source];
+                    if (outgoing_position >= outgoing_offsets[edge.source + 1]) return error.InvalidGraphMetricEdge;
                     outgoing_targets[outgoing_position] = edge.target;
                     outgoing_cursors[edge.source] += 1;
                 }
             }
+            if (edge_index != edge_count) return error.InvalidGraphMetricEdge;
         }
         return .{
             .node_count = node_count,
-            .edge_count = edges.len,
+            .edge_count = edge_count,
             .requirements = requirements,
             .incoming_offsets = incoming_offsets,
             .incoming_sources = incoming_sources,
@@ -966,6 +1003,34 @@ test "serverless bounded graph metric kernels compute all supported metrics" {
 test "serverless graph metric kernels reject unbounded work before allocating" {
     try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, pageRankAlloc(std.testing.allocator, 2, &.{}, .{ .max_nodes = 1 }));
     try std.testing.expectError(error.InvalidGraphMetricEdge, degreeAlloc(std.testing.allocator, 1, &.{.{ .source = 0, .target = 1 }}, .{}));
+}
+
+test "serverless graph metric replayed CSR preserves exact adjacency order and unwinds allocation failures" {
+    const Source = struct {
+        index: usize = 0,
+        pub fn next(self: *@This()) ?Edge {
+            const edges = [_]Edge{
+                .{ .source = 2, .target = 1 }, .{ .source = 1, .target = 1 },
+                .{ .source = 0, .target = 2 }, .{ .source = 2, .target = 1 },
+            };
+            if (self.index == edges.len) return null;
+            defer self.index += 1;
+            return edges[self.index];
+        }
+        fn run(alloc: Allocator) !void {
+            for ([_]TopologyRequirements{ .degree, .pagerank, .eigenvector, .hits }) |requirements| {
+                var topology = try Topology.initFromSourceAlloc(alloc, 3, 4, @This(){}, requirements, .none);
+                defer topology.deinit(alloc);
+                if (requirements.incoming != .none) try std.testing.expectEqualSlices(u32, &.{ 0, 0, 3, 4 }, topology.incoming_offsets);
+                if (requirements.incoming == .neighbors) try std.testing.expectEqualSlices(u32, &.{ 2, 1, 2, 0 }, topology.incoming_sources);
+                if (requirements.outgoing != .none) try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 4 }, topology.outgoing_offsets);
+                if (requirements.outgoing == .neighbors) try std.testing.expectEqualSlices(u32, &.{ 2, 1, 1, 1 }, topology.outgoing_targets);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Source.run, .{});
+    try std.testing.expectError(error.InvalidGraphMetricEdge, Topology.initFromSourceAlloc(std.testing.allocator, 3, 3, Source{}, .hits, .none));
+    try std.testing.expectError(error.InvalidGraphMetricEdge, Topology.initFromSourceAlloc(std.testing.allocator, 3, 5, Source{}, .hits, .none));
 }
 
 test "serverless graph metric kernels normalize compatible warm starts and reject malformed seeds" {
