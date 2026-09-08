@@ -104,6 +104,18 @@ pub const RetainedSegment = union(enum) {
         };
     }
 
+    /// A sub-object (for example an immutable row chunk) may outlive its
+    /// parent generation after off-writer rebasing. Retain the actual backing,
+    /// not the parent generation, which would create a reference cycle.
+    pub fn retain(self: RetainedSegment, alloc: Allocator) !RetainedSegment {
+        if (self == .shared) {
+            const previous = self.shared.refs.fetchAdd(1, .monotonic);
+            std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
+            return self;
+        }
+        return .{ .heap = try alloc.dupe(u8, self.bytes()) };
+    }
+
     pub fn isMapped(self: RetainedSegment) bool {
         return if (self == .shared) self.shared.payload.isMapped() else self == .mapped;
     }

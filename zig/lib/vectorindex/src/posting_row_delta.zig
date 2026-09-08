@@ -20,6 +20,45 @@ const header_len = 80;
 const run_len = 40;
 const max_encoded_bytes = 64 * 1024 * 1024;
 
+pub fn isManifest(bytes: []const u8) bool {
+    return bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "AFRM");
+}
+
+/// Recovery can schedule bounded deferred work without touching code pages.
+/// A compact chunk is stamped with its manifest revision; a later deletion
+/// advances only the manifest. Multiple runs also imply deferred packing work.
+pub fn manifestHasDebt(bytes: []const u8) !bool {
+    try validateFrame(bytes, "AFRM");
+    const count = get(u64, bytes, 64);
+    if (count > Policy.hard_runs or bytes.len != header_len + count * run_len or get(u64, bytes, 72) != 0)
+        return error.InvalidPostingRows;
+    return count > 1 or (count == 1 and (get(u64, bytes, 40) > get(u64, bytes, header_len + 8) or get(u32, bytes, header_len + 28) != 0));
+}
+
+/// A committed allocator value lives at native row-chunk key zero. Serial
+/// zero is never a chunk. Replaying this value with the rest of the capture
+/// prevents identity reuse across WAL rotation, checkpointing and restart.
+pub const Allocation = struct {
+    incarnation: u64,
+    serial: u64,
+
+    pub fn encode(self: Allocation) [24]u8 {
+        var bytes: [24]u8 = @splat(0);
+        @memcpy(bytes[0..4], "AFRA");
+        put(u64, &bytes, 8, self.incarnation);
+        put(u64, &bytes, 16, self.serial);
+        put(u32, &bytes, 4, Crc32.hash(bytes[8..]));
+        return bytes;
+    }
+
+    pub fn decode(bytes: []const u8) !Allocation {
+        if (bytes.len != 24 or !std.mem.eql(u8, bytes[0..4], "AFRA") or
+            get(u32, bytes, 4) != Crc32.hash(bytes[8..]) or get(u64, bytes, 8) == 0 or get(u64, bytes, 16) > std.math.maxInt(u63))
+            return error.InvalidPostingRows;
+        return .{ .incarnation = get(u64, bytes, 8), .serial = get(u64, bytes, 16) };
+    }
+};
+
 pub const Identity = struct {
     incarnation: u64,
     leaf: u64,
@@ -219,6 +258,33 @@ pub const Snapshot = struct {
         return result;
     }
 
+    /// Compatibility/maintenance only. Serving uses scoreTo/Run.scan and
+    /// mutation uses row references; neither needs this aggregate allocation.
+    pub fn materialize(self: *const Snapshot, alloc: Allocator) !proto.RaBitQuantizedVectorSet {
+        if (self.runs.len == 0) return error.InvalidPostingRows;
+        const origin = self.runs[0].chunk.view;
+        var set: proto.RaBitQuantizedVectorSet = .{ .metric = @enumFromInt(origin.metric), .centroid_norm = origin.centroid_norm };
+        errdefer set.deinit(alloc);
+        set.centroid = try alloc.dupe(f32, origin.centroid);
+        set.codes = .{ .count = @intCast(self.row_count), .width = @intCast(origin.width), .data = try alloc.alloc(u64, self.row_count * origin.width) };
+        set.code_counts = try alloc.alloc(u32, self.row_count);
+        set.centroid_distances = try alloc.alloc(f32, self.row_count);
+        set.quantized_dot_products = try alloc.alloc(f32, self.row_count);
+        if (!origin.omitted_l2_centroid_dots) set.centroid_dot_products = try alloc.alloc(f32, self.row_count);
+        var offset: usize = 0;
+        for (self.runs) |run| {
+            const source = run.scan().quantized.rabit;
+            const end = offset + run.len;
+            @memcpy(set.codes.data[offset * origin.width .. end * origin.width], source.codes.data);
+            @memcpy(set.code_counts[offset..end], source.code_counts);
+            @memcpy(set.centroid_distances[offset..end], source.centroid_distances);
+            @memcpy(set.quantized_dot_products[offset..end], source.quantized_dot_products);
+            if (set.centroid_dot_products.len != 0) @memcpy(set.centroid_dot_products[offset..end], source.centroid_dot_products);
+            offset = end;
+        }
+        return set;
+    }
+
     pub fn deinit(self: *Snapshot) void {
         for (self.runs) |run| run.chunk.release();
         self.alloc.free(self.runs);
@@ -372,6 +438,7 @@ fn appendRun(alloc: Allocator, runs: *std.ArrayListUnmanaged(Run), run: Run) !vo
 
 fn sameOrigin(a: directory.View, b: directory.View) bool {
     return a.metric == b.metric and a.width == b.width and
+        a.omitted_l2_centroid_dots == b.omitted_l2_centroid_dots and
         @as(u32, @bitCast(a.centroid_norm)) == @as(u32, @bitCast(b.centroid_norm)) and
         std.mem.eql(u8, std.mem.sliceAsBytes(a.centroid), std.mem.sliceAsBytes(b.centroid));
 }
@@ -393,7 +460,7 @@ pub const Policy = struct {
     pub fn needsRepack(self: Policy, view: *const Snapshot, debt_age_ns: u64) bool {
         const removed = view.physical_rows -| view.row_count;
         return view.runs.len > self.soft_runs or view.chunk_count > self.soft_chunks or
-            view.physical_bytes > self.soft_bytes or
+            ((view.chunk_count > 1 or removed != 0) and view.physical_bytes > self.soft_bytes) or
             (removed != 0 and removed *| 100 >= view.physical_rows *| self.tombstone_percent) or
             (view.chunk_count > 1 or removed != 0) and debt_age_ns >= self.max_age_ns;
     }
@@ -553,6 +620,35 @@ fn expectIds(view: *const Snapshot, expected: []const u64) !void {
     }
 }
 
+test "posting row allocator and recovery debt are authenticated without loading chunks" {
+    var encoded = (Allocation{ .incarnation = 7, .serial = 42 }).encode();
+    try std.testing.expectEqualDeep(Allocation{ .incarnation = 7, .serial = 42 }, try Allocation.decode(&encoded));
+    encoded[16] ^= 1;
+    try std.testing.expectError(error.InvalidPostingRows, Allocation.decode(&encoded));
+    try std.testing.expectError(error.InvalidPostingRows, Allocation.decode(&(Allocation{ .incarnation = 0, .serial = 1 }).encode()));
+    try std.testing.expectError(error.InvalidPostingRows, Allocation.decode(&(Allocation{ .incarnation = 1, .serial = @as(u64, 1) << 63 }).encode()));
+    const a = std.testing.allocator;
+    const chunk = try testChunk(a, 1, 1, &.{ 1, 2, 3, 4 }, .cosine);
+    defer chunk.release();
+    var base = try Snapshot.init(a, test_identity, 1, 10, &.{.{ .chunk = chunk, .start = 0, .len = 4 }});
+    defer base.deinit();
+    const clean = try base.encode();
+    defer a.free(clean);
+    try std.testing.expect(!try manifestHasDebt(clean));
+    var changed = try base.mutate(1, 2, 11, &.{.{ .chunk = 1, .row = 3 }}, null);
+    defer changed.deinit();
+    const dirty = try changed.encode();
+    defer a.free(dirty);
+    try std.testing.expect(try manifestHasDebt(dirty));
+    var repack = try Repack.prepare(&changed, 2);
+    defer repack.deinit();
+    var compact = try repack.rebase(&changed);
+    defer compact.deinit();
+    const compact_bytes = try compact.encode();
+    defer a.free(compact_bytes);
+    try std.testing.expect(!try manifestHasDebt(compact_bytes));
+}
+
 test "posting row deltas preserve revision identity and old query leases" {
     const a = std.testing.allocator;
     for ([_]@import("antfly_vector").vector.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
@@ -676,7 +772,9 @@ test "posting row debt is bounded by density bytes fanout and age" {
     try std.testing.expect(!Policy.needsRepack(.{ .tombstone_percent = 50 }, &dirty, 0));
     try std.testing.expect(Policy.needsRepack(.{ .tombstone_percent = 50 }, &dirty, 30 * std.time.ns_per_s));
     try std.testing.expect(Policy.needsRepack(.{ .tombstone_percent = 50, .soft_runs = 1 }, &dirty, 0));
-    try std.testing.expect(Policy.needsRepack(.{ .soft_bytes = 1 }, &base, 0));
+    // A compact chunk cannot become smaller through another identical repack.
+    try std.testing.expect(!Policy.needsRepack(.{ .soft_bytes = 1 }, &base, 0));
+    try std.testing.expect(Policy.needsRepack(.{ .soft_bytes = 1 }, &dirty, 0));
     const too_many = try a.alloc(Run, Policy.hard_runs + 1);
     defer a.free(too_many);
     try std.testing.expectError(error.PostingRowBackpressure, Snapshot.init(a, test_identity, 1, 100, too_many));

@@ -6,10 +6,42 @@ from native_preparation_experiments import (
     checkpoint_evidence,
     require_disk_headroom,
     delete_preparation_evidence,
+    validate_workload_lines,
 )
 
 
 class NativePreparationTests(unittest.TestCase):
+    def test_successful_client_exit_cannot_hide_write_failures(self):
+        for marker in (
+            "Antfly insert error: HTTP 500",
+            "Insert failed, retrying",
+            "public table batch failed",
+            "err=error.OutOfMemory",
+            "MissingPostingChunk",
+        ):
+            with self.assertRaises(RuntimeError):
+                validate_workload_lines([marker, "client exited successfully"])
+        validate_workload_lines(["dense posting checkpoint published generation=2"])
+
+    def test_row_delta_requires_native_mutations_and_durable_publication(self):
+        flags = {"ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS": "1"}
+        lines = [
+            "dense posting row checkpoint generation=4 leaves=3",
+            "dense posting checkpoint published generation=4",
+            "dense delete preserved rows index=vec rows=40 native_rows=20",
+        ]
+        self.assertEqual(checkpoint_evidence(lines, flags)["leaves"]["sum"], 3)
+        self.assertEqual(
+            delete_preparation_evidence(lines, flags)["native_vector_rows"]["sum"], 20
+        )
+        with self.assertRaises(RuntimeError):
+            checkpoint_evidence(lines[:1], flags)
+        for native in ("0", "-1", "nan"):
+            with self.assertRaises(RuntimeError):
+                delete_preparation_evidence(
+                    [f"dense delete preserved rows rows=40 native_rows={native}"], flags
+                )
+
     def test_stable_origin_treatment_requires_preserved_rows(self):
         flags = {"ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS": "1"}
         result = delete_preparation_evidence(

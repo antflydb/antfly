@@ -18,6 +18,7 @@ REFINEMENTS = {
     "coalesced_deletes": ["ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES"],
     "reused_delete_vectors": ["ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS"],
     "stable_posting_origins": ["ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS"],
+    "posting_row_deltas": ["ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS"],
     "dense_delete_plan": [
         "ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES",
         "ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS",
@@ -53,6 +54,11 @@ def checkpoint_evidence(lines, environment):
     }
     observations = {}
     for flag, marker, field in (
+        (
+            "ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS",
+            "dense posting row checkpoint ",
+            "leaves",
+        ),
         (
             "ANTFLY_EXPERIMENT_STAGE_POSTING_READERS",
             "dense checkpoint worker ",
@@ -108,6 +114,15 @@ def checkpoint_evidence(lines, environment):
 
 
 def validate_native_treatment(arm, environment):
+    # The archived harness predates the live runner's retry gate. A successful
+    # client process does not qualify a run that retried failed public writes.
+    required = {arm / "vdbbench-live.log", arm / "antfly-initial.log"}
+    for path in required:
+        if not path.is_file():
+            raise RuntimeError(f"missing workload log: {path}")
+    for path in sorted(required | set(arm.glob("antfly-*.log"))):
+        with path.open(errors="replace") as stream:
+            validate_workload_lines(stream, path.name)
     active = {
         flag
         for flags in REFINEMENTS.values()
@@ -138,10 +153,34 @@ def validate_native_treatment(arm, environment):
     return result
 
 
+def validate_workload_lines(lines, filename="workload log"):
+    failures = (
+        "Antfly insert error:",
+        "Insert failed,",
+        "public table batch failed",
+        "VectorPayloadStorePoisoned",
+        "err=error.OutOfMemory",
+        "err=OutOfMemory",
+        "PostingWalMutationOutsideCapture",
+        "MissingPostingChunk",
+        "PostingChunkIdentityConflict",
+    )
+    for number, line in enumerate(lines, 1):
+        if any(marker in line for marker in failures):
+            raise RuntimeError(
+                f"unqualified workload failure in {filename}:{number}: {line.strip()[:500]}"
+            )
+
+
 def delete_preparation_evidence(lines, environment):
     """Require actual work reduction; ordinary lifecycle/recall gates still apply."""
     result = {}
     for flag, marker, key in (
+        (
+            "ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS",
+            "dense delete preserved rows ",
+            "native_vector_rows",
+        ),
         (
             "ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES",
             "dense replay delete plan ",
@@ -163,9 +202,19 @@ def delete_preparation_evidence(lines, environment):
         try:
             rows = events(lines, marker)
             values = [
-                int(row["requested"]) - int(row["unique"])
-                if key == "deduplicated_keys"
-                else int(row["rows"] if key == "preserved_vector_rows" else row["reused_rows"])
+                (
+                    int(row["requested"]) - int(row["unique"])
+                    if key == "deduplicated_keys"
+                    else int(
+                        row["native_rows"]
+                        if key == "native_vector_rows"
+                        else (
+                            row["rows"]
+                            if key == "preserved_vector_rows"
+                            else row["reused_rows"]
+                        )
+                    )
+                )
                 for row in rows
             ]
         except (KeyError, ValueError) as error:
@@ -174,9 +223,9 @@ def delete_preparation_evidence(lines, environment):
         # reuse is common to both arms, zero reused rows is then expected in
         # the candidate; the following stable-origin gate must still prove
         # positive preserved work. Never relax the standalone reuse gate.
-        superseded = (
-            flag == "ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS"
-            and environment.get("ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS") == "1"
+        superseded = flag == "ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS" and (
+            environment.get("ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS") == "1"
+            or environment.get("ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS") == "1"
         )
         if not values or min(values) < 0 or (max(values) <= 0 and not superseded):
             raise RuntimeError(f"inert delete treatment: {flag}")

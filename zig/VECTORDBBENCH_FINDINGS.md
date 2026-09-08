@@ -9770,3 +9770,58 @@ file-reference reclamation. Then run matched public-API 50K and 1M read-only
 and mixed qualification. No such qualification or default promotion is claimed
 for this component checkpoint; the requested whole production shape is not yet
 complete.
+
+#### Integrated native posting rows — correctness checkpoint (2026-09-08)
+
+The component above is now wired into the native HBC authority behind
+`ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS` (default off). This is an integrated
+experiment, not a performance promotion. Optional LSM-authoritative sidecars
+and V1 catalog entries do not use the row-only mutation path.
+
+- A checksummed AFRA allocation cursor is committed at row-chunk key zero.
+  New AFRC chunks and AFRM manifests participate in the existing source WAL
+  transaction with membership, routing, vector mappings and source coverage.
+  Source serials and checkpoint serials occupy disjoint namespaces; full
+  checkpoints retain the cursor even when all old chunks become unreachable.
+- Native deletes filter revision-qualified row references without reading or
+  requantizing survivors. Appends quantize only new vectors against the retained
+  scoring origin. Existing aggregate native leaves convert lazily through the
+  quantized-store path; they remain readable alongside row-native leaves.
+- Queries borrow generation-leased code spans and use the existing candidate
+  selector, filters, coverage checks and authoritative float32 completion.
+  Single-run membership is borrowed, not flattened into another ID allocation.
+  Reads remain supported when the experiment is disabled after restart.
+- Repacking runs in the governed checkpoint worker. Soft density/fan-out/byte
+  limits and aging request maintenance; hard limits are retryable replay
+  backpressure. Recovery detects manifest debt without reading code planes.
+  A selective delta repack retains the existing base file. Full checkpoints
+  flatten the bounded segment chain and drop unreachable chunks.
+- A full checkpoint copies the captured manifest's chunk-reference closure
+  even when publishing a compact replacement. A newer source WAL tail can
+  still reference those captured chunks. Generation/backing leases prevent
+  reclamation while older queries need retired files. A later full checkpoint
+  removes chunks that are no longer reachable. This is chunk reuse within the
+  existing immutable-segment lifecycle, not independently addressable chunk
+  files or elimination of every whole-segment rewrite.
+
+Integration testing caught an eager single-delete merge that undid row
+preservation; the merge guard now also recognizes native rows. The scheduling
+review also removed a whole-generation rewrite on each soft row-debt event:
+those events use selective delta repacking while the segment chain has room.
+
+Validation so far: 43 row/WAL/segment Debug tests passed (one performance-only
+test skipped); 21 focused storage/capture/checkpoint tests passed without leaks;
+the database overwrite/reopen checks and 1,000-/10,000-document streaming
+replay checks passed with the flag enabled. The integrated fixture covers L2,
+cosine and inner product, filtered/range and unfiltered score parity, capture
+abort, missing chunks, same-ID source-vector replacement, staged full/delta
+repacks with a newer WAL tail, pinned old readers, reopen, and disabling the
+treatment. Ten benchmark-evidence tests pass; qualification requires actual
+native deletions and a matching durable row-checkpoint publication, not merely
+the environment flag. The archived-harness runner now also rejects public-write
+errors and retries, source-store poisoning/OOM, and native chunk/capture errors
+even when the VectorDBBench client process eventually exits successfully.
+
+Matched public-API 50K/1M performance qualification is still pending. The
+standalone microbenchmark numbers above must not be presented as integrated
+latency, RSS, or disk improvements.

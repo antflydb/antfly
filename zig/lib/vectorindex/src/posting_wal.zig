@@ -53,6 +53,8 @@ pub const RecordKind = enum(u8) {
     vector_leaf_tombstone = 16,
     vector_metadata_tombstone = 17,
     index_metadata_tombstone = 18,
+    /// Immutable native row chunk; id zero is the durable allocation cursor.
+    row_chunk = 19,
     commit = 255,
 };
 
@@ -595,11 +597,12 @@ const lookup_record_kinds = [_]RecordKind{
     .vector_leaf,
     .vector_metadata,
     .index_metadata,
+    .row_chunk,
 };
 
 fn isLookupValueKind(kind: RecordKind) bool {
     return switch (kind) {
-        .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata => true,
+        .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata, .row_chunk => true,
         else => false,
     };
 }
@@ -705,6 +708,7 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
         @intFromEnum(RecordKind.vector_leaf_tombstone) => .vector_leaf_tombstone,
         @intFromEnum(RecordKind.vector_metadata_tombstone) => .vector_metadata_tombstone,
         @intFromEnum(RecordKind.index_metadata_tombstone) => .index_metadata_tombstone,
+        @intFromEnum(RecordKind.row_chunk) => .row_chunk,
         @intFromEnum(RecordKind.commit) => .commit,
         else => return error.InvalidPostingWalRecord,
     };

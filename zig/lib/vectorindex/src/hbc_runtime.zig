@@ -150,6 +150,9 @@ test "posting row selection preserves scoring origin and is allocation safe" {
 pub const NativeLeafScanView = struct {
     member_ids: []const u64,
     quantized: QuantizedSet,
+    /// Native base/delta rows under the same complete generation lease. When
+    /// present, quantized is only a placeholder and must not be scored/freed.
+    row_snapshot: ?*const @import("posting_row_delta.zig").Snapshot = null,
     /// Optional source-space float16 rows owned by the same immutable posting
     /// generation. Rows follow member_ids exactly; per-row metadata makes the
     /// resulting score interval conservative enough to defer authoritative
@@ -289,6 +292,7 @@ pub const WriteProfile = struct {
     centroid_recompute_calls: u64 = 0,
     delete_reused_vector_rows: u64 = 0,
     delete_preserved_vector_rows: u64 = 0,
+    delete_native_vector_rows: u64 = 0,
     centroid_recompute_members_total: u64 = 0,
     centroid_recompute_members_max: u64 = 0,
     save_split_range_ns: u64 = 0,

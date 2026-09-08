@@ -146,6 +146,7 @@ pub const WriteSessionKind = enum {
 };
 const hbc_index_version = vectorindex_hbc.hbc_index_version;
 const IndexMetadata = vectorindex_hbc.IndexMetadata;
+const posting_rows = @import("antfly_vectorindex").posting_row_delta;
 pub const ProjectionCheckpointMetadata = vectorindex_hbc.ProjectionCheckpointMetadata;
 
 // ============================================================================
@@ -2669,6 +2670,7 @@ const ExperimentalPostingReadState = struct {
     /// Lower bound: superseded delta serving rows only. Does not count base
     /// rows, patches, or metadata that a retained generation may still need.
     obsolete_delta_scan_bytes: u64 = 0,
+    row_debt: bool = false,
     scan_admission: vectorindex_quantized_directory.AdmissionStats = .{},
     /// Exact physical scan cost for postings shadowed above the immutable
     /// quantized directory. This is rebuilt from bounded segment/WAL deltas on
@@ -3069,6 +3071,32 @@ const ExperimentalPostingReadState = struct {
         return &block.directory;
     }
 
+    fn rebuildRowDebt(self: *ExperimentalPostingReadState) !void {
+        if (!try self.hasValue(0, .row_chunk)) return;
+        var ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer ids.deinit(self.alloc);
+        for (self.segments) |*segment| {
+            var keys = segment.keys();
+            while (try keys.next()) |key| {
+                if (key.kind == .quantized_checkpoint) try ids.put(self.alloc, key.id, {});
+            }
+        }
+        var values = self.materialized.keyIterator();
+        while (values.next()) |key| {
+            if (try experimentalPostingValueKeyKind(key.*) == .quantized_checkpoint)
+                try ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
+        }
+        var iter = ids.keyIterator();
+        while (iter.next()) |id| {
+            var resolved = (try self.resolveValueAlloc(self.alloc, id.*, .quantized_checkpoint)) orelse continue;
+            defer resolved.deinit(self.alloc);
+            if (posting_rows.isManifest(resolved.bytes) and try posting_rows.manifestHasDebt(resolved.bytes)) {
+                self.row_debt = true;
+                return;
+            }
+        }
+    }
+
     fn rebuildScanAdmission(self: *ExperimentalPostingReadState, dims: usize, use_quantization: bool) !void {
         var admission = if (self.quantized_directory) |*directory|
             directory.admissionStats()
@@ -3080,6 +3108,12 @@ const ExperimentalPostingReadState = struct {
         // walk or checksum unrelated vector metadata payloads on restart.
         var changed = std.AutoHashMapUnmanaged(u64, void).empty;
         defer changed.deinit(self.alloc);
+        // Row-native leaves are deliberately absent from the aggregate AFQD.
+        // Discover their compact keys without touching unrelated payloads.
+        var base_keys = self.segments[0].keys();
+        while (try base_keys.next()) |key| {
+            if (key.kind == .quantized_checkpoint) try changed.put(self.alloc, key.id, {});
+        }
         if (self.quantized_directory) |*directory| {
             for (0..directory.reader.posting_count) |index| {
                 if (directory.missingProjectionLeafAt(index)) |id| try changed.put(self.alloc, id, {});
@@ -3326,7 +3360,7 @@ const ExperimentalPostingReadState = struct {
 
     fn materializeWal(self: *ExperimentalPostingReadState, wal: *const posting_segment_store_mod.RecoveredWal) !void {
         for (wal.replay.records.items) |record| switch (record.kind) {
-            .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata => try self.setBorrowed(record.posting_id, record.kind, record.payload),
+            .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata, .row_chunk => try self.setBorrowed(record.posting_id, record.kind, record.payload),
             .mutation => {
                 if (record.payload.len < 6) return error.CorruptedPostingPatch;
                 const target: vectorindex_posting_wal.RecordKind = switch (record.payload[5]) {
@@ -3453,6 +3487,7 @@ fn experimentalPostingSegmentKind(kind: vectorindex_posting_wal.RecordKind) ?vec
         .vector_leaf => .vector_leaf,
         .vector_metadata => .vector_metadata,
         .index_metadata => .index_metadata,
+        .row_chunk => .row_chunk,
         else => null,
     };
 }
@@ -3491,6 +3526,7 @@ fn experimentalPostingWalKindFromSegment(kind: vectorindex_posting_segment.Entry
         .vector_leaf => .{ .kind = .vector_leaf, .tombstone = false, .patch = false },
         .vector_metadata => .{ .kind = .vector_metadata, .tombstone = false, .patch = false },
         .index_metadata => .{ .kind = .index_metadata, .tombstone = false, .patch = false },
+        .row_chunk => .{ .kind = .row_chunk, .tombstone = false, .patch = false },
         .base_tombstone => .{ .kind = .base, .tombstone = true, .patch = false },
         .quantized_checkpoint_tombstone => .{ .kind = .quantized_checkpoint, .tombstone = true, .patch = false },
         .posting_state_tombstone => .{ .kind = .posting_state, .tombstone = true, .patch = false },
@@ -3550,6 +3586,109 @@ const ExperimentalPostingValueBlob = struct {
 
 const ExperimentalPostingGenerationValues = std.AutoHashMapUnmanaged(u128, ?*ExperimentalPostingValueBlob);
 
+const NativePostingRows = struct {
+    alloc: Allocator,
+    snapshot: posting_rows.Snapshot,
+    members: []const u64,
+    owned_members: ?[]u64,
+
+    fn create(alloc: Allocator, bytes: []const u8, resolver: anytype) !*NativePostingRows {
+        var snapshot = try posting_rows.Snapshot.decode(alloc, bytes, resolver);
+        errdefer snapshot.deinit();
+        return fromSnapshot(alloc, snapshot);
+    }
+
+    /// Ownership transfers on success only.
+    fn fromSnapshot(alloc: Allocator, snapshot: posting_rows.Snapshot) !*NativePostingRows {
+        const owned_members = if (snapshot.runs.len == 1) null else try alloc.alloc(u64, snapshot.row_count);
+        errdefer if (owned_members) |members| alloc.free(members);
+        if (owned_members) |members| {
+            var offset: usize = 0;
+            for (snapshot.runs) |run| {
+                @memcpy(members[offset..][0..run.len], run.scan().member_ids);
+                offset += run.len;
+            }
+        }
+        const result = try alloc.create(NativePostingRows);
+        result.* = .{ .alloc = alloc, .snapshot = snapshot, .members = owned_members orelse snapshot.runs[0].scan().member_ids, .owned_members = owned_members };
+        return result;
+    }
+
+    fn destroy(self: *NativePostingRows) void {
+        self.snapshot.deinit();
+        if (self.owned_members) |members| self.alloc.free(members);
+        self.alloc.destroy(self);
+    }
+};
+
+/// A decode-local interner. Its chunks own independent backing leases, never
+/// a generation reference (which would form a cycle through the row cache).
+const NativePostingRowResolver = struct {
+    alloc: Allocator,
+    generation: *ExperimentalPostingReadGeneration,
+    capture: ?*HBCIndex = null,
+    chunks: std.AutoHashMapUnmanaged(u64, *posting_rows.Chunk) = .empty,
+
+    fn deinit(self: *NativePostingRowResolver) void {
+        var values = self.chunks.valueIterator();
+        while (values.next()) |chunk| chunk.*.release();
+        self.chunks.deinit(self.alloc);
+    }
+
+    pub fn get(self: *NativePostingRowResolver, serial: u64) !?*posting_rows.Chunk {
+        if (self.chunks.get(serial)) |chunk| return chunk;
+        const key = experimentalPostingValueKey(serial, .row_chunk);
+        const chunk = if (self.capture) |index| blk: {
+            if (index.experimental_posting_captured_values.get(key)) |maybe_blob| {
+                const blob = maybe_blob orelse return null;
+                break :blk try openBlob(self.alloc, blob);
+            }
+            break :blk (try self.generation.openRowChunk(self.alloc, serial)) orelse return null;
+        } else (try self.generation.openRowChunk(self.alloc, serial)) orelse return null;
+        errdefer chunk.release();
+        try self.chunks.put(self.alloc, serial, chunk);
+        return chunk;
+    }
+
+    fn releaseBlob(ptr: *anyopaque) void {
+        const blob: *ExperimentalPostingValueBlob = @ptrCast(@alignCast(ptr));
+        blob.release();
+    }
+
+    fn openBlob(alloc: Allocator, blob: *ExperimentalPostingValueBlob) !*posting_rows.Chunk {
+        blob.retain();
+        errdefer blob.release();
+        return posting_rows.Chunk.open(alloc, blob.bytes(), .{ .leased = .{ .ptr = blob, .release = releaseBlob } });
+    }
+
+    const SegmentLease = struct {
+        alloc: Allocator,
+        segment: posting_segment_store_mod.RetainedSegment,
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.segment.deinit(self.alloc);
+            self.alloc.destroy(self);
+        }
+    };
+
+    fn openSegment(alloc: Allocator, segment: posting_segment_store_mod.RetainedSegment, bytes: []const u8) !*posting_rows.Chunk {
+        const offset = @intFromPtr(bytes.ptr) - @intFromPtr(segment.bytes().ptr);
+        var retained = try segment.retain(alloc);
+        errdefer retained.deinit(alloc);
+        const lease = try alloc.create(SegmentLease);
+        errdefer alloc.destroy(lease);
+        lease.* = .{ .alloc = alloc, .segment = retained };
+        return posting_rows.Chunk.open(alloc, retained.bytes()[offset..][0..bytes.len], .{ .leased = .{ .ptr = lease, .release = SegmentLease.release } });
+    }
+
+    fn openCopy(alloc: Allocator, bytes: []const u8) !*posting_rows.Chunk {
+        const owned = try alloc.alignedAlloc(u8, .@"8", bytes.len);
+        errdefer alloc.free(owned);
+        @memcpy(owned, bytes);
+        return posting_rows.Chunk.open(alloc, owned, .{ .owned = .@"8" });
+    }
+};
+
 const ExperimentalPostingReadGeneration = struct {
     /// Complete immutable identity consumed by one query. Topology, routing
     /// cache identity, scan admission, and the posting transaction must never
@@ -3594,6 +3733,9 @@ const ExperimentalPostingReadGeneration = struct {
     leaf_scan_bytes: std.AutoHashMapUnmanaged(u64, vectorindex_quantized_directory.ScanBytes) = .empty,
     routing_mu: std.atomic.Mutex = .unlocked,
     routing_directory: ?*vectorindex_spfresh_index.FlatCentroidDirectory = null,
+    row_mu: std.atomic.Mutex = .unlocked,
+    row_views: std.AutoHashMapUnmanaged(u64, *NativePostingRows) = .empty,
+    row_budget: ?resource_manager_mod.BudgetedAllocator = null,
 
     fn createRoot(alloc: Allocator, state: *ExperimentalPostingReadState) !*ExperimentalPostingReadGeneration {
         const generation = try alloc.create(ExperimentalPostingReadGeneration);
@@ -3605,6 +3747,8 @@ const ExperimentalPostingReadGeneration = struct {
             .scan_admission = state.scan_admission,
             .root = state,
         };
+        if (state.patch_cache_manager) |manager|
+            generation.row_budget = resource_manager_mod.BudgetedAllocator.init(manager, .hbc_node_metadata_cache, alloc, 1);
         return generation;
     }
 
@@ -3626,6 +3770,11 @@ const ExperimentalPostingReadGeneration = struct {
             .overlay_depth = parent.overlay_depth +| 1,
             .parent = parent,
         };
+        if (experimentalPostingRootState(parent)) |state| {
+            if (state.patch_cache_manager) |manager| {
+                generation.row_budget = resource_manager_mod.BudgetedAllocator.init(manager, .hbc_node_metadata_cache, alloc, 1);
+            }
+        }
         parent.retain();
         return generation;
     }
@@ -3633,6 +3782,78 @@ const ExperimentalPostingReadGeneration = struct {
     fn retain(self: *ExperimentalPostingReadGeneration) void {
         const previous = self.refs.fetchAdd(1, .monotonic);
         std.debug.assert(previous > 0 and previous < std.math.maxInt(u32));
+    }
+
+    fn openRowChunk(self: *ExperimentalPostingReadGeneration, alloc: Allocator, serial: u64) !?*posting_rows.Chunk {
+        const key = experimentalPostingValueKey(serial, .row_chunk);
+        var current: ?*ExperimentalPostingReadGeneration = self;
+        while (current) |generation| : (current = generation.parent) {
+            if (generation.values.get(key)) |stored| return if (stored) |blob| try NativePostingRowResolver.openBlob(alloc, blob) else null;
+            if (generation.root) |root| {
+                if (root.materialized.get(key)) |stored| return if (stored.bytes) |bytes| try NativePostingRowResolver.openCopy(alloc, bytes) else null;
+                var i = root.segments.len;
+                while (i != 0) {
+                    i -= 1;
+                    if (try root.segments[i].getValue(serial, .row_chunk)) |bytes|
+                        return try NativePostingRowResolver.openSegment(alloc, root.retained_segments[i], bytes);
+                }
+                return null;
+            }
+        }
+        return error.Corrupted;
+    }
+
+    fn rowAllocator(self: *ExperimentalPostingReadGeneration) Allocator {
+        return if (self.row_budget) |*budget| budget.threadSafeAllocator() else self.alloc;
+    }
+
+    fn rowView(self: *ExperimentalPostingReadGeneration, posting_id: u64) !?*NativePostingRows {
+        // Unchanged leaves share the parent view. Any membership/state change
+        // requires validation against this exact publication, even if the
+        // scoring origin and quantized manifest did not change.
+        if (self.parent) |parent| {
+            var changed = false;
+            inline for (.{ vectorindex_posting_wal.RecordKind.base, .posting_state, .quantized_checkpoint }) |kind|
+                changed = changed or self.values.contains(experimentalPostingValueKey(posting_id, kind));
+            if (!changed) return parent.rowView(posting_id);
+        }
+        if (!try self.hasValue(0, .row_chunk)) return null;
+        lockAtomic(&self.row_mu);
+        if (self.row_views.get(posting_id)) |view| {
+            self.row_mu.unlock();
+            return view;
+        }
+        self.row_mu.unlock();
+        var encoded = (try self.resolveValueAlloc(self.alloc, posting_id, .quantized_checkpoint)) orelse return null;
+        defer encoded.deinit(self.alloc);
+        if (!posting_rows.isManifest(encoded.bytes)) return null;
+        var state = (try self.resolveValueAlloc(self.alloc, posting_id, .posting_state)) orelse return null;
+        defer state.deinit(self.alloc);
+        if ((try vectorindex_posting.decodeState(state.bytes)).payload_dirty) return null;
+        const alloc = self.rowAllocator();
+        var resolver = NativePostingRowResolver{ .alloc = self.alloc, .generation = self };
+        defer resolver.deinit();
+        const staged = try NativePostingRows.create(alloc, encoded.bytes, &resolver);
+        errdefer staged.destroy();
+        const cursor = try posting_rows.Allocation.decode((try self.value(0, .row_chunk)) orelse return error.MissingPostingChunk);
+        if (staged.snapshot.identity.leaf != posting_id or staged.snapshot.identity.incarnation != cursor.incarnation or
+            staged.snapshot.revision > cursor.serial or staged.snapshot.coverage > self.covered_source_sequence.load(.acquire)) return error.Corrupted;
+        var node = (try self.resolveValueAlloc(alloc, posting_id, .base)) orelse return error.Corrupted;
+        defer node.deinit(alloc);
+        const packed_node = try vectorindex_hbc.decodePackedNodeValue(node.bytes);
+        if (!packed_node.header.is_leaf or packed_node.header.parent == 0 or packed_node.ids_bytes.len != staged.members.len * 8) return error.Corrupted;
+        for (staged.members, 0..) |id, i| if (std.mem.readInt(u64, packed_node.ids_bytes[i * 8 ..][0..8], .little) != id) return error.Corrupted;
+        // All disk reads, decoding and budget admission precede this cache
+        // fence. Queries pin the complete owning generation throughout.
+        lockAtomic(&self.row_mu);
+        defer self.row_mu.unlock();
+        const entry = try self.row_views.getOrPut(self.alloc, posting_id);
+        if (entry.found_existing) {
+            staged.destroy();
+            return entry.value_ptr.*;
+        }
+        entry.value_ptr.* = staged;
+        return staged;
     }
 
     fn releaseOpaque(ptr: *anyopaque) void {
@@ -3652,6 +3873,10 @@ const ExperimentalPostingReadGeneration = struct {
             while (values.next()) |slot| if (slot.*) |blob| blob.release();
             generation.values.deinit(generation.alloc);
             generation.leaf_scan_bytes.deinit(generation.alloc);
+            var row_views = generation.row_views.valueIterator();
+            while (row_views.next()) |view| view.*.destroy();
+            generation.row_views.deinit(generation.alloc);
+            if (generation.row_budget) |*budget| budget.deinit();
             if (generation.root) |state| {
                 state.deinit();
                 generation.alloc.destroy(state);
@@ -4282,6 +4507,7 @@ const ExperimentalVectorRowIterator = struct {
 
 fn experimentalPostingValueKeyKind(key: u128) !vectorindex_posting_wal.RecordKind {
     return switch (@as(u8, @truncate(key))) {
+        @intFromEnum(vectorindex_posting_wal.RecordKind.row_chunk) => .row_chunk,
         @intFromEnum(vectorindex_posting_wal.RecordKind.base) => .base,
         @intFromEnum(vectorindex_posting_wal.RecordKind.quantized_checkpoint) => .quantized_checkpoint,
         @intFromEnum(vectorindex_posting_wal.RecordKind.posting_state) => .posting_state,
@@ -4374,6 +4600,10 @@ const StreamingPostingDeltaWriter = struct {
     sink: *lsm_backend.storage_io.AtomicWriteSink,
     writer: vectorindex_posting_segment.StreamingWriter,
 
+    fn appendValueAt(self: *@This(), id: u64, kind: vectorindex_posting_segment.EntryKind, sequence: u64, bytes: []const u8) !void {
+        try self.appendValueBorrowedAt(id, kind, sequence, bytes);
+    }
+
     fn appendValueBorrowedAt(self: *@This(), id: u64, kind: vectorindex_posting_segment.EntryKind, sequence: u64, value: []const u8) !void {
         try self.writer.appendValueAt(self.sink, id, kind, sequence, value);
     }
@@ -4389,6 +4619,8 @@ const StreamingPostingDeltaWriter = struct {
 /// appended after `flattened_wal_bytes`.
 const ExperimentalPostingCheckpointBuild = struct {
     owner_alloc: Allocator,
+    row_mutation_epoch: u64 = 0,
+    row_repack_due: bool = false,
     source_generation: *ExperimentalPostingReadGeneration,
     metadata: IndexMetadata,
     kind: ExperimentalPostingCheckpointKind,
@@ -4595,6 +4827,7 @@ const ExperimentalPostingCheckpointBuild = struct {
             self.projection_source,
             &writer,
             self.kind == .compact_deltas,
+            .{ .generation = self.segment_generation, .forced = self.row_repack_due },
         );
         if (self.kind == .delta and self.flattened_wal_bytes == 0 and result.source_value_count == 0 and result.scan_build.written_rows == 0) {
             // Abort the temporary writer before fsync/rename. Neither a new
@@ -4863,6 +5096,10 @@ pub const HBCIndex = struct {
     // owns for the checkpoint step.
     experimental_posting_maintenance_capture_active: bool = false,
     experimental_posting_captured_values: ExperimentalPostingCapturedValues = .empty,
+    experimental_posting_captured_rows: std.AutoHashMapUnmanaged(u64, *NativePostingRows) = .empty,
+    row_mutation_epoch: u64 = 0,
+    row_repack_pending: bool = false,
+    row_debt_since_ns: u64 = 0,
     experimental_posting_commit_workspace: PostingCommitWorkspace = .{},
     experimental_exact_vector_capture_enabled: bool = false,
     experimental_exact_vector_mutations: ExperimentalExactVectorMutations = .empty,
@@ -7885,6 +8122,7 @@ pub const HBCIndex = struct {
         }
         self.clearExperimentalPostingCapturedValues();
         self.experimental_posting_captured_values.deinit(self.alloc);
+        self.experimental_posting_captured_rows.deinit(self.alloc);
         self.experimental_posting_commit_workspace.deinit(self.alloc);
         self.clearExperimentalExactVectorMutations();
         self.experimental_exact_vector_mutations.deinit(self.alloc);
@@ -8036,6 +8274,11 @@ pub const HBCIndex = struct {
         self.experimental_posting_read_generation = generation;
         self.experimental_posting_reads_enabled.store(true, .release);
         self.experimental_posting_read_generation_mu.unlock();
+        if (self.row_debt_since_ns == 0) {
+            if (experimentalPostingRootState(generation)) |root| {
+                if (root.row_debt) self.row_debt_since_ns = nowNs();
+            }
+        }
         if (old) |previous| previous.release();
     }
 
@@ -8916,6 +9159,9 @@ pub const HBCIndex = struct {
     }
 
     fn clearExperimentalPostingMutationBase(self: *HBCIndex) void {
+        var rows = self.experimental_posting_captured_rows.valueIterator();
+        while (rows.next()) |row| row.*.destroy();
+        self.experimental_posting_captured_rows.clearRetainingCapacity();
         if (self.experimental_posting_mutation_value_lease) |lease| {
             self.experimental_posting_mutation_value_lease = null;
             lease.release(lease.ptr);
@@ -9046,6 +9292,8 @@ pub const HBCIndex = struct {
             return error.PostingSegmentGenerationOverflow;
         };
         build.* = .{
+            .row_mutation_epoch = self.row_mutation_epoch,
+            .row_repack_due = self.rowRepackDue(),
             .owner_alloc = self.alloc,
             .queued_ns = nowNs(),
             .source_generation = source_generation,
@@ -9183,6 +9431,10 @@ pub const HBCIndex = struct {
         defer prepared.deinit();
         const install_started_ns = nowNs();
         try self.installPreparedExperimentalPostingCheckpointRebasedTail(posting_store, &prepared, build.rebase_source orelse build.source_generation, build.staged_readers, build.staged_rebase);
+        if ((build.kind == .full or build.row_repack_due) and build.row_mutation_epoch == self.row_mutation_epoch) {
+            self.row_repack_pending = false;
+            self.row_debt_since_ns = 0;
+        }
         std.log.info("dense checkpoint handoff generation={} sequence={} kind={s} completed_wait_ns={} prepare_ns={} install_ns={} written_bytes={} retained_bytes={}", .{
             build.segment_generation,                 build.covered_source_sequence,                     @tagName(build.kind),
             prepare_started_ns -| build.completed_ns, install_started_ns -| prepare_started_ns,          nowNs() -| install_started_ns,
@@ -9375,10 +9627,10 @@ pub const HBCIndex = struct {
         }
         if (self.experimental_posting_checkpoint_build == null and
             posting_store.checkpoint != null and
-            shouldStartExperimentalPostingCheckpoint(
+            (self.rowRepackDue() or shouldStartExperimentalPostingCheckpoint(
                 posting_store.wal_committed_bytes,
                 posting_store.deltaSegmentCount(),
-            ))
+            )))
         {
             if (!try self.startExperimentalPostingCheckpointBuild(posting_store, null)) {
                 // A live immutable generation is normally available. Retain
@@ -9422,7 +9674,7 @@ pub const HBCIndex = struct {
         // serving rows, however, must eventually be reclaimed even if no new
         // WAL traffic arrives. That build still yields to foreground work.
         if (self.experimental_posting_checkpoint_build == null and
-            (compact_obsolete_scans or shouldStartExperimentalPostingIdleCheckpoint(
+            (self.rowRepackDue() or compact_obsolete_scans or shouldStartExperimentalPostingIdleCheckpoint(
                 posting_store.wal_committed_bytes,
                 posting_store.deltaSegmentCount(),
             )))
@@ -10146,7 +10398,7 @@ pub const HBCIndex = struct {
             if (current) |blob| {
                 const value = blob.bytes();
                 var emitted_patch = false;
-                if (experimentalPostingKindBenefitsFromPatch(kind)) {
+                if (experimentalPostingKindBenefitsFromPatch(kind) and !posting_rows.isManifest(value)) {
                     var previous = try if (delta_base_generation) |generation|
                         generation.resolveValueAlloc(self.alloc, posting_id, kind)
                     else
@@ -10450,6 +10702,61 @@ pub const HBCIndex = struct {
         return projection_values.items;
     }
 
+    fn appendRowCheckpointValue(writer: anytype, sink: anytype, id: u64, kind: vectorindex_posting_segment.EntryKind, sequence: u64, bytes: []const u8) !void {
+        if (comptime @TypeOf(sink) == @TypeOf(null)) {
+            try writer.appendValueAt(id, kind, sequence, bytes);
+        } else {
+            try writer.appendValueAt(sink, id, kind, sequence, bytes);
+        }
+    }
+
+    fn appendRowRepack(alloc: Allocator, writer: anytype, sink: anytype, snapshot: *const posting_rows.Snapshot, sequence: u64, serial_namespace: u64, age_ns: u64) !bool {
+        if (!(posting_rows.Policy{}).needsRepack(snapshot, age_ns)) return false;
+        const posting_id = snapshot.identity.leaf;
+        if (serial_namespace >= (@as(u64, 1) << 31) or posting_id > std.math.maxInt(u32)) return error.PostingRowIdentityExhausted;
+        const serial = (@as(u64, 1) << 63) | (serial_namespace << 32) | posting_id;
+        var repack = try posting_rows.Repack.prepare(snapshot, serial);
+        defer repack.deinit();
+        var compact = try repack.rebase(snapshot);
+        defer compact.deinit();
+        const manifest = try compact.encode();
+        defer alloc.free(manifest);
+        if (repack.compact) |chunk| try appendRowCheckpointValue(writer, sink, serial, .row_chunk, sequence, chunk.bytes);
+        try appendRowCheckpointValue(writer, sink, posting_id, .quantized_checkpoint, sequence, manifest);
+        return true;
+    }
+
+    /// Copy the captured manifest's reference closure even when repacking it:
+    /// a source transaction committed after capture may still name these rows.
+    /// A subsequent full checkpoint collects chunks no longer in that closure.
+    fn appendRowCheckpoint(
+        alloc: Allocator,
+        writer: anytype,
+        sink: anytype,
+        generation: *ExperimentalPostingReadGeneration,
+        posting_id: u64,
+        sequence: u64,
+        encoded: []const u8,
+        emitted: *std.AutoHashMapUnmanaged(u64, void),
+        segment_generation: ?u64,
+        reclaimer: ?*ExperimentalPostingSequentialReclaimer,
+    ) !void {
+        var resolver = NativePostingRowResolver{ .alloc = alloc, .generation = generation };
+        defer resolver.deinit();
+        var snapshot = try posting_rows.Snapshot.decode(alloc, encoded, &resolver);
+        defer snapshot.deinit();
+        if (snapshot.identity.leaf != posting_id or snapshot.coverage > sequence) return error.Corrupted;
+        for (snapshot.runs) |run| {
+            if ((try emitted.getOrPut(alloc, run.chunk.serial)).found_existing) continue;
+            try appendRowCheckpointValue(writer, sink, run.chunk.serial, .row_chunk, sequence, run.chunk.bytes);
+            if (reclaimer) |pages| pages.observe(run.chunk.bytes);
+        }
+        if (segment_generation) |serial_namespace| {
+            if (try appendRowRepack(alloc, writer, sink, &snapshot, sequence, serial_namespace, (posting_rows.Policy{}).max_age_ns)) return;
+        }
+        try appendRowCheckpointValue(writer, sink, posting_id, .quantized_checkpoint, sequence, encoded);
+    }
+
     /// Rewrites a checkpoint from the already complete immutable query
     /// generation. This avoids opening a new LSM snapshot and scanning all
     /// derived namespaces every time the sidecar WAL is flattened.
@@ -10470,6 +10777,11 @@ pub const HBCIndex = struct {
         var latest: ExperimentalPostingLatestValues = .empty;
         defer latest.deinit(alloc);
         try collectExperimentalPostingCompactionValues(alloc, generation, &latest, reconstructed_values);
+
+        var row_chunks = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer row_chunks.deinit(alloc);
+        if (try generation.value(0, .row_chunk)) |cursor|
+            try writer.appendValueAt(0, .row_chunk, covered_source_sequence, cursor);
 
         var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
         try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
@@ -10566,7 +10878,9 @@ pub const HBCIndex = struct {
             }
             var quantized_directory_entry_written = false;
             if (try experimentalPostingCheckpointValue(alloc, reconstructed_values, &latest, root, node_id, .quantized_checkpoint)) |quantized| {
-                if (node_id == metadata.root_node) {
+                if (posting_rows.isManifest(quantized)) {
+                    try appendRowCheckpoint(alloc, writer, null, generation, node_id, covered_source_sequence, quantized, &row_chunks, null, null);
+                } else if (node_id == metadata.root_node) {
                     try writer.appendValueBorrowedAt(node_id, .quantized_checkpoint, covered_source_sequence, quantized);
                 } else {
                     var decoded_quantized = proto.RaBitQuantizedVectorSet.decode(alloc, quantized) catch |err| switch (err) {
@@ -10717,6 +11031,13 @@ pub const HBCIndex = struct {
         defer writer.deinit();
         const sink = staged_writer.output();
 
+        var row_chunks = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer row_chunks.deinit(alloc);
+        var row_leaves = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer row_leaves.deinit(alloc);
+        if (try generation.value(0, .row_chunk)) |cursor|
+            try writer.appendValueAt(sink, 0, .row_chunk, covered_source_sequence, cursor);
+
         var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
         try writer.appendValueAt(sink, 0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
 
@@ -10795,7 +11116,7 @@ pub const HBCIndex = struct {
                 try writer.appendValueAt(sink, node_id, .posting_state, covered_source_sequence, posting_state);
                 base_reclaimer.observe(posting_state);
             }
-            if (node_id == metadata.root_node) {
+            {
                 if (try experimentalPostingStreamingCheckpointValue(
                     alloc,
                     &latest,
@@ -10807,7 +11128,12 @@ pub const HBCIndex = struct {
                     var quantized_value = resolved_quantized;
                     defer quantized_value.deinit(alloc);
                     const quantized = quantized_value.bytes;
-                    try writer.appendValueAt(sink, node_id, .quantized_checkpoint, covered_source_sequence, quantized);
+                    if (posting_rows.isManifest(quantized)) {
+                        try appendRowCheckpoint(alloc, &writer, sink, generation, node_id, covered_source_sequence, quantized, &row_chunks, segment_generation, &base_reclaimer);
+                        try row_leaves.put(alloc, node_id, {});
+                    } else if (node_id == metadata.root_node) {
+                        try writer.appendValueAt(sink, node_id, .quantized_checkpoint, covered_source_sequence, quantized);
+                    }
                     base_reclaimer.observe(quantized);
                 }
             }
@@ -10815,6 +11141,7 @@ pub const HBCIndex = struct {
         base_reclaimer.reclaimObserved();
 
         {
+            if (row_leaves.count() != 0) std.log.info("dense posting row checkpoint generation={} sequence={} leaves={} retained_chunks={}", .{ segment_generation, covered_source_sequence, row_leaves.count(), row_chunks.count() });
             const encoded_centroid_directory = try centroid_directory.build();
             defer alloc.free(encoded_centroid_directory);
             try writer.appendValueAt(sink, 0, .centroid_directory, covered_source_sequence, encoded_centroid_directory);
@@ -10881,6 +11208,11 @@ pub const HBCIndex = struct {
             defer packed_node_value.deinit(alloc);
             const packed_node = packed_node_value.bytes;
             const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+            if (row_leaves.contains(node_id)) {
+                quantized_directory.observeFallbackLeaf(decoded_node.ids_bytes.len / @sizeOf(u64));
+                base_reclaimer.observe(packed_node);
+                continue;
+            }
             if (reuse_rows and cold_base_reader != null and quantized_file_offset != null and
                 decoded_node.header.is_leaf and effective_projection_source != null and
                 !effective_projection_source.?.retain_projection_plane)
@@ -11226,6 +11558,7 @@ pub const HBCIndex = struct {
         var ids = changed.keyIterator();
         while (ids.next()) |id| {
             yieldExperimentalCheckpointForForeground(manager, force_progress);
+            if (try generation.rowView(id.*)) |_| continue;
             // A folded suffix retires its old files. Copy only a still-current
             // immutable row, retaining all encoded subgroup/projection planes.
             // The generation check includes live overlays: an older row must
@@ -11318,7 +11651,7 @@ pub const HBCIndex = struct {
         projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
         writer: anytype,
     ) !ExperimentalPostingCheckpointBuildResult {
-        return appendExperimentalPostingDeltaFromGenerationMode(alloc, generation, metadata, covered_source_sequence, foreground_manager, force_progress, projection_source, writer, false);
+        return appendExperimentalPostingDeltaFromGenerationMode(alloc, generation, metadata, covered_source_sequence, foreground_manager, force_progress, projection_source, writer, false, null);
     }
 
     /// Fold the immutable suffix against the retained base, not against the
@@ -11334,6 +11667,7 @@ pub const HBCIndex = struct {
         projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
         writer: anytype,
         compact_deltas: bool,
+        row_repack: ?struct { generation: u64, forced: bool },
     ) !ExperimentalPostingCheckpointBuildResult {
         var latest: ExperimentalPostingLatestValues = .empty;
         defer latest.deinit(alloc);
@@ -11344,6 +11678,32 @@ pub const HBCIndex = struct {
         else
             try collectExperimentalPostingLatestValues(alloc, generation, &latest);
         const root = experimentalPostingRootState(generation) orelse return error.Corrupted;
+
+        var row_values = std.ArrayListUnmanaged(ExperimentalPostingResolvedValue).empty;
+        defer {
+            for (row_values.items) |*resolved| resolved.deinit(alloc);
+            row_values.deinit(alloc);
+        }
+        if (row_repack) |policy| if (policy.forced) {
+            // Idle/recovery debt may have no new WAL key. Include only those
+            // current manifests, not every value in the immutable suffix.
+            for (root.segments) |*segment| {
+                var keys = segment.keys();
+                while (try keys.next()) |key| {
+                    if (key.kind != .quantized_checkpoint) continue;
+                    const value_key = experimentalPostingValueKey(key.id, .quantized_checkpoint);
+                    if (latest.contains(value_key)) continue;
+                    var resolved = (try generation.resolveValueAlloc(alloc, key.id, .quantized_checkpoint)) orelse continue;
+                    var owned = true;
+                    defer if (owned) resolved.deinit(alloc);
+                    if (!posting_rows.isManifest(resolved.bytes) or !try posting_rows.manifestHasDebt(resolved.bytes)) continue;
+                    try row_values.append(alloc, resolved);
+                    owned = false;
+                    try latest.put(alloc, value_key, resolved.bytes);
+                }
+            }
+        };
+        var repacked_leaves: usize = 0;
 
         var posting_count: u64 = 0;
         var patch_count: u64 = 0;
@@ -11383,6 +11743,17 @@ pub const HBCIndex = struct {
             defer if (resolved) |*value| value.deinit(alloc);
             const current_value = if (resolved) |value| value.bytes else entry.value_ptr.*;
             if (current_value) |value_bytes| {
+                if (row_repack) |policy| if (record_kind == .quantized_checkpoint and posting_rows.isManifest(value_bytes)) {
+                    var resolver = NativePostingRowResolver{ .alloc = alloc, .generation = generation };
+                    defer resolver.deinit();
+                    var snapshot = try posting_rows.Snapshot.decode(alloc, value_bytes, &resolver);
+                    defer snapshot.deinit();
+                    if (snapshot.identity.leaf != id or snapshot.coverage > covered_source_sequence) return error.Corrupted;
+                    if (try appendRowRepack(alloc, writer, null, &snapshot, covered_source_sequence, policy.generation, if (policy.forced) (posting_rows.Policy{}).max_age_ns else 0)) {
+                        repacked_leaves += 1;
+                        continue;
+                    }
+                };
                 if (record_kind == .base) if (centroid_directory) |*directory| {
                     const node = try vectorindex_hbc.decodePackedNodeValue(value_bytes);
                     if (node.header.is_leaf and node.ids_bytes.len > 0) {
@@ -11397,7 +11768,7 @@ pub const HBCIndex = struct {
                     }
                 };
                 var emitted_patch = false;
-                if (experimentalPostingSegmentPatchKind(record_kind)) |patch_kind| {
+                if (if (posting_rows.isManifest(value_bytes)) null else experimentalPostingSegmentPatchKind(record_kind)) |patch_kind| {
                     var base_value = root.resolveSegmentValueAlloc(
                         alloc,
                         if (compact_deltas) 1 else root.segments.len,
@@ -11444,6 +11815,9 @@ pub const HBCIndex = struct {
             const encoded = try directory.build();
             try writer.appendValueOwnedAt(0, .centroid_directory, covered_source_sequence, encoded);
         }
+        if (row_repack) |policy| if (repacked_leaves != 0) {
+            std.log.info("dense posting row checkpoint generation={} sequence={} leaves={} selective=true", .{ policy.generation, covered_source_sequence, repacked_leaves });
+        };
         const scan_build = if (metadata) |index_metadata| try appendExperimentalDeltaScanBlocks(
             alloc,
             writer,
@@ -11870,6 +12244,7 @@ pub const HBCIndex = struct {
             .vector_metadata,
             .index_metadata,
             .tombstone,
+            .row_chunk,
             .base_tombstone,
             .quantized_checkpoint_tombstone,
             .posting_state_tombstone,
@@ -11921,6 +12296,7 @@ pub const HBCIndex = struct {
         try state.materializeWal(&wal);
         try state.loadDeltaScanBlocks(metadata_config.dims, metadata_config.metric);
         try state.rebuildScanAdmission(metadata_config.dims, metadata_config.use_quantization);
+        try state.rebuildRowDebt();
         // Materialized full values borrow from the recovered byte buffer; the
         // replay frame index itself is no longer needed after activation.
         state.wal_bytes = wal.bytes;
@@ -12100,17 +12476,20 @@ pub const HBCIndex = struct {
             var keys = item.values.keyIterator();
             while (keys.next()) |key| {
                 const kind = experimentalPostingValueKeyKind(key.*) catch continue;
-                if (experimentalPostingKindAffectsLeafScan(kind)) return true;
+                if (experimentalPostingKindAffectsLeafScan(kind) and
+                    (generation.rowView(experimentalPostingValueKeyId(key.*)) catch return true) == null) return true;
             }
             if (item.root) |root| {
                 var materialized = root.materialized.keyIterator();
                 while (materialized.next()) |key| {
                     const kind = experimentalPostingValueKeyKind(key.*) catch continue;
-                    if (experimentalPostingKindAffectsLeafScan(kind)) return true;
+                    if (experimentalPostingKindAffectsLeafScan(kind) and
+                        (generation.rowView(experimentalPostingValueKeyId(key.*)) catch return true) == null) return true;
                 }
                 var pending = root.leaf_scan_bytes.iterator();
                 while (pending.next()) |leaf| {
                     if (leaf.value_ptr.unfiltered == 0) continue;
+                    if ((generation.rowView(leaf.key_ptr.*) catch return true) != null) continue;
                     var value = (root.resolveValueAlloc(self.alloc, leaf.key_ptr.*, .base) catch return true) orelse continue;
                     defer value.deinit(self.alloc);
                     const node = vectorindex_hbc.decodePackedNodeValue(value.bytes) catch return true;
@@ -12353,6 +12732,9 @@ pub const HBCIndex = struct {
         );
         if (result.found_existing) if (result.value_ptr.*) |old| old.release();
         result.value_ptr.* = blob;
+        if (posting_value.kind == .quantized_checkpoint) {
+            if (self.experimental_posting_captured_rows.fetchRemove(posting_value.posting_id)) |old| old.value.destroy();
+        }
         return self.experimental_posting_mutation_base_generation != null;
     }
 
@@ -16344,11 +16726,180 @@ pub const HBCIndex = struct {
     // ========================================================================
 
     pub fn saveQuantized(self: *HBCIndex, txn: anytype, node_id: u64, qs: *const QuantizedSet) !void {
+        if (try self.storeNativePostingRows(txn, node_id, qs)) return;
         try vectorindex_hbc_index.saveQuantized(self, txn, node_id, qs, nowNs, elapsedSince);
     }
 
     pub fn putQuantizedCached(self: *HBCIndex, txn: anytype, node_id: u64, qs: *const QuantizedSet) !void {
+        if (try self.storeNativePostingRows(txn, node_id, qs)) return;
         try vectorindex_hbc_index.putQuantizedCached(self, txn, node_id, qs, nowNs, elapsedSince);
+    }
+
+    fn nativePostingRowsEnabled(self: *const HBCIndex) bool {
+        return (if (self.resource_manager) |manager| manager.dense_posting_row_deltas else @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS")) and
+            self.experimental_posting_wal_authoritative.load(.acquire) and
+            self.experimental_posting_capture_enabled and self.experimental_posting_mutation_base_generation != null;
+    }
+
+    fn captureNativeRowValue(self: *HBCIndex, id: u64, kind: vectorindex_posting_wal.RecordKind, bytes: []const u8) !void {
+        if (!self.experimental_posting_capture_enabled or self.experimental_posting_mutation_base_generation == null)
+            return error.PostingWalMutationOutsideCapture;
+        const blob = try ExperimentalPostingValueBlob.createCopy(self.alloc, bytes);
+        errdefer blob.release();
+        const entry = try self.experimental_posting_captured_values.getOrPut(self.alloc, experimentalPostingValueKey(id, kind));
+        if (entry.found_existing) if (entry.value_ptr.*) |old| old.release();
+        entry.value_ptr.* = blob;
+    }
+
+    fn allocatePostingRowIdentity(self: *HBCIndex) !posting_rows.Allocation {
+        const generation = self.experimental_posting_mutation_base_generation orelse return error.PostingWalMutationOutsideCapture;
+        const key = experimentalPostingValueKey(0, .row_chunk);
+        var cursor: posting_rows.Allocation = undefined;
+        if (self.experimental_posting_captured_values.get(key)) |stored| {
+            cursor = try posting_rows.Allocation.decode((stored orelse return error.Corrupted).bytes());
+        } else if (try generation.value(0, .row_chunk)) |bytes| {
+            cursor = try posting_rows.Allocation.decode(bytes);
+        } else {
+            var nonce: [8]u8 = undefined;
+            self.runtimeIo().random(&nonce);
+            cursor = .{ .incarnation = std.mem.readInt(u64, &nonce, .little) | 1, .serial = 0 };
+        }
+        // Upper-half serials belong to independently named checkpoint chunks.
+        if (cursor.serial >= std.math.maxInt(u63)) return error.PostingRowIdentityExhausted;
+        cursor.serial += 1;
+        try self.captureNativeRowValue(0, .row_chunk, &cursor.encode());
+        return cursor;
+    }
+
+    fn stagePostingRows(self: *HBCIndex, node_id: u64, snapshot: posting_rows.Snapshot) !void {
+        // Takes ownership only on success. Persist bytes before replacing the
+        // transaction-local view; an error leaves rollback to the capture owner.
+        const encoded = try snapshot.encode();
+        defer snapshot.alloc.free(encoded);
+        const row = try NativePostingRows.fromSnapshot(self.alloc, snapshot);
+        errdefer {
+            if (row.owned_members) |members| self.alloc.free(members);
+            self.alloc.destroy(row);
+        }
+        const entry = try self.experimental_posting_captured_rows.getOrPut(self.alloc, node_id);
+        errdefer {
+            if (!entry.found_existing) _ = self.experimental_posting_captured_rows.remove(node_id);
+        }
+        try self.captureNativeRowValue(node_id, .quantized_checkpoint, encoded);
+        if (entry.found_existing) entry.value_ptr.*.destroy();
+        entry.value_ptr.* = row;
+        self.invalidateQuantizedCache(node_id);
+        self.row_mutation_epoch +%= 1;
+        if ((posting_rows.Policy{}).needsRepack(&snapshot, 0)) self.row_repack_pending = true;
+        if (self.row_debt_since_ns == 0 and (snapshot.chunk_count > 1 or snapshot.physical_rows > snapshot.row_count))
+            self.row_debt_since_ns = nowNs();
+    }
+
+    fn currentPostingRows(self: *HBCIndex, txn: anytype, node_id: u64) !?*NativePostingRows {
+        if (experimentalPostingGenerationFromTxn(txn)) |generation| return generation.rowView(node_id);
+        const generation = self.experimental_posting_mutation_base_generation orelse return null;
+        if (self.experimental_posting_captured_rows.get(node_id)) |rows| return rows;
+        // A regular payload replacement/tombstone shadows every older row view.
+        if (self.experimental_posting_captured_values.contains(experimentalPostingValueKey(node_id, .quantized_checkpoint))) return null;
+        return generation.rowView(node_id);
+    }
+
+    pub fn loadRowQuantized(self: *HBCIndex, txn: anytype, node_id: u64, is_root: bool, expected_count: usize) !?QuantizedSet {
+        if (is_root) return null;
+        if (try self.currentPostingRows(txn, node_id)) |rows| {
+            if (rows.snapshot.row_count != expected_count) return error.Corrupted;
+            return .{ .rabit = try rows.snapshot.materialize(self.alloc) };
+        }
+        // Writers may need the previous scoring payload while membership or
+        // statistics are dirty. Such a payload is not a serving rowView, but
+        // it remains a valid maintenance input; never protobuf-decode AFRM.
+        const immutable = experimentalPostingGenerationFromTxn(txn);
+        const generation = immutable orelse self.experimental_posting_mutation_base_generation orelse return null;
+        if (!try generation.hasValue(0, .row_chunk) and
+            !self.experimental_posting_captured_values.contains(experimentalPostingValueKey(0, .row_chunk))) return null;
+        var key: [10]u8 = undefined;
+        const encoded = self.getNamespaced(txn, .quant, encodeQuantKey(&key, node_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (!posting_rows.isManifest(encoded)) return null;
+        var resolver = NativePostingRowResolver{ .alloc = self.alloc, .generation = generation, .capture = if (immutable == null) self else null };
+        defer resolver.deinit();
+        var snapshot = try posting_rows.Snapshot.decode(self.alloc, encoded, &resolver);
+        defer snapshot.deinit();
+        if (snapshot.identity.leaf != node_id or snapshot.row_count != expected_count) return error.Corrupted;
+        return .{ .rabit = try snapshot.materialize(self.alloc) };
+    }
+
+    fn rowRepackDue(self: *const HBCIndex) bool {
+        return self.row_repack_pending or (self.row_debt_since_ns != 0 and
+            nowNs() -| self.row_debt_since_ns >= (posting_rows.Policy{}).max_age_ns);
+    }
+
+    fn storeNativePostingRows(self: *HBCIndex, txn: anytype, node_id: u64, qs: *const QuantizedSet) !bool {
+        if (!self.nativePostingRowsEnabled() or qs.* != .rabit or qs.getCount() == 0) return false;
+        var key: [12]u8 = undefined;
+        const bytes = self.getNamespaced(txn, .nodes, vectorindex_hbc.encodeNodeKey(&key, node_id, .packed_node)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const node = try vectorindex_hbc.decodePackedNodeValue(bytes);
+        if (!node.header.is_leaf or node.header.parent == 0 or node.ids_bytes.len != qs.getCount() * 8) return false;
+        const ids = try self.alloc.alloc(u64, qs.getCount());
+        defer self.alloc.free(ids);
+        for (ids, 0..) |*id, i| id.* = std.mem.readInt(u64, node.ids_bytes[i * 8 ..][0..8], .little);
+        const identity = try self.allocatePostingRowIdentity();
+        const chunk = try posting_rows.Chunk.build(self.alloc, .{ .incarnation = identity.incarnation, .leaf = node_id, .origin = identity.serial }, identity.serial, identity.serial, ids, &qs.rabit);
+        defer chunk.release();
+        try self.captureNativeRowValue(identity.serial, .row_chunk, chunk.bytes);
+        var snapshot = try posting_rows.Snapshot.init(self.alloc, chunk.identity, identity.serial, self.experimental_posting_capture_max_mutation_sequence, &.{.{ .chunk = chunk, .start = 0, .len = @intCast(ids.len) }});
+        errdefer snapshot.deinit();
+        try self.stagePostingRows(node_id, snapshot);
+        return true;
+    }
+
+    pub fn prepareNativeDeletedRows(self: *HBCIndex, txn: anytype, leaf: *const Node, deletes: []const u64, options: BatchInsertOptions) !bool {
+        if (!self.nativePostingRowsEnabled() or !options.preserve_delete_rows or leaf.parent == 0 or
+            options.defer_quantized_rebuild or options.suppress_quantized_payload_persist or leaf.posting_state.payload_dirty) return false;
+        const row = (try self.currentPostingRows(txn, leaf.id)) orelse return false;
+        if (!std.mem.eql(u64, row.members, leaf.members)) return error.Corrupted;
+        var removed = std.ArrayListUnmanaged(posting_rows.RowRef).empty;
+        defer removed.deinit(self.alloc);
+        for (row.snapshot.runs) |run| for (run.scan().member_ids, 0..) |id, i| {
+            if (std.mem.indexOfScalar(u64, deletes, id) != null)
+                try removed.append(self.alloc, .{ .chunk = run.chunk.serial, .row = run.start + @as(u32, @intCast(i)) });
+        };
+        if (removed.items.len == 0 or removed.items.len == row.members.len) return false;
+        const identity = try self.allocatePostingRowIdentity();
+        var base = row.snapshot;
+        base.alloc = self.alloc;
+        var next = try base.mutate(base.revision, identity.serial, @max(base.coverage, self.experimental_posting_capture_max_mutation_sequence), removed.items, null);
+        errdefer next.deinit();
+        try self.stagePostingRows(leaf.id, next);
+        self.write_profile.delete_preserved_vector_rows += next.row_count;
+        self.write_profile.delete_native_vector_rows += next.row_count;
+        return true;
+    }
+
+    pub fn appendNativePostingRows(self: *HBCIndex, txn: anytype, leaf: *const Node, vectors: []const f32, count: usize) !bool {
+        if (!self.nativePostingRowsEnabled() or leaf.parent == 0 or count == 0 or count > leaf.members.len) return false;
+        const row = (try self.currentPostingRows(txn, leaf.id)) orelse return false;
+        const previous_count = leaf.members.len - count;
+        if (!std.mem.eql(u64, row.members, leaf.members[0..previous_count])) return error.Corrupted;
+        if (vectors.len != count * self.config.dims) return error.Corrupted;
+        const identity = try self.allocatePostingRowIdentity();
+        const origin = row.snapshot.runs[0].chunk.view;
+        var added = try self.quantizer.quantize(origin.centroid, vectors, count);
+        defer added.deinit(self.alloc);
+        const chunk = try posting_rows.Chunk.build(self.alloc, row.snapshot.identity, identity.serial, identity.serial, leaf.members[previous_count..], &added);
+        defer chunk.release();
+        var base = row.snapshot;
+        base.alloc = self.alloc;
+        var next = try base.mutate(base.revision, identity.serial, @max(base.coverage, self.experimental_posting_capture_max_mutation_sequence), &.{}, chunk);
+        errdefer next.deinit();
+        try self.captureNativeRowValue(identity.serial, .row_chunk, chunk.bytes);
+        try self.stagePostingRows(leaf.id, next);
+        return true;
     }
 
     /// Borrows an aligned RaBitQ view from the immutable native base. The
@@ -16410,8 +16961,13 @@ pub const HBCIndex = struct {
                 if (self.experimental_posting_captured_values.contains(experimentalPostingValueKey(node_id, kind))) return null;
             }
         }
-        const view = (try generation.leafScanViewIfUnmodified(node_id)) orelse return null;
-        return try self.nativeLeafScanView(view);
+        if (try generation.leafScanViewIfUnmodified(node_id)) |view| return try self.nativeLeafScanView(view);
+        if (try generation.rowView(node_id)) |rows| return .{
+            .member_ids = rows.members,
+            .quantized = .{ .rabit = .{} },
+            .row_snapshot = &rows.snapshot,
+        };
+        return null;
     }
 
     pub fn loadNativeLeafScanViewFromHandle(self: *HBCIndex, txn: anytype, node_id: u64, handle: vectorindex_search_types.NativeLeafScanHandle) !?vectorindex_hbc_runtime.NativeLeafScanView {
@@ -23578,7 +24134,7 @@ test "immutable posting replacement patches resolve bounded chains and compact l
     for ([_]*ExperimentalPostingReadGeneration{ root, overlay }) |source| {
         var folded_writer = vectorindex_posting_segment.Writer.init(alloc);
         defer folded_writer.deinit();
-        _ = try HBCIndex.appendExperimentalPostingDeltaFromGenerationMode(alloc, source, null, 4, null, null, null, &folded_writer, true);
+        _ = try HBCIndex.appendExperimentalPostingDeltaFromGenerationMode(alloc, source, null, 4, null, null, null, &folded_writer, true, null);
         const folded_bytes = try folded_writer.build();
         defer alloc.free(folded_bytes);
         const folded = try createTestExperimentalPostingReadState(alloc, &.{ base_segment, folded_bytes });
@@ -23809,7 +24365,7 @@ test "immutable posting delta embeds exact centroid replacements" {
         try fold_state.loadDeltaScanBlocks(metadata.dims, metadata.metric);
         var folded_writer = vectorindex_posting_segment.Writer.init(alloc);
         defer folded_writer.deinit();
-        _ = try HBCIndex.appendExperimentalPostingDeltaFromGenerationMode(alloc, fold_root, metadata, 2, null, null, null, &folded_writer, true);
+        _ = try HBCIndex.appendExperimentalPostingDeltaFromGenerationMode(alloc, fold_root, metadata, 2, null, null, null, &folded_writer, true, null);
         const folded = try folded_writer.build();
         defer alloc.free(folded);
         var folded_reader = try vectorindex_posting_segment.VerifiedReader.init(alloc, folded);
@@ -28207,6 +28763,164 @@ test "hbc stable origins replace changed external vector revisions across reopen
         try std.testing.expectEqual(@as(u64, 1), result.getHits()[0].vector_id);
         const expected_distance = vec.distance(&Loader.replacement, &Loader.replacement, metric);
         try std.testing.expectApproxEqAbs(expected_distance, result.getHits()[0].distance, 0.0001);
+    }
+}
+
+test "native posting row integration survives mutation checkpoint and reopen" {
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    manager.dense_posting_row_deltas = true;
+    const Fixture = struct {
+        changed_id: u64 = 0,
+        const replacement = [_]f32{ -17, 12, 2, 7 };
+        fn vector(id: u64) [4]f32 {
+            return .{ @floatFromInt(id), 1, @floatFromInt(id % 7), @floatFromInt(id % 3) };
+        }
+        fn load(ctx: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return a.dupe(f32, if (id == self.changed_id) &replacement else &vector(id));
+        }
+        fn checkpoint(idx: *HBCIndex, kind: ExperimentalPostingCheckpointKind) !void {
+            try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, kind));
+            idx.experimental_posting_checkpoint_build.?.awaitCompletion();
+            try idx.experimental_posting_checkpoint_build.?.stageReaders();
+            try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
+        }
+        fn check(idx: *HBCIndex, deleted: []const u64) !void {
+            const fixture: *@This() = @ptrCast(@alignCast(idx.external_vector_ctx.?));
+            var hits = try idx.search(&vector(20), 64);
+            defer hits.deinit();
+            try std.testing.expectEqual(@as(usize, 64 - deleted.len), hits.getHits().len);
+            for (hits.getHits()) |hit| {
+                try std.testing.expect(std.mem.indexOfScalar(u64, deleted, hit.vector_id) == null);
+                try std.testing.expectApproxEqAbs(vec.distance(&vector(20), if (hit.vector_id == fixture.changed_id) &replacement else &vector(hit.vector_id), idx.config.metric), hit.distance, 0.001);
+            }
+            var filtered = try idx.searchWithRequest(.{ .query = &vector(20), .k = 64, .filter_prefix = "member", .distance_under = 1.0e9 });
+            defer filtered.deinit();
+            try std.testing.expectEqualDeep(hits.getHits(), filtered.getHits());
+        }
+    };
+    for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
+        var tp: TestPath = .{};
+        const path = tp.init();
+        defer tp.cleanup();
+        const config: HBCConfig = .{ .dims = 4, .leaf_size = 16, .branching_factor = 2, .metric = metric, .search_width = 128, .max_cached_vectors = 0, .stable_posting_origin_max_mutations = std.math.maxInt(u32), .storage_backend = .lsm };
+        var context = Fixture{};
+        var deleted = [_]u64{ 1, 2, 3, 4, 0, 0 };
+        {
+            var idx = try HBCIndex.open(alloc, path, config);
+            defer idx.close();
+            idx.setIo(runtime.io());
+            idx.resource_manager = &manager;
+            idx.setExternalVectorLoader(&context, Fixture.load);
+            idx.setExperimentalPostingAuthorityTransitionPermitted(true);
+            try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = false, .make_authoritative = true });
+            try idx.beginExperimentalPostingMutationCapture();
+            for (1..65) |id| try idx.batchInsertWithMetadataOptions(&.{.{ .vector_id = id, .vector = &Fixture.vector(id), .metadata = "member" }}, .{ .skip_vector_store = true });
+            try idx.persistExperimentalPostingSidecarAtAppliedSequence(64, .{});
+            const generation = idx.retainCurrentExperimentalPostingReadGeneration().?;
+            defer generation.release();
+            try std.testing.expect(try generation.hasValue(0, .row_chunk));
+            var row_count: usize = 0;
+            for (1..idx.metadata.node_count + 1) |id| if (try generation.rowView(id)) |rows| {
+                row_count += rows.members.len;
+            };
+            try std.testing.expect(row_count > 0);
+            try Fixture.check(&idx, &.{});
+            try Fixture.checkpoint(&idx, .full);
+            try idx.beginExperimentalPostingMutationCapture();
+            try idx.batchApplyOptions(&.{}, &.{ 1, 2, 3, 4 }, .{ .preserve_delete_rows = true, .skip_vector_store = true });
+            try idx.persistExperimentalPostingSidecarAtAppliedSequence(65, .{});
+            try std.testing.expect(idx.write_profile.delete_preserved_vector_rows > 0);
+            try Fixture.check(&idx, deleted[0..4]);
+            try Fixture.checkpoint(&idx, .delta);
+            try Fixture.checkpoint(&idx, .full);
+            try Fixture.check(&idx, deleted[0..4]);
+
+            const pinned = idx.retainCurrentExperimentalPostingReadGeneration().?;
+            defer pinned.release();
+            var selected: ?*NativePostingRows = null;
+            for (1..idx.metadata.node_count + 1) |id| if (try pinned.rowView(id)) |rows| {
+                if (rows.members.len >= 4) {
+                    selected = rows;
+                    break;
+                }
+            };
+            const old_rows = selected orelse return error.MissingPostingChunk;
+            const leaf = old_rows.snapshot.identity.leaf;
+            const old_count = old_rows.members.len;
+            const old_serial = old_rows.snapshot.runs[0].chunk.serial;
+            deleted[4] = old_rows.members[1];
+            deleted[5] = old_rows.members[2];
+            {
+                const broken = try ExperimentalPostingReadGeneration.createOverlay(alloc, pinned, 65, pinned.wal_generation.load(.acquire), pinned.wal_committed_bytes.load(.acquire));
+                defer broken.release();
+                const manifest = try old_rows.snapshot.encode();
+                defer old_rows.snapshot.alloc.free(manifest);
+                try broken.set(leaf, .quantized_checkpoint, manifest);
+                try broken.set(old_serial, .row_chunk, null);
+                try std.testing.expectError(error.MissingPostingChunk, broken.rowView(leaf));
+            }
+            try idx.beginExperimentalPostingMutationCapture();
+            try idx.batchApplyOptions(&.{}, deleted[4..5], .{ .preserve_delete_rows = true, .skip_vector_store = true });
+            idx.cancelExperimentalPostingMutationCapture();
+            try Fixture.check(&idx, deleted[0..4]);
+            try idx.beginExperimentalPostingMutationCapture();
+            try idx.batchApplyOptions(&.{}, deleted[4..5], .{ .preserve_delete_rows = true, .skip_vector_store = true });
+            try idx.persistExperimentalPostingSidecarAtAppliedSequence(66, .{});
+            const checkpoint_kind: ExperimentalPostingCheckpointKind = if (metric == .cosine) .delta else .full;
+            idx.row_repack_pending = true;
+            try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, checkpoint_kind));
+            const build = idx.experimental_posting_checkpoint_build.?;
+            build.awaitCompletion();
+            // Deterministically keep installation behind another source commit.
+            build.completed.store(false, .release);
+            var completion_gate = true;
+            defer if (completion_gate) build.completed.store(true, .release);
+            // The authoritative source has already replaced this vector.
+            // Delete must retain the OLD row revision; append quantizes only
+            // the replacement and publishes it in this same native capture.
+            context.changed_id = old_rows.members[3];
+            try idx.beginExperimentalPostingMutationCapture();
+            try idx.batchApplyOptions(&.{.{ .vector_id = context.changed_id, .vector = &Fixture.replacement, .metadata = "member" }}, &.{ deleted[5], context.changed_id }, .{ .preserve_delete_rows = true, .skip_vector_store = true });
+            try idx.persistExperimentalPostingSidecarAtAppliedSequence(67, .{});
+            build.completed.store(true, .release);
+            completion_gate = false;
+            try build.stageReaders();
+            // Old references are needed by the WAL tail even though the
+            // worker published a compact replacement for its captured view.
+            const staged = build.staged_readers.?;
+            try std.testing.expect(try staged.hasValue(old_serial, .row_chunk));
+            if (checkpoint_kind == .delta) try std.testing.expectEqual(
+                experimentalPostingRootState(pinned).?.retained_segments[0].bytes().ptr,
+                experimentalPostingRootState(staged).?.retained_segments[0].bytes().ptr,
+            );
+            const compact_rows = (try staged.rowView(leaf)).?;
+            try std.testing.expectEqual(@as(usize, 1), compact_rows.snapshot.runs.len);
+            try std.testing.expect(compact_rows.snapshot.runs[0].chunk.serial != old_serial);
+            // Avoid using `build` after publication destroys its owner.
+            try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
+            try std.testing.expectEqual(old_count, old_rows.members.len);
+            try Fixture.check(&idx, &deleted);
+        }
+        var idx = try HBCIndex.open(alloc, path, config);
+        defer idx.close();
+        idx.setIo(runtime.io());
+        idx.setExternalVectorLoader(&context, Fixture.load);
+        try idx.activateExperimentalPostingReads(67);
+        try Fixture.check(&idx, &deleted);
+        // The experiment can be disabled without making its durable rows
+        // unreadable. The next ordinary mutation materializes/replaces them.
+        idx.config.stable_posting_origin_max_mutations = 0;
+        try idx.beginExperimentalPostingMutationCapture();
+        try idx.batchApplyOptions(&.{.{ .vector_id = deleted[5], .vector = &Fixture.vector(deleted[5]), .metadata = "member" }}, &.{}, .{ .skip_vector_store = true });
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(68, .{});
+        try Fixture.check(&idx, deleted[0..5]);
+        _ = try idx.publishExperimentalPostingCheckpoint(68);
+        try Fixture.check(&idx, deleted[0..5]);
     }
 }
 

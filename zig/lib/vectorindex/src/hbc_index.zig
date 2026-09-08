@@ -548,7 +548,7 @@ fn loadNativeQuantizedReadView(
 fn loadNativeLeafScanForProbe(self: anytype, txn: anytype, probe: search_types.FlatCentroidProbe) !?hbc_runtime.NativeLeafScanView {
     if (comptime @hasDecl(childType(@TypeOf(self)), "loadNativeLeafScanViewFromHandle")) {
         if (probe.native_scan_resolved) {
-            const handle = probe.native_scan_handle orelse return null;
+            const handle = probe.native_scan_handle orelse return try loadNativeLeafScanReadView(self, txn, probe.posting_id);
             return self.loadNativeLeafScanViewFromHandle(txn, probe.posting_id, handle) catch |err| {
                 if (err == error.Corrupted) return null;
                 return err;
@@ -1659,6 +1659,12 @@ pub fn updateQuantizedWithAddedVector(
     if (node.members.len == 0) return false;
 
     const previous_count = node.members.len - 1;
+    if (comptime @hasDecl(childType(@TypeOf(self)), "appendNativePostingRows")) {
+        if (try self.appendNativePostingRows(txn, node, transformed_vector, 1)) {
+            self.write_profile.refresh_quantized_ns += elapsed_fn(compute_start);
+            return true;
+        }
+    }
     var cached = (loadQuantizedOwned(self, txn, node.id, usesNonQuantizedPayload(node), previous_count, isNotFoundGeneric) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
@@ -1761,6 +1767,12 @@ pub fn updateQuantizedWithAddedVectors(
     if (added_count == 0) return true;
 
     const previous_count = node.members.len - added_count;
+    if (comptime @hasDecl(childType(@TypeOf(self)), "appendNativePostingRows")) {
+        if (try self.appendNativePostingRows(txn, node, transformed_vectors, added_count)) {
+            self.write_profile.refresh_quantized_ns += elapsed_fn(compute_start);
+            return true;
+        }
+    }
     var cached = (loadQuantizedOwned(self, txn, node.id, usesNonQuantizedPayload(node), previous_count, isNotFoundGeneric) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
@@ -2908,16 +2920,11 @@ fn searchProfiledRequestAttempt(
             if (native_leaf) |native_scan| {
                 profile.native_leaf_scan_hits += 1;
                 try coverage_tracker.observe(self, &txn, scratch, probe.posting_id, native_scan.member_ids);
-                try @This().scoreLeafMemberIds(
+                try @This().scoreNativeLeafScan(
                     self,
                     &txn,
                     probe.posting_id,
-                    false,
-                    true,
-                    native_scan.member_ids,
-                    &native_scan.quantized,
-                    native_scan.projections,
-                    native_scan.subgroup_plan,
+                    native_scan,
                     transformed_query,
                     transformed_query_measure,
                     req.query,
@@ -3038,16 +3045,11 @@ fn searchProfiledRequestAttempt(
                 const leaf_id = root.id;
                 root_handle.deinit(self.alloc);
                 root_handle_active = false;
-                try @This().scoreLeafMemberIds(
+                try @This().scoreNativeLeafScan(
                     self,
                     &txn,
                     leaf_id,
-                    false,
-                    true,
-                    native_scan.member_ids,
-                    &native_scan.quantized,
-                    native_scan.projections,
-                    native_scan.subgroup_plan,
+                    native_scan,
                     transformed_query,
                     transformed_query_measure,
                     req.query,
@@ -3239,16 +3241,11 @@ fn searchProfiledRequestAttempt(
                 node_handle.deinit(self.alloc);
                 node_handle_active = false;
                 try coverage_tracker.observe(self, &txn, scratch, leaf_id, native_scan.member_ids);
-                try @This().scoreLeafMemberIds(
+                try @This().scoreNativeLeafScan(
                     self,
                     &txn,
                     leaf_id,
-                    false,
-                    true,
-                    native_scan.member_ids,
-                    &native_scan.quantized,
-                    native_scan.projections,
-                    native_scan.subgroup_plan,
+                    native_scan,
                     transformed_query,
                     transformed_query_measure,
                     req.query,
@@ -4079,6 +4076,70 @@ pub fn testFusedNativeCandidateParity() !void {
             }
         }
     }
+}
+
+fn scoreNativeLeafScan(
+    self: anytype,
+    txn: anytype,
+    leaf_id: u64,
+    scan: hbc_runtime.NativeLeafScanView,
+    approx_query: []const f32,
+    approx_query_measure: f32,
+    exact_query: []const f32,
+    exact_query_measure: f32,
+    req: search_types.SearchRequest,
+    filter_state: *const search_types.RequestFilterState,
+    results: *search_results.ApproxSearchResults,
+    scratch: anytype,
+    profile: *search_types.SearchProfile,
+    comptime use_search_cache: bool,
+    now: fn () u64,
+    elapsed: fn (u64) u64,
+) !void {
+    if (scan.row_snapshot) |rows| {
+        // Dirty/native row manifests have no subgroup permutation or duplicate
+        // float16 plane. Preserve the global planner's fallback/order contract.
+        if (scratch.global_subgroups.active) try drainGlobalSubgroups(self, txn, scratch, req, approx_query, results, profile, false, now, elapsed);
+        if (filter_state.isTrivial() and req.filter_prefix.len == 0 and req.distance_over == null and req.distance_under == null) {
+            const Sink = struct {
+                target: *search_results.ApproxSearchResults,
+                ids: [8]u64 = undefined,
+                distances: [8]f32 = undefined,
+                bounds: [8]f32 = undefined,
+                count: usize = 0,
+                pub fn write(out: *@This(), id: u64, distance: f32, bound: f32) void {
+                    out.ids[out.count] = id;
+                    out.distances[out.count] = distance;
+                    out.bounds[out.count] = bound;
+                    out.count += 1;
+                    if (out.count == 8) out.flush();
+                }
+                fn flush(out: *@This()) void {
+                    out.target.addApproxResults(out.ids[0..out.count], out.distances[0..out.count], out.bounds[0..out.count]);
+                    out.count = 0;
+                }
+            };
+            const start = now();
+            var sink = Sink{ .target = results };
+            try rows.scoreTo(&self.quantizer, approx_query, &scratch.estimate, if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null, &sink);
+            sink.flush();
+            profile.leaf_score_ns += elapsed(start);
+            profile.approx_leaves_scored += 1;
+            profile.approx_vectors_scored += rows.row_count;
+            profile.max_leaf_vectors_considered = @max(profile.max_leaf_vectors_considered, rows.row_count);
+            noteLeafScanBytes(profile, rows.row_count, @as(u64, @intCast(rabitq.codeWidth(self.config.dims))) * 8);
+            return;
+        }
+        // Filtered/exact-range requests reuse the existing semantics on each
+        // borrowed span; no aggregate decode or changed authoritative scoring.
+        for (rows.runs) |run| {
+            try search_types.checkCancelled(req);
+            const span = run.scan();
+            try scoreLeafMemberIds(self, txn, leaf_id, false, true, span.member_ids, &span.quantized, null, null, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, use_search_cache, now, elapsed);
+        }
+        return;
+    }
+    return scoreLeafMemberIds(self, txn, leaf_id, false, true, scan.member_ids, &scan.quantized, scan.projections, scan.subgroup_plan, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, use_search_cache, now, elapsed);
 }
 
 fn scoreLeafMemberIds(
@@ -7108,6 +7169,20 @@ fn saveDeletedLeafRows(self: anytype, txn: anytype, leaf: *types.Node, rows: *co
     self.write_profile.delete_preserved_vector_rows += @intCast(leaf.members.len);
 }
 
+fn prepareNativeDeletedRows(self: anytype, txn: anytype, leaf: *const types.Node, deletes: []const u64, options: hbc_runtime.BatchInsertOptions) !bool {
+    if (comptime @hasDecl(childType(@TypeOf(self)), "prepareNativeDeletedRows"))
+        return self.prepareNativeDeletedRows(txn, leaf, deletes, options);
+    return false;
+}
+
+fn finishNativeDeletedRows(self: anytype, txn: anytype, leaf: *types.Node) !void {
+    try savePackedNodeValue(self, txn, leaf);
+    posting.PostingStore.notePayloadRefreshed(leaf);
+    try posting.PostingStore.saveState(self, txn, leaf.id, leaf.posting_state);
+    try self.cacheNode(leaf);
+    try saveNodeSplitRange(self, txn, leaf, isNotFoundGeneric);
+}
+
 /// Eager deletion used to load every surviving vector twice: once for the
 /// centroid/radius and again for the scoring payload. Keep one leaf-scoped
 /// matrix, preserving the exact arithmetic, member order and dirty versions.
@@ -7197,7 +7272,8 @@ fn batchDeleteTxnOptions(self: anytype, txn: anytype, vector_ids: []const u64, o
         const remove_ids = try self.alloc.alloc(u64, group.len);
         defer self.alloc.free(remove_ids);
         for (group, 0..) |entry, i| remove_ids[i] = entry.vector_id;
-        var preserved_rows = try prepareDeletedLeafRows(self, txn, &leaf, remove_ids, options);
+        const native_rows = try prepareNativeDeletedRows(self, txn, &leaf, remove_ids, options);
+        var preserved_rows = if (native_rows) null else try prepareDeletedLeafRows(self, txn, &leaf, remove_ids, options);
         defer if (preserved_rows) |*rows| rows.deinit(self.alloc);
         const removed_count = try posting.PostingStore.removeMembers(self.alloc, &leaf, remove_ids);
         if (removed_count == 0) {
@@ -7205,7 +7281,10 @@ fn batchDeleteTxnOptions(self: anytype, txn: anytype, vector_ids: []const u64, o
             continue;
         }
 
-        const leaf_refreshed = if (preserved_rows) |*rows| blk: {
+        const leaf_refreshed = if (native_rows) blk: {
+            try finishNativeDeletedRows(self, txn, &leaf);
+            break :blk true;
+        } else if (preserved_rows) |*rows| blk: {
             try saveDeletedLeafRows(self, txn, &leaf, rows);
             break :blk true;
         } else try tryRefreshDeletedLeaf(self, txn, &leaf, options);
@@ -7605,12 +7684,16 @@ fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_ru
     defer leaf.deinit(self.alloc);
     try leaf.ensureUnbacked(self.alloc);
 
-    var preserved_rows = try prepareDeletedLeafRows(self, txn, &leaf, &.{vector_id}, options);
+    const native_rows = try prepareNativeDeletedRows(self, txn, &leaf, &.{vector_id}, options);
+    var preserved_rows = if (native_rows) null else try prepareDeletedLeafRows(self, txn, &leaf, &.{vector_id}, options);
     defer if (preserved_rows) |*rows| rows.deinit(self.alloc);
     try posting.PostingStore.removeMember(self.alloc, &leaf, vector_id);
-    if (preserved_rows == null) leaf.covering_radius = if (leaf.members.len == 0) 0 else std.math.nan(f32);
+    if (preserved_rows == null and !native_rows) leaf.covering_radius = if (leaf.members.len == 0) 0 else std.math.nan(f32);
 
-    const leaf_refreshed = if (preserved_rows) |*rows| blk: {
+    const leaf_refreshed = if (native_rows) blk: {
+        try finishNativeDeletedRows(self, txn, &leaf);
+        break :blk true;
+    } else if (preserved_rows) |*rows| blk: {
         try saveDeletedLeafRows(self, txn, &leaf, rows);
         break :blk true;
     } else try tryRefreshDeletedLeaf(self, txn, &leaf, options);
@@ -7652,7 +7735,7 @@ fn deleteTxnOptions(self: anytype, txn: anytype, vector_id: u64, options: hbc_ru
         // Row-preserving deletion keeps the leaf serviceable and its centroid
         // debt visible. The bounded layout-maintenance pass may merge it; do
         // not immediately undo the read-free mutation with an eager merge.
-        if (preserved_rows == null and leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) skip_merge: {
+        if (preserved_rows == null and !native_rows and leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) skip_merge: {
             var parent = loadNode(self, txn, leaf.parent) catch |err| {
                 if (!isNotFoundGeneric(err)) return err;
                 // Dangling parent pointer: the leaf is already saved; skip
@@ -10623,6 +10706,9 @@ pub fn putQuantizedCached(self: anytype, txn: anytype, node_id: u64, qs: *const 
 pub fn loadQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, expected_count: usize, is_not_found: fn (anyerror) bool) !hbc_runtime.QuantizedSet {
     _ = is_not_found;
     const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "loadRowQuantized")) {
+        if (try self.loadRowQuantized(txn, node_id, is_root, expected_count)) |quantized| return quantized;
+    }
     if (comptime @hasDecl(Index, "loadNativeQuantizedView")) {
         if (try self.loadNativeQuantizedView(txn, node_id, is_root, expected_count)) |native| {
             return try native.clone(self.alloc);

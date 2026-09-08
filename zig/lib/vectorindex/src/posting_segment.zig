@@ -60,6 +60,7 @@ pub const EntryKind = enum(u8) {
     /// Complete mmap-friendly RaBitQ leaf directory. Per-posting WAL/delta
     /// records remain authoritative overlays above this immutable base.
     quantized_directory = 21,
+    row_chunk = 22,
 };
 
 pub const DeltaValue = struct {
@@ -81,7 +82,7 @@ const nested_container_alignment: usize = 64;
 
 fn isNativeNestedContainer(kind: EntryKind) bool {
     return switch (kind) {
-        .centroid_directory, .vector_directory, .quantized_directory => true,
+        .centroid_directory, .vector_directory, .quantized_directory, .row_chunk => true,
         else => false,
     };
 }
@@ -586,6 +587,7 @@ pub const Reader = struct {
             @intFromEnum(EntryKind.base_patch) => .base_patch,
             @intFromEnum(EntryKind.quantized_checkpoint_patch) => .quantized_checkpoint_patch,
             @intFromEnum(EntryKind.quantized_directory) => .quantized_directory,
+            @intFromEnum(EntryKind.row_chunk) => .row_chunk,
             else => return error.CorruptedPostingSegment,
         };
         const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;

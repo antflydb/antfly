@@ -4970,7 +4970,7 @@ pub const IndexManager = struct {
             .max_cached_vectors = cache_limits.max_cached_vectors,
             .max_cached_metadata = cache_limits.max_cached_metadata,
             .lazy_posting_maintenance = dense_cfg.lazy_posting_maintenance,
-            .stable_posting_origin_max_mutations = if (if (self.resource_manager) |rm| rm.dense_stable_posting_origins else false) 64 else 0,
+            .stable_posting_origin_max_mutations = if (self.resource_manager) |rm| (if (rm.dense_posting_row_deltas and entry.native_physical_v2) std.math.maxInt(u32) else if (rm.dense_stable_posting_origins) 64 else 0) else 0,
             .auto_posting_maintenance_max_postings = dense_cfg.auto_posting_maintenance_max_postings,
             .centroid_directory_mode = dense_cfg.centroid_directory_mode,
             .flat_exact_min_postings = dense_cfg.flat_exact_min_postings,
@@ -17020,7 +17020,7 @@ pub const IndexManager = struct {
                     .max_cached_vectors = cache_limits.max_cached_vectors,
                     .max_cached_metadata = cache_limits.max_cached_metadata,
                     .lazy_posting_maintenance = dense_cfg.lazy_posting_maintenance,
-                    .stable_posting_origin_max_mutations = if (if (self.resource_manager) |rm| rm.dense_stable_posting_origins else false) 64 else 0,
+                    .stable_posting_origin_max_mutations = if (self.resource_manager) |rm| (if (rm.dense_posting_row_deltas and native_physical_v2) std.math.maxInt(u32) else if (rm.dense_stable_posting_origins) 64 else 0) else 0,
                     .auto_posting_maintenance_max_postings = dense_cfg.auto_posting_maintenance_max_postings,
                     .centroid_directory_mode = dense_cfg.centroid_directory_mode,
                     .flat_exact_min_postings = dense_cfg.flat_exact_min_postings,
@@ -20710,9 +20710,10 @@ pub const IndexManager = struct {
 
         const reused_rows_before = entry.index.write_profile.delete_reused_vector_rows;
         const preserved_rows_before = entry.index.write_profile.delete_preserved_vector_rows;
+        const native_rows_before = entry.index.write_profile.delete_native_vector_rows;
         entry.index.batchApplyOptions(&.{}, vector_ids.items, .{
             .reuse_delete_vectors = if (self.resource_manager) |rm| rm.dense_reused_delete_vectors else false,
-            .preserve_delete_rows = if (self.resource_manager) |rm| rm.dense_stable_posting_origins else false,
+            .preserve_delete_rows = if (self.resource_manager) |rm| rm.dense_stable_posting_origins or (rm.dense_posting_row_deltas and entry.native_physical_v2) else false,
         }) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -20721,8 +20722,8 @@ pub const IndexManager = struct {
         if (benchMetricsEnabled()) std.log.info("dense delete apply index={s} keys={d} vectors={d} reused_rows={d}", .{
             entry.config.name, keys.len, vector_ids.items.len, entry.index.write_profile.delete_reused_vector_rows -| reused_rows_before,
         });
-        if (benchMetricsEnabled()) std.log.info("dense delete preserved rows index={s} rows={d}", .{
-            entry.config.name, entry.index.write_profile.delete_preserved_vector_rows -| preserved_rows_before,
+        if (benchMetricsEnabled()) std.log.info("dense delete preserved rows index={s} rows={d} native_rows={d}", .{
+            entry.config.name, entry.index.write_profile.delete_preserved_vector_rows -| preserved_rows_before, entry.index.write_profile.delete_native_vector_rows -| native_rows_before,
         });
         for (pending_deletes.items) |pending| {
             if (pending.ordinal) |ordinal| {
