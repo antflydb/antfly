@@ -13,6 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
+const Adler32 = @import("antfly_hash").Adler32;
 
 pub fn encodeRgba(alloc: std.mem.Allocator, width: u32, height: u32, rgba: []const u8) ![]u8 {
     const expected = @as(usize, width) * @as(usize, height) * 4;
@@ -75,7 +77,7 @@ fn encodeZlibNoCompression(alloc: std.mem.Allocator, payload: []const u8) ![]u8 
     }
 
     var checksum: [4]u8 = undefined;
-    std.mem.writeInt(u32, &checksum, std.hash.Adler32.hash(payload), .big);
+    std.mem.writeInt(u32, &checksum, Adler32.hash(payload), .big);
     try out.appendSlice(alloc, &checksum);
 
     return try out.toOwnedSlice(alloc);
@@ -94,7 +96,7 @@ fn appendChunk(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name:
     @memcpy(crc_buf[name.len..], data);
 
     var crc: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc, std.hash.Crc32.hash(crc_buf), .big);
+    std.mem.writeInt(u32, &crc, Crc32.hash(crc_buf), .big);
     try out.appendSlice(alloc, &crc);
 }
 

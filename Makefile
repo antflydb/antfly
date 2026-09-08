@@ -73,7 +73,7 @@ help:
 # ====================================================================================
 
 .PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
-.PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
+.PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check zig-checksums-check
 
 build-antfarm: build-antfarm-main
 
@@ -132,6 +132,10 @@ zig-generate:
 
 zig-openapi-generate:
 	$(ZIG_MAKE) openapi-generate
+
+zig-checksums-check:
+	python3 -m unittest discover -s scripts/ci -p test_check_zig_checksum_usage.py
+	python3 scripts/ci/check_zig_checksum_usage.py
 
 zig-generated-check: graph-identifier-check
 	$(ZIG_MAKE) generated-check

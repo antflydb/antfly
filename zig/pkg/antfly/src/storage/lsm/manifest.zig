@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const lsm_table_file = @import("table_file.zig");
 
 pub const magic = "ALSMMAN1";
@@ -152,7 +153,7 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
         try appendU32(allocator, &bytes, @intCast(obsolete.path.len));
         try bytes.appendSlice(allocator, obsolete.path);
     }
-    try appendU32(allocator, &bytes, std.hash.Crc32.hash(bytes.items));
+    try appendU32(allocator, &bytes, Crc32.hash(bytes.items));
 
     return try bytes.toOwnedSlice(allocator);
 }
@@ -305,7 +306,7 @@ fn verifiedBody(raw: []const u8) ![]const u8 {
     if (raw.len < checksum_len) return error.InvalidManifest;
     const body = raw[0 .. raw.len - checksum_len];
     const expected = std.mem.readInt(u32, raw[raw.len - checksum_len ..][0..checksum_len], .little);
-    if (std.hash.Crc32.hash(body) != expected) return error.InvalidManifest;
+    if (Crc32.hash(body) != expected) return error.InvalidManifest;
     return body;
 }
 

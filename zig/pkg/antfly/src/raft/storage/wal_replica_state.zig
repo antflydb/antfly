@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const raft_engine = @import("raft_engine");
@@ -646,7 +647,7 @@ pub const WalReplicaState = struct {
         std.mem.writeInt(u32, payload[0..4], applied_watermark_magic, .little);
         std.mem.writeInt(u32, payload[4..8], applied_watermark_version, .little);
         std.mem.writeInt(u64, payload[8..16], self.applied_index, .little);
-        std.mem.writeInt(u32, payload[16..20], std.hash.Crc32.hash(payload[0..16]), .little);
+        std.mem.writeInt(u32, payload[16..20], Crc32.hash(payload[0..16]), .little);
         try writeFileAtomically(self.io_impl.io(), self.applied_watermark_path, &payload);
         self.durable_applied_index = self.applied_index;
         self.stats.applied_watermark_persist_ns += elapsedSince(started_ns);
@@ -678,7 +679,7 @@ pub const WalReplicaState = struct {
         if (file_magic != applied_watermark_magic) return error.InvalidReplicaState;
         const file_version = std.mem.readInt(u32, payload[4..8], .little);
         if (file_version != applied_watermark_version) return error.UnsupportedReplicaStateVersion;
-        if (std.mem.readInt(u32, payload[16..20], .little) != std.hash.Crc32.hash(payload[0..16]))
+        if (std.mem.readInt(u32, payload[16..20], .little) != Crc32.hash(payload[0..16]))
             return error.InvalidReplicaState;
         const watermark = std.mem.readInt(u64, payload[8..16], .little);
         if (watermark > self.applied_index) self.applied_index = watermark;
