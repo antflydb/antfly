@@ -937,7 +937,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightWithResample(
     mean: [3]f32,
     std_dev: [3]f32,
     resample: Resample,
-    pad_rgb: [3]u8,
+    pad_rgb: [3]f32,
 ) ![]f32 {
     return preprocessDecodedRectKeepAspectPadRightScaledWithResample(
         allocator,
@@ -961,7 +961,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     std_dev: [3]f32,
     rescale_factor: f32,
     resample: Resample,
-    pad_rgb: [3]u8,
+    pad_rgb: [3]f32,
 ) ![]f32 {
     const resized_width = computeAspectFitWidth(img.width, img.height, target_height, max_width);
     if (resized_width == 0) return error.InvalidImageBuffer;
@@ -976,6 +976,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
         rescale_factor,
         resample,
     );
+    if (resized_width == max_width) return resized;
     defer allocator.free(resized);
 
     const output_plane_stride = @as(usize, max_width) * @as(usize, target_height);
@@ -984,7 +985,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     errdefer allocator.free(output);
 
     for (0..3) |ch| {
-        const pad_value = ((@as(f32, @floatFromInt(pad_rgb[ch])) * rescale_factor) - mean[ch]) / std_dev[ch];
+        const pad_value = ((pad_rgb[ch] * rescale_factor) - mean[ch]) / std_dev[ch];
         @memset(output[ch * output_plane_stride ..][0..output_plane_stride], pad_value);
 
         const src_plane = resized[ch * resized_plane_stride ..][0..resized_plane_stride];

@@ -40,6 +40,10 @@ All notable changes to Antfly will be documented in this file.
   unpadded AveragePool, and bound convolution workspace through tiled execution.
 - Correct Paddle image normalization and CTC space handling, preserve dynamic
   recognition widths up to 3200, and propagate recognition failures.
+- Pad narrow Paddle recognition crops to the training-width canvas with neutral
+  padding, avoiding invalid convolution shapes without stretching glyphs.
+- Discover nested multistage reader bundles in model inventory and readiness;
+  keep parent-only compatibility unknown and validate stages during loading.
 - Add an isolated `reader-bench-install` build target for exercising the production
   reader without rebuilding the full application.
 

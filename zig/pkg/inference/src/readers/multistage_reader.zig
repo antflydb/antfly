@@ -683,7 +683,10 @@ fn applyModelTypeNormalization(model_type: []const u8, stage_kind: StageKind, co
 fn applyModelTypeStageDefaults(model_type: []const u8, stage_kind: StageKind, config: *multistage_ocr.PreprocessConfig) void {
     if (std.mem.eql(u8, model_type, "paddleocr") and stage_kind == .recognition) {
         config.keep_aspect_ratio = true;
-        config.pad_value_rgb = .{ 255, 255, 255 };
+        // Paddle retains its training-width canvas for narrow crops and pads
+        // after normalization with zero, not white. Long lines remain dynamic.
+        config.min_width = 320;
+        config.pad_value_rgb = .{ 127.5, 127.5, 127.5 };
     }
 }
 

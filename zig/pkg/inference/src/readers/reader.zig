@@ -483,6 +483,7 @@ pub fn probeManifest(
     model_path: []const u8,
     man: manifest_mod.ModelManifest,
 ) !ReaderSupport {
+    if (man.has_multistage_ocr) return .{ .supported = .multistage };
     const multistage = multistage_metadata.isMultiStageModelDir(allocator, model_path) catch |err| switch (err) {
         error.InvalidMetadata, error.FileTooLarge, error.IsDir, error.SymLinkLoop => return .{ .unsupported = .invalid_metadata },
         else => return err,

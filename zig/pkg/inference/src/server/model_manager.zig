@@ -758,6 +758,14 @@ pub fn compatibilitySummaryForBackends(
     man: *const manifest_mod.ModelManifest,
     preferred_backends: []const backends.BackendType,
 ) !CompatibilitySummary {
+    // The parent has no single-model weight artifact. Its reader validates
+    // the component graphs during loading; discovery cannot certify those
+    // stages from the parent manifest alone.
+    if (man.has_multistage_ocr) return .{
+        .level = .unknown,
+        .code = .unknown_architecture,
+        .message = "multistage OCR compatibility requires per-stage validation",
+    };
     var best: ?CompatibilitySummary = null;
     for (preferred_backends) |backend| {
         const summary = try compatibilitySummaryForBackend(
@@ -2236,6 +2244,7 @@ pub fn isManifestPotentiallyLoadableInCurrentBuild(man: manifest_mod.ModelManife
     if (man.hasIncompleteColqwenBundle()) return false;
     if (man.hasIncompleteClipclapGgufBundle()) return false;
     if (man.hasIncompleteFlorence2GgufBundle()) return false;
+    if (man.has_multistage_ocr) return true;
     if (man.onnx_path != null or
         man.visual_model_path != null or
         man.audio_model_path != null or

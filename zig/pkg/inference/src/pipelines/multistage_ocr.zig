@@ -64,8 +64,9 @@ pub const PreprocessConfig = struct {
     resample: image.Resample = .bilinear,
     keep_aspect_ratio: bool = false,
     dynamic_width: bool = false,
+    min_width: u32 = 1,
     size_multiple: u32 = 1,
-    pad_value_rgb: [3]u8 = .{ 255, 255, 255 },
+    pad_value_rgb: [3]f32 = .{ 255, 255, 255 },
 };
 
 fn detectionInputSize(config: PreprocessConfig, width: u32, height: u32) struct { width: u32, height: u32 } {
@@ -233,6 +234,62 @@ pub const DetectionPostProcessor = union(enum) {
     }
 };
 
+fn preprocessRecognitionImage(allocator: std.mem.Allocator, img: image.Image, config: PreprocessConfig) !struct { pixel_values: []f32, width: u32 } {
+    var input_width = config.width;
+    const pixel_values = if (config.keep_aspect_ratio) blk: {
+        if (config.dynamic_width) {
+            const content_width = image.computeAspectFitWidth(img.width, img.height, config.height, config.width);
+            input_width = @min(config.width, @max(config.min_width, content_width));
+        }
+        break :blk try image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
+            allocator,
+            img,
+            input_width,
+            config.height,
+            config.mean,
+            config.std,
+            config.rescale_factor,
+            config.resample,
+            config.pad_value_rgb,
+        );
+    } else try image.preprocessDecodedRectScaledWithResample(
+        allocator,
+        img,
+        input_width,
+        config.height,
+        config.mean,
+        config.std,
+        config.rescale_factor,
+        config.resample,
+    );
+    return .{ .pixel_values = pixel_values, .width = input_width };
+}
+
+test "dynamic CTC preprocessing pads narrow crops without stretching and retains wide lines" {
+    const allocator = std.testing.allocator;
+    const config = PreprocessConfig{
+        .width = 3200,
+        .height = 48,
+        .min_width = 320,
+        .keep_aspect_ratio = true,
+        .dynamic_width = true,
+        .pad_value_rgb = .{ 127.5, 127.5, 127.5 },
+    };
+    var black = [_]u8{0} ** (1000 * 3);
+    const narrow = try preprocessRecognitionImage(allocator, .{ .data = &black, .width = 1, .height = 1000, .channels = 3 }, config);
+    defer allocator.free(narrow.pixel_values);
+    try std.testing.expectEqual(@as(u32, 320), narrow.width);
+    for (0..3 * config.height) |row| {
+        const values = narrow.pixel_values[row * narrow.width ..][0..narrow.width];
+        try std.testing.expectEqual(@as(f32, -1), values[0]);
+        for (values[1..]) |value| try std.testing.expectApproxEqAbs(@as(f32, 0), value, 1e-6);
+    }
+    const wide = try preprocessRecognitionImage(allocator, .{ .data = &black, .width = 1000, .height = 1, .channels = 3 }, config);
+    defer allocator.free(wide.pixel_values);
+    try std.testing.expectEqual(@as(u32, 3200), wide.width);
+    for (wide.pixel_values) |value| try std.testing.expectEqual(@as(f32, -1), value);
+}
+
 pub const CTCRecognizer = struct {
     allocator: std.mem.Allocator,
     session: backends.Session,
@@ -245,43 +302,9 @@ pub const CTCRecognizer = struct {
     }
 
     pub fn recognize(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
-        var input_width = self.preprocess.width;
-        const pixel_values = if (self.preprocess.keep_aspect_ratio) blk: {
-            if (self.preprocess.dynamic_width) {
-                input_width = image.computeAspectFitWidth(img.width, img.height, self.preprocess.height, self.preprocess.width);
-                break :blk try image.preprocessDecodedRectScaledWithResample(
-                    self.allocator,
-                    img,
-                    input_width,
-                    self.preprocess.height,
-                    self.preprocess.mean,
-                    self.preprocess.std,
-                    self.preprocess.rescale_factor,
-                    self.preprocess.resample,
-                );
-            }
-
-            break :blk try image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
-                self.allocator,
-                img,
-                self.preprocess.width,
-                self.preprocess.height,
-                self.preprocess.mean,
-                self.preprocess.std,
-                self.preprocess.rescale_factor,
-                self.preprocess.resample,
-                self.preprocess.pad_value_rgb,
-            );
-        } else try image.preprocessDecodedRectScaledWithResample(
-            self.allocator,
-            img,
-            self.preprocess.width,
-            self.preprocess.height,
-            self.preprocess.mean,
-            self.preprocess.std,
-            self.preprocess.rescale_factor,
-            self.preprocess.resample,
-        );
+        const input = try preprocessRecognitionImage(self.allocator, img, self.preprocess);
+        const input_width = input.width;
+        const pixel_values = input.pixel_values;
         defer self.allocator.free(pixel_values);
 
         const input_name = if (self.session.inputInfo().len > 0) self.session.inputInfo()[0].name else "x";

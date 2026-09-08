@@ -30,7 +30,7 @@ loading weights.
 | State | Meaning | Behaviour |
 |---|---|---|
 | **`compatible`** | Static checks found a viable runtime path for this artifact and build. | May load, subject to resource admission. |
-| **`unknown`** | Antfly cannot prove compatibility or incompatibility without trying an unrecognized contract. | Rejected by default; opt in with `--allow-unknown-models`. |
+| **`unknown`** | Listing cannot establish a viable runtime path from the parent contract alone. | Unrecognized single-model contracts require `--allow-unknown-models`; multistage OCR is assessed per stage. |
 | **`incompatible`** | A required artifact/backend is missing, a tensor contract cannot be materialized, or the path is known unsafe or unusable. | Always rejected before load; the unknown-model opt-in cannot override it. |
 
 Resource fit is separate from compatibility. Model weights are admitted against stable host
@@ -185,8 +185,9 @@ time on the actual storage topology.
 The native reader supports the `monkt/paddleocr-onnx` v3 detector with its English
 or Latin CTC recognizer. These artifacts execute through Antfly's own ONNX importer
 and native compute backend; ONNX Runtime and Paddle's runtime are not required.
-This is an isolated production-reader qualification, not a full-server or CUDA
-certification.
+The English recognizer has also been exercised through standalone image reading
+and embedded/mixed/scanned PDF ingestion on native CPU with Accelerate BLAS
+(Apple M5 Pro). This does not qualify CUDA or Metal execution.
 
 The model directory needs `det.onnx`, `rec.onnx`, `dict.txt`, and
 `antfly_metadata.json`:
@@ -209,8 +210,15 @@ The model directory needs `det.onnx`, `rec.onnx`, `dict.txt`, and
 The Paddle download path creates this metadata automatically. Without a custom
 preprocessor, dynamic detector inputs fit within 960 pixels with dimensions aligned
 to 32; dynamic recognition inputs preserve line aspect ratio up to width 3200.
+Narrow recognition crops retain a 320-pixel canvas with neutral padding rather
+than stretching glyphs or shrinking below the convolution's minimum dimensions.
 Fixed-width models retain their declared width. Recognition failures propagate
 instead of silently dropping text.
+
+Nested multistage bundles appear in `/ai/v1/models` and readiness inventory even
+without a top-level weight file. Their parent compatibility is `unknown` because
+listing does not inspect every stage graph. Reader loading still validates and
+admits the individual stages; the parent label does not bypass those checks.
 
 Build and exercise only the native reader, without rebuilding Antfly:
 
@@ -243,8 +251,11 @@ document-extraction configuration:
 Embedded inference must be enabled for this local provider route. The existing
 PDF extraction pipeline uses the shared native PDF reader for embedded text and
 the reader provider for OCR fallback; the isolated benchmark does not replace
-either production path. The default OCR model remains Florence-2. Full-server
-PDF ingestion with Paddle still requires end-to-end qualification.
+either production path. The default OCR model remains Florence-2. Native PDF
+working-set limits and unsupported CCITT streams can still prevent rendering;
+the document manifest retains per-page OCR failure details. Reader bounding boxes
+are not yet retained when PDF ingestion selects OCR text, so OCR text recovery
+does not imply visual-grounding support.
 
 ## Known incompatible artifacts and families
 
