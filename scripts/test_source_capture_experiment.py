@@ -1,6 +1,6 @@
 import unittest
 
-from source_capture_experiment import capture_preparation_evidence
+from source_capture_experiment import capture_preparation_evidence, checkpoint_handoffs
 
 
 class CaptureEvidenceTest(unittest.TestCase):
@@ -66,6 +66,27 @@ class CaptureEvidenceTest(unittest.TestCase):
             capture_preparation_evidence(lines, True)
         with self.assertRaises(RuntimeError):
             capture_preparation_evidence(self.lines() + self.lines()[1:], True)
+
+    def test_handoffs_require_publication_and_preserve_nonadditive_samples(self):
+        handoff = "dense checkpoint handoff generation=2 sequence=8 kind=delta completed_wait_ns=100 prepare_ns=2 install_ns=3 written_bytes=40 retained_bytes=20"
+        blocker = "dense checkpoint completion blockers generation=2 source_capture_overlap_ns=90 maintenance_capture_overlap_ns=20 rebase_stage_ns=5 lock_deferrals=3"
+        self.assertEqual(checkpoint_handoffs([handoff, blocker]), [])
+        publication = (
+            "dense posting checkpoint published generation=2 sequence=8 kind=delta"
+        )
+        samples = checkpoint_handoffs([handoff, blocker, publication])
+        self.assertEqual(samples[0]["source_capture_overlap_ns"], 90)
+        self.assertEqual(samples[0]["lock_deferrals"], 3)
+        self.assertNotIn("scheduling_ns", samples[0])
+        self.assertNotIn(
+            "source_capture_overlap_ns", checkpoint_handoffs([handoff, publication])[0]
+        )
+        with self.assertRaises(RuntimeError):
+            checkpoint_handoffs([handoff, handoff, publication])
+        with self.assertRaises(RuntimeError):
+            checkpoint_handoffs(
+                [handoff.replace("install_ns=3", "install_ns=-1"), publication]
+            )
 
 
 if __name__ == "__main__":

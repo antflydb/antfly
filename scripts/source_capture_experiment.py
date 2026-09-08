@@ -9,6 +9,64 @@ from native_preparation_experiments import events
 FLAG = "ANTFLY_EXPERIMENT_DEFER_SOURCE_CAPTURE"
 
 
+def checkpoint_handoffs(lines):
+    """Preserve per-generation wait observations, not additive stage estimates."""
+    published = {
+        row.get("generation")
+        for row in events(lines, "dense posting checkpoint published ")
+    }
+    blockers = {}
+    result = []
+    try:
+        for row in events(lines, "dense checkpoint completion blockers "):
+            if row.get("generation") not in published:
+                continue
+            generation = int(row["generation"])
+            if generation in blockers:
+                raise ValueError("ambiguous completion identity")
+            blockers[generation] = row
+        seen = set()
+        for row in events(lines, "dense checkpoint handoff "):
+            if row.get("generation") not in published:
+                continue
+            generation = int(row["generation"])
+            if generation <= 0 or generation in seen:
+                raise ValueError("invalid or duplicate handoff identity")
+            seen.add(generation)
+            values = {
+                key: int(row[key])
+                for key in (
+                    "sequence",
+                    "completed_wait_ns",
+                    "prepare_ns",
+                    "install_ns",
+                    "written_bytes",
+                    "retained_bytes",
+                )
+            }
+            if generation in blockers:
+                values.update(
+                    {
+                        key: int(blockers[generation][key])
+                        for key in (
+                            "source_capture_overlap_ns",
+                            "maintenance_capture_overlap_ns",
+                            "rebase_stage_ns",
+                            "lock_deferrals",
+                        )
+                    }
+                )
+            if any(value < 0 for value in values.values()):
+                raise ValueError("negative completion observation")
+            result.append({"generation": generation, "kind": row["kind"], **values})
+    except (KeyError, ValueError) as error:
+        raise RuntimeError("invalid checkpoint wait evidence") from error
+    # Missing blocker samples remain missing. Overlap and rebase timers can
+    # intersect; lock deferrals are counts, not lock-wait time. Never subtract
+    # their sum from completed_wait_ns and label the remainder scheduling.
+    return result
+
+
 def capture_preparation_evidence(lines, deferred):
     rows = events(lines, "dense replay collection ")
     committed = {}
@@ -74,4 +132,5 @@ def capture_preparation_evidence(lines, deferred):
         "observations_starting_outside_capture": outside,
         "collection_ns": sum(row["collect_ns"] for row in observed),
         "apply_ns": sum(row["apply_ns"] for row in observed),
+        "checkpoint_handoffs": checkpoint_handoffs(lines),
     }
