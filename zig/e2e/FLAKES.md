@@ -13,6 +13,7 @@ entries so later failures can be compared with the original signature.
 | `test_backup_restore.py::test_three_by_three_cluster_backup_restore_through_metadata_public_api` | [PR #658, run 34177703845, job 101916669107](https://github.com/antflydb/antfly/actions/runs/34177703845/job/101916669107?pr=658), head [`96bee1e80`](https://github.com/antflydb/antfly/commit/96bee1e80cf115c2dc636ed065a0378d8cfb27f3) | [`1bf7230cc`](https://github.com/antflydb/antfly/commit/1bf7230cc74c37ba4263964719542c210ff9473d) | Write-admission handling fixed; 30/30 soak runs passed. |
 | `test_cli.py::test_cli_inline_create_load_wait_query_image_and_rag_pipeline` | [PR #658, run 34177703845, job 101916669107](https://github.com/antflydb/antfly/actions/runs/34177703845/job/101916669107?pr=658), head [`96bee1e80`](https://github.com/antflydb/antfly/commit/96bee1e80cf115c2dc636ed065a0378d8cfb27f3) | [`1bf7230cc`](https://github.com/antflydb/antfly/commit/1bf7230cc74c37ba4263964719542c210ff9473d) | Readiness assertion fixed; 30/30 soak runs passed. |
 | Same CLI pipeline, retry-exhaustion phase (`settled_failure is not None`) | [PR #659, run 34182855053, job 101932868141](https://github.com/antflydb/antfly/actions/runs/34182855053/job/101932868141), head [`51ec7a551`](https://github.com/antflydb/antfly/commit/51ec7a551aa3ac5713eb243155a9e2c9d8cfa0ac) | [`19b988108`](https://github.com/antflydb/antfly/commit/19b9881080af1dbc805f9ad5bda096b62bf063b1) | Reproduced in 3/3 concurrent runs with real retry sleeps; corrected-budget soak passed 9/9. |
+| Same three-by-three backup test, initial table create | [PR #664, run 34263167199, job 102199089027](https://github.com/antflydb/antfly/actions/runs/34263167199/job/102199089027?pr=664), merge `d6108b73b85a8e77dfcb740d5518279b2a51d826` | This change | Read waiter clock and pre-admission handling fixed; 100/100 Debug soak runs passed. |
 
 ### Retrieval streaming teardown
 
@@ -57,6 +58,61 @@ shard payloads in the backup, and restored documents through every data node.
 Harness regressions cover eventual admission, retry classification, deadline
 diagnostics, and process exit. The specific CI rejection has not been
 reproduced naturally in the local soak.
+
+### Three-by-three backup table creation: unknown outcome
+
+The #664 recurrence failed earlier than the seeding case above: the initial
+`POST /db/v1/tables/metadata_leader_backup_<unique suffix>` returned HTTP 409,
+`table mutation outcome is unknown; observe table state before retrying`.
+The job reported 352 passed, five skipped, and this one failure. Its failure
+log did not contain the cluster diagnostics needed to locate the failure.
+The test now attaches all six server log tails when that initial create fails.
+
+Investigation found that `MetadataHttpService.ensureLinearizableReadWithContext`
+ran a **ticking** Raft round on each iteration of its 1 ms polling loop. The
+runtime also has a dedicated cadence driver. Read traffic could therefore
+advance elections, heartbeats, and virtual time independently of elapsed time.
+A captured stack showed a routing read executing this path; the accompanying
+runtime diagnostics reported virtual time well ahead of elapsed time.
+
+The fix uses the existing progress-only Raft operations in
+that read loop, including pending-update synchronization. The dedicated ticker
+continues to own election and heartbeat time. ReadIndex requests, quorum
+requirements, request deadlines, and the E2E create-success assertion remain
+unchanged. Unknown outcomes remain non-retryable; this fix does not turn a 409
+into success or replay a possibly committed mutation.
+
+The local investigation also exposed socket pressure under three concurrent
+six-node clusters: `AddressUnavailable` in data control rounds and Python
+`EADDRNOTAVAIL`, with 45,747 TCP sockets in `TIME_WAIT`. Changing the fixture's
+5 ms ticks to the runtime's 100 ms defaults did not solve the issue: that probe
+reproduced the create 409 near the forwarding deadline. No cadence override
+change is included in the fix.
+
+A deterministic regression starts without a leader and gives a read waiter a
+50 ms deadline. Before the fix, that waiter advanced virtual time from zero to
+3,800 ms. With the fix, it times out without advancing time or electing itself.
+The test then advances the dedicated cadence driver, verifies leader election,
+and completes a ReadIndex request without any further virtual-time advance.
+This proves the clock ownership bug; the original CI log alone cannot establish
+which internal timeout produced its 409.
+
+The first Debug soak then exposed a distinct initial-create failure:
+`503 metadata_leader_unavailable`. The server's
+`metadataMutationNotAdmittedResponse` marks this response with
+`X-Antfly-Metadata-Mutation-Not-Admitted: true`, a stronger guarantee than a
+leader-routing hint. Even a quorum-backed leader observation cannot reserve
+mutation authority for a subsequent request. The fixture now honors this
+pre-admission contract within the original 30-second create budget, using a
+one-second backoff and the remaining budget for each request.
+
+Retry requires HTTP 503, that explicit non-admission marker, the exact
+`metadata_leader_unavailable` code, and `retryable: true`. A contradictory
+unknown/committed outcome marker forbids retry. Transport errors, unmarked
+503s, ambiguous 409s, and process exits still fail. The create must return a
+successful response, and every replication, backup payload, and restore
+assertion remains. Recovered admission attempts are printed in the soak log;
+failures retain the last status, headers, body, and all server log tails.
 
 ### CLI image readiness
 
@@ -177,3 +233,64 @@ counts, failing node IDs, and preserved diagnostics when adding a new result.
 Both soaks used `scripts/ci/zig-e2e-regression-loop.sh` with `SKIP_BUILD=1`,
 `ANTFLY_BIN` set to the executable above, and the corresponding test node ID.
 These are local macOS results; Linux CI remains the cross-platform check.
+
+### Follow-up validation for #664
+
+2026-09-08 (America/Los_Angeles), macOS ARM64, based on `origin/main`
+[`fea3e6611`](https://github.com/antflydb/antfly/commit/fea3e66111a3f39f8cc95a8c71e31d6e30f2dc5f),
+in `.worktrees/fix-metadata-backup-create-flake`:
+
+- The native **Debug** build passed. Executable SHA-256:
+  `65576850a6cbb3d934c8d158138a39dfa7d16f3cab79d80d7c5e0dcadf03611f`.
+- **75 metadata service tests passed** in Debug, with zero leaks, including
+  the read waiter clock regression. **114 Python harness, scheduler, and
+  leader-discovery checks passed**.
+- Original 5 ms fixture cadence, three workers × ten repetitions:
+  **29/30 passed**. No unknown-outcome 409 recurred. Worker 2, iteration 2
+  failed at initial create with the explicit pre-admission JSON response
+  `503 metadata_leader_unavailable` for
+  `metadata_leader_backup_1788900153771408000` through data node 4.
+  This exposed the admission handling gap addressed next; this initial result
+  is not a clean soak.
+- A temporary probe removed only the fixture's `--raft-tick-ms` and
+  `--control-tick-ms` overrides, retaining the original test assertions.
+  At the runtime's 100 ms defaults, **9/9 passed** (three workers × three
+  repetitions). Before the fix, this probe failed 9/9 with five initial-create
+  unknown-outcome 409s. That earlier executable was ReleaseSafe, so the E2E
+  comparison also changes optimization mode; the deterministic clock
+  regression supplies the isolated evidence for the production bug.
+- With the admission helper, **132 fast checks passed**, including 18 new
+  cases covering safe admission retry, successful 200/202 responses, deadline
+  exhaustion, backoff overshoot, process exit, and refusal to replay unmarked,
+  malformed, conflicting, transport-failed, or ambiguous outcomes.
+- Final original-cadence Debug soak with the admission helper:
+  **100/100 passed**, four workers × 25 repetitions. No initial-create retries
+  occurred in this batch; the deterministic harness cases exercise the
+  recovered 503 path. The executable is unchanged from the initial Debug soak.
+
+Build and correctness commands, from `zig/`:
+
+```sh
+python3 tools/run_bounded_zig_build.py --zig zig -- build antfly -Doptimize=Debug -fincremental
+python3 tools/run_bounded_zig_build.py --zig zig -- build lib-metadata-test -Doptimize=Debug -- metadata.service.
+```
+
+Final original-cadence soak, from the worktree root (the initial 30-run batch
+used three workers and ten repetitions):
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+ANTFLY_E2E_REGRESSION_WORKERS=4 ANTFLY_E2E_REGRESSION_REPEATS=25 \
+ANTFLY_E2E_PRESERVE_FAILURE_LIMIT=2 \
+scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_backup_restore.py::test_three_by_three_cluster_backup_restore_through_metadata_public_api
+```
+
+Local logs, the temporary comparison sources, and the failed six-node runtime
+root are retained under the worktree's ignored
+`.benchmark-results/metadata-backup-flake/` directory. In particular,
+`soak-debug.log` records all 30 original-cadence outcomes and
+`soak-debug-runtime-cadence.log` records the nine comparison outcomes.
+`soak-debug-100.log` records all 100 final passing executions.
+The probe sources are not part of test collection. Linux CI validation remains
+outstanding.
