@@ -5115,27 +5115,33 @@ pub const ModelManager = struct {
         key: ComponentPlanKey,
         loader: *ComponentLoader,
     ) !bool {
+        const entry = try self.cachedComponentPlan(key) orelse return false;
+        defer entry.release();
+        @memcpy(loader.allowed_backends[0..entry.allowed_backend_count], entry.allowed_backends[0..entry.allowed_backend_count]);
+        loader.allowed_backend_count = entry.allowed_backend_count;
+        loader.validated_generation = entry.signature;
+        return true;
+    }
+
+    fn cachedComponentPlan(self: *ModelManager, key: ComponentPlanKey) !?*ComponentPlanCacheEntry {
         spinLock(&self.component_plan_cache_lock);
         const entry = self.component_plan_cache.get(key) orelse {
             self.component_plan_cache_lock.unlock();
-            return false;
+            return null;
         };
         entry.retain();
         self.component_plan_cache_lock.unlock();
-        defer entry.release();
+        errdefer entry.release();
 
         const signature = try componentDependencySignature(
             self.componentPlanIo(),
             entry.dependencies,
         );
-        if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) return false;
-        @memcpy(
-            loader.allowed_backends[0..entry.allowed_backend_count],
-            entry.allowed_backends[0..entry.allowed_backend_count],
-        );
-        loader.allowed_backend_count = entry.allowed_backend_count;
-        loader.validated_generation = signature;
-        return true;
+        if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) {
+            entry.release();
+            return null;
+        }
+        return entry;
     }
 
     fn publishComponentPlan(
@@ -5928,6 +5934,13 @@ pub const ModelManager = struct {
             "tokenizer.json",
             "config.json",
             "generation_config.json",
+            "clip_config.json",
+            "model_manifest.json",
+            "antfly_inference_bundle.json",
+            "antfly_inference_variants.json",
+            "gliner_config.json",
+            "added_tokens.json",
+            "1_SpladePooling/config.json",
             managed_receipt.complete_filename,
             managed_receipt.in_progress_filename,
             managed_receipt.plan_filename,
@@ -5945,17 +5958,26 @@ pub const ModelManager = struct {
         }
         const direct = try componentDependencySignature(self.componentPlanIo(), dependencies.items);
         if (component_paths.len == 0) return direct;
-        // Reuse the component validator's cached transitive closure. Warm
-        // calls stat dependencies, not just graph files; external tensor data
-        // and native shards must invalidate heavy sessions as well as plans.
-        const loader = try self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, component_paths);
-        const closure = loader.validated_generation orelse blk: {
+        // Artifact identity is backend-neutral. Optional graphs participate in
+        // invalidation, but must not restrict the backend of the selected pair.
+        // Cache the closure under a distinct namespace in the bounded plan cache.
+        var closure_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        closure_hash.update("composite-artifact-closure-v1");
+        closure_hash.update(&direct);
+        const closure_key = closure_hash.finalResult();
+        const closure = if (try self.cachedComponentPlan(closure_key)) |entry| blk: {
+            defer entry.release();
+            break :blk entry.signature;
+        } else blk: {
             var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
             defer man.deinit();
-            var inspection = try inspectComponentArtifacts(self.allocator, &man, component_paths, .manifest);
+            var inspection = try inspectComponentArtifacts(self.allocator, &man, component_paths, .multistage_ocr);
             defer inspection.deinit();
             if (inspection.invalid_summary != null) return error.IncompatibleModel;
-            break :blk try componentDependencySignature(self.componentPlanIo(), inspection.dependencies.items);
+            const signature = try componentDependencySignature(self.componentPlanIo(), inspection.dependencies.items);
+            if (!std.mem.eql(u8, &direct, &try componentDependencySignature(self.componentPlanIo(), dependencies.items))) return error.ModelArtifactsChanging;
+            try self.publishComponentPlan(closure_key, signature, &.{}, inspection.dependencies.items);
+            break :blk signature;
         };
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(&direct);
@@ -5994,22 +6016,43 @@ pub const ModelManager = struct {
         errdefer if (decoder) |*managed| managed.deinit();
         if (kind != .whisper_metadata) {
             if (component_paths.len != 2 and component_paths.len != 3) return error.InvalidModelLayout;
-            var loader = try self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, component_paths);
-            encoder = if (control) |active| try loader.loadWithControl(component_paths[0], active) else try loader.load(component_paths[0]);
-            var strict = try loader.restrictToBackend(encoder.?.session.backend());
-            if (component_paths.len == 3) {
-                // Try the qualified fast path before allocating the fallback
-                // decoder. No extra model residency remains on the warm path.
-                decoder = (if (control) |active| strict.loadWithControl(component_paths[2], active) else strict.load(component_paths[2])) catch |err| switch (err) {
-                    error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => null,
+            var metadata = std.heap.ArenaAllocator.init(self.allocator);
+            defer metadata.deinit();
+            const merged = if (component_paths.len == 3) blk: {
+                const signature = @import("../backends/imported_onnx_session.zig").inspectSignature(metadata.allocator(), component_paths[2]) catch |err| switch (err) {
+                    error.IncompatibleModel, error.UnsupportedDType => break :blk false,
                     else => return err,
                 };
-                if (decoder) |*candidate| if (!@import("../pipelines/seq2seq_decode.zig").qualified(candidate.session)) {
-                    candidate.deinit();
-                    decoder = null;
+                break :blk @import("../pipelines/seq2seq_decode.zig").qualifiedSignature(signature.inputs, signature.outputs);
+            } else false;
+            if (merged) {
+                const selected = [_][]const u8{ component_paths[0], component_paths[2] };
+                // Optional graph support must not constrain fallback placement.
+                const loaded = blk: {
+                    var loader = self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, &selected) catch |err| break :blk err;
+                    encoder = (if (control) |active| loader.loadWithControl(selected[0], active) else loader.load(selected[0])) catch |err| break :blk err;
+                    var strict = loader.restrictToBackend(encoder.?.session.backend()) catch |err| break :blk err;
+                    decoder = (if (control) |active| strict.loadWithControl(selected[1], active) else strict.load(selected[1])) catch |err| break :blk err;
+                    if (!@import("../pipelines/seq2seq_decode.zig").qualified(decoder.?.session)) break :blk error.IncompatibleModel;
+                    break :blk @as(anyerror!void, {});
                 };
+                if (loaded) |_| {} else |err| {
+                    switch (err) {
+                        error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => {},
+                        else => return err,
+                    }
+                    if (decoder) |*candidate| candidate.deinit();
+                    decoder = null;
+                    if (encoder) |*candidate| candidate.deinit();
+                    encoder = null;
+                }
             }
-            if (decoder == null) decoder = if (control) |active| try strict.loadWithControl(component_paths[1], active) else try strict.load(component_paths[1]);
+            if (decoder == null) {
+                var loader = try self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, component_paths[0..2]);
+                encoder = if (control) |active| try loader.loadWithControl(component_paths[0], active) else try loader.load(component_paths[0]);
+                var strict = try loader.restrictToBackend(encoder.?.session.backend());
+                decoder = if (control) |active| try strict.loadWithControl(component_paths[1], active) else try strict.load(component_paths[1]);
+            }
         }
         const verified_generation = try self.compositeRuntimeKey(
             model_dir,
@@ -6147,14 +6190,13 @@ pub const ModelManager = struct {
                 defer self.allocator.free(candidate);
                 if (!std.mem.eql(u8, candidate, component_paths[1])) {
                     const planned = [_][]const u8{ component_paths[0], component_paths[1], candidate };
-                    // Existing component policy caches validate backend support
-                    // and the complete external-data closure. Unsupported
-                    // optional graphs do not remove a working full-prefix route.
-                    _ = self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, &planned) catch |err| switch (err) {
+                    // The runtime single-flight pins metadata-only selection.
+                    // Artifact identity includes the optional graph; backend
+                    // policy is applied only to the selected executable pair.
+                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, kind, control) catch |err| switch (err) {
                         error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => return self.acquireCompositeRuntimePlanned(model_dir, component_paths, kind, control),
                         else => return err,
                     };
-                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, kind, control);
                 }
             }
         }
@@ -10331,6 +10373,14 @@ test "composite decoder selection qualifies optional merged artifacts and pins f
     defer first.release();
     try std.testing.expect(first.get().considered_merged_decoder);
     try std.testing.expectEqual(.full_prefix, first.get().decoder_execution);
+    // The unqualified graph is fingerprinted, but never enters executable
+    // backend policy (or its heavyweight session construction).
+    var plans = manager.component_plan_cache.valueIterator();
+    while (plans.next()) |entry| {
+        if (entry.*.allowed_backend_count == 0) continue;
+        for (entry.*.dependencies) |dependency|
+            try std.testing.expect(!std.mem.endsWith(u8, dependency, "decoder_model_merged.onnx"));
+    }
     var second = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
     defer second.release();
     try std.testing.expect(first.get() == second.get());

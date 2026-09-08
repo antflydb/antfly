@@ -853,7 +853,18 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         // Mirror the shared local request gate before crossing the transport.
         if (!state.node.tryAcquireRequestSlot()) return error.ResourceTemporarilyUnavailable;
         defer state.node.releaseRequestSlot();
-        const json = try worker_runtime.invokeProvider(worker, context);
+        const result = try worker_runtime.invokeProvider(worker, context);
+        const json = switch (result) {
+            .json => |json| json,
+            .numeric => |numeric| {
+                errdefer {
+                    for (numeric.rows) |row| state.alloc.free(row);
+                    state.alloc.free(numeric.rows);
+                }
+                try publishNumericProviderResponse(context, state.alloc, numeric.rows, numeric.kind);
+                return;
+            },
+        };
         errdefer state.alloc.free(json);
         const response = try state.alloc.create(ProviderResponseState);
         response.* = .{ .alloc = state.alloc, .json = json };

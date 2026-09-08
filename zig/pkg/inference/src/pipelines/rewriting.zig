@@ -66,10 +66,23 @@ pub const RewritingPipeline = struct {
     pub fn rewritePrepared(self: *RewritingPipeline, io: std.Io, prepared: *const PreparedTextBatch) ![]RewriteResult {
         try prepared.validateFor(self.enc_dec.encoder, self.tokenizer, self.config.max_length);
         const allocator = self.allocator;
+        const Work = struct {
+            original: usize,
+            width: usize,
+            fn less(_: void, a: @This(), b: @This()) bool {
+                return a.width < b.width or (a.width == b.width and a.original < b.original);
+            }
+        };
+        const queue_bytes = try std.math.mul(usize, prepared.ids.len, @sizeOf(Work) + @sizeOf(RewriteResult));
+        var queue_permit = try self.enc_dec.encoder.admitHostPreprocess(queue_bytes);
+        defer queue_permit.deinit();
+        const order = try allocator.alloc(Work, prepared.ids.len);
+        defer allocator.free(order);
+        for (order, 0..) |*work, i| work.* = .{ .original = i, .width = 0 };
         const results = try allocator.alloc(RewriteResult, prepared.ids.len);
         var initialized: usize = 0;
         errdefer {
-            for (results[0..initialized]) |*result| result.deinit();
+            for (order[0..initialized]) |work| results[work.original].deinit();
             allocator.free(results);
         }
         if (self.enc_dec.batch_dispatch == null) {
@@ -106,70 +119,54 @@ pub const RewritingPipeline = struct {
                 std.heap.smp_allocator.free(self_job.mask);
             }
         };
-        while (initialized < prepared.ids.len) {
-            const count = @min(@as(usize, 8), prepared.ids.len - initialized);
-            const tokenized = prepared.ids[initialized..][0..count];
-            var order: [8]usize = undefined;
-            var widths: [8]usize = undefined;
-            for (tokenized, 0..) |ids, i| {
+        // Group lightweight indices across the entire bounded prepared queue;
+        // tensor materialization and execution remain limited to eight rows.
+        for (prepared.ids, order) |ids, *work| {
+            if (self.enc_dec.execution_control) |control| try control.check();
+            if (ids.len == 0) return error.InvalidInputShape;
+            const length = @min(ids.len, self.config.max_length);
+            if (length == 0) return error.InvalidInputShape;
+            work.width = @import("batch_execution.zig").maskedSequenceBucket(self.enc_dec.encoder, length, self.config.max_length);
+        }
+        std.mem.sort(Work, order, {}, Work.less);
+        while (initialized < order.len) {
+            const width = order[initialized].width;
+            var execute_count: usize = 1;
+            while (execute_count < 8 and initialized + execute_count < order.len and order[initialized + execute_count].width == width) execute_count += 1;
+            while (execute_count > 1 and !try self.enc_dec.fitsWindow(execute_count, width, try std.math.add(usize, prepared.reserved_bytes, queue_bytes)))
+                execute_count = @max(@as(usize, 1), execute_count / 2);
+            var jobs: [8]Job = undefined;
+            var job_count: usize = 0;
+            defer for (jobs[0..job_count]) |*job| job.deinit();
+            const window = order[initialized..][0..execute_count];
+            for (window, 0..) |work, i| {
+                const tokens = prepared.ids[work.original];
+                const alloc = std.heap.smp_allocator;
+                const ids = try alloc.alloc(i64, width);
+                errdefer alloc.free(ids);
+                const mask = try alloc.alloc(i64, width);
+                @memset(ids, self.enc_dec.config.pad_token_id);
+                @memset(mask, 0);
+                for (tokens[0..@min(tokens.len, width)], 0..) |id, j| {
+                    ids[j] = id;
+                    mask[j] = 1;
+                }
+                var pipeline = self.enc_dec;
+                pipeline.allocator = alloc;
+                // Progress sinks need not be concurrent. Cancellation remains
+                // inherited and is checked by every stage and decode step.
+                if (pipeline.execution_control) |*control| control.progress = null;
+                jobs[i] = .{ .pipeline = pipeline, .ids = ids, .mask = mask };
+                job_count += 1;
+            }
+            var group = std.Io.Group.init;
+            defer group.cancel(io);
+            for (jobs[0..execute_count]) |*job| group.async(io, Job.run, .{job});
+            try group.await(io);
+            for (jobs[0..execute_count], window) |*job, work| {
+                if (job.err) |err| return err;
                 if (self.enc_dec.execution_control) |control| try control.check();
-                if (ids.len == 0) return error.InvalidInputShape;
-                order[i] = i;
-                const length = @min(tokenized[i].len, self.config.max_length);
-                if (length == 0) return error.InvalidInputShape;
-                widths[i] = @import("batch_execution.zig").maskedSequenceBucket(self.enc_dec.encoder, length, self.config.max_length);
-            }
-            std.mem.sort(usize, order[0..count], &widths, struct {
-                fn less(sizes: *const [8]usize, a: usize, b: usize) bool {
-                    return sizes[a] < sizes[b];
-                }
-            }.less);
-            var completed: [8]?RewriteResult = @splat(null);
-            defer for (&completed) |*result| if (result.*) |*value| value.deinit();
-            var work_offset: usize = 0;
-            while (work_offset < count) {
-                const width = widths[order[work_offset]];
-                var execute_count: usize = 1;
-                while (work_offset + execute_count < count and widths[order[work_offset + execute_count]] == width) execute_count += 1;
-                while (execute_count > 1 and !try self.enc_dec.fitsWindow(execute_count, width, prepared.reserved_bytes))
-                    execute_count = @max(@as(usize, 1), execute_count / 2);
-                var jobs: [8]Job = undefined;
-                var job_count: usize = 0;
-                defer for (jobs[0..job_count]) |*job| job.deinit();
-                for (order[work_offset..][0..execute_count], 0..) |original, i| {
-                    const tokens = tokenized[original];
-                    const alloc = std.heap.smp_allocator;
-                    const ids = try alloc.alloc(i64, width);
-                    errdefer alloc.free(ids);
-                    const mask = try alloc.alloc(i64, width);
-                    @memset(ids, self.enc_dec.config.pad_token_id);
-                    @memset(mask, 0);
-                    for (tokens[0..@min(tokens.len, width)], 0..) |id, j| {
-                        ids[j] = id;
-                        mask[j] = 1;
-                    }
-                    var pipeline = self.enc_dec;
-                    pipeline.allocator = alloc;
-                    // Progress sinks need not be concurrent. Cancellation remains
-                    // inherited and is checked by every stage and decode step.
-                    if (pipeline.execution_control) |*control| control.progress = null;
-                    jobs[i] = .{ .pipeline = pipeline, .ids = ids, .mask = mask };
-                    job_count += 1;
-                }
-                var group = std.Io.Group.init;
-                defer group.cancel(io);
-                for (jobs[0..execute_count]) |*job| group.async(io, Job.run, .{job});
-                try group.await(io);
-                for (jobs[0..execute_count], order[work_offset..][0..execute_count]) |*job, original| {
-                    if (job.err) |err| return err;
-                    if (self.enc_dec.execution_control) |control| try control.check();
-                    completed[original] = .{ .allocator = allocator, .text = try self.tokenizer.decode(allocator, job.output.?.text_ids), .completion_tokens = job.output.?.text_ids.len -| 1 };
-                }
-                work_offset += execute_count;
-            }
-            for (completed[0..count], 0..) |result, i| {
-                results[initialized] = result.?;
-                completed[i] = null;
+                results[work.original] = .{ .allocator = allocator, .text = try self.tokenizer.decode(allocator, job.output.?.text_ids), .completion_tokens = job.output.?.text_ids.len -| 1 };
                 initialized += 1;
             }
         }
@@ -328,7 +325,7 @@ test "rewrite arrays fuse padded encoder and independent decoder stages" {
     bounded.run_admission = .{
         .controller = &controller,
         .backend_class = .cpu,
-        .limits = .{ .host_limit_bytes = 1500 },
+        .limits = .{ .host_limit_bytes = 1500 + @sizeOf(@import("../backends/admitted_allocator.zig").AdmittedAllocator) + 3 * @import("../backends/admitted_allocator.zig").AdmittedAllocator.allocationOverhead(.of([]i32)) },
         .static_workspace_bytes = 1,
         .check_live_memory = false,
     };
@@ -374,6 +371,18 @@ test "rewrite arrays fuse padded encoder and independent decoder stages" {
     }
     try std.testing.expectEqual(@as(usize, 512 + 7 * 16), probe.encoder_cells);
     for (mixed, 0..) |result, index| try std.testing.expectEqualStrings(if (index == 1) "long" else "short", result.text);
+    probe.calls = 0;
+    probe.encoder_cells = 0;
+    const interleaved = try pipeline.rewriteBatch(std.testing.io, &.{ &short, &long, &short, &long, &short, &long, &short, &long, &short, &long, &short, &long, &short, &long, &short, &long });
+    defer {
+        for (interleaved) |*result| result.deinit();
+        std.testing.allocator.free(interleaved);
+    }
+    // Six physical forwards (encoder + two decode steps for each width),
+    // rather than twelve from sorting two adjacent eight-item windows.
+    try std.testing.expectEqual(@as(usize, 6), probe.calls);
+    try std.testing.expectEqual(@as(usize, 8 * (512 + 16)), probe.encoder_cells);
+    for (interleaved, 0..) |result, index| try std.testing.expectEqualStrings(if (index % 2 == 1) "long" else "short", result.text);
     // Symbolic vocabulary metadata must use the same concrete projection as
     // execution, rather than approving a window with a trailing width of one.
     pipeline.enc_dec.encoder.output_geometry = .{ .input_name = "input_ids", .width = 1 };

@@ -10,11 +10,16 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Dispatch = @import("../server/tensor_microbatch.zig").Dispatch;
 
 pub fn qualified(session: backends.Session) bool {
+    return qualifiedSignature(session.inputInfo(), session.outputInfo());
+}
+
+/// Shared by metadata-only cold planning and the loaded-session ABI check.
+pub fn qualifiedSignature(inputs: []const backends.TensorInfo, outputs: []const backends.TensorInfo) bool {
     var ids = false;
     var encoder = false;
     var branch = false;
     var past_count: usize = 0;
-    for (session.inputInfo()) |info| {
+    for (inputs) |info| {
         if (std.mem.eql(u8, info.name, "input_ids")) {
             if (info.dtype != .i64 or info.shape.len != 2 or info.shape[0] > 1 or info.shape[1] > 0) return false;
             ids = true;
@@ -28,13 +33,13 @@ pub fn qualified(session: backends.Session) bool {
             branch = true;
         } else if (kv.pastInputSuffix(info.name)) |suffix| {
             if (!validCacheSuffix(suffix) or info.dtype != .f32 or info.shape.len != 4 or info.shape[0] > 1 or info.shape[1] <= 0 or info.shape[2] > 0 or info.shape[3] <= 0) return false;
-            if (!kv.hasPresentOutputForPastInput(session.outputInfo(), info.name)) return false;
+            if (!kv.hasPresentOutputForPastInput(outputs, info.name)) return false;
             past_count += 1;
         } else return false;
     }
     var present_count: usize = 0;
     var logits = false;
-    for (session.outputInfo()) |info| {
+    for (outputs) |info| {
         if (std.mem.eql(u8, info.name, "logits")) {
             if (info.dtype != .f32 or info.shape.len != 3 or info.shape[0] > 1) return false;
             logits = true;

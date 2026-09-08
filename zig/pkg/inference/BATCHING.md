@@ -168,8 +168,12 @@ tokenizes it once, before validation or any model forward. HTTP and direct
 execution share these IDs; input usage uses the stored counts and output usage
 uses generated IDs rather than re-encoding decoded text. Token IDs are retained
 for whole-request validation; padded tensors and model execution stay bounded
-to eight-row windows. Capacity is checked before the first tokenizer call.
-It partitions that window by token-length class before materializing tensors,
+to eight-row windows. Tokenizer allocations acquire host capacity before the
+backing allocation, including normalization/Viterbi scratch and realloc overlap;
+scratch is released as soon as the tokenizer frees it. This is enforced allocation
+accounting, not an estimate based on UTF-8 length. The retained token owner is
+bound to the same session, controller and limits as its consumer.
+It partitions the whole bounded queue by token-length class before materializing tensors,
 then restores original result order. Subdivision never inherits an unrelated
 long request's padding width.
 Execution groups are then sized using actual padded token lengths against both
@@ -241,13 +245,25 @@ both prefill (empty past inputs) and equal-position cached steps. The explicitly
 broadcast `use_cache_branch` is passed once; differing values cannot coalesce.
 Empty cross-cache outputs retain each request's previous cache owner.
 
-Composite runtimes consider an optional merged decoder before loading the
-ordinary decoder. The existing component policy verifies backend support and
-the artifact dependency closure; the loaded cache ABI must qualify before
-selection. Valid but unqualified candidates are closed before fallback loading.
+Composite runtimes inspect an optional merged decoder's declared graph I/O before
+loading either backend session. Unqualified candidates never load weights or
+constrain backend selection. Backend-neutral artifact-closure caching fingerprints
+all considered graphs; executable policy checks only the selected encoder/decoder
+pair. The existing runtime single-flight caches selection by artifact generation,
+so warm requests stat dependencies without repeating graph-signature inspection.
+The loaded cache ABI is checked again before publication.
 Unsupported optional graphs preserve the ordinary route, while resource and
 cancellation failures propagate. The considered graphs and their external data
 participate in the generation key; selection is pinned with the runtime.
+
+The supervised embedded worker uses protocol v4: provider calls carry the same
+task-neutral attachment envelope as HTTP, including per-item provenance in
+options. RPC sends borrowed segments without constructing a second media slab;
+the receiver acquires capacity for the complete logical message before transfer.
+Dense vectors and scores return bounded little-endian f32 payloads with row
+descriptors, not JSON arrays. A typed invocation rejects an absent numeric result
+rather than falling back to JSON under a numeric-only memory allowance. These
+contracts apply independently of model family and do not change public APIs.
 
 This is shared fused-batching infrastructure, not a claim that every artifact
 and provider now executes natively batched. GPU generation's shared graph,

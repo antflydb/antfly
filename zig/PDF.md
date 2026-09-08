@@ -4875,9 +4875,12 @@ It performs prefill once, submits only appended tokens, and retains immutable
 cross-attention state when cached branches return empty cross outputs. Both
 generic seq2seq and transcription use it when the selected artifact exposes
 the explicit ABI. Composite runtime selection considers an optional merged
-decoder and qualifies its loaded ABI before choosing it over the ordinary
-decoder. Component policy and generation fingerprints cover the considered
-graphs and external data; unsupported candidates preserve the ordinary route.
+decoder and qualifies its declared graph signature before backend construction,
+then verifies the loaded ABI. Backend-neutral generation fingerprints cover all
+considered graphs and external data, while executable backend policy covers only
+the selected encoder/decoder pair. Selection shares the runtime single-flight
+and generation cache; unqualified candidates incur no backend session or weight
+residency. Unsupported candidates preserve the ordinary route.
 Native generation / Florence caching are unchanged. This is not a new
 prefix-cache implementation.
 Cache output geometry and old/new cache overlap are admitted against host and
@@ -4892,8 +4895,9 @@ context-specific logits. This is a forward-count result, not a hardware speedup
 claim. Device-resident cache transport and device-side row gather/scatter remain
 unimplemented; the host KV path continues to account for old/new overlap.
 
-The follow-up scheduler now partitions tokenized rewrite windows by length
-class before padding and restores request order after execution. Capacity
+The follow-up scheduler now partitions the entire bounded tokenized rewrite queue
+by length class before padding, materializes at most eight rows at a time, and
+restores request order after execution. Capacity
 failures subdivide groups before forwarding instead of discarding all batching;
 physical subgroups have distinct execution identities. Imported seq2seq stages
 use named-input output projections, with explicit transformed time axes and
@@ -4904,6 +4908,37 @@ Extend length bucketing to other pipelines only with masking and output-position
 parity tests. Accelerator-backed parity, peak-memory and throughput measurements
 remain release requirements; hermetic batching tests do not establish a hardware
 speedup.
+
+### Worker transport and enforced preparation admission
+
+The supervised embedded worker preserves the same task-neutral provider contract
+as in-process execution. Protocol v4 forwards JSON plus borrowed encoded/raster
+attachments and item/source/page references. The RPC sender uses scatter/gather
+segments, retaining caller buffers for the invocation; the receiver reserves its
+bounded logical payload before accepting chunks. No base64 or sender-side media
+slab is introduced. This applies to readers, generators, embedders and any other
+executor using the attachment ABI, independently of deployment placement.
+
+Typed numeric provider responses preserve dense-vector/score kinds and row
+lengths using little-endian f32 payloads. The host owns decoded rows until response
+destruction. Invalid lengths, nonfinite values and missing typed results fail
+closed: a typed-memory plan cannot silently fall back to JSON parsing. Existing
+RPC cancellation, resource callbacks, response ownership and protocol-version
+handshakes remain authoritative.
+
+Prepared text uses an admission-backed allocator for every tokenizer allocation,
+including normalization, Unigram Viterbi scratch, retained IDs and realloc overlap.
+Capacity is acquired before backing allocation and released after free; allocator
+failures preserve the admission error and unwind all leases. Only actual retained
+token storage and bounded staging remain charged after preparation. Length-class
+queue indices/result descriptors have their own admitted allowance. A 16 KiB
+tokenizer-scratch regression rejects over-budget growth before the backing
+allocation; allocation-failure tests cover complete cleanup.
+
+For sixteen alternating short/long rewrites, the hermetic dispatcher regression
+now uses six physical forwards instead of twelve from adjacent eight-item sorting,
+while preserving original result order. This is a scheduling/forward-count win,
+not a measured accelerator throughput claim.
 
 ### Remaining resident-decoder execution contract
 

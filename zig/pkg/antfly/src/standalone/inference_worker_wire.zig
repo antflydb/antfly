@@ -16,7 +16,7 @@ const std = @import("std");
 const bridge = @import("inference_bridge.zig");
 const http = @import("../runtime_http_abi.zig");
 
-pub const version: u32 = 3;
+pub const version: u32 = 4;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
@@ -136,7 +136,98 @@ pub const Create = struct {
     }
 };
 
-pub const Provider = struct { operation: c_int, deadline_ns: ?u64 };
+pub const attachments = @import("httpx").attachment_envelope;
+pub const AttachmentRef = struct {
+    attachment_index: usize,
+    item_index: usize,
+    item_id: ?[]const u8,
+    source_fingerprint: ?[]const u8,
+    page_number: ?u32,
+};
+pub const Provider = struct {
+    operation: c_int,
+    deadline_ns: ?u64,
+    numeric: bool,
+    attachment_refs: []const AttachmentRef,
+};
+
+/// Only descriptors enter JSON; image/raster bytes remain borrowed segments.
+pub const ProviderInput = struct {
+    options: Provider,
+    body: attachments.EncodedSegments,
+
+    pub fn init(arena: std.mem.Allocator, context: *const bridge.ProviderInvokeContext) !ProviderInput {
+        if ((context.binary_payloads == null and context.binary_payloads_len != 0) or
+            (context.attachment_refs == null and context.attachment_refs_len != 0)) return error.InvalidInput;
+        const payloads = try arena.alloc(attachments.Attachment, context.binary_payloads_len);
+        for (payloads, 0..) |*payload, i| {
+            const source = context.binary_payloads.?[i];
+            payload.* = .{ .mime_type = source.content_type.slice(), .data = source.bytes.slice() };
+        }
+        const refs = try arena.alloc(AttachmentRef, context.attachment_refs_len);
+        for (refs, 0..) |*ref, i| {
+            const source = context.attachment_refs.?[i];
+            if (source.attachment_index >= payloads.len) return error.InvalidInput;
+            ref.* = .{ .attachment_index = source.attachment_index, .item_index = source.item_index, .item_id = source.item_id.slice(), .source_fingerprint = source.source_fingerprint.slice(), .page_number = if (source.has_page_number != 0) source.page_number else null };
+        }
+        if (try attachments.encodedSize(context.request_json.slice(), payloads) > @import("inference_worker_rpc.zig").max_body_bytes) return error.BodyTooLarge;
+        return .{
+            .options = .{ .operation = context.operation, .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null, .numeric = context.out_numeric_result != null, .attachment_refs = refs },
+            .body = try attachments.encodeSegmentsAlloc(arena, context.request_json.slice(), payloads),
+        };
+    }
+};
+
+pub const ProviderOutput = struct {
+    kind: @FieldType(bridge.NumericResult, "kind") = .absent,
+    row_lengths: []const usize = &.{},
+
+    pub fn encode(arena: std.mem.Allocator, result: bridge.NumericResult) !struct { options: ProviderOutput, body: []u8 } {
+        if (result.kind == .absent or (result.rows == null and result.len != 0)) return error.InvalidInferenceNumericResult;
+        const lengths = try arena.alloc(usize, result.len);
+        var bytes: usize = 0;
+        for (lengths, 0..) |*length, i| {
+            const row = result.rows.?[i];
+            if (row.values == null and row.len != 0) return error.InvalidInferenceNumericResult;
+            length.* = row.len;
+            bytes = std.math.add(usize, bytes, std.math.mul(usize, row.len, 4) catch return error.BodyTooLarge) catch return error.BodyTooLarge;
+        }
+        if (bytes > @import("inference_worker_rpc.zig").max_body_bytes) return error.BodyTooLarge;
+        const body = try arena.alloc(u8, bytes);
+        var offset: usize = 0;
+        for (lengths, 0..) |length, i| for (0..length) |j| {
+            const value = result.rows.?[i].values.?[j];
+            if (!std.math.isFinite(value)) return error.InvalidInferenceNumericResult;
+            std.mem.writeInt(u32, body[offset..][0..4], @bitCast(value), .little);
+            offset += 4;
+        };
+        return .{ .options = .{ .kind = result.kind, .row_lengths = lengths }, .body = body };
+    }
+
+    pub fn decode(self: ProviderOutput, alloc: std.mem.Allocator, body: []const u8) ![][]f32 {
+        if (self.kind == .absent) return error.InvalidInferenceNumericResult;
+        var bytes: usize = 0;
+        for (self.row_lengths) |length| bytes = std.math.add(usize, bytes, std.math.mul(usize, length, 4) catch return error.InvalidInferenceNumericResult) catch return error.InvalidInferenceNumericResult;
+        if (bytes != body.len) return error.InvalidInferenceNumericResult;
+        const rows = try alloc.alloc([]f32, self.row_lengths.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |row| alloc.free(row);
+            alloc.free(rows);
+        }
+        var offset: usize = 0;
+        for (rows, self.row_lengths) |*row, length| {
+            row.* = try alloc.alloc(f32, length);
+            initialized += 1;
+            for (row.*) |*value| {
+                value.* = @bitCast(std.mem.readInt(u32, body[offset..][0..4], .little));
+                if (!std.math.isFinite(value.*)) return error.InvalidInferenceNumericResult;
+                offset += 4;
+            }
+        }
+        return rows;
+    }
+};
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Http = struct {
     route: []const u8,
@@ -153,4 +244,85 @@ pub const Observation = struct { key: usize, previous: u64, next: u64 };
 
 test "inference worker logical body limit matches the public HTTP contract" {
     try std.testing.expectEqual(@import("../api/public_limits.zig").max_request_body_bytes, @import("inference_worker_rpc.zig").max_body_bytes);
+}
+
+test "inference worker provider attachments preserve bytes and per-item provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var response_handle: ?*anyopaque = null;
+    var response: bridge.String = undefined;
+    var numeric: bridge.NumericResult = .{};
+    const payloads = [_]bridge.ProviderBinaryPayload{
+        .{ .bytes = .init("\x00\xff\x80\x01"), .content_type = .init("application/x-antfly-raster") },
+        .{ .bytes = .init("\x89PNG\x00"), .content_type = .init("image/png") },
+    };
+    const refs = [_]bridge.ProviderAttachmentRef{
+        .{ .attachment_index = 1, .item_index = 0, .item_id = .init("a:3"), .source_fingerprint = .init("a"), .page_number = 3, .has_page_number = 1 },
+        .{ .attachment_index = 0, .item_index = 1, .item_id = .init("b:9"), .source_fingerprint = .init("b"), .page_number = 9, .has_page_number = 1 },
+    };
+    var context = bridge.ProviderInvokeContext{
+        .abi_version = bridge.abi_version,
+        .handle = &numeric,
+        .operation = @intFromEnum(bridge.ProviderOperation.embed_dense_rasters),
+        .request_json = .init("{\"image_count\":2}"),
+        .deadline_ns = 42,
+        .has_deadline = 1,
+        .out_response_handle = &response_handle,
+        .out_response_json = &response,
+        .out_numeric_result = &numeric,
+        .binary_payloads = &payloads,
+        .binary_payloads_len = payloads.len,
+        .attachment_refs = &refs,
+        .attachment_refs_len = refs.len,
+    };
+    const input = try ProviderInput.init(alloc, &context);
+    const options = try std.json.Stringify.valueAlloc(alloc, input.options, .{});
+    const decoded = try std.json.parseFromSliceLeaky(Provider, alloc, options, .{});
+    try std.testing.expectEqual(@as(?u64, 42), decoded.deadline_ns);
+    try std.testing.expect(decoded.numeric);
+    try std.testing.expectEqual(@as(usize, 1), decoded.attachment_refs[0].attachment_index);
+    try std.testing.expectEqualStrings("b", decoded.attachment_refs[1].source_fingerprint.?);
+    try std.testing.expectEqual(@as(?u32, 9), decoded.attachment_refs[1].page_number);
+    const slab = try std.mem.concat(alloc, u8, input.body.segments);
+    var media = try attachments.parseAlloc(alloc, slab, .{});
+    defer media.deinit();
+    try std.testing.expectEqualStrings(context.request_json.slice(), media.metadata);
+    for (payloads, media.attachments) |payload, attachment| {
+        try std.testing.expectEqualStrings(payload.bytes.slice(), attachment.data);
+        try std.testing.expectEqualStrings(payload.content_type.slice(), attachment.mime_type);
+    }
+    // The sender owns descriptors only; media segments point at caller bytes.
+    try std.testing.expectEqual(payloads[0].bytes.ptr, input.body.segments[3].ptr);
+    context.binary_payloads = null;
+    try std.testing.expectError(error.InvalidInput, ProviderInput.init(alloc, &context));
+    context.binary_payloads = &payloads;
+    context.binary_payloads_len = 1;
+    try std.testing.expectError(error.InvalidInput, ProviderInput.init(alloc, &context));
+}
+
+fn checkNumericRoundTrip(alloc: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const rows = [_]bridge.NumericRow{ .{ .values = &.{ 1, -2.5 }, .len = 2 }, .{ .values = &.{3}, .len = 1 } };
+    for ([_]@FieldType(bridge.NumericResult, "kind"){ .dense_vectors, .scores }) |kind| {
+        const frame = try ProviderOutput.encode(arena.allocator(), .{ .kind = kind, .rows = &rows, .len = rows.len });
+        const json = try std.json.Stringify.valueAlloc(arena.allocator(), frame.options, .{});
+        const options = try std.json.parseFromSliceLeaky(ProviderOutput, arena.allocator(), json, .{});
+        const decoded = try options.decode(alloc, frame.body);
+        defer {
+            for (decoded) |row| alloc.free(row);
+            alloc.free(decoded);
+        }
+        try std.testing.expectEqual(kind, options.kind);
+        try std.testing.expectEqualSlices(f32, &.{ 1, -2.5 }, decoded[0]);
+        try std.testing.expectEqualSlices(f32, &.{3}, decoded[1]);
+        try std.testing.expectError(error.InvalidInferenceNumericResult, options.decode(std.testing.allocator, frame.body[0 .. frame.body.len - 1]));
+        std.mem.writeInt(u32, frame.body[0..4], @bitCast(std.math.nan(f32)), .little);
+        try std.testing.expectError(error.InvalidInferenceNumericResult, options.decode(std.testing.allocator, frame.body));
+    }
+}
+
+test "inference worker typed numeric responses preserve ownership under allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNumericRoundTrip, .{});
 }
