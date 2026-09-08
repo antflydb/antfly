@@ -3576,6 +3576,38 @@ All report zero skips, failures, and leaks. The production build,
 reported no failures but still had pending jobs; these are local results,
 not certification of the new commit by remote CI.
 
+### Terminal Merge Retries After Split-Start (2026-09-07)
+
+The terminal-control fold still compared the live receiver range with the
+historical merge range before recognizing an exact terminal receipt. A later
+split-start legitimately narrows that range while retaining the receipt, so
+an already-in-flight merge checkpoint could fail committed apply with
+`MergeRangeStateMismatch`. The send-side obsolete-accept guard cannot recall
+such requests.
+
+Matching terminal controls now preserve the live range before active-transition
+range validation. Checkpoint syntax and the durable participant, original
+range, and namespace contracts are still validated; nonterminal range
+mismatches remain errors. Terminal phase, bootstrap evidence, and copy-attempt
+ownership are unchanged while the enclosing Raft applied index advances.
+
+Regressions compose both merge terminal outcomes with production split-start
+mutations and all five delayed receiver control kinds. DB coverage includes
+reopen before replay and after a subsequent ordinary write; apply-store
+coverage restores the split-start snapshot before replay. Both check the
+narrowed range, preserved terminal evidence, continued write/apply progress,
+and rejection of a conflicting historical contract. This is scoped coverage
+of delayed merge controls after split-start, not every overlapping topology
+history.
+
+Validation: the new DB regression first reproduced `MergeRangeStateMismatch`
+at the delayed accept before the fix. With the fix, all five focused DB merge
+regressions pass in Debug and ReleaseSafe, and the default data-storage gate
+passes 69/69, all with zero skips, failures, and leaks. `make fmt-check`,
+`zig fmt --check` on the changed Zig files, and `git diff --check` pass. The
+pre-push checks on the previous head had no failures but still had pending
+jobs; these results do not certify remote CI for this checkpoint.
+
 ### Current Answer: Coverage, Parity, and Completeness
 
 The short answer is **yes, there are still valuable VOPR tests and

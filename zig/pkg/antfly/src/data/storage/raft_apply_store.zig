@@ -3965,6 +3965,63 @@ test "data raft merge receiver checkpoint expands monotonically and snapshots" {
     try std.testing.expectEqual(@as(usize, 3), entries.len);
     try std.testing.expectEqualStrings("doc:b", entries[1].key);
     try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", entries[2].value);
+
+    // Terminal receipts outlive later topology changes. A delayed merge
+    // control must preserve a subsequent split's range, including on a
+    // replacement replica restored from the split-start snapshot.
+    for ([_]db_types.MergeReplicationCheckpoint.Kind{ .finalize, .rollback }, 0..) |terminal, ordinal| {
+        const receiver_group: u64 = 702 + @as(u64, @intCast(ordinal)) * 10;
+        var delayed = checkpoint;
+        delayed.transition_id = receiver_group - 2;
+        delayed.donor_group_id = receiver_group - 1;
+        delayed.receiver_group_id = receiver_group;
+        try Apply.barrier(alloc, &source, receiver_group, 1);
+        try Apply.command(alloc, &source, receiver_group, 2, .{ .merge_checkpoint = delayed });
+        delayed.kind = .bootstrap_complete;
+        delayed.bootstrap_applied_index = 2;
+        try Apply.command(alloc, &source, receiver_group, 3, .{ .merge_checkpoint = delayed });
+        delayed.kind = terminal;
+        delayed.bootstrap_applied_index = if (terminal == .finalize) 2 else 0;
+        try Apply.command(alloc, &source, receiver_group, 4, .{ .merge_checkpoint = delayed });
+        for ([_]db_types.SplitTransitionMutation.Kind{ .prepare, .start }, 5..) |kind, index| {
+            try Apply.command(alloc, &source, receiver_group, index, .{ .split_transition = .{
+                .kind = kind,
+                .transition_id = receiver_group + 1,
+                .attempt_epoch = 1,
+                .destination_group_id = receiver_group + 2,
+                .split_key = "doc:t",
+            } });
+        }
+        const split_snapshot = try source.snapshotBuilder().buildSnapshot(alloc, receiver_group);
+        defer alloc.free(split_snapshot);
+        try target.installSnapshot(alloc, receiver_group, 6, split_snapshot);
+        for ([_]db_types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 7..) |kind, index| {
+            delayed.kind = kind;
+            delayed.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+            delayed.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+            try Apply.command(alloc, &target, receiver_group, index, .{ .merge_checkpoint = delayed });
+            const split_range = try target.currentRange(alloc, receiver_group);
+            defer range_state.freeRange(alloc, split_range);
+            try std.testing.expectEqualStrings(if (terminal == .finalize) "doc:a" else "doc:m", split_range.start);
+            try std.testing.expectEqualStrings("doc:t", split_range.end);
+        }
+        var conflicting = delayed;
+        conflicting.merged_start = "doc:b";
+        try std.testing.expectError(error.ConflictingMergeTransition, Apply.command(alloc, &target, receiver_group, 12, .{ .merge_checkpoint = conflicting }));
+        try Apply.command(alloc, &target, receiver_group, 12, .{ .writes = &.{.{ .key = "doc:n", .value = "{\"live\":true}" }} });
+        var receipt = (try target.currentMergeReceiverState(alloc, receiver_group)).?;
+        defer receipt.deinit(alloc);
+        try std.testing.expectEqual(if (terminal == .finalize) merge_state.Phase.finalized else .rolled_back, receipt.phase);
+        try std.testing.expectEqual(terminal == .finalize, receipt.bootstrap_complete);
+        try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 2 else 0), receipt.bootstrap_applied_index);
+        try std.testing.expectEqualStrings("", receipt.merged_range.?.end);
+        try std.testing.expectEqual(@as(u64, 12), (try target.latestBatchForTransition(receiver_group)).?.last_entry_index);
+        const live_entries = try target.groupState(alloc, receiver_group);
+        defer shard_state_store.freeGroupStateEntries(alloc, live_entries);
+        try std.testing.expectEqual(@as(usize, 1), live_entries.len);
+        try std.testing.expectEqualStrings("doc:n", live_entries[0].key);
+        try std.testing.expectEqualStrings("{\"live\":true}", live_entries[0].value);
+    }
 }
 
 test "data raft merge accept initializes a pristine replica projection" {

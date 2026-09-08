@@ -325,19 +325,20 @@ pub fn planCheckpointApply(
         ))
         return error.ConflictingMergeTransition;
 
+    // An exact terminal identity is a durable no-op for delayed controls, not
+    // a command error that can wedge replay at an already committed index.
+    // A subsequent split may have changed the live range; only the historical
+    // identity/range/namespace contract above must still match the receipt.
+    if (prior.phase == .finalized or prior.phase == .rolled_back)
+        return preserveAdvanced(prior, checkpoint, current_range);
+
     const expected_current = switch (prior.phase) {
         .accepting => merged,
-        .finalized => merged,
-        .rolling_back, .rolled_back => base,
+        .rolling_back => base,
+        .finalized, .rolled_back => unreachable,
         .none => return error.InvalidMergeState,
     };
     if (!rangesEqual(current_range, expected_current)) return error.MergeRangeStateMismatch;
-
-    // An exact terminal identity is a durable no-op for delayed controls, not
-    // a command error that can wedge replay at an already committed index.
-    // Identity/range/namespace mismatches above remain fail closed.
-    if (prior.phase == .finalized or prior.phase == .rolled_back)
-        return preserveAdvanced(prior, checkpoint, current_range);
 
     // Attempts are ordered first by the donor's elected term, then by its
     // node-local sequence. Delayed begins cannot reclaim a newer attempt;

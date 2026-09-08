@@ -105130,6 +105130,91 @@ test "db replicated merge checkpoints keep rolled back receivers live across del
     try std.testing.expectEqualStrings("{\"live\":true}", value);
 }
 
+test "db terminal merge controls preserve a subsequent split across reopen" {
+    const alloc = std.testing.allocator;
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .finalize, .rollback }) |terminal| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+        var checkpoint: types.MergeReplicationCheckpoint = .{
+            .kind = .accept,
+            .transition_id = 60,
+            .donor_group_id = 61,
+            .receiver_group_id = 62,
+            .receiver_base_start = "m",
+            .receiver_base_end = "z",
+            .merged_start = "a",
+            .merged_end = "z",
+        };
+        const expected_start = if (terminal == .finalize) "a" else "m";
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+            defer db.close();
+            try db.updateRange(.{ .start = "m", .end = "z" });
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+            checkpoint.kind = .bootstrap_complete;
+            checkpoint.bootstrap_applied_index = 1;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+            checkpoint.kind = terminal;
+            checkpoint.bootstrap_applied_index = if (terminal == .finalize) 1 else 0;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+            // Exercise the production split-start mutation, including its
+            // persisted range, without replacing the terminal merge receipt.
+            try db.core.prepareSplit("t");
+            try db.core.completeSplitTransition(63, "t");
+            checkpoint.kind = .accept;
+            checkpoint.bootstrap_applied_index = 0;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = 4 });
+            try std.testing.expectEqualStrings(expected_start, db.getRange().start);
+            try std.testing.expectEqualStrings("t", db.getRange().end);
+        }
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+            defer db.close();
+            for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 5..) |kind, index| {
+                checkpoint.kind = kind;
+                checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+                checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+                try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+                try std.testing.expectEqualStrings(expected_start, db.getRange().start);
+                try std.testing.expectEqualStrings("t", db.getRange().end);
+            }
+            var conflicting = checkpoint;
+            conflicting.donor_group_id = 99;
+            try std.testing.expectError(error.ConflictingMergeTransition, db.batchRaftReplicatedApply(
+                .{ .merge_checkpoint = conflicting },
+                .{ .term = 2, .index = 10 },
+            ));
+            conflicting = checkpoint;
+            conflicting.merged_end = "zz";
+            try std.testing.expectError(error.ConflictingMergeTransition, db.batchRaftReplicatedApply(
+                .{ .merge_checkpoint = conflicting },
+                .{ .term = 2, .index = 10 },
+            ));
+            try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 10 });
+            const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+            defer alloc.free(raw);
+            var state = try merge_state_mod.decodeAlloc(alloc, raw);
+            defer state.deinit(alloc);
+            try std.testing.expectEqual(if (terminal == .finalize) merge_state_mod.Phase.finalized else .rolled_back, state.phase);
+            try std.testing.expectEqual(terminal == .finalize, state.bootstrap_complete);
+            try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 1 else 0), state.bootstrap_applied_index);
+            try std.testing.expectEqualStrings("z", state.receiver_base_range.end);
+            try std.testing.expectEqualStrings("z", state.merged_range.?.end);
+            try std.testing.expectEqual(@as(u64, 10), (try db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(shard_mod.SplitPhase.splitting, db.core.splitState().?.phase);
+        }
+        var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer reopened.close();
+        try std.testing.expectEqualStrings(expected_start, reopened.getRange().start);
+        try std.testing.expectEqualStrings("t", reopened.getRange().end);
+        const value = (try reopened.get(alloc, "n")).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"live\":true}", value);
+        try std.testing.expectEqual(@as(u64, 10), (try reopened.raftAppliedEntry()).?.index);
+    }
+}
+
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
