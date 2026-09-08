@@ -30519,7 +30519,13 @@ test "api http server query builder maps doc identity mismatch to unavailable" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
-    try std.testing.expectEqualStrings("{\"error\":\"doc identity unavailable\"}", resp.body);
+    const failure = try std.json.parseFromSlice(metadata_openapi.QueryTemporarilyUnavailableError, alloc, resp.body, .{});
+    defer failure.deinit();
+    try std.testing.expectEqualStrings("doc_identity_unavailable", failure.value.code);
+    try std.testing.expectEqualStrings("doc identity unavailable", failure.value.message);
+    try std.testing.expect(failure.value.retryable);
+    const retry_after = resp.header("Retry-After") orelse return error.MissingRetryAfterHeader;
+    try std.testing.expect((try std.fmt.parseInt(u32, retry_after, 10)) > 0);
 }
 
 test "api http server query builder loads structured table index metadata" {
