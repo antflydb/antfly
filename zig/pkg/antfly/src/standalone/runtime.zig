@@ -1170,7 +1170,11 @@ const LocalStandaloneMetadata = struct {
         try context.ensureActive();
         switch (call) {
             .snapshot => return std.json.Stringify.valueAlloc(alloc, self.nativeState(), .{}),
-            .resolve => |target| return std.json.Stringify.valueAlloc(alloc, try self.resolveNativeLocked(target), .{}),
+            .resolve => |target| {
+                const table = try self.resolveNativeLocked(target);
+                const identity: ?native_catalog.ResolvedTable = if (table) |value| native_catalog.ResolvedTable.fromTable(value) else null;
+                return std.json.Stringify.valueAlloc(alloc, identity, .{});
+            },
             .mutate => |request| {
                 if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
                 var arena = std.heap.ArenaAllocator.init(alloc);

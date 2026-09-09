@@ -1530,7 +1530,7 @@ pub const StatusSource = struct {
     }
 
     pub fn dropTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
-        try tables_api.validateTableMutationName(table_name);
+        try tables_api.validateInternalTableMutationName(table_name);
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
@@ -1541,7 +1541,7 @@ pub const StatusSource = struct {
     /// snapshot after this point. A failing legacy callback has no admission
     /// receipt, so authority errors are conservatively reported as ambiguous.
     pub fn dropTableExact(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !metadata_table_topology_mutations.DropResult {
-        try tables_api.validateTableMutationName(table_name);
+        try tables_api.validateInternalTableMutationName(table_name);
         if (self.vtable.drop_table_exact) |fn_ptr|
             return try BoundaryAbi.call("drop_table_exact", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
         self.dropTable(alloc, table_name) catch |err|
@@ -14768,7 +14768,7 @@ pub const ApiHttpServer = struct {
         if (identity.*) |value| if (!permissionsAllow(value.permissions, .table, logical, .admin)) return error.Forbidden;
         const bytes = try self.source.nativeCatalog(alloc, context, .{ .resolve = target });
         defer alloc.free(bytes);
-        const parsed = try std.json.parseFromSlice(?metadata_table_manager.TableRecord, alloc, bytes, .{ .allocate = .alloc_always });
+        const parsed = try std.json.parseFromSlice(?native_catalog.ResolvedTable, alloc, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const physical = if (parsed.value) |table| try alloc.dupe(u8, table.name) else blk: {
             const state_bytes = try self.source.nativeCatalog(alloc, context, .snapshot);
@@ -14800,7 +14800,7 @@ pub const ApiHttpServer = struct {
         if (identity.*) |value| if (!permissionsAllow(value.permissions, .table, logical, .read) and !permissionsAllow(value.permissions, .table, logical, .write)) return error.Forbidden;
         const bytes = try self.source.nativeCatalog(alloc, context, .{ .resolve = target });
         defer alloc.free(bytes);
-        const parsed = try std.json.parseFromSlice(?metadata_table_manager.TableRecord, alloc, bytes, .{ .allocate = .alloc_always });
+        const parsed = try std.json.parseFromSlice(?native_catalog.ResolvedTable, alloc, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const table = parsed.value orelse return error.TableNotFound;
         if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, logical, table.name);

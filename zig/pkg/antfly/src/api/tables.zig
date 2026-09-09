@@ -70,6 +70,23 @@ pub fn validateTableMutationName(table_name: []const u8) !void {
     }
 }
 
+/// Internal restore identities also carry a bounded qualified target until
+/// publication. Public names keep their existing 255-byte validation contract.
+pub fn validateInternalTableMutationName(table_name: []const u8) !void {
+    if (table_name.len <= max_table_name_bytes) return validateTableMutationName(table_name);
+    const catalog = @import("../catalog/domain.zig");
+    try catalog.validateStorageName(table_name);
+}
+
+test "native catalog maximum restore identity can be dropped internally" {
+    const catalog = @import("../catalog/domain.zig");
+    const component: [catalog.max_name_bytes]u8 = @splat('a');
+    const name = try std.fmt.allocPrint(std.testing.allocator, "table:00000000000000000000000000000000:{s}.{s}.{s}", .{ component, component, component });
+    defer std.testing.allocator.free(name);
+    try validateInternalTableMutationName(name);
+    try std.testing.expectError(error.InvalidTableName, validateTableMutationName(name));
+}
+
 test "table mutation names preserve the public contract" {
     try validateTableMutationName("vmp_media_item_embedding-v0.2~candidate");
     try validateTableMutationName("sales/archive");

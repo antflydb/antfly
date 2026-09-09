@@ -540,5 +540,6 @@ export type DatabaseCatalogRecord = components["schemas"]["DatabaseCatalogRecord
 export type NamespaceCatalogRecord = components["schemas"]["NamespaceCatalogRecord"];
 export type TablespaceCatalogRecord = components["schemas"]["TablespaceCatalogRecord"];
 export type CreateTablespaceRequest = components["schemas"]["CreateTablespaceRequest"];
-export type CatalogTablespaceBindingRequest = components["schemas"]["CatalogTablespaceBindingRequest"];
+export type CatalogTablespaceBindingRequest =
+  components["schemas"]["CatalogTablespaceBindingRequest"];
 export type RenameCatalogResourceRequest = components["schemas"]["RenameCatalogResourceRequest"];

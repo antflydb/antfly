@@ -871,7 +871,7 @@ pub const MetadataHttpClient = struct {
         definition_json: ?[]const u8,
         forwarding: raft_mutation_forwarding.Context,
     ) !?topology_protocol.DropResult {
-        try tables_api.validateTableMutationName(table_name);
+        if (kind == .drop_table) try tables_api.validateInternalTableMutationName(table_name) else try tables_api.validateTableMutationName(table_name);
         const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedTableMutation{
             .kind = kind,
             .table_name = table_name,

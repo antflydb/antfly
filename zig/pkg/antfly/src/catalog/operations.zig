@@ -110,8 +110,10 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
     return switch (input) {
         .snapshot => snapshotJson(svc, alloc, context),
         .resolve => |target| blk: {
-            const table = try resolve(svc, alloc, context, target);
-            defer if (table) |value| table_manager.freeTable(alloc, value);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const table = try store.resolveNativeCatalogIdentity(alloc, svc.metadata_group_id, target);
+            defer if (table) |value| value.deinit(alloc);
             break :blk std.json.Stringify.valueAlloc(alloc, table, .{});
         },
         .mutate => |request| blk: {

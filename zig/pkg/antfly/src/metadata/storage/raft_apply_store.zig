@@ -2594,6 +2594,14 @@ pub const RaftApplyStore = struct {
     /// Qualified point lookup shares one read transaction across name indexes
     /// and the physical table record. Caller owns the returned table record.
     pub fn resolveNativeCatalogTable(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, target: native_catalog.Target) !?metadata.TableRecord {
+        return self.resolveNativeCatalogResult(metadata.TableRecord, alloc, group_id, target);
+    }
+
+    pub fn resolveNativeCatalogIdentity(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, target: native_catalog.Target) !?native_catalog.ResolvedTable {
+        return self.resolveNativeCatalogResult(native_catalog.ResolvedTable, alloc, group_id, target);
+    }
+
+    fn resolveNativeCatalogResult(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, group_id: u64, target: native_catalog.Target) !?Result {
         try target.validate();
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -2608,12 +2616,12 @@ pub const RaftApplyStore = struct {
             defer binding.deinit();
             var key_buf: [160]u8 = undefined;
             const bytes = txn.get(try tableKeyForGroup(&key_buf, group_id, binding.value.id)) catch |err| switch (err) {
-                error.NotFound => return null,
+                error.NotFound => return error.InvalidCatalogRecord,
                 else => return err,
             };
-            const table = try decodeTableRecord(alloc, bytes);
-            if (!std.mem.eql(u8, table.name, binding.value.storage_name)) {
-                metadata_table_manager.freeTable(alloc, table);
+            const table: Result = if (Result == metadata.TableRecord) try decodeTableRecord(alloc, bytes) else try decodeTableIdentity(alloc, bytes);
+            if (table.table_id != binding.value.id or !std.mem.eql(u8, table.name, binding.value.storage_name)) {
+                if (Result == metadata.TableRecord) metadata_table_manager.freeTable(alloc, table) else table.deinit(alloc);
                 return error.InvalidCatalogRecord;
             }
             return table;
@@ -2627,7 +2635,9 @@ pub const RaftApplyStore = struct {
             metadata_table_manager.freeTable(alloc, table);
             return null;
         }
-        return table;
+        if (Result == metadata.TableRecord) return table;
+        defer metadata_table_manager.freeTable(alloc, table);
+        return try native_catalog.ResolvedTable.fromTable(table).clone(alloc);
     }
 
     fn applyNativeCatalogTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
@@ -7839,6 +7849,26 @@ fn decodeSplitTransitionRecord(alloc: std.mem.Allocator, encoded: []const u8) !m
 fn decodeMergeTransitionRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.MergeTransitionRecord {
     var pos: usize = 0;
     return try readMergeTransitionRecord(alloc, encoded, &pos);
+}
+
+/// Every released table-record encoding shares the identity prefix. Validate
+/// the length-framed tail without allocating or interpreting its definition.
+fn decodeTableIdentity(alloc: std.mem.Allocator, encoded: []const u8) !native_catalog.ResolvedTable {
+    var pos: usize = 0;
+    const table_id = try readInt(encoded, &pos, u64);
+    _ = try readInt(encoded, &pos, u16); // replicas
+    _ = try readInt(encoded, &pos, u32); // minimum ranges
+    const name = try readRequiredString(alloc, encoded, &pos);
+    errdefer alloc.free(name);
+    var fields: usize = 0;
+    while (pos < encoded.len) : (fields += 1) {
+        const length = try readInt(encoded, &pos, u32);
+        if (length > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
+        pos += length;
+    }
+    // Legacy, read-schema, and restore-intent records respectively.
+    if (fields != 5 and fields != 6 and fields != 8) return error.InvalidMetadataTransitionEncoding;
+    return .{ .table_id = table_id, .name = name };
 }
 
 fn decodeTableRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.TableRecord {
@@ -15731,7 +15761,8 @@ test "native catalog publishes names and table topology atomically and fences st
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     defer store.deinit();
     try applyNativeCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .database, .name = "analytics" } });
-    const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .min_ranges = 1 };
+    const large_description = [_]u8{'x'} ** (256 * 1024);
+    const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .description = &large_description, .min_ranges = 1 };
     const ranges = [_]metadata.RangeRecord{.{ .table_id = 42, .group_id = 301, .range_id = 301, .start_key = "" }};
     try applyNativeCatalogTestCommand(&store, 2, .{ .expected_revision = 1, .mutation = .{ .action = .create, .kind = .table, .name = "events", .database = "analytics", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } });
     {
@@ -15739,6 +15770,16 @@ test "native catalog publishes names and table topology atomically and fences st
         defer metadata_table_manager.freeTable(alloc, resolved);
         try std.testing.expectEqual(@as(u64, 42), resolved.table_id);
         try std.testing.expectEqualStrings("table:42", resolved.name);
+    }
+    // The hot-path response must neither serialize nor allocate the table's
+    // potentially large definition. Its allocator budget is independent of it.
+    {
+        var buffer: [16 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const identity = (try store.resolveNativeCatalogIdentity(bounded.allocator(), 21, .{ .database = "analytics", .table = "events" })).?;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        try std.testing.expectEqualStrings("{\"table_id\":42,\"name\":\"table:42\"}", encoded);
     }
     try applyNativeCatalogTestCommand(&store, 3, .{ .expected_revision = 2, .mutation = .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "reports" } });
     try std.testing.expectEqual(@as(?metadata.TableRecord, null), try store.resolveNativeCatalogTable(alloc, 21, .{ .database = "analytics", .table = "events" }));
@@ -15770,7 +15811,7 @@ test "native catalog publishes names and table topology atomically and fences st
     // A damaged derived name row cannot masquerade as an absent database.
     {
         var txn = try restored.store.beginWriteTxn();
-        defer txn.abort();
+        errdefer txn.abort();
         const key = try native_catalog_storage.nameKeyAlloc(alloc, 21, .database, 0, "reports");
         defer alloc.free(key);
         try txn.delete(key);

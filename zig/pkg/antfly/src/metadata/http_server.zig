@@ -500,7 +500,7 @@ pub const AdminSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
-                .native_catalog = nativeCatalogServiceCall(service.MetadataService),
+                .native_catalog = comptime nativeCatalogServiceCall(service.MetadataService),
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
@@ -561,7 +561,7 @@ pub const AdminSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
-                .native_catalog = nativeCatalogServiceCall(service.MetadataHttpService),
+                .native_catalog = comptime nativeCatalogServiceCall(service.MetadataHttpService),
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
@@ -2863,8 +2863,13 @@ pub const MetadataHttpServer = struct {
         defer forwarded.deinit();
         if (forwarded.value.protocol_version != routes.Routes.table_mutation_protocol_version)
             return ctx.status(426).text("unsupported table mutation protocol");
-        tables_api.validateTableMutationName(forwarded.value.table_name) catch
-            return ctx.status(400).text("invalid table name");
+        if (forwarded.value.kind == .drop_table) {
+            tables_api.validateInternalTableMutationName(forwarded.value.table_name) catch
+                return ctx.status(400).text("invalid table name");
+        } else {
+            tables_api.validateTableMutationName(forwarded.value.table_name) catch
+                return ctx.status(400).text("invalid table name");
+        }
         var create_request: ?tables_api.CreateTableRequest = null;
         defer if (create_request) |*request| request.deinit(ctx.allocator);
         switch (forwarded.value.kind) {

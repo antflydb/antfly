@@ -2252,7 +2252,7 @@ pub fn build(b: *std.Build) void {
     });
     const native_catalog_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "native catalog" },
+        .filters = &.{"native catalog"},
     });
     const native_catalog_api_step = b.step("native-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     native_catalog_api_step.dependOn(&b.addRunArtifact(native_catalog_api_tests).step);
@@ -4288,6 +4288,7 @@ pub fn build(b: *std.Build) void {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "native catalog",
         "model-directed",
         "tool query builder",
         "agent conversation",
@@ -9341,7 +9342,7 @@ pub fn build(b: *std.Build) void {
     standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
     const native_catalog_standalone_tests = b.addTest(.{
         .root_module = standalone_runtime_test_mod,
-        .filters = &.{ "native catalog" },
+        .filters = &.{"native catalog"},
     });
     const native_catalog_standalone_step = b.step("native-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     native_catalog_standalone_step.dependOn(&b.addRunArtifact(native_catalog_standalone_tests).step);
@@ -9349,6 +9350,8 @@ pub fn build(b: *std.Build) void {
         .root_module = standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
+            "standalone.runtime.test.native catalog",
+            "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",
             "local generate message conversion preserves tool history and admission",
             "inference worker",

@@ -19,6 +19,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
+import pytest
+
 from helpers import wait_until
 
 
@@ -91,9 +93,13 @@ def test_catalog_rename_restart_and_placement(stateful_api):
     api.delete(f"/tablespaces/{tablespace}")
 
 
-def test_catalog_restore_to_qualified_destination(backup_api):
+@pytest.mark.parametrize("long_names", [False, True])
+def test_catalog_restore_to_qualified_destination(backup_api, long_names):
     api = backup_api
     database = "restore_" + uuid.uuid4().hex[:12]
+    if long_names:
+        database = database.ljust(128, "a")
+    destination = "destination".ljust(128, "a") if long_names else "destination"
     api.post(f"/databases/{database}", {})
     path = f"/databases/{database}/namespaces/public/tables"
     api.post(path + "/source", {"num_shards": 1})
@@ -109,14 +115,14 @@ def test_catalog_restore_to_qualified_destination(backup_api):
         }
         api.post(path + "/source/backup", body)
         response = api.s.post(
-            api.url + path + "/destination/restore",
+            api.url + path + f"/{destination}/restore",
             json=body,
             headers={"Idempotency-Key": "catalog-restore"},
             timeout=30,
         )
         assert response.status_code == 202, response.text
         accepted = response.json()
-        assert accepted["table_name"] == f"{database}.public.destination"
+        assert accepted["table_name"] == f"{database}.public.{destination}"
 
         def terminal():
             job = api.get("/restore/jobs/" + accepted["job_id"])
@@ -126,14 +132,14 @@ def test_catalog_restore_to_qualified_destination(backup_api):
         assert completed["phase"] == "succeeded", (
             json.dumps(completed) + api.debug_logs()
         )
-        assert api.get(path + "/destination/documents/doc1") == {"title": "restored"}
+        assert api.get(path + f"/{destination}/documents/doc1") == {"title": "restored"}
         assert api.get(path + "/source/documents/doc1") == {"title": "restored"}
         assert (
             api.get(path + "/source")["table_id"]
-            != api.get(path + "/destination")["table_id"]
+            != api.get(path + f"/{destination}")["table_id"]
         )
         replay = api.s.post(
-            api.url + path + "/destination/restore",
+            api.url + path + f"/{destination}/restore",
             json=body,
             headers={"Idempotency-Key": "catalog-restore"},
             timeout=30,
@@ -141,14 +147,103 @@ def test_catalog_restore_to_qualified_destination(backup_api):
         assert replay.status_code == 202, replay.text
         assert replay.json()["job_id"] == accepted["job_id"]
         api.post(
-            path + "/destination/batch",
+            path + f"/{destination}/batch",
             {"inserts": {"doc2": {"title": "new"}}, "sync_level": "full_index"},
         )
         result = api.post(
-            path + "/destination/query",
+            path + f"/{destination}/query",
             {"full_text_search": {"match_all": {}}, "limit": 10},
         )
         assert result["responses"][0]["hits"]["total"]["value"] == 2
     api.delete(path + "/source")
-    api.delete(path + "/destination")
+    api.delete(path + f"/{destination}")
     api.delete(f"/databases/{database}")
+
+
+def test_catalog_scope_indexes_and_placement_overrides(stateful_api):
+    api = stateful_api
+    database = "scopes_" + uuid.uuid4().hex[:12]
+    root = f"/databases/{database}"
+    assert (
+        api._request(
+            "GET", "/tables/table:00000000000000000000000000000000"
+        ).status_code
+        == 404
+    )
+    api.post(root, {})
+    for namespace in ("left", "right"):
+        api.post(root + f"/namespaces/{namespace}", {})
+    policies = {database + "_db": 2, database + "_ns": 3, database + "_table": 1}
+    for name, ranges in policies.items():
+        api.post(
+            f"/tablespaces/{name}",
+            {
+                "placement_policy_json": json.dumps(
+                    {"min_ranges": ranges, "desired_replica_count": 1}
+                )
+            },
+        )
+    api.put(root + "/tablespace", {"tablespace_name": database + "_db"})
+    left = root + "/namespaces/left"
+    right = root + "/namespaces/right"
+    api.put(left + "/tablespace", {"tablespace_name": database + "_ns"})
+    left_table = left + "/tables/events"
+    right_table = right + "/tables/events"
+    left_created = api.post(left_table, {})
+    right_created = api.post(right_table, {})
+    assert len(left_created["shards"]) == 3
+    assert len(right_created["shards"]) == 2
+    assert left_created["table_id"] != right_created["table_id"]
+    override = api.post(
+        left + "/tables/override", {"tablespace_name": database + "_table"}
+    )
+    assert len(override["shards"]) == 1
+    for path, scope in ((left_table, "left"), (right_table, "right")):
+        api.post(
+            path + "/batch",
+            {"inserts": {"same_key": {"scope": scope}}, "sync_level": "full_index"},
+        )
+        assert api.get(path + "/documents/same_key") == {"scope": scope}
+    for path, expected in ((left, {"events", "override"}), (right, {"events"})):
+        assert {
+            table["name"].split(".")[-1] for table in api.get(path + "/tables")
+        } == expected
+    api.post(
+        left_table + "/indexes/vectors",
+        {
+            "type": "embeddings",
+            "external": True,
+            "dimension": 8,
+            "distance_metric": "cosine",
+        },
+    )
+    assert api.get(left_table + "/indexes/vectors")["config"]["name"] == "vectors"
+    assert api._request("GET", right_table + "/indexes/vectors").status_code == 404
+    api.delete(left_table + "/indexes/vectors")
+    assert api._request("GET", left_table + "/indexes/vectors").status_code == 404
+    renamed_policy = database + "_renamed"
+    api.post("/tablespaces/" + database + "_ns/rename", {"name": renamed_policy})
+    assert (
+        next(ns for ns in api.get(root + "/namespaces") if ns["name"] == "left")[
+            "tablespace_name"
+        ]
+        == renamed_policy
+    )
+    assert api._request("DELETE", "/tablespaces/" + renamed_policy).status_code == 409
+    api.delete(left + "/tablespace")
+    inherited = api.post(left + "/tables/inherited", {})
+    assert len(inherited["shards"]) == 2
+    # Parent changes are defaults for future creation, not implicit resharding.
+    assert len(api.get(left_table)["shards"]) == 3
+    api.put(left_table + "/tablespace", {"tablespace_name": database + "_table"})
+    api.delete(left_table + "/tablespace")
+    for path in (
+        left_table,
+        right_table,
+        left + "/tables/override",
+        left + "/tables/inherited",
+    ):
+        api.delete(path)
+    api.delete(root)
+    for name in (database + "_db", renamed_policy, database + "_table"):
+        api.delete("/tablespaces/" + name)

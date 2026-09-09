@@ -401,10 +401,10 @@ export default Client;
 export * from "./models.js";
 
 export type {
+  CatalogTablespaceBindingRequest,
+  CreateTablespaceRequest,
   DatabaseCatalogRecord,
   NamespaceCatalogRecord,
-  TablespaceCatalogRecord,
-  CreateTablespaceRequest,
-  CatalogTablespaceBindingRequest,
   RenameCatalogResourceRequest,
+  TablespaceCatalogRecord,
 } from "./types.js";

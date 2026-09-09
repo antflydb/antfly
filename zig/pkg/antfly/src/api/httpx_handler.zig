@@ -4937,9 +4937,6 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const name = (try decodePathParamOrBadRequest(ctx, encoded)) orelse return null;
         errdefer alloc.free(name);
-        const route = try native_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
-        defer if (route) |value| value.deinit(alloc);
-        const target: native_catalog.Target = if (route) |value| try value.target() else try native_catalog.Target.parse(name);
         // Physical catalog names are never public aliases. This check also
         // applies when authentication is disabled.
         if (std.mem.startsWith(u8, name, "table:")) {
@@ -4947,6 +4944,18 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return null;
         }
+        const route = native_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path)) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            alloc.free(name);
+            _ = ctx.status(400);
+            return null;
+        };
+        defer if (route) |value| value.deinit(alloc);
+        const target: native_catalog.Target = (if (route) |value| value.target() else native_catalog.Target.parse(name)) catch {
+            alloc.free(name);
+            _ = ctx.status(400);
+            return null;
+        };
         const bytes = self.api_server.source.nativeCatalog(alloc, operationContext(ctx, identity.*), .{ .resolve = target }) catch |err| {
             if (route == null and err == error.UnsupportedOperation) return name;
             alloc.free(name);
@@ -4954,7 +4963,7 @@ pub const AntflyApiHandler = struct {
             return null;
         };
         defer alloc.free(bytes);
-        const parsed = try std.json.parseFromSlice(?metadata_table_manager.TableRecord, alloc, bytes, .{ .allocate = .alloc_always });
+        const parsed = try std.json.parseFromSlice(?native_catalog.ResolvedTable, alloc, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const table = parsed.value orelse {
             alloc.free(name);
@@ -4964,8 +4973,9 @@ pub const AntflyApiHandler = struct {
         const logical = try target.resourceNameAlloc(alloc);
         defer alloc.free(logical);
         if (identity.*) |*value| try http_server_mod.projectCatalogIdentity(self.api_server.alloc, value, logical, table.name);
+        const physical = try alloc.dupe(u8, table.name);
         alloc.free(name);
-        return try alloc.dupe(u8, table.name);
+        return physical;
     }
 
     fn resolveRestoreTableName(self: *AntflyApiHandler, ctx: *httpx.Context, encoded: []const u8, identity: *?AuthenticatedIdentity) !?[]u8 {
@@ -5667,8 +5677,6 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
-        defer ctx.allocator.free(decoded_table_name);
         const body_data = body: {
             const needs_h2_body_slot = ctx.hasStreamingRequestBody();
             if (needs_h2_body_slot and !self.query_body_admission.tryAcquire())
@@ -5679,6 +5687,25 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("missing body");
             };
         };
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse {
+            // Preserve syntax-error precedence on missing tables without
+            // repeating validation or parsing successful query requests.
+            if (ctx.response.status_code == 404) {
+                if (ctx.header("content-type")) |content_type| {
+                    if (std.mem.indexOf(u8, content_type, "ndjson") != null) {
+                        var lines = std.mem.splitScalar(u8, body_data, '\n');
+                        while (lines.next()) |line| {
+                            if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+                            if (!try std.json.validate(ctx.allocator, line)) return textResponse(ctx, 400, "invalid query request");
+                        }
+                        return ctx.text("invalid path parameter");
+                    }
+                }
+                if (!try std.json.validate(ctx.allocator, body_data)) return textResponse(ctx, 400, "invalid query request");
+            }
+            return ctx.text("invalid path parameter");
+        };
+        defer ctx.allocator.free(decoded_table_name);
         if (try self.acquirePublicOperation(ctx, "queryTable")) |response| return response;
         defer self.releasePublicOperation("queryTable");
         var cancellation = requestCancellation(ctx);
@@ -5689,10 +5716,17 @@ pub const AntflyApiHandler = struct {
             authenticated_identity,
             &cancellation,
         );
-        if (!std.mem.eql(u8, decoded_table_name, table_name)) http_server_mod.projectCatalogQueryResponse(self.api_server.alloc, &resp, table_name) catch |err| {
-            resp.deinit(self.api_server.alloc);
-            return err;
-        };
+        {
+            errdefer resp.deinit(self.api_server.alloc);
+            const route = try native_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path));
+            defer if (route) |value| value.deinit(ctx.allocator);
+            const logical_name = if (route) |value|
+                try (try value.target()).resourceNameAlloc(ctx.allocator)
+            else
+                try @import("http_route_helpers.zig").decodePercentEncodedPathComponentAlloc(ctx.allocator, table_name);
+            defer ctx.allocator.free(logical_name);
+            if (!std.mem.eql(u8, decoded_table_name, logical_name)) try http_server_mod.projectCatalogQueryResponse(self.api_server.alloc, &resp, logical_name);
+        }
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 

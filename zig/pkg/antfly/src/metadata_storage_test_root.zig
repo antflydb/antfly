@@ -7,5 +7,5 @@
 const storage = @import("metadata/storage/mod.zig");
 
 test {
-    _ = storage;
+    _ = storage.raft_apply_store;
 }

@@ -14,7 +14,8 @@
 
 //! Transactional catalog persistence. Records and name indexes are separate so
 //! routing resolves a qualified name with point reads, independent of catalog
-//! size. The complete inventory is used only for administrative mutations.
+//! size for indexed hits. Administrative mutations and negative-lookup
+//! corruption checks inspect the complete inventory.
 const std = @import("std");
 const docstore = @import("../storage/docstore.zig");
 const domain = @import("domain.zig");

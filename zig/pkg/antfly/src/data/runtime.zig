@@ -19593,6 +19593,7 @@ const RemoteMetadataSource = struct {
             .ptr = self,
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
+                .native_catalog = remoteNativeCatalog,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
@@ -20563,6 +20564,40 @@ const RemoteMetadataSource = struct {
             return validation;
         }
         return last_err;
+    }
+
+    fn remoteNativeCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../catalog/domain.zig").Call) ![]u8 {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        // Even ambiguous writes may have committed new topology. Invalidate
+        // cached snapshots without automatically replaying the mutation.
+        defer if (input == .mutate) self.invalidateCache();
+        return self.withMetadataMutationApiClient([]u8, struct {
+            fn call(
+                _: *RemoteMetadataSource,
+                client: *antfly.metadata_http_client.MetadataHttpClient,
+                base_uri: []const u8,
+                forwarding: antfly.public_api.raft_mutation_forwarding.Context,
+                ctx: anytype,
+            ) ![]u8 {
+                try ctx.request.ensureActive();
+                var bounded = forwarding;
+                if (ctx.request.deadline_ns) |deadline| {
+                    const now: u64 = if (ctx.request.deadline_io) |borrow| blk: {
+                        var receiver = try borrow.receive();
+                        break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
+                    } else @import("antfly_platform").time.monotonicNs();
+                    if (now >= deadline) return error.DeadlineExceeded;
+                    bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
+                }
+                const bytes = try client.forwardNativeCatalog(base_uri, ctx.input, bounded);
+                defer client.alloc.free(bytes);
+                return ctx.alloc.dupe(u8, bytes) catch |err| {
+                    if (ctx.input == .mutate) return error.MetadataMutationOutcomeUnknown;
+                    return err;
+                };
+            }
+        }.call, .{ .alloc = alloc, .request = request, .input = input });
     }
 
     fn remoteCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {

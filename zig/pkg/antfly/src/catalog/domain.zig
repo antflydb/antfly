@@ -25,6 +25,25 @@ pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
 pub const Kind = enum { database, namespace, tablespace, table };
 
+/// Routing response deliberately excludes schema, index definitions, and
+/// credentials. A document operation needs only this stable identity.
+pub const ResolvedTable = struct {
+    table_id: u64,
+    name: []const u8,
+
+    pub fn fromTable(table: anytype) @This() {
+        return .{ .table_id = table.table_id, .name = table.name };
+    }
+
+    pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
+        return .{ .table_id = self.table_id, .name = try alloc.dupe(u8, self.name) };
+    }
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+    }
+};
+
 pub const PlacementPolicy = struct {
     placement_role: ?[]const u8 = null,
     desired_replica_count: ?u16 = null,
@@ -318,9 +337,18 @@ pub fn httpStatus(err: anyerror) u16 {
         error.TableTopologyProtocolUpgradeRequired => 426,
         error.Forbidden => 403,
         error.UnsupportedOperation => 503,
-        error.MetadataMutationOutcomeUnknown, error.NotLeader, error.Timeout, error.Cancelled => 503,
+        error.MetadataMutationOutcomeUnknown, error.NotLeader, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
+}
+
+/// Only trusted native ingress constructs these immutable routing identities.
+pub fn validateStorageName(name: []const u8) !void {
+    if (name.len < 38 or !std.mem.startsWith(u8, name, "table:")) return error.InvalidCatalogMutation;
+    for (name[6..38]) |c| if (!std.ascii.isHex(c)) return error.InvalidCatalogMutation;
+    if (name.len == 38) return;
+    if (name[38] != ':') return error.InvalidCatalogMutation;
+    _ = try Target.parse(name[39..]);
 }
 
 /// Restore jobs persist their immutable destination identity. The qualified

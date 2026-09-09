@@ -77,10 +77,23 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
         if (mutation_action == .drop or mutation_action == .rename or route.kind == .table) return .{ .status = 204, .body = &.{} };
     }
     const bytes = source.nativeCatalog(a, request, .snapshot) catch |err| {
-        if (action != null) return response(alloc, 202, .{ .status = "committed_visibility_pending" });
+        if (action != null) return visibilityPending(alloc);
         return failure(alloc, err);
     };
-    var state = std.json.parseFromSliceLeaky(domain.State, a, bytes, .{ .allocate = .alloc_always }) catch return failure(alloc, error.InvalidCatalogRecord);
+    return projectSnapshot(alloc, a, route, action, bytes) catch |err| {
+        // Admission has already committed. A stale/malformed projection or a
+        // concurrent rename/drop must not turn that result into a rejection.
+        if (action != null) return visibilityPending(alloc);
+        return failure(alloc, err);
+    };
+}
+
+fn visibilityPending(alloc: std.mem.Allocator) !Response {
+    return response(alloc, 202, .{ .status = "committed_visibility_pending" });
+}
+
+fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes.Route, action: ?domain.Action, bytes: []const u8) !Response {
+    var state = std.json.parseFromSliceLeaky(domain.State, a, bytes, .{ .allocate = .alloc_always }) catch return error.InvalidCatalogRecord;
     var inventory = std.ArrayListUnmanaged(domain.Resource).empty;
     try inventory.appendSlice(a, state.resources);
     if (state.resources.len == 0) {
@@ -88,13 +101,13 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
         try inventory.append(a, domain.default_namespace);
     }
     state.resources = inventory.items;
-    const parent_id: u64 = if (route.kind == .namespace) (state.find(.database, 0, route.database) orelse return failure(alloc, error.DatabaseNotFound)).id else 0;
+    const parent_id: u64 = if (route.kind == .namespace) (state.find(.database, 0, route.database) orelse return error.DatabaseNotFound).id else 0;
     const status: u16 = if (action == .create) 201 else 200;
     if (route.name) |name| {
-        const resource = state.find(route.kind, parent_id, name) orelse return failure(alloc, error.CatalogNotFound);
+        const resource = state.find(route.kind, parent_id, name) orelse return error.CatalogNotFound;
         return switch (route.kind) {
             .database => response(alloc, status, databaseValue(state, resource)),
-            .namespace => response(alloc, status, namespaceValue(state, resource)),
+            .namespace => response(alloc, status, try namespaceValue(state, resource)),
             .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
             .table => failure(alloc, error.InvalidCatalogMutation),
         };
@@ -112,7 +125,7 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
         },
         .namespace => {
             var out = std.ArrayListUnmanaged(Namespace).empty;
-            for (state.resources) |r| if (r.kind == .namespace and r.parent_id == parent_id) try out.append(a, namespaceValue(state, r));
+            for (state.resources) |r| if (r.kind == .namespace and r.parent_id == parent_id) try out.append(a, try namespaceValue(state, r));
             std.mem.sort(Namespace, out.items, {}, struct {
                 fn less(_: void, l: Namespace, r: Namespace) bool {
                     return std.mem.lessThan(u8, l.name, r.name);
@@ -140,9 +153,31 @@ fn bindingName(state: domain.State, resource: domain.Resource) ?[]const u8 {
 fn databaseValue(state: domain.State, resource: domain.Resource) Database {
     return .{ .database_id = resource.id, .name = resource.name, .tablespace_name = bindingName(state, resource) };
 }
-fn namespaceValue(state: domain.State, resource: domain.Resource) Namespace {
-    return .{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = (state.byId(.database, resource.parent_id) orelse unreachable).name, .name = resource.name, .tablespace_name = bindingName(state, resource) };
+fn namespaceValue(state: domain.State, resource: domain.Resource) !Namespace {
+    return .{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = (state.byId(.database, resource.parent_id) orelse return error.InvalidCatalogRecord).name, .name = resource.name, .tablespace_name = bindingName(state, resource) };
 }
 fn tablespaceValue(alloc: std.mem.Allocator, resource: domain.Resource) !Tablespace {
     return .{ .tablespace_id = resource.id, .name = resource.name, .location_json = resource.location_json, .placement_policy_json = try std.json.Stringify.valueAlloc(alloc, resource.placement_policy, .{ .emit_null_optional_fields = false }) };
+}
+
+test "native catalog committed mutations retain success when projection fails" {
+    const Source = struct {
+        snapshot: ?[]const u8,
+        fn nativeCatalog(self: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]const u8 {
+            return switch (call) {
+                .mutate => try alloc.dupe(u8, "{}"),
+                .snapshot => try alloc.dupe(u8, self.snapshot orelse return error.Timeout),
+                else => error.UnexpectedCall,
+            };
+        }
+    };
+    for ([_]?[]const u8{ null, "invalid JSON", "{}" }) |snapshot| {
+        var result = try execute(Source{ .snapshot = snapshot }, std.testing.allocator, .{}, .{ .kind = .database, .name = "created" }, .create, "{}");
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 202), result.status);
+        try std.testing.expectEqualStrings("{\"status\":\"committed_visibility_pending\"}", result.body);
+    }
+    var result = try execute(Source{ .snapshot = "invalid JSON" }, std.testing.allocator, .{}, .{ .kind = .database, .name = "created" }, null, "");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 500), result.status);
 }

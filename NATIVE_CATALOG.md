@@ -92,3 +92,28 @@ await client.api.POST("/db/v1/databases/{databaseName}", {
 The CLI provides `database`, `namespace`, and `tablespace` commands, including
 rename and tablespace binding commands. Existing table and document commands
 accept qualified names, for example `--table analytics.public.events`.
+
+## Regression coverage and lookup cost
+
+`zig/e2e/antfly/test_native_catalog.py` covers inherited and explicit placement,
+namespace isolation, index lifecycle, logical renames across restart, MCP
+resolution, and qualified restore with idempotency and maximum-length names.
+The catalog cases in `test_auth.py` run against both standalone and separate
+metadata/data processes, checking scoped permissions, row filters, NDJSON
+per-line authorization, and rename/drop behavior. They run in the regular
+Python E2E job.
+
+The focused Zig targets are `native-catalog-test`, `native-catalog-api-test`, and
+`native-catalog-standalone-test`. The metadata, HTTP, and standalone test lanes
+also include their corresponding catalog regressions. Raft-store tests cover
+atomic topology/binding publication, stale revisions, reopen, snapshot install,
+and corruption checks. HTTP tests cover ambiguous outcomes, post-commit
+projection failures, and request-local aliases with live permission revocation.
+
+Positive indexed lookups return only the immutable table ID and physical name.
+The binary table-record reader validates length framing without copying or
+parsing schema/index definitions. A regression resolves a record with a 256 KiB
+definition using a 16 KiB allocation budget. Negative lookups check the catalog
+inventory to distinguish absence from a corrupt name index. Further profiling
+should measure remote leader discovery and query-response name projection;
+those still perform work per request and per response, respectively.
