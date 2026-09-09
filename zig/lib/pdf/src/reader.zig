@@ -20013,7 +20013,7 @@ test "image row streaming checksum spans vector tails reduction blocks and read 
         const pixels = try alloc.alloc(u8, stride * 3);
         defer alloc.free(pixels);
         for (pixels, 0..) |*byte, index| byte.* = @truncate(index * 31 + index / 17);
-        var compressed: std.Io.Writer.Allocating = .init(alloc);
+        var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 256);
         defer compressed.deinit();
         var history: [std.compress.flate.max_window_len]u8 = undefined;
         var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);

@@ -7112,6 +7112,7 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     var fake = FakeReader{ .first_ptr = png[0..].ptr, .second_ptr = jpeg[0..].ptr };
     var state = inference_host.LinkedInferenceState{
         .alloc = alloc,
+        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
         .io = std.testing.io,
         .node = undefined, // The model-free override must not enter Node.
         .warm_models = undefined,
@@ -7243,6 +7244,7 @@ test "standalone raster reader ABI preserves borrowed strided pages and identity
     var fake = FakeReader{ .expected = .{ first[0..].ptr, second[0..].ptr } };
     var state = inference_host.LinkedInferenceState{
         .alloc = alloc,
+        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
         .io = std.testing.io,
         .node = undefined, // The model-free override must not enter Node.
         .warm_models = undefined,

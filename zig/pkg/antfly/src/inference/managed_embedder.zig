@@ -1343,7 +1343,14 @@ pub const ManagedEmbedder = struct {
     ) ![32]u8 {
         const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse or entry.multimodal) return error.QueryEmbeddingNotCacheable;
-        if (entry.secret_store) |store| {
+        const endpoint = managedEmbeddingEndpointIdentity(entry);
+        // Only effective file-backed credentials depend on this store. Other
+        // credential sources must neither refresh it nor invalidate on rotation.
+        const secret_store = if (endpoint.credentials.kind == .secret_ref)
+            entry.secret_store
+        else
+            null;
+        if (secret_store) |store| {
             _ = try store.refreshIfChangedThrottled(query_cache_secret_refresh_interval_ns);
         }
 
@@ -1351,7 +1358,7 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, "antfly-query-embedding-v3");
         hashQueryCacheField(&hasher, @tagName(security_domain));
         hashQueryCacheField(&hasher, security_scope);
-        managedEmbeddingEndpointIdentity(entry).updateHash(&hasher);
+        endpoint.updateHash(&hasher);
         hashQueryCacheField(&hasher, @tagName(entry.bedrock_request_format));
         hashQueryCacheField(&hasher, entry.input_type);
         hashQueryCacheField(&hasher, entry.query_input_type);
@@ -1360,7 +1367,7 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, EmbeddingTaskType.retrieval_query.canonical());
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
-        hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generationFast() else 0);
+        hashQueryCacheU64(&hasher, if (secret_store) |store| store.generationFast() else 0);
         hashQueryCacheField(&hasher, text);
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
@@ -8564,6 +8571,39 @@ pub fn testFileBackedApiKeyRotation() !void {
     defer env_managed.deinit();
     const env_cache_key = try env_managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
 
+    // Store rotation must not invalidate sources that do not use the store,
+    // even if an unused api_key reference is configured for a cloud provider.
+    const independent_sources = [_]struct {
+        provider: ProviderKind,
+        api_key: ?common_secrets.SecretValue,
+        credentials_path: []const u8 = "",
+    }{
+        .{ .provider = .openai, .api_key = .{ .literal = @constCast("literal-key") } },
+        .{ .provider = .openai, .api_key = null },
+        .{ .provider = .vertex, .api_key = .{ .secret_ref = @constCast("unused") } },
+        .{ .provider = .vertex, .api_key = null, .credentials_path = "credentials.json" },
+        .{ .provider = .bedrock, .api_key = .{ .secret_ref = @constCast("unused") } },
+        .{ .provider = .ollama, .api_key = .{ .secret_ref = @constCast("unused") } },
+    };
+    // These are borrowed, stack-owned entries: only query identity is tested.
+    var independent_entries: [independent_sources.len]ManagedEmbeddingEntry = undefined;
+    var independent_keys: [independent_sources.len][32]u8 = undefined;
+    for (independent_sources, &independent_entries, &independent_keys) |source, *entry, *key| {
+        entry.* = .{
+            .alloc = alloc,
+            .index_name = @constCast("semantic_idx"),
+            .provider = source.provider,
+            .model = @constCast("model"),
+            .base_url = @constCast(base_uri),
+            .dimensions = 3,
+            .api_key = source.api_key,
+            .credentials_path = @constCast(source.credentials_path),
+            .secret_store = &secret_store,
+        };
+        const independent = ManagedEmbedder{ .alloc = alloc, .entries = entry[0..1] };
+        key.* = try independent.queryCacheKey("semantic_idx", .principal, "alice", "same query");
+    }
+
     const first = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
     defer alloc.free(first);
     try app.expectHeader(0, "Bearer first-key");
@@ -8578,6 +8618,11 @@ pub fn testFileBackedApiKeyRotation() !void {
     try std.testing.expect(!std.mem.eql(u8, &first_cache_key, &rotated_cache_key));
     const rotated_env_cache_key = try env_managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
     try std.testing.expectEqualSlices(u8, &env_cache_key, &rotated_env_cache_key);
+    for (&independent_entries, &independent_keys) |*entry, *key| {
+        const independent = ManagedEmbedder{ .alloc = alloc, .entries = entry[0..1] };
+        const rotated = try independent.queryCacheKey("semantic_idx", .principal, "alice", "same query");
+        try std.testing.expectEqualSlices(u8, key, &rotated);
+    }
 
     const second = try managed.embedQuery(alloc, "semantic_idx", "beta concept");
     defer alloc.free(second);

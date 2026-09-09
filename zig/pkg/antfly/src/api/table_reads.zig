@@ -18410,7 +18410,6 @@ test "reranker admission precedes candidate rendering" {
 
     try std.testing.expectError(error.RerankRateLimited, applyReranker(
         failing.allocator(),
-        io_impl.io(),
         .{
             .reranker = .{ .provider = .antfly, .model = "model", .field = "body" },
             .reranker_query_text = "query",
