@@ -64494,10 +64494,12 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     const Size = struct {
         fn physical(b: *lsm_backend_mod.Backend) !u64 {
             var bytes = b.snapshotMaintenanceStats().wal_retained_bytes;
-            for (b.runs.items) |run| if (run.path) |name| {
+            var cursor = b.runs.cursor();
+            while (cursor.next()) |run| if (run.path) |name| {
                 bytes += try b.storage.?.fileSize(name);
             };
-            for (b.obsolete_paths.items) |obsolete| bytes += try b.storage.?.fileSize(obsolete.path);
+            var obsolete_cursor = b.obsolete_paths.iterator();
+            while (obsolete_cursor.next()) |obsolete| bytes += try b.storage.?.fileSize(obsolete.path);
             return bytes;
         }
     };

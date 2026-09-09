@@ -35,6 +35,22 @@ const Entry = struct {
     payload: ?*Payload = null,
     domain: []const u8 = "",
 
+    pub const Summary = struct {
+        tombstone_runs: usize = 0,
+        gc_requested: bool = false,
+        oldest_tombstone: u64 = std.math.maxInt(u64),
+        newest_tombstone: u64 = 0,
+    };
+    pub fn summarize(entry: Entry, left: Summary, right: Summary) Summary {
+        const deletes = (entry.run.tombstone_count orelse 0) != 0;
+        return .{
+            .tombstone_runs = left.tombstone_runs + right.tombstone_runs + @intFromBool(deletes),
+            .gc_requested = left.gc_requested or right.gc_requested or (deletes and entry.run.gc_requested),
+            .oldest_tombstone = @min(left.oldest_tombstone, right.oldest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else std.math.maxInt(u64)),
+            .newest_tombstone = @max(left.newest_tombstone, right.newest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else 0),
+        };
+    }
+
     pub fn retainShared(self: Entry) Entry {
         _ = self.payload.?.refs.fetchAdd(1, .monotonic);
         return self;
@@ -52,11 +68,31 @@ const Entry = struct {
     }
 };
 
+const BoundsSummary = struct {
+    pub const Summary = struct { largest: ?*const Run = null };
+    pub fn summarize(entry: Entry, left: Summary, right: Summary) Summary {
+        var largest = entry.run;
+        for ([_]?*const Run{ left.largest, right.largest }) |candidate| if (candidate) |run| {
+            if (compareBound(largest.largest_namespace_name, largest.largest_key, run.largest_namespace_name, run.largest_key) == .lt) largest = run;
+        };
+        return .{ .largest = largest };
+    }
+};
+
+fn compareBound(a_ns: ?[]const u8, a: []const u8, b_ns: ?[]const u8, b: []const u8) std.math.Order {
+    const ns = state.compareNamespace(.{ .name = a_ns }, .{ .name = b_ns });
+    return if (ns == .eq) std.mem.order(u8, a, b) else ns;
+}
+
 fn compareDomain(a: Entry, b: Entry) std.math.Order {
     const ns = state.compareNamespace(.{ .name = a.run.smallest_namespace_name }, .{ .name = b.run.smallest_namespace_name });
     if (ns != .eq) return ns;
     const domain = std.mem.order(u8, a.domain, b.domain);
     return if (domain != .eq) domain else compare(a, b);
+}
+
+fn compareId(a: Entry, b: Entry) std.math.Order {
+    return std.math.order(a.run.id, b.run.id);
 }
 
 fn compareBounds(a: Entry, b: Entry) std.math.Order {
@@ -70,6 +106,7 @@ pub const LevelAggregate = struct {
     level: u32,
     count: usize = 0,
     bytes: u64 = 0,
+    tombstone_runs: usize = 0,
     pub fn retainShared(self: @This()) @This() {
         return self;
     }
@@ -100,15 +137,28 @@ fn compare(a: Entry, b: Entry) std.math.Order {
 }
 
 pub const Directory = struct {
+    pub fn runLess(a: *const Run, b: *const Run) bool {
+        return compare(.{ .run = a }, .{ .run = b }) == .lt;
+    }
+    pub fn containsReadOrdered(handles: []const Handle, run: *const Run) bool {
+        var lo: usize = 0;
+        var hi = handles.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (runLess(handles[mid].run, run)) lo = mid + 1 else hi = mid;
+        }
+        return lo < handles.len and handles[lo].run.id == run.id;
+    }
     const Tree = @import("ordered_index.zig").Index(Entry, compare);
-    const DomainTree = @import("ordered_index.zig").Index(Entry, compareDomain);
-    const BoundsTree = @import("ordered_index.zig").Index(Entry, compareBounds);
+    const IdTree = @import("ordered_index.zig").SummarizedIndex(Entry, compareId, void);
+    const BoundsTree = @import("ordered_index.zig").SummarizedIndex(Entry, compareBounds, BoundsSummary);
     const LevelTree = @import("ordered_index.zig").Index(LevelAggregate, compareLevel);
     tree: Tree = .{},
-    domains: DomainTree = .{},
+    ids: IdTree = .{},
     bounds: BoundsTree = .{},
     levels: LevelTree = .{},
     total_run_bytes: u64 = 0,
+    memory_run_count: usize = 0,
     retired_next: ?*Directory = null,
 
     pub fn create(allocator: std.mem.Allocator) !*Directory {
@@ -119,10 +169,11 @@ pub const Directory = struct {
     pub fn fork(self: *const Directory, allocator: std.mem.Allocator) !*Directory {
         const out = try create(allocator);
         out.tree = self.tree.fork();
-        out.domains = self.domains.fork();
+        out.ids = self.ids.fork();
         out.bounds = self.bounds.fork();
         out.levels = self.levels.fork();
         out.total_run_bytes = self.total_run_bytes;
+        out.memory_run_count = self.memory_run_count;
         return out;
     }
     pub fn destroy(self: *Directory, allocator: std.mem.Allocator) void {
@@ -130,12 +181,33 @@ pub const Directory = struct {
         allocator.destroy(self);
     }
 
+    pub const Reclaimer = struct {
+        directory: *Directory,
+        tree: Tree.Reclaimer,
+        ids: IdTree.Reclaimer,
+        bounds: BoundsTree.Reclaimer,
+        levels: LevelTree.Reclaimer,
+
+        pub fn init(directory: *Directory) @This() {
+            directory.retainAccounting();
+            return .{ .directory = directory, .tree = .init(directory.tree), .ids = .init(directory.ids), .bounds = .init(directory.bounds), .levels = .init(directory.levels) };
+        }
+        pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+            return self.tree.step(allocator, credits) and self.ids.step(allocator, credits) and self.bounds.step(allocator, credits) and self.levels.step(allocator, credits);
+        }
+        /// Only after step reports completion, back under the accounting lock.
+        pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {
+            self.directory.releaseAccounting();
+            allocator.destroy(self.directory);
+        }
+    };
+
     /// Keep headers immutable while a detached reclamation batch is charged.
     pub fn destroyContents(self: *const Directory, allocator: std.mem.Allocator) void {
         var tree = self.tree;
         tree.deinit(allocator);
-        var domains = self.domains;
-        domains.deinit(allocator);
+        var ids = self.ids;
+        ids.deinit(allocator);
         var bounds = self.bounds;
         bounds.deinit(allocator);
         var levels = self.levels;
@@ -144,21 +216,21 @@ pub const Directory = struct {
 
     pub fn retainAccounting(self: *const Directory) void {
         if (self.tree.account) |account| _ = account.retain();
-        if (self.domains.account) |account| _ = account.retain();
+        if (self.ids.account) |account| _ = account.retain();
         if (self.bounds.account) |account| _ = account.retain();
         if (self.levels.account) |account| _ = account.retain();
     }
 
     pub fn releaseAccounting(self: *const Directory) void {
         if (self.tree.account) |account| account.release();
-        if (self.domains.account) |account| account.release();
+        if (self.ids.account) |account| account.release();
         if (self.bounds.account) |account| account.release();
         if (self.levels.account) |account| account.release();
     }
     pub fn put(self: *Directory, backend: anytype, run: Run) !void {
         const allocator = backend.allocator;
         try self.tree.prepare(allocator);
-        try self.domains.prepare(allocator);
+        try self.ids.prepare(allocator);
         try self.bounds.prepare(allocator);
         try self.levels.prepare(allocator);
         const payload = try allocator.create(Payload);
@@ -193,36 +265,171 @@ pub const Directory = struct {
         const entry = Entry{ .run = &payload.run, .payload = payload, .domain = domain };
         defer entry.deinit(allocator);
         const previous = find(self.tree.root, entry);
+        self.memory_run_count += @intFromBool(run.path == null);
+        if (previous) |node| self.memory_run_count -= @intFromBool(node.entry.run.path == null);
         const old_bytes = if (previous) |node| node.entry.run.size_bytes else 0;
         var level = self.levelStats(run.level);
         level.count += @intFromBool(previous == null);
         level.bytes = level.bytes - old_bytes + run.size_bytes;
+        level.tombstone_runs += @intFromBool((run.tombstone_count orelse 0) != 0);
+        if (previous) |node| level.tombstone_runs -= @intFromBool((node.entry.run.tombstone_count orelse 0) != 0);
         self.total_run_bytes = self.total_run_bytes - old_bytes + run.size_bytes;
         self.levels.putPrepared(allocator, level);
         self.tree.putPrepared(allocator, entry);
-        self.domains.putPrepared(allocator, entry);
+        self.ids.putPrepared(allocator, entry);
         self.bounds.putPrepared(allocator, entry);
     }
     pub fn remove(self: *Directory, allocator: std.mem.Allocator, run: *const Run) !void {
         try self.tree.prepare(allocator);
-        try self.domains.prepare(allocator);
+        try self.ids.prepare(allocator);
         try self.bounds.prepare(allocator);
         try self.levels.prepare(allocator);
         const existing = find(self.tree.root, .{ .run = run }) orelse return;
         // All three trees own this payload until their prepared edits finish.
         const entry = existing.entry.retainShared();
         defer entry.deinit(allocator);
+        self.memory_run_count -= @intFromBool(entry.run.path == null);
         var level = self.levelStats(entry.run.level);
         level.count -= 1;
         level.bytes -= entry.run.size_bytes;
+        level.tombstone_runs -= @intFromBool((entry.run.tombstone_count orelse 0) != 0);
         self.total_run_bytes -= entry.run.size_bytes;
         if (level.count == 0) self.levels.removePrepared(allocator, level) else self.levels.putPrepared(allocator, level);
         self.tree.removePrepared(allocator, entry);
-        self.domains.removePrepared(allocator, entry);
+        self.ids.removePrepared(allocator, entry);
         self.bounds.removePrepared(allocator, entry);
     }
     pub fn count(self: *const Directory) usize {
         return if (self.tree.root) |root| root.count else 0;
+    }
+
+    /// Handles borrow immutable payloads from a pinned directory, never slots
+    /// in the mutable Backend.runs array. A move/replacement changes identity.
+    pub const Handle = struct {
+        run: *const Run,
+        revision: *const anyopaque,
+
+        pub fn retain(self: @This()) @This() {
+            const payload: *Payload = @ptrCast(@alignCast(@constCast(self.revision)));
+            _ = payload.account.retain();
+            _ = payload.refs.fetchAdd(1, .monotonic);
+            return self;
+        }
+
+        pub fn release(self: @This(), allocator: std.mem.Allocator) void {
+            const payload: *Payload = @ptrCast(@alignCast(@constCast(self.revision)));
+            const account = payload.account;
+            (Entry{ .run = self.run, .payload = payload }).deinit(allocator);
+            account.release();
+        }
+    };
+
+    pub fn at(self: *const Directory, rank: usize) Handle {
+        const entry = self.tree.root.?.at(rank);
+        return .{ .run = entry.run, .revision = entry.payload.? };
+    }
+
+    pub fn readLess(_: void, a: Handle, b: Handle) bool {
+        return compare(.{ .run = a.run }, .{ .run = b.run }) == .lt;
+    }
+
+    pub const Cursor = struct {
+        directory: *const Directory,
+        rank: usize = 0,
+        path: Tree.Cursor = .{},
+
+        pub fn next(self: *@This()) ?Handle {
+            if (self.rank == self.directory.count()) return null;
+            const entry = self.path.at(self.directory.tree.root.?, self.rank);
+            self.rank += 1;
+            return .{ .run = entry.run, .revision = entry.payload.? };
+        }
+    };
+
+    pub fn readCursor(self: *const Directory) Cursor {
+        return .{ .directory = self };
+    }
+
+    /// First candidate rank (forward), or one past the last candidate
+    /// (reverse), in a disjoint lower level. One AVL descent replaces binary
+    /// search over rank lookups, which would otherwise cost O(log² N).
+    pub fn levelBoundRank(self: *const Directory, level: u32, namespace: ?[]const u8, key: ?[]const u8, reverse: bool, inclusive: bool) usize {
+        std.debug.assert(level != 0);
+        var root = self.tree.root;
+        var rank: usize = 0;
+        while (root) |node| {
+            const run = node.entry.run;
+            const order = if (key) |target|
+                compareBound(if (reverse) run.smallest_namespace_name else run.largest_namespace_name, if (reverse) run.smallest_key else run.largest_key, namespace, target)
+            else
+                state.compareNamespace(.{ .name = run.smallest_namespace_name }, .{ .name = namespace });
+            const past = order == .lt or (order == .eq and (if (reverse) key == null or inclusive else !inclusive));
+            if (run.level < level or (run.level == level and past)) {
+                rank += 1 + (if (node.left) |left| left.count else 0);
+                root = node.right;
+            } else root = node.left;
+        }
+        return rank;
+    }
+
+    pub fn resolve(self: *const Directory, handle: Handle) ?usize {
+        const node = find(self.tree.root, .{ .run = handle.run }) orelse return null;
+        if (@as(*const anyopaque, node.entry.payload.?) != handle.revision) return null;
+        return self.tree.root.?.lowerBound(node.entry);
+    }
+
+    pub fn rankOf(self: *const Directory, run: *const Run) ?usize {
+        const node = find(self.tree.root, .{ .run = run }) orelse return null;
+        return self.tree.root.?.lowerBound(node.entry);
+    }
+
+    pub const OverlapCursor = struct {
+        stack: [2 * @bitSizeOf(usize)]*const BoundsTree.Node = undefined,
+        len: usize = 0,
+        lower_ns: ?[]const u8,
+        lower: []const u8,
+        upper_ns: ?[]const u8,
+        upper: []const u8,
+        visited: usize = 0,
+
+        /// A budget counts visited nodes, not just matches. Call again with a
+        /// replenished budget to resume a large overlap without restarting.
+        pub fn next(self: *@This(), budget: *usize) ?Handle {
+            while (self.len != 0 and budget.* != 0) {
+                budget.* -= 1;
+                self.visited += 1;
+                self.len -= 1;
+                const node = self.stack[self.len];
+                const largest = node.summary.largest.?;
+                if (compareBound(largest.largest_namespace_name, largest.largest_key, self.lower_ns, self.lower) == .lt) continue;
+                const run = node.entry.run;
+                const starts_before_end = compareBound(run.smallest_namespace_name, run.smallest_key, self.upper_ns, self.upper) != .gt;
+                if (starts_before_end) if (node.right) |right| {
+                    self.stack[self.len] = right;
+                    self.len += 1;
+                };
+                if (node.left) |left| {
+                    self.stack[self.len] = left;
+                    self.len += 1;
+                }
+                if (starts_before_end and compareBound(run.largest_namespace_name, run.largest_key, self.lower_ns, self.lower) != .lt)
+                    return .{ .run = run, .revision = node.entry.payload.? };
+            }
+            return null;
+        }
+
+        pub fn done(self: *const @This()) bool {
+            return self.len == 0;
+        }
+    };
+
+    pub fn overlaps(self: *const Directory, lower_ns: ?[]const u8, lower: []const u8, upper_ns: ?[]const u8, upper: []const u8) OverlapCursor {
+        var cursor = OverlapCursor{ .lower_ns = lower_ns, .lower = lower, .upper_ns = upper_ns, .upper = upper };
+        if (self.bounds.root) |root| {
+            cursor.stack[0] = root;
+            cursor.len = 1;
+        }
+        return cursor;
     }
 
     pub fn levelStats(self: *const Directory, number: u32) LevelAggregate {
@@ -237,6 +444,16 @@ pub const Directory = struct {
 
     pub fn levelCount(self: *const Directory) usize {
         return if (self.levels.root) |root| root.count else 0;
+    }
+
+    pub fn levelStart(self: *const Directory, level: u32) usize {
+        var start: usize = 0;
+        for (0..self.levelCount()) |rank| {
+            const item = self.levelAt(rank);
+            if (item.level >= level) break;
+            start += item.count;
+        }
+        return start;
     }
 
     pub fn levelAt(self: *const Directory, rank: usize) LevelAggregate {
@@ -254,6 +471,56 @@ pub const Directory = struct {
         try visitRemoved(previous.tree.root, self.tree.root, visitor);
         try visitAdded(self.tree.root, previous.tree.root, visitor);
     }
+
+    /// Allocation-free persistent-root diff. Shared subtrees are skipped even
+    /// across rotations; callers pin both roots and pay one credit per node.
+    pub const ChangeCursor = struct {
+        pub const Change = struct { kind: enum { remove, put }, run: *const Run };
+        previous: ?*Tree.Node,
+        current: ?*Tree.Node,
+        stack: [2 * @bitSizeOf(usize)]*Tree.Node = undefined,
+        len: usize = 0,
+        phase: enum { removed, added, done } = .removed,
+
+        pub fn init(previous: *const Directory, current: *const Directory) ChangeCursor {
+            var cursor = ChangeCursor{ .previous = previous.tree.root, .current = current.tree.root };
+            cursor.push(previous.tree.root);
+            return cursor;
+        }
+        fn push(self: *ChangeCursor, node: ?*Tree.Node) void {
+            if (node) |value| {
+                self.stack[self.len] = value;
+                self.len += 1;
+            }
+        }
+        pub fn done(self: *const ChangeCursor) bool {
+            return self.phase == .done;
+        }
+        pub fn next(self: *ChangeCursor, credits: *usize) ?Change {
+            while (credits.* != 0 and !self.done()) {
+                if (self.len == 0) {
+                    if (self.phase == .removed) {
+                        self.phase = .added;
+                        self.push(self.current);
+                    } else self.phase = .done;
+                    continue;
+                }
+                credits.* -= 1;
+                self.len -= 1;
+                const node = self.stack[self.len];
+                const matched = find(if (self.phase == .removed) self.current else self.previous, node.entry);
+                if (matched == node) continue;
+                self.push(node.right);
+                self.push(node.left);
+                if (self.phase == .removed) {
+                    if (matched == null) return .{ .kind = .remove, .run = node.entry.run };
+                } else if (matched == null or matched.?.entry.payload != node.entry.payload) {
+                    return .{ .kind = .put, .run = node.entry.run };
+                }
+            }
+            return null;
+        }
+    };
 
     /// A validated predecessor remains valid after removals. Only inserted or
     /// replaced runs and their immediate final neighbors can introduce a new
@@ -317,27 +584,92 @@ pub const Directory = struct {
         return runs;
     }
     pub fn accountedMemoryBytes(self: *const Directory, pass: u64) u64 {
-        return @sizeOf(Directory) + (self.tree.spare.capacity + self.domains.spare.capacity + self.bounds.spare.capacity + self.levels.spare.capacity) * @sizeOf(*Tree.Node) +
+        return @sizeOf(Directory) + (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.levels.spare.capacity) * @sizeOf(*Tree.Node) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0) +
-            (if (self.domains.account) |account| account.chargeOnce(pass) else 0) +
+            (if (self.ids.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.bounds.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.levels.account) |account| account.chargeOnce(pass) else 0);
     }
 
     pub const PlanningOrder = struct { domain: []usize, bounds: []usize };
 
-    /// Ordering is maintained incrementally at publication. The existing
-    /// positional planner adapter only translates stable IDs; it never sorts
-    /// the complete domain/range index after an unrelated publication.
+    pub fn byId(self: *const Directory, id: u64) ?*const Run {
+        var node = self.ids.root;
+        while (node) |current| {
+            switch (std.math.order(id, current.entry.run.id)) {
+                .lt => node = current.left,
+                .gt => node = current.right,
+                .eq => return current.entry.run,
+            }
+        }
+        return null;
+    }
+
+    /// Scheduling is independent of component discovery. In particular, a
+    /// clock rollback makes any future-dated tombstone immediately eligible;
+    /// retaining only the minimum timestamp would lose that condition.
+    pub fn tombstoneGcDelay(self: *const Directory, age: u64, now: u64) ?u64 {
+        const summary = (self.tree.root orelse return null).summary;
+        if (summary.tombstone_runs == 0) return null;
+        if (summary.gc_requested) return 0;
+        if (age == 0) return null;
+        if (summary.oldest_tombstone == 0 or summary.newest_tombstone > now) return 0;
+        return (summary.oldest_tombstone +| age) -| now;
+    }
+
+    pub fn tombstoneRunCount(self: *const Directory) usize {
+        return if (self.tree.root) |root| root.summary.tombstone_runs else 0;
+    }
+
+    pub const TombstoneCursor = struct {
+        directory: *const Directory,
+        rank: usize = 0,
+
+        pub fn next(self: *@This()) ?Handle {
+            const found = nextMarked(self.directory.tree.root, self.rank, 0) orelse return null;
+            self.rank = found.rank + 1;
+            return .{ .run = found.node.entry.run, .revision = found.node.entry.payload.? };
+        }
+        const Found = struct { node: *const Tree.Node, rank: usize };
+        fn nextMarked(root: ?*const Tree.Node, after: usize, base: usize) ?Found {
+            const node = root orelse return null;
+            if (node.summary.tombstone_runs == 0 or base + node.count <= after) return null;
+            const rank = base + (if (node.left) |left| left.count else 0);
+            if (nextMarked(node.left, after, base)) |found| return found;
+            if (rank >= after and (node.entry.run.tombstone_count orelse 0) != 0) return .{ .node = node, .rank = rank };
+            return nextMarked(node.right, after, rank + 1);
+        }
+    };
+
+    /// Skip tombstone-free subtrees when finding component anchors. Iteration
+    /// preserves read precedence, unlike a pre-order walk of marked nodes.
+    pub fn tombstoneCursor(self: *const Directory) TombstoneCursor {
+        return .{ .directory = self };
+    }
+
+    /// Diagnostic/oracle adapter only. Production selection walks immutable
+    /// overlap cursors; do not pay for a separate domain-order tree on every
+    /// publication just to accelerate an exceptional full projection.
     pub fn planningOrder(self: *const Directory, allocator: std.mem.Allocator) !PlanningOrder {
         const domain = try allocator.alloc(usize, self.count());
         errdefer allocator.free(domain);
         const ordered_bounds = try allocator.alloc(usize, self.count());
         errdefer allocator.free(ordered_bounds);
         if (self.count() == 0) return .{ .domain = domain, .bounds = ordered_bounds };
-        const first = self.domains.root.?.at(0);
-        const last = self.domains.root.?.at(self.count() - 1);
-        const one_domain = state.compareNamespace(.{ .name = first.run.smallest_namespace_name }, .{ .name = last.run.smallest_namespace_name }) == .eq and std.mem.eql(u8, first.domain, last.domain);
+        const entries = try allocator.alloc(Entry, self.count());
+        defer allocator.free(entries);
+        var by_level: Tree.Cursor = .{};
+        var one_domain = true;
+        for (entries, 0..) |*entry, i| {
+            entry.* = by_level.at(self.tree.root.?, i);
+            if (state.compareNamespace(.{ .name = entries[0].run.smallest_namespace_name }, .{ .name = entry.run.smallest_namespace_name }) != .eq or !std.mem.eql(u8, entries[0].domain, entry.domain)) one_domain = false;
+            domain[i] = i;
+        }
+        if (!one_domain) std.mem.sort(usize, domain, entries, struct {
+            fn less(all: []Entry, a: usize, b: usize) bool {
+                return compareDomain(all[a], all[b]) == .lt;
+            }
+        }.less);
         const one_sorted_level = self.levelCount() == 1 and self.levelAt(0).level != 0;
         if (one_domain and one_sorted_level) {
             for (0..self.count()) |i| {
@@ -349,12 +681,9 @@ pub const Directory = struct {
         var positions: std.AutoHashMapUnmanaged(u64, usize) = .empty;
         defer positions.deinit(allocator);
         try positions.ensureTotalCapacity(allocator, @intCast(self.count()));
-        var by_level: Tree.Cursor = .{};
-        for (0..self.count()) |i| positions.putAssumeCapacity(by_level.at(self.tree.root.?, i).run.id, i);
-        var by_domain: DomainTree.Cursor = .{};
+        for (entries, 0..) |entry, i| positions.putAssumeCapacity(entry.run.id, i);
         var by_bounds: BoundsTree.Cursor = .{};
         for (0..self.count()) |i| {
-            domain[i] = if (one_domain) i else positions.get(by_domain.at(self.domains.root.?, i).run.id).?;
             ordered_bounds[i] = if (one_sorted_level) i else positions.get(by_bounds.at(self.bounds.root.?, i).run.id).?;
         }
         return .{ .domain = domain, .bounds = ordered_bounds };
@@ -391,6 +720,58 @@ test "run directory path copies preserve pinned epochs through inserts removals 
     try std.testing.expectEqual(baseline_pins, backend.pins);
     const projected = try snapshot.project(allocator);
     defer allocator.free(projected);
+    {
+        const gc = try snapshot.fork(allocator);
+        defer gc.destroy(allocator);
+        try std.testing.expectEqual(@as(?u64, null), gc.tombstoneGcDelay(100, 1000));
+        var old = projected[0];
+        old.tombstone_count = 1;
+        old.oldest_tombstone_unix_ns = 950;
+        try gc.put(&backend, old);
+        try std.testing.expectEqual(@as(?u64, 50), gc.tombstoneGcDelay(100, 1000));
+        try std.testing.expectEqual(@as(?u64, 0), gc.tombstoneGcDelay(100, 1100));
+        try std.testing.expectEqual(@as(?u64, null), gc.tombstoneGcDelay(0, 1000));
+        var future = projected[1];
+        future.tombstone_count = 1;
+        future.oldest_tombstone_unix_ns = 1001;
+        try gc.put(&backend, future);
+        var deletes = gc.tombstoneCursor();
+        try std.testing.expectEqual(old.id, deletes.next().?.run.id);
+        try std.testing.expectEqual(future.id, deletes.next().?.run.id);
+        try std.testing.expect(deletes.next() == null);
+        try std.testing.expect(deletes.next() == null);
+        try std.testing.expectEqual(@as(?u64, 0), gc.tombstoneGcDelay(100, 1000));
+        try gc.remove(allocator, &future);
+        try std.testing.expectEqual(@as(?u64, 50), gc.tombstoneGcDelay(100, 1000));
+        old.gc_requested = true;
+        try gc.put(&backend, old);
+        try std.testing.expectEqual(@as(?u64, 0), gc.tombstoneGcDelay(0, 1000));
+        old.gc_requested = false;
+        old.oldest_tombstone_unix_ns = 0;
+        try gc.put(&backend, old);
+        try std.testing.expectEqual(@as(?u64, 0), gc.tombstoneGcDelay(100, 1000));
+        old.tombstone_count = 0;
+        old.gc_requested = true;
+        try gc.put(&backend, old);
+        try std.testing.expectEqual(@as(?u64, null), gc.tombstoneGcDelay(100, 1000));
+        try std.testing.expectEqual(@as(?u64, null), snapshot.tombstoneGcDelay(100, 1000));
+        var no_deletes = snapshot.tombstoneCursor();
+        try std.testing.expect(no_deletes.next() == null);
+    }
+    {
+        const detached = try Directory.create(allocator);
+        var alive = true;
+        defer if (alive) detached.destroy(allocator);
+        try detached.put(&backend, projected[0]);
+        const handle = detached.at(0).retain();
+        defer handle.release(allocator);
+        detached.destroy(allocator);
+        alive = false;
+        // A selected handle owns both its payload and accounting lifetime,
+        // even after every directory from that lineage has been reclaimed.
+        try std.testing.expectEqual(projected[0].id, handle.run.id);
+        try std.testing.expectEqualStrings(projected[0].smallest_key, handle.run.smallest_key);
+    }
     const candidate = try original.fork(allocator);
     defer candidate.destroy(allocator);
     for (projected, 0..) |*run, i| if (i % 2 == 0) {
@@ -401,6 +782,20 @@ test "run directory path copies preserve pinned epochs through inserts removals 
     const remaining = try candidate.project(allocator);
     defer allocator.free(remaining);
     for (remaining, 0..) |run, i| try std.testing.expectEqual(@as(u64, 2 * i + 2), run.id);
+    try std.testing.expect(candidate.resolve(snapshot.at(0)) == null);
+    try std.testing.expectEqual(@as(?usize, 0), candidate.resolve(snapshot.at(1)));
+    var overlap = candidate.overlaps(null, projected[30].smallest_key, null, projected[40].largest_key);
+    var matches: usize = 0;
+    while (!overlap.done()) {
+        var budget: usize = 1;
+        if (overlap.next(&budget)) |handle| {
+            try std.testing.expect(handle.run.id >= 31 and handle.run.id <= 41);
+            try std.testing.expect(handle.run.id % 2 == 0);
+            matches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), matches);
+    try std.testing.expect(overlap.visited < candidate.count() / 2);
     const Changes = struct {
         removed: [256]bool = @splat(false),
         pub fn put(_: *@This(), _: Run) !void {
@@ -418,6 +813,18 @@ test "run directory path copies preserve pinned epochs through inserts removals 
     // genuinely shared roots, without hiding removals or visiting them twice.
     try candidate.changesSince(snapshot, &changes);
     for (changes.removed, 0..) |removed, i| try std.testing.expectEqual(i % 2 == 0, removed);
+    var incremental = Directory.ChangeCursor.init(snapshot, candidate);
+    var incremental_changes: Changes = .{};
+    var no_credit: usize = 0;
+    try std.testing.expect(incremental.next(&no_credit) == null);
+    while (!incremental.done()) {
+        var credit: usize = 1;
+        if (incremental.next(&credit)) |change| switch (change.kind) {
+            .remove => try incremental_changes.remove(change.run.*),
+            .put => try incremental_changes.put(change.run.*),
+        };
+    }
+    try std.testing.expectEqualSlices(bool, &changes.removed, &incremental_changes.removed);
     const Validator = struct {
         fn validate(runs: []const Run) !void {
             for (runs, 0..) |run, i| {

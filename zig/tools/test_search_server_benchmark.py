@@ -273,6 +273,36 @@ class ServerBenchmarkTest(unittest.TestCase):
             path.write_bytes(base + edit + edit)
             self.assertIsNone(benchmark.lsm_manifest_inventory(root, path))
 
+            def checked(body):
+                return body + struct.pack("<I", zlib.crc32(body))
+
+            (root / "manifest-10.checkpoint").write_bytes(base)
+            (root / "manifest-20.journal").write_bytes(
+                checked(b"ALSMSEG1" + struct.pack("<QQ", 20, 1)) + edit
+            )
+            (root / "manifest-20.next").write_bytes(
+                checked(b"ALSMNXT1" + struct.pack("<QQ", 20, 21))
+            )
+            (root / "manifest-21.journal").write_bytes(
+                checked(b"ALSMSEG1" + struct.pack("<QQ", 21, 2))
+            )
+            (root / "manifest-11.checkpoint").write_bytes(
+                frame(1, True, lsm_manifest([], [], 0, version=10))
+            )
+            for checkpoint, segment, sequence in ((10, 20, 0), (11, 21, 1)):
+                path.write_bytes(
+                    checked(
+                        b"ALSMSET1" + struct.pack("<QQQ", checkpoint, segment, sequence)
+                    )
+                )
+                inventory = benchmark.lsm_manifest_inventory(root, path)
+                self.assertIsNotNone(inventory)
+                self.assertEqual([], inventory["active_runs"])
+            (root / "manifest-21.next").write_bytes(
+                checked(b"ALSMNXT1" + struct.pack("<QQ", 21, 20))
+            )
+            self.assertIsNone(benchmark.lsm_manifest_inventory(root, path))
+
     def test_response_hit_count_supports_antfly_and_quickwit(self):
         self.assertEqual(1, benchmark.response_hit_count(b'{"hits":[{"id":"doc:1"}]}'))
         self.assertEqual(

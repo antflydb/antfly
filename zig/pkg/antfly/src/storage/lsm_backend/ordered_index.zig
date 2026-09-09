@@ -21,9 +21,17 @@ const Account = @import("memory_account.zig").Account;
 /// Unused nodes stay in the writer's small pool, avoiding O(height) allocator
 /// calls on ordinary unshared inserts and updates.
 pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.Order) type {
+    return SummarizedIndex(Entry, compare, Entry);
+}
+
+/// Multiple indexes can share an owned entry without duplicating unrelated
+/// aggregates on every node. `void` selects a rank-only index.
+pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.Order, comptime SummaryPolicy: type) type {
     return struct {
         const Self = @This();
         pub const Node = struct {
+            const Summary = if (SummaryPolicy != void and @hasDecl(SummaryPolicy, "Summary")) SummaryPolicy.Summary else void;
+            summary: Summary = if (Summary == void) {} else .{},
             account: ?*Account = null,
             refs: std.atomic.Value(usize) = .init(1),
             entry: Entry,
@@ -52,6 +60,7 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
                 self.height = 1 + @max(depth(self.left), depth(self.right));
                 self.bytes = @sizeOf(Node) + self.entry.retainedBytes() +
                     (if (self.left) |node| node.bytes else 0) + (if (self.right) |node| node.bytes else 0);
+                if (Summary != void) self.summary = SummaryPolicy.summarize(self.entry, if (self.left) |node| node.summary else .{}, if (self.right) |node| node.summary else .{});
             }
 
             pub fn at(root: *const Node, rank: usize) Entry {
@@ -152,6 +161,60 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
             self.* = .{};
         }
 
+        /// An owned destruction continuation. A bounded DFS stack replaces
+        /// recursive last-reference destruction; shared subtrees cost one
+        /// credit regardless of their size. No allocation is needed to retire
+        /// a root, including on OOM and cancellation paths.
+        pub const Reclaimer = struct {
+            owned: Self,
+            pending: [2 * @bitSizeOf(usize)]*Node = undefined,
+            len: usize = 0,
+            complete: bool = false,
+
+            pub fn init(owned: Self) @This() {
+                var out = @This(){ .owned = owned };
+                if (owned.root) |root| {
+                    out.pending[0] = root;
+                    out.len = 1;
+                }
+                out.owned.root = null;
+                return out;
+            }
+            pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+                if (self.complete) return true;
+                while (credits.* != 0 and self.len != 0) {
+                    credits.* -= 1;
+                    self.len -= 1;
+                    const node = self.pending[self.len];
+                    if (node.refs.fetchSub(1, .acq_rel) != 1) continue;
+                    if (node.left) |child| {
+                        self.pending[self.len] = child;
+                        self.len += 1;
+                    }
+                    if (node.right) |child| {
+                        self.pending[self.len] = child;
+                        self.len += 1;
+                    }
+                    node.entry.deinit(allocator);
+                    if (node.account) |account| account.discharge(@sizeOf(Node));
+                    allocator.destroy(node);
+                }
+                if (self.len != 0) return false;
+                while (credits.* != 0) {
+                    const node = self.owned.spare.pop() orelse break;
+                    credits.* -= 1;
+                    if (self.owned.account) |account| account.discharge(@sizeOf(Node));
+                    allocator.destroy(node);
+                }
+                if (self.owned.spare.items.len != 0) return false;
+                self.owned.spare.deinit(allocator);
+                if (self.owned.account) |account| account.release();
+                self.owned = .{};
+                self.complete = true;
+                return true;
+            }
+        };
+
         pub fn fork(self: *const Self) Self {
             return .{ .root = if (self.root) |root| root.retain() else null, .account = if (self.account) |account| account.retain() else null };
         }
@@ -163,8 +226,27 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
         }
 
         pub fn prepare(self: *Self, allocator: std.mem.Allocator) !void {
+            return self.prepareEdits(allocator, 1);
+        }
+
+        /// Reserve a publication's edits before changing any shared root.
+        /// The AVL height bound includes growth caused by the entire batch.
+        fn preparedNodeCount(self: *const Self, edits: usize) !usize {
+            if (edits == 0) return 0;
+            const growth = if (edits == 1) 0 else std.math.log2_int(usize, edits) + 1;
+            return std.math.mul(usize, edits, 3 * (@as(usize, depth(self.root)) + growth) + 4);
+        }
+
+        /// Conservative allocation bound, including pointer-vector growth.
+        pub fn prepareMemoryBound(self: *const Self, edits: usize) !u64 {
+            const needed = try self.preparedNodeCount(edits);
+            return std.math.add(u64, @sizeOf(Account), try std.math.mul(u64, needed, @sizeOf(Node) + 2 * @sizeOf(*Node)));
+        }
+
+        pub fn prepareEdits(self: *Self, allocator: std.mem.Allocator, edits: usize) !void {
+            if (edits == 0) return;
             if (self.account == null) self.account = try Account.create(allocator);
-            const needed = 3 * @as(usize, depth(self.root)) + 4;
+            const needed = try self.preparedNodeCount(edits);
             try self.spare.ensureTotalCapacity(allocator, needed);
             while (self.spare.items.len < needed) {
                 const node = try allocator.create(Node);
@@ -176,7 +258,7 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
         fn unique(self: *Self, allocator: std.mem.Allocator, node: *Node) *Node {
             if (node.refs.load(.acquire) == 1) return node;
             const copy = self.spare.pop().?;
-            copy.* = .{ .account = self.account, .entry = node.entry.retainShared(), .left = if (node.left) |child| child.retain() else null, .right = if (node.right) |child| child.retain() else null, .count = node.count, .height = node.height, .bytes = node.bytes };
+            copy.* = .{ .account = self.account, .entry = node.entry.retainShared(), .left = if (node.left) |child| child.retain() else null, .right = if (node.right) |child| child.retain() else null, .count = node.count, .height = node.height, .bytes = node.bytes, .summary = node.summary };
             node.release(allocator);
             return copy;
         }
@@ -266,6 +348,41 @@ pub fn Index(comptime Entry: type, comptime compare: fn (Entry, Entry) std.math.
         /// Like insertion, removal consumes only the nodes reserved by prepare.
         pub fn removePrepared(self: *Self, allocator: std.mem.Allocator, entry: Entry) void {
             self.root = self.remove(allocator, self.root, entry);
+        }
+
+        pub fn find(root: ?*const Node, probe: Entry) ?*const Node {
+            var current = root;
+            while (current) |node| switch (compare(probe, node.entry)) {
+                .lt => current = node.left,
+                .gt => current = node.right,
+                .eq => return node,
+            };
+            return null;
+        }
+
+        /// Shared subtree identity avoids a complete merge walk, including
+        /// when rotations moved a shared subtree to a different parent.
+        pub fn changesSince(self: *const Self, previous: *const Self, visitor: anytype) !void {
+            try removed(previous.root, self.root, visitor);
+            try added(self.root, previous.root, visitor);
+        }
+
+        fn removed(root: ?*const Node, current: ?*const Node, visitor: anytype) !void {
+            const node = root orelse return;
+            const match = find(current, node.entry);
+            if (match == node) return;
+            try removed(node.left, current, visitor);
+            if (match == null) try visitor.remove(node.entry);
+            try removed(node.right, current, visitor);
+        }
+
+        fn added(root: ?*const Node, previous: ?*const Node, visitor: anytype) !void {
+            const node = root orelse return;
+            const match = find(previous, node.entry);
+            if (match == node) return;
+            try added(node.left, previous, visitor);
+            if (match == null or !Entry.eql(node.entry, match.?.entry)) try visitor.put(node.entry);
+            try added(node.right, previous, visitor);
         }
     };
 }

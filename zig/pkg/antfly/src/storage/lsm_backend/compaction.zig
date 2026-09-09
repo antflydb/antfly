@@ -18,9 +18,73 @@ const state_mod = @import("state.zig");
 const repository_mod = @import("repository.zig");
 const runtime_mod = @import("runtime.zig");
 const compaction_scheduler_mod = @import("compaction_scheduler.zig");
+const Directory = @import("run_directory.zig").Directory;
+const run_store = @import("run_store.zig");
+const ClosureJob = @import("closure_job.zig").Job;
+const resource_manager_mod = @import("../resource_manager.zig");
 
 const State = state_mod.State;
 const Run = repository_mod.Run;
+
+test "resumable closure bounds discovery and emission and cleans up every allocation failure" {
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+        fn check(allocator: std.mem.Allocator, directory: *const Directory) !void {
+            var job = try ClosureJob.init(allocator, directory, &.{directory.at(0)}, 0, false);
+            defer job.deinit(allocator);
+            try std.testing.expect(!try job.step(allocator, 0));
+            try std.testing.expect(!try job.stepUntil(allocator, 7, 0));
+            try std.testing.expectEqual(@as(usize, 0), job.visits);
+            var slices: usize = 0;
+            while (true) {
+                const before = job.visits + job.emitted;
+                const done = try job.step(allocator, 7);
+                try std.testing.expect(job.visits + job.emitted - before <= 7);
+                slices += 1;
+                if (done) break;
+            }
+            try std.testing.expect(slices > 1);
+            try std.testing.expect(try job.stepUntil(allocator, 1, 0));
+            try std.testing.expectEqual(directory.count(), job.emitted);
+            try std.testing.expectEqual(@as(usize, 1), job.source_len);
+            for (job.handles.?, job.indices.?, 0..) |handle, index, rank| {
+                try std.testing.expectEqual(rank, index);
+                try std.testing.expectEqual(directory.at(rank).run.id, handle.run.id);
+            }
+        }
+    };
+    const allocator = std.testing.allocator;
+    var fixture = Fixture{ .allocator = allocator };
+    const directory = try Directory.create(allocator);
+    defer directory.destroy(allocator);
+    for (0..33) |i| {
+        var key: [8]u8 = undefined;
+        var end: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        std.mem.writeInt(u64, &end, if (i == 0) 33 else i, .big);
+        try directory.put(&fixture, .{
+            .id = i + 1,
+            .level = if (i == 0) 0 else 1,
+            .size_bytes = 1,
+            .path = @constCast("closure.sst"),
+            .smallest_namespace_name = null,
+            .smallest_key = &key,
+            .largest_namespace_name = null,
+            .largest_key = &end,
+            .entry_count = 1,
+            .bloom_filter = null,
+            .state = null,
+        });
+    }
+    try std.testing.checkAllAllocationFailures(allocator, Fixture.check, .{directory});
+    var limited = try ClosureJob.init(allocator, directory, &.{directory.at(0)}, 2, false);
+    defer limited.deinit(allocator);
+    while (!try limited.step(allocator, 1)) {}
+    try std.testing.expect(limited.phase == .oversized);
+}
+
 fn gcNowNs() u64 {
     return @import("antfly_platform").time.realtimeNs();
 }
@@ -32,12 +96,20 @@ pub fn nextTombstoneGcDelay(backend: anytype) ?u64 {
         if (backend.tombstone_gc_retry_after_ns != 0)
             return backend.tombstone_gc_retry_after_ns -| backend.nowNs();
     }
-    for (backend.runs.items) |run| if (run.gc_requested and (run.tombstone_count orelse 0) != 0) return 0;
+    if (comptime @hasField(@TypeOf(backend.*), "run_directory_dirty")) {
+        if (!backend.run_directory_dirty) if (backend.run_directory) |directory|
+            return directory.tombstoneGcDelay(backend.options.tombstone_gc_max_age_ns, gcNowNs());
+    }
+    for (0..run_store.count(backend)) |rank| {
+        const run = run_store.at(backend, rank);
+        if (run.gc_requested and (run.tombstone_count orelse 0) != 0) return 0;
+    }
     if (comptime !@hasField(@TypeOf(backend.options), "tombstone_gc_max_age_ns")) return null;
     if (backend.options.tombstone_gc_max_age_ns == 0) return null;
     const now = gcNowNs();
     var delay: ?u64 = null;
-    for (backend.runs.items) |run| {
+    for (0..run_store.count(backend)) |rank| {
+        const run = run_store.at(backend, rank).*;
         if ((run.tombstone_count orelse 0) == 0) continue;
         // Unknown ages and wall-clock rollback must not postpone GC indefinitely.
         const due = if (run.oldest_tombstone_unix_ns == 0 or run.oldest_tombstone_unix_ns > now) 0 else run.oldest_tombstone_unix_ns +| backend.options.tombstone_gc_max_age_ns;
@@ -60,6 +132,7 @@ pub const max_exact_l0_overlap_runs = 64;
 pub var test_output_partitions_only: bool = false;
 
 fn domainPlanningEnabled(backend: anytype) bool {
+    if (comptime @hasDecl(@TypeOf(backend.*), "planningDirectory")) return !(@import("builtin").is_test and test_output_partitions_only);
     return backend.options.run_partition_key != null and !(@import("builtin").is_test and test_output_partitions_only);
 }
 
@@ -78,6 +151,7 @@ const CompactionWork = struct {
 };
 
 pub const CompactionPlan = struct {
+    complete_coverage: ?bool = null,
     source_level: u32,
     source_start: usize,
     source_len: usize,
@@ -91,6 +165,7 @@ pub const CompactionPlan = struct {
     // A whole overlap component, potentially spanning several levels.
     tombstone_gc: bool = false,
     split_gc: bool = false,
+    input_handles: ?[]const Directory.Handle = null,
 
     pub fn sourceIndex(self: @This(), i: usize) usize {
         const index = self.source_start + i;
@@ -105,10 +180,227 @@ pub const CompactionPlan = struct {
 
 const SelectedPlan = struct {
     plan: CompactionPlan,
+    borrowed_inputs: bool = false,
+    complete_coverage: ?bool = null,
+    reservation: ?resource_manager_mod.Reservation = null,
+    gc_objective_handles: ?[]const Directory.Handle = null,
+    gc_objective_indices: ?[]const usize = null,
+    released_inputs: usize = 0,
+    released_objectives: usize = 0,
     fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        var owned = self;
+        var credits: usize = std.math.maxInt(usize);
+        std.debug.assert(owned.deinitStep(allocator, &credits));
+    }
+    fn release(self: @This(), backend: anytype) void {
+        if (comptime @typeInfo(@TypeOf(backend)) != .pointer) {
+            self.deinit(backend.allocator);
+            return;
+        }
+        if (comptime !supportsUnlockedBackendCompaction(@TypeOf(backend.*))) {
+            self.deinit(backend.allocator);
+            return;
+        }
+        if (self.borrowed_inputs) {
+            self.deinit(backend.allocator);
+            return;
+        }
+        // End-of-operation cleanup cannot extend the writer fence with K
+        // handle releases. The caller no longer uses this selected plan.
+        backend.retainReaderKind(.compaction);
+        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        var owned = self;
+        while (true) {
+            var credits: usize = 2048;
+            const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+            var done = false;
+            while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+                var quantum: usize = @min(credits, 64);
+                const before = quantum;
+                done = owned.deinitStep(backend.allocator, &quantum);
+                credits -= before - quantum;
+                if (done) break;
+            }
+            if (done) break;
+            if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};
+        }
+        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+        backend.releaseReaderKind(.compaction);
+    }
+    fn deinitStep(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+        if (!self.borrowed_inputs) if (self.plan.input_handles) |handles| {
+            while (self.released_inputs < handles.len and credits.* != 0) {
+                handles[self.released_inputs].release(allocator);
+                self.released_inputs += 1;
+                credits.* -= 1;
+            }
+            if (self.released_inputs != handles.len) return false;
+            allocator.free(handles);
+            self.plan.input_handles = null;
+        };
+        if (self.gc_objective_handles) |handles| {
+            while (self.released_objectives < handles.len and credits.* != 0) {
+                handles[self.released_objectives].release(allocator);
+                self.released_objectives += 1;
+                credits.* -= 1;
+            }
+            if (self.released_objectives != handles.len) return false;
+            allocator.free(handles);
+            self.gc_objective_handles = null;
+        }
         if (self.plan.run_indices) |indices| allocator.free(indices);
+        self.plan.run_indices = null;
+        if (self.gc_objective_indices) |indices| allocator.free(indices);
+        self.gc_objective_indices = null;
+        if (self.reservation) |*lease| lease.release();
+        self.reservation = null;
+        return true;
     }
 };
+
+/// An exceptional broad ordinary closure belongs to maintenance, not to the
+/// stack of whichever request first noticed pressure. Keep its epoch and
+/// scratch reservation until the cursor completes or is discarded.
+pub const PendingDirectoryClosure = struct {
+    directory: *Directory,
+    job: ClosureJob,
+    retired_job: ?ClosureJob = null,
+    retired_next: ?*@This() = null,
+    seeds: []Directory.Handle,
+    seed_len: usize,
+    max_bytes: u64,
+    allow_oversized: bool,
+    overlap_threshold: usize,
+    reservation: ?resource_manager_mod.Reservation = null,
+
+    fn create(backend: anytype, seeds: []const Directory.Handle, max_bytes: u64, allow_oversized: bool, overlap_threshold: usize) !*@This() {
+        const allocator = backend.allocator;
+        var reservation: ?resource_manager_mod.Reservation = null;
+        errdefer if (reservation) |*lease| lease.release();
+        const current = try backend.planningDirectory();
+        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, 64 * 1024 + current.count() * 256);
+        const directory = try current.fork(allocator);
+        errdefer directory.destroy(allocator);
+        const owned = try allocator.dupe(Directory.Handle, seeds);
+        errdefer allocator.free(owned);
+        const self = try allocator.create(@This());
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .directory = directory,
+            .job = try ClosureJob.init(allocator, directory, owned, max_bytes, false),
+            .seeds = owned,
+            .seed_len = owned.len,
+            .max_bytes = max_bytes,
+            .allow_oversized = allow_oversized,
+            .overlap_threshold = overlap_threshold,
+            .reservation = reservation,
+        };
+        return self;
+    }
+
+    pub fn cleanupStep(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+        if (self.retired_job) |*job| {
+            if (!job.deinitStep(allocator, credits)) return false;
+            self.retired_job = null;
+        }
+        return self.job.deinitStep(allocator, credits);
+    }
+
+    fn step(self: *@This(), allocator: std.mem.Allocator, deadline: u64) !bool {
+        var credits: usize = 2048;
+        if (self.retired_job) |*job| {
+            while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+                var quantum: usize = @min(credits, 64);
+                const before = quantum;
+                const done = job.deinitStep(allocator, &quantum);
+                credits -= before - quantum;
+                if (done) {
+                    self.retired_job = null;
+                    break;
+                }
+            }
+            if (self.retired_job != null) return false;
+        }
+        return self.job.stepUntil(allocator, credits, deadline);
+    }
+
+    pub fn destroy(self: *@This(), backend: anytype) void {
+        const allocator = backend.allocator;
+        var credits: usize = std.math.maxInt(usize);
+        std.debug.assert(self.cleanupStep(allocator, &credits));
+        backend.retireCheckpointDirectory(self.directory);
+        allocator.free(self.seeds);
+        if (self.reservation) |*lease| lease.release();
+        allocator.destroy(self);
+    }
+};
+
+fn resumeDirectoryClosure(backend: anytype) !?SelectedPlan {
+    const pending = backend.pending_directory_closure.?;
+    if (backend.directory_planning_in_flight) return null;
+    backend.directory_planning_in_flight = true;
+    defer backend.directory_planning_in_flight = false;
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    const BackendType = @TypeOf(backend.*);
+    if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+    runtime_mod.unlockBackend(BackendType, backend, true);
+    const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+    const advanced = pending.step(backend.allocator, deadline);
+    _ = runtime_mod.lockBackend(BackendType, backend);
+    backend.directory_planning_slices +|= 1;
+    var destroy = false;
+    defer if (destroy) {
+        backend.pending_directory_closure = null;
+        backend.retireClosurePlanning(pending);
+    };
+    const done = advanced catch |err| {
+        destroy = true;
+        return err;
+    };
+    if (!done) return null;
+    if (pending.job.phase == .oversized) {
+        const retry = pending.seed_len > 1 or (pending.allow_oversized and pending.job.max_bytes != 0);
+        if (!retry) {
+            destroy = true;
+            return null;
+        }
+        pending.seed_len = @max(@as(usize, 1), pending.seed_len / 2);
+        const limit = if (pending.seed_len == 1 and pending.job.max_bytes != 0 and pending.allow_oversized) 0 else pending.max_bytes;
+        var replacement = try ClosureJob.init(backend.allocator, pending.directory, pending.seeds[0..pending.seed_len], limit, false);
+        std.mem.swap(ClosureJob, &replacement, &pending.job);
+        pending.retired_job = replacement;
+        return null;
+    }
+    destroy = true;
+    if (pending.job.source_len < pending.overlap_threshold) return null;
+    const handles = pending.job.handles.?;
+    var selected = SelectedPlan{ .plan = .{
+        .source_level = pending.job.source_level,
+        .source_start = 0,
+        .source_len = pending.job.source_len,
+        .target_start = pending.job.source_len,
+        .target_len = handles.len - pending.job.source_len,
+        .output_level = pending.job.source_level +| 1,
+        .run_indices = pending.job.indices,
+        .input_handles = handles,
+        .partition_key = backend.options.run_partition_key,
+    } };
+    pending.job.handles = null;
+    pending.job.indices = null;
+    errdefer selected.release(backend);
+    if ((try backend.planningDirectory()).tree.root != pending.directory.tree.root) {
+        const relocated = try relocateDirectoryPlan(backend, selected.plan) orelse {
+            selected.release(backend);
+            return null;
+        };
+        backend.allocator.free(selected.plan.run_indices.?);
+        selected.plan.run_indices = relocated.plan.run_indices;
+    }
+    selected.reservation = pending.reservation;
+    pending.reservation = null;
+    return selected;
+}
 
 fn sameDomain(a: Run, b: Run, partition: *const fn ([]const u8) []const u8) bool {
     return state_mod.compareNamespace(.{ .name = a.smallest_namespace_name }, .{ .name = b.smallest_namespace_name }) == .eq and
@@ -140,7 +432,8 @@ pub const DomainIndex = struct {
 
     pub fn create(backend: anytype) !*DomainIndex {
         const allocator = backend.allocator;
-        const source = backend.runs.items;
+        const source = try run_store.project(backend, allocator);
+        defer allocator.free(source);
         const partition = backend.options.run_partition_key orelse wholeKeyspace;
         const self = try allocator.create(DomainIndex);
         errdefer allocator.destroy(self);
@@ -293,7 +586,7 @@ fn gcComponentEligible(backend: anytype, indices: []const usize) bool {
     var entries: u64 = 0;
     var requested = false;
     for (indices) |i| {
-        const run = backend.runs.items[i];
+        const run = run_store.at(backend, i).*;
         const deletes = run.tombstone_count orelse 0;
         tombstones +|= deletes;
         entries = @max(entries, run.entry_count);
@@ -319,7 +612,7 @@ fn requestEligibleGcComponents(backend: anytype, index: *const DomainIndex) !voi
             continue;
         }
         for (indices) |i| {
-            const run = &backend.runs.items[i];
+            const run = run_store.at(backend, i);
             if ((run.tombstone_count orelse 0) == 0 or run.gc_requested) continue;
             run.gc_requested = true;
             changed = true;
@@ -339,7 +632,7 @@ fn tombstoneGcCandidate(backend: anytype, index: *const DomainIndex, max_bytes: 
         var bytes: u64 = 0;
         var level: u32 = 1;
         for (indices) |i| {
-            const run = backend.runs.items[i];
+            const run = run_store.at(backend, i).*;
             bytes +|= run.size_bytes;
             level = @max(level, run.level);
         }
@@ -355,13 +648,477 @@ fn tombstoneGcCandidate(backend: anytype, index: *const DomainIndex, max_bytes: 
 }
 
 pub fn hasTombstoneGcDebt(backend: anytype) bool {
+    if (comptime @hasField(@TypeOf(backend.*), "run_directory_dirty")) {
+        if (!backend.run_directory_dirty) if (backend.run_directory) |directory| {
+            if (directory.tombstoneRunCount() == 0) return false;
+        };
+    }
+    if (comptime @hasField(@TypeOf(backend.*), "gc_debt_cache")) {
+        if (backend.gc_debt_cache) |cache| {
+            const now = gcNowNs();
+            if (cache.generation == backend.run_directory_generation and cache.age == backend.options.tombstone_gc_max_age_ns and cache.percent == backend.options.tombstone_gc_min_percent and now >= cache.checked_at and now < cache.valid_until) return cache.has_debt;
+        }
+        // Unknown debt schedules one bounded/off-lock discovery, not a global
+        // projection under the maintenance scoring lock.
+        return true;
+    }
     const index = backend.domainIndex() catch return true;
     // Debt is independent of temporary admission denial. Below the garbage
     // fraction there is no standalone job, so the scheduler can become idle.
     return tombstoneGcCandidate(backend, index, 0) != null;
 }
 
+pub const GcDebtCache = struct {
+    generation: u64,
+    age: u64,
+    percent: u8,
+    checked_at: u64,
+    valid_until: u64 = std.math.maxInt(u64),
+    has_debt: bool = false,
+};
+
+pub const PendingGc = struct {
+    directory: *Directory,
+    job: @import("gc_job.zig").Job,
+    cache: GcDebtCache,
+    reservation: ?resource_manager_mod.Reservation = null,
+    retired_next: ?*PendingGc = null,
+    selected: ?SelectedPlan = null,
+    intent: ?Intent = null,
+
+    const Intent = struct {
+        base: *Directory,
+        directory: ?*Directory,
+        store: ?*run_store.Store,
+        index: usize = 0,
+        refreshed: usize = 0,
+        wire: u64,
+        header_bytes: u64,
+        reservation: ?resource_manager_mod.Reservation = null,
+        rebase: ?Rebase = null,
+
+        const Rebase = struct {
+            directory: *Directory,
+            store: *run_store.Store,
+            changes: Directory.ChangeCursor,
+        };
+
+        fn beginRebase(self: *Intent, backend: anytype) !void {
+            const current = try backend.planningDirectory();
+            const directory = try current.fork(backend.allocator);
+            errdefer directory.destroy(backend.allocator);
+            const store = try backend.allocator.create(run_store.Store);
+            store.* = backend.runs.fork();
+            self.rebase = .{ .directory = directory, .store = store, .changes = .init(self.base, directory) };
+        }
+
+        fn finishRebase(self: *Intent, backend: anytype) void {
+            const rebase = self.rebase.?;
+            std.debug.assert(rebase.changes.done());
+            backend.retireCheckpointDirectory(self.base);
+            self.base = rebase.directory;
+            backend.retireRunStore(rebase.store);
+            self.rebase = null;
+        }
+
+        fn stepRebase(self: *Intent, backend: anytype, component: *const ClosureJob, selected: *const SelectedPlan, credits_arg: usize, deadline: u64) !bool {
+            var credits = credits_arg;
+            const rebase = &self.rebase.?;
+            const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
+            const first = objectives[0].run;
+            const first_visibility = if (first.visibility_id == 0) first.id else first.visibility_id;
+            while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+                const change = rebase.changes.next(&credits) orelse return rebase.changes.done();
+                const run = change.run;
+                if (Directory.containsReadOrdered(objectives, run)) return error.CompactionPlanningStale;
+                const visibility = if (run.visibility_id == 0) run.id else run.visibility_id;
+                const newer = run.level < first.level or
+                    (first.level == 0 and run.level == 0 and visibility > first_visibility);
+                const overlap = compareRunBound(run.largest_namespace_name, run.largest_key, component.lower_ns, component.lower) != .lt and
+                    compareRunBound(run.smallest_namespace_name, run.smallest_key, component.upper_ns, component.upper) != .gt;
+                if (overlap and !newer) return error.CompactionPlanningStale;
+                // Admit the changed paths before cloning them. The original
+                // broad intent is retained; only concurrent deltas add credit.
+                if (self.reservation) |*lease| {
+                    const height = @max(self.directory.?.tree.root.?.height, rebase.directory.tree.root.?.height);
+                    const names = run.smallest_key.len + run.largest_key.len +
+                        (if (run.path) |path| path.len else 0) +
+                        (if (run.smallest_namespace_name) |name| name.len else 0) +
+                        (if (run.largest_namespace_name) |name| name.len else 0);
+                    try lease.growBoundedOversized(4096 + @as(u64, height) * 8192 + names +
+                        (if (run.state) |*state| state.estimatedMemoryBytes() else 0), 1);
+                }
+                if (change.kind == .remove) {
+                    try self.store.?.remove(backend.allocator, run);
+                    try self.directory.?.remove(backend.allocator, run);
+                } else {
+                    const source = rebase.store.find(run) orelse return error.CompactionPlanningStale;
+                    const revision = run_store.Store.revision(source, run.*);
+                    try self.store.?.stageRevision(backend.allocator, revision);
+                    self.store.?.adopt(&revision);
+                    try self.directory.?.put(backend, revision);
+                }
+            }
+            return rebase.changes.done();
+        }
+
+        fn create(backend: anytype, pending: *PendingGc) !Intent {
+            const allocator = backend.allocator;
+            const current = try backend.planningDirectory();
+            const changes: u64 = pending.job.intent_runs;
+            const height: u64 = @max(
+                @max(if (current.tree.root) |root| root.height else 1, if (current.ids.root) |root| root.height else 1),
+                @max(if (current.bounds.root) |root| root.height else 1, if (current.levels.root) |root| root.height else 1),
+                if (backend.runs.tree.root) |root| root.height else 1,
+            );
+            const nodes = @min(current.count(), changes *| height);
+            const node_bytes = @sizeOf(@TypeOf(current.tree).Node) + @sizeOf(@TypeOf(current.ids).Node) + @sizeOf(@TypeOf(current.bounds).Node) + @sizeOf(@TypeOf(current.levels).Node) + @sizeOf(run_store.Store.Tree.Node);
+            const scratch = 8192 +| (nodes +| height * 8 +| 64) *| node_bytes +| changes *| (2 * @sizeOf(Run) + 256) +| pending.job.intent_data_bytes;
+            var reservation: ?resource_manager_mod.Reservation = null;
+            errdefer if (reservation) |*lease| lease.release();
+            if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, scratch);
+            const wire = try backend.reserveGcMetadata(if (changes != 0) pending.job.intent_wire_bytes else 0);
+            errdefer backend.manifest_reserved_mutation_bytes -= wire;
+            const base = try current.fork(allocator);
+            errdefer base.destroy(allocator);
+            const directory = try current.fork(allocator);
+            errdefer directory.destroy(allocator);
+            const store = try allocator.create(run_store.Store);
+            store.* = backend.runs.fork();
+            return .{ .base = base, .directory = directory, .store = store, .wire = wire, .reservation = reservation, .header_bytes = 3 * @sizeOf(Directory) + 2 * @sizeOf(run_store.Store) + (2 * @bitSizeOf(usize) * 8 + 128) * 5 * @sizeOf(usize) };
+        }
+
+        fn step(self: *Intent, backend: anytype, selected: *SelectedPlan, credits_arg: usize, deadline: u64) !bool {
+            var credits = credits_arg;
+            const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
+            while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+                credits -= 1;
+                if (self.index < objectives.len) {
+                    const handle = objectives[self.index];
+                    if ((handle.run.tombstone_count orelse 0) != 0 and !handle.run.gc_requested) {
+                        const source = self.store.?.find(handle.run) orelse return error.CompactionPlanningStale;
+                        var revision = run_store.Store.revision(source, handle.run.*);
+                        revision.gc_requested = true;
+                        try self.store.?.stageRevision(backend.allocator, revision);
+                        self.store.?.adopt(&revision);
+                        try self.directory.?.put(backend, revision);
+                    }
+                    self.index += 1;
+                    continue;
+                }
+                const handles = selected.plan.input_handles orelse return true;
+                if (self.refreshed == handles.len) return true;
+                const old = handles[self.refreshed];
+                const run = self.directory.?.byId(old.run.id) orelse return error.CompactionPlanningStale;
+                const rank = self.directory.?.rankOf(run).?;
+                @constCast(selected.plan.run_indices.?)[self.refreshed] = rank;
+                @constCast(handles)[self.refreshed] = self.directory.?.at(rank).retain();
+                old.release(backend.allocator);
+                self.refreshed += 1;
+            }
+            return false;
+        }
+
+        fn discard(self: *Intent, backend: anytype) void {
+            if (self.rebase) |rebase| {
+                backend.retireCheckpointDirectory(rebase.directory);
+                backend.retireRunStore(rebase.store);
+            }
+            if (self.store) |store| backend.retireRunStore(store);
+            if (self.directory) |directory| backend.retireCheckpointDirectory(directory);
+            backend.retireCheckpointDirectory(self.base);
+            backend.manifest_reserved_mutation_bytes -= self.wire;
+            if (self.reservation) |*lease| lease.release();
+        }
+    };
+
+    pub fn cleanupStep(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+        if (self.selected) |*selected| {
+            if (!selected.deinitStep(allocator, credits)) return false;
+            self.selected = null;
+        }
+        return self.job.deinitStep(allocator, credits);
+    }
+
+    pub fn accountedMemoryBytes(self: *const @This(), pass: u64) u64 {
+        // Candidate roots share the already-reachable atomic accounts. Their
+        // mutable tree headers must not be inspected by a concurrent writer.
+        return self.directory.accountedMemoryBytes(pass) + if (self.intent) |*intent| intent.header_bytes else @as(u64, 0);
+    }
+
+    pub fn discardIntent(self: *@This(), backend: anytype) void {
+        if (self.intent) |*intent| intent.discard(backend);
+        self.intent = null;
+    }
+
+    pub fn destroy(self: *@This(), backend: anytype) void {
+        self.discardIntent(backend);
+        if (self.selected) |selected| selected.deinit(backend.allocator);
+        self.job.deinit(backend.allocator);
+        backend.retireCheckpointDirectory(self.directory);
+        if (self.reservation) |*lease| lease.release();
+        backend.allocator.destroy(self);
+    }
+    fn take(self: *@This(), allocator: std.mem.Allocator) !?SelectedPlan {
+        if (!self.job.eligible) return null;
+        const component = &self.job.component.?;
+        var result = SelectedPlan{ .plan = .{ .source_level = 0, .source_start = 0, .source_len = 0, .target_start = 0, .target_len = 0, .output_level = 0 } };
+        if (self.job.progress == null) {
+            const handles = component.handles.?;
+            result.plan = .{ .source_level = handles[0].run.level, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = @max(@as(u32, 1), handles[handles.len - 1].run.level), .run_indices = component.indices, .input_handles = handles, .tombstone_gc = true };
+        } else {
+            if (self.job.progress.?.phase == .done) {
+                const progress = &self.job.progress.?;
+                result.plan = .{ .source_level = progress.source_level, .source_start = 0, .source_len = progress.source_len, .target_start = progress.source_len, .target_len = progress.handles.?.len - progress.source_len, .output_level = progress.source_level +| 1, .run_indices = progress.indices, .input_handles = progress.handles };
+                progress.indices = null;
+                progress.handles = null;
+            } else if (self.job.split) {
+                const handles = try allocator.alloc(Directory.Handle, 1);
+                errdefer allocator.free(handles);
+                const indices = try allocator.alloc(usize, 1);
+                const anchor = self.job.anchor;
+                handles[0] = anchor.retain();
+                indices[0] = self.directory.rankOf(anchor.run).?;
+                result.plan = .{ .source_level = anchor.run.level, .source_start = 0, .source_len = 1, .target_start = 1, .target_len = 0, .output_level = anchor.run.level, .run_indices = indices, .input_handles = handles, .split_gc = true };
+            }
+            result.gc_objective_handles = component.handles;
+            result.gc_objective_indices = component.indices;
+        }
+        component.handles = null;
+        component.indices = null;
+        return result;
+    }
+};
+
+fn handleBytes(handles: []const Directory.Handle) u64 {
+    var bytes: u64 = 0;
+    for (handles) |handle| bytes +|= handle.run.size_bytes;
+    return bytes;
+}
+
+test "GC intent rebases writes between slices without restarting or dropping newer rows" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Fixture = struct {
+        fn make(allocator: std.mem.Allocator, id: u64, deletes: bool) !Run {
+            const first = try allocator.dupe(u8, "a");
+            errdefer allocator.free(first);
+            return .{ .id = id, .level = 0, .size_bytes = 1, .path = null, .smallest_namespace_name = null, .smallest_key = first, .largest_namespace_name = null, .largest_key = try allocator.dupe(u8, "a"), .entry_count = 1, .tombstone_count = @intFromBool(deletes), .oldest_tombstone_unix_ns = 1, .bloom_filter = null, .state = .{} };
+        }
+        fn append(backend: *Backend, id: u64) !void {
+            var runs: std.ArrayListUnmanaged(Run) = .empty;
+            defer {
+                for (runs.items) |*run| run.deinit(backend.allocator);
+                runs.deinit(backend.allocator);
+            }
+            try runs.append(backend.allocator, try make(backend.allocator, id, false));
+            const directory = try backend.prepareRunDirectoryChange(null, runs.items);
+            errdefer if (directory) |root| root.destroy(backend.allocator);
+            try appendBackendRuns(backend, &runs);
+            backend.invalidateReadVersion();
+            backend.publishRunDirectory(directory);
+        }
+    };
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{ .tombstone_gc_max_age_ns = 1, .tombstone_gc_min_percent = 1 });
+    defer backend.close();
+    const inputs = 3000;
+    for (0..inputs) |i| try backend.runs.append(allocator, try Fixture.make(allocator, i + 1, true));
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    var added: usize = 0;
+    var original: ?*PendingGc = null;
+    for (0..10000) |_| {
+        if (try selectDirectoryGc(&backend, 0)) |selected| {
+            defer selected.deinit(allocator);
+            try std.testing.expect(added != 0);
+            try std.testing.expectEqual(@as(usize, inputs), selected.plan.source_len);
+            try std.testing.expectEqual(inputs + added, backend.runs.count());
+            for (0..inputs) |i| {
+                const run = run_store.planAt(&backend, selected.plan, i);
+                try std.testing.expect(run.gc_requested and run.id <= inputs);
+            }
+            for (0..added) |i| try std.testing.expect(backend.run_directory.?.byId(inputs + i + 1) != null);
+            return;
+        }
+        if (backend.pending_gc) |pending| {
+            if (original) |expected| try std.testing.expectEqual(expected, pending) else original = pending;
+            if (pending.intent != null) {
+                added += 1;
+                try Fixture.append(&backend, inputs + added);
+            }
+        }
+    }
+    return error.GcIntentDidNotConverge;
+}
+
+fn resumeGcIntent(backend: anytype, pending: *PendingGc) !?SelectedPlan {
+    var retire = false;
+    defer if (retire) {
+        backend.pending_gc = null;
+        backend.retireGcPlanning(pending);
+    };
+    if (backend.manifestCoordinationIo()) |io| io.checkCancel() catch |err| {
+        retire = true;
+        return err;
+    };
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    const intent = &pending.intent.?;
+    const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+    var turns: usize = 0;
+    while (true) {
+        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        const result = if (intent.rebase != null)
+            intent.stepRebase(backend, &pending.job.component.?, &pending.selected.?, 512, deadline)
+        else
+            intent.step(backend, &pending.selected.?, 512, deadline);
+        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+        backend.directory_planning_slices +|= 1;
+        const done = result catch |err| {
+            retire = true;
+            return err;
+        };
+        turns += 1;
+        if (done) {
+            if (intent.rebase != null) intent.finishRebase(backend);
+            if ((try backend.planningDirectory()).tree.root == intent.base.tree.root) break;
+            intent.beginRebase(backend) catch |err| {
+                retire = true;
+                return err;
+            };
+        }
+        if (turns == 4 or @import("antfly_platform").time.monotonicNs() >= deadline) return null;
+    }
+    retire = true;
+    var result_reservation: ?resource_manager_mod.Reservation = null;
+    errdefer if (result_reservation) |*lease| lease.release();
+    if (pending.selected.?.plan.source_len != 0) if (backend.options.resource_manager) |manager| {
+        const inputs = pending.selected.?.plan.input_handles.?.len;
+        const objectives = if (pending.selected.?.gc_objective_handles) |handles| handles.len else 0;
+        result_reservation = try manager.reserve(.lsm_table_builder_working_set, 1024 + (inputs + objectives) * (@sizeOf(Directory.Handle) + @sizeOf(usize)));
+    };
+    // All record revisions, metadata clones and handle refreshes are prepared.
+    // Publication changes two roots and the durable-metadata obligation only.
+    std.mem.swap(run_store.Store, &backend.runs, intent.store.?);
+    backend.publishRunDirectory(intent.directory);
+    intent.directory = null;
+    backend.manifest_pending_mutation_bytes +|= intent.wire;
+    backend.manifest_reserved_mutation_bytes -= intent.wire;
+    intent.wire = 0;
+    backend.markManifestDirty();
+    if (pending.selected.?.plan.source_len == 0) return null;
+    var selected = pending.selected.?;
+    pending.selected = null;
+    selected.plan.partition_key = backend.options.run_partition_key;
+    selected.reservation = result_reservation;
+    return selected;
+}
+
+test "GC intent rejects changes to selected newer levels above its tombstone anchor" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{});
+    defer backend.close();
+    for (0..2) |i| {
+        const first = try allocator.dupe(u8, "a");
+        const last = allocator.dupe(u8, "c") catch |err| {
+            allocator.free(first);
+            return err;
+        };
+        var run = Run{ .id = i + 1, .level = @intCast(i), .size_bytes = 1, .path = null, .smallest_namespace_name = null, .smallest_key = first, .largest_namespace_name = null, .largest_key = last, .entry_count = 1, .tombstone_count = @intCast(i), .bloom_filter = null, .state = .{} };
+        errdefer run.deinit(allocator);
+        try backend.runs.append(allocator, run);
+    }
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    const original = try backend.planningDirectory();
+    const handles = [_]Directory.Handle{ original.at(0), original.at(1) };
+    var component = try ClosureJob.init(allocator, original, &.{handles[1]}, 0, true);
+    defer component.deinit(allocator);
+    while (!try component.step(allocator, 1)) {}
+    var selected = SelectedPlan{ .plan = .{ .source_level = 0, .source_start = 0, .source_len = 2, .target_start = 2, .target_len = 0, .output_level = 1, .input_handles = &handles, .tombstone_gc = true }, .borrowed_inputs = true };
+    const store = try allocator.create(run_store.Store);
+    store.* = backend.runs.fork();
+    var intent = PendingGc.Intent{ .base = try original.fork(allocator), .directory = try original.fork(allocator), .store = store, .wire = 0, .header_bytes = 0 };
+    defer intent.discard(&backend);
+    const latest = try original.fork(allocator);
+    var revised = handles[0].run.*;
+    revised.gc_requested = true;
+    try latest.put(&backend, revised);
+    backend.publishRunDirectory(latest);
+    try intent.beginRebase(&backend);
+    try std.testing.expectError(error.CompactionPlanningStale, intent.stepRebase(&backend, &component, &selected, 2048, std.math.maxInt(u64)));
+    try std.testing.expect(!intent.directory.?.byId(handles[0].run.id).?.gc_requested);
+}
+
+fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
+    if (backend.directory_planning_in_flight) return null;
+    // A completed negative sweep is not new work. Rebuilding it each turn
+    // would report planner progress forever to run-until-idle callers.
+    if (backend.pending_gc == null and !hasTombstoneGcDebt(backend)) return null;
+    backend.directory_planning_in_flight = true;
+    defer backend.directory_planning_in_flight = false;
+    if (backend.pending_gc) |pending| if (pending.intent != null) return resumeGcIntent(backend, pending);
+    const allocator = backend.allocator;
+    const configured = backend.options.tombstone_gc_max_input_bytes;
+    const limit = if (max_bytes == 0) configured else if (configured == 0) max_bytes else @min(max_bytes, configured);
+    if (backend.pending_gc == null) {
+        const current_directory = try backend.planningDirectory();
+        if (current_directory.tombstoneRunCount() == 0) return null;
+        const directory = try current_directory.fork(allocator);
+        errdefer backend.retireCheckpointDirectory(directory);
+        var reservation: ?resource_manager_mod.Reservation = null;
+        errdefer if (reservation) |*lease| lease.release();
+        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, 64 * 1024 + directory.count() * 384);
+        const pending = try allocator.create(PendingGc);
+        const cache = GcDebtCache{ .generation = backend.run_directory_generation, .age = backend.options.tombstone_gc_max_age_ns, .percent = backend.options.tombstone_gc_min_percent, .checked_at = gcNowNs() };
+        pending.* = .{ .directory = directory, .job = .init(directory, backend.gc_planning_next_rank, cache.age, cache.percent, cache.checked_at, limit), .cache = cache, .reservation = reservation };
+        backend.pending_gc = pending;
+    }
+    const pending = backend.pending_gc.?;
+    var retire = false;
+    defer if (retire) {
+        backend.pending_gc = null;
+        backend.retireGcPlanning(pending);
+    };
+    if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+    const result = pending.job.step(allocator, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms);
+    _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+    backend.directory_planning_slices +|= 1;
+    const done = result catch |err| {
+        retire = true;
+        return err;
+    };
+    if (!done) return null;
+    retire = true;
+    backend.gc_planning_next_rank = pending.job.cursor.rank;
+    pending.cache.has_debt = pending.job.eligible;
+    pending.cache.valid_until = pending.job.valid_until;
+    if (pending.cache.generation == backend.run_directory_generation) backend.gc_debt_cache = pending.cache;
+    pending.selected = try pending.take(allocator) orelse return null;
+    const selected = &pending.selected.?;
+    const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
+    // Revalidate the whole collection objective before persisting its intent.
+    var objective_plan = selected.plan;
+    objective_plan.input_handles = objectives;
+    objective_plan.source_level = objectives[0].run.level;
+    objective_plan.split_gc = false;
+    objective_plan.tombstone_gc = true;
+    const objective = try relocateDirectoryPlan(backend, objective_plan) orelse return null;
+    defer objective.deinit(allocator);
+    pending.intent = try PendingGc.Intent.create(backend, pending);
+    retire = false;
+    return resumeGcIntent(backend, pending);
+}
+
 fn selectTombstoneGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
+    if (comptime @hasDecl(@TypeOf(backend.*), "planningDirectory")) return selectDirectoryGc(backend, max_bytes) catch |err| {
+        if (err == error.CompactionPlanningStale) return null;
+        return err;
+    };
     const index = if (comptime @hasDecl(@TypeOf(backend.*), "domainIndex")) backend.domainIndex() catch |err| {
         if (err == error.CompactionPlanningStale) return null;
         return err;
@@ -375,7 +1132,7 @@ fn selectTombstoneGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
         return try selectGcProgress(backend, index, limit);
     };
     const best = candidate.indices;
-    return .{ .plan = .{ .source_level = backend.runs.items[best[0]].level, .source_start = 0, .source_len = best.len, .target_start = 0, .target_len = 0, .output_level = candidate.level, .run_indices = try backend.allocator.dupe(usize, best), .tombstone_gc = true } };
+    return .{ .plan = .{ .source_level = run_store.at(backend, best[0]).*.level, .source_start = 0, .source_len = best.len, .target_start = 0, .target_len = 0, .output_level = candidate.level, .run_indices = try backend.allocator.dupe(usize, best), .tombstone_gc = true } };
 }
 
 /// A large connected component is not one indivisible GC job. Advance one
@@ -384,19 +1141,19 @@ fn selectTombstoneGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
 fn selectGcProgress(backend: anytype, index: *const DomainIndex, limit: u64) !?SelectedPlan {
     var best: ?ScoredCompactionPlan = null;
     var best_indices: ?[]const usize = null;
-    const all_end = [_]usize{backend.runs.items.len};
+    const all_end = [_]usize{run_store.count(backend)};
     const ends = if (index.mixed) &all_end else index.ends;
     var start: usize = 0;
     for (ends) |end| {
         defer start = end;
-        const runs = if (index.mixed) backend.runs.items else index.runs[start..end];
+        const runs = if (index.mixed) (try run_store.oracleItems(backend)) else index.runs[start..end];
         for (runs, 0..) |run, i| {
             const deletes = run.tombstone_count orelse 0;
             if (deletes == 0 or run.level == std.math.maxInt(u32)) continue;
             const percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) backend.options.tombstone_gc_min_percent else 50;
             // The projection may predate the request bit; use the live input.
             const live_index = if (index.mixed) i else index.order[start + i];
-            if (!backend.runs.items[live_index].gc_requested and !tombstoneAgeDue(backend, run) and @as(u64, deletes) * 100 < @as(u64, run.entry_count) * percent) continue;
+            if (!run_store.at(backend, live_index).*.gc_requested and !tombstoneAgeDue(backend, run) and @as(u64, deletes) * 100 < @as(u64, run.entry_count) * percent) continue;
             var plan = buildPlanForSourceRange(runs, run.level, i, 1) orelse continue;
             var priority: u64 = if (tombstoneAgeDue(backend, run)) 3 else 2;
             if (!planWithinInputBudget(runs, plan, limit)) {
@@ -435,8 +1192,8 @@ pub fn compactTombstonesScheduled(comptime BackendType: type, backend: *BackendT
         if ((nextTombstoneGcDelay(backend) orelse 1) == 0) deferTombstoneGc(backend);
         return false;
     };
-    defer selected.deinit(backend.allocator);
-    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, selected.plan, score);
+    defer selected.release(backend);
+    var work = try compactionWorkForPlan(backend.allocator, &backend.runs, selected.plan, score);
     defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         deferTombstoneGc(backend);
@@ -459,14 +1216,29 @@ fn deferTombstoneGc(backend: anytype) void {
 /// planner. L0 precedence and target closure are unchanged *within* a domain;
 /// unrelated interleaved runs are never added merely to make a global slice.
 fn selectDomainPlan(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
+    if (comptime @hasField(@TypeOf(backend.*), "pending_directory_closure")) {
+        if (backend.pending_directory_closure != null) return resumeDirectoryClosure(backend);
+    }
+    if (comptime @hasDecl(@TypeOf(backend.*), "planningDirectory")) {
+        return selectDirectoryPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, stats) catch |err| {
+            if (err != error.CompactionPlanningBudgetExceeded) return err;
+            // A broad closure continues on a pinned tree outside the writer
+            // mutex. Never construct a complete DomainIndex/ID projection.
+            return selectDirectoryPlanOffLock(backend, l0_limit, l0_only, max_bytes, allow_oversized, stats);
+        };
+    }
+    return selectProjectedDomainPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, stats);
+}
+
+fn selectProjectedDomainPlan(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
     const allocator = backend.allocator;
-    const partition = backend.options.run_partition_key.?;
+    const partition = backend.options.run_partition_key orelse wholeKeyspace;
     const index = if (comptime @hasDecl(@TypeOf(backend.*), "domainIndex")) backend.domainIndex() catch |err| {
         if (err == error.CompactionPlanningStale) return null;
         return err;
     } else try DomainIndex.create(backend);
     defer if (comptime !@hasDecl(@TypeOf(backend.*), "domainIndex")) index.destroy(allocator);
-    const runs = backend.runs.items;
+    const runs = (try run_store.oracleItems(backend));
     if (index.mixed) {
         // Previously written mixed SSTs must first be reshaped with the full
         // overlap closure. Never hide overlapping data behind a new domain.
@@ -508,15 +1280,288 @@ fn selectDomainPlan(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes:
     return .{ .plan = plan };
 }
 
+/// Enumerate only the selected range's dependencies. Unlike DomainIndex this
+/// path neither projects the full epoch nor creates a global ID-to-rank map.
+const DirectoryPlanningBudget = struct {
+    remaining: usize = 16384,
+    max_inputs: usize = 4096,
+    resumable: bool = false,
+    io: ?std.Io = null,
+    gc_all: bool = false,
+
+    fn next(self: *@This(), cursor: *Directory.OverlapCursor) !?Directory.Handle {
+        while (true) {
+            if (cursor.next(&self.remaining)) |handle| return handle;
+            if (cursor.done() or !self.resumable) return null;
+            if (self.io) |io| try io.checkCancel();
+            self.remaining = 16384;
+        }
+    }
+};
+
+fn directoryClosure(allocator: std.mem.Allocator, directory: *const Directory, seeds: []const Directory.Handle, max_bytes: u64, budget: *DirectoryPlanningBudget) !?SelectedPlan {
+    const anchor = seeds[0];
+    if (!budget.gc_all and anchor.run.level == std.math.maxInt(u32)) return null;
+    var handles: std.ArrayListUnmanaged(Directory.Handle) = .empty;
+    defer handles.deinit(allocator);
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(allocator);
+    var bytes: u64 = 0;
+    var bounds = CompactionBounds{ .smallest_namespace_name = anchor.run.smallest_namespace_name, .smallest_key = anchor.run.smallest_key, .largest_namespace_name = anchor.run.largest_namespace_name, .largest_key = anchor.run.largest_key };
+    var visibility: u64 = 0;
+    for (seeds) |seed| {
+        try handles.append(allocator, seed);
+        try seen.put(allocator, seed.run.id, {});
+        bytes +|= seed.run.size_bytes;
+        bounds.include(seed.run.*);
+        visibility = @max(visibility, if (seed.run.visibility_id == 0) seed.run.id else seed.run.visibility_id);
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var cursor = directory.overlaps(bounds.smallest_namespace_name, bounds.smallest_key, bounds.largest_namespace_name, bounds.largest_key);
+        while (try budget.next(&cursor)) |handle| {
+            const run = handle.run;
+            const older_l0 = anchor.run.level == 0 and run.level == 0 and (if (run.visibility_id == 0) run.id else run.visibility_id) <= visibility;
+            if (!budget.gc_all and !older_l0 and run.level != anchor.run.level + 1) continue;
+            if (seen.contains(run.id)) continue;
+            bytes +|= run.size_bytes;
+            if (max_bytes != 0 and bytes > max_bytes) return null;
+            if (handles.items.len == budget.max_inputs) return error.CompactionPlanningBudgetExceeded;
+            try seen.put(allocator, run.id, {});
+            try handles.append(allocator, handle);
+            const old = bounds;
+            bounds.include(run.*);
+            changed = changed or compareRunBound(old.smallest_namespace_name, old.smallest_key, bounds.smallest_namespace_name, bounds.smallest_key) != .eq or compareRunBound(old.largest_namespace_name, old.largest_key, bounds.largest_namespace_name, bounds.largest_key) != .eq;
+        }
+        if (!cursor.done()) return error.CompactionPlanningBudgetExceeded;
+    }
+    if (max_bytes != 0 and bytes > max_bytes) return null;
+    // Read precedence is a metadata comparator, not a rank lookup. Looking up
+    // two tree ranks per comparison turns a broad sort into O(K log K log N).
+    std.mem.sort(Directory.Handle, handles.items, {}, Directory.readLess);
+    var source_len: usize = 0;
+    while (source_len < handles.items.len and handles.items[source_len].run.level == anchor.run.level) : (source_len += 1) {}
+    const indices = try allocator.alloc(usize, handles.items.len);
+    errdefer allocator.free(indices);
+    if (handles.items.len > directory.count() / 4) {
+        // Dense selections use an allocation-free merge walk. This is O(N)
+        // only when N <= 4K, and never materializes an unselected run vector.
+        var cursor = directory.readCursor();
+        var selected: usize = 0;
+        while (cursor.next()) |handle| {
+            if (handle.run.id != handles.items[selected].run.id) continue;
+            indices[selected] = cursor.rank - 1;
+            selected += 1;
+            if (selected == handles.items.len) break;
+        }
+        std.debug.assert(selected == handles.items.len);
+    } else for (handles.items, indices) |handle, *index| index.* = directory.rankOf(handle.run).?;
+    const owned = try handles.toOwnedSlice(allocator);
+    for (owned) |handle| _ = handle.retain();
+    var plan = CompactionPlan{ .source_level = anchor.run.level, .source_start = 0, .source_len = source_len, .target_start = source_len, .target_len = owned.len - source_len, .output_level = anchor.run.level +| 1, .run_indices = indices, .input_handles = owned, .partition_key = wholeKeyspace };
+    if (budget.gc_all) {
+        plan.source_level = owned[0].run.level;
+        plan.source_len = owned.len;
+        plan.target_start = owned.len;
+        plan.target_len = 0;
+        plan.output_level = @max(@as(u32, 1), owned[owned.len - 1].run.level);
+        plan.tombstone_gc = true;
+    }
+    return .{ .plan = plan };
+}
+
+fn selectDirectoryPlan(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
+    return selectDirectoryPlanBudgeted(backend, l0_limit, l0_only, max_bytes, allow_oversized, stats, .{});
+}
+
+fn selectDirectoryPlanOffLock(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
+    const BackendType = @TypeOf(backend.*);
+    if (comptime @hasField(BackendType, "directory_planning_in_flight")) {
+        if (backend.directory_planning_in_flight) return null;
+        backend.directory_planning_in_flight = true;
+    }
+    defer if (comptime @hasField(BackendType, "directory_planning_in_flight")) {
+        backend.directory_planning_in_flight = false;
+    };
+    const directory = try (try backend.planningDirectory()).fork(backend.allocator);
+    if (comptime !@hasDecl(BackendType, "retainReaderKind")) {
+        defer directory.destroy(backend.allocator);
+        return selectDirectoryPlanBudgeted(backend, l0_limit, l0_only, max_bytes, allow_oversized, stats, .{ .max_inputs = directory.count(), .resumable = true });
+    }
+    defer backend.retireCheckpointDirectory(directory);
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    const Snapshot = struct {
+        allocator: std.mem.Allocator,
+        options: @TypeOf(backend.options),
+        planner_seed: usize,
+        directory: *const Directory,
+        pub fn planningDirectory(self: *@This()) !*const Directory {
+            return self.directory;
+        }
+    };
+    var snapshot = Snapshot{ .allocator = backend.allocator, .options = backend.options, .planner_seed = backend.planner_seed, .directory = directory };
+    // Reserve distinct candidate tickets before allowing another planner in.
+    backend.planner_seed +%= 8;
+    const io: ?std.Io = if (snapshot.options.read_runtime) |runtime| runtime.io else null;
+    runtime_mod.unlockBackend(BackendType, backend, true);
+    const result = selectDirectoryPlanBudgeted(&snapshot, l0_limit, l0_only, max_bytes, allow_oversized, stats, .{ .max_inputs = directory.count(), .resumable = true, .io = io });
+    _ = runtime_mod.lockBackend(BackendType, backend);
+    var selected = (try result) orelse return null;
+    var keep = false;
+    defer if (!keep) selected.release(backend);
+    // The pinned immutable root is an exact certificate for both dependencies
+    // and positions. With no intervening publication, accepting even a broad
+    // closure is O(1) under the writer mutex.
+    if ((try backend.planningDirectory()).tree.root == directory.tree.root) {
+        keep = true;
+        return selected;
+    }
+    const relocated = try relocateDirectoryPlan(backend, selected.plan) orelse return null;
+    backend.allocator.free(selected.plan.run_indices.?);
+    selected.plan.run_indices = relocated.plan.run_indices;
+    keep = true;
+    return selected;
+}
+
+fn selectDirectoryPlanBudgeted(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats, initial_budget: DirectoryPlanningBudget) !?SelectedPlan {
+    const directory = try backend.planningDirectory();
+    var selected_level: ?u32 = null;
+    var best_pressure: u64 = 0;
+    for (0..directory.levelCount()) |rank| {
+        const level = directory.levelAt(rank);
+        if (l0_only and level.level != 0) continue;
+        const run_target = if (level.level == 0) l0_limit else levelRunTarget(level.level, backend.options.level_target_runs_base, backend.options.level_target_runs_multiplier);
+        const byte_target = levelByteTargetForTotals(directory.total_run_bytes, directory.maxLevel(), level.level, backend.options.level_target_bytes_base, backend.options.level_target_bytes_multiplier);
+        var pressure: u64 = 0;
+        if (level.count > run_target and (level.level == 0 or run_target != 0)) pressure = normalizedPressurePriority(level.count, @max(@as(usize, 1), run_target));
+        if (byte_target != 0 and level.bytes > byte_target) pressure = @max(pressure, normalizedPressurePriority(level.bytes, byte_target));
+        if (pressure > best_pressure) {
+            best_pressure = pressure;
+            selected_level = level.level;
+        }
+    }
+    const overlap_threshold = backend.options.l0_overlap_compact_threshold_runs;
+    const hotspot = selected_level == null and !l0_only and overlap_threshold != 0 and directory.levelStats(0).count >= overlap_threshold;
+    const level = selected_level orelse if (hotspot) @as(u32, 0) else return null;
+    const count = directory.levelStats(level).count;
+    const start = directory.levelStart(level);
+    var reservation: ?resource_manager_mod.Reservation = null;
+    // Inspect allocation-free pressure totals first: idle maintenance must
+    // not fail merely because another table owns the builder budget.
+    // Bounds cover the seed window, geometric scratch, and retained handles.
+    if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, 64 * 1024 + @min(directory.count(), initial_budget.max_inputs) * 256);
+    defer if (reservation) |*lease| lease.release();
+    var budget = initial_budget;
+    for (0..@min(count, 8)) |_| {
+        const offset = backend.planner_seed % count;
+        backend.planner_seed +%= 1;
+        // Start L0 pressure at the oldest end and drain a bounded window in
+        // one closure. Promoting one disjoint run at a time repeatedly rewrites
+        // the same target and fails to drain a pressure episode efficiently.
+        const seed_rank = if (level == 0) count - 1 - offset else offset;
+        const anchor = directory.at(start + seed_rank);
+        const target = if (level == 0) @max(@as(usize, 1), l0_limit / 2) else levelRunTarget(level, backend.options.level_target_runs_base, backend.options.level_target_runs_multiplier);
+        const desired = if (hotspot) 1 else if (level == 0 and l0_limit == 0) @min(count, 2) else @max(@as(usize, 1), count -| target);
+        var seeds: [4096]Directory.Handle = undefined;
+        seeds[0] = anchor;
+        var seed_len: usize = 1;
+        for (1..@min(count, seeds.len)) |step| {
+            if (seed_len >= desired) break;
+            const rank = if (level == 0) (seed_rank + count - step) % count else (seed_rank + step) % count;
+            const candidate = directory.at(start + rank);
+            if (backend.options.run_partition_key) |partition| {
+                if (!sameDomain(anchor.run.*, candidate.run.*, partition)) continue;
+            }
+            seeds[seed_len] = candidate;
+            seed_len += 1;
+        }
+        var candidate: ?SelectedPlan = null;
+        while (true) {
+            candidate = directoryClosure(backend.allocator, directory, seeds[0..seed_len], max_bytes, &budget) catch |err| {
+                if (comptime @hasField(@TypeOf(backend.*), "pending_directory_closure")) {
+                    if (err == error.CompactionPlanningBudgetExceeded) {
+                        if (reservation) |*lease| lease.release();
+                        reservation = null;
+                        backend.pending_directory_closure = try PendingDirectoryClosure.create(backend, seeds[0..seed_len], max_bytes, allow_oversized, if (hotspot) overlap_threshold else 0);
+                        backend.directory_planning_slices +|= 1;
+                        return null;
+                    }
+                }
+                return err;
+            };
+            if (candidate != null or budget.remaining == 0) break;
+            stats.oversized_skips += 1;
+            if (seed_len == 1) {
+                // Only the minimum indivisible closure can bypass the byte
+                // target, never the entire pressure window.
+                if (allow_oversized) candidate = directoryClosure(backend.allocator, directory, seeds[0..1], 0, &budget) catch |err| {
+                    if (comptime @hasField(@TypeOf(backend.*), "pending_directory_closure")) {
+                        if (err == error.CompactionPlanningBudgetExceeded) {
+                            if (reservation) |*lease| lease.release();
+                            reservation = null;
+                            backend.pending_directory_closure = try PendingDirectoryClosure.create(backend, seeds[0..1], 0, false, if (hotspot) overlap_threshold else 0);
+                            backend.directory_planning_slices +|= 1;
+                            return null;
+                        }
+                    }
+                    return err;
+                };
+                break;
+            }
+            seed_len = @max(@as(usize, 1), seed_len / 2);
+        }
+        var selected = candidate orelse {
+            if (budget.remaining == 0) break;
+            continue;
+        };
+        selected.plan.partition_key = backend.options.run_partition_key;
+        if (hotspot and selected.plan.source_len < overlap_threshold) {
+            selected.release(backend);
+            continue;
+        }
+        selected.reservation = reservation;
+        reservation = null;
+        return selected;
+    }
+    return null;
+}
+
+pub fn directorySelectionInputCountForTest(backend: anytype) !usize {
+    std.debug.assert(@import("builtin").is_test);
+    var stats: CompactionSelectionStats = .{};
+    const selected = try selectDomainPlanSynchronous(backend, backend.options.compact_threshold_runs, false, backend.options.max_compaction_input_bytes, false, &stats) orelse return 0;
+    defer selected.release(backend);
+    return selected.plan.source_len + selected.plan.target_len;
+}
+
+fn selectDomainPlanSynchronous(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
+    while (true) {
+        if (try selectDomainPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, stats)) |selected| return selected;
+        if (comptime @hasField(@TypeOf(backend.*), "pending_directory_closure")) {
+            if (backend.pending_directory_closure != null and !backend.directory_planning_in_flight) continue;
+        }
+        return null;
+    }
+}
+
 fn compactDomainPlan(comptime BackendType: type, backend: *BackendType, l0_limit: usize, l0_only: bool, comptime scheduled: bool, score: u64, max_bytes: u64, allow_oversized: bool) !bool {
+    if (scheduled and !l0_only) if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
     var stats: CompactionSelectionStats = .{};
     defer noteCompactionSelectionStats(BackendType, backend, stats);
-    const selected = try selectDomainPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats) orelse return false;
-    defer selected.deinit(backend.allocator);
+    const selected = (if (scheduled)
+        try selectDomainPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats)
+    else
+        try selectDomainPlanSynchronous(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats)) orelse return false;
+    defer selected.release(backend);
     if (scheduled) {
-        var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, selected.plan, score);
+        var work = try compactionWorkForPlan(backend.allocator, &backend.runs, selected.plan, score);
         defer work.deinit(backend.allocator);
-        var grant = backend.acquireCompactionGrant(work) orelse return false;
+        var grant = backend.acquireCompactionGrant(work) orelse {
+            rememberDeniedCompaction(BackendType, backend, selected.plan, score);
+            return false;
+        };
         defer grant.complete();
         try compactPlanAt(BackendType, backend, selected.plan);
     } else try compactPlanAt(BackendType, backend, selected.plan);
@@ -547,6 +1592,76 @@ fn relocateDomainPlan(allocator: std.mem.Allocator, runs: []const Run, plan: Com
     relocated.run_indices = try indices.toOwnedSlice(allocator);
     relocated.partition_key = partition;
     return .{ .plan = relocated };
+}
+
+fn relocateDirectoryPlan(backend: anytype, plan: CompactionPlan) !?SelectedPlan {
+    const allocator = backend.allocator;
+    var directory = try (try backend.planningDirectory()).fork(allocator);
+    defer backend.retireCheckpointDirectory(directory);
+    var reservation: ?resource_manager_mod.Reservation = null;
+    defer if (reservation) |*lease| lease.release();
+    if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, 8192 + plan.input_handles.?.len * 128);
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    const io = backend.manifestCoordinationIo();
+    var job = @import("dependency_job.zig").Job.init(directory, plan);
+    defer if (job.indices) |indices| allocator.free(indices);
+    runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+    const checked = advanceDependencyJob(allocator, &job, io);
+    _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+    try checked;
+    if (!job.valid) return null;
+    // Extend the completed certificate through deltas, not through another
+    // O(K) identity scan. Stable input handles survive unrelated rank changes.
+    while ((try backend.planningDirectory()).tree.root != directory.tree.root) {
+        const latest = try (try backend.planningDirectory()).fork(allocator);
+        var changes = Directory.ChangeCursor.init(directory, latest);
+        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        const accepted = advanceDependencyChanges(&job, &changes, io);
+        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+        backend.retireCheckpointDirectory(directory);
+        directory = latest;
+        try accepted;
+        if (!job.valid) return null;
+    }
+    var relocated = plan;
+    relocated.run_indices = job.indices;
+    job.indices = null;
+    return .{ .plan = relocated, .borrowed_inputs = true, .complete_coverage = job.covered };
+}
+
+fn advanceDependencyJob(allocator: std.mem.Allocator, job: *@import("dependency_job.zig").Job, io: ?std.Io) !void {
+    // Reclaim the temporary membership tree before the final certificate CAS.
+    // Delta validation uses the already-sorted stable handles afterwards.
+    defer {
+        const indices = job.indices;
+        job.indices = null;
+        while (true) {
+            var credits: usize = 2048;
+            if (job.deinitStep(allocator, &credits)) break;
+            if (io) |runtime| runtime.sleep(.fromNanoseconds(1), .awake) catch {};
+        }
+        job.indices = indices;
+    }
+    while (true) {
+        if (io) |runtime| try runtime.checkCancel();
+        if (try job.step(allocator, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms)) return;
+        if (io) |runtime| try runtime.sleep(.fromNanoseconds(1), .awake);
+    }
+}
+
+fn advanceDependencyChanges(job: *@import("dependency_job.zig").Job, changes: *Directory.ChangeCursor, io: ?std.Io) !void {
+    while (!changes.done()) {
+        if (io) |runtime| try runtime.checkCancel();
+        var credits: usize = 2048;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            if (changes.next(&credits)) |change| {
+                if (!job.acceptChange(change)) return;
+            } else break;
+        }
+        if (!changes.done()) if (io) |runtime| try runtime.sleep(.fromNanoseconds(1), .awake);
+    }
 }
 
 pub const RememberedCompaction = struct {
@@ -629,24 +1744,24 @@ pub fn flushMutable(comptime BackendType: type, backend: *BackendType) !void {
     var directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryChange")) try backend.prepareRunDirectoryChange(null, new_runs.items) else null;
     errdefer if (directory) |owned| owned.destroy(backend.allocator);
     if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
-    try appendOwnedRuns(&backend.runs, backend.allocator, &new_runs);
+    try appendBackendRuns(backend, &new_runs);
     if (comptime @hasDecl(BackendType, "publishRunDirectory")) backend.publishRunDirectory(directory);
     directory = null;
-    sortRuns(backend.runs.items);
+    if (comptime @TypeOf(backend.runs) != run_store.Store) sortRuns(backend.runs.items);
     if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
         if (@hasDecl(BackendType, "markManifestDirty")) backend.markManifestDirty();
         return;
     }
     try maybeCompactRuns(BackendType, backend);
     if (@hasDecl(BackendType, "persistManifest")) {
-        try backend.persistManifest();
+        try backend.persistManifestLocked();
     } else if (backend.root_dir != null) {
         try repository_mod.persistManifestWithStorage(
             backend.storage.?,
             backend.allocator,
             backend.root_dir.?,
             backend.next_run_id,
-            backend.runs.items,
+            (try run_store.oracleItems(backend)),
             backend.obsolete_paths.items,
         );
     }
@@ -658,7 +1773,7 @@ pub fn maybeCompactRuns(comptime BackendType: type, backend: *BackendType) !void
         return;
     }
     while (selectCompactionPlan(
-        backend.runs.items,
+        (try run_store.oracleItems(backend)),
         backend.options.compact_threshold_runs,
         backend.options.l0_overlap_compact_threshold_runs,
         backend.options.level_target_runs_base,
@@ -687,7 +1802,7 @@ pub fn maybeCompactRunsScheduledWithL0Limit(
 
     var selection_stats: CompactionSelectionStats = .{};
     const plan = selectCompactionPlanWithStats(
-        backend.runs.items,
+        (try run_store.oracleItems(backend)),
         l0_limit,
         backend.options.l0_overlap_compact_threshold_runs,
         backend.options.level_target_runs_base,
@@ -703,7 +1818,7 @@ pub fn maybeCompactRunsScheduledWithL0Limit(
     };
     noteCompactionSelectionStats(BackendType, backend, selection_stats);
 
-    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    var work = try compactionWorkForPlan(backend.allocator, &backend.runs, plan, score);
     defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         rememberDeniedCompaction(BackendType, backend, plan, score);
@@ -719,7 +1834,7 @@ pub fn compactOldestPair(comptime BackendType: type, backend: *BackendType) !voi
         _ = try compactDomainPlan(BackendType, backend, 0, true, false, 0, 0, false);
         return;
     }
-    const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
+    const plan = selectL0Compaction((try run_store.oracleItems(backend)), 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
@@ -728,7 +1843,7 @@ pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_li
         _ = try compactDomainPlan(BackendType, backend, l0_limit, true, false, 0, 0, false);
         return;
     }
-    const plan = selectL0Compaction(backend.runs.items, l0_limit, 0, false) orelse return;
+    const plan = selectL0Compaction((try run_store.oracleItems(backend)), l0_limit, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
@@ -738,7 +1853,7 @@ pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendTy
 
     var selection_stats: CompactionSelectionStats = .{};
     const plan = selectL0CompactionWithStats(
-        backend.runs.items,
+        (try run_store.oracleItems(backend)),
         l0_limit,
         backend.options.max_compaction_input_bytes,
         allowOversizedSingleCompactionInput(backend),
@@ -748,7 +1863,7 @@ pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendTy
         return false;
     };
     noteCompactionSelectionStats(BackendType, backend, selection_stats);
-    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    var work = try compactionWorkForPlan(backend.allocator, &backend.runs, plan, score);
     defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         rememberDeniedCompaction(BackendType, backend, plan, score);
@@ -774,7 +1889,7 @@ pub fn compactL0ToLimitScheduledWithinBudget(
     if (domainPlanningEnabled(backend)) return compactDomainPlan(BackendType, backend, l0_limit, true, true, score, effective_limit, max_input_bytes == null and allowOversizedSingleCompactionInput(backend));
     var selection_stats: CompactionSelectionStats = .{};
     const plan = selectL0CompactionWithStats(
-        backend.runs.items,
+        (try run_store.oracleItems(backend)),
         l0_limit,
         effective_limit,
         max_input_bytes == null and allowOversizedSingleCompactionInput(backend),
@@ -784,7 +1899,7 @@ pub fn compactL0ToLimitScheduledWithinBudget(
         return false;
     };
     noteCompactionSelectionStats(BackendType, backend, selection_stats);
-    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    var work = try compactionWorkForPlan(backend.allocator, &backend.runs, plan, score);
     defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         return false;
@@ -800,7 +1915,7 @@ pub fn compactAllRuns(comptime BackendType: type, backend: *BackendType) !void {
         return;
     }
     while (selectCompactionPlan(
-        backend.runs.items,
+        (try run_store.oracleItems(backend)),
         0,
         0,
         backend.options.level_target_runs_base,
@@ -820,7 +1935,7 @@ fn allowOversizedSingleCompactionInput(backend: anytype) bool {
     return backend.options.max_compaction_input_allow_oversized_single_job;
 }
 
-fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: []const Run, plan: CompactionPlan, score: u64) !CompactionWork {
+fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: anytype, plan: CompactionPlan, score: u64) !CompactionWork {
     const total_runs = plan.source_len + plan.target_len;
     const run_ids = try allocator.alloc(u64, total_runs);
     errdefer allocator.free(run_ids);
@@ -830,7 +1945,7 @@ fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: []const Run, plan: 
     var run_count: usize = 0;
     var key_range: ?compaction_scheduler_mod.KeyRange = null;
     for (0..plan.source_len) |i| {
-        const run = runs[plan.sourceIndex(i)];
+        const run = run_store.planGet(runs, plan, i);
         input_runs += 1;
         input_bytes +|= run.size_bytes;
         includeRunInWorkKeyRange(&key_range, plan.output_level, run);
@@ -838,7 +1953,7 @@ fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: []const Run, plan: 
         run_count += 1;
     }
     for (0..plan.target_len) |i| {
-        const run = runs[plan.targetIndex(i)];
+        const run = run_store.planGet(runs, plan, plan.source_len + i);
         input_runs += 1;
         input_bytes +|= run.size_bytes;
         includeRunInWorkKeyRange(&key_range, plan.output_level, run);
@@ -883,14 +1998,14 @@ fn planWithinInputBudget(runs: []const Run, plan: CompactionPlan, max_input_byte
     return compactionInputBytes(runs, plan) <= max_input_bytes;
 }
 
-fn compactionInputBytes(runs: []const Run, plan: CompactionPlan) u64 {
+fn compactionInputBytes(runs: anytype, plan: CompactionPlan) u64 {
     var input_bytes: u64 = 0;
     for (0..plan.source_len) |i| {
-        const run = runs[plan.sourceIndex(i)];
+        const run = run_store.planGet(runs, plan, i);
         input_bytes +|= run.size_bytes;
     }
     for (0..plan.target_len) |i| {
-        const run = runs[plan.targetIndex(i)];
+        const run = run_store.planGet(runs, plan, plan.source_len + i);
         input_bytes +|= run.size_bytes;
     }
     return input_bytes;
@@ -939,13 +2054,13 @@ fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendTyp
     const remembered = backend.remembered_compaction orelse return false;
     backend.compaction_scheduler.noteRememberedRetry();
 
-    const plan = validateRememberedCompaction(backend.runs.items, remembered) orelse {
+    const plan = validateRememberedCompaction(&backend.runs, remembered) orelse {
         backend.remembered_compaction = null;
         backend.compaction_scheduler.noteRememberedStale();
         return false;
     };
 
-    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, remembered.score);
+    var work = try compactionWorkForPlan(backend.allocator, &backend.runs, plan, remembered.score);
     defer work.deinit(backend.allocator);
     if (backend.options.max_compaction_input_bytes > 0 and work.input_bytes > backend.options.max_compaction_input_bytes) {
         backend.remembered_compaction = null;
@@ -966,12 +2081,35 @@ fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendTyp
 
 fn rememberDeniedCompaction(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan, score: u64) void {
     if (!@hasField(BackendType, "remembered_compaction")) return;
-    const remembered = rememberCompactionPlan(backend.runs.items, plan, score) orelse return;
+    const remembered = rememberCompactionPlan(&backend.runs, plan, score) orelse return;
     backend.remembered_compaction = remembered;
     backend.compaction_scheduler.noteRememberedCandidate();
 }
 
-fn rememberCompactionPlan(runs: []const Run, plan: CompactionPlan, score: u64) ?RememberedCompaction {
+fn rememberCompactionPlan(runs: anytype, plan: CompactionPlan, score: u64) ?RememberedCompaction {
+    if (comptime @TypeOf(runs) == *run_store.Store or @TypeOf(runs) == *const run_store.Store) {
+        if (plan.input_handles) |handles| {
+            if (handles.len > max_remembered_compaction_run_ids) return null;
+            var ranks: [max_remembered_compaction_run_ids]usize = undefined;
+            for (handles, 0..) |handle, i| ranks[i] = runs.rankOf(handle.run) orelse return null;
+            var current = plan;
+            current.input_handles = null;
+            current.run_indices = ranks[0..handles.len];
+            return rememberCompactionPlan(runs, current, score);
+        }
+    }
+    if (plan.run_indices != null and plan.partition_key == null) {
+        // A directory-selected contiguous window can use the fixed-size retry
+        // record without retaining either its scratch or an entire epoch.
+        var contiguous = plan;
+        contiguous.source_start = plan.sourceIndex(0);
+        contiguous.target_start = if (plan.target_len != 0) plan.targetIndex(0) else contiguous.source_start + plan.source_len;
+        for (0..plan.source_len) |i| if (plan.sourceIndex(i) != contiguous.source_start + i) return null;
+        for (0..plan.target_len) |i| if (plan.targetIndex(i) != contiguous.target_start + i) return null;
+        contiguous.run_indices = null;
+        contiguous.input_handles = null;
+        return rememberCompactionPlan(runs, contiguous, score);
+    }
     // Domain plans own a transient mapping. A denied job is reselected from
     // the latest version instead of retaining pointers into planning scratch.
     if (plan.run_indices != null) return null;
@@ -987,40 +2125,44 @@ fn rememberCompactionPlan(runs: []const Run, plan: CompactionPlan, score: u64) ?
         .score = score,
     };
     var idx: usize = 0;
-    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
+    for (plan.source_start..plan.source_start + plan.source_len) |rank| {
+        const run = run_store.get(runs, rank);
         remembered.run_ids[idx] = run.id;
         idx += 1;
     }
-    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
+    for (plan.target_start..plan.target_start + plan.target_len) |rank| {
+        const run = run_store.get(runs, rank);
         remembered.run_ids[idx] = run.id;
         idx += 1;
     }
     return remembered;
 }
 
-fn validateRememberedCompaction(runs: []const Run, remembered: RememberedCompaction) ?CompactionPlan {
+fn validateRememberedCompaction(runs: anytype, remembered: RememberedCompaction) ?CompactionPlan {
     const plan = remembered.plan;
     if (remembered.run_count == 0 or remembered.run_count != plan.source_len + plan.target_len) return null;
     if (!planInBounds(runs, plan)) return null;
 
     var idx: usize = 0;
-    for (runs[plan.source_start .. plan.source_start + plan.source_len]) |run| {
+    for (plan.source_start..plan.source_start + plan.source_len) |rank| {
+        const run = run_store.get(runs, rank);
         if (idx >= remembered.run_count or run.id != remembered.run_ids[idx]) return null;
         idx += 1;
     }
-    for (runs[plan.target_start .. plan.target_start + plan.target_len]) |run| {
+    for (plan.target_start..plan.target_start + plan.target_len) |rank| {
+        const run = run_store.get(runs, rank);
         if (idx >= remembered.run_count or run.id != remembered.run_ids[idx]) return null;
         idx += 1;
     }
     return plan;
 }
 
-fn planInBounds(runs: []const Run, plan: CompactionPlan) bool {
+fn planInBounds(runs: anytype, plan: CompactionPlan) bool {
     if (plan.source_len == 0) return false;
-    const len = if (plan.run_indices) |indices| indices.len else runs.len;
+    const len = if (plan.run_indices) |indices| indices.len else run_store.len(runs);
     if (plan.source_start > len or plan.source_len > len - plan.source_start) return false;
     if (plan.target_start > len or plan.target_len > len - plan.target_start) return false;
-    if (plan.run_indices) |indices| for (indices) |index| if (index >= runs.len) return false;
+    if (plan.run_indices) |indices| for (indices) |index| if (index >= run_store.len(runs)) return false;
     return true;
 }
 
@@ -1030,7 +2172,7 @@ pub fn compactOldestWindow(comptime BackendType: type, backend: *BackendType, wi
         _ = try compactDomainPlan(BackendType, backend, 0, true, false, 0, 0, false);
         return;
     }
-    const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
+    const plan = selectL0Compaction((try run_store.oracleItems(backend)), 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
 }
 
@@ -1074,15 +2216,18 @@ fn planSelectsIndex(plan: CompactionPlan, index: usize) bool {
         (index >= plan.target_start and index - plan.target_start < plan.target_len);
 }
 
-fn planHasCompleteCoverage(runs: []const Run, plan: CompactionPlan) bool {
+fn planHasCompleteCoverage(runs: anytype, plan: CompactionPlan) bool {
     if (!planInBounds(runs, plan)) return false;
-    var smallest = runs[plan.sourceIndex(0)];
+    var smallest = run_store.planGet(runs, plan, 0);
     var largest = smallest;
-    for (runs, 0..) |run, i| if (planSelectsIndex(plan, i)) {
+    for (0..run_store.len(runs)) |i| {
+        if (!planSelectsIndex(plan, i)) continue;
+        const run = run_store.get(runs, i);
         if (compareRunBound(run.smallest_namespace_name, run.smallest_key, smallest.smallest_namespace_name, smallest.smallest_key) == .lt) smallest = run;
         if (compareRunBound(run.largest_namespace_name, run.largest_key, largest.largest_namespace_name, largest.largest_key) == .gt) largest = run;
-    };
-    for (runs, 0..) |run, i| {
+    }
+    for (0..run_store.len(runs)) |i| {
+        const run = run_store.get(runs, i);
         if (planSelectsIndex(plan, i)) continue;
         // Smaller levels (and earlier L0 runs) are newer than every selected
         // source. Their continued existence cannot reveal an older value.
@@ -1093,20 +2238,50 @@ fn planHasCompleteCoverage(runs: []const Run, plan: CompactionPlan) bool {
     return true;
 }
 
-fn compactPlanAt(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+fn compactPlanAt(comptime BackendType: type, backend: *BackendType, initial_plan: CompactionPlan) !void {
+    var plan = initial_plan;
+    var validated: ?SelectedPlan = null;
+    defer if (validated) |selected| selected.release(backend);
+    if (comptime @hasDecl(BackendType, "planningDirectory")) {
+        if (plan.input_handles != null) {
+            if ((try backend.planningDirectory()).tombstoneRunCount() == 0 or plan.split_gc) {
+                plan.complete_coverage = false;
+            } else {
+                validated = try relocateDirectoryPlan(backend, plan);
+                const selected = validated orelse return;
+                plan.run_indices = selected.plan.run_indices;
+                plan.complete_coverage = selected.complete_coverage;
+            }
+        }
+    }
     if (!plan.tombstone_gc and !plan.split_gc and plan.partition_key != null and plan.source_len == 1 and plan.target_len == 0 and
-        ((backend.runs.items[plan.sourceIndex(0)].tombstone_count orelse 0) == 0 or !planHasCompleteCoverage(backend.runs.items, plan)))
+        ((run_store.planAt(backend, plan, 0).*.tombstone_count orelse 0) == 0 or !(plan.complete_coverage orelse planHasCompleteCoverage(&backend.runs, plan))))
     {
         // A closed, nonoverlapping domain needs only a manifest-level move.
         // SST bytes and file identity are immutable; do not decode/re-encode
         // a cold payload just to change its level.
-        const directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryMove")) try backend.prepareRunDirectoryMove(plan.sourceIndex(0), plan.output_level) else null;
+        var metadata_credit = if (comptime @hasDecl(BackendType, "admitCompactionMetadata")) try backend.admitCompactionMetadata(plan, &.{run_store.planAt(backend, plan, 0).*}) else {};
+        defer if (comptime @hasDecl(BackendType, "admitCompactionMetadata")) metadata_credit.release();
+        const directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryMove")) try backend.prepareRunDirectoryMove(run_store.planAt(backend, plan, 0), plan.output_level) else null;
+        errdefer if (directory) |root| root.destroy(backend.allocator);
         if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
-        const run = &backend.runs.items[plan.sourceIndex(0)];
+        const run = run_store.planAt(backend, plan, 0);
         const bytes = run.size_bytes;
-        run.level = plan.output_level;
-        sortRuns(backend.runs.items);
+        if (comptime @TypeOf(backend.runs) == run_store.Store) {
+            var moved = run.*;
+            moved.level = plan.output_level;
+            const retired = try backend.allocator.create(run_store.Store);
+            errdefer backend.allocator.destroy(retired);
+            const candidate = try backend.runs.prepareReplace(backend.allocator, run, moved);
+            retired.* = backend.runs;
+            backend.runs = candidate;
+            backend.retireRunStore(retired);
+        } else {
+            run.level = plan.output_level;
+            if (comptime @TypeOf(backend.runs) != run_store.Store) sortRuns(backend.runs.items);
+        }
         if (comptime @hasDecl(BackendType, "publishRunDirectory")) backend.publishRunDirectory(directory);
+        if (comptime @hasDecl(BackendType, "admitCompactionMetadata")) metadata_credit.commit();
         if (@hasDecl(BackendType, "markManifestDirty")) backend.markManifestDirty();
         if (@hasField(BackendType, "compaction_stats")) {
             backend.compaction_stats.compactions += 1;
@@ -1139,18 +2314,18 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     defer backend.allocator.free(selected);
     var selected_len: usize = 0;
     for (0..plan.source_len) |i| {
-        const run = &backend.runs.items[plan.sourceIndex(i)];
+        const run = run_store.planAt(backend, plan, i);
         selected[selected_len] = run;
         selected_len += 1;
     }
     for (0..plan.target_len) |i| {
-        const run = &backend.runs.items[plan.targetIndex(i)];
+        const run = run_store.planAt(backend, plan, plan.source_len + i);
         selected[selected_len] = run;
         selected_len += 1;
     }
     const input_bytes = sumRunPtrBytes(selected[0..selected_len]);
 
-    const drop_tombstones = !plan.split_gc and planHasCompleteCoverage(backend.runs.items, plan);
+    const drop_tombstones = !plan.split_gc and (plan.complete_coverage orelse planHasCompleteCoverage(&backend.runs, plan));
     const split_start = backend.next_run_id;
     if (plan.split_gc) backend.next_run_id +|= countRunPtrEntries(selected[0..selected_len]);
     var compacted_runs = if (plan.split_gc)
@@ -1161,13 +2336,16 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
         try makeStateRunsFromSelectedRuns(BackendType, backend, selected[0..selected_len], plan.output_level, drop_tombstones);
     inheritTombstoneAge(compacted_runs.items, selected[0..selected_len]);
     errdefer discardOutputRuns(BackendType, backend, &compacted_runs);
+    if (comptime @TypeOf(backend.runs) == run_store.Store) {
+        return installCompactedRuns(BackendType, backend, plan, selected_len, input_bytes, start_ns, &compacted_runs);
+    }
 
     var retained = std.ArrayListUnmanaged(Run).empty;
     errdefer {
         for (retained.items) |*run| run.deinit(backend.allocator);
         retained.deinit(backend.allocator);
     }
-    try retained.ensureTotalCapacity(backend.allocator, backend.runs.items.len - selected_len + compacted_runs.items.len);
+    try retained.ensureTotalCapacity(backend.allocator, run_store.count(backend) - selected_len + compacted_runs.items.len);
 
     var obsolete_runs = std.ArrayListUnmanaged(Run).empty;
     errdefer {
@@ -1176,7 +2354,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     }
     try obsolete_runs.ensureTotalCapacity(backend.allocator, selected_len);
 
-    var remove = try backend.allocator.alloc(bool, backend.runs.items.len);
+    var remove = try backend.allocator.alloc(bool, run_store.count(backend));
     defer backend.allocator.free(remove);
     @memset(remove, false);
     for (0..plan.source_len) |i| remove[plan.sourceIndex(i)] = true;
@@ -1197,7 +2375,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     }
     try backend.reserveObsoletePublication(obsolete_paths.items.len, @intFromBool(selected_len > 0));
 
-    reconcileGcObjective(backend.runs.items, plan, compacted_runs.items);
+    reconcileGcObjective(&backend.runs, plan, compacted_runs.items);
     const directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryChange")) try backend.prepareRunDirectoryChange(plan, compacted_runs.items) else null;
 
     for (backend.runs.items, 0..) |*run, i| {
@@ -1243,9 +2421,36 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     obsolete_runs = .empty;
 }
 
-fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
+fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendType, initial_plan: CompactionPlan) !void {
+    var plan = initial_plan;
+    var normalized_handles: ?[]Directory.Handle = null;
+    var normalized_indices: ?[]usize = null;
+    defer {
+        if (normalized_handles) |handles| {
+            for (handles) |handle| handle.release(backend.allocator);
+            backend.allocator.free(handles);
+        }
+        if (normalized_indices) |indices| backend.allocator.free(indices);
+    }
+    if (comptime @hasDecl(BackendType, "planningDirectory")) {
+        if (plan.input_handles == null and plan.source_len != 0) {
+            const directory = try backend.planningDirectory();
+            const indices = try backend.allocator.alloc(usize, plan.source_len + plan.target_len);
+            normalized_indices = indices;
+            const handles = try backend.allocator.alloc(Directory.Handle, indices.len);
+            for (indices, handles, 0..) |*index, *handle, i| {
+                index.* = if (i < plan.source_len) plan.sourceIndex(i) else plan.targetIndex(i - plan.source_len);
+                handle.* = directory.at(index.*).retain();
+            }
+            normalized_handles = handles;
+            plan.source_start = 0;
+            plan.target_start = plan.source_len;
+            plan.run_indices = indices;
+            plan.input_handles = handles;
+        }
+    }
     if (plan.source_len == 0) return;
-    const drop_tombstones = !plan.split_gc and planHasCompleteCoverage(backend.runs.items, plan);
+    const drop_tombstones = !plan.split_gc and (plan.complete_coverage orelse planHasCompleteCoverage(&backend.runs, plan));
     const start_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) backend.writeStatsNowNs() else 0;
 
     var selected_runs = std.ArrayListUnmanaged(Run).empty;
@@ -1303,14 +2508,16 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         return err;
     }
 
-    const domain_plan = if (plan.tombstone_gc or plan.split_gc)
-        try relocateGcPlan(backend.allocator, backend.runs.items, plan, selected_runs.items)
-    else if (plan.partition_key != null) try relocateDomainPlan(backend.allocator, backend.runs.items, plan, selected_run_ids) else null;
+    const domain_plan = if (plan.input_handles != null and comptime @hasDecl(BackendType, "planningDirectory"))
+        try relocateDirectoryPlan(backend, plan)
+    else if (plan.tombstone_gc or plan.split_gc)
+        try relocateGcPlan(backend.allocator, (try run_store.oracleItems(backend)), plan, selected_runs.items)
+    else if (plan.partition_key != null) try relocateDomainPlan(backend.allocator, (try run_store.oracleItems(backend)), plan, selected_run_ids) else null;
     defer if (domain_plan) |selected_plan| selected_plan.deinit(backend.allocator);
-    const publish_plan = (if (plan.partition_key != null or plan.tombstone_gc or plan.split_gc)
+    const publish_plan = (if (plan.input_handles != null or plan.partition_key != null or plan.tombstone_gc or plan.split_gc)
         if (domain_plan) |selected_plan| selected_plan.plan else null
     else
-        relocatePlanIfInputsStillMatch(backend.runs.items, plan, selected_run_ids)) orelse {
+        relocatePlanIfInputsStillMatch((try run_store.oracleItems(backend)), plan, selected_run_ids)) orelse {
         if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
         discardOutputRuns(BackendType, backend, &build_result);
@@ -1321,7 +2528,8 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     // Revalidate all older persisted data, not only the target-level closure.
     // Concurrent newer L0 publication is harmless, but an older overlapping
     // value outside the selected inputs must prevent delete elision.
-    if (drop_tombstones and !planHasCompleteCoverage(backend.runs.items, publish_plan)) {
+    const complete_coverage = if (domain_plan) |selected_plan| selected_plan.complete_coverage orelse planHasCompleteCoverage(&backend.runs, publish_plan) else planHasCompleteCoverage(&backend.runs, publish_plan);
+    if (drop_tombstones and !complete_coverage) {
         if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
         discardOutputRuns(BackendType, backend, &build_result);
@@ -1351,11 +2559,11 @@ fn appendPlanRunSnapshots(
 ) !void {
     try out.ensureUnusedCapacity(backend.allocator, plan.source_len + plan.target_len);
     for (0..plan.source_len) |i| {
-        const run = backend.runs.items[plan.sourceIndex(i)];
+        const run = run_store.planAt(backend, plan, i).*;
         try appendCompactionSnapshot(BackendType, backend, out, run);
     }
     for (0..plan.target_len) |i| {
-        const run = backend.runs.items[plan.targetIndex(i)];
+        const run = run_store.planAt(backend, plan, plan.source_len + i).*;
         try appendCompactionSnapshot(BackendType, backend, out, run);
     }
 }
@@ -1523,12 +2731,15 @@ fn installCompactedRuns(
     start_ns: u64,
     compacted_runs: *std.ArrayListUnmanaged(Run),
 ) !void {
+    if (comptime @TypeOf(backend.runs) == run_store.Store) {
+        return installOwnedTreeRuns(backend, plan, selected_len, input_bytes, start_ns, compacted_runs);
+    }
     var retained = std.ArrayListUnmanaged(Run).empty;
     errdefer {
         for (retained.items) |*run| run.deinit(backend.allocator);
         retained.deinit(backend.allocator);
     }
-    try retained.ensureTotalCapacity(backend.allocator, backend.runs.items.len - selected_len + compacted_runs.items.len);
+    try retained.ensureTotalCapacity(backend.allocator, run_store.count(backend) - selected_len + compacted_runs.items.len);
 
     var obsolete_runs = std.ArrayListUnmanaged(Run).empty;
     errdefer {
@@ -1537,7 +2748,7 @@ fn installCompactedRuns(
     }
     try obsolete_runs.ensureTotalCapacity(backend.allocator, selected_len);
 
-    var remove = try backend.allocator.alloc(bool, backend.runs.items.len);
+    var remove = try backend.allocator.alloc(bool, run_store.count(backend));
     defer backend.allocator.free(remove);
     @memset(remove, false);
     for (0..plan.source_len) |i| remove[plan.sourceIndex(i)] = true;
@@ -1558,7 +2769,7 @@ fn installCompactedRuns(
     }
     try backend.reserveObsoletePublication(obsolete_paths.items.len, @intFromBool(selected_len > 0));
 
-    reconcileGcObjective(backend.runs.items, plan, compacted_runs.items);
+    reconcileGcObjective(&backend.runs, plan, compacted_runs.items);
     const directory = if (comptime @hasDecl(BackendType, "prepareRunDirectoryChange")) try backend.prepareRunDirectoryChange(plan, compacted_runs.items) else null;
 
     for (backend.runs.items, 0..) |*run, i| {
@@ -1602,6 +2813,62 @@ fn installCompactedRuns(
     obsolete_paths.items.len = 0;
     backend.queueObsoleteRunsAssumeCapacity(obsolete_runs);
     obsolete_runs = .empty;
+}
+
+fn installOwnedTreeRuns(backend: anytype, plan: CompactionPlan, selected_len: usize, input_bytes: u64, start_ns: u64, outputs: *std.ArrayListUnmanaged(Run)) !void {
+    const allocator = backend.allocator;
+    const retired_store = try allocator.create(run_store.Store);
+    errdefer allocator.destroy(retired_store);
+    var metadata_credit = try backend.admitCompactionMetadata(plan, outputs.items);
+    defer metadata_credit.release();
+    var candidate = backend.runs.fork();
+    errdefer candidate.deinit(allocator);
+    var retired: std.ArrayListUnmanaged(Run) = .empty;
+    errdefer {
+        for (retired.items) |*run| run.deinit(allocator);
+        retired.deinit(allocator);
+    }
+    try retired.ensureTotalCapacity(allocator, selected_len);
+    var paths: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    try paths.ensureTotalCapacity(allocator, selected_len);
+    for (0..selected_len) |i| {
+        const run = run_store.planAt(backend, plan, i);
+        if (run.path) |path| paths.appendAssumeCapacity(try allocator.dupe(u8, path));
+        retired.appendAssumeCapacity(run.retainOwned());
+        try candidate.remove(allocator, run);
+    }
+    reconcileGcObjective(&backend.runs, plan, outputs.items);
+    for (outputs.items) |run| try candidate.stage(allocator, run);
+    try backend.reserveObsoletePublication(paths.items.len, @intFromBool(selected_len != 0));
+    const directory = try backend.prepareRunDirectoryChange(plan, outputs.items);
+    // Everything below is allocation-free. Untouched runs stay shared; only
+    // removed payloads move to the retirement owner and outputs are adopted.
+    var output_bytes: u64 = 0;
+    for (outputs.items) |run| {
+        candidate.adopt(&run);
+        output_bytes +|= run.size_bytes;
+    }
+    backend.recordCompactionWriteStats(outputs.items, elapsedNs(@TypeOf(backend.*), backend, start_ns));
+    disarmRunList(outputs);
+    outputs.deinit(allocator);
+    outputs.* = .empty;
+    backend.invalidateReadVersion();
+    std.mem.swap(run_store.Store, &backend.runs, &candidate);
+    retired_store.* = candidate;
+    backend.retireRunStore(retired_store);
+    backend.publishRunDirectory(directory);
+    metadata_credit.commit();
+    backend.compaction_stats.compactions += 1;
+    backend.compaction_stats.input_runs += selected_len;
+    backend.compaction_stats.input_bytes +|= input_bytes;
+    backend.compaction_stats.output_bytes +|= output_bytes;
+    for (paths.items) |path| backend.queueObsoleteFilePathAssumeCapacity(path);
+    paths.items.len = 0;
+    backend.queueObsoleteRunsAssumeCapacity(retired);
 }
 
 pub fn discardOutputRuns(comptime BackendType: type, backend: *BackendType, runs: *std.ArrayListUnmanaged(Run)) void {
@@ -2115,7 +3382,7 @@ pub fn levelByteTargetForRuns(runs: []const Run, level: u32, base: usize, multip
     return levelByteTargetForTotals(total_bytes, max_level, level, base, multiplier);
 }
 
-fn levelByteTargetForTotals(total_bytes: u64, max_level: u32, level: u32, base: usize, multiplier: usize) u64 {
+pub fn levelByteTargetForTotals(total_bytes: u64, max_level: u32, level: u32, base: usize, multiplier: usize) u64 {
     if (level == 0 or base == 0) return 0;
     const factor: u64 = @intCast(@max(@as(usize, 1), multiplier));
     if (factor == 1) return staticLevelByteTarget(level, base, multiplier);
@@ -2423,7 +3690,7 @@ test "domain planner uses global lower level budgets and normalized pressure" {
     var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
     var stats: CompactionSelectionStats = .{};
     const selected = (try selectDomainPlan(&backend, 3, false, 0, false, &stats)).?;
-    defer selected.deinit(backend.allocator);
+    defer selected.release(backend);
     // Each L1 domain is below the local budget, but global L1 is 4x its
     // budget. It must outrank the 1.33x L0 pressure in the unrelated z domain.
     try std.testing.expectEqual(@as(u32, 1), selected.plan.source_level);
@@ -2489,7 +3756,7 @@ test "tombstone GC density bounds garbage without stranding duplicate older vers
     // One complete delete generation over three older copies must qualify,
     // even though tombstones are only 25% of physical input entries.
     const selected = (try selectTombstoneGc(&backend, 0)).?;
-    defer selected.deinit(backend.allocator);
+    defer selected.release(backend);
     try std.testing.expectEqual(@as(usize, 4), selected.plan.source_len);
     const bounded = (try selectTombstoneGc(&backend, 20)).?;
     defer bounded.deinit(backend.allocator);
@@ -2531,7 +3798,7 @@ test "bounded GC carries aggregate eligibility across windows and retries indepe
     try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), nextTombstoneGcDelay(&backend));
     backend.tombstone_gc_retry_after_ns = 0;
     const selected = (try selectTombstoneGc(&backend, 1536)).?;
-    defer selected.deinit(backend.allocator);
+    defer selected.release(backend);
     try std.testing.expect(compactionInputBytes(&runs, selected.plan) <= 1536);
     try std.testing.expect(runs[0].gc_requested and runs[1].gc_requested);
     // Even if a preceding job lowers density, the outstanding objective stays.
@@ -2548,7 +3815,6 @@ test "bounded GC carries aggregate eligibility across windows and retries indepe
 }
 
 test "persistent planner ordering matches rebuilt domain and GC indexes after level moves" {
-    const Directory = @import("run_directory.zig").Directory;
     const Family = struct {
         fn key(bytes: []const u8) []const u8 {
             return bytes[0..@min(bytes.len, 1)];
@@ -2653,7 +3919,7 @@ test "domain compaction maps interleaved inputs and revalidates concurrent publi
     var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
     var stats: CompactionSelectionStats = .{};
     const selected = (try selectDomainPlan(&backend, 2, true, 8, false, &stats)).?;
-    defer selected.deinit(backend.allocator);
+    defer selected.release(backend);
     const plan = selected.plan;
     try std.testing.expect(plan.run_indices != null);
     try std.testing.expect(compactionInputBytes(&runs, plan) <= 8);
@@ -3793,10 +5059,10 @@ fn countTombstones(entries: anytype) u32 {
 
 /// GC requests can advance while ordinary compaction builds off-lock. Merge
 /// the live objective at the installation fence, including denied GC attempts.
-fn reconcileGcObjective(live: []const Run, plan: CompactionPlan, outputs: []Run) void {
+fn reconcileGcObjective(live: anytype, plan: CompactionPlan, outputs: []Run) void {
     var requested = false;
-    for (0..plan.source_len) |i| requested = requested or live[plan.sourceIndex(i)].gc_requested;
-    for (0..plan.target_len) |i| requested = requested or live[plan.targetIndex(i)].gc_requested;
+    for (0..plan.source_len) |i| requested = requested or run_store.planGet(live, plan, i).gc_requested;
+    for (0..plan.target_len) |i| requested = requested or run_store.planGet(live, plan, plan.source_len + i).gc_requested;
     if (requested) for (outputs) |*run| {
         if ((run.tombstone_count orelse 0) != 0) run.gc_requested = true;
     };
@@ -3865,7 +5131,36 @@ fn deinitRunList(allocator: std.mem.Allocator, runs: *std.ArrayListUnmanaged(Run
     runs.* = .empty;
 }
 
-pub fn appendOwnedRuns(dst: *std.ArrayListUnmanaged(Run), allocator: std.mem.Allocator, src: *std.ArrayListUnmanaged(Run)) !void {
+pub fn appendBackendRuns(backend: anytype, src: *std.ArrayListUnmanaged(Run)) !void {
+    if (comptime !@hasDecl(@TypeOf(backend.*), "retireRunStore")) return appendOwnedRuns(&backend.runs, backend.allocator, src);
+    if (backend.runs.count() == 0) return appendOwnedRuns(&backend.runs, backend.allocator, src);
+    const retired = try backend.allocator.create(run_store.Store);
+    errdefer backend.allocator.destroy(retired);
+    var candidate = backend.runs.fork();
+    errdefer candidate.deinit(backend.allocator);
+    try appendOwnedRuns(&candidate, backend.allocator, src);
+    retired.* = backend.runs;
+    backend.runs = candidate;
+    backend.retireRunStore(retired);
+}
+
+pub fn appendOwnedRuns(dst: anytype, allocator: std.mem.Allocator, src: *std.ArrayListUnmanaged(Run)) !void {
+    if (comptime @TypeOf(dst) == *@import("run_store.zig").Store) {
+        var candidate = dst.fork();
+        errdefer candidate.deinit(allocator);
+        for (src.items) |run| try candidate.stage(allocator, run);
+        for (src.items) |*run| {
+            candidate.adopt(run);
+            if (run.owner) |owner| owner.release(allocator);
+            disarmRun(run);
+        }
+        std.mem.swap(@import("run_store.zig").Store, dst, &candidate);
+        candidate.deinit(allocator);
+        src.items.len = 0;
+        src.deinit(allocator);
+        src.* = .empty;
+        return;
+    }
     try dst.ensureUnusedCapacity(allocator, src.items.len);
     for (src.items) |*run| {
         dst.appendAssumeCapacity(run.*);
@@ -4169,14 +5464,14 @@ test "compaction publication OOM leaves the active run version intact" {
             &compacted_runs,
         );
         if (result) |_| {
-            try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-            try std.testing.expectEqual(@as(u64, 3), backend.runs.items[0].id);
+            try std.testing.expectEqual(@as(usize, 1), run_store.count(backend));
+            try std.testing.expectEqual(@as(u64, 3), run_store.at(backend, 0).*.id);
         } else |err| {
             if (err != error.OutOfMemory) return err;
             observed_preflight_failure = true;
-            try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
-            try std.testing.expectEqual(@as(u64, 1), backend.runs.items[0].id);
-            try std.testing.expectEqual(@as(u64, 2), backend.runs.items[1].id);
+            try std.testing.expectEqual(@as(usize, 2), run_store.count(backend));
+            try std.testing.expectEqual(@as(u64, 1), run_store.at(backend, 0).*.id);
+            try std.testing.expectEqual(@as(u64, 2), run_store.at(backend, 1).*.id);
             try std.testing.expectEqual(@as(usize, 1), compacted_runs.items.len);
             failing.fail_index = std.math.maxInt(usize);
             failing.resize_fail_index = std.math.maxInt(usize);

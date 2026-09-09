@@ -211,8 +211,10 @@ fn derivePhysicalFieldValidations(
     schema: ParsedTableSchema,
 ) ![]impl.PhysicalFieldValidation {
     var out = std.ArrayListUnmanaged(impl.PhysicalFieldValidation).empty;
-    errdefer freePhysicalFieldValidationItems(alloc, out.items);
     defer out.deinit(alloc);
+    // Error defers run in reverse order: release the owned strings before
+    // destroying the array that contains their descriptors.
+    errdefer freePhysicalFieldValidationItems(alloc, out.items);
     var seen_types = std.StringHashMapUnmanaged(u16).empty;
     defer seen_types.deinit(alloc);
     for (schema.document_schemas) |document_schema| {

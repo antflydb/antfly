@@ -146,20 +146,7 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
     try appendU32(allocator, &bytes, @intCast(manifest.runs.len));
     try appendU32(allocator, &bytes, @intCast(manifest.obsolete_paths.len));
     for (manifest.runs) |run| {
-        try appendU64(allocator, &bytes, run.id);
-        try appendU32(allocator, &bytes, run.level);
-        try appendU64(allocator, &bytes, run.size_bytes);
-        try appendCompressionStats(allocator, &bytes, run.compression_stats);
-        try appendU32(allocator, &bytes, @intCast(run.path.len));
-        try appendU32(allocator, &bytes, if (run.smallest_namespace_name) |name| @intCast(name.len) else 0);
-        try appendU32(allocator, &bytes, @intCast(run.smallest_key.len));
-        try appendU32(allocator, &bytes, if (run.largest_namespace_name) |name| @intCast(name.len) else 0);
-        try appendU32(allocator, &bytes, @intCast(run.largest_key.len));
-        try appendU32(allocator, &bytes, run.entry_count);
-        try appendU64(allocator, &bytes, if (run.tombstone_count) |count| count else std.math.maxInt(u64));
-        try appendU64(allocator, &bytes, run.oldest_tombstone_unix_ns);
-        try appendU64(allocator, &bytes, run.visibility_id);
-        try appendU32(allocator, &bytes, @intFromBool(run.gc_requested));
+        try bytes.appendSlice(allocator, &runHeader(run));
         try bytes.appendSlice(allocator, run.path);
         if (run.smallest_namespace_name) |name| try bytes.appendSlice(allocator, name);
         try bytes.appendSlice(allocator, run.smallest_key);
@@ -174,6 +161,33 @@ pub fn encodeAlloc(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
     try appendU32(allocator, &bytes, Crc32.hash(bytes.items));
 
     return try bytes.toOwnedSlice(allocator);
+}
+
+fn putInt(comptime T: type, bytes: []u8, offset: *usize, value: T) void {
+    std.mem.writeInt(T, bytes[offset.*..][0..@sizeOf(T)], value, .little);
+    offset.* += @sizeOf(T);
+}
+
+pub fn runHeader(run: RunMeta) [112]u8 {
+    var bytes: [112]u8 = undefined;
+    var offset: usize = 0;
+    putInt(u64, &bytes, &offset, run.id);
+    putInt(u32, &bytes, &offset, run.level);
+    putInt(u64, &bytes, &offset, run.size_bytes);
+    inline for (.{ "logical_entry_bytes", "physical_entry_bytes", "raw_blocks", "compressed_blocks", "compression_codec_mask" }) |field|
+        putInt(u64, &bytes, &offset, @field(run.compression_stats, field));
+    putInt(u32, &bytes, &offset, @intCast(run.path.len));
+    putInt(u32, &bytes, &offset, if (run.smallest_namespace_name) |name| @intCast(name.len) else 0);
+    putInt(u32, &bytes, &offset, @intCast(run.smallest_key.len));
+    putInt(u32, &bytes, &offset, if (run.largest_namespace_name) |name| @intCast(name.len) else 0);
+    putInt(u32, &bytes, &offset, @intCast(run.largest_key.len));
+    putInt(u32, &bytes, &offset, run.entry_count);
+    putInt(u64, &bytes, &offset, if (run.tombstone_count) |count| count else std.math.maxInt(u64));
+    putInt(u64, &bytes, &offset, run.oldest_tombstone_unix_ns);
+    putInt(u64, &bytes, &offset, run.visibility_id);
+    putInt(u32, &bytes, &offset, @intFromBool(run.gc_requested));
+    std.debug.assert(offset == bytes.len);
+    return bytes;
 }
 
 pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) anyerror!OwnedManifest {
@@ -378,7 +392,7 @@ pub fn borrowedRunMeta(run: BorrowedRunMeta) RunMeta {
 /// its length/sequence header and complete payload, so recovery distinguishes
 /// an incomplete final append from corruption of a complete record.
 pub fn encodeJournalFrameAlloc(allocator: std.mem.Allocator, sequence: u64, checkpoint: bool, removed_runs: []const u64, removed_paths: []const []const u8, manifest: Manifest) ![]u8 {
-    if (checkpoint and (sequence != 0 or removed_runs.len != 0 or removed_paths.len != 0)) return error.InvalidManifest;
+    if (checkpoint and (removed_runs.len != 0 or removed_paths.len != 0)) return error.InvalidManifest;
     const encoded = try encodeAlloc(allocator, manifest);
     defer allocator.free(encoded);
     var body: std.ArrayListUnmanaged(u8) = .empty;
@@ -411,6 +425,7 @@ fn decodeJournalBorrowed(allocator: std.mem.Allocator, raw: []u8) !BorrowedManif
     defer paths.deinit(allocator);
     var cursor: usize = journal_magic.len;
     var sequence: u64 = 0;
+    var first = true;
     var next_run_id: u64 = 0;
     while (cursor < raw.len) {
         if (raw.len - cursor < journal_header_len) break;
@@ -420,19 +435,20 @@ fn decodeJournalBorrowed(allocator: std.mem.Allocator, raw: []u8) !BorrowedManif
         if (length > std.math.maxInt(u32)) return error.InvalidManifest;
         const found_sequence = std.mem.readInt(u64, header[8..16], .little);
         const kind = std.mem.readInt(u32, header[16..20], .little);
-        if (found_sequence != sequence or kind != @intFromBool(sequence == 0)) return error.InvalidManifest;
+        if (first) sequence = found_sequence;
+        if (found_sequence != sequence or kind != @intFromBool(first)) return error.InvalidManifest;
         cursor += journal_header_len;
         if (length > raw.len - cursor or raw.len - cursor - @as(usize, @intCast(length)) < 4) break;
         const body = raw[cursor..][0..@intCast(length)];
         if (Crc32.hash(body) != std.mem.readInt(u32, raw[cursor + body.len ..][0..4], .little)) return error.InvalidManifest;
         var offset: usize = 0;
         const removed_count = try readU32(body, &offset);
-        if (removed_count > (body.len - offset) / 8 or (sequence == 0 and removed_count != 0)) return error.InvalidManifest;
+        if (removed_count > (body.len - offset) / 8 or (first and removed_count != 0)) return error.InvalidManifest;
         for (0..removed_count) |_| {
             if (!runs.remove(try readU64(body, &offset))) return error.InvalidManifest;
         }
         const removed_paths = try readU32(body, &offset);
-        if (removed_paths > (body.len - offset) / 4 or (sequence == 0 and removed_paths != 0)) return error.InvalidManifest;
+        if (removed_paths > (body.len - offset) / 4 or (first and removed_paths != 0)) return error.InvalidManifest;
         for (0..removed_paths) |_| {
             const len = try readU32(body, &offset);
             if (!paths.remove(try readSlice(body, &offset, len))) return error.InvalidManifest;
@@ -442,14 +458,15 @@ fn decodeJournalBorrowed(allocator: std.mem.Allocator, raw: []u8) !BorrowedManif
         var edit = try decodeBorrowedOwnedAlloc(allocator, body[offset..]);
         edit.raw = &.{};
         defer edit.deinit(allocator);
-        if (sequence != 0 and edit.next_run_id < next_run_id) return error.InvalidManifest;
+        if (!first and edit.next_run_id < next_run_id) return error.InvalidManifest;
         next_run_id = edit.next_run_id;
         for (edit.runs) |run| try runs.put(allocator, run.id, run);
         for (edit.obsolete_paths) |path| try paths.put(allocator, path.path, path);
         sequence = std.math.add(u64, sequence, 1) catch return error.InvalidManifest;
+        first = false;
         cursor += body.len + 4;
     }
-    if (sequence == 0) return error.InvalidManifest;
+    if (first) return error.InvalidManifest;
     const result_runs = try allocator.alloc(BorrowedRunMeta, runs.count());
     errdefer allocator.free(result_runs);
     var run_iter = runs.valueIterator();

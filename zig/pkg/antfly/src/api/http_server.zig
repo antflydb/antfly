@@ -8527,7 +8527,12 @@ pub const ApiHttpServer = struct {
             writer_fence.writer_not_after_unix_ns != null and
             admission_now >= initial_writer_lease_expiration)
             return error.BackupAttemptLeaseLost;
-        var operation_control = try backupOperationControl(io, writer_fence, request);
+        // Local execution is always bounded, even when a rolling-upgrade
+        // reservation deliberately has no persisted delivery deadline. Do not
+        // rewrite that legacy fence: cleanup must retain its tombstone.
+        var execution_fence = writer_fence;
+        execution_fence.writer_not_after_unix_ns = initial_writer_lease_expiration;
+        var operation_control = try backupOperationControl(io, execution_fence, request);
         try operation_control.ensureActive();
         if (backups_api.manifestExistsAtLocationWithIoAndCancellation(
             self.alloc,
@@ -41008,10 +41013,20 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/writer-role-lifecycle", .{tmp.sub_path});
     defer alloc.free(root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const root_abs = try std.fs.path.resolve(alloc, &.{ cwd, root });
+    defer alloc.free(root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{root_abs});
+    defer alloc.free(location_uri);
     var location: backups_api.BackupLocation = .{ .file = root };
     var source = FakeSource{};
     var writes = SuccessfulForwardedWrites{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = &runtime, .node_config = &node_config }, source.iface(), null, writes.source());
     defer server.deinit();
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 7,
@@ -41034,15 +41049,18 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         fence,
         table.name,
         &location,
-        "file:///backups",
+        location_uri,
         "logical",
         "logical-artifact",
         .portable,
-        "backups",
+        "test-backups",
         null,
         .logical_create,
         .{},
     );
+    // Committed writer-state retirement is asynchronous. Exercise its real
+    // owner and repository instead of assuming cleanup ran inline.
+    runtime.durable_jobs.drainOwner(server.backup_maintenance_owner_id);
     try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
         std.testing.io,
@@ -41057,11 +41075,11 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         fence,
         table.name,
         &location,
-        "file:///backups",
+        location_uri,
         "legacy",
         "legacy",
         .portable,
-        "backups",
+        "test-backups",
         null,
         .legacy_forwarded_create,
         .{},
@@ -41089,11 +41107,11 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         adopt_fence,
         table.name,
         &location,
-        "file:///backups",
+        location_uri,
         "adopt-artifact",
         "adopt-artifact",
         .portable,
-        "backups",
+        "test-backups",
         null,
         .adopt,
         .{},

@@ -470,7 +470,7 @@ const Scenario = struct {
             .maintenance = self.backend.snapshotMaintenanceStats(),
             .read = self.read_stats,
             .runs = summarizeRuns(&self.backend),
-            .obsolete_paths = self.backend.obsolete_paths.items.len,
+            .obsolete_paths = self.backend.obsolete_paths.count(),
             .mutable_entries = self.backend.mutable.entries.items.len,
         };
     }
@@ -1188,8 +1188,9 @@ fn effectiveL0HardLimitRuns(cfg: Config) usize {
 
 fn summarizeRuns(backend: *const antfly.lsm_backend.Backend) RunSummary {
     var summary: RunSummary = .{};
-    summary.count = backend.runs.items.len;
-    for (backend.runs.items) |run| {
+    summary.count = backend.runs.count();
+    var cursor = backend.runs.cursor();
+    while (cursor.next()) |run| {
         if (run.level == 0) summary.l0_count += 1;
         summary.max_level = @max(summary.max_level, run.level);
         summary.bytes += run.size_bytes;

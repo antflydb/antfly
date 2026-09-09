@@ -618,16 +618,19 @@ def materialize_lsm_manifest(raw: bytes) -> bytes:
     runs: dict[int, bytes] = {}
     paths: dict[bytes, bytes] = {}
     offset, sequence, next_id = 8, 0, 0
+    first = True
     while offset < len(raw):
         if len(raw) - offset < 24:
             break
         length, found_sequence, kind, checksum = struct.unpack_from(
             "<QQII", raw, offset
         )
+        if first:
+            sequence = found_sequence
         if (
             zlib.crc32(raw[offset : offset + 20]) != checksum
             or found_sequence != sequence
-            or kind != int(sequence == 0)
+            or kind != int(first)
             or length > (1 << 32) - 1
         ):
             raise ValueError("invalid manifest journal header")
@@ -640,7 +643,7 @@ def materialize_lsm_manifest(raw: bytes) -> bytes:
         cursor = 0
         removed = struct.unpack_from("<I", body, cursor)[0]
         cursor += 4
-        if removed > (len(body) - cursor) // 8 or (sequence == 0 and removed):
+        if removed > (len(body) - cursor) // 8 or (first and removed):
             raise ValueError("invalid manifest removals")
         for _ in range(removed):
             run_id = struct.unpack_from("<Q", body, cursor)[0]
@@ -649,7 +652,7 @@ def materialize_lsm_manifest(raw: bytes) -> bytes:
                 raise ValueError("unknown removed run")
         removed = struct.unpack_from("<I", body, cursor)[0]
         cursor += 4
-        if removed > (len(body) - cursor) // 4 or (sequence == 0 and removed):
+        if removed > (len(body) - cursor) // 4 or (first and removed):
             raise ValueError("invalid obsolete removals")
         for _ in range(removed):
             size = struct.unpack_from("<I", body, cursor)[0]
@@ -673,7 +676,7 @@ def materialize_lsm_manifest(raw: bytes) -> bytes:
         ):
             raise ValueError("invalid embedded checksum")
         found_id, run_count, path_count = struct.unpack_from("<QII", manifest, 12)
-        if sequence and found_id < next_id:
+        if not first and found_id < next_id:
             raise ValueError("regressing manifest identity")
         next_id = found_id
         cursor = 28
@@ -698,18 +701,97 @@ def materialize_lsm_manifest(raw: bytes) -> bytes:
         if cursor != len(manifest) - 4:
             raise ValueError("trailing embedded bytes")
         sequence += 1
+        first = False
         offset += length + 4
-    if sequence == 0:
+    if first:
         raise ValueError("missing manifest checkpoint")
     result = b"ALSMMAN1" + struct.pack("<IQII", 10, next_id, len(runs), len(paths))
     result += b"".join(runs.values()) + b"".join(paths.values())
     return result + struct.pack("<I", zlib.crc32(result))
 
 
+def load_lsm_manifest_stream(path: Path) -> bytes:
+    limit = 128 * 1024 * 1024
+
+    def read(file: Path, maximum: int = limit) -> bytes:
+        with file.open("rb") as source:
+            data = source.read(maximum + 1)
+        if len(data) > maximum:
+            raise ValueError("manifest byte budget exceeded")
+        return data
+
+    def header(data: bytes, magic: bytes, identity: int) -> int:
+        if (
+            len(data) < 28
+            or data[:8] != magic
+            or struct.unpack_from("<Q", data, 8)[0] != identity
+            or zlib.crc32(data[:24]) != struct.unpack_from("<I", data, 24)[0]
+        ):
+            raise ValueError("invalid manifest segment header")
+        return struct.unpack_from("<Q", data, 16)[0]
+
+    pointer = read(path)
+    if not pointer.startswith(b"ALSMSET1"):
+        return pointer
+    if (
+        len(pointer) != 36
+        or zlib.crc32(pointer[:32]) != struct.unpack_from("<I", pointer, 32)[0]
+    ):
+        raise ValueError("invalid manifest descriptor")
+    checkpoint, segment, sequence = struct.unpack_from("<QQQ", pointer, 8)
+    if not checkpoint or not segment:
+        raise ValueError("invalid manifest identity")
+    base = read(path.with_name(f"manifest-{checkpoint}.checkpoint"))
+    if (
+        len(base) < 36
+        or base[:8] != b"ALSMJNL1"
+        or struct.unpack_from("<Q", base, 16)[0] != sequence
+        or struct.unpack_from("<Q", base, 8)[0] != len(base) - 36
+    ):
+        raise ValueError("checkpoint sequence mismatch")
+    chunks, total = [base], len(base)
+    expected = sequence + 1
+    for _ in range(64):
+        try:
+            link = read(path.with_name(f"manifest-{segment}.next"), 28)
+        except FileNotFoundError:
+            link = None
+        data = read(path.with_name(f"manifest-{segment}.journal"), limit - total + 28)
+        if header(data, b"ALSMSEG1", segment) != expected:
+            raise ValueError("segment sequence gap")
+        offset = 28
+        while len(data) - offset >= 24:
+            size, found, kind, checksum = struct.unpack_from("<QQII", data, offset)
+            if (
+                found != expected
+                or kind != 0
+                or size > (1 << 32) - 1
+                or zlib.crc32(data[offset : offset + 20]) != checksum
+            ):
+                raise ValueError("invalid segmented edit")
+            if len(data) - offset < size + 28:
+                break
+            offset += size + 28
+            expected += 1
+        if link is not None and offset != len(data):
+            raise ValueError("incomplete sealed segment")
+        chunks.append(data[28:])
+        total += len(data) - 28
+        if link is None:
+            return b"".join(chunks)
+        if len(link) != 28:
+            raise ValueError("invalid segment link")
+        successor = header(link, b"ALSMNXT1", segment)
+        if successor <= segment:
+            raise ValueError("manifest segment cycle")
+        segment = successor
+    raise ValueError("manifest segment budget exceeded")
+
+
 def lsm_manifest_inventory(root: Path, manifest_path: Path) -> dict[str, Any] | None:
     """Decode LSM run ownership without opening or mutating the store."""
     try:
-        raw = materialize_lsm_manifest(manifest_path.read_bytes())
+        raw = materialize_lsm_manifest(load_lsm_manifest_stream(manifest_path))
         if len(raw) < 28 or raw[:8] != b"ALSMMAN1":
             return None
         offset = 8

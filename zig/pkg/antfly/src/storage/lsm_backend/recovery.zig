@@ -131,19 +131,28 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     const loaded_manifest = blk: {
         const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
         defer finishOpenPhase(BackendType, backend, .opening_manifest, phase_start);
-        break :blk try repository_mod.loadManifestIfPresentWithStorage(
+        var loaded_runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty;
+        defer {
+            for (loaded_runs.items) |*run| run.deinit(allocator);
+            loaded_runs.deinit(allocator);
+        }
+        const loaded = try repository_mod.loadManifestWithRecoveryState(
             backend.storage.?,
             allocator,
             backend.root_dir.?,
             &backend.manifest_backing,
             &backend.next_run_id,
-            &backend.runs,
+            &loaded_runs,
             &backend.obsolete_paths,
+            if (@hasField(BackendType, "recovered_manifest")) &backend.recovered_manifest else null,
         );
+        try compaction_mod.appendOwnedRuns(&backend.runs, allocator, &loaded_runs);
+        break :blk loaded;
     };
     recordOpenManifestLoaded(BackendType, backend, loaded_manifest);
     if (loaded_manifest) {
-        for (backend.runs.items) |run| {
+        for (0..@import("run_store.zig").count(backend)) |rank| {
+            const run = @import("run_store.zig").at(backend, rank).*;
             const path = run.path orelse return error.RunStateUnavailable;
             // Check the manifest bound first so old oversized manifests retain
             // their precise FileTooBig diagnosis even when the referenced file
@@ -182,8 +191,8 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
             .{
                 backend.root_dir.?,
                 loaded_manifest,
-                backend.runs.items.len,
-                backend.obsolete_paths.items.len,
+                @import("run_store.zig").count(backend),
+                backend.obsolete_paths.count(),
                 backend.next_run_id,
             },
         );
@@ -224,7 +233,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         }
         const phase_start = beginOpenPhase(BackendType, backend, .mounting_runs);
         defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
-        compaction_mod.sortRuns(backend.runs.items);
+        if (comptime @TypeOf(backend.runs) != @import("run_store.zig").Store) compaction_mod.sortRuns(backend.runs.items);
         if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
         // Build cold metadata before publishing the opened backend. Subsequent
         // writes maintain this root incrementally, including before first read.
@@ -259,7 +268,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     if (debug_open) {
         std.log.info(
             "lsm backend open done root={s} runs={d} mutable_entries={d}",
-            .{ backend.root_dir.?, backend.runs.items.len, backend.mutable.entryCount() },
+            .{ backend.root_dir.?, @import("run_store.zig").count(backend), backend.mutable.entryCount() },
         );
     }
 }
@@ -336,16 +345,17 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
     if (@hasDecl(BackendType, "destroyRunMetadata")) backend.destroyRunMetadata();
-    for (backend.runs.items) |*run| {
+    for (0..@import("run_store.zig").count(backend)) |rank| {
+        const run = @import("run_store.zig").at(backend, rank);
         if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
         if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);
-        run.deinit(backend.allocator);
+        if (comptime @TypeOf(backend.runs) != @import("run_store.zig").Store) run.deinit(backend.allocator);
     }
     backend.runs.deinit(backend.allocator);
     if (@hasField(BackendType, "obsolete_paths")) {
-        for (backend.obsolete_paths.items) |*obsolete| {
+        if (comptime @hasField(@TypeOf(backend.obsolete_paths), "items")) for (backend.obsolete_paths.items) |*obsolete| {
             obsolete.deinit(backend.allocator);
-        }
+        };
         backend.obsolete_paths.deinit(backend.allocator);
     }
     if (@hasField(BackendType, "obsolete_runs")) {
@@ -377,6 +387,9 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     if (@hasField(BackendType, "manifest_backing")) {
         if (backend.manifest_backing) |raw| backend.allocator.free(raw);
+    }
+    if (@hasField(BackendType, "obsolete_reclaim_after")) {
+        if (backend.obsolete_reclaim_after) |path| backend.allocator.free(path);
     }
     if (@hasDecl(BackendType, "releaseRootWriterLock")) {
         backend.releaseRootWriterLock();

@@ -38616,8 +38616,10 @@ test "provisioned table write source rejects writes that violate enforced docume
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+    }
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -38649,6 +38651,7 @@ test "provisioned table write source rejects writes that violate enforced docume
     };
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
     try std.testing.expectError(error.InvalidBatchRequest, source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"unexpected\"}" }},
     }));
@@ -54883,6 +54886,7 @@ test "provisioned table write source create table provisions local indexes and s
 
     const Catalog = struct {
         var indexes_json: []const u8 = tables_api.default_indexes_json;
+        var current_schema_json: []const u8 = schema_json;
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -54898,18 +54902,23 @@ test "provisioned table write source create table provisions local indexes and s
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            // indexes_json is runtime state, so an inline array containing it
+            // would live on this call's stack. Own the snapshot descriptors
+            // until the catalog consumer explicitly releases them.
+            const records = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            records[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .description = "docs table",
+                .schema_json = current_schema_json,
+                .read_schema_json = "",
+                .indexes_json = indexes_json,
+                .replication_sources_json = "[]",
+                .placement_role = "data",
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .description = "docs table",
-                    .schema_json = schema_json,
-                    .read_schema_json = "",
-                    .indexes_json = indexes_json,
-                    .replication_sources_json = "[]",
-                    .placement_role = "data",
-                }})[0..]),
+                .tables = records,
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
                     .table_id = 7,
@@ -54923,7 +54932,9 @@ test "provisioned table write source create table provisions local indexes and s
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables);
+        }
     };
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
@@ -54933,6 +54944,7 @@ test "provisioned table write source create table provisions local indexes and s
     defer source.deinit();
     source.write_cache = &write_cache;
     Catalog.indexes_json = tables_api.default_indexes_json;
+    Catalog.current_schema_json = schema_json;
     var req = tables_api.CreateTableRequest{
         .schema_json = try alloc.dupe(u8, schema_json),
     };
@@ -54952,6 +54964,7 @@ test "provisioned table write source create table provisions local indexes and s
         "{\"version\":1,\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}";
     Catalog.indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}";
     _ = try source.source().updateSchema(alloc, "docs", updated_schema_json);
+    Catalog.current_schema_json = updated_schema_json;
 
     {
         lockAtomic(&source.local_db_mutex);

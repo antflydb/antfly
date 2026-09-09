@@ -210,8 +210,14 @@ comptime {
     _ = @import("lsm_backend/compaction.zig");
     _ = @import("lsm_backend/compaction_scheduler.zig");
     _ = @import("lsm_backend/mod.zig");
+    _ = @import("lsm_backend/manifest_set.zig");
+    _ = @import("lsm_backend/manifest_replay.zig");
+    _ = @import("lsm_backend/obsolete_ledger.zig");
     _ = @import("lsm_backend/repository.zig");
     _ = @import("lsm_backend/run_directory.zig");
+    _ = @import("lsm_backend/run_store.zig");
+    _ = @import("lsm_backend/gc_job.zig");
+    _ = @import("lsm_backend/dependency_job.zig");
     _ = @import("lsm_backend/runtime.zig");
     _ = @import("lsm_backend/state.zig");
     _ = @import("lsm_backend/storage_io.zig");
