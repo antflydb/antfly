@@ -21,6 +21,7 @@ test {
     _ = @import("standalone/inference_worker_rpc.zig");
     _ = @import("standalone/inference_worker_wire.zig");
     _ = @import("standalone/inference_worker.zig");
+    _ = @import("standalone/provider_failure.zig");
     _ = runtime;
     _ = inference_host;
     _ = storage_backend_erased;

@@ -156,7 +156,8 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
     paused: bool = false,
     shutdown: std.atomic.Value(bool) = .init(false),
     stats_value: types.TransactionRecoveryStats = .{},
-    future: ?Io.Future(void) = null,
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     scan_after: ?transactions_mod.TxnId = null,
 
     pub fn init(
@@ -180,6 +181,7 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
         return .{
             .alloc = alloc,
             .io = io,
+            .backend_runtime = backend_runtime,
             .store = runtime_store.store,
             .owns_store = runtime_store.owned,
             .config = config,
@@ -257,7 +259,7 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         self.shutdown.store(false, .release);
         self.mutex.unlock(io);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).register(self, workerStep);
     }
 
     fn stopLocked(self: *Runtime) bool {
@@ -334,23 +336,17 @@ pub fn recoverOnce(alloc: Allocator, store: anytype, config: Config) !types.Tran
     return stats;
 }
 
-fn workerMain(runtime: *Runtime) void {
-    while (true) {
-        if (isShutdown(runtime)) return;
-        const now_ns = runtime.config.clock.nowRealtimeNs();
-        if (!ensureLease(runtime, now_ns)) {
-            sleepInterval(runtime);
-            continue;
-        }
-
+fn workerStep(runtime: *Runtime) ?u64 {
+    if (isShutdown(runtime)) return null;
+    const now_ns = runtime.config.clock.nowRealtimeNs();
+    if (ensureLease(runtime, now_ns)) {
         const summary = runRecovery(runtime, now_ns) catch {
             recordRun(runtime, now_ns, .{}, true);
-            sleepInterval(runtime);
-            continue;
+            return @max(1, runtime.config.interval_ms);
         };
         recordRun(runtime, now_ns, summary, false);
-        sleepInterval(runtime);
     }
+    return @max(1, runtime.config.interval_ms);
 }
 
 fn ensureLease(runtime: *Runtime, now_ns: u64) bool {
@@ -594,19 +590,6 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
         .store = try backend_erased.storeFrom(alloc, store),
         .owned = true,
     };
-}
-
-fn sleepInterval(runtime: *Runtime) void {
-    var remaining_ms = runtime.config.interval_ms;
-    if (remaining_ms == 0) remaining_ms = 1;
-    const io = runtime.io orelse return;
-
-    while (remaining_ms > 0) {
-        if (isShutdown(runtime)) return;
-        const slice_ms: u64 = @min(remaining_ms, 100);
-        io.sleep(.fromMilliseconds(@intCast(slice_ms)), .awake) catch return;
-        remaining_ms -= slice_ms;
-    }
 }
 
 fn isShutdown(runtime: *Runtime) bool {
@@ -1074,11 +1057,12 @@ test "transaction recovery executes production pass on borrowed VoprIo" {
     const txn_id: transactions_mod.TxnId = .{6} ** 16;
     try manager.initTransaction(txn_id, 1_000);
 
+    var runtime_owners_closed = false;
     var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
         .borrowed_io = .{ .general = vopr_io.io() },
     });
-    defer backend_runtime.deinit();
+    defer if (!runtime_owners_closed) backend_runtime.deinit();
     var clock = platform_clock.ManualClock{};
     clock.setRealtimeNs(5_000);
     var resolver_ctx: u8 = 0;
@@ -1089,14 +1073,21 @@ test "transaction recovery executes production pass on borrowed VoprIo" {
         .resolver_ctx = &resolver_ctx,
         .resolve_participant_fn = TestResolver.resolve,
     });
-    defer runtime.deinit();
+    defer if (!runtime_owners_closed) runtime.deinit();
 
     try runtime.runOnce();
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
     try std.testing.expectEqual(@as(u64, 1), runtime.stats().runs);
     var lifecycle_ok = false;
     const Lifecycle = struct {
-        fn run(target: *Runtime, passed: *bool) void {
+        fn run(target: *Runtime, backend_owner: *background_runtime_mod.BackendRuntimeHandle, closed: *bool, passed: *bool) void {
+            // Shared executor ownership outlives the registration. Drain both
+            // inside VoprIo before requiring the scheduler to be quiescent.
+            defer {
+                target.deinit();
+                backend_owner.deinit();
+                closed.* = true;
+            }
             target.start() catch return;
             if (!target.isStarted()) return;
             if (!target.pause()) return;
@@ -1108,7 +1099,7 @@ test "transaction recovery executes production pass on borrowed VoprIo" {
             passed.* = true;
         }
     };
-    _ = vopr_io.io().async(Lifecycle.run, .{ &runtime, &lifecycle_ok });
+    _ = vopr_io.io().async(Lifecycle.run, .{ &runtime, &backend_runtime, &runtime_owners_closed, &lifecycle_ok });
     const scheduler = vopr_io.scheduler();
     var enabled: vopr.transition.List = .{};
     defer enabled.deinit(alloc);
