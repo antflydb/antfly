@@ -4996,7 +4996,7 @@ fn mergeObservedDynamicFieldCapabilitySet(
     for (merged.items) |*existing| {
         if (!std.mem.eql(u8, existing.index_name, incoming.index_name)) continue;
         for (incoming.field_capabilities) |capability| {
-            if (mergeObservedFieldCapabilityIntoSet(existing.field_capabilities, capability)) continue;
+            if (try mergeObservedFieldCapabilityIntoSet(alloc, existing.field_capabilities, capability)) continue;
             const cloned = try storage_schema.cloneFieldCapabilityAlloc(alloc, capability);
             const old_len = existing.field_capabilities.len;
             const expanded = alloc.realloc(existing.field_capabilities, old_len + 1) catch |err| {
@@ -5021,12 +5021,13 @@ fn mergeObservedDynamicFieldCapabilitySet(
 }
 
 fn mergeObservedFieldCapabilityIntoSet(
+    alloc: std.mem.Allocator,
     capabilities: []storage_schema.FieldCapability,
     needle: storage_schema.FieldCapability,
-) bool {
+) !bool {
     for (capabilities) |*capability| {
         if (!fieldCapabilityAggregationKeyEqual(capability.*, needle)) continue;
-        mergeObservedFieldCapability(capability, needle);
+        try mergeObservedFieldCapability(alloc, capability, needle);
         return true;
     }
     return false;
@@ -5046,23 +5047,33 @@ fn fieldCapabilityAggregationKeyEqual(left: storage_schema.FieldCapability, righ
 }
 
 fn mergeObservedFieldCapability(
+    alloc: std.mem.Allocator,
     existing: *storage_schema.FieldCapability,
     incoming: storage_schema.FieldCapability,
-) void {
+) !void {
     existing.searchable = existing.searchable and incoming.searchable;
     existing.filterable = existing.filterable and incoming.filterable;
     existing.aggregatable = existing.aggregatable and incoming.aggregatable;
     existing.doc_values = existing.doc_values and incoming.doc_values;
     existing.sortable = existing.sortable and incoming.sortable;
-    existing.doc_value_coverage = storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage);
-    existing.queryability_state = storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state);
-    existing.sort_lifecycle_state = storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state);
+    try replaceOwnedCapabilityState(alloc, &existing.doc_value_coverage, storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
+    try replaceOwnedCapabilityState(alloc, &existing.queryability_state, storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state));
+    try replaceOwnedCapabilityState(alloc, &existing.sort_lifecycle_state, storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state));
     if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
-        existing.missing_null_policy = "mixed";
+        try replaceOwnedCapabilityState(alloc, &existing.missing_null_policy, "mixed");
     }
     if (!indexSortMembershipEqual(existing.index_sort, incoming.index_sort)) {
         existing.index_sort = null;
     }
+}
+
+fn replaceOwnedCapabilityState(alloc: std.mem.Allocator, state: *[]const u8, replacement: []const u8) !void {
+    if (std.mem.eql(u8, state.*, replacement)) return;
+    // Conservative-state helpers return borrowed strings. Preserve the owned
+    // aggregate's contract, including when allocation fails or aliases input.
+    const owned = try alloc.dupe(u8, replacement);
+    alloc.free(state.*);
+    state.* = owned;
 }
 
 fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -5073,6 +5084,36 @@ fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
 fn indexSortMembershipEqual(left: ?storage_schema.IndexSortMembership, right: ?storage_schema.IndexSortMembership) bool {
     if (left == null or right == null) return left == null and right == null;
     return left.?.position == right.?.position and left.?.desc == right.?.desc;
+}
+
+test "provisioned observed dynamic capability merge preserves ownership under allocation failure" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var source = storage_schema.observedDynamicFieldCapability(null, "price", .{
+                .field_type = .numeric,
+                .do_index = true,
+                .doc_values = true,
+                .sortable = true,
+            });
+            source.doc_value_coverage = "covered";
+            source.queryability_state = "queryable";
+            storage_schema.refreshSortLifecycleState(&source);
+            var owned = try storage_schema.cloneFieldCapabilityAlloc(alloc, source);
+            defer storage_schema.freeOwnedFieldCapability(alloc, owned);
+            const incoming = storage_schema.observedDynamicFieldCapability(null, "price", .{
+                .field_type = .numeric,
+                .do_index = true,
+                .doc_values = true,
+                .sortable = true,
+            });
+            try mergeObservedFieldCapability(alloc, &owned, incoming);
+            var differing_policy = incoming;
+            differing_policy.missing_null_policy = "different";
+            try mergeObservedFieldCapability(alloc, &owned, differing_policy);
+            try std.testing.expectEqualStrings("mixed", owned.missing_null_policy);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "provisioned observed dynamic capability merge is conservative across groups" {
@@ -22946,7 +22987,9 @@ test "provisioned local query execution returns stamped identity request" {
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
     {
-        var db = try db_mod.DB.open(alloc, group_path, .{});
+        var db = try db_mod.DB.open(alloc, group_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        });
         defer db.close();
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -24311,7 +24354,9 @@ test "provisioned table read source preflights every local group" {
 
     var source = ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
     _ = source.withIo(&io_impl);
-    try std.testing.expectError(error.InvalidArgument, source.source().preflightQuery(alloc, "docs", .{
+    // The second group has no physical index. Read-only preflight reports the
+    // missing index without materializing the metadata-declared catalog.
+    try std.testing.expectError(error.IndexNotFound, source.source().preflightQuery(alloc, "docs", .{
         .index_name = "dense_idx",
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
     }, .read_index, 0));
@@ -24422,7 +24467,7 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
     try std.testing.expectEqual(@as(u64, 0), statuses.items[0].stats.indexes[0].doc_count);
 }
 
-test "provisioned query db installs asset producer from indexes_json and replays assets" {
+test "provisioned query db does not run writer-owned asset producers" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("antfly-api-provisioned-asset-enrichment");
     defer path_tmp.cleanup();
@@ -24551,7 +24596,8 @@ test "provisioned query db installs asset producer from indexes_json and replays
     var db_lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 0, "docs");
     defer db_lease.release();
 
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(db_mod.OpenMode.query_readonly, db_lease.db.open_mode);
     var lookup = (try db_lease.db.lookup(alloc, "doc:a", .{
         .fields = &.{"_artifacts"},
         .include_all_fields = false,
@@ -24559,8 +24605,9 @@ test "provisioned query db installs asset producer from indexes_json and replays
     defer lookup.deinit(alloc);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, lookup.json, .{});
     defer parsed.deinit();
-    const artifacts = parsed.value.object.get("_artifacts").?.object;
-    try std.testing.expectEqualStrings("generator:hello", artifacts.get("generated_title_v1").?.object.get("value").?.string);
+    if (parsed.value.object.get("_artifacts")) |artifacts| {
+        try std.testing.expect(artifacts.object.get("generated_title_v1") == null);
+    }
 }
 
 test "provisioned table read source runtime status stays cache-only without shared snapshot" {
@@ -29754,7 +29801,7 @@ test "hosted table read source preflights every local group" {
     );
     _ = hosted.withIo(&io_impl);
 
-    try std.testing.expectError(error.InvalidArgument, hosted.source().preflightQuery(test_alloc, "docs", .{
+    try std.testing.expectError(error.IndexNotFound, hosted.source().preflightQuery(test_alloc, "docs", .{
         .index_name = "dv_v1",
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
     }, .read_index, 0));

@@ -3419,6 +3419,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
             .relational_base_rows = config.relational_base_rows,
+            .clock = config.clock orelse platform_clock.Clock.real(),
+            .deadline_clock = config.clock orelse platform_clock.Clock.real(),
+            .activity_epoch = newActivityEpoch(config, config.clock orelse platform_clock.Clock.real()),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -3909,6 +3912,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
             .relational_base_rows = .init(config.relational_base_rows),
+            .clock = config.clock orelse backend_runtime.clock(),
+            .deadline_clock = config.clock orelse backend_runtime.monotonicClock(),
+            .activity_epoch = newActivityEpoch(config, config.clock orelse backend_runtime.clock()),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
