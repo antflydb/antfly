@@ -2693,7 +2693,7 @@ pub const BoundTableReadSource = struct {
         const agg_ns = if (phase_profile) platform_time.monotonicNs() - agg_start_ns else 0;
         try checkQueryDeadline(response_req);
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
-        try applyQueryPostProcessing(alloc, postProcessingIo(null), response_req, &result, &meta, null, null, null);
+        try applyQueryPostProcessing(alloc, postProcessingIo(self.db.backend_runtime), response_req, &result, &meta, null, null, null);
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
         const encode_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         const response = try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -22460,41 +22460,28 @@ test "bound table read source reranks hits after materialization" {
     const url = try std.fmt.allocPrint(alloc, "{s}", .{ts.baseUrl()});
     defer alloc.free(url);
 
-    var response: ?query_api.QueryResponse = null;
-    defer if (response) |*value| value.deinit(alloc);
-    var run_err: ?anyerror = null;
-    var group = std.Io.Group.init;
-
-    const Fiber = struct {
-        fn run(
-            a: std.mem.Allocator,
-            read_source: *BoundTableReadSource,
-            out: *?query_api.QueryResponse,
-            err_out: *?anyerror,
-            reranker_url: []const u8,
-        ) std.Io.Cancelable!void {
-            out.* = read_source.source().query(a, "docs", .{
-                .query = .{ .match = .{ .field = "body", .text = "hello" } },
-                .limit = 10,
-                .profile = true,
-                .reranker = .{
-                    .provider = .antfly,
-                    .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                    .field = "body",
-                    .url = reranker_url,
-                },
-                .reranker_query_text = "hello",
-            }, .read_index) catch |err| {
-                err_out.* = err;
-                return;
-            };
+    const Serve = struct {
+        fn run(server: *httpx.TestServer) !void {
+            try server.handleOne();
         }
     };
-
-    group.concurrent(io_impl.io(), Fiber.run, .{ alloc, &source, &response, &run_err, url }) catch return;
-    try ts.handleOne();
-    group.await(io_impl.io()) catch {};
-    if (run_err) |err| return err;
+    var serving = try io_impl.io().concurrent(Serve.run, .{&ts});
+    defer _ = serving.cancel(io_impl.io()) catch {};
+    // An early query failure must cancel the listener instead of leaving the
+    // test blocked forever in accept with the actual error hidden in a fiber.
+    var response = try source.source().query(alloc, "docs", .{
+        .query = .{ .match = .{ .field = "body", .text = "hello" } },
+        .limit = 10,
+        .profile = true,
+        .reranker = .{
+            .provider = .antfly,
+            .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            .field = "body",
+            .url = url,
+        },
+        .reranker_query_text = "hello",
+    }, .read_index);
+    defer if (response) |*value| value.deinit(alloc);
 
     try std.testing.expect(response != null);
     const RerankResponse = struct {
@@ -22509,12 +22496,13 @@ test "bound table read source reranks hits after materialization" {
             } = null,
         },
     };
-    var parsed = try parseJsonTestBody(RerankResponse, alloc, response.?.json);
+    var parsed = try ant_json.parseFromSlice(RerankResponse, alloc, response.?.json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const inner = parsed.value.responses[0];
     try std.testing.expectEqualStrings("doc:b", inner.hits.?.hits.?[0]._id);
     try std.testing.expectEqualStrings("doc:a", inner.hits.?.hits.?[1]._id);
     try std.testing.expectEqualStrings("cross-encoder/ms-marco-MiniLM-L-6-v2", inner.profile.?.reranker.?.model);
+    try serving.await(io_impl.io());
 }
 
 test "provisioned table read source routes lookup and scan across ranges" {
@@ -22767,9 +22755,9 @@ test "provisioned table read source merges query results across ranges" {
     const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
     defer alloc.free(right_path);
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(alloc, left_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer left_db.close();
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(alloc, right_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 } });
     defer right_db.close();
 
     try left_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
@@ -22856,8 +22844,12 @@ test "provisioned table read source merges query results across ranges" {
     var parsed = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, response.json);
     defer parsed.deinit();
     const hits = parsed.value.responses.?[0].hits.?.hits.?;
-    try std.testing.expectEqualStrings("doc:a", hits[0]._id);
-    try std.testing.expectEqualStrings("doc:z", hits[1]._id);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    // Equal-score hits may use either shard's identity as their tie breaker.
+    // This test verifies that both ranges contribute exactly one result.
+    const first_is_a = std.mem.eql(u8, "doc:a", hits[0]._id);
+    try std.testing.expectEqualStrings("doc:a", hits[if (first_is_a) 0 else 1]._id);
+    try std.testing.expectEqualStrings("doc:z", hits[if (first_is_a) 1 else 0]._id);
 }
 
 test "provisioned table read source serves dense queries for explicit external embeddings" {
@@ -22873,7 +22865,7 @@ test "provisioned table read source serves dense queries for explicit external e
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     try db.addIndex(.{
@@ -23962,7 +23954,7 @@ test "provisioned table read source serves public dense query requests with read
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -24044,7 +24036,7 @@ test "provisioned table read source serves profiled public dense query requests 
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -24130,7 +24122,7 @@ test "provisioned table read source serves public dense query requests without e
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -24212,7 +24204,7 @@ test "provisioned table read source serves benchmark-shaped packed dense query w
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -24360,7 +24352,7 @@ test "provisioned table read source preflights every local group" {
         .index_name = "dense_idx",
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
     }, .read_index, 0));
-    try std.testing.expectError(error.UnsupportedQueryRequest, source.source().preflightQuery(alloc, "docs", .{
+    try std.testing.expectError(error.IndexNotFound, source.source().preflightQuery(alloc, "docs", .{
         .graph_queries = &.{
             .{
                 .name = "neighbors",
@@ -24481,7 +24473,10 @@ test "provisioned query db does not run writer-owned asset producers" {
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
     {
-        var db = try db_mod.DB.open(alloc, group_path, .{});
+        var db = try db_mod.DB.open(alloc, group_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        });
         defer db.close();
         try db.batch(.{
             .writes = &.{.{
@@ -24490,6 +24485,8 @@ test "provisioned query db does not run writer-owned asset producers" {
             }},
             .sync_level = .write,
         });
+        // Query-only handles consume the published snapshot, not writer WAL.
+        try db.sync(true);
     }
 
     var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
@@ -24598,13 +24595,11 @@ test "provisioned query db does not run writer-owned asset producers" {
 
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(db_mod.OpenMode.query_readonly, db_lease.db.open_mode);
-    var lookup = (try db_lease.db.lookup(alloc, "doc:a", .{
-        .fields = &.{"_artifacts"},
-        .include_all_fields = false,
-    })).?;
-    defer lookup.deinit(alloc);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, lookup.json, .{});
+    const raw = (try db_lease.db.get(alloc, "doc:a")) orelse return error.TestExpectedDocument;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
+    try std.testing.expectEqualStrings("hello", parsed.value.object.get("body").?.string);
     if (parsed.value.object.get("_artifacts")) |artifacts| {
         try std.testing.expect(artifacts.object.get("generated_title_v1") == null);
     }
@@ -29415,7 +29410,7 @@ test "hosted textStatsGroupLocal serves only the local group" {
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(test_alloc, path, 7);
     defer test_alloc.free(group_path);
-    var db = try db_mod.DB.open(test_alloc, group_path, .{});
+    var db = try db_mod.DB.open(test_alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7, .range_id = 7 } });
     defer db.close();
 
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
@@ -29805,7 +29800,7 @@ test "hosted table read source preflights every local group" {
         .index_name = "dv_v1",
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
     }, .read_index, 0));
-    try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().preflightQuery(test_alloc, "docs", .{
+    try std.testing.expectError(error.IndexNotFound, hosted.source().preflightQuery(test_alloc, "docs", .{
         .graph_queries = &.{
             .{
                 .name = "neighbors",
