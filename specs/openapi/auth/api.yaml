@@ -71,7 +71,7 @@ components:
 
     ResourceType:
       type: string
-      enum: ["table", "user", "inference", "*"]
+      enum: ["table", "database", "namespace", "tablespace", "user", "inference", "*"]
       description: "Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes."
       example: "table"
 

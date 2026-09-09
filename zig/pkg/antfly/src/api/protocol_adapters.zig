@@ -817,7 +817,7 @@ fn identityHasPermission(
 ) bool {
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
-        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and @import("../catalog/routes.zig").tableResourceMatches(permission.resource, resource));
         if (!type_match or !resource_match) continue;
         if (permission.type == .admin or permission.type == permission_type) return true;
     }

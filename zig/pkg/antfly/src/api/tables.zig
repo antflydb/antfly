@@ -797,6 +797,7 @@ pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: Create
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    if (req.tablespace_name) |name| try root.object.put(arena, "tablespace_name", .{ .string = name });
     if (req.num_shards) |num_shards| {
         try root.object.put(arena, "num_shards", .{ .integer = @intCast(num_shards) });
     }
@@ -843,6 +844,13 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     var req: CreateTableRequest = .{};
     errdefer req.deinit(alloc);
 
+    if (root.get("tablespace_name")) |value| {
+        if (value != .null) {
+            if (value != .string) return error.InvalidCreateTableRequest;
+            try @import("../catalog/domain.zig").validateName(value.string);
+            req.tablespace_name = try alloc.dupe(u8, value.string);
+        }
+    }
     if (root.get("num_shards")) |value| {
         if (value != .null) req.num_shards = try parseU32Field(value);
     }
@@ -1540,6 +1548,7 @@ fn buildTableStatus(
         null;
     return .{
         .name = table.name,
+        .table_id = try std.fmt.allocPrint(alloc, "{d}", .{table.table_id}),
         .description = if (table.description.len > 0) table.description else null,
         .indexes = try parseTableIndexes(alloc, table.indexes_json),
         .shards = shards,

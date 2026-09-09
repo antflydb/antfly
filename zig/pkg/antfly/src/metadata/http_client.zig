@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const native_catalog = @import("../catalog/domain.zig");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const tables_api = @import("../api/tables.zig");
@@ -773,6 +774,43 @@ pub const MetadataHttpClient = struct {
             null,
             .{ .remaining_ms = 5_000, .forwards_remaining = 2, .campaign_allowed = true },
         );
+    }
+
+    pub fn forwardNativeCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: native_catalog.Call, forwarding: raft_mutation_forwarding.Context) ![]u8 {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > native_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        const uri = try join(self.alloc, base_uri, "/internal/v1/catalog/native");
+        defer self.alloc.free(uri);
+        var remaining_buf: [10]u8 = undefined;
+        var forwards_buf: [3]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{forwarding.forwards_remaining}) },
+            .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = if (forwarding.campaign_allowed) "true" else "false" },
+        };
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {
+            if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        defer response.deinit(self.alloc);
+        const outcome = responseHeader(response, routes.Routes.raft_mutation_outcome_header) orelse {
+            if (response.status == 404 or response.status == 405 or response.status == 426) return error.TableTopologyProtocolUpgradeRequired;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_unknown)) return error.MetadataMutationOutcomeUnknown;
+        if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
+        if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
+        return switch (response.status) {
+            400 => error.InvalidCatalogMutation,
+            404 => error.CatalogNotFound,
+            409 => error.CatalogGenerationChanged,
+            413 => error.CatalogCommandTooLarge,
+            426 => error.TableTopologyProtocolUpgradeRequired,
+            503 => error.NotLeader,
+            else => error.MetadataMutationOutcomeUnknown,
+        };
     }
 
     pub fn forwardTableMutation(

@@ -435,6 +435,11 @@ export class AntflyClient {
     this.client = this.buildClient();
   }
 
+  /** Typed access to every generated endpoint, including native catalog lifecycle routes. */
+  get api(): Client<paths> {
+    return this.client;
+  }
+
   /**
    * Build the Authorization header value from the auth config.
    * Returns undefined if no auth is configured.

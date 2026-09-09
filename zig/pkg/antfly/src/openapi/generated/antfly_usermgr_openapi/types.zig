@@ -358,6 +358,9 @@ pub const PermissionType = enum {
 /// Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes.
 pub const ResourceType = enum {
     table,
+    database,
+    namespace,
+    tablespace,
     user,
     inference,
     @"*",
@@ -365,6 +368,9 @@ pub const ResourceType = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .table => "table",
+            .database => "database",
+            .namespace => "namespace",
+            .tablespace => "tablespace",
             .user => "user",
             .inference => "inference",
             .@"*" => "*",
@@ -379,6 +385,9 @@ pub const ResourceType = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "table", .table },
+            .{ "database", .database },
+            .{ "namespace", .namespace },
+            .{ "tablespace", .tablespace },
             .{ "user", .user },
             .{ "inference", .inference },
             .{ "*", .@"*" },

@@ -2231,6 +2231,19 @@ pub fn build(b: *std.Build) void {
         antfly_imports.configure(b, test_mod.*, true, true);
     }
 
+    const native_catalog_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "native catalog", "catalog rename", "catalog names" },
+    });
+    const native_catalog_api_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "native catalog" },
+    });
+    const native_catalog_api_step = b.step("native-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
+    native_catalog_api_step.dependOn(&b.addRunArtifact(native_catalog_api_tests).step);
+    const native_catalog_test_step = b.step("native-catalog-test", "Run native catalog durability, identity, and routing tests");
+    native_catalog_test_step.dependOn(&b.addRunArtifact(native_catalog_tests).step);
+
     const metadata_unit_test_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_unit_lane_a_test_root.zig",
         "pkg/antfly/src/metadata_unit_lane_b_test_root.zig",
@@ -7788,6 +7801,12 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_root", standalone_runtime_test_mod);
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
     standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
+    const native_catalog_standalone_tests = b.addTest(.{
+        .root_module = standalone_runtime_test_mod,
+        .filters = &.{ "native catalog" },
+    });
+    const native_catalog_standalone_step = b.step("native-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
+    native_catalog_standalone_step.dependOn(&b.addRunArtifact(native_catalog_standalone_tests).step);
     const lib_standalone_runtime_tests = b.addTest(.{
         .root_module = standalone_runtime_test_mod,
         .filters = &.{

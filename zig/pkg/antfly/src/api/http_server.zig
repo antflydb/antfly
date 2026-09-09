@@ -13,6 +13,9 @@
 // limitations.
 
 const std = @import("std");
+const native_catalog = @import("../catalog/domain.zig");
+const native_catalog_routes = @import("../catalog/routes.zig");
+const native_catalog_operations = @import("../catalog/operations.zig");
 const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
 const ant_json = @import("antfly-json");
 const kernel_abi = @import("kernel_abi.zig");
@@ -1293,6 +1296,8 @@ pub const StatusSource = struct {
     routing: ?table_catalog.CatalogRoutingSource = null,
 
     pub const VTable = struct {
+        native_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: native_catalog.Call) anyerror![]u8 = null,
+
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
@@ -1339,6 +1344,11 @@ pub const StatusSource = struct {
         restore_extensions: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn nativeCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: native_catalog.Call) ![]u8 {
+        const callback = self.vtable.native_catalog orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("native_catalog", self.boundary_dispatch, callback, .{ self.ptr, alloc, context, input });
+    }
 
     pub fn status(self: StatusSource) !metadata_api.MetadataStatus {
         return try BoundaryAbi.call("status", self.boundary_dispatch, self.vtable.status, .{self.ptr});
@@ -1613,6 +1623,10 @@ pub const StatusSource = struct {
                 return @ptrCast(@alignCast(ptr));
             }
 
+            fn nativeCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: native_catalog.Call) anyerror![]u8 {
+                return native_catalog_operations.call(cast(ptr), alloc, context, input);
+            }
+
             fn status(ptr: *anyopaque) anyerror!metadata_api.MetadataStatus {
                 return try cast(ptr).status();
             }
@@ -1782,6 +1796,7 @@ pub const StatusSource = struct {
         };
 
         return .{
+            .native_catalog = Gen.nativeCatalog,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
@@ -1827,11 +1842,39 @@ pub const StatusSource = struct {
     /// locally; every other operation keeps the generated local vtable.
     fn makeHttpServiceVTable() VTable {
         var vtable = makeServiceVTable(metadata_service.MetadataHttpService);
+        vtable.native_catalog = HttpRoutedCatalog.call;
         vtable.create_table = HttpRoutedTableMutations.createTable;
         vtable.drop_table = HttpRoutedTableMutations.dropTable;
         vtable.drop_table_exact = HttpRoutedTableMutations.dropTableExact;
         return vtable;
     }
+
+    const HttpRoutedCatalog = struct {
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: native_catalog.Call) anyerror![]u8 {
+            const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+            var result: ?[]u8 = null;
+            errdefer if (result) |bytes| alloc.free(bytes);
+            const ops = Ops{ .svc = svc, .alloc = alloc, .request = context, .input = input, .result = &result };
+            try runRoutedTableMutation(svc, ops);
+            return result orelse error.MetadataMutationOutcomeUnknown;
+        }
+        const Ops = struct {
+            svc: *metadata_service.MetadataHttpService,
+            alloc: std.mem.Allocator,
+            request: api_operation.RequestContext,
+            input: native_catalog.Call,
+            result: *?[]u8,
+            pub fn local(self: @This()) !void {
+                self.result.* = try native_catalog_operations.call(self.svc, self.alloc, self.request, self.input);
+            }
+            pub fn forward(self: @This(), peer: metadata_service.ReallocationProtocolPeer, forwarding: raft_mutation_forwarding.Context) !void {
+                var client = self.svc.tableMutationForwardClient();
+                const response = try client.forwardNativeCatalog(peer.orchestration_url orelse return error.NotLeader, self.input, forwarding);
+                defer client.alloc.free(response);
+                self.result.* = try self.alloc.dupe(u8, response);
+            }
+        };
+    };
 
     const HttpRoutedTableMutations = struct {
         fn cast(ptr: *anyopaque) *metadata_service.MetadataHttpService {
@@ -2036,7 +2079,8 @@ fn deriveRestoreMetadataSpec(
     try backups_api.validateRestoreManifest(alloc, manifest, manifest.backup_id);
     if (manifest.artifact_integrity_mode != .declared)
         return error.BackupIntegrityMissing;
-    if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+    if (!std.mem.eql(u8, manifest.table_name, table_name) and
+        (native_catalog.restoreTarget(table_name) catch null) == null) return error.InvalidBackupRequest;
     const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest) catch |err| switch (err) {
         error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
         else => return err,
@@ -6334,6 +6378,10 @@ pub const ApiHttpServer = struct {
         if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
         defer self.releaseQuery();
 
+        var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
+        defer if (catalog_identity) |*identity| identity.deinit(self.alloc);
+        var physical_table: ?[]u8 = null;
+        defer if (physical_table) |name| self.alloc.free(name);
         var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
         defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
         var runtime_validator_context: ?QueryBuilderRuntimeQueryRequestValidatorContext = null;
@@ -6342,7 +6390,8 @@ pub const ApiHttpServer = struct {
                 if (!permissionsAllow(identity.permissions, .table, table_name, .read))
                     return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
             }
-            table_context = self.loadQueryBuilderTableContext(table_name) catch |err| switch (err) {
+            physical_table = try self.resolveCatalogNameAlloc(self.alloc, .{ .deadline_ns = request_context.deadline_ns, .cancellation = request_context.cancellation orelse .none }, table_name, &catalog_identity);
+            table_context = self.loadQueryBuilderTableContext(physical_table.?) catch |err| switch (err) {
                 error.TableNotFound => return try contextual_operations.jsonErrorAlloc(self.alloc, 404, "not found"),
                 else => return err,
             };
@@ -6350,8 +6399,8 @@ pub const ApiHttpServer = struct {
                 runtime_validator_context = .{
                     .server = self,
                     .source = reads,
-                    .table_name = table_name,
-                    .authenticated_identity = authenticated_identity,
+                    .table_name = physical_table.?,
+                    .authenticated_identity = catalog_identity,
                     .query_embedding_security_scope = queryEmbeddingSecurityScope(authenticated_identity),
                     .request_context = request_context,
                 };
@@ -6417,13 +6466,17 @@ pub const ApiHttpServer = struct {
         try request_context.check();
         const table = request.table orelse return error.InvalidQueryBuilderRequest;
         if (identity) |subject| if (!permissionsAllow(subject.permissions, .table, table, .read)) return error.Forbidden;
-        const context = try self.loadQueryBuilderTableContext(table);
+        var catalog_identity = try cloneCatalogIdentity(self.alloc, identity);
+        defer if (catalog_identity) |*owned| owned.deinit(self.alloc);
+        const physical = try self.resolveCatalogNameAlloc(self.alloc, .{ .deadline_ns = request_context.deadline_ns, .cancellation = request_context.cancellation orelse .none }, table, &catalog_identity);
+        defer self.alloc.free(physical);
+        const context = try self.loadQueryBuilderTableContext(physical);
         defer freeQueryBuilderTableContext(self.alloc, context);
         var validator = QueryBuilderRuntimeQueryRequestValidatorContext{
             .server = self,
             .source = self.table_reads orelse return error.TableNotFound,
-            .table_name = table,
-            .authenticated_identity = identity,
+            .table_name = physical,
+            .authenticated_identity = catalog_identity,
             .query_embedding_security_scope = queryEmbeddingSecurityScope(identity),
             .request_context = request_context,
         };
@@ -6536,11 +6589,15 @@ pub const ApiHttpServer = struct {
             fn runQuery(
                 ptr_inner: *anyopaque,
                 inner_alloc: std.mem.Allocator,
-                table_name: []const u8,
+                logical_name: []const u8,
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                if (runner.authenticated_identity) |identity| {
+                var catalog_identity = try cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
+                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+                const table_name = try runner.server.resolveCatalogNameAlloc(inner_alloc, .{ .deadline_ns = runner.deadline_ns }, logical_name, &catalog_identity);
+                defer inner_alloc.free(table_name);
+                if (catalog_identity) |identity| {
                     if (!permissionsAllow(identity.permissions, .table, table_name, .read))
                         return error.Forbidden;
                 }
@@ -6565,7 +6622,7 @@ pub const ApiHttpServer = struct {
                 };
                 const row_filter_json = try resolveEffectiveRowFilterJson(
                     inner_alloc,
-                    runner.authenticated_identity,
+                    catalog_identity,
                     table_name,
                 );
                 defer if (row_filter_json) |value| inner_alloc.free(value);
@@ -6573,7 +6630,7 @@ pub const ApiHttpServer = struct {
                     injectRowFilterIntoSearchRequest(inner_alloc, &query_req.req, value) catch
                         return error.InvalidRetrievalAgentRequest;
                 }
-                if (runner.authenticated_identity) |*identity| {
+                if (catalog_identity) |*identity| {
                     ApiHttpServer.attachGraphTableReadAuthorizer(&query_req.req, identity);
                 }
                 return (runner.source.query(
@@ -6591,14 +6648,18 @@ pub const ApiHttpServer = struct {
             fn scanKeyPage(
                 ptr_inner: *anyopaque,
                 inner_alloc: std.mem.Allocator,
-                table_name: []const u8,
+                logical_name: []const u8,
                 after_key: []const u8,
                 limit: u32,
                 filter_query_json: ?[]const u8,
                 exclusion_query_json: ?[]const u8,
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                if (runner.authenticated_identity) |identity| {
+                var catalog_identity = try cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
+                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+                const table_name = try runner.server.resolveCatalogNameAlloc(inner_alloc, .{ .deadline_ns = runner.deadline_ns }, logical_name, &catalog_identity);
+                defer inner_alloc.free(table_name);
+                if (catalog_identity) |identity| {
                     if (!permissionsAllow(identity.permissions, .table, table_name, .read))
                         return error.Forbidden;
                 }
@@ -6610,19 +6671,23 @@ pub const ApiHttpServer = struct {
                     limit,
                     filter_query_json,
                     exclusion_query_json,
-                    runner.authenticated_identity,
+                    catalog_identity,
                 );
             }
 
             fn probeIncomingEdges(
                 ptr_inner: *anyopaque,
                 inner_alloc: std.mem.Allocator,
-                table_name: []const u8,
+                logical_name: []const u8,
                 index_name: []const u8,
                 keys: []const []const u8,
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                if (runner.authenticated_identity) |identity| {
+                var catalog_identity = try cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
+                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+                const table_name = try runner.server.resolveCatalogNameAlloc(inner_alloc, .{ .deadline_ns = runner.deadline_ns }, logical_name, &catalog_identity);
+                defer inner_alloc.free(table_name);
+                if (catalog_identity) |identity| {
                     if (!permissionsAllow(identity.permissions, .table, table_name, .read))
                         return error.Forbidden;
                     if (effectiveRowFilterJson(identity, table_name) != null)
@@ -9774,7 +9839,8 @@ pub const ApiHttpServer = struct {
         };
         defer manifest.deinit(self.alloc);
 
-        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+        if (!std.mem.eql(u8, manifest.table_name, table_name) and
+            (native_catalog.restoreTarget(table_name) catch null) == null) return error.InvalidBackupRequest;
         if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
         try backups_api.validateRestorableManifestLayout(&manifest);
         const effective_destination_principal = try restoreDestinationPrincipal(
@@ -9882,7 +9948,10 @@ pub const ApiHttpServer = struct {
                 return error.UnsupportedBackupFormat;
             };
             defer create_req.deinit(self.alloc);
-            self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
+            const logical_target = try native_catalog.restoreTarget(table_name);
+            const logical_name = if (logical_target) |target| try target.resourceNameAlloc(self.alloc) else try self.alloc.dupe(u8, table_name);
+            defer self.alloc.free(logical_name);
+            (if (logical_target != null) self.createNativeOrLegacyTable(logical_name, table_name, create_req, null) else self.source.createTable(self.alloc, table_name, create_req)) catch |err| switch (err) {
                 error.UnsupportedOperation => {},
                 else => return err,
             };
@@ -10216,6 +10285,19 @@ pub const ApiHttpServer = struct {
         else
             try std.Io.Dir.cwd().createDir(io, path, .default_dir);
         return path;
+    }
+
+    pub fn catalogStorageNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator) ![]u8 {
+        var entropy: [16]u8 = undefined;
+        if (self.sharedApiIo()) |io| {
+            try io.randomSecure(&entropy);
+        } else {
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            try io_impl.io().randomSecure(&entropy);
+        }
+        const hex = std.fmt.bytesToHex(entropy, .lower);
+        return try std.fmt.allocPrint(alloc, "table:{s}", .{&hex});
     }
 
     fn backupGenerationIdAlloc(self: *ApiHttpServer) ![]u8 {
@@ -12047,8 +12129,8 @@ pub const ApiHttpServer = struct {
                     return error.InvalidBackupRequest;
                 return error.InternalFailure;
             };
-            if (!std.mem.eql(u8, manifest.table_name, table_name))
-                return error.InvalidBackupRequest;
+            if (!std.mem.eql(u8, manifest.table_name, table_name) and
+                (native_catalog.restoreTarget(table_name) catch null) == null) return error.InvalidBackupRequest;
             const effective_destination_principal = restoreDestinationPrincipal(
                 self.alloc,
                 manifest.replication_sources_json,
@@ -14377,11 +14459,74 @@ pub const ApiHttpServer = struct {
         return try result_alloc.dupe(u8, query_response.json);
     }
 
+    pub fn resolveCatalogRestoreNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, name: []const u8, identity: *?AuthenticatedIdentity, idempotency_key: ?[]const u8) ![]u8 {
+        if (self.source.vtable.native_catalog == null) return alloc.dupe(u8, name);
+        const target = try native_catalog.Target.parse(name);
+        const logical = try target.resourceNameAlloc(alloc);
+        defer alloc.free(logical);
+        if (identity.*) |value| if (!permissionsAllow(value.permissions, .table, logical, .admin)) return error.Forbidden;
+        const bytes = try self.source.nativeCatalog(alloc, context, .{ .resolve = target });
+        defer alloc.free(bytes);
+        const parsed = try std.json.parseFromSlice(?metadata_table_manager.TableRecord, alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const physical = if (parsed.value) |table| try alloc.dupe(u8, table.name) else blk: {
+            const state_bytes = try self.source.nativeCatalog(alloc, context, .snapshot);
+            defer alloc.free(state_bytes);
+            const state = try std.json.parseFromSlice(native_catalog.State, alloc, state_bytes, .{});
+            defer state.deinit();
+            _ = try state.value.namespaceFor(target.database, target.namespace);
+            const fresh = if (idempotency_key) |key| stable: {
+                const payload = try std.json.Stringify.valueAlloc(alloc, .{ .principal = transactionPrincipal(identity.*) orelse "auth-disabled", .target = logical, .key = key }, .{});
+                defer alloc.free(payload);
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(payload, &hash, .{});
+                const hex = std.fmt.bytesToHex(hash[0..16].*, .lower);
+                break :stable try std.fmt.allocPrint(alloc, "table:{s}", .{hex});
+            } else try self.catalogStorageNameAlloc(alloc);
+            defer alloc.free(fresh);
+            break :blk try std.fmt.allocPrint(alloc, "{s}:{s}", .{ fresh, logical });
+        };
+        errdefer alloc.free(physical);
+        if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, logical, physical);
+        return physical;
+    }
+
+    pub fn resolveCatalogNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, name: []const u8, identity: *?AuthenticatedIdentity) ![]u8 {
+        if (self.source.vtable.native_catalog == null) return alloc.dupe(u8, name);
+        const target = try native_catalog.Target.parse(name);
+        const logical = try target.resourceNameAlloc(alloc);
+        defer alloc.free(logical);
+        if (identity.*) |value| if (!permissionsAllow(value.permissions, .table, logical, .read) and !permissionsAllow(value.permissions, .table, logical, .write)) return error.Forbidden;
+        const bytes = try self.source.nativeCatalog(alloc, context, .{ .resolve = target });
+        defer alloc.free(bytes);
+        const parsed = try std.json.parseFromSlice(?metadata_table_manager.TableRecord, alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const table = parsed.value orelse return error.TableNotFound;
+        if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, logical, table.name);
+        return alloc.dupe(u8, table.name);
+    }
+
     pub fn executeMcpApplicationOperation(
         self: *ApiHttpServer,
-        operation: contextual_operations.McpApplicationOperation,
-        authenticated_identity: ?AuthenticatedIdentity,
+        input: contextual_operations.McpApplicationOperation,
+        borrowed_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        var operation = input;
+        var authenticated_identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
+        defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
+        var physical_name: ?[]u8 = null;
+        defer if (physical_name) |name| self.alloc.free(name);
+        switch (operation) {
+            .list_tables, .create_table => {},
+            .restore => |*request| {
+                physical_name = try self.resolveCatalogRestoreNameAlloc(self.alloc, .{}, request.table_name, &authenticated_identity, null);
+                request.table_name = physical_name.?;
+            },
+            inline else => |*request| {
+                physical_name = self.resolveCatalogNameAlloc(self.alloc, .{}, request.table_name, &authenticated_identity) catch |err| return contextualJsonErrorResponse(self.alloc, native_catalog.httpStatus(err), @errorName(err));
+                request.table_name = physical_name.?;
+            },
+        }
         const admission_class = request_admission_policy.mcpOperationClass(operation);
         const admitted = switch (admission_class) {
             .none => true,
@@ -14411,18 +14556,28 @@ pub const ApiHttpServer = struct {
                 defer if (storage_statuses) |items| self.alloc.free(items);
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
-                return try contextualJsonResponse(
-                    self.alloc,
-                    200,
-                    try tables_api.buildTableListWithStorageStatuses(arena_impl.allocator(), &snapshot, null, storage_statuses),
-                );
+                const arena = arena_impl.allocator();
+                const listed = try tables_api.buildTableListWithStorageStatuses(arena, &snapshot, null, storage_statuses);
+                if (self.source.vtable.native_catalog != null) {
+                    const bytes = try self.source.nativeCatalog(arena, .{}, .snapshot);
+                    const state = try std.json.parseFromSliceLeaky(native_catalog.State, arena, bytes, .{});
+                    for (listed) |*item| for (state.resources) |resource| {
+                        if (resource.kind != .table or !std.mem.eql(u8, resource.storage_name, item.name)) continue;
+                        const namespace = state.byId(.namespace, resource.parent_id) orelse return error.InvalidCatalogRecord;
+                        const database = state.byId(.database, namespace.parent_id) orelse return error.InvalidCatalogRecord;
+                        item.name = if (namespace.id == native_catalog.default_namespace_id) resource.name else try std.fmt.allocPrint(arena, "{s}.{s}.{s}", .{ database.name, namespace.name, resource.name });
+                        break;
+                    };
+                }
+                return try contextualJsonResponse(self.alloc, 200, listed);
             },
             .create_table => |request| return try self.executeMcpCreateTable(request.table_name, request.body, authenticated_identity),
             .drop_table => |request| return try self.executeMcpDropTable(request.table_name),
             .describe_table => |request| {
                 const body = (try self.maybeEncodeTableStatus(request.table_name)) orelse
                     return try contextual_operations.textAlloc(self.alloc, 404, "not found");
-                return contextual_operations.json(body, false);
+                defer self.alloc.free(body);
+                return contextual_operations.json(try projectCatalogStatusAlloc(self.alloc, body, input.describe_table.table_name), false);
             },
             .list_indexes => |request| {
                 var response = try public_table_http.handleTableListIndexes(self.alloc, request.table_name, self.tableApi(.{}));
@@ -14461,7 +14616,7 @@ pub const ApiHttpServer = struct {
             .get_document => |request| return try self.executeMcpGetDocument(request, authenticated_identity),
             .sample_documents => |request| return try self.executeMcpSampleDocuments(request, authenticated_identity),
             .query => |request| {
-                var response = try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(
+                var response = try self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(
                     request.table_name,
                     request.body,
                     null,
@@ -14469,6 +14624,7 @@ pub const ApiHttpServer = struct {
                     null,
                 );
                 defer response.deinit(self.alloc);
+                if (operation == .query) try projectCatalogQueryResponse(self.alloc, &response, input.query.table_name);
                 return try cloneContextualResponse(self.alloc, response);
             },
             .backup => |request| {
@@ -14503,12 +14659,30 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn createNativeOrLegacyTable(self: *ApiHttpServer, logical_name: []const u8, physical_name: []const u8, request: tables_api.CreateTableRequest, identity: ?AuthenticatedIdentity) !void {
+        if (self.source.vtable.native_catalog == null) return self.source.createTable(self.alloc, physical_name, request);
+        const target = try native_catalog.Target.parse(logical_name);
+        if (request.tablespace_name) |name| if (identity) |value| {
+            if (!permissionsAllow(value.permissions, .tablespace, name, .read)) return error.Forbidden;
+        };
+        const body = try tables_api.encodeStoredCreateTableRequestAlloc(self.alloc, request);
+        defer self.alloc.free(body);
+        const result = try self.source.nativeCatalog(self.alloc, .{}, .{ .mutate = .{
+            .mutation = .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table, .tablespace = request.tablespace_name },
+            .create_table_json = body,
+            .physical_name = physical_name,
+        } });
+        self.alloc.free(result);
+    }
+
     fn executeMcpCreateTable(
         self: *ApiHttpServer,
-        table_name: []const u8,
+        logical_name: []const u8,
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        const table_name = if (self.source.vtable.native_catalog != null) try self.catalogStorageNameAlloc(self.alloc) else try self.alloc.dupe(u8, logical_name);
+        defer self.alloc.free(table_name);
         if (body.len > tables_api.max_table_create_body_bytes)
             return try contextual_operations.textAlloc(self.alloc, 413, "create table request too large");
         var request = table_contract.parseCreateTableRequest(self.alloc, body) catch |err|
@@ -14617,7 +14791,8 @@ pub const ApiHttpServer = struct {
         if (request.indexes_json) |old| self.alloc.free(old);
         request.indexes_json = sealed_indexes_json;
 
-        self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
+        self.createNativeOrLegacyTable(logical_name, table_name, request, authenticated_identity) catch |err| return switch (err) {
+            error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.InvalidCatalogName, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.Forbidden => try contextualJsonErrorResponse(self.alloc, native_catalog.httpStatus(err), @errorName(err)),
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
             error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
@@ -14686,7 +14861,8 @@ pub const ApiHttpServer = struct {
         }
         const response_body = (try self.maybeEncodeTableStatus(table_name)) orelse
             return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
-        return contextual_operations.json(response_body, false);
+        defer self.alloc.free(response_body);
+        return contextual_operations.json(try projectCatalogStatusAlloc(self.alloc, response_body, logical_name), false);
     }
 
     fn executeMcpDropTable(self: *ApiHttpServer, table_name: []const u8) !contextual_operations.OwnedResponse {
@@ -14835,6 +15011,24 @@ pub const ApiHttpServer = struct {
     /// adapters use this to retain protocol-specific overload responses
     /// without double-counting application admission.
     pub fn handleAdmittedPublicTableQueryWithContentTypeCancellation(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        borrowed_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !contextual_operations.OwnedResponse {
+        var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
+        defer if (identity) |*owned| owned.deinit(self.alloc);
+        const physical = self.resolveCatalogNameAlloc(self.alloc, .{ .cancellation = if (cancellation) |value| value.token() else .none }, table_name, &identity) catch |err| return contextualJsonErrorResponse(self.alloc, native_catalog.httpStatus(err), @errorName(err));
+        defer self.alloc.free(physical);
+        var response = try self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(physical, body, content_type, identity, cancellation);
+        errdefer response.deinit(self.alloc);
+        if (!std.mem.eql(u8, physical, table_name)) try projectCatalogQueryResponse(self.alloc, &response, table_name);
+        return response;
+    }
+
+    pub fn handleAdmittedResolvedTableQueryWithContentTypeCancellation(
         self: *ApiHttpServer,
         table_name: []const u8,
         body: []const u8,
@@ -15065,7 +15259,7 @@ pub const ApiHttpServer = struct {
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
 
-            const table_name = if (route_table_name) |name| name else blk: {
+            const logical_table_name = if (route_table_name) |name| name else blk: {
                 var parsed_table = parseGlobalQueryTable(arena, line) catch {
                     return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
                 };
@@ -15076,12 +15270,17 @@ pub const ApiHttpServer = struct {
                 break :blk parsed_table.table_name;
             };
 
+            var line_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
+            defer if (line_identity) |*identity| identity.deinit(self.alloc);
+            const table_name = if (route_table_name != null) try self.alloc.dupe(u8, logical_table_name) else self.resolveCatalogNameAlloc(self.alloc, .{ .cancellation = if (cancellation) |value| value.token() else .none }, logical_table_name, &line_identity) catch |err| return contextualJsonErrorResponse(self.alloc, native_catalog.httpStatus(err), @errorName(err));
+            defer self.alloc.free(table_name);
+
             // Authorize every NDJSON line independently. A permitted decoy
             // line must not lend authority to a later protected-table line.
-            if (!transactionTablePermissionAllowed(authenticated_identity, table_name, .read))
+            if (!transactionTablePermissionAllowed(line_identity, table_name, .read))
                 return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
 
-            const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+            const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, line_identity, table_name);
             defer if (row_filter_json) |value| self.alloc.free(value);
 
             const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
@@ -15093,7 +15292,7 @@ pub const ApiHttpServer = struct {
                 table_name,
                 line,
                 row_filter_json,
-                authenticated_identity,
+                line_identity,
                 if (cancellation) |value| value.token() else null,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer query_response.deinit(self.alloc);
@@ -15113,9 +15312,12 @@ pub const ApiHttpServer = struct {
                 .array => |array| array.items,
                 else => return try contextual_operations.textAlloc(self.alloc, 500, "query failed"),
             };
-            for (responses) |response_value| {
+            for (responses) |*response_value| {
+                if (route_table_name == null and response_value.* == .object) if (response_value.object.getPtr("table")) |name| {
+                    name.* = .{ .string = logical_table_name };
+                };
                 if (emitted > 0) try out.writer.writeByte(',');
-                try std.json.Stringify.value(response_value, .{}, &out.writer);
+                try std.json.Stringify.value(response_value.*, .{}, &out.writer);
                 emitted += 1;
             }
         }
@@ -16538,13 +16740,13 @@ pub const ApiHttpServer = struct {
                 if (options.phase) |phase| if (state.phase != phase) continue;
                 if (options.scope) |scope| if (state.scope != scope) continue;
                 if (identity) |authenticated| {
-                    if (!restoreJobStateAllowed(authenticated, state)) continue;
+                    if (!try self.restoreJobStateAllowed(authenticated, state)) continue;
                 }
                 if (jobs.items.len == options.limit) {
                     continuation_cursor = last_returned_sequence;
                     break :scan;
                 }
-                jobs.appendAssumeCapacity(try restoreJobViewFromStateAlloc(arena, state));
+                jobs.appendAssumeCapacity(try self.restoreJobViewFromStateAlloc(arena, state));
                 last_returned_sequence = state.enqueue_sequence;
             }
             scan_cursor = batch.next_scan_cursor orelse break;
@@ -16561,18 +16763,37 @@ pub const ApiHttpServer = struct {
         });
     }
 
+    fn catalogLogicalNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, physical: []const u8) ![]u8 {
+        if (std.mem.startsWith(u8, physical, "table:") and self.source.vtable.native_catalog != null) {
+            const bytes = try self.source.nativeCatalog(alloc, .{}, .snapshot);
+            defer alloc.free(bytes);
+            var state = try std.json.parseFromSlice(native_catalog.State, alloc, bytes, .{});
+            defer state.deinit();
+            for (state.value.resources) |resource| {
+                if (resource.kind != .table or !std.mem.eql(u8, resource.storage_name, physical)) continue;
+                const namespace = state.value.byId(.namespace, resource.parent_id) orelse return error.InvalidCatalogRecord;
+                const database = state.value.byId(.database, namespace.parent_id) orelse return error.InvalidCatalogRecord;
+                return std.fmt.allocPrint(alloc, "{s}.{s}.{s}", .{ database.name, namespace.name, resource.name });
+            }
+            if (try native_catalog.restoreTarget(physical)) |target| return target.resourceNameAlloc(alloc);
+        }
+        return alloc.dupe(u8, physical);
+    }
+
     pub fn restoreJobAllowed(self: *ApiHttpServer, alloc: std.mem.Allocator, identity: AuthenticatedIdentity, job_id: u64) !bool {
         const encoded = (try self.restore_job_store.load(alloc, job_id)) orelse return false;
         defer alloc.free(encoded);
         var parsed = try std.json.parseFromSlice(restore_jobs.JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        return restoreJobStateAllowed(identity, parsed.value);
+        return self.restoreJobStateAllowed(identity, parsed.value);
     }
 
-    fn restoreJobStateAllowed(identity: AuthenticatedIdentity, state: restore_jobs.JobState) bool {
+    fn restoreJobStateAllowed(self: *ApiHttpServer, identity: AuthenticatedIdentity, state: restore_jobs.JobState) !bool {
+        const logical_name = if (state.table_name) |name| try self.catalogLogicalNameAlloc(self.alloc, name) else null;
+        defer if (logical_name) |name| self.alloc.free(name);
         return switch (state.scope) {
             .cluster => permissionsAllow(identity.permissions, .@"*", "*", .admin),
-            .table => permissionsAllow(identity.permissions, .table, state.table_name orelse return false, .admin),
+            .table => permissionsAllow(identity.permissions, .table, logical_name orelse return false, .admin),
         };
     }
 
@@ -16595,13 +16816,13 @@ pub const ApiHttpServer = struct {
         expires_at_ms: ?u64,
     };
 
-    fn restoreJobViewAlloc(arena: std.mem.Allocator, encoded: []const u8) !RestoreJobView {
+    fn restoreJobViewAlloc(self: *ApiHttpServer, arena: std.mem.Allocator, encoded: []const u8) !RestoreJobView {
         var parsed = try std.json.parseFromSlice(restore_jobs.JobState, arena, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        return try restoreJobViewFromStateAlloc(arena, parsed.value);
+        return try self.restoreJobViewFromStateAlloc(arena, parsed.value);
     }
 
-    fn restoreJobViewFromStateAlloc(arena: std.mem.Allocator, state: restore_jobs.JobState) !RestoreJobView {
+    fn restoreJobViewFromStateAlloc(self: *ApiHttpServer, arena: std.mem.Allocator, state: restore_jobs.JobState) !RestoreJobView {
         const result: ?std.json.Value = if (state.result_json) |raw| blk: {
             const value = try std.json.parseFromSlice(std.json.Value, arena, raw, .{});
             break :blk value.value;
@@ -16610,7 +16831,7 @@ pub const ApiHttpServer = struct {
             .job_id = try std.fmt.allocPrint(arena, "{d}", .{state.job_id}),
             .attempt_id = state.attempt_id,
             .scope = state.scope,
-            .table_name = if (state.table_name) |table_name| try arena.dupe(u8, table_name) else null,
+            .table_name = if (state.table_name) |table_name| try self.catalogLogicalNameAlloc(arena, table_name) else null,
             .backup_id = try arena.dupe(u8, state.backup_id),
             .phase = state.phase,
             .cancel_requested = state.cancel_requested,
@@ -16630,7 +16851,7 @@ pub const ApiHttpServer = struct {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
-        const view = try restoreJobViewAlloc(arena, encoded);
+        const view = try self.restoreJobViewAlloc(arena, encoded);
         var response = try contextualJsonResponseOmitNullOptionals(self.alloc, status, view);
         if (status == 202) {
             response.headers = try self.alloc.alloc(contextual_operations.Header, 2);
@@ -19323,6 +19544,19 @@ fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
 }
 
 pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_common.Method, path: []const u8) !?RequiredPermission {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    if (try native_catalog_routes.parseAlloc(arena.allocator(), path)) |route| {
+        const resource_type: usermgr.ResourceType = switch (route.kind) {
+            .database => .database,
+            .namespace => .namespace,
+            .table => .table,
+            .tablespace => .tablespace,
+        };
+        const permission: usermgr.PermissionType = if (method == .GET or (route.kind == .table and std.mem.eql(u8, route.suffix, "query"))) .read else if (route.kind == .table and std.mem.eql(u8, route.suffix, "batch")) .write else .admin;
+        return .{ .resource_type = resource_type, .resource = try native_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
+    }
+
     if (method == .POST and routes.Routes.matchInferenceConnectionInvocation(path) != null) return .{
         .resource_type = .inference,
         .resource = "*",
@@ -19696,7 +19930,7 @@ pub fn permissionsAllow(
 ) bool {
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
-        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and native_catalog_routes.tableResourceMatches(permission.resource, resource));
         if (!type_match or !resource_match) continue;
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
@@ -20607,6 +20841,9 @@ fn parseListTablesParams(alloc: std.mem.Allocator, query: []const u8) !metadata_
 fn resourceTypeFromOpenApi(value: usermgr_openapi.ResourceType) usermgr.ResourceType {
     return switch (value) {
         .table => .table,
+        .database => .database,
+        .namespace => .namespace,
+        .tablespace => .tablespace,
         .user => .user,
         .inference => .inference,
         .@"*" => .@"*",
@@ -20624,6 +20861,9 @@ fn permissionTypeFromOpenApi(value: usermgr_openapi.PermissionType) usermgr.Perm
 fn resourceTypeToOpenApi(value: usermgr.ResourceType) usermgr_openapi.ResourceType {
     return switch (value) {
         .table => .table,
+        .database => .database,
+        .namespace => .namespace,
+        .tablespace => .tablespace,
         .user => .user,
         .inference => .inference,
         .@"*" => .@"*",
@@ -46683,4 +46923,127 @@ test "query builder dependency 503 responses preserve public retry contract" {
         }
         try std.testing.expect(retry_header);
     }
+}
+
+pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
+    const permission_count = identity.permissions.len;
+    for (0..permission_count) |i| {
+        const original = identity.permissions[i];
+        if (original.resource_type != .table or !native_catalog_routes.tableResourceMatches(original.resource, logical)) continue;
+        var permission = try usermgr.Permission.initOwned(alloc, .table, physical, original.type);
+        errdefer permission.deinit(alloc);
+        identity.permissions = try alloc.realloc(identity.permissions, identity.permissions.len + 1);
+        identity.permissions[identity.permissions.len - 1] = permission;
+    }
+    const filter_count = identity.row_filter.len;
+    for (0..filter_count) |i| {
+        const original = identity.row_filter[i];
+        if (!native_catalog_routes.tableResourceMatches(original.table, logical)) continue;
+        var filter = try usermgr.RowFilterEntry.initOwned(alloc, physical, original.filter);
+        errdefer filter.deinit(alloc);
+        identity.row_filter = try alloc.realloc(identity.row_filter, identity.row_filter.len + 1);
+        identity.row_filter[identity.row_filter.len - 1] = filter;
+    }
+}
+
+pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedIdentity) !?AuthenticatedIdentity {
+    const value = identity orelse return null;
+    var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
+    owned.is_internal_service = value.is_internal_service;
+    return owned;
+}
+
+test "native catalog authorizes qualified resources before lookup and rename admission" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, input: native_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            self.calls += 1;
+            return a.dupe(u8, if (input == .resolve) "null" else "{}");
+        }
+    };
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permissions = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "analytics.public.events", .read),
+        try usermgr.Permission.initOwned(alloc, .database, "analytics", .admin),
+    };
+    defer for (&permissions) |*permission| permission.deinit(alloc);
+    var user = try auth.manager.createUser("reader", "secret", &permissions);
+    defer user.deinit(alloc);
+    const authorization = try encodeBasicAuthorization(alloc, "reader", "secret");
+    defer alloc.free(authorization);
+    var fake = Fake{};
+    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .native_catalog = Fake.catalog } }, null, null);
+    defer server.deinit();
+    const cases = [_]struct { path: []const u8, status: u16 }{
+        .{ .path = "/databases/other/namespaces/public/tables/events", .status = 403 },
+        .{ .path = "/tables/events", .status = 403 },
+        .{ .path = "/databases/analytics/namespaces/public/tables/events", .status = 404 },
+    };
+    for (cases) |case| {
+        var response = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = case.path, .authorization = authorization });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(case.status, response.status);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    var rename = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/databases/analytics/rename", .authorization = authorization, .body = "{\"name\":\"other\"}", .content_type = "application/json" });
+    defer rename.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), rename.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "native catalog projects only matching permission and row-filter scopes" {
+    const alloc = std.testing.allocator;
+    var permissions = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "analytics.public.*", .read),
+        try usermgr.Permission.initOwned(alloc, .table, "other.public.events", .write),
+    };
+    defer for (&permissions) |*permission| permission.deinit(alloc);
+    var filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(alloc, "analytics.public.events", "{\"term\":{\"tenant\":\"a\"}}"),
+        try usermgr.RowFilterEntry.initOwned(alloc, "other.public.events", "{\"term\":{\"tenant\":\"b\"}}"),
+    };
+    defer for (&filters) |*filter| filter.deinit(alloc);
+    var identity = (try cloneCatalogIdentity(alloc, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &filters })).?;
+    defer identity.deinit(alloc);
+    try projectCatalogIdentity(alloc, &identity, "analytics.public.events", "table:immutable");
+    try std.testing.expect(permissionsAllow(identity.permissions, .table, "table:immutable", .read));
+    try std.testing.expect(!permissionsAllow(identity.permissions, .table, "table:immutable", .write));
+    try std.testing.expectEqual(@as(usize, 3), identity.row_filter.len);
+    try std.testing.expectEqualStrings("table:immutable", identity.row_filter[2].table);
+    try std.testing.expectEqualStrings(filters[0].filter, identity.row_filter[2].filter);
+}
+
+pub fn projectCatalogQueryResponse(alloc: std.mem.Allocator, response: *contextual_operations.OwnedResponse, logical_name: []const u8) !void {
+    if (response.status < 200 or response.status >= 300) return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const responses = parsed.value.object.getPtr("responses") orelse return;
+    if (responses.* != .array) return;
+    for (responses.array.items) |*item| {
+        if (item.* != .object) continue;
+        if (item.object.getPtr("table")) |name| name.* = .{ .string = logical_name };
+    }
+    const body = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    alloc.free(response.body);
+    response.body = body;
+}
+
+fn projectCatalogStatusAlloc(alloc: std.mem.Allocator, body: []const u8, logical_name: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        if (parsed.value.object.getPtr("name")) |name| name.* = .{ .string = logical_name };
+    }
+    return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }

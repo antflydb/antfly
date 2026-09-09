@@ -53,7 +53,7 @@ fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
 
 pub const DropResult = topology_protocol.DropResult;
 
-fn deriveRestoreDestinationRanges(
+pub fn deriveRestoreDestinationRanges(
     alloc: std.mem.Allocator,
     table: metadata_table_manager.TableRecord,
     source_ranges: []const metadata_table_manager.RangeRecord,
@@ -218,6 +218,9 @@ pub fn restore(
         if (range.table_id != table.table_id or unique_groups.contains(range.group_id))
             return error.InvalidTableTopologyMutation;
         unique_groups.putAssumeCapacity(range.group_id, {});
+    }
+    if (try @import("../catalog/domain.zig").restoreTarget(table.name)) |target| {
+        return @import("../catalog/operations.zig").restore(svc, alloc, request, target, table, ranges);
     }
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
         request,

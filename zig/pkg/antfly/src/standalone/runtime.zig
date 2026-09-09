@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const native_catalog = @import("../catalog/domain.zig");
 const lease_executor = @import("lease_executor.zig");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
@@ -734,7 +735,10 @@ const LocalStandaloneMetadata = struct {
     last_schema_migration_finalize_at_ms: u64 = 0,
     local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
 
+    native_catalog_state: ?std.json.Parsed(native_catalog.State) = null,
+
     const PersistedCatalog = struct {
+        native_catalog: native_catalog.State = .{},
         epoch: u64 = 1,
         tables: []const antfly.metadata.TableRecord = &.{},
         ranges: []const antfly.metadata.RangeRecord = &.{},
@@ -748,6 +752,7 @@ const LocalStandaloneMetadata = struct {
         previous_manager: antfly.metadata.TableManager,
         previous_extensions: antfly.extensions.ExtensionCatalog,
         previous_epoch: u64,
+        previous_native_catalog: std.json.Parsed(native_catalog.State),
         committed: bool = false,
 
         fn commit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) !void {
@@ -757,10 +762,13 @@ const LocalStandaloneMetadata = struct {
 
         fn deinit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) void {
             if (self.committed) {
+                self.previous_native_catalog.deinit();
                 self.previous_extensions.deinit();
                 self.previous_manager.deinit();
                 return;
             }
+            if (metadata.native_catalog_state) |*state| state.deinit();
+            metadata.native_catalog_state = self.previous_native_catalog;
             metadata.extension_catalog.deinit();
             metadata.manager.deinit();
             metadata.manager = self.previous_manager;
@@ -777,9 +785,12 @@ const LocalStandaloneMetadata = struct {
         const ranges = try self.manager.listRanges(self.alloc);
         defer self.manager.freeRanges(self.alloc, ranges);
         _ = try manager.replaceProjectedTopology(tables, ranges);
+        var extensions = try self.cloneExtensionCatalogLocked();
+        errdefer extensions.deinit();
         return .{
             .previous_manager = manager,
-            .previous_extensions = try self.cloneExtensionCatalogLocked(),
+            .previous_extensions = extensions,
+            .previous_native_catalog = try native_catalog.cloneStateAlloc(self.alloc, self.nativeState()),
             .previous_epoch = self.epoch,
         };
     }
@@ -823,6 +834,7 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn deinit(self: *LocalStandaloneMetadata) void {
+        if (self.native_catalog_state) |*state| state.deinit();
         self.extension_catalog.deinit();
         self.manager.deinit();
         self.alloc.free(self.catalog_path);
@@ -859,6 +871,7 @@ const LocalStandaloneMetadata = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .status = status,
+                .native_catalog = nativeCatalog,
                 .admin_snapshot = catalogAdminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .linearizable_snapshot = linearizableSnapshot,
@@ -1113,6 +1126,101 @@ const LocalStandaloneMetadata = struct {
         snapshot.* = undefined;
     }
 
+    fn nativeState(self: *const LocalStandaloneMetadata) native_catalog.State {
+        return if (self.native_catalog_state) |state| state.value else .{};
+    }
+
+    fn applyNativeDeltaLocked(self: *LocalStandaloneMetadata, delta: native_catalog.Delta) !void {
+        const next = try native_catalog.applyDeltaStateAlloc(self.alloc, self.nativeState(), delta);
+        if (self.native_catalog_state) |*state| state.deinit();
+        self.native_catalog_state = next;
+    }
+
+    fn nativePhysicalTablesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator) ![]native_catalog.PhysicalTable {
+        const tables = try self.manager.listTables(alloc);
+        defer self.manager.freeTables(alloc, tables);
+        const physical = try alloc.alloc(native_catalog.PhysicalTable, tables.len);
+        for (tables, physical) |table, *item| {
+            // Borrow names from the live manager rather than the temporary clone.
+            item.* = .{ .id = table.table_id, .name = self.findTableByNameLocked(table.name).?.name };
+        }
+        return physical;
+    }
+
+    fn resolveNativeLocked(self: *LocalStandaloneMetadata, target: native_catalog.Target) !?antfly.metadata.TableRecord {
+        try target.validate();
+        const state = self.nativeState();
+        const namespace = state.namespaceFor(target.database, target.namespace) catch return null;
+        if (state.find(.table, namespace.id, target.table)) |binding| {
+            const table = self.findTableByNameLocked(binding.storage_name) orelse return error.InvalidCatalogRecord;
+            if (table.table_id != binding.id) return error.InvalidCatalogRecord;
+            return table.*;
+        }
+        if (namespace.id != native_catalog.default_namespace_id) return null;
+        const table = self.findTableByNameLocked(target.table) orelse return null;
+        if (native_catalog.hasBinding(state, table.table_id)) return null;
+        return table.*;
+    }
+
+    fn nativeCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: native_catalog.Call) ![]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        if (!lockAtomicUntil(&self.mutex, context.deadline_ns)) return error.DeadlineExceeded;
+        defer self.mutex.unlock();
+        try context.ensureActive();
+        switch (call) {
+            .snapshot => return std.json.Stringify.valueAlloc(alloc, self.nativeState(), .{}),
+            .resolve => |target| return std.json.Stringify.valueAlloc(alloc, try self.resolveNativeLocked(target), .{}),
+            .mutate => |request| {
+                if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const a = arena.allocator();
+                const state = self.nativeState();
+                var command = request.mutation;
+                var table: ?antfly.metadata.TableRecord = null;
+                var ranges: []const antfly.metadata.RangeRecord = &.{};
+                if (command.kind == .table and command.action == .create) {
+                    const name = request.physical_name orelse return error.InvalidCatalogMutation;
+                    if (!std.mem.startsWith(u8, name, "table:") or name.len > 512) return error.InvalidCatalogMutation;
+                    var req = try antfly.public_api.tables.parseStoredCreateTableRequest(a, request.create_table_json orelse return error.InvalidCatalogMutation);
+                    const namespace = try state.namespaceFor(command.database, command.namespace);
+                    const explicit = if (command.tablespace) |n| (state.find(.tablespace, 0, n) orelse return error.TablespaceNotFound).id else 0;
+                    const policy = if (try state.effectiveTablespace(namespace, explicit)) |space| space.placement_policy else native_catalog.PlacementPolicy{};
+                    if (req.num_shards == null) req.num_shards = policy.min_ranges;
+                    table = try deriveStandaloneTableRecord(self.storage_engine, name, req);
+                    if (policy.placement_role) |role| table.?.placement_role = role;
+                    // Standalone owns one local replica; policy metadata remains
+                    // portable when a backup is restored into a cluster.
+                    ranges = try antfly.public_api.tables.deriveInitialRanges(a, table.?);
+                    command.table_id = table.?.table_id;
+                    command.storage_name = name;
+                } else if (request.create_table_json != null or request.physical_name != null) return error.InvalidCatalogMutation;
+                const physical = try self.nativePhysicalTablesLocked(a);
+                const delta = try native_catalog.plan(a, state, command, physical);
+                var mutation = try self.beginCatalogMutationLocked();
+                defer mutation.deinit(self);
+                if (table) |created| {
+                    try self.manager.upsertTable(created);
+                    for (ranges) |range| try self.manager.upsertRange(range);
+                } else if (command.kind == .table and command.action == .set_tablespace) {
+                    var current = (try self.resolveNativeLocked(.{ .database = command.database, .namespace = command.namespace, .table = command.name })) orelse return error.TableNotFound;
+                    const namespace = try state.namespaceFor(command.database, command.namespace);
+                    const policy = if (try state.effectiveTablespace(namespace, delta.upserts[0].tablespace_id)) |space| space.placement_policy else native_catalog.PlacementPolicy{};
+                    current.placement_role = policy.placement_role orelse "data";
+                    current.min_ranges = policy.min_ranges orelse 1;
+                    if (self.storage_engine == .lite and current.min_ranges != 1) return error.InvalidCreateTableRequest;
+                    try self.manager.upsertTable(current);
+                }
+                try self.applyNativeDeltaLocked(delta);
+                self.epoch +|= 1;
+                try context.ensureActive();
+                try mutation.commit(self);
+                return alloc.dupe(u8, "{}");
+            },
+        }
+    }
+
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         const table = try deriveStandaloneTableRecord(self.storage_engine, table_name, req);
@@ -1212,7 +1320,8 @@ const LocalStandaloneMetadata = struct {
     ) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try antfly.public_api.backups.validateTableManifest(alloc, manifest, manifest.backup_id);
-        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+        if (!std.mem.eql(u8, manifest.table_name, table_name) and
+            (native_catalog.restoreTarget(table_name) catch null) == null) return error.InvalidBackupRequest;
         var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, table.indexes_json);
@@ -1237,6 +1346,13 @@ const LocalStandaloneMetadata = struct {
         if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
+        if (try native_catalog.restoreTarget(table_name)) |target| {
+            const physical = try self.nativePhysicalTablesLocked(alloc);
+            defer alloc.free(physical);
+            var delta = try native_catalog.plan(alloc, self.nativeState(), .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table, .table_id = table.table_id, .storage_name = table_name }, physical);
+            defer delta.deinit(alloc);
+            try self.applyNativeDeltaLocked(delta);
+        }
         try self.manager.upsertTable(table);
         for (ranges) |range| try self.manager.upsertRange(range);
         self.epoch +|= 1;
@@ -1267,6 +1383,11 @@ const LocalStandaloneMetadata = struct {
         }
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
+        if (self.nativeState().byId(.table, table_id)) |binding| {
+            const empty = [_]native_catalog.Resource{};
+            const removed = [_]native_catalog.Resource{binding};
+            try self.applyNativeDeltaLocked(.{ .upserts = @constCast(&empty), .removes = @constCast(&removed), .next_id = self.nativeState().next_id });
+        }
         _ = self.manager.removeTableTopology(table_id);
         self.epoch +|= 1;
         try mutation.commit(self);
@@ -1702,6 +1823,7 @@ const LocalStandaloneMetadata = struct {
             parsed.value.extension_members,
             parsed.value.extension_dependencies,
         );
+        self.native_catalog_state = try native_catalog.cloneStateAlloc(self.alloc, parsed.value.native_catalog);
         self.epoch = @max(parsed.value.epoch, 1);
     }
 
@@ -1720,6 +1842,7 @@ const LocalStandaloneMetadata = struct {
         defer self.extension_catalog.freeDependencies(self.alloc, extension_dependencies);
 
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, PersistedCatalog{
+            .native_catalog = self.nativeState(),
             .epoch = self.epoch,
             .tables = tables,
             .ranges = ranges,
@@ -8757,4 +8880,39 @@ test "runtime lease watchdog prefers a DNS-verified Kubernetes API host and reta
     const overridden_endpoint = try haLeaseAPIEndpoint(&env);
     try std.testing.expectEqualStrings("kubernetes.default.svc.cluster.local", overridden_endpoint.host);
     try std.testing.expectEqualStrings("443", overridden_endpoint.port);
+}
+
+test "native catalog standalone checkpoint preserves bindings and rolls back undurable changes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const source = metadata.statusSource();
+    const create_db = try source.nativeCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "analytics" } } });
+    alloc.free(create_db);
+    const create_table = try source.nativeCatalog(alloc, .{}, .{ .mutate = .{
+        .mutation = .{ .action = .create, .kind = .table, .database = "analytics", .name = "events" },
+        .physical_name = "table:stable-test-identity",
+        .create_table_json = "{}",
+    } });
+    alloc.free(create_table);
+    const rename = try source.nativeCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "warehouse" } } });
+    alloc.free(rename);
+    metadata.deinit();
+    metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    const table = (try metadata.resolveNativeLocked(.{ .database = "warehouse", .table = "events" })).?;
+    try std.testing.expectEqualStrings("table:stable-test-identity", table.name);
+    try std.testing.expect((try metadata.resolveNativeLocked(.{ .database = "analytics", .table = "events" })) == null);
+    try std.testing.expectError(error.DatabaseNotEmpty, source.nativeCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .drop, .kind = .database, .name = "warehouse" } } }));
+    const previous_path = metadata.catalog_path;
+    metadata.catalog_path = "";
+    defer metadata.catalog_path = previous_path;
+    try std.testing.expectError(error.FileNotFound, source.nativeCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .database, .name = "warehouse", .new_name = "undurable" } } }));
+    try std.testing.expect((try metadata.resolveNativeLocked(.{ .database = "warehouse", .table = "events" })) != null);
+    try std.testing.expect((try metadata.resolveNativeLocked(.{ .database = "undurable", .table = "events" })) == null);
 }

@@ -107,6 +107,10 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     var req: tables_api.CreateTableRequest = .{};
     errdefer req.deinit(alloc);
 
+    if (parsed.value.tablespace_name) |name| {
+        try @import("../catalog/domain.zig").validateName(name);
+        req.tablespace_name = try alloc.dupe(u8, name);
+    }
     if (parsed.value.num_shards) |num_shards| {
         req.num_shards = std.math.cast(u32, num_shards) orelse return error.InvalidCreateTableRequest;
     }
@@ -228,6 +232,7 @@ pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.Create
     try out.append(alloc, '{');
     var first = true;
 
+    if (req.tablespace_name) |name| try appendField(alloc, &out, "tablespace_name", .{ .string = name }, &first);
     if (req.num_shards) |num_shards| {
         try appendField(alloc, &out, "num_shards", .{ .integer = num_shards }, &first);
     }

@@ -21,6 +21,8 @@ T = TypeVar("T", bound="CreateTableRequest")
 class CreateTableRequest:
     """
     Attributes:
+        tablespace_name (str | Unset): Explicit tablespace policy for the new table, overriding namespace and database
+            defaults.
         num_shards (int | Unset): Number of shards to create for the table. Data is partitioned across shards based on
             key ranges.
 
@@ -76,6 +78,7 @@ class CreateTableRequest:
             Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     """
 
+    tablespace_name: str | Unset = UNSET
     num_shards: int | Unset = UNSET
     description: str | Unset = UNSET
     indexes: CreateTableRequestIndexes | Unset = UNSET
@@ -84,6 +87,8 @@ class CreateTableRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        tablespace_name = self.tablespace_name
+
         num_shards = self.num_shards
 
         description = self.description
@@ -106,6 +111,8 @@ class CreateTableRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if tablespace_name is not UNSET:
+            field_dict["tablespace_name"] = tablespace_name
         if num_shards is not UNSET:
             field_dict["num_shards"] = num_shards
         if description is not UNSET:
@@ -126,6 +133,8 @@ class CreateTableRequest:
         from ..models.table_schema import TableSchema
 
         d = dict(src_dict)
+        tablespace_name = d.pop("tablespace_name", UNSET)
+
         num_shards = d.pop("num_shards", UNSET)
 
         description = d.pop("description", UNSET)
@@ -154,6 +163,7 @@ class CreateTableRequest:
                 replication_sources.append(replication_sources_item)
 
         create_table_request = cls(
+            tablespace_name=tablespace_name,
             num_shards=num_shards,
             description=description,
             indexes=indexes,

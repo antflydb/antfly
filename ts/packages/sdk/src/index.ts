@@ -399,3 +399,12 @@ import { Client } from "./sdk.js";
 export default Client;
 
 export * from "./models.js";
+
+export type {
+  DatabaseCatalogRecord,
+  NamespaceCatalogRecord,
+  TablespaceCatalogRecord,
+  CreateTablespaceRequest,
+  CatalogTablespaceBindingRequest,
+  RenameCatalogResourceRequest,
+} from "./types.js";

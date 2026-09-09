@@ -348,6 +348,24 @@ pub const Detail = enum(c_int) {
     generation_rate_limit,
     unsupported_tensor_type,
     generation_capacity_unavailable,
+    // Native catalog errors cross the independently compiled runtime boundary.
+    database_not_found,
+    namespace_not_found,
+    tablespace_not_found,
+    catalog_not_found,
+    catalog_already_exists,
+    catalog_generation_changed,
+    tablespace_in_use,
+    namespace_not_empty,
+    database_not_empty,
+    protected_catalog_resource,
+    invalid_catalog_name,
+    invalid_catalog_mutation,
+    invalid_tablespace_location,
+    invalid_tablespace_placement_policy,
+    catalog_command_too_large,
+    invalid_catalog_record,
+    catalog_id_exhausted,
 };
 
 pub const Status = extern struct {
@@ -365,6 +383,24 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.DatabaseNotFound => status(.not_found, .database_not_found),
+        error.NamespaceNotFound => status(.not_found, .namespace_not_found),
+        error.TablespaceNotFound => status(.not_found, .tablespace_not_found),
+        error.CatalogNotFound => status(.not_found, .catalog_not_found),
+        error.CatalogAlreadyExists => status(.conflict, .catalog_already_exists),
+        error.CatalogGenerationChanged => status(.conflict, .catalog_generation_changed),
+        error.TablespaceInUse => status(.conflict, .tablespace_in_use),
+        error.NamespaceNotEmpty => status(.conflict, .namespace_not_empty),
+        error.DatabaseNotEmpty => status(.conflict, .database_not_empty),
+        error.ProtectedCatalogResource => status(.conflict, .protected_catalog_resource),
+        error.InvalidCatalogName => status(.invalid_argument, .invalid_catalog_name),
+        error.InvalidCatalogMutation => status(.invalid_argument, .invalid_catalog_mutation),
+        error.InvalidTablespaceLocation => status(.invalid_argument, .invalid_tablespace_location),
+        error.InvalidTablespacePlacementPolicy => status(.invalid_argument, .invalid_tablespace_placement_policy),
+        error.CatalogCommandTooLarge => status(.invalid_argument, .catalog_command_too_large),
+        error.InvalidCatalogRecord => status(.corrupt, .invalid_catalog_record),
+        error.CatalogIdExhausted => status(.internal, .catalog_id_exhausted),
+
         error.OutOfMemory => status(.out_of_memory, .out_of_memory),
         error.InvalidArgument => status(.invalid_argument, .invalid_argument),
         error.InvalidArguments => status(.invalid_argument, .invalid_arguments),
@@ -715,6 +751,24 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .database_not_found => "DatabaseNotFound",
+        .namespace_not_found => "NamespaceNotFound",
+        .tablespace_not_found => "TablespaceNotFound",
+        .catalog_not_found => "CatalogNotFound",
+        .catalog_already_exists => "CatalogAlreadyExists",
+        .catalog_generation_changed => "CatalogGenerationChanged",
+        .tablespace_in_use => "TablespaceInUse",
+        .namespace_not_empty => "NamespaceNotEmpty",
+        .database_not_empty => "DatabaseNotEmpty",
+        .protected_catalog_resource => "ProtectedCatalogResource",
+        .invalid_catalog_name => "InvalidCatalogName",
+        .invalid_catalog_mutation => "InvalidCatalogMutation",
+        .invalid_tablespace_location => "InvalidTablespaceLocation",
+        .invalid_tablespace_placement_policy => "InvalidTablespacePlacementPolicy",
+        .catalog_command_too_large => "CatalogCommandTooLarge",
+        .invalid_catalog_record => "InvalidCatalogRecord",
+        .catalog_id_exhausted => "CatalogIdExhausted",
+
         .none => "RuntimeBoundaryFailure",
         .out_of_memory => "OutOfMemory",
         .invalid_argument => "InvalidArgument",
@@ -1119,4 +1173,9 @@ test "generation capacity retains retryability across the runtime boundary" {
     const result = statusFromError(error.GenerationCapacityUnavailable);
     try std.testing.expectEqual(@intFromEnum(Code.retryable), result.code);
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
+}
+
+test "native catalog errors retain their stable runtime boundary classification" {
+    const errors = [_]anyerror{ error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
+    for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }

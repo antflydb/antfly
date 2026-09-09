@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const native_catalog = @import("../../catalog/domain.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backups_api = @import("../../api/backups.zig");
@@ -569,7 +570,24 @@ fn prepareRestoreSnapshotIfNeeded(
         }
     }
 
-    return try prepareRestoreSnapshot(transition, alloc, io, path, group_id, restore, options);
+    var prepared = try prepareRestoreSnapshot(transition, alloc, io, path, group_id, restore, options);
+    errdefer prepared.deinit();
+    // A qualified restore publishes a new table incarnation. Reassign only
+    // the isolated, integrity-validated candidate; serving generations and
+    // ordinary repair opens retain their exact namespace checks.
+    if (options.expected_table_name) |name| {
+        if ((try native_catalog.restoreTarget(name)) != null) {
+            if (options.expected_identity_namespace) |namespace| {
+                try restore.cancellation.check();
+                const open_options = try preparedRestoreOpenOptionsForRepair(&prepared, restore, options);
+                var db = try db_mod.DB.open(alloc, prepared.path(), open_options);
+                defer db.close();
+                if (!db.core.identity_namespace.eql(namespace))
+                    try db.reassignIdentityNamespaceForInternalTransition(namespace);
+            }
+        }
+    }
+    return prepared;
 }
 
 fn prepareRestoreSnapshot(
@@ -596,7 +614,9 @@ fn prepareRestoreSnapshot(
     };
     try backups_api.validateRestoreManifest(alloc, manifest, restore.backup_id);
     if (options.expected_table_name) |table_name| {
-        if (!std.mem.eql(u8, manifest.table_name, table_name)) {
+        if (!std.mem.eql(u8, manifest.table_name, table_name) and
+            (native_catalog.restoreTarget(table_name) catch null) == null)
+        {
             std.log.err("restore manifest validation failed phase=table_identity class=mismatch", .{});
             return error.InvalidBackupRequest;
         }

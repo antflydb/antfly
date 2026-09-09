@@ -39,6 +39,9 @@ pub fn runFromIterator(
     defer client.deinit();
 
     if (std.mem.eql(u8, command, "table")) return cli.table.run(init.gpa, io, &client, args);
+    if (std.mem.eql(u8, command, "database")) return cli.database_cmd.run(init.gpa, io, &client, args);
+    if (std.mem.eql(u8, command, "namespace")) return cli.namespace_cmd.run(init.gpa, io, &client, args);
+    if (std.mem.eql(u8, command, "tablespace")) return cli.tablespace.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "index")) return cli.index.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "artifact")) return cli.artifact.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "query")) return cli.query.run(init.gpa, io, &client, args);
