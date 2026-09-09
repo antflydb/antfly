@@ -103,7 +103,7 @@ zig build antfly-storage-test
 zig build antfly-metadata-test
 zig build lib-image-test
 zig build antfly-audio-test
-zig build antfly-raft-sim-test
+zig build raft-vopr-test
 zig build inference-test
 ```
 
@@ -160,7 +160,7 @@ Artifact targets build and install into `zig-out/bin`. Run binaries directly,
 so a comparison can build once and execute several workloads:
 
 ```sh
-zig build graph-pattern-bench antfly-storage-bench
+zig build graph-pattern-bench antfly-storage-bench -Doptimize=ReleaseFast
 ./zig-out/bin/graph_pattern_query_bench --mode exact --fanout 10000 --target-degree 100000
 ./zig-out/bin/graph_pattern_query_bench --mode generic --fanout 10000 --target-degree 100000
 ```

@@ -46,6 +46,10 @@ pub const SnapshotArtifactPolicy = struct {
 };
 
 pub const FileSnapshotStoreConfig = struct {
+    /// Borrowed maintenance scheduling, synchronization, and awake clock.
+    /// Must outlive the store. File operations retain the store's native I/O;
+    /// the maintenance task must park and wake through this capability.
+    maintenance_io: ?std.Io = null,
     root_dir: []const u8,
     max_snapshot_bytes: usize = 1 << 30,
     max_chunk_bytes: usize = snapshot_transfer.max_chunk_bytes,
@@ -88,8 +92,8 @@ pub const FileSnapshotStore = struct {
     artifact_reserved: ArtifactUsage = .{},
     artifact_usage_reconciliations: std.atomic.Value(u64) = .init(0),
     next_artifact_maintenance_ns: std.atomic.Value(u64) = .init(0),
-    artifact_maintenance_mutex: std.atomic.Mutex = .unlocked,
-    artifact_maintenance_thread: ?std.Thread = null,
+    artifact_maintenance_mutex: std.Io.Mutex = .init,
+    artifact_maintenance_future: ?std.Io.Future(void) = null,
     artifact_maintenance_event: std.Io.Event = .unset,
     artifact_maintenance_stop: std.atomic.Value(bool) = .init(false),
     artifact_maintenance_requested: std.atomic.Value(bool) = .init(false),
@@ -129,13 +133,21 @@ pub const FileSnapshotStore = struct {
         return self;
     }
 
-    pub fn deinit(self: *FileSnapshotStore) void {
-        platform_sync.lockYielding(&self.artifact_maintenance_mutex);
+    /// Close maintenance admission and wake its task without joining it.
+    /// Borrowed scheduler owners can publish every stop, drive tasks to
+    /// quiescence, and then reclaim their stores with deinit.
+    pub fn beginShutdown(self: *FileSnapshotStore) void {
+        const maintenance_io = self.maintenanceIo();
+        self.artifact_maintenance_mutex.lockUncancelable(maintenance_io);
+        defer self.artifact_maintenance_mutex.unlock(maintenance_io);
         self.artifact_maintenance_stop.store(true, .release);
-        const maintenance_thread = self.artifact_maintenance_thread;
-        if (maintenance_thread != null) self.artifact_maintenance_event.set(io(self));
-        self.artifact_maintenance_mutex.unlock();
-        if (maintenance_thread) |thread| thread.join();
+        self.artifact_maintenance_event.set(maintenance_io);
+    }
+
+    pub fn deinit(self: *FileSnapshotStore) void {
+        self.beginShutdown();
+        if (self.artifact_maintenance_future) |*future| future.await(self.maintenanceIo());
+        self.artifact_maintenance_future = null;
         var lease_keys = self.fetch_leases.keyIterator();
         while (lease_keys.next()) |key| self.alloc.free(key.*);
         self.fetch_leases.deinit(self.alloc);
@@ -895,14 +907,14 @@ pub const FileSnapshotStore = struct {
     }
 
     fn deferArtifactMaintenance(self: *FileSnapshotStore) void {
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.maintenanceMonotonicNs();
         self.next_artifact_maintenance_ns.store(now_ns +| artifact_maintenance_interval_ns, .release);
     }
 
     /// Foreground requests only publish an O(1) wake-up. Directory iteration
     /// and durability syncs stay on the store's maintenance lane.
     fn maybeRunArtifactMaintenance(self: *FileSnapshotStore) void {
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.maintenanceMonotonicNs();
         const previous = self.next_artifact_maintenance_ns.load(.acquire);
         if (previous != 0 and now_ns < previous) return;
         if (self.next_artifact_maintenance_ns.cmpxchgStrong(
@@ -915,18 +927,16 @@ pub const FileSnapshotStore = struct {
     }
 
     fn requestArtifactMaintenance(self: *FileSnapshotStore) void {
+        const maintenance_io = self.maintenanceIo();
+        self.artifact_maintenance_mutex.lockUncancelable(maintenance_io);
+        defer self.artifact_maintenance_mutex.unlock(maintenance_io);
+        if (self.artifact_maintenance_stop.load(.acquire)) return;
         _ = self.artifact_maintenance_requests.fetchAdd(1, .monotonic);
         self.artifact_maintenance_requested.store(true, .release);
         if (comptime builtin.single_threaded) return;
 
-        platform_sync.lockYielding(&self.artifact_maintenance_mutex);
-        if (self.artifact_maintenance_stop.load(.acquire)) {
-            self.artifact_maintenance_mutex.unlock();
-            return;
-        }
-        if (self.artifact_maintenance_thread == null) {
-            self.artifact_maintenance_thread = std.Thread.spawn(
-                .{},
+        if (self.artifact_maintenance_future == null) {
+            self.artifact_maintenance_future = maintenance_io.concurrent(
                 artifactMaintenanceMain,
                 .{self},
             ) catch |err| {
@@ -935,12 +945,10 @@ pub const FileSnapshotStore = struct {
                     self.root_dir,
                     @errorName(err),
                 });
-                self.artifact_maintenance_mutex.unlock();
                 return;
             };
         }
-        self.artifact_maintenance_event.set(io(self));
-        self.artifact_maintenance_mutex.unlock();
+        self.artifact_maintenance_event.set(maintenance_io);
     }
 
     fn artifactMaintenanceMain(self: *FileSnapshotStore) void {
@@ -959,7 +967,7 @@ pub const FileSnapshotStore = struct {
                 self.deferArtifactMaintenance();
             }
             if (self.artifact_maintenance_stop.load(.acquire)) return;
-            self.artifact_maintenance_event.waitTimeout(io(self), .{
+            self.artifact_maintenance_event.waitTimeout(self.maintenanceIo(), .{
                 .duration = .{
                     .raw = std.Io.Duration.fromNanoseconds(artifact_maintenance_interval_ns),
                     .clock = .awake,
@@ -1101,6 +1109,14 @@ pub const FileSnapshotStore = struct {
         return self.io_impl.io();
     }
 
+    fn maintenanceIo(self: *FileSnapshotStore) std.Io {
+        return self.cfg.maintenance_io orelse io(self);
+    }
+
+    fn maintenanceMonotonicNs(self: *FileSnapshotStore) u64 {
+        return @intCast(@max(0, std.Io.Clock.awake.now(self.maintenanceIo()).toNanoseconds()));
+    }
+
     fn snapshotPath(self: *const FileSnapshotStore, snapshot_id: []const u8) ![]u8 {
         return try std.fmt.allocPrint(self.alloc, "{s}/{s}.snap", .{ self.root_dir, snapshot_id });
     }
@@ -1145,6 +1161,115 @@ fn waitForArtifactMaintenance(store: *FileSnapshotStore, completed_before: u64) 
         try store.io().sleep(.fromMilliseconds(1), .awake);
     }
     return error.ArtifactMaintenanceTimeout;
+}
+
+fn runReadyMaintenanceTasksForTest(sim: *@import("vopr").vopr_io.VoprIo) !void {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var ready: vopr.transition.List = .{};
+    defer ready.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    for (0..32) |_| {
+        ready.items.clearRetainingCapacity();
+        try sim.scheduler().enumerateReady(&ready, alloc);
+        try ready.canonicalize();
+        // Tests advance the maintenance clock explicitly. An idle worker
+        // must return control without consuming its next periodic deadline.
+        for (ready.items.items) |candidate| {
+            if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) continue;
+            try sim.scheduler().executeReady(candidate.id, &events, alloc);
+            break;
+        } else return;
+    }
+    return error.SnapshotMaintenanceDidNotPark;
+}
+
+test "file snapshot maintenance uses borrowed scheduling for deadlines wakeups and shutdown" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    const interval = FileSnapshotStore.artifact_maintenance_interval_ns;
+    for ([_]bool{ false, true }) |enter_worker| {
+        var sim = try vopr.vopr_io.VoprIo.init(.{
+            .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
+        });
+        defer sim.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        defer alloc.free(root);
+        var store = try FileSnapshotStore.init(alloc, .{ .root_dir = root, .maintenance_io = sim.io() });
+        defer store.deinit();
+        // Always publish a stop and drain before store.deinit, including an
+        // assertion failure while a borrowed task is parked.
+        defer {
+            store.beginShutdown();
+            _ = sim.cancelAndDrainTasksForTeardown(alloc, 32) catch {};
+        }
+
+        const start = store.maintenanceMonotonicNs();
+        try std.testing.expectEqual(start + interval, store.next_artifact_maintenance_ns.load(.acquire));
+        store.maybeRunArtifactMaintenance();
+        try std.testing.expect(store.artifact_maintenance_future == null);
+        try sim.advance(interval - 1);
+        store.maybeRunArtifactMaintenance();
+        try std.testing.expect(store.artifact_maintenance_future == null);
+        try sim.advance(1);
+        store.maybeRunArtifactMaintenance();
+        try std.testing.expect(store.artifact_maintenance_future != null);
+        const future = store.artifact_maintenance_future.?.any_future;
+
+        if (enter_worker) {
+            try runReadyMaintenanceTasksForTest(&sim);
+            try std.testing.expectEqual(@as(u64, 1), store.artifactUsageSnapshot().maintenance_runs);
+            try std.testing.expect(!sim.tasks.isQuiescent());
+            try std.testing.expectEqual(start + interval, store.maintenanceMonotonicNs());
+
+            // A contended lifecycle lock must park another requester on the
+            // borrowed scheduler instead of blocking its owning OS thread.
+            var requester: ?std.Io.Future(void) = null;
+            defer if (requester) |*task| task.cancel(sim.io());
+            {
+                store.artifact_maintenance_mutex.lockUncancelable(sim.io());
+                defer store.artifact_maintenance_mutex.unlock(sim.io());
+                requester = try sim.io().concurrent(FileSnapshotStore.requestArtifactMaintenance, .{&store});
+                try runReadyMaintenanceTasksForTest(&sim);
+                try std.testing.expectEqual(@as(u64, 1), store.artifactUsageSnapshot().maintenance_runs);
+            }
+            try runReadyMaintenanceTasksForTest(&sim);
+            requester.?.await(sim.io());
+            requester = null;
+            try std.testing.expectEqual(@as(u64, 2), store.artifactUsageSnapshot().maintenance_runs);
+
+            // Coalesced foreground pressure wakes the same parked task.
+            store.requestArtifactMaintenance();
+            store.requestArtifactMaintenance();
+            try runReadyMaintenanceTasksForTest(&sim);
+            try std.testing.expectEqual(future, store.artifact_maintenance_future.?.any_future);
+            try std.testing.expectEqual(@as(u64, 3), store.artifactUsageSnapshot().maintenance_runs);
+            try sim.advance(interval - 1);
+            try runReadyMaintenanceTasksForTest(&sim);
+            try std.testing.expectEqual(@as(u64, 3), store.artifactUsageSnapshot().maintenance_runs);
+            try sim.advance(1);
+            try runReadyMaintenanceTasksForTest(&sim);
+            try std.testing.expectEqual(@as(u64, 4), store.artifactUsageSnapshot().maintenance_runs);
+        }
+
+        // Shutdown must handle both a queued worker and one parked on its
+        // timer, without advancing virtual time or canceling the future.
+        const stopped_at = store.maintenanceMonotonicNs();
+        const requests = store.artifactUsageSnapshot().maintenance_requests;
+        const runs = store.artifactUsageSnapshot().maintenance_runs;
+        store.beginShutdown();
+        store.beginShutdown();
+        store.requestArtifactMaintenance();
+        try runReadyMaintenanceTasksForTest(&sim);
+        try std.testing.expect(sim.tasks.isQuiescent());
+        try std.testing.expectEqual(stopped_at, store.maintenanceMonotonicNs());
+        try std.testing.expectEqual(requests, store.artifactUsageSnapshot().maintenance_requests);
+        try std.testing.expectEqual(runs, store.artifactUsageSnapshot().maintenance_runs);
+        try sim.ensureNoCapabilityViolation();
+    }
 }
 
 test "file snapshot store persists snapshot bodies" {

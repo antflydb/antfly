@@ -78,14 +78,17 @@ pub fn main(init: std.process.Init) !void {
         @tagName(cfg.suite),
     });
 
+    var worker_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1), .stack_size = 256 * 1024 });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     var heartbeat = Heartbeat{};
-    const heartbeat_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Heartbeat.run, .{&heartbeat}) catch |err| blk: {
+    var heartbeat_future = scheduling_io.concurrent(Heartbeat.run, .{&heartbeat}) catch |err| blk: {
         std.debug.print("recall_harness_heartbeat_disabled err={s}\n", .{@errorName(err)});
         break :blk null;
     };
     defer {
         heartbeat.stop.store(true, .release);
-        if (heartbeat_thread) |thread| thread.join();
+        if (heartbeat_future) |*future| future.await(scheduling_io);
     }
 
     var ok = true;

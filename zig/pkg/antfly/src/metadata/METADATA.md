@@ -50,8 +50,8 @@ Completed or substantially in place:
   rebalance inspection
 - metadata HTTP/admin endpoints in
   [http_server.zig](http_server.zig)
-- stepped multi-node metadata simulations in
-  [sim_harness.zig](sim_harness.zig)
+- stepped multi-node metadata VOPR tests in
+  [vopr_harness.zig](vopr_harness.zig)
 
 The projected raft apply store is still part of the implementation, but the
 control plane is no longer just transition-focused scaffolding. Desired topology,
@@ -82,8 +82,8 @@ placement, store observation, and reconcile status are first-class surfaces.
   - heartbeat/load/lease-pressure signal merge outside the service boundary
 - [control_loop.zig](control_loop.zig)
   - control-loop execution around reconcile/service actions
-- [sim_harness.zig](sim_harness.zig)
-  - multi-node metadata HTTP simulation and convergence coverage
+- [vopr_harness.zig](vopr_harness.zig)
+  - multi-node metadata VOPR and HTTP integration convergence coverage
 
 ## Control-Plane Shape
 

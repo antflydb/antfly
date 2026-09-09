@@ -52,9 +52,13 @@ pub const CatalogCursor = struct {
     revision: u64,
 };
 
-fn catalogProjectionDeadline(deadline_ns: ?u64) !void {
+fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("../../runtime_io_abi.zig").Borrow) !void {
     if (deadline_ns) |deadline| {
-        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        const now_ns: u64 = if (deadline_io) |borrow| blk: {
+            var receiver = try borrow.receive();
+            break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
+        } else platform_time.monotonicNs();
+        if (now_ns >= deadline) return error.CatalogRoutingSnapshotTimeout;
     }
 }
 
@@ -2577,7 +2581,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
     ) ![]metadata.TableRecord {
-        return try self.listTablesTxnUntil(alloc, txn, group_id, null);
+        return try self.listTablesTxnUntil(alloc, txn, group_id, null, null);
     }
 
     fn listTablesTxnUntil(
@@ -2586,13 +2590,14 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         deadline_ns: ?u64,
+        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
     ) ![]metadata.TableRecord {
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         var prefix_buf: [128]u8 = undefined;
         const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
         const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
         defer freeKvs(alloc, kvs);
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         const out = try alloc.alloc(metadata.TableRecord, kvs.len);
         var filled: usize = 0;
         errdefer {
@@ -2602,11 +2607,11 @@ pub const RaftApplyStore = struct {
             alloc.free(out);
         }
         for (kvs, 0..) |kv, i| {
-            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns);
+            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns, deadline_io);
             out[i] = try decodeTableRecord(alloc, kv.value);
             filled = i + 1;
         }
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         return out;
     }
 
@@ -2618,9 +2623,17 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         deadline_ns: ?u64,
     ) !CatalogProjectionSnapshot {
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
+        return self.captureCatalogProjectionWithClock(alloc, group_id, deadline_ns, null);
+    }
+
+    pub fn captureCatalogProjectionWithClock(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        deadline_ns: ?u64,
+        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
+    ) !CatalogProjectionSnapshot {
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
 
@@ -2646,16 +2659,12 @@ pub const RaftApplyStore = struct {
         else
             null;
 
-        const tables = try self.listTablesTxnUntil(alloc, &txn, group_id, deadline_ns);
+        const tables = try self.listTablesTxnUntil(alloc, &txn, group_id, deadline_ns, deadline_io);
         errdefer self.freeTables(alloc, tables);
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
-        const ranges = try self.listRangesTxnUntil(alloc, &txn, group_id, deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
+        const ranges = try self.listRangesTxnUntil(alloc, &txn, group_id, deadline_ns, deadline_io);
         errdefer self.freeRanges(alloc, ranges);
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         return .{
             .metadata_incarnation = incarnation,
             .catalog_revision = catalog_revision,
@@ -3305,7 +3314,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
     ) ![]metadata.RangeRecord {
-        return try self.listRangesTxnUntil(alloc, txn, group_id, null);
+        return try self.listRangesTxnUntil(alloc, txn, group_id, null, null);
     }
 
     fn listRangesTxnUntil(
@@ -3314,13 +3323,14 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         deadline_ns: ?u64,
+        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
     ) ![]metadata.RangeRecord {
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         var prefix_buf: [128]u8 = undefined;
         const prefix = try rangePrefixForGroup(&prefix_buf, group_id);
         const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
         defer freeKvs(alloc, kvs);
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         const out = try alloc.alloc(metadata.RangeRecord, kvs.len);
         var filled: usize = 0;
         errdefer {
@@ -3328,11 +3338,11 @@ pub const RaftApplyStore = struct {
             alloc.free(out);
         }
         for (kvs, 0..) |kv, i| {
-            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns);
+            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns, deadline_io);
             out[i] = try decodeRangeRecord(alloc, kv.value);
             filled = i + 1;
         }
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         return out;
     }
 
@@ -11585,6 +11595,20 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
         ),
     );
 
+    // Projection scans must retain the caller's clock across every page.
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer vopr_io.deinit();
+    const clock = @import("../../runtime_io_abi.zig").Borrow.init(&vopr_io.io());
+    const deadline = 8 * std.time.ns_per_s;
+    {
+        const snapshot = try store.captureCatalogProjectionWithClock(std.testing.allocator, 41, deadline, clock);
+        defer store.freeTables(std.testing.allocator, snapshot.tables);
+        defer store.freeRanges(std.testing.allocator, snapshot.ranges);
+        try std.testing.expectEqual(@as(u64, 4), snapshot.catalog_revision);
+    }
+    vopr_io.monotonic_ns = deadline;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.captureCatalogProjectionWithClock(std.testing.allocator, 41, deadline, clock));
+
     const io = store.io_impl.io();
     store.apply_mutex.lockUncancelable(io);
     {
@@ -13210,7 +13234,11 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
     );
 
     var dispatch = Dispatch{ .store = &store };
-    var dispatch_thread = try std.Thread.spawn(.{}, Dispatch.run, .{&dispatch});
+    var dispatch_thread = try std.testing.io.concurrent(Dispatch.run, .{&dispatch});
+    defer {
+        owned.release.set(std.Options.debug_io);
+        dispatch_thread.await(std.testing.io);
+    }
     owned.entered.waitUncancelable(std.Options.debug_io);
 
     var detach = Detach{ .store = &store, .registration = registration };
@@ -13223,7 +13251,12 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
         .contended = &detach_lock_contended,
     };
     defer test_lifecycle_detach_lock_barrier = null;
-    var detach_thread = try std.Thread.spawn(.{}, Detach.run, .{&detach});
+    var detach_thread = try std.testing.io.concurrent(Detach.run, .{&detach});
+    defer {
+        detach_lock_resume.set(std.Options.debug_io);
+        owned.release.set(std.Options.debug_io);
+        detach_thread.await(std.testing.io);
+    }
     detach.started.waitUncancelable(std.Options.debug_io);
     detach_lock_entered.waitUncancelable(std.Options.debug_io);
     // The detach call reached the exact apply-lock boundary while the callback
@@ -13233,8 +13266,8 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
     const apply_lock_was_contended = detach_lock_contended.load(.acquire);
     detach_lock_resume.set(std.Options.debug_io);
     owned.release.set(std.Options.debug_io);
-    dispatch_thread.join();
-    detach_thread.join();
+    dispatch_thread.await(std.testing.io);
+    detach_thread.await(std.testing.io);
     try std.testing.expect(blocked_at_lock_boundary);
     try std.testing.expect(apply_lock_was_contended);
     try std.testing.expect(detach.removed);

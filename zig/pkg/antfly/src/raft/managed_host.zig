@@ -568,6 +568,10 @@ pub const ManagedHttpHost = struct {
         self.http_host.stop();
     }
 
+    pub fn beginTransportShutdown(self: *ManagedHttpHost) void {
+        self.http_host.beginTransportShutdown();
+    }
+
     pub fn baseUri(self: *ManagedHttpHost, alloc: std.mem.Allocator) ![]u8 {
         return try self.http_host.baseUri(alloc);
     }
@@ -937,6 +941,7 @@ fn prepareHostDeps(
             owned_store.* = try data_storage.RaftApplyStore.init(alloc, .{
                 .root_dir = replica_root_dir,
                 .no_sync = replica_apply_store_no_sync,
+                .io = if (backend_runtime) |runtime| runtime.apiIo() else null,
                 .backend_runtime = backend_runtime,
             });
             prepared.owned_data_store = owned_store;

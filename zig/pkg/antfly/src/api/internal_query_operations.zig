@@ -248,7 +248,7 @@ pub fn planSemanticQuery(
             };
             const cache = planning.query_embedding_cache orelse
                 break :blk try TemplateQueryComputeContext.run(&compute_context, alloc);
-            break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, TemplateQueryComputeContext.run);
+            break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, TemplateQueryComputeContext.run);
         } else blk: {
             var compute_context = DenseQueryComputeContext{
                 .runtime = &runtime,
@@ -258,12 +258,12 @@ pub fn planSemanticQuery(
             const cache = planning.query_embedding_cache orelse
                 break :blk try DenseQueryComputeContext.run(&compute_context, alloc);
             const budget = planning.query_embedding_budget orelse
-                break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+                break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run);
             const key = runtime.queryCacheKey(index_name, planning.query_embedding_security_domain, planning.query_embedding_security_scope, semantic_search) catch |err| switch (err) {
-                error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run),
+                error.QueryEmbeddingNotCacheable => break :blk try cache.computeUncached(alloc, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run),
                 else => return err,
             };
-            break :blk try cache.getOrCompute(budget, alloc, key, embedding_deadline_ns, &compute_context, DenseQueryComputeContext.run);
+            break :blk try cache.getOrCompute(budget, alloc, key, cache.deadlineFromNative(embedding_deadline_ns), &compute_context, DenseQueryComputeContext.run);
         },
         .k = limit,
     };

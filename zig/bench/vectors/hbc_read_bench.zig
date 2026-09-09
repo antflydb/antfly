@@ -223,7 +223,6 @@ const StorageHarness = struct {
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,
         .now_ns = CountingStorage.nowNs,
-        .rename_is_atomic = true,
     };
 
     allocator: Allocator,

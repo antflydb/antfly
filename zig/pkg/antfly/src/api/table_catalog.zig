@@ -25,12 +25,14 @@ const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const tables_api = @import("tables.zig");
+const runtime_io_abi = @import("../runtime_io_abi.zig");
 
 /// One absolute monotonic budget shared by snapshot capture and all CPU-side
 /// routing work that follows it. The periodic checkpoint keeps large catalog
 /// scans interruptible without putting a clock read on every range.
 pub const RoutingBudget = struct {
     deadline_ns: ?u64 = null,
+    io: ?runtime_io_abi.Borrow = null,
 
     const checkpoint_stride: usize = 64;
 
@@ -38,9 +40,44 @@ pub const RoutingBudget = struct {
         return .{ .deadline_ns = deadline_ns };
     }
 
+    pub fn initIo(deadline_ns: ?u64, io: ?std.Io) RoutingBudget {
+        return .{ .deadline_ns = deadline_ns, .io = if (io) |value| runtime_io_abi.Borrow.init(&value) else null };
+    }
+
+    pub fn nowNs(self: RoutingBudget) u64 {
+        const borrow = self.io orelse return platform_time.monotonicNs();
+        var receiver = borrow.receive() catch @panic("incompatible routing clock ABI");
+        return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+    }
+
+    /// Translate a deadline into this budget's clock without extending it.
+    /// Threaded .awake and native MONOTONIC have different epochs on Darwin.
+    pub fn deadlineFrom(self: RoutingBudget, source: RoutingBudget) ?u64 {
+        const deadline = source.deadline_ns orelse return null;
+        if (self.io) |target| {
+            if (source.io) |origin| {
+                if (target.userdata == origin.userdata and target.vtable == origin.vtable and target.dispatch == origin.dispatch)
+                    return deadline;
+            }
+        } else if (source.io == null) return deadline;
+        // Sample the destination first so time spent translating cannot
+        // extend the caller's budget. Expired budgets remain expired.
+        const target_now = self.nowNs();
+        return target_now +| (deadline -| source.nowNs());
+    }
+
+    pub fn sleepNs(self: RoutingBudget, duration_ns: u64) !void {
+        if (self.io) |borrow| {
+            var receiver = try borrow.receive();
+            try receiver.io().sleep(.fromNanoseconds(duration_ns), .awake);
+        } else {
+            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), duration_ns / std.time.ns_per_ms));
+        }
+    }
+
     pub fn checkpoint(self: RoutingBudget) !void {
         if (self.deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (self.nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
     }
 
@@ -68,6 +105,24 @@ fn cloneGroupIdsUntil(
 pub const CatalogSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Authority for process-local routing deadlines, propagated through
+    /// request-scoped projections as well as remote capture and retries.
+    io: ?runtime_io_abi.Borrow = null,
+
+    pub fn budget(self: CatalogSource, deadline_ns: ?u64) RoutingBudget {
+        return .{ .deadline_ns = deadline_ns, .io = self.io };
+    }
+
+    /// Routing deadlines belong to this catalog, not necessarily to the
+    /// request executor. Preserve remaining time when crossing clock domains.
+    /// In particular, Threaded .awake and native MONOTONIC differ on Darwin.
+    pub fn deadlineFrom(self: CatalogSource, source: RoutingBudget) ?u64 {
+        return self.budget(null).deadlineFrom(source);
+    }
+
+    pub fn routeFenceDeadline(self: CatalogSource, fence: metadata_api.CatalogRouteFence) ?u64 {
+        return self.deadlineFrom(.{ .deadline_ns = fence.admission_deadline_ns, .io = fence.admission_deadline_io });
+    }
 
     pub const VTable = struct {
         /// Snapshot slices and all transitively referenced bytes must remain
@@ -152,6 +207,7 @@ pub const CatalogSource = struct {
                 .wait_for_change = self.vtable.wait_for_routing_change,
                 .await_route = self.vtable.await_route,
             },
+            .io = self.io,
         };
     }
 
@@ -260,6 +316,7 @@ pub const CatalogRouteAuthority = struct {
 };
 
 pub const CatalogRoutingSource = struct {
+    io: ?runtime_io_abi.Borrow = null,
     projection: CatalogProjectionSource,
     authority: CatalogRouteAuthority,
 
@@ -280,6 +337,13 @@ pub const CatalogRoutingSource = struct {
         deadline_ns: u64,
         probe_interval_ns: u64,
     ) !CatalogChangeWaitResult {
+        if (self.authority.wait_for_change == &defaultWaitForRoutingChange) {
+            const budget = RoutingBudget{ .io = self.io };
+            const now_ns = budget.nowNs();
+            if (now_ns < deadline_ns)
+                try budget.sleepNs(@min(deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms)));
+            return .retry;
+        }
         return try self.authority.wait_for_change(self.authority.ptr, observed_token, deadline_ns, probe_interval_ns);
     }
 };
@@ -318,7 +382,7 @@ pub const RoutingSession = struct {
         deadline_ns: ?u64,
     ) !RoutingSession {
         const routing = try base.routingSource();
-        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, RoutingBudget.init(deadline_ns));
+        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, base.budget(deadline_ns));
     }
 
     /// Use the cached/eventual projection for positive routes. Misses are
@@ -330,7 +394,7 @@ pub const RoutingSession = struct {
         query: RouteQuery,
         deadline_ns: ?u64,
     ) !RoutingSession {
-        const budget = RoutingBudget.init(deadline_ns);
+        const budget = base.budget(deadline_ns);
         try budget.checkpoint();
         const routing = try base.routingSource();
         var snapshot = try routing.eventualSnapshot(deadline_ns);
@@ -454,7 +518,7 @@ pub const RoutingSession = struct {
     }
 
     pub fn catalog(self: *RoutingSession) CatalogSource {
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{ .ptr = self, .vtable = &vtable, .io = self.base.io };
     }
 
     const vtable: CatalogSource.VTable = .{
@@ -486,11 +550,9 @@ pub const RoutingSession = struct {
     }
 
     fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
         const self = cast(ptr);
-        return try cloneRoutingSnapshot(self.alloc, self.snapshot.value, deadline_ns);
+        try self.base.budget(deadline_ns).checkpoint();
+        return try cloneRoutingSnapshot(self.alloc, self.snapshot.value, self.base.budget(deadline_ns));
     }
 
     fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -566,9 +628,9 @@ pub const RoutingSession = struct {
     ) !RouteResult {
         const self = cast(ptr);
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return .timed_out;
+            if (self.base.budget(deadline_ns).nowNs() >= deadline) return .timed_out;
         }
-        const budget = RoutingBudget.init(deadline_ns);
+        const budget = self.base.budget(deadline_ns);
         const resolved = routePlanFromSnapshotWithBudget(alloc, self.snapshot.value, table_name, query, budget) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout => return .timed_out,
             else => return err,
@@ -618,9 +680,8 @@ pub const RoutingSession = struct {
 fn cloneRoutingSnapshot(
     alloc: std.mem.Allocator,
     source: metadata_api.CatalogRoutingSnapshot,
-    deadline_ns: ?u64,
+    budget: RoutingBudget,
 ) !metadata_api.CatalogRoutingSnapshot {
-    const budget = RoutingBudget.init(deadline_ns);
     try budget.checkpoint();
     const tables = try alloc.alloc(metadata_table_manager.TableRecord, source.tables.len);
     var table_count: usize = 0;
@@ -939,7 +1000,7 @@ pub fn routedGroupsSnapshotUntil(
     group_ids: []const u64,
     deadline_ns: ?u64,
 ) !RoutedSpanSnapshot {
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = catalog.budget(deadline_ns);
     try budget.checkpoint();
     if (catalog.vtable.route_fence) |route_fence| {
         const route_identity = catalog.vtable.route_identity;
@@ -1846,7 +1907,7 @@ pub fn resolveGroupsForSpanUntil(
     to_key: []const u8,
     deadline_ns: ?u64,
 ) ![]u64 {
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = catalog.budget(deadline_ns);
     return switch (try resolveGroupsForSpanWithDeadline(alloc, try catalog.routingSource(), table_name, from_key, to_key, deadline_ns)) {
         .found => |plan_value| blk: {
             var plan = plan_value;
@@ -1867,7 +1928,7 @@ pub fn resolveGroupsForSpanPinnedUntil(
     expected_epoch: u64,
     deadline_ns: ?u64,
 ) ![]u64 {
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = catalog.budget(deadline_ns);
     var result = try resolveCatalogRoute(alloc, catalog, table_name, .{ .span = .{
         .from_key = from_key,
         .to_key = to_key,
@@ -2077,7 +2138,7 @@ fn resolveRouteObserved(
         else => return err,
     };
     defer eventual.deinit();
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = RoutingBudget{ .deadline_ns = deadline_ns, .io = routing.io };
     const eventual_plan = routePlanFromSnapshotWithBudget(alloc, eventual.value, table_name, query, budget) catch |err| switch (err) {
         error.CatalogRoutingSnapshotTimeout => return .timed_out,
         else => return err,
@@ -2123,7 +2184,7 @@ pub fn awaitRoute(
         );
     }
     while (true) {
-        if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
+        if ((RoutingBudget{ .io = routing.io }).nowNs() >= deadline_ns) return .timed_out;
         var resolved = try resolveRouteObserved(alloc, routing, table_name, query, deadline_ns);
         switch (resolved) {
             .found => |plan| {
@@ -2181,7 +2242,7 @@ pub fn routePlanFromSnapshotUntil(
     );
 }
 
-fn routePlanFromSnapshotWithBudget(
+pub fn routePlanFromSnapshotWithBudget(
     alloc: std.mem.Allocator,
     snapshot: metadata_api.CatalogRoutingSnapshot,
     table_name: []const u8,
@@ -2514,7 +2575,7 @@ pub fn routedSpanSnapshotUntil(
     to_key: []const u8,
     deadline_ns: ?u64,
 ) !RoutedSpanSnapshot {
-    const budget = RoutingBudget.init(deadline_ns);
+    const budget = catalog.budget(deadline_ns);
     var result = try resolveCatalogRoute(alloc, catalog, table_name, .{ .span = .{
         .from_key = from_key,
         .to_key = to_key,
@@ -2552,7 +2613,7 @@ pub fn resolveGroupsForSpanEventually(
     timeout_ns: u64,
     poll_interval_ms: u64,
 ) !ResolveGroupsResult {
-    const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+    const deadline_ns = catalog.budget(null).nowNs() +| timeout_ns;
     return try resolveGroupsForSpanEventuallyUntil(
         alloc,
         catalog,

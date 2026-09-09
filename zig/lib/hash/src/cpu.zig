@@ -128,30 +128,30 @@ test "CPU feature cache is safe during concurrent first use" {
     if (builtin.single_threaded) return error.SkipZigTest;
     const Worker = struct {
         cache: *std.atomic.Value(u8),
-        start: *std.atomic.Value(bool),
+        start: *std.Io.Event,
         observed: Features = .{},
 
         fn run(self: *@This()) void {
-            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.start.waitUncancelable(std.testing.io);
             self.observed = featuresCached(self.cache);
         }
     };
     var cache = std.atomic.Value(u8).init(0);
-    var start = std.atomic.Value(bool).init(false);
+    var start: std.Io.Event = .unset;
     var workers: [8]Worker = undefined;
-    var threads: [8]std.Thread = undefined;
+    var tasks: [8]std.Io.Future(void) = undefined;
     var started: usize = 0;
     errdefer {
-        start.store(true, .release);
-        for (threads[0..started]) |thread| thread.join();
+        start.set(std.testing.io);
+        for (tasks[0..started]) |*task| task.await(std.testing.io);
     }
-    for (&workers, &threads) |*worker, *thread| {
+    for (&workers, &tasks) |*worker, *task| {
         worker.* = .{ .cache = &cache, .start = &start };
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        task.* = try std.testing.io.concurrent(Worker.run, .{worker});
         started += 1;
     }
-    start.store(true, .release);
-    for (threads) |thread| thread.join();
+    start.set(std.testing.io);
+    for (&tasks) |*task| task.await(std.testing.io);
     started = 0;
     const expected = detect();
     for (workers) |worker| try std.testing.expectEqual(expected, worker.observed);

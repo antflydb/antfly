@@ -152,7 +152,7 @@ Current classification:
 - `metadata/server.zig` median-key lookup: routed `HostedShardDbAdapter` first.
   Local routes dynamically prefer the data server's live adapter when
   registered and otherwise fall back to a direct local DB adapter.
-- `metadata/sim_harness.zig` median-key lookup: simulation-only direct DB open.
+- `metadata/vopr_harness.zig` median-key lookup: simulation-only direct DB open.
   It should stay explicit about runtime mode and can later reuse a simulation
   `ShardDbAdapter` if the test harness grows one.
 - `api/table_reads.zig`, `api/table_writes.zig`, and

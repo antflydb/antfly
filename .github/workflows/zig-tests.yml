@@ -348,10 +348,10 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
-      - name: Compile HBC storage benchmark contracts
+      - name: Compile consolidated storage benchmark contracts
         if: needs.changes.outputs.zig_tests == 'true'
         working-directory: zig
-        run: zig build hbc-read-bench-build
+        run: zig build antfly-storage-bench-build -Doptimize=Debug
 
       - name: Test bounded-build tooling
         working-directory: zig
@@ -720,12 +720,12 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: "true"
         run: scripts/ci/zig-tla-verify.sh
 
-      - name: Run Zig simulation tests
+      - name: Run Zig VOPR tests
         working-directory: zig
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          antfly-sim-test
+          vopr-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 

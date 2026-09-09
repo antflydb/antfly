@@ -27136,7 +27136,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
                 defer self.alloc.free(key);
                 if (i == 1023) {
                     self.reached_checkpoint.store(true, .release);
-                    while (!self.release_checkpoint.load(.acquire)) std.Thread.yield() catch {};
+                    while (!self.release_checkpoint.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
                 if (try callback(scan_ctx, key, "{}") == .stop) return;
             }
@@ -27170,11 +27170,11 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
     var harness = Harness{ .alloc = std.heap.page_allocator };
     var cancellation = std.atomic.Value(bool).init(false);
     var worker = Worker{ .harness = &harness, .cancellation = &cancellation };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
     var joined = false;
     defer if (!joined) {
         harness.release_checkpoint.store(true, .release);
-        thread.join();
+        thread.await(std.testing.io);
     };
 
     var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -27186,7 +27186,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
     try std.testing.expect(harness.reached_checkpoint.load(.acquire));
     cancellation.store(true, .release);
     harness.release_checkpoint.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
     try std.testing.expect(worker.observed_cancel.load(.acquire));
 }

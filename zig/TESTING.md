@@ -54,9 +54,10 @@ zig build antfly-test
 `antfly-test` includes:
 
 - `antfly-unit-test`
-- `antfly-sim-test`
+- `vopr-test`
 - `antfly-integration-test`
-- `antfly-recall-test` (the default recall harness over `testdata/vectorsets`)
+- `antfly-recall-test`
+- the default recall harness over `testdata/vectorsets`
 - `antfly-chaos-test`
 
 Run only the inference package tests:
@@ -106,10 +107,10 @@ The aggregate Make targets reserve 20% memory headroom and use the patched Zig
 From the `zig/` directory, the equivalent targets are `make test` and
 `make unit-test`.
 
-Run mocked-time and modeled simulation checks:
+Run fast deterministic VOPR checks, including production HTTP on `VoprIo`:
 
 ```sh
-zig build antfly-sim-test
+zig build vopr-test
 ```
 
 Run focused real HTTP and public API integration checks:

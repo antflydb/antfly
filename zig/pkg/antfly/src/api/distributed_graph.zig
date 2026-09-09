@@ -54,11 +54,77 @@ const query_contract = @import("query_contract.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const tables_api = @import("tables.zig");
 
+/// Production-neutral semantic boundaries in a distributed graph request.
+/// Callers may use these to observe or suspend a request without coupling the
+/// query engine to a particular scheduler or test harness. Hooks run only
+/// after an owned intermediate result is internally consistent and hold no
+/// catalog or database lease.
+pub const LifecyclePhase = enum {
+    source_snapshot_acquired,
+    snapshot_validated,
+    expand_round_completed,
+    target_authorization_started,
+    hydration_started,
+    hydration_fanout_started,
+    hydration_completed,
+    attempt_failed,
+};
+
+pub const LifecycleEvent = struct {
+    phase: LifecyclePhase,
+    query_name: []const u8 = "",
+    depth: u32 = 0,
+    group_count: usize = 0,
+    result_count: usize = 0,
+    attempt: u32 = 0,
+    error_code: u16 = 0,
+    /// Borrowed for the synchronous hook call only.
+    table_name: []const u8 = "",
+    /// Borrowed for the synchronous hook call only. Lifecycle hooks may use
+    /// it to park at a lease-free boundary until request cancellation is
+    /// visible, but must not retain it.
+    cancellation: ?CancellationToken = null,
+};
+
+pub const LifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: LifecycleEvent) void,
+
+    pub fn reach(self: LifecycleHook, event: LifecycleEvent) void {
+        self.reach_fn(self.ptr, event);
+    }
+};
+
+/// Production-neutral logical work boundary for routed graph operations.
+/// Deterministic runtimes can model reversible per-owner service rates without
+/// making the graph coordinator depend on VOPR. Native runtimes leave this
+/// unset and retain their ordinary request behavior.
+pub const WorkKind = enum {
+    expand,
+    hydrate,
+    get_edges,
+};
+
+pub const WorkCostPort = struct {
+    ptr: *anyopaque,
+    charge_fn: *const fn (ptr: *anyopaque, group_id: u64, kind: WorkKind, units: u64) anyerror!void,
+
+    /// Parallel fanout may call this concurrently. Implementations that are
+    /// not scheduler-confined must synchronize their own accounting and
+    /// reversible effect state.
+    pub fn charge(self: WorkCostPort, group_id: u64, kind: WorkKind, units: u64) !void {
+        try self.charge_fn(self.ptr, group_id, kind, units);
+    }
+};
+
 pub const Worker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Absolute deadline in the worker's fanout clock (native when absent).
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+    lifecycle_hook: ?LifecycleHook = null,
+    work_cost_port: ?WorkCostPort = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -111,6 +177,8 @@ pub const Worker = struct {
         consistency: raft_mod.ReadConsistency,
     ) !GraphExpandResponse {
         try self.ensureActive();
+        if (self.work_cost_port) |port| try port.charge(group_id, .expand, req.frontier.len);
+        try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
@@ -128,6 +196,8 @@ pub const Worker = struct {
         req: GraphHydrateRequest,
         consistency: raft_mod.ReadConsistency,
     ) !GraphHydrateResponse {
+        try self.ensureActive();
+        if (self.work_cost_port) |port| try port.charge(group_id, .hydrate, req.keys.len);
         try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
@@ -148,6 +218,8 @@ pub const Worker = struct {
     ) !GraphEdgesResponse {
         try self.ensureActive();
         const func = self.vtable.execute_graph_get_edges orelse return error.UnsupportedQueryRequest;
+        if (self.work_cost_port) |port| try port.charge(group_id, .get_edges, 1);
+        try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
@@ -196,24 +268,76 @@ pub const Worker = struct {
         return func(self.ptr);
     }
 
+    pub fn reachLifecycle(self: Worker, event: LifecycleEvent) void {
+        if (self.lifecycle_hook) |hook| hook.reach(event);
+    }
+
+    fn monotonicNs(self: Worker) u64 {
+        if (self.fanoutIo()) |io| {
+            return @intCast(std.Io.Clock.now(.awake, io).nanoseconds);
+        }
+        return platform_time.monotonicNs();
+    }
+
+    fn budget(self: Worker) table_catalog.RoutingBudget {
+        return .initIo(self.execution_deadline_ns, self.fanoutIo());
+    }
+
+    fn routingDeadline(self: Worker, catalog: table_catalog.CatalogSource) ?u64 {
+        return catalog.deadlineFrom(self.budget());
+    }
+
     fn ensureActive(self: Worker) !void {
         if (self.cancellation) |value| {
             if (value.isCancelled()) return error.Cancelled;
         }
         if (self.execution_deadline_ns) |deadline_ns| {
-            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            if (self.monotonicNs() >= deadline_ns) return error.Timeout;
         }
     }
 
     fn remainingTimeoutMs(self: Worker) !?u32 {
         const deadline_ns = self.execution_deadline_ns orelse return null;
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.monotonicNs();
         if (now_ns >= deadline_ns) return error.Timeout;
         const remaining_ns = deadline_ns - now_ns;
         const rounded_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
         return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
     }
 };
+
+test "distributed graph translates native worker and catalog deadline boundaries" {
+    const Runtime = struct {
+        fn io(ptr: *anyopaque) ?std.Io {
+            return @as(*@import("vopr").vopr_io.VoprIo, @ptrCast(@alignCast(ptr))).io();
+        }
+    };
+    var runtime = try @import("vopr").vopr_io.VoprIo.init(.{
+        .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * std.time.ns_per_s),
+    });
+    defer runtime.deinit();
+    var worker = Worker{ .ptr = &runtime, .vtable = &.{
+        .execute_graph_expand = undefined,
+        .execute_graph_hydrate = undefined,
+        .fanout_io = Runtime.io,
+    } };
+    worker.execution_deadline_ns = worker.budget().deadlineFrom(.init(platform_time.monotonicNs() + std.time.ns_per_s));
+    try worker.ensureActive();
+    var catalog_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 17 * std.time.ns_per_s });
+    defer catalog_io.deinit();
+    const catalog = table_catalog.CatalogSource{
+        .ptr = undefined,
+        .vtable = undefined,
+        .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog_io.io()),
+    };
+    const routed_deadline = worker.routingDeadline(catalog).?;
+    try std.testing.expect(routed_deadline > 17 * std.time.ns_per_s);
+    try std.testing.expect(routed_deadline <= 18 * std.time.ns_per_s);
+    try catalog.budget(routed_deadline).checkpoint();
+    runtime.monotonic_ns += std.time.ns_per_s;
+    try std.testing.expectError(error.Timeout, worker.ensureActive());
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(worker.routingDeadline(catalog)).checkpoint());
+}
 
 pub const IncomingSourceGroupsRequest = struct {
     index_name: []const u8,
@@ -1922,9 +2046,13 @@ pub fn executeCrossRange(
     // refresh routing. Preserve their single bounded retry here. Production
     // table reads use executeCrossRangeWithMatchAnchors and own the retry so a
     // fresh attempt also refreshes the base scan and MATCH anchor snapshots.
+    worker.reachLifecycle(.{
+        .phase = .source_snapshot_acquired,
+        .group_count = base_result.shard_identity_read_generations.len,
+    });
     var attempts: u32 = 0;
     while (true) : (attempts += 1) {
-        return executeCrossRangeWithMatchAnchors(
+        return executeCrossRangeWithMatchAnchorsLifecycle(
             alloc,
             catalog,
             worker,
@@ -1933,6 +2061,7 @@ pub fn executeCrossRange(
             base_result,
             if (requiresCompleteMatchAnchors(req)) MatchAnchorSource{ .materialized = base_result } else null,
             consistency,
+            false,
         ) catch |err| switch (err) {
             error.TopologyChanged => {
                 if (attempts == 0) continue;
@@ -1953,6 +2082,30 @@ pub fn executeCrossRangeWithMatchAnchors(
     match_anchor_source: ?MatchAnchorSource,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
+    return executeCrossRangeWithMatchAnchorsLifecycle(
+        alloc,
+        catalog,
+        worker,
+        table_name,
+        req,
+        base_result,
+        match_anchor_source,
+        consistency,
+        true,
+    );
+}
+
+fn executeCrossRangeWithMatchAnchorsLifecycle(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: Worker,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    base_result: db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
+    consistency: raft_mod.ReadConsistency,
+    emit_source_snapshot: bool,
+) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try requireStampedCrossRangeRequest(req, base_result);
     try rejectUnstampedResultRefs(req, base_result);
@@ -1968,17 +2121,27 @@ pub fn executeCrossRangeWithMatchAnchors(
     };
 
     var request_worker = worker;
-    request_worker.execution_deadline_ns = req.execution_deadline_ns;
+    request_worker.execution_deadline_ns = worker.budget().deadlineFrom(.{ .deadline_ns = req.execution_deadline_ns });
     request_worker.cancellation = req.cancellation;
     try request_worker.ensureActive();
+    if (emit_source_snapshot) request_worker.reachLifecycle(.{
+        .phase = .source_snapshot_acquired,
+        .group_count = base_result.shard_identity_read_generations.len,
+    });
 
-    try request_worker.ensureActive();
-    return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_source, consistency) catch |err| switch (err) {
-        // UnknownGroup is topology churn from the coordinator's perspective.
-        // Let the outer table-read attempt refresh the complete routing and
-        // snapshot state instead of retrying expensive graph work in place.
-        error.UnknownGroup => error.TopologyChanged,
-        else => err,
+    return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_source, consistency) catch |err| {
+        request_worker.reachLifecycle(.{
+            .phase = .attempt_failed,
+            .error_code = @intFromError(err),
+        });
+        return switch (err) {
+            // UnknownGroup is topology churn from the coordinator's
+            // perspective. Let the outer table-read attempt refresh the
+            // complete routing and snapshot state instead of retrying
+            // expensive graph work in place.
+            error.UnknownGroup => error.TopologyChanged,
+            else => err,
+        };
     };
 }
 
@@ -2000,11 +2163,15 @@ fn executeCrossRangeOnce(
     // existing range + generation checks below to validate an unstamped
     // standalone catalog without weakening cross-shard snapshot fencing.
     try table_catalog.validateDocIdentityReadyForTable(alloc, catalog, table_name);
-    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result, worker.execution_deadline_ns);
+    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result, worker.routingDeadline(catalog));
     if (match_anchor_source) |source| switch (source) {
-        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors, worker.execution_deadline_ns),
+        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors, worker.routingDeadline(catalog)),
         .paged => {},
     };
+    worker.reachLifecycle(.{
+        .phase = .snapshot_validated,
+        .group_count = base_result.shard_identity_read_generations.len,
+    });
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
     const sorted_query_indexes = try graph_exec.sortGraphQueriesByDependencies(alloc, req.graph_queries);
@@ -2374,15 +2541,19 @@ const GraphNodeAdmissionContext = struct {
                 exclusion_query_json_live = true;
             }
         } else {
+            self.worker.reachLifecycle(.{
+                .phase = .target_authorization_started,
+                .table_name = table_name,
+            });
             var authorization = if (self.table_authorizer) |authorizer|
                 try authorizer.authorize(self.alloc, table_name)
             else
                 db_mod.types.GraphTableReadAuthorization{ .allowed = true };
             defer authorization.deinit(self.alloc);
             const exists = authorization.allowed and
-                try table_catalog.tableExistsUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns);
+                try table_catalog.tableExistsUntil(self.alloc, self.catalog, table_name, self.worker.routingDeadline(self.catalog));
             topology_epoch = if (exists)
-                try table_catalog.topologyEpochUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns)
+                try table_catalog.topologyEpochUntil(self.alloc, self.catalog, table_name, self.worker.routingDeadline(self.catalog))
             else
                 0;
             allowed = exists;
@@ -2759,7 +2930,7 @@ fn executeSingleCrossRange(
     request_work_budget: *graph_pattern_mod.WorkBudget,
     request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
-    const topology_epoch = try table_catalog.topologyEpochUntil(alloc, catalog, table_name, worker.execution_deadline_ns);
+    const topology_epoch = try table_catalog.topologyEpochUntil(alloc, catalog, table_name, worker.routingDeadline(catalog));
     const admission_req = graphNodeAdmissionRequest(req, graph_query);
     var admission = GraphNodeAdmissionContext.init(
         alloc,
@@ -2938,7 +3109,7 @@ const DistributedEdgeReader = struct {
             table_name,
             key,
             table_state.topology_epoch,
-            self.worker.execution_deadline_ns,
+            self.worker.routingDeadline(self.catalog),
         )) orelse return error.TableNotFound;
 
         // Outgoing adjacency is colocated with its source and needs one routed
@@ -2977,7 +3148,7 @@ const DistributedEdgeReader = struct {
             "",
             "",
             table_state.topology_epoch,
-            self.worker.execution_deadline_ns,
+            self.worker.routingDeadline(self.catalog),
         );
         defer if (group_ids.len > 0) a.free(group_ids);
         if (group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
@@ -3633,7 +3804,7 @@ fn executeDistributedConjunctivePattern(
             edge_reader.catalog,
             edge_reader.source_table,
             page,
-            edge_reader.worker.execution_deadline_ns,
+            edge_reader.worker.routingDeadline(edge_reader.catalog),
         );
         try validateMatchingSourceSnapshots(base_result, page);
         try validateMatchAnchorPageOrder(cursor_key, page.hits);
@@ -4012,6 +4183,8 @@ fn executeDistributedTraverse(
     }
 
     while (frontier.len > 0 and state.nodes.items.len < collection_limit) {
+        var completed_depth: u32 = 0;
+        for (frontier) |item| completed_depth = @max(completed_depth, item.depth);
         var next_frontier = std.ArrayListUnmanaged(FrontierState).empty;
         defer {
             for (next_frontier.items) |*item| item.deinit(alloc);
@@ -4316,6 +4489,14 @@ fn executeDistributedTraverse(
             }
         }
 
+        worker.reachLifecycle(.{
+            .phase = .expand_round_completed,
+            .query_name = graph_query.name,
+            .depth = completed_depth +| 1,
+            .group_count = batch_entries.len,
+            .result_count = state.nodes.items.len,
+        });
+
         freeFrontier(alloc, frontier);
         frontier = try next_frontier.toOwnedSlice(alloc);
     }
@@ -4327,7 +4508,15 @@ fn executeDistributedTraverse(
         state.nodes.items.len = public_len;
     }
 
-    const hydrated_hits = if (graphResultHydrationRequested(req, graph_query.query))
+    const hydration_requested = graphResultHydrationRequested(req, graph_query.query);
+    if (hydration_requested) {
+        worker.reachLifecycle(.{
+            .phase = .hydration_started,
+            .query_name = graph_query.name,
+            .result_count = state.nodes.items.len,
+        });
+    }
+    const hydrated_hits = if (hydration_requested)
         try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.include_all_fields, graph_query.query.fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
@@ -4336,6 +4525,13 @@ fn executeDistributedTraverse(
         state.hits,
         hydrated_hits,
     );
+    if (hydration_requested) {
+        worker.reachLifecycle(.{
+            .phase = .hydration_completed,
+            .query_name = graph_query.name,
+            .result_count = state.hits.items.len,
+        });
+    }
 
     const total_hits: u32 = @intCast(state.nodes.items.len);
     const name = state.name;
@@ -5198,7 +5394,7 @@ fn findDistributedShortestPath(
             expansion_table,
             item.key,
             table_state.topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         )) orelse return error.TableNotFound;
         const frontier_ids = [_]u32{0};
         // The caller-facing slices and GraphExpandRequest each own one copy of
@@ -5367,7 +5563,7 @@ fn batchFrontierByGroup(
                     table_name,
                     item.key,
                     table_state.topology_epoch,
-                    worker.execution_deadline_ns,
+                    worker.routingDeadline(catalog),
                 )) orelse return error.TableNotFound;
                 try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
             },
@@ -5381,7 +5577,7 @@ fn batchFrontierByGroup(
                         table_name,
                         item.key,
                         table_state.topology_epoch,
-                        worker.execution_deadline_ns,
+                        worker.routingDeadline(catalog),
                     )) orelse return error.TableNotFound;
                     try appendFrontierBatch(alloc, &batches, table_state, owner_group_id, @intCast(i));
                 }
@@ -5407,7 +5603,7 @@ fn batchFrontierByGroup(
             "",
             "",
             table_state.topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         );
         defer if (group_ids.len > 0) alloc.free(group_ids);
         if (group_ids.len == 0) return error.TableNotFound;
@@ -6776,7 +6972,7 @@ fn hydrateHitsForKeys(
             table_name,
             key,
             topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         )) orelse return error.TableNotFound;
         const batch = try batches.getOrPut(alloc, group_id);
         if (!batch.found_existing) batch.value_ptr.* = .empty;
@@ -6897,6 +7093,11 @@ fn hydrateHitsForKeys(
             for (entries[start..end], start..end) |entry, i| {
                 group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, include_all_fields, fields, consistency });
             }
+            worker.reachLifecycle(.{
+                .phase = .hydration_fanout_started,
+                .group_count = end - start,
+                .cancellation = worker.cancellation,
+            });
             group.await(io) catch {};
         }
         recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - fanout_start_ns));
@@ -6975,7 +7176,7 @@ pub fn probeIncomingEdgesForKeys(
         "",
         "",
         topology_epoch,
-        worker.execution_deadline_ns,
+        worker.routingDeadline(catalog),
     );
     defer if (group_ids.len > 0) alloc.free(group_ids);
     if (group_ids.len == 0) return error.TableNotFound;
@@ -7443,6 +7644,26 @@ pub fn parseGraphHydrateResponse(alloc: std.mem.Allocator, body: []const u8) !Gr
             .config_hash = parsed.value.incoming_index_config_hash,
         },
     };
+}
+
+test "graph hydrate response wire flattens index identity" {
+    const alloc = std.testing.allocator;
+    var response = GraphHydrateResponse{
+        .has_incoming = try alloc.dupe(bool, &.{ true, false }),
+        .incoming_index_identity = .{ .incarnation = 41, .config_hash = 99 },
+    };
+    defer response.deinit(alloc);
+
+    const encoded = try encodeGraphHydrateResponse(alloc, response);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_incarnation\":41") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_config_hash\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_identity\"") == null);
+
+    var decoded = try parseGraphHydrateResponse(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, decoded.has_incoming);
+    try std.testing.expect(decoded.incoming_index_identity.eql(response.incoming_index_identity));
 }
 
 fn identityGenerationFromResolvedFilterEnvelope(
@@ -8773,8 +8994,13 @@ test "distributed graph paged execution trusts only source-filtered anchors acro
     );
     defer admission.deinit();
     const edge_reader = DistributedEdgeReader{
-        .catalog = undefined,
-        .worker = undefined,
+        // Paging validates its deadline even when no edge expansion or
+        // routing snapshot is needed. Keep those clock fields initialized.
+        .catalog = .{ .ptr = undefined, .vtable = undefined },
+        .worker = .{ .ptr = undefined, .vtable = &.{
+            .execute_graph_expand = undefined,
+            .execute_graph_hydrate = undefined,
+        } },
         .source_table = "docs",
         .index_name = "graph",
         .consistency = .read_index,
@@ -13546,6 +13772,9 @@ test "distributed graph traverse target nodes filter returned nodes without prun
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -13895,6 +14124,9 @@ test "distributed graph traverse routes cross-table frontier by table generation
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -14098,6 +14330,9 @@ test "distributed graph retries once on topology change and succeeds" {
         phase: u32 = 0,
         expand_calls: u32 = 0,
         hydrate_calls: u32 = 0,
+        lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".fields.len]u32 =
+            .{0} ** @typeInfo(LifecyclePhase).@"enum".fields.len,
+        lifecycle_valid: bool = true,
     };
 
     const FakeCatalog = struct {
@@ -14149,11 +14384,36 @@ test "distributed graph retries once on topology change and succeeds" {
         fn iface(state: *TestState) Worker {
             return .{
                 .ptr = state,
+                .lifecycle_hook = .{ .ptr = state, .reach_fn = reachLifecycle },
                 .vtable = &.{
                     .execute_graph_expand = executeGraphExpand,
                     .execute_graph_hydrate = executeGraphHydrate,
                 },
             };
+        }
+
+        fn reachLifecycle(ptr: *anyopaque, event: LifecycleEvent) void {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.lifecycle_counts[@intFromEnum(event.phase)] += 1;
+            switch (event.phase) {
+                // This fixture deliberately uses the scalar identity stamp,
+                // so it has no per-shard snapshot vector to count.
+                .source_snapshot_acquired => state.lifecycle_valid = state.lifecycle_valid and event.group_count == 0,
+                .snapshot_validated => {},
+                .target_authorization_started => state.lifecycle_valid = state.lifecycle_valid and event.table_name.len > 0,
+                .expand_round_completed => {
+                    state.lifecycle_valid = state.lifecycle_valid and
+                        std.mem.eql(u8, "walk", event.query_name) and
+                        event.depth == 1 and event.result_count == 1;
+                },
+                .hydration_started, .hydration_completed => state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name),
+                // A scheduled fanout batch may contain one group.
+                .hydration_fanout_started => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 0,
+                .attempt_failed => {
+                    state.lifecycle_valid = state.lifecycle_valid and event.attempt == 0 and
+                        event.error_code == @intFromError(error.TopologyChanged);
+                },
+            }
         }
 
         fn executeGraphExpand(
@@ -14264,6 +14524,13 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqualStrings("doc:b", results[0].nodes[0].key);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("doc:b", results[0].hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.source_snapshot_acquired)]);
+    try std.testing.expectEqual(@as(u32, 2), state.lifecycle_counts[@intFromEnum(LifecyclePhase.snapshot_validated)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.attempt_failed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.expand_round_completed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_started)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
+    try std.testing.expect(state.lifecycle_valid);
 }
 
 test "distributed graph stops after single retry on repeated topology churn" {
@@ -14426,6 +14693,9 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }

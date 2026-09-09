@@ -241,6 +241,11 @@ pub const RequestExecutor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Optional clock authority owned by the same runtime as the transport.
+    /// Authentication and retry envelopes use this instead of escaping to the
+    /// host clock when an executor is backed by a simulated or embedded Io.
+    realtime_ns_fn: ?*const fn (ptr: *anyopaque) i128 = null,
+    clock_io: ?@import("../../runtime_io_abi.zig").Borrow = null,
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse,
@@ -259,6 +264,17 @@ pub const RequestExecutor = struct {
         // that does not implement tracking therefore remains safely unknown.
         if (req.delivery_tracker) |tracker| tracker.markUnknown();
         return try BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req });
+    }
+
+    pub fn monotonicNs(self: RequestExecutor) u64 {
+        const borrow = self.clock_io orelse return @import("antfly_platform").time.monotonicNs();
+        var receiver = borrow.receive() catch @panic("incompatible HTTP clock ABI");
+        return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+    }
+
+    pub fn realtimeNs(self: RequestExecutor) ?i128 {
+        const now = self.realtime_ns_fn orelse return null;
+        return now(self.ptr);
     }
 
     pub fn supportsConcurrentRequests(self: RequestExecutor) bool {

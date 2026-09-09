@@ -129,6 +129,10 @@ pub const Slice = enum(u8) {
     /// host-memory envelope.
     dense_vector_block_build_working_set,
     dense_source_payload_state,
+    /// Pending persistent object-range cache writes. The durable bytes use
+    /// the capacity-domain ledger; this slice owns only queued key/payload
+    /// memory until the cache worker completes or drops the write.
+    lake_range_cache_queue,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -164,6 +168,7 @@ pub const Slice = enum(u8) {
             .shard_transition_working_set => "shard_transition.working_set",
             .dense_vector_block_build_working_set => "dense.vector_block_build_working_set",
             .dense_source_payload_state => "dense.source_payload_state",
+            .lake_range_cache_queue => "lake.range_cache_queue",
         };
     }
 };
@@ -365,80 +370,81 @@ pub const Options = struct {
     identity_allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn defaultBudgets() [slice_count]Budget {
-        return .{
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 1024 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
-            // ModelManager owns hardware-aware host/backend limits. These
-            // owner-bridge slices are unlimited by default, while deployments
-            // may set coordinated node budgets through ResourceManager options.
-            .{},
-            .{},
-            .{},
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 },
-        };
+        // Name every slice: additions cannot silently shift another owner's policy.
+        return std.enums.EnumArray(Slice, Budget).init(.{
+            .lsm_block_table_cache = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lsm_compaction_work = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .lsm_table_builder_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lsm_in_memory_state = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .lsm_wal_write_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .lsm_wal_retention = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 1024 * 1024 * 1024 },
+            .lsm_recovery_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .hbc_node_metadata_cache = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .dense_search_working_set = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .dense_apply_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .dense_routing_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .derived_replay_window = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .full_text_pending_segments = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .full_text_build_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .full_text_segment_residency = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .document_extraction_working_set = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .derived_backlog = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
+            .text_merge_buffers = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
+            .algebraic_tensor_accumulators = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .sparse_apply_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lite_native_page_cache = .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 },
+            .lite_native_link_cache = .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 },
+            .lite_docstore_snapshot_cache = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .inference_prompt_cache = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .inference_tokenizer_cache = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            .inference_model_residency = .{},
+            .inference_kv_working_set = .{},
+            .inference_scratch_working_set = .{},
+            .dense_repair_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .shard_transition_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .dense_vector_block_build_working_set = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            .dense_source_payload_state = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 },
+            .lake_range_cache_queue = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+        }).values;
     }
 
     pub fn defaultPolicies() [slice_count]Policy {
-        return .{
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .report },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .defer_background_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-        };
+        // Name every slice: additions cannot silently shift another owner's policy.
+        return std.enums.EnumArray(Slice, Policy).init(.{
+            .lsm_block_table_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lsm_compaction_work = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .lsm_table_builder_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .lsm_in_memory_state = .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
+            .lsm_wal_write_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lsm_wal_retention = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lsm_recovery_working_set = .{ .soft_action = .report, .hard_action = .report },
+            .hbc_node_metadata_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .dense_search_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .dense_apply_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .dense_routing_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .derived_replay_window = .{ .soft_action = .report, .hard_action = .reject_work },
+            .full_text_pending_segments = .{ .soft_action = .defer_background_work, .hard_action = .defer_background_work },
+            .full_text_build_working_set = .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
+            .full_text_segment_residency = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .document_extraction_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .derived_backlog = .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
+            .text_merge_buffers = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .algebraic_tensor_accumulators = .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
+            .sparse_apply_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lite_native_page_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lite_native_link_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lite_docstore_snapshot_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_prompt_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_tokenizer_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_model_residency = .{ .soft_action = .report, .hard_action = .reject_work },
+            .inference_kv_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .inference_scratch_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .dense_repair_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .shard_transition_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .dense_vector_block_build_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .dense_source_payload_state = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lake_range_cache_queue = .{ .soft_action = .report, .hard_action = .reject_work },
+        }).values;
     }
 };
 
@@ -1022,7 +1028,7 @@ pub const ResourceManager = struct {
             if (comptime builtin.os.tag == .freestanding) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
     }
@@ -1477,6 +1483,7 @@ pub const ResourceManager = struct {
             @panic("resource manager deinitialized with active dense search admission");
         self.dense_search_admission_mutex.unlock();
 
+        _ = alloc;
         lockAtomic(&self.reclaimer_mutex);
         for (self.reclaimers.items) |slot| {
             if (slot.identity != 0 or slot.in_flight != 0)
@@ -1497,7 +1504,7 @@ pub const ResourceManager = struct {
             @panic("resource manager deinitialized with live reservations");
         if (self.batch_reservation_identities.count() != 0)
             @panic("resource manager deinitialized with live batch reservations");
-        self.capacity_domains.deinit(alloc);
+        self.capacity_domains.deinit(self.identity_allocator);
         self.capacity_domains = .empty;
         self.reservation_identities.deinit(self.identity_allocator);
         self.reservation_identities = .empty;
@@ -1515,10 +1522,11 @@ pub const ResourceManager = struct {
         observation: CapacityObservation,
         now_ns: u64,
     ) !CapacityReservation {
+        _ = alloc;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
-        const entry = try self.capacity_domains.getOrPut(alloc, domain_id);
+        const entry = try self.capacity_domains.getOrPut(self.identity_allocator, domain_id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
         const domain = entry.value_ptr;
         self.observeCapacityLocked(domain, observation);
@@ -3369,6 +3377,17 @@ test "default tokenizer cache budget is aligned with its resource slice" {
     );
 }
 
+test "default lake range cache queue budget is aligned with its terminal resource slice" {
+    const budgets = Options.defaultBudgets();
+    const policies = Options.defaultPolicies();
+    const index = @intFromEnum(Slice.lake_range_cache_queue);
+    try std.testing.expectEqual(slice_count - 1, index);
+    try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), budgets[index].soft_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), budgets[index].hard_limit_bytes);
+    try std.testing.expectEqual(PressureAction.report, policies[index].soft_action);
+    try std.testing.expectEqual(PressureAction.reject_work, policies[index].hard_action);
+}
+
 test "identity allocation failure rolls back every memory ledger" {
     var identity_storage: [1]u8 = undefined;
     var identity_fba = std.heap.FixedBufferAllocator.init(&identity_storage);
@@ -3463,13 +3482,7 @@ fn cacheBenefitPerByte(sample: HbcCacheBenefitSample, miss_service_ns_per_miss: 
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (comptime builtin.os.tag == .freestanding) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 test "resource manager tracks reservations and releases" {
@@ -3839,6 +3852,19 @@ test "capacity percentage safety floor is capped on large volumes" {
     defer std.testing.allocator.free(domains);
     try std.testing.expectEqual(@as(usize, 1), domains.len);
     try std.testing.expectEqual(@as(u64, 30), domains[0].last_safety_floor_bytes);
+}
+
+test "resource manager owns capacity domains independently of consumer allocator" {
+    var manager = ResourceManager.init(.{
+        .identity_allocator = std.testing.allocator,
+        .disk_safety_floor_bytes = 0,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var reservation = try manager.reserveCapacity(std.heap.page_allocator, 7, 1, .{}, 0);
+    reservation.release();
+    try std.testing.expectEqual(@as(usize, 1), manager.capacityStats().domain_count);
 }
 
 test "capacity reservation revalidation fails closed when available space falls" {

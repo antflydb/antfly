@@ -33,7 +33,24 @@ pub fn sleepNs(ns: u64) void {
 
 pub fn yieldBriefly() void {
     if (comptime builtin.os.tag == .freestanding) return;
-    sleepNs(100_000);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    io.sleep(.fromMicroseconds(100), .awake) catch unreachable;
+}
+
+/// Scheduler handoff for synchronous compatibility APIs with no borrowed Io.
+/// No executor workers are created. Use an owner's Io waits when available;
+/// freestanding callers retain only a processor hint.
+pub fn yieldNow() void {
+    if (comptime builtin.os.tag == .freestanding) {
+        std.atomic.spinLoopHint();
+        return;
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    io.sleep(.zero, .awake) catch unreachable;
 }
 
 pub fn monotonicNs() u64 {
