@@ -16,13 +16,27 @@ class ReleaseLinePolicyTests(unittest.TestCase):
         self.policy = release_lines.load_policy()
 
     def test_active_line_resolves_from_canonical_tags(self) -> None:
-        line = release_lines.resolve_tag("v0.2.1-rc.4", self.policy)
-        self.assertEqual((line.name, line.source_ref), ("0.2", "refs/heads/main"))
-        self.assertEqual(line.trusted_source_refs, ("refs/heads/main",))
+        for tag in ("v0.2.2", "v0.2.2-rc.1"):
+            with self.subTest(tag=tag):
+                line = release_lines.resolve_tag(tag, self.policy)
+                self.assertEqual(
+                    (line.name, line.source_ref), ("0.2", "refs/heads/v0.2.x")
+                )
+                self.assertEqual(
+                    line.trusted_source_refs,
+                    ("refs/heads/main", "refs/heads/v0.2.x"),
+                )
+        for tag in ("v0.3.0", "v0.3.0-rc.1"):
+            with self.subTest(tag=tag):
+                line = release_lines.resolve_tag(tag, self.policy)
+                self.assertEqual(
+                    (line.name, line.source_ref), ("0.3", "refs/heads/main")
+                )
+                self.assertEqual(line.trusted_source_refs, ("refs/heads/main",))
 
     def test_tag_cannot_select_a_different_release_line(self) -> None:
         with self.assertRaisesRegex(SystemExit, "no trusted release line"):
-            release_lines.resolve_tag("v0.3.0-rc.1", self.policy)
+            release_lines.resolve_tag("v0.4.0-rc.1", self.policy)
 
     def test_noncanonical_and_nightly_tags_cannot_select_release_lines(self) -> None:
         for tag in ("v0.2.1-rc4", "v0.0.0-dev.12"):
@@ -47,20 +61,19 @@ class ReleaseLinePolicyTests(unittest.TestCase):
         )
 
     def test_source_handoff_preserves_historical_provenance(self) -> None:
-        policy = copy.deepcopy(self.policy)
-        policy["lines"]["0.2"]["source_ref"] = "refs/heads/v0.2.x"
-        policy["lines"]["0.2"]["trusted_source_refs"].append("refs/heads/v0.2.x")
-        release_lines.validate_policy(policy)
-
-        current = release_lines.resolve_tag("v0.2.2", policy)
+        current = release_lines.resolve_tag("v0.2.2", self.policy)
         self.assertEqual(current.source_ref, "refs/heads/v0.2.x")
-        release_lines.validate_provenance("v0.2.1", "0.2", "refs/heads/main", policy)
-        release_lines.validate_provenance("v0.2.2", "0.2", "refs/heads/v0.2.x", policy)
+        release_lines.validate_provenance(
+            "v0.2.1", "0.2", "refs/heads/main", self.policy
+        )
+        release_lines.validate_provenance(
+            "v0.2.2", "0.2", "refs/heads/v0.2.x", self.policy
+        )
 
     def test_provenance_rejects_wrong_line_or_untrusted_source(self) -> None:
         for line, source_ref in (
             ("0.3", "refs/heads/main"),
-            ("0.2", "refs/heads/v0.2.x"),
+            ("0.2", "refs/heads/v0.3.x"),
         ):
             with (
                 self.subTest(line=line, source_ref=source_ref),
@@ -85,8 +98,8 @@ class ReleaseLinePolicyTests(unittest.TestCase):
     def test_policy_rejects_invalid_or_incomplete_trusted_source_history(self) -> None:
         for trusted_source_refs in (
             [],
-            ["refs/heads/v0.2.x"],
-            ["refs/heads/main", "refs/heads/main"],
+            ["refs/heads/main"],
+            ["refs/heads/v0.2.x", "refs/heads/v0.2.x"],
             ["refs/heads/main", "refs/heads/v0.3.x"],
             ["refs/heads/main", "refs/heads/feature"],
         ):

@@ -29259,10 +29259,57 @@ pub const RuntimeDecl = struct {
     }
 };
 
-/// Emitted when an error occurs during retrieval
+/// Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error.
 pub const SSEError = struct {
-    /// Error message
+    /// Error message or stable machine-readable code.
     @"error": []const u8,
+    /// Human-readable error description.
+    message: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+    /// Whether the failure is temporary and the request may be retried.
+    retryable: ?bool = null,
+    /// Minimum retry delay in milliseconds.
+    retry_after_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "error", "error", false },
+        .{ "message", "message", true },
+        .{ "reason", "reason", true },
+        .{ "retryable", "retryable", true },
+        .{ "retry_after_ms", "retry_after_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.retryable) |value| {
+            try jw.objectField("retryable");
+            try jw.write(value);
+        }
+        if (self.retry_after_ms) |value| {
+            try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// SSE event types emitted by the retrieval agent streaming endpoint

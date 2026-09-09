@@ -2335,14 +2335,16 @@ fn appendDynamicSchemaLessStringTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
-    try appendNamedTextField(alloc, fields, path, text, "standard", false, text_analysis);
+    // Unmapped dynamic strings have the same cross-field search default as
+    // schemaless strings. Explicit mappings are handled before this fallback.
+    try appendNamedTextField(alloc, fields, path, text, "standard", true, text_analysis);
     if (observed_field_analyzers) |collector| {
         try appendObservedFieldAnalyzer(alloc, collector, path, .{
             .field_type = .text,
             .do_index = true,
             .doc_values = false,
             .sortable = false,
-            .include_in_all = false,
+            .include_in_all = true,
             .analyzer = "standard",
         });
     }
@@ -4170,6 +4172,9 @@ test "document mapper records observed dynamic-template field analyzers" {
     defer result.deinit(alloc);
 
     try std.testing.expect(result.segment != null);
+    var reader = try segment_mod.SegmentReader.init(alloc, result.segment.?);
+    defer reader.deinit();
+    try std.testing.expect((try reader.invertedIndex("_all")) == null);
     try std.testing.expectEqual(@as(usize, 2), result.observed_field_analyzers.len);
     try std.testing.expectEqualStrings("meta.body", result.observed_field_analyzers[0].field_name);
     try std.testing.expectEqualStrings("french", result.observed_field_analyzers[0].analyzer_name);
@@ -4640,11 +4645,12 @@ test "document mapper emits default dynamic schema text fields" {
     defer runtime_schema.freeSchema(alloc, schema);
 
     const text_analysis = introducer_mod.TextAnalysisConfig{};
-    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
         .{ .key = "doc:1", .value = "{\"title\":\"Document One\",\"body\":\"alpha benchmark body\",\"status\":\"active\",\"tenant\":\"tenanta\",\"id\":42,\"active\":true}" },
         .{ .key = "doc:2", .value = "{\"title\":\"Document Two\",\"body\":\"beta benchmark body\",\"status\":\"active\",\"tenant\":\"tenanta\",\"id\":42.5,\"active\":false}" },
-    }, text_analysis, schema)).?;
-    defer alloc.free(segment);
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+    const segment = result.segment.?;
 
     var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
     defer reader.deinit();
@@ -4655,6 +4661,14 @@ test "document mapper emits default dynamic schema text fields" {
     try std.testing.expect((try reader.invertedIndex("status.keyword")) != null);
     try std.testing.expect((try reader.invertedIndex("tenant")) != null);
     try std.testing.expect((try reader.invertedIndex("tenant.keyword")) != null);
+
+    var all_index = (try reader.invertedIndex("_all")) orelse return error.TestExpectedEqual;
+    try std.testing.expect(all_index.lookup("alpha") != null);
+    try std.testing.expect(all_index.lookup("document") != null);
+    for (result.observed_field_analyzers) |field| {
+        // Only the analyzed primary field contributes, not its exact copy.
+        try std.testing.expectEqual(!std.mem.endsWith(u8, field.field_name, ".keyword"), field.include_in_all);
+    }
 
     const id_section = (try reader.getSection("id", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var id_values = try typed_dv.TypedDocValuesReader.init(alloc, id_section);

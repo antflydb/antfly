@@ -4830,7 +4830,7 @@ pub const AntflyApiHandler = struct {
                 error.RateLimit => return jsonErrorResponse(ctx, 429, "agent generation rate limited"),
                 error.GenerationCapacityUnavailable => {
                     try ctx.setHeader("Retry-After", "1");
-                    return ctx.status(503).json(.{ .@"error" = "GenerationCapacityUnavailable", .retryable = true, .reason = "inference_capacity" });
+                    return ctx.status(503).json(connections_api.generationCapacityFailure());
                 },
                 error.TableNotFound => {
                     _ = ctx.status(404);

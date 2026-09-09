@@ -9664,12 +9664,12 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             query_boost,
         ),
         .term_query => |term| .{ .term = .{
-            .field = try alloc.dupe(u8, term.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, term.field orelse "_all"),
             .term = try alloc.dupe(u8, term.term),
             .boost = query_boost,
         } },
         .match_query => |match| .{ .match = .{
-            .field = try alloc.dupe(u8, match.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, match.field orelse "_all"),
             .text = try alloc.dupe(u8, match.match),
             .analyzer = if (match.analyzer) |analyzer| try alloc.dupe(u8, analyzer) else null,
             .boost = query_boost,
@@ -9684,7 +9684,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
         .match_phrase_query => |phrase| blk: {
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
             break :blk .{ .match_phrase = .{
-                .field = try alloc.dupe(u8, phrase.field orelse return error.UnsupportedQueryRequest),
+                .field = try alloc.dupe(u8, phrase.field orelse "_all"),
                 .text = try alloc.dupe(u8, phrase.match_phrase),
                 .analyzer = if (phrase.analyzer) |analyzer| try alloc.dupe(u8, analyzer) else null,
                 .max_edits = fuzziness.max_edits,
@@ -9697,7 +9697,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
             const field = try alloc.dupe(
                 u8,
-                phrase.field orelse return error.UnsupportedQueryRequest,
+                phrase.field orelse "_all",
             );
             errdefer alloc.free(field);
             const terms = try cloneFields(alloc, phrase.terms);
@@ -9717,7 +9717,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
             const field = try alloc.dupe(
                 u8,
-                phrase.field orelse return error.UnsupportedQueryRequest,
+                phrase.field orelse "_all",
             );
             errdefer alloc.free(field);
             const terms = try cloneTextMatrixAlloc(alloc, phrase.terms);
@@ -9733,7 +9733,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             const fuzziness = try parseBleveFuzziness(fuzzy.fuzziness, 1);
             const prefix_len = try parseBlevePrefixLength(fuzzy.prefix_length);
             break :blk .{ .fuzzy = .{
-                .field = try alloc.dupe(u8, fuzzy.field orelse return error.UnsupportedQueryRequest),
+                .field = try alloc.dupe(u8, fuzzy.field orelse "_all"),
                 .term = try alloc.dupe(u8, fuzzy.term),
                 .max_edits = fuzziness.max_edits,
                 .prefix_len = prefix_len,
@@ -9742,17 +9742,17 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             } };
         },
         .prefix_query => |prefix| .{ .prefix = .{
-            .field = try alloc.dupe(u8, prefix.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, prefix.field orelse "_all"),
             .prefix = try alloc.dupe(u8, prefix.prefix),
             .boost = query_boost,
         } },
         .wildcard_query => |wildcard| .{ .wildcard = .{
-            .field = try alloc.dupe(u8, wildcard.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, wildcard.field orelse "_all"),
             .pattern = try alloc.dupe(u8, wildcard.wildcard),
             .boost = query_boost,
         } },
         .regexp_query => |regexp| .{ .regexp = .{
-            .field = try alloc.dupe(u8, regexp.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, regexp.field orelse "_all"),
             .pattern = try alloc.dupe(u8, regexp.regexp),
             .boost = query_boost,
         } },
@@ -17720,4 +17720,42 @@ test "api query contract rejects legacy native doc id constraint fields" {
         \\}
     ;
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", old_arrays));
+}
+
+test "api query contract defaults omitted text fields to all" {
+    const alloc = std.testing.allocator;
+    const queries = [_][]const u8{
+        "{\"match\":\"Korean history major events\"}",
+        "{\"match\":\"Korean history\",\"analyzer\":\"standard\"}",
+        "{\"term\":\"korean\"}",
+        "{\"term\":\"korean\",\"fuzziness\":1}",
+        "{\"match_phrase\":\"Korean history\"}",
+        "{\"match_phrase\":\"Korean history\",\"analyzer\":\"standard\"}",
+        "{\"prefix\":\"kore\"}",
+        "{\"wildcard\":\"kor*\"}",
+        "{\"regexp\":\"kor.*\"}",
+        "{\"fuzzy\":\"korean\"}",
+        "{\"terms\":[\"korean\",\"history\"]}",
+        "{\"terms\":[[\"korean\"],[\"history\"]]}",
+    };
+    for (queries) |query| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"full_text_search\":{s}}}", .{query});
+        defer alloc.free(body);
+        var parsed = try parsePublicQueryRequest(alloc, null, "docs", body);
+        defer parsed.deinit(alloc);
+        const text = parsed.req.full_text orelse return error.TestExpectedEqual;
+        const field = switch (text) {
+            .match => |v| v.field,
+            .term => |v| v.field,
+            .match_phrase => |v| v.field,
+            .prefix => |v| v.field,
+            .wildcard => |v| v.field,
+            .regexp => |v| v.field,
+            .fuzzy => |v| v.field,
+            .phrase => |v| v.field,
+            .multi_phrase => |v| v.field,
+            else => return error.TestExpectedEqual,
+        };
+        try std.testing.expectEqualStrings("_all", field);
+    }
 }
