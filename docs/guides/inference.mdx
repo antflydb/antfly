@@ -62,14 +62,24 @@ to start the server; configure the listener with `--host` and `--port`.
 
 Explicit CLI options override config regardless of argument order. Supplying
 one or more `--preload-model` flags replaces the config preload list rather than
-appending to it. A model-count limit of zero disables that limit. When paths are
+appending to it. For an exact match of kind, model reference (including artifact
+variant), and backend, config-only `residency_mode` and `memory_budget_mb`
+policies are retained; unrelated config models are not loaded. Duplicate config
+entries matching the same CLI selection are rejected as ambiguous.
+A model-count limit of zero disables that limit. When paths are
 absent from both CLI and config, the usual environment/home defaults apply.
 Preload entries retain their backend, artifact format/quantization, and optional
 residency/memory-budget choices.
+An unqualified preload name with `format`/`quantization` is expanded to an
+explicit artifact reference (for example, `owner/model:gguf:Q4_K`) before
+resolution. Conflicts between preferences and already-qualified references are
+rejected rather than silently selecting another installed artifact.
 
 This config support is for the next runtime release; v0.2.1 requires explicit
 model CLI flags. The operator continues passing those flags so its fix can be
 released independently of the runtime update.
+Config-only per-model policies require the new runtime; releasing the operator
+does not add those capabilities to v0.2.1.
 
 ## Pulling Models
 

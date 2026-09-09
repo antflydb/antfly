@@ -328,7 +328,72 @@ fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Conf
         try preload_object.put(scratch, "preload", entry.value);
         config.inference.preload = try common_config.parseInferencePreloadModels(alloc, .{ .object = preload_object });
     }
+    for (config.inference.preload) |*model| try normalizeRunPreloadName(alloc, model);
     return config;
+}
+
+fn stripHuggingFacePrefix(name: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, name, "hf:")) name[3..] else name;
+}
+
+// Warming resolves by name, so config artifact preferences must be part of the
+// same reference used by the CLI and registry. Config retains ownership.
+fn normalizeRunPreloadName(alloc: std.mem.Allocator, model: *common_config.Config.InferenceConfig.WarmModelConfig) !void {
+    const name = stripHuggingFacePrefix(model.name);
+    if (model.format != null or model.quantization != null) {
+        if (std.mem.indexOfScalar(u8, name, ':')) |separator| {
+            var selection = std.mem.splitScalar(u8, name[separator + 1 ..], ':');
+            const format = selection.next().?;
+            const quantization = selection.next();
+            if (selection.next() != null) return error.InvalidConfig;
+            if (!validRunArtifactFormat(format)) return error.InvalidConfig;
+            if (model.format) |expected| {
+                if (!std.mem.eql(u8, format, expected)) return error.InvalidConfig;
+            }
+            if (model.quantization) |expected| {
+                if (expected.len == 0 or !std.mem.eql(u8, quantization orelse "", expected)) return error.InvalidConfig;
+            }
+        } else {
+            const format = model.format orelse return error.InvalidConfig;
+            if (!validRunArtifactFormat(format) or name.len == 0) return error.InvalidConfig;
+            const qualified = if (model.quantization) |quantization| blk: {
+                if (quantization.len == 0 or std.mem.indexOfScalar(u8, quantization, ':') != null) return error.InvalidConfig;
+                break :blk try std.fmt.allocPrint(alloc, "{s}:{s}:{s}", .{ name, format, quantization });
+            } else try std.fmt.allocPrint(alloc, "{s}:{s}", .{ name, format });
+            alloc.free(model.name);
+            model.name = qualified;
+            return;
+        }
+    }
+    if (name.len != model.name.len) {
+        const normalized = try alloc.dupe(u8, name);
+        alloc.free(model.name);
+        model.name = normalized;
+    }
+}
+
+fn validRunArtifactFormat(format: []const u8) bool {
+    inline for (.{ "gguf", "onnx", "safetensors", "hybrid" }) |supported| {
+        if (std.mem.eql(u8, format, supported)) return true;
+    }
+    return false;
+}
+
+fn runConfiguredWarmModel(model: common_config.Config.InferenceConfig.WarmModelConfig) !inference.server.WarmModel {
+    if (model.name.len == 0) return error.InvalidConfig;
+    return .{
+        .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidArguments,
+        .name = model.name,
+        .backend = try parseOptionalBackendType(model.backend),
+        .format = model.format,
+        .quantization = model.quantization,
+        .residency_mode = if (model.residency_mode) |mode| switch (mode) {
+            .auto => .auto,
+            .resident => .resident,
+            .streamed => .streamed,
+        } else null,
+        .memory_budget_mb = model.memory_budget_mb,
+    };
 }
 
 const RunModelOverrides = struct {
@@ -363,22 +428,24 @@ fn resolveRunModelSettings(alloc: std.mem.Allocator, config: ?*const common_conf
     errdefer alloc.free(preload);
     if (cli.preload.len > 0) {
         @memcpy(preload, cli.preload);
+        // CLI selects the list; it cannot express per-model memory policies.
+        // Preserve those only for an identical kind/reference/backend from
+        // config, never from an unrelated model or another artifact variant.
+        for (preload) |*warm| {
+            var matched = false;
+            for (cfg.preload) |model| {
+                if (!std.mem.eql(u8, model.name, stripHuggingFacePrefix(warm.name))) continue;
+                const configured = try runConfiguredWarmModel(model);
+                if (configured.kind != warm.kind or configured.backend != warm.backend) continue;
+                if (matched) return error.AmbiguousPreloadModelConfig;
+                matched = true;
+                warm.residency_mode = warm.residency_mode orelse configured.residency_mode;
+                warm.memory_budget_mb = warm.memory_budget_mb orelse configured.memory_budget_mb;
+            }
+        }
     } else {
         for (cfg.preload, preload) |model, *warm| {
-            if (model.name.len == 0) return error.InvalidConfig;
-            warm.* = .{
-                .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidArguments,
-                .name = model.name,
-                .backend = try parseOptionalBackendType(model.backend),
-                .format = model.format,
-                .quantization = model.quantization,
-                .residency_mode = if (model.residency_mode) |mode| switch (mode) {
-                    .auto => .auto,
-                    .resident => .resident,
-                    .streamed => .streamed,
-                } else null,
-                .memory_budget_mb = model.memory_budget_mb,
-            };
+            warm.* = try runConfiguredWarmModel(model);
         }
     }
     return .{ .models_dir = models_dir, .ml_dir = ml_dir, .max_loaded_models = max_loaded_models, .preload = preload };
@@ -1045,6 +1112,65 @@ test "inference run config CLI overrides nested config which overrides flat fiel
     try std.testing.expectEqual(@as(usize, 0), cli.max_loaded_models);
     try std.testing.expectEqual(@as(usize, 1), cli.preload.len);
     try std.testing.expectEqualStrings("cli/model:i8", cli.preload[0].name);
+}
+
+test "inference run config selects explicit artifacts and rejects conflicting references" {
+    const alloc = std.testing.allocator;
+    var config = try parseRunConfig(alloc,
+        \\{"inference":{"preload":[{"kind":"generator","name":"hf:owner/model","format":"gguf","quantization":"Q4_K"}]}}
+    );
+    defer config.deinit();
+    const settings = try resolveRunModelSettings(alloc, &config, .{});
+    defer alloc.free(settings.preload);
+    try std.testing.expectEqualStrings("owner/model:gguf:Q4_K", settings.preload[0].name);
+    for ([_][]const u8{
+        \\{"preload":[{"kind":"generator","name":"owner/model:gguf:Q8_0","format":"gguf","quantization":"Q4_K"}]}
+        ,
+        \\{"preload":[{"kind":"generator","name":"owner/model","quantization":"Q4_K"}]}
+        ,
+        \\{"preload":[{"kind":"generator","name":"owner/model:i8","format":"gguf"}]}
+        ,
+    }) |raw| {
+        try std.testing.expectError(error.InvalidConfig, parseRunConfig(alloc, raw));
+    }
+}
+
+test "inference run config retains policies only for matching CLI preload identities" {
+    const alloc = std.testing.allocator;
+    var config = try parseRunConfig(alloc,
+        \\{"preload":[{"kind":"generator","name":"hf:owner/model","backend":"cuda","format":"gguf","quantization":"Q4_K","residency_mode":"streamed","memory_budget_mb":4096},{"kind":"embedder","name":"config/only"}]}
+    );
+    defer config.deinit();
+    const settings = try resolveRunModelSettings(alloc, &config, .{ .preload = &.{
+        try parsePreloadModelFlag("generator:cuda:owner/model:gguf:Q4_K"),
+        try parsePreloadModelFlag("generator:cuda:owner/model:gguf:Q8_0"),
+        try parsePreloadModelFlag("generator:native:owner/model:gguf:Q4_K"),
+        try parsePreloadModelFlag("embedder:cuda:owner/model:gguf:Q4_K"),
+    } });
+    defer alloc.free(settings.preload);
+    try std.testing.expectEqual(@as(usize, 4), settings.preload.len);
+    try std.testing.expect(settings.preload[0].residency_mode != null);
+    try std.testing.expect(settings.preload[0].memory_budget_mb != null);
+    try std.testing.expectEqual(.streamed, settings.preload[0].residency_mode.?);
+    try std.testing.expectEqual(@as(u32, 4096), settings.preload[0].memory_budget_mb.?);
+    const request = settings.preload[0].a4bRequest().?;
+    try std.testing.expectEqual(.streamed, request.residency_mode);
+    try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
+    for (settings.preload[1..]) |model| {
+        try std.testing.expectEqual(null, model.residency_mode);
+        try std.testing.expectEqual(null, model.memory_budget_mb);
+    }
+}
+
+test "inference run config rejects ambiguous CLI policy matches" {
+    const alloc = std.testing.allocator;
+    var config = try parseRunConfig(alloc,
+        \\{"preload":[{"kind":"generator","name":"owner/model","backend":"cuda","memory_budget_mb":4096},{"kind":"generator","name":"owner/model","backend":"cuda","memory_budget_mb":8192}]}
+    );
+    defer config.deinit();
+    try std.testing.expectError(error.AmbiguousPreloadModelConfig, resolveRunModelSettings(alloc, &config, .{
+        .preload = &.{try parsePreloadModelFlag("generator:cuda:owner/model")},
+    }));
 }
 
 test "inference run config defaults and invalid model policies" {

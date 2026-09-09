@@ -314,6 +314,22 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 			return "", fmt.Errorf("failed to parse spec.config: %w", err)
 		}
 	}
+	if config == nil {
+		return "", fmt.Errorf("spec.config must be an object")
+	}
+	// Match the standalone runtime's nested-over-flat precedence before
+	// generating defaults, CLI arguments, puller paths, or volume mounts.
+	if raw, exists := config["inference"]; exists {
+		nested, ok := raw.(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("spec.config.inference must be an object")
+		}
+		for _, key := range []string{"models_dir", "ml_dir", "max_loaded_models", "preload"} {
+			if value, exists := nested[key]; exists {
+				config[key] = value
+			}
+		}
+	}
 
 	loadingStrategy := pool.Spec.Models.LoadingStrategy
 	if loadingStrategy == "" {
@@ -372,11 +388,15 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		}
 	}
 	if _, exists := config["max_loaded_models"]; !exists {
+		preloadCount := len(preload)
+		if explicit, ok := config["preload"].([]any); ok {
+			preloadCount = len(explicit)
+		}
 		if pool.Spec.Models.MaxLoadedModels != nil {
 			config["max_loaded_models"] = *pool.Spec.Models.MaxLoadedModels
-		} else if len(preload) > 10 {
+		} else if preloadCount > 10 {
 			// Ensure eager startup can retain every requested model.
-			config["max_loaded_models"] = len(preload)
+			config["max_loaded_models"] = preloadCount
 		}
 	}
 
@@ -390,7 +410,8 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 }
 
 // inferenceModelArgs translates the merged model settings to the released CLI
-// contract. Keep --config for admission settings; it does not configure models.
+// contract. New runtimes also read --config, retaining policies for matching
+// CLI preload identities; old runtimes still require these model flags.
 func inferenceModelArgs(configJSON string) (string, []string, error) {
 	var config struct {
 		ModelsDir       string `json:"models_dir"`

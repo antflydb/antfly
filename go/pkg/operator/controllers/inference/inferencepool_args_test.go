@@ -103,6 +103,45 @@ func TestInferenceModelArgsValidation(t *testing.T) {
 	}
 }
 
+func TestInferenceNestedConfigOverridesGeneratedModelSettings(t *testing.T) {
+	for _, preload := range []string{`[]`, `[{"kind":"generator","name":"owner/custom","backend":"cuda","format":"gguf","quantization":"Q4_K","residency_mode":"streamed","memory_budget_mb":4096}]`} {
+		t.Run(preload, func(t *testing.T) {
+			g := NewWithT(t)
+			scheme := newInferenceUnitTestScheme(g)
+			pool := &api.InferencePool{
+				ObjectMeta: metav1.ObjectMeta{Name: "nested", Namespace: "default", UID: "nested-uid"},
+				Spec: api.InferencePoolSpec{
+					Models: api.ModelConfig{Preload: []api.ModelSpec{{Name: "owner/generated", Tasks: []string{"embed"}}}},
+					Config: `{"models_dir":"/flat","max_loaded_models":9,"inference":{"models_dir":"/custom-models","max_loaded_models":0,"preload":` + preload + `}}`,
+				},
+			}
+			client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).Build()
+			r := &InferencePoolReconciler{Client: client, Scheme: scheme}
+			ctx := context.Background()
+			g.Expect(r.reconcileConfigMap(ctx, pool)).To(Succeed())
+			g.Expect(r.reconcileStatefulSet(ctx, pool)).To(Succeed())
+			sts := &appsv1.StatefulSet{}
+			g.Expect(client.Get(ctx, types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}, sts)).To(Succeed())
+			want := []string{"inference", "run", "--host", "0.0.0.0", "--port", "8080", "--config", "/config/config.json", "--allow-insecure-public-bind", "--models-dir", "/custom-models", "--max-loaded-models", "0"}
+			if preload != "[]" {
+				want = append(want, "--preload-model", "generator:cuda:owner/custom:gguf:Q4_K")
+			}
+			g.Expect(sts.Spec.Template.Spec.Containers[0].Args).To(Equal(want))
+			g.Expect(sts.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: "models", MountPath: "/custom-models"}))
+			for _, c := range sts.Spec.Template.Spec.InitContainers {
+				g.Expect(c.Args[3:5]).To(Equal([]string{"--models-dir", "/custom-models"}))
+				g.Expect(c.VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: "models", MountPath: "/custom-models"}))
+			}
+			cm := &corev1.ConfigMap{}
+			g.Expect(client.Get(ctx, types.NamespacedName{Name: pool.Name + "-config", Namespace: pool.Namespace}, cm)).To(Succeed())
+			if preload != "[]" {
+				g.Expect(cm.Data["config.json"]).To(ContainSubstring(`"residency_mode": "streamed"`))
+				g.Expect(cm.Data["config.json"]).To(ContainSubstring(`"memory_budget_mb": 4096`))
+			}
+		})
+	}
+}
+
 func TestInferenceModelArgsEagerCapacityAndEmptyOverride(t *testing.T) {
 	g := NewWithT(t)
 	pool := &api.InferencePool{}
@@ -121,4 +160,15 @@ func TestInferenceModelArgsEagerCapacityAndEmptyOverride(t *testing.T) {
 	_, args, err = inferenceModelArgs(raw)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(args).To(Equal([]string{"--models-dir", "/models", "--max-loaded-models", "0"}))
+	pool.Spec.Config = `{"inference":{"preload":[]}}`
+	raw, err = (&InferencePoolReconciler{}).generateCompleteConfig(pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	_, args, err = inferenceModelArgs(raw)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(args).To(Equal([]string{"--models-dir", "/models"}))
+	for _, config := range []string{`null`, `{"inference":null}`, `{"inference":[]}`} {
+		pool.Spec.Config = config
+		_, err = (&InferencePoolReconciler{}).generateCompleteConfig(pool)
+		g.Expect(err).To(HaveOccurred())
+	}
 }
