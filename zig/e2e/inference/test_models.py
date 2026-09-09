@@ -37,7 +37,6 @@ def test_models_has_expected_keys(api):
         "chunkers",
         "generators",
         "extractors",
-        "classifiers",
         "rewriters",
         "readers",
         "transcribers",
@@ -76,7 +75,7 @@ def test_models_exposes_nli_classifiers_as_extractors(api):
         pytest.skip("NLI classifier model is not available")
     caps = model.get("capabilities", [])
     assert {"classification", "zero_shot", "multi_label"}.issubset(caps)
-    assert "cross-encoder/nli-distilroberta-base" not in resp["classifiers"]
+    assert "classifiers" not in resp
 
 
 def test_models_exposes_reader_inputs(api):

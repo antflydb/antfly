@@ -175,7 +175,9 @@ pub const Config = struct {
     pub fn validate(self: Config) !void {
         if (self.field.len == 0 and self.template.len == 0) return error.InvalidRerankerConfig;
         const capabilities = providerCapabilities(self.provider);
-        if (capabilities.model_required and self.model.len == 0) return error.InvalidRerankerConfig;
+        const model = std.mem.trim(u8, self.model, " \t\r\n");
+        if ((self.model.len > 0 and model.len == 0) or (capabilities.model_required and model.len == 0))
+            return error.InvalidRerankerConfig;
         const provider_max = capabilities.max_candidate_count;
         if (self.candidate_count) |candidate_count| {
             if (candidate_count == 0) return error.InvalidRerankerConfig;
@@ -191,10 +193,18 @@ pub const Config = struct {
     }
 
     pub fn defaultedUrl(self: Config) []const u8 {
-        if (self.url.len > 0) return self.url;
+        if (std.mem.trim(u8, self.url, " \t\r\n").len > 0) return self.url;
         return providerCapabilities(self.provider).default_url;
     }
 };
+
+test "reranker rejects a blank explicit routing model" {
+    try (Config{ .provider = .antfly, .field = "body" }).validate();
+    try std.testing.expectError(
+        error.InvalidRerankerConfig,
+        (Config{ .provider = .antfly, .field = "body", .model = " \t" }).validate(),
+    );
+}
 
 /// Validate the effective retrieval window before any shard fan-out begins.
 /// `candidate_count` is optional for ergonomic small queries, but omitting it

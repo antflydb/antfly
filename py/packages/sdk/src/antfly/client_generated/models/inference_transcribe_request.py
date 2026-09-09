@@ -15,20 +15,21 @@ T = TypeVar("T", bound="InferenceTranscribeRequest")
 class InferenceTranscribeRequest:
     """
     Attributes:
+        model (str): Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and
+            distributed execution resolve the same model. Example: openai/whisper-tiny.
         audio (str): Base64-encoded audio data (WAV, MP3, FLAC, etc.)
-        model (str | Unset): Name of transcriber model from models_dir/transcribers/ Example: openai/whisper-tiny.
         language (str | Unset): Force specific language for transcription (optional, model-dependent) Example: en.
     """
 
+    model: str
     audio: str
-    model: str | Unset = UNSET
     language: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        audio = self.audio
-
         model = self.model
+
+        audio = self.audio
 
         language = self.language
 
@@ -36,11 +37,10 @@ class InferenceTranscribeRequest:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "model": model,
                 "audio": audio,
             }
         )
-        if model is not UNSET:
-            field_dict["model"] = model
         if language is not UNSET:
             field_dict["language"] = language
 
@@ -49,15 +49,15 @@ class InferenceTranscribeRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        audio = d.pop("audio")
+        model = d.pop("model")
 
-        model = d.pop("model", UNSET)
+        audio = d.pop("audio")
 
         language = d.pop("language", UNSET)
 
         inference_transcribe_request = cls(
-            audio=audio,
             model=model,
+            audio=audio,
             language=language,
         )
 

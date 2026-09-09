@@ -550,6 +550,7 @@ fn initIoThreaded(
     if (backend_runtime) |bg| {
         const io_impl = bg.io_impl orelse return error.MissingBackendRuntimeIo;
         runtime.* = io_threaded_runtime_mod.DerivedRuntime.initBorrowed(alloc, io_impl, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
+        runtime.scheduler = try bg.maintenanceScheduler();
     } else {
         runtime.* = try io_threaded_runtime_mod.DerivedRuntime.init(alloc, replay_source, ctx, apply_fn, persist_fn, truncate_fn, begin_catch_up_fn, finish_catch_up_fn, can_advance_to_target_fn, applied_sequence_advanced_fn, resource_manager);
     }

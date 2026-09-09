@@ -1,4 +1,4 @@
-# Native catalog
+# System Catalog Design
 
 Databases and namespaces group the existing document tables. The catalog is
 independent of SQL, relational rows, and lake storage. `default.public` exists
