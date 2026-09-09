@@ -6354,6 +6354,9 @@ const SharedPdfWindowScheduler = struct {
     spool_registered: bool = false,
     typed_replay_transactions: usize = 0,
     active_work: ?*WindowWork = null,
+    /// Publication policy: replay spills private rows durably; synchronous
+    /// execution stages only typed results in its invocation-owned allocator.
+    precommit: ?*PrecommitDocumentExecution = null,
 
     fn ownerCanOverlap(self: *const @This(), raster: bool) bool {
         const request = self.requests[self.current];
@@ -6395,6 +6398,7 @@ const SharedPdfWindowScheduler = struct {
         text: bool = false,
         staged_text_min: usize = std.math.maxInt(usize),
         staged_text_max: usize = 0,
+        staged_source_digest: ?[32]u8 = null,
         owned_config: bool = false,
         config: document_extraction_mod.Config = .{},
         capabilities: inference_work.InferenceCapabilities = undefined,
@@ -6413,7 +6417,7 @@ const SharedPdfWindowScheduler = struct {
 
     fn deinit(self: *@This()) void {
         if (self.spool_root) |root| {
-            if (self.spool_dirty) self.cleanupSpool() catch |err|
+            if (self.spool_dirty and self.precommit == null) self.cleanupSpool() catch |err|
                 std.log.warn("shared PDF result cleanup failed: {s}", .{@errorName(err)});
             self.runtime.alloc.free(root);
         }
@@ -6489,6 +6493,9 @@ const SharedPdfWindowScheduler = struct {
         consumer.prepared = true;
         if (requestHasChunkSource(request)) return;
         if (request.kind == .asset) return self.prepareTextConsumer(consumer, request, raw);
+        // Page-vector publication has a separate precommit sink. Never send
+        // speculative vectors through replay's durable write/checkpoint path.
+        if (self.precommit != null) return;
         if (request.kind != .dense_embedding or request.embedding_input != .pdf_page_images) return;
         const embedder = self.runtime.config.dense_embedder orelse return;
         const indexes = try self.runtime.index_manager.denseIndexesForEmbedding(self.runtime.alloc, requestEmbeddingName(request), request.expected_dims);
@@ -7188,6 +7195,9 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn textConsumerIsComplete(self: *@This(), request: enrichment_types.GeneratedEnrichmentRequest, source_url: []const u8, config_json: []const u8, config: document_extraction_mod.Config) !bool {
+        // The ordinary precommit path owns force-reprocess and unchanged-source
+        // checks. Speculation must not clean replay attempts or skip that path.
+        if (self.precommit != null) return false;
         const alloc = self.runtime.alloc;
         const artifact = requestArtifactName(request);
         const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact);
@@ -7250,6 +7260,7 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn storeSpoolRows(self: *@This(), alloc: Allocator, writes: *std.ArrayListUnmanaged(KVPair)) !void {
+        if (self.precommit) |execution| return execution.stage(writes.items);
         if (!self.spool_registered) {
             const key = try alloc.dupe(u8, self.spool_attempt_key.?);
             errdefer alloc.free(key);
@@ -7285,6 +7296,21 @@ const SharedPdfWindowScheduler = struct {
         const consumers = self.consumers orelse return;
         const consumer = consumers[self.current];
         if (consumer.staged_text_max == 0) return;
+        if (self.precommit) |execution| {
+            for (units) |*unit| {
+                const page = unit.page_number orelse continue;
+                const key = try self.textKey(alloc, self.current, page);
+                defer alloc.free(key);
+                const value = execution.rows.get(key) orelse continue;
+                const parsed = try std.json.parseFromSlice(document_extraction_mod.Unit, alloc, value, .{});
+                defer parsed.deinit();
+                if (!std.mem.eql(u8, parsed.value.unit_id, unit.unit_id)) return error.InvalidPdfRenderWindow;
+                const replacement = try cloneDocumentExtractionUnit(alloc, parsed.value);
+                unit.deinit(alloc);
+                unit.* = replacement;
+            }
+            return;
+        }
         var cursor: usize = 0;
         while (cursor < units.len) {
             while (cursor < units.len) : (cursor += 1) {
@@ -7338,6 +7364,10 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn beginOcr(self: *@This(), source_url: []const u8, source: TextSource, page_count: usize, policy: GeneratedTextBatchPolicy, window: *RuntimePdfRenderWindow, prefetch: ?*PdfWindowPrefetchStart) !?*WindowWork {
+        if (self.precommit != null) return self.begin(PreparedDocumentSourceCache.sourceIdentity(source_url), source.fingerprint, self.raw_doc orelse return null, page_count, SharedPdfTransform.init(source.config, policy.max_pixels, policy.preferred_image_width, policy.preferred_image_height, window.page_output_bytes_cap, window.batch == .raster), switch (window.batch) {
+            .encoded => |batch| .{ .encoded = batch },
+            .raster => |batch| .{ .raster = batch },
+        }, source.config.credentials, source, window.lease, prefetch);
         const cache = self.prepared_sources orelse return null;
         if (self.current + 1 >= self.requests.len) return null;
         var borrowed = try cache.lookup(source_url, if (source.config.credentials.len > 0) source.config.credentials else null) orelse return null;
@@ -7359,6 +7389,12 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn consumeTextWithAllocator(self: *@This(), alloc: Allocator, consumer: *Consumer, index: usize, source: TextSource, rendered: PdfEmbeddingRenderedWindow, window_lease: ?*PdfWindowCompositeLease, pending_mask: ?[]const bool, jobs: *WindowJobs) !void {
+        if (self.precommit != null) {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(source.fingerprint, &digest, .{});
+            if (consumer.staged_source_digest) |previous| if (!std.mem.eql(u8, &previous, &digest)) self.precommit.?.clearRows();
+            consumer.staged_source_digest = digest;
+        }
         const runtime = self.runtime;
         const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
         var cancellation: AssetInvocationCancellation = undefined;
@@ -7530,6 +7566,7 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn textStageExists(self: *@This(), key: []const u8) !bool {
+        if (self.precommit) |execution| return execution.rows.contains(key);
         const Reader = struct {
             fn read(runtime: *EnrichmentRuntime, k: []const u8) ![]u8 {
                 var txn = try runtime.store.beginRead();
@@ -8357,6 +8394,42 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     const digest = [_]u8{7} ** 32;
     const resources = runtime.config.resource_manager orelse manager.resource_manager.?;
     const before = resources.sliceStats(.document_extraction_working_set).used_bytes;
+    {
+        const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..3], "{}");
+        defer execution.destroy();
+        try execution.scheduler.ensureConsumers();
+        for (1..3) |i| {
+            execution.scheduler.consumers.?[i] = scheduler.consumers.?[i];
+            execution.scheduler.consumers.?[i].plans = .empty;
+        }
+        try execution.scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &digest, "{}", 2, transform, .{ .encoded = batch }, "", source, window_lease);
+        try std.testing.expectEqual(@as(usize, 4), harness.text_calls);
+        try std.testing.expectEqual(@as(usize, 0), harness.embed_calls);
+        try std.testing.expectEqual(@as(usize, 4), execution.rows.count());
+        try std.testing.expect(!execution.scheduler.spool_registered);
+        // Neither the parent's scheduler nor its public/private store changes.
+        try std.testing.expect(runtime.shared_pdf_windows == &scheduler);
+        try std.testing.expect(!try scheduler.textStageExists(execution.scheduler.spool_attempt_key.?));
+        execution.select(1);
+        execution.validateSource(source.fingerprint);
+        var restored = try cloneDocumentExtractionUnit(alloc, units[0]);
+        defer restored.deinit(alloc);
+        try execution.scheduler.restoreTextUnit(alloc, &restored);
+        try std.testing.expect(std.mem.startsWith(u8, restored.text, "Reader"));
+        try std.testing.expectEqual(@as(usize, 0), execution.scheduler.typed_replay_transactions);
+        execution.select(2);
+        try execution.scheduler.restoreTextUnit(alloc, &restored);
+        try std.testing.expect(std.mem.startsWith(u8, restored.text, "Generator"));
+        // A denied staging allocation leaves all earlier successful rows live.
+        execution.staging.max_live_bytes = execution.staging.live_bytes;
+        try std.testing.expectError(error.OutOfMemory, execution.stage(&.{.{ .key = "extra", .value = "not admitted" }}));
+        try std.testing.expectEqual(@as(usize, 4), execution.rows.count());
+        execution.validateSource("different-source-bytes");
+        try std.testing.expectEqual(@as(usize, 0), execution.scheduler.consumers.?[2].staged_text_max);
+        try std.testing.expectEqual(@as(usize, 0), execution.rows.count());
+        harness.text_calls = 0;
+    }
+    try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
     try scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &digest, "{}", 2, transform, .{ .encoded = batch }, "", source, window_lease);
     try std.testing.expectEqual(@as(usize, 4), harness.text_calls);
     try std.testing.expectEqual(@as(usize, 2), harness.embed_calls);
@@ -11599,6 +11672,147 @@ pub fn completeDocumentExtractionGeneratedTextForRequest(
     );
 }
 
+/// One precommit document invocation owns mutable execution state; providers,
+/// backend lanes and the read store are borrowed from the lifecycle owner.
+/// Only typed page results survive a window. Public artifact publication stays
+/// in DB's existing atomic batch, and optional staging is strictly bounded.
+pub const PrecommitDocumentExecution = struct {
+    runtime: EnrichmentRuntime,
+    scheduler: SharedPdfWindowScheduler,
+    budgeted: ?resource_manager_mod.BudgetedAllocator = null,
+    staging: ReservedWorkingSetAllocator,
+    rows: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    pub fn useful(requests: []const enrichment_types.GeneratedEnrichmentRequest) bool {
+        var consumers: usize = 0;
+        for (requests) |request| if (request.kind == .asset) {
+            consumers += 1;
+            if (consumers == 2) return true;
+        };
+        return false;
+    }
+
+    pub fn create(parent: *EnrichmentRuntime, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !*@This() {
+        if (builtin.os.tag == .freestanding) return error.UnsupportedPrecommitDocumentExecution;
+        const alloc = parent.alloc;
+        const self = try alloc.create(@This());
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .runtime = .{
+                .alloc = alloc,
+                .backend_runtime = parent.backend_runtime,
+                .io_impl = parent.io_impl,
+                .store = parent.store,
+                .owns_store = false,
+                .change_journal = parent.change_journal,
+                .replay_source = parent.replay_source,
+                .index_manager = parent.index_manager,
+                .write_ctx = self,
+                .write_fn = rejectPublication,
+                .notify_ctx = self,
+                .notify_fn = ignoreNotification,
+                .config = parent.config,
+                .ownership = try ownership_mod.State.init(alloc, parent.store, "precommit-no-lease", .{}),
+            },
+            .scheduler = undefined,
+            .staging = ReservedWorkingSetAllocator.init(alloc, 64 * 1024 * 1024),
+        };
+        const manager = parent.config.resource_manager orelse parent.index_manager.resource_manager;
+        if (manager) |m| {
+            self.budgeted = resource_manager_mod.BudgetedAllocator.init(m, .document_extraction_working_set, alloc, 1);
+            self.staging.backing = self.budgeted.?.allocator();
+        }
+        self.scheduler = SharedPdfWindowScheduler.init(&self.runtime, requests, 0);
+        self.scheduler.precommit = self;
+        self.scheduler.raw_doc = raw;
+        self.runtime.shared_pdf_windows = &self.scheduler;
+        return self;
+    }
+
+    pub fn select(self: *@This(), index: usize) void {
+        self.scheduler.current = index;
+        setActiveFailureFingerprint(&self.runtime, requestFailureFingerprint(self.scheduler.requests[index]));
+    }
+
+    fn rejectPublication(_: *anyopaque, _: derived_types.DerivedBatch, _: []const GeneratedArtifactPromotion, _: []const []const u8, _: ?GeneratedWriteFence) !GeneratedRecordCommit {
+        return error.PrecommitPublicationForbidden;
+    }
+
+    fn ignoreNotification(_: *anyopaque, _: u64) void {}
+
+    fn stage(self: *@This(), writes: []const KVPair) !void {
+        const alloc = self.staging.allocator();
+        var pending = std.ArrayListUnmanaged(KVPair).empty;
+        defer {
+            for (pending.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            pending.deinit(alloc);
+        }
+        for (writes) |row| {
+            const key = try alloc.dupe(u8, row.key);
+            errdefer alloc.free(key);
+            const value = try alloc.dupe(u8, row.value);
+            errdefer alloc.free(value);
+            try pending.append(alloc, .{ .key = key, .value = value });
+        }
+        try self.rows.ensureUnusedCapacity(alloc, @intCast(pending.items.len));
+        for (pending.items) |row| {
+            if (self.rows.fetchRemove(row.key)) |old| {
+                alloc.free(old.key);
+                alloc.free(old.value);
+            }
+            self.rows.putAssumeCapacity(row.key, row.value);
+        }
+        pending.clearRetainingCapacity();
+    }
+
+    fn validateSource(self: *@This(), fingerprint: []const u8) void {
+        const consumers = self.scheduler.consumers orelse return;
+        const consumer = &consumers[self.scheduler.current];
+        const previous = consumer.staged_source_digest orelse return;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(fingerprint, &digest, .{});
+        if (!std.mem.eql(u8, &previous, &digest)) {
+            // A remote locator may change between consumers. Never apply
+            // previously staged results to different bytes.
+            self.clearRows();
+        }
+    }
+
+    fn clearRows(self: *@This()) void {
+        const scratch = self.staging.allocator();
+        var rows = self.rows.iterator();
+        while (rows.next()) |row| {
+            scratch.free(row.key_ptr.*);
+            scratch.free(row.value_ptr.*);
+        }
+        self.rows.clearRetainingCapacity();
+        if (self.scheduler.consumers) |consumers| for (consumers) |*consumer| {
+            consumer.staged_text_min = std.math.maxInt(usize);
+            consumer.staged_text_max = 0;
+            consumer.staged_source_digest = null;
+        };
+    }
+
+    pub fn destroy(self: *@This()) void {
+        const alloc = self.runtime.alloc;
+        self.clearRows();
+        self.rows.deinit(self.staging.allocator());
+        self.scheduler.deinit();
+        if (self.budgeted) |*budget| budget.deinit();
+        // Borrowed providers and service ownership never transfer to this
+        // invocation. Mutable telemetry/recovery state is invocation-local.
+        clearIndexEmbeddingActivity(&self.runtime);
+        clearPublishedGeneratedArtifacts(&self.runtime);
+        clearIsolatedFailedIndexes(&self.runtime);
+        self.runtime.inference_recovery.deinit(alloc);
+        if (builtin.os.tag != .freestanding) self.runtime.ownership.deinit(alloc);
+        alloc.destroy(self);
+    }
+};
+
 pub const DocumentExtractionGeneratedTextMemory = struct {
     native_backing_alloc: ?Allocator = null,
 };
@@ -11620,6 +11834,9 @@ pub fn completeDocumentExtractionGeneratedTextForRequestWithMemory(
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const batch_policy = requestGeneratedTextBatchPolicy(alloc, request);
     const source_fingerprint = sourceContentFingerprint(source_bytes);
+    if (runtime.shared_pdf_windows) |shared| {
+        if (shared.precommit) |execution| execution.validateSource(&source_fingerprint);
+    }
     completeRuntimeDocumentExtractionGeneratedTextBatchWithMemory(runtime, alloc, memory.native_backing_alloc orelse alloc, producer, config, batch_policy, source_url, source_bytes, &source_fingerprint, extraction.route_type, source_content_type, extraction.units, .ocr) catch |err| {
         if (!isDocumentWideOcrFailure(err)) return err;
         try markPendingGeneratedUnitTextFailures(
@@ -14701,6 +14918,14 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                 admitted_batch_policy.preferred_image_height = transform.target_height;
             }
         }
+    }
+    if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
+        if (runtime.shared_pdf_windows) |shared| if (shared.precommit != null) {
+            admitted_batch_policy.render_items = shared.planWindow(shared.raw_doc.?, admitted_batch_policy.max_items) catch |err| blk: {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                break :blk admitted_batch_policy.max_items;
+            };
+        };
     }
     var requests = std.ArrayListUnmanaged(asset_producer_mod.Request).empty;
     defer requests.deinit(working_alloc);

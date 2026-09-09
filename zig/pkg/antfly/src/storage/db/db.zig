@@ -34344,6 +34344,7 @@ fn computeAssetRequestDerived(
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
     deferred_asset_producer_items: ?*std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
     force_reprocess: bool,
+    document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
 ) !void {
     var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
     defer producer_cfg.deinit(alloc);
@@ -34389,6 +34390,7 @@ fn computeAssetRequestDerived(
             dense_embeddings,
             sparse_embeddings,
             force_reprocess,
+            document_execution,
         );
     }
 
@@ -34715,6 +34717,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
     force_reprocess: bool,
+    document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
 ) !void {
     const artifact_name = requestArtifactName(request);
     var config = try document_extraction_mod.parseConfig(alloc, config_json);
@@ -34851,7 +34854,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     defer extraction.deinit(document_extraction_alloc);
     if (db.enrichment_runtime) |runtime| {
         try enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
-            runtime,
+            if (document_execution) |execution| &execution.runtime else runtime,
             document_extraction_alloc,
             request,
             config,
@@ -39560,7 +39563,13 @@ fn prepareGeneratedEnrichments(
             chunk_cache.deinit(self.alloc);
         }
 
-        for (generated) |request| {
+        const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (self.enrichment_runtime) |runtime|
+            if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, generated, cleaned) else null
+        else
+            null;
+        defer if (document_execution) |execution| execution.destroy();
+        for (generated, 0..) |request, request_index| {
+            if (document_execution) |execution| execution.select(request_index);
             if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
                 try appendGeneratedEnrichmentRef(self.alloc, &planned, request);
                 continue;
@@ -39579,6 +39588,7 @@ fn prepareGeneratedEnrichments(
                     &sparse_embeddings,
                     &deferred_asset_producer_items,
                     containsName(force_generated_artifact_names, requestArtifactName(request)),
+                    document_execution,
                 ),
                 .chunk_text => try computeChunkRequestDerived(
                     self.alloc,

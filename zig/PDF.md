@@ -2,6 +2,40 @@
 
 ## September 2026 render-control verification
 
+### Follow-up: precommit sharing and image-row decoding
+
+Precommit document extraction now uses the shared PDF window scheduler through
+an invocation-owned execution session. It borrows immutable provider/backend
+handles but owns its mutable scheduling, recovery and progress state; it never
+installs a scheduler on the live replay runtime. Compatible reader/generator
+consumers borrow the same page buffers and retain independent typed outputs.
+The publication sink differs: replay uses fenced private durable rows, whereas
+precommit uses node-admitted local result staging (64 MiB hard limit) and the
+existing atomic primary/artifact commit. Staging pressure declines optional
+sharing and preserves the ordinary bounded execution path. No page rasters
+survive their consumer window. Source-fingerprint changes invalidate staged
+results; forced reprocessing and unchanged-state checks stay with precommit's
+ordinary publication path. Page-vector replay checkpoints are not used by this
+precommit text-result sink.
+
+The native image decoder has a pull-based row path for 8-bit DeviceGray/RGB/CMYK
+images with raw or single-Flate streams, including TIFF/PNG predictors, color
+keys, and same-size 8-bit soft masks with optional Matte correction. Color and
+mask streams advance together into native-resolution RGBA. PDF bytes are
+borrowed; owned decryption input, inflate history, predictor rows and RGBA are
+charged to the existing image-tree allocator and aggregate render grant.
+There is no full decompressed sample plane or full RGBA soft-mask allocation.
+The 64 MiB materialized-stream ceiling remains in force for general streams
+and individual rows; geometry bounds cumulative image work. Truncated or
+surplus samples, invalid checksums, and cancellation stop decoding. The final
+native RGBA result must still fit the hard image working-set limit.
+
+Other codecs, color spaces, packed samples, predictor layouts and differently
+sized masks retain their existing guarded paths; this is not a relaxation of
+their limits or an automatic reduction in DPI. The formerly rejected academic
+page has rendered at requested 150 DPI under the unchanged 256 MiB scratch cap;
+full service qualification is recorded separately when complete.
+
 The initial source-build ablation exposed two admission defects: reserving every
 lane's 128 MiB decode ceiling made parallel rendering impossible under the
 default 256 MiB renderer cap, and speculative partial grants below that ceiling
@@ -23,9 +57,9 @@ Foreground failures do not create another speculative replay cycle.
 
 Source tests and production qualification must verify these changes separately.
 The 51-page corpus also includes an approximately 98.7 MB decoded image that
-exceeds the unchanged 64 MiB per-stream ceiling. Supporting that input at low
-memory requires a bounded streaming image decoder, not relaxing benchmark gates
-or silently reducing requested DPI. See `scripts/bench/pdf/` for the retained
+exceeds the unchanged 64 MiB materialized-stream ceiling. The image-row path
+above addresses that input without relaxing benchmark gates or reducing DPI.
+See `scripts/bench/pdf/` for the retained
 failed experiments, render-control matrix and multi-consumer qualification.
 
 Final Metal qualification at production source `29dd963a4` confirms four actual
@@ -5270,12 +5304,12 @@ provide independent cache ownership and device-domain KV admission.
 
 The September render-control experiments exposed two distinct ingestion paths.
 `full_index`/`enrichments` precompute generated artifacts into the commit; `write`
-uses durable enrichment replay. Both use bounded PDF rendering, but the shared
-window scheduler currently belongs to replay. A multi-consumer full-index run
-therefore does not measure replay's render reuse. Benchmark provenance must pin
+uses durable enrichment replay. Both use bounded PDF rendering. Precommit now
+uses invocation-local text-result staging with the common window scheduler;
+replay retains its own durable staging and publication. Benchmark provenance must pin
 the sync level and require final artifact/vector coverage for either path.
 
-The long-term convergence is a document execution session independent of its
+The convergence boundary is a document execution session independent of its
 publication sink: immutable prepared source, bounded page windows, task-specific
 consumers, and typed staged results. Precommit execution must collect into the
 pending commit, while replay retains attempt-scoped durable staging and lease
