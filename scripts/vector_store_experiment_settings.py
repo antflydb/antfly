@@ -145,6 +145,23 @@ CONTROLS["cost_prior_baseline"] = dict(CONTROLS["foreground_gc"])
 TREATMENTS["cost_prior_baseline"] = {**_COST_BASE, **_COST_ALL}
 CONTROLS["cost_source_defaults"] = {}
 TREATMENTS["cost_source_defaults"] = {**_COST_BASE, **_COST_ALL}
+# Isolate locator cost against the bitmap prototype, then compare the complete
+# compact shape against the hash-map control. Sparse batching uses matched debt
+# scheduling to exercise the delayed sparse reclamation observed previously.
+CONTROLS["mark_locator"] = {**_COST_BASE, "ANTFLY_SOURCE_VECTOR_BITMAP_MARKING": "1"}
+TREATMENTS["mark_locator"] = {"ANTFLY_SOURCE_VECTOR_BITMAP_LOCATOR": "1"}
+CONTROLS["mark_locator_shape"] = dict(_COST_BASE)
+TREATMENTS["mark_locator_shape"] = {
+    "ANTFLY_SOURCE_VECTOR_BITMAP_MARKING": "1",
+    "ANTFLY_SOURCE_VECTOR_BITMAP_LOCATOR": "1",
+}
+CONTROLS["mark_sparse_batch"] = {
+    **_COST_BASE,
+    "ANTFLY_SOURCE_VECTOR_DEBT_SCHEDULING": "1",
+}
+TREATMENTS["mark_sparse_batch"] = {
+    "ANTFLY_SOURCE_VECTOR_SPARSE_GC_COPY_BYTES": "67108864"
+}
 ALL_FLAGS = sorted(
     {key for flags in [*TREATMENTS.values(), *CONTROLS.values()] for key in flags}
 )

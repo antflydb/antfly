@@ -12,6 +12,65 @@ Existing planes remain readable without an eager rewrite. This does not change
 the table-level source-ownership setting or exact-score requirements. Frozen
 comparison catalogs and archive locations are in `benchmark-baselines/README.md`.
 
+## Bitmap locator and sparse reclamation follow-up
+
+Two focused opt-in changes now target the preceding experiments' costs.
+`ANTFLY_SOURCE_VECTOR_BITMAP_LOCATOR=1` adds a snapshot-local locator to bitmap
+marking. Its slots contain physical addresses; every probe verifies the complete
+digest against pinned segment metadata. Construction yields within the existing
+scan budget, and copy subsets share the completed locator and its source cut.
+The existing lookup serves reads while construction is incomplete. At one million
+physical rows the slot array is 16 MiB, in addition to bitmap and WAL-fallback
+storage. `mark_bitmap_bytes` excludes locator bytes; total source heap includes
+them, and scan counters include locator construction work.
+
+`ANTFLY_SOURCE_VECTOR_SPARSE_GC_COPY_BYTES=67108864` allows one verified mark to
+select several low-density garbage segments. It targets at most 64 MiB of selected
+copy work and 65,536 additional sparse live rows, while preserving the existing
+selection of denser garbage and permitting one oversized segment for progress.
+Copy steps retain their independent byte budget. Planning admission failure
+releases the cut for retry; old snapshots and post-cut writes retain their
+existing protection. Neither setting changes durable formats or defaults.
+
+The [qualification ledger](../.benchmark-results/vector-store-marking-targets/README.md)
+tracks separate locator-versus-bitmap, compact-shape-versus-hash, and sparse-batch
+comparisons. All twelve fresh 50K workload/reclamation arms and six independent
+candidate inventories passed. Median paired changes are:
+
+| 50K comparison | Ready time | Mixed writes/s | Mixed p99 | Fixed churn time | Mixed physical footprint |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Locator versus prior bitmap | +5.2% | -1.3% | +0.5% | +3.5% | -8.8% |
+| Compact bitmap shape versus hash marking | +1.5% | -0.6% | +1.8% | +1.7% | -22.0% |
+| Sparse batches versus matched debt scheduler | -5.7% | +0.5% | -0.8% | +1.0% | +30.5% |
+
+The compact shape reduces measured marking and planning time in both hash-control
+pairs, but does not yet improve end-to-end churn consistently. Sparse batching's
+foreground changes are small; churn logical write I/O rises 5.5%, and sampled
+physical footprint rises in both pairs (4.8% and 56.2%). The unbatched debt controls
+need 407/356 seconds to reclaim after churn, versus 2.4/2.5 seconds for the batched
+candidates. These runs finish with different layouts.
+
+A separate [matched-layout ABBA check](../.benchmark-results/vector-store-marking-targets/matched-sparse/RESULTS.md)
+clones the same saved sparse database for every arm and changes only the batch
+target. Controls take 336/338 seconds and 56 collections; batching takes 8.8/9.8
+seconds and two collections. Mark rows fall from 11.56 million to 461,014, with
+exactly the same 15,490,108 payload bytes written. Post-GC serving and retained
+counts pass in every arm. This isolates a substantial sparse-cleanup benefit on
+that layout; it does not establish a universally optimal batch size.
+
+The compact locator shape also passed all four 1M workload/reclamation checks
+and both independent inventories. Readiness improves 15.9%/12.8%, but the mixed
+and churn results reverse between pairs: writes +25.7%/-36.4%, p99 -21.8%/+95.3%,
+and churn time -6.0%/+67.1%. Median paired changes are -14.3% readiness time,
+-5.4% writes, +36.8% p99, +30.6% churn, +21.2% sampled physical footprint, and
++2.4% churn logical write I/O. This does not qualify a default. Both control
+churn source-counter intervals are incomplete, so no paired marking-time ratio
+is claimed at 1M. Candidate planning takes 2.1/6.5 seconds, including a 4.7-second
+restore planning interval that writes only 309,724 payload bytes. Metadata
+planning under the source lock remains a concrete profiling target; these
+counters do not prove the cause of the entire latency regression. The independent
+1M sparse-batching comparison is still in progress.
+
 ## Cost-recovery experiments
 
 Four further opt-in treatments are implemented:
@@ -45,10 +104,43 @@ not matched GC microbenchmarks.
 
 Bitmap marking reduced sampled mixed physical footprint 6.5% at 50K, with the
 foreground tradeoffs above. The cutoff did not establish an optimal threshold.
-Debt scheduling and bitmap marking are now being measured separately at 1M to
-test long ingestion and metadata pressure. None of these results changes
-defaults or qualifies an unmeasured combination. Full per-arm results and
-limitations are in the [measurement report](../.benchmark-results/vector-store-cost-recovery/RESULTS.md).
+
+Debt scheduling and bitmap marking also completed separate 1M ABBA runs. All
+eight workloads/reclamation checks and four independent inventories passed,
+with the source limit held at 384 MiB. Median paired changes were:
+
+| Treatment at 1M | Ready time | Mixed writes/s | Mixed p99 | Fixed churn time | Mixed physical footprint |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Debt-based background scheduling | -1.1% | +5.1% | -3.5% | -14.3% | +2.1% |
+| Segment bitmap marking | +11.2% | -7.2% | +29.3% | +10.4% | +5.3% |
+
+Debt scheduling improves churn in both pairs (15.6% and 13.1%), but mixed writes
+and latency change direction between pairs. Initial mark rows are
+control/candidate 6.03M/0.80M and 5.24M/5.50M: the large reduction in the first
+pair does not repeat. All four debt runs reclaim in 17–21 seconds. The 50K
+sparse-GC outlier remains relevant even though it does not recur at 1M.
+
+Bitmap marking reduces the reachability representation to about 191–193 KiB
+of sampled bitmap/offset storage, with zero WAL-fallback entries in these
+ingestion samples. Other source allocations remain: maximum sampled source
+heap is control/candidate 378.8/306.1 MiB and 372.1/365.4 MiB. These samples can
+miss brief peaks. Mixed RSS falls 12.9% overall, while physical footprint changes
+direction between pairs; the smaller marking representation is not a uniform
+whole-process memory improvement. Ready time, mixed writes, p99 and churn all
+regress in both pairs. The first pair spends 15.97 seconds marking 4.02M churn
+rows versus the control's 2.02 seconds for 6.05M rows. The second candidate also
+spends 15.10 seconds marking; its control's complete source interval is
+unavailable. Compact marking needs faster location lookup before promotion.
+
+Keep all four settings opt-in. Do not combine the foreground-cost regressions
+or infer a new default from these comparisons against the previous candidate.
+The next focused experiments should apply queued WAL deltas at installation
+without eager foreground map updates, amortize a verified mark over bounded
+sparse-segment reclamation, and measure snapshot-safe location hints for bitmap
+marking. The cutoff needs a matched-dimension size sweep before selecting a
+crossover. These are follow-up hypotheses, not implemented or qualified wins.
+Full per-arm results and limitations are in the
+[measurement report](../.benchmark-results/vector-store-cost-recovery/RESULTS.md).
 
 ## Lifecycle fixes and isolated qualification
 

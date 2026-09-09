@@ -99,6 +99,8 @@ pub const Store = struct {
     delta_inventory: bool = false,
     debt_scheduling: bool = false,
     bitmap_marking: bool = false,
+    bitmap_locator: bool = false,
+    sparse_gc_copy_bytes: u64 = 0,
     inventory_min_payloads: u64 = 0,
     inventory_requested: bool = false,
     last_mark_completed_ns: u64 = 0,
@@ -578,6 +580,10 @@ pub const Store = struct {
     }
 
     fn scanMarking(marking: *Marking, started: u64, budget_ns: u64, limit: usize, allow_verification: bool, progress: *ScanProgress) !void {
+        while (marking.live.locatorPending()) {
+            if (markBudgetExpired(started, budget_ns, limit, progress)) return;
+            if (try marking.live.advanceLocator()) progress.rows += 1;
+        }
         while (!marking.primary_done) {
             if (markBudgetExpired(started, budget_ns, limit, progress)) return;
             const entry = if (!marking.started)
@@ -848,6 +854,11 @@ pub const Store = struct {
         self.delta_inventory = experimentEnabled("ANTFLY_SOURCE_VECTOR_DELTA_INVENTORY");
         self.inventory.delta = self.delta_inventory;
         self.bitmap_marking = experimentEnabled("ANTFLY_SOURCE_VECTOR_BITMAP_MARKING");
+        self.bitmap_locator = experimentEnabled("ANTFLY_SOURCE_VECTOR_BITMAP_LOCATOR");
+        if (@import("builtin").link_libc) {
+            if (std.c.getenv("ANTFLY_SOURCE_VECTOR_SPARSE_GC_COPY_BYTES")) |raw|
+                self.sparse_gc_copy_bytes = try std.fmt.parseInt(u64, std.mem.span(raw), 10);
+        }
         self.inventory_requested = self.incremental_inventory;
         if (@import("builtin").link_libc) {
             if (std.c.getenv("ANTFLY_SOURCE_VECTOR_INVENTORY_MIN_PAYLOADS")) |raw|
@@ -1001,7 +1012,7 @@ pub const Store = struct {
         };
         unique.clearRetainingCapacity();
         if (@TypeOf(unique) == *LiveSet) {
-            if (self.bitmap_marking) try unique.enableBitmaps(opened);
+            if (self.bitmap_marking) try unique.enableBitmapsMode(opened, self.bitmap_locator);
         }
         for (opened.readers) |reader| for (0..reader.count) |i| {
             const entry = try reader.entryAt(i);
@@ -1611,7 +1622,8 @@ pub const Store = struct {
         // fixed slack covers the header/alignment and the Marking itself.
         // Reserve also for the source lease (and full-GC sealing successor).
         if (self.bitmap_marking) {
-            return std.math.add(usize, try LiveSet.workspaceBytes(&self.opened), try std.math.add(usize, @sizeOf(Marking) + 4096, try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 3)));
+            const locator_workspace = if (self.bitmap_locator) try LiveSet.locatorWorkspaceBytes(&self.opened) else 0;
+            return std.math.add(usize, locator_workspace, try std.math.add(usize, try LiveSet.workspaceBytes(&self.opened), try std.math.add(usize, @sizeOf(Marking) + 4096, try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 3))));
         }
         const count = std.math.cast(u32, self.stats.retained_payloads) orelse return error.VectorPayloadCountOverflow;
         const load_capacity = (try std.math.mul(usize, count, 5)) / 4;
@@ -1706,7 +1718,7 @@ pub const Store = struct {
         var live = LiveSet.init(self.alloc);
         errdefer live.deinit();
         if (self.bitmap_marking) {
-            try live.enableBitmaps(&source_snapshot);
+            try live.enableBitmapsDeferred(&source_snapshot, self.bitmap_locator);
         } else try live.ensureTotalCapacity(std.math.cast(u32, self.stats.retained_payloads) orelse return error.ResourceBudgetExceeded);
         const marking = try self.alloc.create(Marking);
         marking.* = .{
@@ -1739,6 +1751,22 @@ pub const Store = struct {
     fn recordDuration(total: *u64, maximum: *u64, elapsed: u64) void {
         total.* += elapsed;
         maximum.* = @max(maximum.*, elapsed);
+    }
+
+    const SparseSegment = struct {
+        index: usize,
+        live_bytes: u64,
+        live_rows: u64,
+        ratio: f64,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return if (a.ratio == b.ratio) a.index < b.index else a.ratio > b.ratio;
+        }
+    };
+
+    fn deferMarkPlanning(self: *Store) void {
+        self.stats.collection_deferrals += 1;
+        self.marking.?.deinit(self.alloc);
+        self.marking = null;
     }
 
     fn finishMarkingLocked(self: *Store, budget_bytes: u64) !bool {
@@ -1785,39 +1813,97 @@ pub const Store = struct {
         defer selected.deinit(self.alloc);
         var copy_live = LiveSet.init(self.alloc);
         defer copy_live.deinit();
-        if (self.bitmap_marking) try copy_live.enableBitmaps(&self.opened);
         const partial = self.selective_gc and !manifest.hasPhysicalBase();
+        const bounded_plan = (self.bitmap_marking and self.bitmap_locator) or (partial and self.sparse_gc_copy_bytes != 0);
+        const selection_scratch = if (self.budget) |budget| if (partial and self.sparse_gc_copy_bytes != 0)
+            budget.reserveScratch(try std.math.mul(usize, self.opened.readers.len, 2 * @sizeOf(SparseSegment))) catch {
+                self.deferMarkPlanning();
+                return false;
+            }
+        else
+            null else null;
+        defer if (selection_scratch) |reservation| reservation.release();
+        var selected_rows: u64 = 0;
         if (partial) {
             // Retain cold segments byte-for-byte. Updated versions arrive in
             // newer append runs; prioritize segments with reclaimable bytes.
             var best: ?usize = null;
             var best_ratio: f64 = 0;
+            var best_live_rows: u64 = 0;
             var selected_reclaimable = false;
+            var selected_copy_bytes: u64 = 0;
+            var selected_sparse_rows: u64 = 0;
+            var sparse = std.ArrayListUnmanaged(SparseSegment).empty;
+            defer sparse.deinit(self.alloc);
             for (self.opened.readers, 0..) |reader, index| {
                 var total: u64 = 0;
                 var dead: u64 = 0;
+                var live_rows: u64 = 0;
                 for (0..reader.count) |i| {
                     const row = try reader.entryAt(i);
                     if (row.value != .vector or row.key.len != 32) continue;
                     const bytes = @as(u64, row.value.vector.dims) * 4;
                     total += bytes;
-                    if (!live.contains(row.key[0..32].*)) dead += bytes;
+                    if (!live.contains(row.key[0..32].*)) dead += bytes else live_rows += 1;
                 }
                 const ratio = @as(f64, @floatFromInt(dead)) / @as(f64, @floatFromInt(@max(1, total)));
                 if (ratio > best_ratio) {
                     best_ratio = ratio;
                     best = index;
+                    best_live_rows = live_rows;
                 }
                 if (ratio >= 0.25 or reader.count == 0) {
                     try selected.append(self.alloc, manifest.segments[index]);
                     selected_reclaimable = selected_reclaimable or dead != 0;
+                    selected_copy_bytes +|= total - dead;
+                    selected_rows +|= live_rows;
+                } else if (self.sparse_gc_copy_bytes != 0 and dead != 0) {
+                    try sparse.append(self.alloc, .{ .index = index, .live_bytes = total - dead, .live_rows = live_rows, .ratio = ratio });
                 }
             }
             // Empty output segments are cheap to retire, but selecting one
             // must not starve real garbage below the density threshold.
-            if (!selected_reclaimable) {
-                if (best) |index| try selected.append(self.alloc, manifest.segments[index]);
+            if (self.sparse_gc_copy_bytes != 0) {
+                std.mem.sort(SparseSegment, sparse.items, {}, SparseSegment.less);
+                for (sparse.items) |candidate| {
+                    // Always admit the best nonempty candidate to make progress
+                    // even when one segment exceeds the target. Copying still
+                    // yields at the existing per-step byte budget.
+                    if (selected_reclaimable and (candidate.live_bytes > self.sparse_gc_copy_bytes -| selected_copy_bytes or candidate.live_rows > 65536 -| selected_sparse_rows)) continue;
+                    try selected.append(self.alloc, manifest.segments[candidate.index]);
+                    selected_copy_bytes +|= candidate.live_bytes;
+                    selected_sparse_rows +|= candidate.live_rows;
+                    selected_rows +|= candidate.live_rows;
+                    selected_reclaimable = true;
+                }
+            } else if (!selected_reclaimable) {
+                if (best) |index| {
+                    try selected.append(self.alloc, manifest.segments[index]);
+                    selected_rows +|= best_live_rows;
+                }
             }
+        }
+        const plan_count: u32 = if (partial) @intCast(@min(live.count(), selected_rows)) else live.count();
+        const planning_scratch = if (self.budget) |budget| if (bounded_plan) blk: {
+            var bytes = try std.math.add(usize, try std.math.mul(usize, plan_count, @sizeOf(CollectionItem)), try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 3));
+            if (partial) {
+                if (self.bitmap_marking) {
+                    bytes = try std.math.add(usize, bytes, try LiveSet.workspaceBytes(if (self.bitmap_locator) &live.source.? else &self.opened));
+                } else {
+                    const slots = try std.math.ceilPowerOfTwo(usize, @max(8, (@as(usize, plan_count) * 5) / 4 + 1));
+                    bytes = try std.math.add(usize, bytes, try std.math.mul(usize, slots, 40));
+                }
+            }
+            break :blk budget.reserveScratch(bytes) catch {
+                self.deferMarkPlanning();
+                return false;
+            };
+        } else null else null;
+        defer if (planning_scratch) |reservation| reservation.release();
+        if (partial) {
+            if (self.bitmap_marking) {
+                if (self.bitmap_locator) try copy_live.enableSubset(&live) else try copy_live.enableBitmaps(&self.opened);
+            } else if (bounded_plan) try copy_live.ensureTotalCapacity(plan_count);
             for (selected.items) |segment| {
                 for (self.opened.readers) |reader| {
                     if (reader.generation != segment.generation or reader.shard_id != segment.shard_id) continue;
@@ -3763,6 +3849,25 @@ test "source vector payloads mark workspace admission releases snapshots and res
             defer budget.backing = alloc;
             try std.testing.expectError(error.OutOfMemory, source.collectStepDeferredMark(&raw, 4096));
         }
+        // Admission can change between the cut and copy planning. Reject the
+        // new plan before allocation, release its leases, and retry cleanly.
+        source.bitmap_marking = true;
+        source.bitmap_locator = true;
+        source.sparse_gc_copy_bytes = 64 * 1024 * 1024;
+        try std.testing.expect(!try source.startMarkingLocked(&raw));
+        var progress: Store.ScanProgress = .{};
+        try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress);
+        try std.testing.expect(source.marking.?.scan_done);
+        budget.reservation.shrink(budget.reservation.bytes - budget.live_bytes);
+        var plan_pressure = try manager.reserve(.dense_source_payload_state, limit - manager.sliceStats(.dense_source_payload_state).used_bytes);
+        defer plan_pressure.release();
+        const before_deferred_plan = source.stats.collection_deferrals;
+        try std.testing.expect(!try source.finishMarkingLocked(4096));
+        try std.testing.expect(source.marking == null and source.collection == null);
+        try std.testing.expect(!source.poisoned);
+        try std.testing.expectEqual(before_deferred_plan + 1, source.stats.collection_deferrals);
+        try std.testing.expectEqual(generation, source.currentGeneration());
+        plan_pressure.release();
         var steps: usize = 0;
         while (!try source.collectStep(&raw, 4096)) : (steps += 1) try std.testing.expect(steps < 4096);
         try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
@@ -4069,6 +4174,10 @@ test "source vector payloads deferred inventory preserves receipt totals and bui
     defer source.deinit();
     source.checkpoint_receipts = true;
     try std.testing.expect(try source.loadCheckpointReceipt());
+    // This fixture exercises deferred cache construction, regardless of a
+    // process-wide small-table policy. The cutoff has separate transition tests.
+    source.inventory_min_payloads = 0;
+    source.inventory_requested = true;
     source.incremental_inventory = true;
     source.inventory.deinit(alloc);
     const updates = source.stats.inventory_updates;
@@ -4087,12 +4196,18 @@ test "source vector payloads deferred inventory preserves receipt totals and bui
     try std.testing.expectEqual(@as(u64, 2), source.stats.retained_payloads);
     // A failed first map construction consumes neither the old source nor next.
     var next = try source.opened.clone(alloc);
-    defer next.deinit();
+    var next_owned = true;
+    defer if (next_owned) next.deinit();
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     {
         source.alloc = failing.allocator();
         defer source.alloc = alloc;
-        try std.testing.expectError(error.OutOfMemory, source.installOpened(&next));
+        const installation = source.installOpened(&next);
+        if (installation) |_| {
+            // Preserve single ownership even if the expected failure regresses.
+            next_owned = false;
+        } else |_| {}
+        try std.testing.expectError(error.OutOfMemory, installation);
     }
     try std.testing.expect(!source.inventory.initialized);
     try source.checkpoint();
@@ -4195,7 +4310,7 @@ test "source vector payloads cost experiments preserve updates deletes old lease
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
-    for ([_]bool{ false, true }) |bitmap| for ([_]bool{ false, true }) |delta| for ([_]u64{ 0, 2 }) |cutoff| {
+    for ([_]bool{ false, true }) |bitmap| for ([_]bool{ false, true }) |delta| for ([_]u64{ 0, 2 }) |cutoff| for ([_]bool{ false, true }) |locator| {
         var memory = lsm.MemoryStorage.init(alloc);
         defer memory.deinit();
         var backend = mem.Backend.init(alloc, .{});
@@ -4205,6 +4320,7 @@ test "source vector payloads cost experiments preserve updates deletes old lease
         var source = try Store.open(alloc, memory.storage(), "/cost-experiments", false);
         defer source.deinit();
         source.bitmap_marking = bitmap;
+        source.bitmap_locator = locator;
         source.delta_inventory = delta;
         source.inventory.delta = delta;
         source.incremental_inventory = true;
@@ -4337,4 +4453,138 @@ test "source vector payloads debt notification counts committed replacements and
     try std.testing.expectEqual(@as(u64, 20), source.obsolete_debt);
     while (!try source.collectStep(&raw, 1)) {}
     try std.testing.expectEqual(@as(u64, 0), source.obsolete_debt);
+}
+
+fn testBitmapLocatorAllocation(alloc: Allocator, opened: *const native.Opened) !void {
+    var live = LiveSet.init(alloc);
+    defer live.deinit();
+    try live.enableBitmapsMode(opened, true);
+    var subset = LiveSet.init(alloc);
+    defer subset.deinit();
+    try subset.enableSubset(&live);
+}
+
+test "source vector payloads bitmap locator verifies collisions and owns immutable subset leases" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/bitmap-locator", false);
+    defer source.deinit();
+    source.append_only = true;
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var references: [64]payload.Reference = undefined;
+    for (&references, 0..) |*reference, i| {
+        var buffer: [32]u8 = undefined;
+        reference.* = try payload.Reference.forArtifact(try std.fmt.bufPrint(&buffer, "model-{d}", .{i}), artifact);
+        try Store.prepare(&source, &.{.{ .reference = reference.*, .artifact = artifact }});
+    }
+    try source.checkpoint();
+    try std.testing.checkAllAllocationFailures(alloc, testBitmapLocatorAllocation, .{&source.opened});
+    var control = LiveSet.init(alloc);
+    defer control.deinit();
+    try control.enableBitmaps(&source.opened);
+    var indexed = LiveSet.init(alloc);
+    defer indexed.deinit();
+    try indexed.enableBitmapsDeferred(&source.opened, true);
+    try std.testing.expect(indexed.locatorPending());
+    try indexed.put(references[0].digest, references[0].dims);
+    while (try indexed.advanceLocator()) {
+        try std.testing.expectEqual(@as(?u32, 3), indexed.get(references[0].digest));
+    }
+    try std.testing.expect(!indexed.locatorPending());
+    for (references) |reference| {
+        try control.put(reference.digest, reference.dims);
+        try indexed.put(reference.digest, reference.dims);
+    }
+    try std.testing.expectEqual(control.count(), indexed.count());
+    for (references) |reference| try std.testing.expectEqual(control.get(reference.digest), indexed.get(reference.digest));
+    var collision = references[0].digest;
+    collision[31] ^= 1; // identical bucket hash, different full identity
+    try std.testing.expect(indexed.get(collision) == null);
+    try std.testing.expectError(error.MissingCommittedVectorPayload, indexed.put(collision, 3));
+    try std.testing.expectError(error.VectorReferenceIdentityMismatch, indexed.put(references[0].digest, 4));
+    var subset = LiveSet.init(alloc);
+    defer subset.deinit();
+    try subset.enableSubset(&indexed);
+    for (references[0..32]) |reference| try subset.put(reference.digest, reference.dims);
+    indexed.clearRetainingCapacity();
+    const late = try payload.Reference.forArtifact("late-model", artifact);
+    try Store.prepare(&source, &.{.{ .reference = late, .artifact = artifact }});
+    try source.checkpoint();
+    try std.testing.expect(subset.get(late.digest) == null);
+    for (references[0..32]) |reference| try std.testing.expectEqual(@as(?u32, 3), subset.get(reference.digest));
+    var iterated: usize = 0;
+    var it = subset.iterator();
+    while (it.next()) |entry| {
+        try std.testing.expectEqual(@as(?u32, 3), control.get(entry.key_ptr.*));
+        iterated += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 32), iterated);
+}
+
+test "source vector payloads sparse batches amortize one mark with bounded selection and old leases" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    for ([_]u64{ 0, 84, 64 * 1024 * 1024 }) |target| {
+        var memory = lsm.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var source = try Store.open(alloc, memory.storage(), "/sparse-batches", false);
+        defer source.deinit();
+        source.append_only = true;
+        source.selective_gc = true;
+        source.sparse_gc_copy_bytes = target;
+        source.mark_outside_lock = true;
+        source.mark_step_rows = 1;
+        var backend = mem.Backend.init(alloc, .{});
+        defer backend.close();
+        var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer raw.deinit();
+        var store = try docs.DocStore.openRuntime(alloc, &raw);
+        defer store.close();
+        store.payload_store = source.interface();
+        const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+        defer alloc.free(artifact);
+        var counts: [3]usize = @splat(0);
+        var names: [3][8][]u8 = undefined;
+        defer for (0..3) |shard| for (names[shard][0..counts[shard]]) |name| alloc.free(name);
+        var attempt: usize = 0;
+        while (counts[0] + counts[1] + counts[2] != 24) : (attempt += 1) {
+            var buffer: [40]u8 = undefined;
+            const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buffer, "sparse-{d}", .{attempt}), "model-a");
+            const reference = try payload.Reference.forArtifact(key, artifact);
+            const shard = vector_block.keyHash(&reference.digest) & 127;
+            if (shard >= 3 or counts[shard] == 8) {
+                alloc.free(key);
+                continue;
+            }
+            names[shard][counts[shard]] = key;
+            counts[shard] += 1;
+            try store.put(key, artifact);
+        }
+        try source.checkpoint();
+        var old = try source.snapshot(alloc);
+        defer old.deinit();
+        for (0..3) |shard| try store.delete(names[shard][0]);
+        const collections = source.stats.collections;
+        while (!try source.collectStep(&raw, 12)) {}
+        try std.testing.expectEqual(collections + 1, source.stats.collections);
+        // Each segment has seven live 12-byte vectors and one dead vector.
+        try std.testing.expectEqual(@as(u64, if (target > 84) 21 else 23), source.stats.retained_payloads);
+        for (0..3) |shard| {
+            const old_reference = try payload.Reference.forArtifact(names[shard][0], artifact);
+            try std.testing.expect((try old.get(&old_reference.digest, std.math.maxInt(u64), 1)) == .vector);
+            for (names[shard][1..]) |key| {
+                const actual = try store.get(alloc, key);
+                defer alloc.free(actual);
+                try std.testing.expectEqualSlices(u8, artifact, actual);
+            }
+        }
+        while (source.stats.retained_payloads != 21) _ = try source.collectStep(&raw, 12);
+        try source.inventoryRetainedPayloads();
+        try std.testing.expectEqual(@as(u64, 21), source.stats.retained_payloads);
+        try std.testing.expectEqual(@as(u64, 21 * 12), source.stats.retained_payload_bytes);
+    }
 }
