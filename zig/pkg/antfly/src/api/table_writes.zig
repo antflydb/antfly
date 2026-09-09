@@ -15663,18 +15663,12 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         leases: []const ProvisionedTableWriteCache.CachedDb,
     ) void {
-        // Maintenance does not replace the storage root or revoke a serving
-        // generation. Fence completion until the same resident owner samples
-        // current state, preserving immutable serving facts on WriterLocked.
-        // Root replacement and durable repair retain their separate, explicit
-        // authority invalidations. A retired maintenance lease cannot revoke
-        // a replacement root's observations.
-        for (leases) |lease| {
-            const entry = lease.entry orelse continue;
-            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
-            if (self.runtime_status_cache) |cache|
-                cache.markGroupTargetObservationPending(entry.table_name, entry.group_id, null);
-        }
+        // Maintenance refreshes acceleration/progress facts; it does not
+        // create a new source target. Only durable commits and structural
+        // transitions may revoke source-observation authority. In particular,
+        // a busy owner must not turn known pending coverage into unknown on
+        // every maintenance tick. Publication still validates root identity
+        // and the commit fence captured before sampling.
         self.publishRuntimeStatusLeaseSnapshots(alloc, leases);
     }
 
@@ -28298,10 +28292,15 @@ test "standalone managed structural catch-up owns admitted enrichment progress" 
     _ = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
 
     var outcome: ManagedIndexCreateCatchUp = .retry;
-    for (0..8) |_| {
+    // Native publication runs on the checkpoint worker even when resident
+    // replay workers are disabled. Drive the standalone owner until its
+    // durable proof settles; a fixed poll count races that worker's I/O.
+    const deadline_ns = platform_time.monotonicNs() + 15 * std.time.ns_per_s;
+    while (platform_time.monotonicNs() < deadline_ns) {
         outcome = try catchUpManagedIndexCreate(alloc, &db, cfg.name, false);
         if (outcome == .complete) break;
         try std.testing.expectEqual(ManagedIndexCreateCatchUp.retry, outcome);
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectEqual(ManagedIndexCreateCatchUp.complete, outcome);
     try std.testing.expect(try db.completedManagedDenseGenerationIsServiceable(alloc, cfg.name));
@@ -30619,6 +30618,7 @@ fn observedSourceTargetSequence(stats: db_mod.types.DBStats) u64 {
         stats.doc_identity.max_deleted_generation,
     );
     for (stats.indexes) |item| {
+        if (item.runtime_coverage_source_sequence) |sequence| target = @max(target, sequence);
         target = @max(target, item.replay_target_sequence);
         for (item.source_replay) |source| target = @max(target, source.target_sequence);
     }
@@ -49628,7 +49628,7 @@ test "runtime status publication rejects retired writer and authoritatively clea
     try std.testing.expect(!published.items[0].stats.repair_degraded);
 }
 
-test "maintenance runtime status preserves serving facts while fencing convergence" {
+test "maintenance runtime status preserves source observation without inventing targets" {
     const alloc = std.testing.allocator;
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -49695,8 +49695,8 @@ test "maintenance runtime status preserves serving facts while fencing convergen
         try std.testing.expectEqual(@as(u64, 41), preserved.items[0].stats.doc_count);
         try std.testing.expect(preserved.items[0].metadata.target_observation_complete);
     }
-    // On the current root, contention withdraws completion but leaves the
-    // immutable facts available. This is the recurring maintenance/E2E race.
+    // A maintenance refresh blocked by the current writer cannot revoke a
+    // source observation: no commit or structural transition occurred.
     visible_generation = 1;
     db.core.lockApplyExclusive();
     source.refreshMaintenanceRuntimeStatusLeaseSnapshots(alloc, &.{lease});
@@ -49705,8 +49705,19 @@ test "maintenance runtime status preserves serving facts while fencing convergen
         var preserved = (try snapshot_cache.snapshot(alloc, "docs")).?;
         defer preserved.deinit(alloc);
         try std.testing.expectEqual(@as(u64, 41), preserved.items[0].stats.doc_count);
-        try std.testing.expect(!preserved.items[0].metadata.target_observation_complete);
+        try std.testing.expect(preserved.items[0].metadata.target_observation_complete);
         try std.testing.expect(runtime_status.statusHasRuntimeFacts(preserved.items[0]));
+    }
+    // A real structural invalidation remains fenced despite any number of
+    // blocked maintenance refreshes. Only a new owner observation repairs it.
+    snapshot_cache.markGroupTargetObservationPending("docs", 7001, null);
+    db.core.lockApplyExclusive();
+    for (0..8) |_| source.refreshMaintenanceRuntimeStatusLeaseSnapshots(alloc, &.{lease});
+    db.core.unlockApplyExclusive();
+    {
+        var pending = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer pending.deinit(alloc);
+        try std.testing.expect(!pending.items[0].metadata.target_observation_complete);
     }
     source.refreshMaintenanceRuntimeStatusLeaseSnapshots(alloc, &.{lease});
     {
@@ -49865,12 +49876,14 @@ test "provisioned owner publication advances exact index replay target" {
         },
     );
 
-    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
-    try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.indexes[0].replay_target_sequence);
-    try std.testing.expect(!statuses.items[0].metadata.target_observation_complete);
-    statuses.deinit(alloc);
+    {
+        var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+        defer statuses.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+        try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+        try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.indexes[0].replay_target_sequence);
+        try std.testing.expect(!statuses.items[0].metadata.target_observation_complete);
+    }
 
     // Activity refreshes normally reuse the immutable cached snapshot and
     // overlay resident lifecycle facts. Once that overlay succeeds it is an
@@ -49878,13 +49891,18 @@ test "provisioned owner publication advances exact index replay target" {
     // carrying the cached false bit forward would leave completion unknown
     // forever after restart.
     try std.testing.expect(source.overlayCachedManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
-    statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
-    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
-    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
-    try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
-    try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
-    try std.testing.expect(statuses.items[0].metadata.target_observation_complete);
-    statuses.deinit(alloc);
+    {
+        var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+        defer statuses.deinit(alloc);
+        const item = statuses.items[0].stats.indexes[0];
+        try std.testing.expectEqual(@as(u64, 2), item.replay_target_sequence);
+        try std.testing.expectEqual(@as(u64, 2), item.replay_applied_sequence);
+        try std.testing.expect(!item.replay_catch_up_required);
+        // Replay convergence does not complete asynchronous native projection
+        // publication. Any remaining backfill here must be that explicit debt.
+        try std.testing.expectEqual(item.dense_vector_projection_pending, item.backfill_active);
+        try std.testing.expect(statuses.items[0].metadata.target_observation_complete);
+    }
 
     const unrelated_sequence = cached.db.core.store.nextReplaySequence(1);
     const unrelated_payload = try change_journal_mod.encodeRecord(alloc, .{
@@ -49898,7 +49916,7 @@ test "provisioned owner publication advances exact index replay target" {
     // A global replay entry for another managed-index kind must not recreate
     // dense replay debt in the next authoritative owner publication.
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
-    statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);

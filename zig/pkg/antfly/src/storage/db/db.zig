@@ -28589,6 +28589,7 @@ pub const DB = struct {
             item.coverage_publication = null;
             item.runtime_serving_applied_sequence = null;
             item.runtime_coverage_applied_sequence = null;
+            item.runtime_coverage_source_sequence = null;
         }
         // Coverage outcomes and identity totals are one status invariant. A
         // cached status may predate the write whose generated artifact is
@@ -29164,6 +29165,7 @@ pub const DB = struct {
         if (item.coverage_summary_ready) {
             item.coverage_publication = stamp;
             item.runtime_coverage_applied_sequence = stamp.applied_through;
+            item.runtime_coverage_source_sequence = self.core.nextDerivedSequence();
         }
     }
 
@@ -91845,6 +91847,10 @@ test "db progressive managed admission serves a checkpointed partial generation"
     var producer_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
     producer_checkpoint.applied_sequence = @max(producer_checkpoint.applied_sequence, producer_fence);
     try db.core.saveProjectionCheckpoint(cfg.name, producer_checkpoint);
+    // Lifecycle metadata cannot advance native WAL coverage. Model the
+    // mutation-free replay boundary through its durable sequence authority.
+    try db.core.saveAppliedSequence(cfg.name, producer_fence);
+    try std.testing.expectEqual(producer_fence, try db.managedIndexAppliedSequence(alloc, cfg.name));
     try db.updateIndexRepairIntent(alloc, repair_id, .{ .target_sequence = producer_fence });
     const rearmed = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
     try std.testing.expect(rearmed.deferred);
@@ -111639,7 +111645,7 @@ test "db native snapshot admission bounds capture under concurrent writes" {
         fn afterCaptureAdmission(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn afterApplyRelease(ptr: *anyopaque) void {
@@ -111649,13 +111655,13 @@ while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .
                 self.apply_released.store(true, .release);
             }
             self.copy_entered.store(true, .release);
-while (!self.release_copy.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release_copy.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn beforeArtifactMaterialize(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.materialize_entered.store(true, .release);
-while (!self.release_materialize.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release_materialize.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const SnapshotWorker = struct {
@@ -111768,7 +111774,7 @@ while (!self.release_materialize.load(.acquire)) std.testing.io.sleep(.fromNanos
     const copy_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (!fence.copy_entered.load(.acquire) and
         !worker.done.load(.acquire) and
-monotonicTimeNs() < copy_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        monotonicTimeNs() < copy_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     if (!fence.copy_entered.load(.acquire)) {
         worker.canceled.store(true, .release);
         fence.release_copy.store(true, .release);
@@ -111800,7 +111806,7 @@ monotonicTimeNs() < copy_deadline) std.testing.io.sleep(.fromNanoseconds(1), .aw
     const materialize_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (!fence.materialize_entered.load(.acquire) and
         !worker.done.load(.acquire) and
-monotonicTimeNs() < materialize_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        monotonicTimeNs() < materialize_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     if (!fence.materialize_entered.load(.acquire)) {
         worker.canceled.store(true, .release);
         fence.release_materialize.store(true, .release);

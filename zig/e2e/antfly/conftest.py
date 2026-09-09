@@ -1233,12 +1233,12 @@ class StatefulAntflyServer:
 def require_standalone_storage_headroom(root: Path) -> None:
     """Fail before launch when production disk admission cannot run fixtures.
 
-    Match storage/resource_manager.zig's default max(1 GiB, capacity/20)
+    Match storage/resource_manager.zig's max(1 GiB, min(capacity/20, 16 GiB))
     safety floor, plus 256 MiB for the small local fixtures. This is a test
     environment requirement, not an override of the server's disk guard.
     """
     usage = shutil.disk_usage(root)
-    safety_floor = max(1024**3, usage.total // 20)
+    safety_floor = max(1024**3, min(usage.total // 20, 16 * 1024**3))
     required = safety_floor + 256 * 1024**2
     if usage.free < required:
         raise RuntimeError(

@@ -3223,6 +3223,11 @@ pub const DBIndexStats = struct {
     // metadata relabeling nor cloning may manufacture a witness.
     runtime_serving_applied_sequence: ?u64 = null,
     runtime_coverage_applied_sequence: ?u64 = null,
+    // Durable source frontier sampled with these coverage counters under the
+    // owner's apply lock. Artifact replay can lag while a provider is working;
+    // observing pending source work must not require producing that artifact.
+    // This witness follows the coverage payload, never a progress overlay.
+    runtime_coverage_source_sequence: ?u64 = null,
     // Owner-issued local payload authority. Null means unknown, not revision
     // zero. These are never synthesized by metadata overlays or serialized.
     serving_publication: ?@import("publication.zig").Stamp = null,
