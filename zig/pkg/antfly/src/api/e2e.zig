@@ -53,6 +53,17 @@ const query_openapi = @import("antfly_query_openapi");
 const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const AgentStatus = metadata_openapi.AgentStatus;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
+const native_catalog = @import("../catalog/domain.zig");
+
+fn resolveTestTable(svc: *metadata_service.MetadataService, name: []const u8) !native_catalog.ResolvedTable {
+    const alloc = std.testing.allocator;
+    const bytes = try http_server.StatusSource.fromMetadataService(svc).nativeCatalog(alloc, .{}, .{ .resolve = try native_catalog.Target.parse(name) });
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(?native_catalog.ResolvedTable, alloc, bytes, .{});
+    defer parsed.deinit();
+    const table = parsed.value orelse return error.TestUnexpectedResult;
+    return .{ .table_id = table.table_id, .name = try alloc.dupe(u8, table.name) };
+}
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try ant_json.parseFromSlice(T, alloc, body, .{});
@@ -741,9 +752,9 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(projected_ranges.len > 0);
     const projected_tables = try svc.listProjectedTables(std.testing.allocator);
     defer svc.freeProjectedTables(std.testing.allocator, projected_tables);
-    const docs_table_id = for (projected_tables) |table| {
-        if (std.mem.eql(u8, table.name, "docs")) break table.table_id;
-    } else return error.TestUnexpectedResult;
+    const docs_identity = try resolveTestTable(&svc, "docs");
+    defer std.testing.allocator.free(docs_identity.name);
+    const docs_table_id = docs_identity.table_id;
     const group_id = for (projected_ranges) |range| {
         if (range.table_id == docs_table_id) break range.group_id;
     } else return error.TestUnexpectedResult;
@@ -7405,6 +7416,8 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
     try std.testing.expectEqual(@as(usize, 1), projected_ranges.len);
 
+    const docs_identity = try resolveTestTable(&svc, "docs");
+    defer std.testing.allocator.free(docs_identity.name);
     const left_group_id = projected_ranges[0].group_id;
     var group_statuses = [_]metadata_mod.GroupStatusReport{.{
         .group_id = left_group_id,
@@ -7414,7 +7427,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     }};
     var runtime_statuses = [_]metadata_mod.RuntimeGroupStatusReport{.{
         .table_id = projected_ranges[0].table_id,
-        .table_name = "docs",
+        .table_name = docs_identity.name,
         .group_id = left_group_id,
         .store_id = 1,
         .node_id = 1,
@@ -7445,7 +7458,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
     // re-entering the metadata API and deadlocking behind that control round.
     data_server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
     defer data_server.setRemoteMetadataFetchErrorForTest(null);
-    try metadata_client.requestTableSplit(metadata_api, "docs", split_body);
+    try metadata_client.requestTableSplit(metadata_api, docs_identity.name, split_body);
 
     var finalized = false;
     rounds = 0;

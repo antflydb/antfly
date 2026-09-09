@@ -4951,6 +4951,7 @@ pub const AntflyApiHandler = struct {
             return null;
         };
         defer if (route) |value| value.deinit(alloc);
+        if (route == null and self.api_server.source.vtable.native_catalog == null) return name;
         const target: native_catalog.Target = (if (route) |value| value.target() else native_catalog.Target.parse(name)) catch {
             alloc.free(name);
             _ = ctx.status(400);

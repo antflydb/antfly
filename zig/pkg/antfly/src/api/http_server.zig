@@ -17022,6 +17022,7 @@ pub const ApiHttpServer = struct {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
+        var names = RestoreCatalogNames{ .source = self.source, .arena = arena };
         var jobs = std.ArrayListUnmanaged(RestoreJobView).empty;
         defer jobs.deinit(arena);
         try jobs.ensureTotalCapacity(arena, options.limit);
@@ -17051,13 +17052,13 @@ pub const ApiHttpServer = struct {
                 if (options.phase) |phase| if (state.phase != phase) continue;
                 if (options.scope) |scope| if (state.scope != scope) continue;
                 if (identity) |authenticated| {
-                    if (!try self.restoreJobStateAllowed(authenticated, state)) continue;
+                    if (!try restoreJobStateAllowed(authenticated, state, &names)) continue;
                 }
                 if (jobs.items.len == options.limit) {
                     continuation_cursor = last_returned_sequence;
                     break :scan;
                 }
-                jobs.appendAssumeCapacity(try self.restoreJobViewFromStateAlloc(arena, state));
+                jobs.appendAssumeCapacity(try restoreJobViewFromStateAlloc(arena, state, &names));
                 last_returned_sequence = state.enqueue_sequence;
             }
             scan_cursor = batch.next_scan_cursor orelse break;
@@ -17074,34 +17075,58 @@ pub const ApiHttpServer = struct {
         });
     }
 
-    fn catalogLogicalNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, physical: []const u8) ![]u8 {
-        if (std.mem.startsWith(u8, physical, "table:") and self.source.vtable.native_catalog != null) {
-            const bytes = try self.source.nativeCatalog(alloc, .{}, .snapshot);
-            defer alloc.free(bytes);
-            var state = try std.json.parseFromSlice(native_catalog.State, alloc, bytes, .{});
-            defer state.deinit();
-            for (state.value.resources) |resource| {
-                if (resource.kind != .table or !std.mem.eql(u8, resource.storage_name, physical)) continue;
-                const namespace = state.value.byId(.namespace, resource.parent_id) orelse return error.InvalidCatalogRecord;
-                const database = state.value.byId(.database, namespace.parent_id) orelse return error.InvalidCatalogRecord;
-                return std.fmt.allocPrint(alloc, "{s}.{s}.{s}", .{ database.name, namespace.name, resource.name });
+    /// Request-arena-owned projection shared by authorization and rendering.
+    /// A new request reloads names so renames are never hidden by a TTL cache.
+    const RestoreCatalogNames = struct {
+        source: StatusSource,
+        arena: std.mem.Allocator,
+        loaded: bool = false,
+        names: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+        fn resolve(self: *@This(), physical: []const u8) ![]const u8 {
+            if (self.source.vtable.native_catalog == null) return physical;
+            if (!self.loaded) {
+                const bytes = try self.source.nativeCatalog(self.arena, .{}, .snapshot);
+                const state = try std.json.parseFromSliceLeaky(native_catalog.State, self.arena, bytes, .{});
+                var databases = std.AutoHashMapUnmanaged(u64, native_catalog.Resource).empty;
+                var namespaces = std.AutoHashMapUnmanaged(u64, native_catalog.Resource).empty;
+                try databases.put(self.arena, native_catalog.default_database_id, native_catalog.default_database);
+                try namespaces.put(self.arena, native_catalog.default_namespace_id, native_catalog.default_namespace);
+                for (state.resources) |resource| switch (resource.kind) {
+                    .database => try databases.put(self.arena, resource.id, resource),
+                    .namespace => try namespaces.put(self.arena, resource.id, resource),
+                    else => {},
+                };
+                for (state.resources) |resource| {
+                    if (resource.kind != .table) continue;
+                    const namespace = namespaces.get(resource.parent_id) orelse return error.InvalidCatalogRecord;
+                    const database = databases.get(namespace.parent_id) orelse return error.InvalidCatalogRecord;
+                    const logical = try std.fmt.allocPrint(self.arena, "{s}.{s}.{s}", .{ database.name, namespace.name, resource.name });
+                    const entry = try self.names.getOrPut(self.arena, resource.storage_name);
+                    if (entry.found_existing) return error.InvalidCatalogRecord;
+                    entry.value_ptr.* = logical;
+                }
             }
-            if (try native_catalog.restoreTarget(physical)) |target| return target.resourceNameAlloc(alloc);
+            self.loaded = true;
+            if (self.names.get(physical)) |name| return name;
+            if (try native_catalog.restoreTarget(physical)) |target| return target.resourceNameAlloc(self.arena);
+            return physical;
         }
-        return alloc.dupe(u8, physical);
-    }
+    };
 
     pub fn restoreJobAllowed(self: *ApiHttpServer, alloc: std.mem.Allocator, identity: AuthenticatedIdentity, job_id: u64) !bool {
         const encoded = (try self.restore_job_store.load(alloc, job_id)) orelse return false;
         defer alloc.free(encoded);
         var parsed = try std.json.parseFromSlice(restore_jobs.JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        return self.restoreJobStateAllowed(identity, parsed.value);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var names = RestoreCatalogNames{ .source = self.source, .arena = arena.allocator() };
+        return restoreJobStateAllowed(identity, parsed.value, &names);
     }
 
-    fn restoreJobStateAllowed(self: *ApiHttpServer, identity: AuthenticatedIdentity, state: restore_jobs.JobState) !bool {
-        const logical_name = if (state.table_name) |name| try self.catalogLogicalNameAlloc(self.alloc, name) else null;
-        defer if (logical_name) |name| self.alloc.free(name);
+    fn restoreJobStateAllowed(identity: AuthenticatedIdentity, state: restore_jobs.JobState, names: *RestoreCatalogNames) !bool {
+        const logical_name = if (state.table_name) |name| try names.resolve(name) else null;
         return switch (state.scope) {
             .cluster => permissionsAllow(identity.permissions, .@"*", "*", .admin),
             .table => permissionsAllow(identity.permissions, .table, logical_name orelse return false, .admin),
@@ -17130,10 +17155,11 @@ pub const ApiHttpServer = struct {
     fn restoreJobViewAlloc(self: *ApiHttpServer, arena: std.mem.Allocator, encoded: []const u8) !RestoreJobView {
         var parsed = try std.json.parseFromSlice(restore_jobs.JobState, arena, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        return try self.restoreJobViewFromStateAlloc(arena, parsed.value);
+        var names = RestoreCatalogNames{ .source = self.source, .arena = arena };
+        return try restoreJobViewFromStateAlloc(arena, parsed.value, &names);
     }
 
-    fn restoreJobViewFromStateAlloc(self: *ApiHttpServer, arena: std.mem.Allocator, state: restore_jobs.JobState) !RestoreJobView {
+    fn restoreJobViewFromStateAlloc(arena: std.mem.Allocator, state: restore_jobs.JobState, names: *RestoreCatalogNames) !RestoreJobView {
         const result: ?std.json.Value = if (state.result_json) |raw| blk: {
             const value = try std.json.parseFromSlice(std.json.Value, arena, raw, .{});
             break :blk value.value;
@@ -17142,14 +17168,14 @@ pub const ApiHttpServer = struct {
             .job_id = try std.fmt.allocPrint(arena, "{d}", .{state.job_id}),
             .attempt_id = state.attempt_id,
             .scope = state.scope,
-            .table_name = if (state.table_name) |table_name| try self.catalogLogicalNameAlloc(arena, table_name) else null,
+            .table_name = if (state.table_name) |table_name| try arena.dupe(u8, try names.resolve(table_name)) else null,
             .backup_id = try arena.dupe(u8, state.backup_id),
             .phase = state.phase,
             .cancel_requested = state.cancel_requested,
             .durability_pending_table_count = restore_jobs.tableIndexRangeCount(state.durability_pending_table_ranges orelse &.{}),
             .published_table_count = restore_jobs.tableIndexRangeCount(state.published_table_ranges orelse &.{}),
             .completed_table_count = restore_jobs.tableIndexRangeCount(state.completed_table_ranges orelse &.{}),
-            .total_table_count = if (state.scope == .table) @as(usize, 1) else if (state.table_names) |names| names.len else null,
+            .total_table_count = if (state.scope == .table) @as(usize, 1) else if (state.table_names) |table_names| table_names.len else null,
             .result = result,
             .@"error" = if (state.last_error) |last_error| try arena.dupe(u8, last_error) else null,
             .created_at_ms = state.created_at_ms,
@@ -47729,4 +47755,68 @@ test "native catalog physical aliases retain live permission revocation after cl
     try std.testing.expect(!try tablePermissionCurrentlyAllowed(cloned, "table:stable", .write));
     try auth.manager.removePermissionFromUser("reader", "analytics.public.*", .table);
     try std.testing.expect(!try tablePermissionCurrentlyAllowed(cloned, "table:stable", .read));
+}
+
+test "native catalog restore listing shares one projection and honors legacy renames" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        snapshots: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: native_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(input == .snapshot);
+            self.snapshots += 1;
+            const resources = [_]native_catalog.Resource{
+                .{ .kind = .table, .id = 10, .parent_id = 2, .name = "articles", .storage_name = "docs" },
+                .{ .kind = .table, .id = 11, .parent_id = 2, .name = "events", .storage_name = "table:immutable" },
+            };
+            return std.json.Stringify.valueAlloc(a, native_catalog.State{ .resources = &resources }, .{});
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fake = Fake{};
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .native_catalog = Fake.catalog } }, null, null);
+    defer server.deinit();
+    try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "catalog-list");
+    server.restore_job_store.io = std.testing.io;
+    for (0..40) |i| {
+        const backup_id = try std.fmt.allocPrint(alloc, "backup-{d}", .{i});
+        defer alloc.free(backup_id);
+        const encoded = try server.restore_job_store.start(alloc, .{
+            .scope = .table,
+            .table_name = if (i % 2 == 0) "docs" else "table:immutable",
+            .backup_id = backup_id,
+            .location = "file:///backups",
+            .connection = "archive",
+            .idempotency_namespace = "catalog-list",
+        });
+        alloc.free(encoded);
+    }
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "default.public.*", .admin);
+    defer permission.deinit(alloc);
+    var permissions = [_]usermgr.Permission{permission};
+    const identity = AuthenticatedIdentity{ .username = @constCast("operator"), .permissions = &permissions };
+    var result = try server.handlePublicListRestoreJobs(identity, .{ .limit = 50 });
+    defer result.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.body, .{});
+    defer parsed.deinit();
+    const jobs = parsed.value.object.get("jobs").?.array.items;
+    try std.testing.expectEqual(@as(usize, 40), jobs.len);
+    for (jobs) |job| {
+        const name = job.object.get("table_name").?.string;
+        try std.testing.expect(std.mem.eql(u8, name, "default.public.articles") or std.mem.eql(u8, name, "default.public.events"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.snapshots);
+    var old_permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .admin);
+    defer old_permission.deinit(alloc);
+    permissions[0] = old_permission;
+    var denied = try server.handlePublicListRestoreJobs(identity, .{ .limit = 50 });
+    defer denied.deinit(alloc);
+    var denied_json = try std.json.parseFromSlice(std.json.Value, alloc, denied.body, .{});
+    defer denied_json.deinit();
+    try std.testing.expectEqual(@as(usize, 0), denied_json.value.object.get("jobs").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 2), fake.snapshots);
 }

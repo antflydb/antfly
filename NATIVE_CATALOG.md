@@ -114,6 +114,38 @@ Positive indexed lookups return only the immutable table ID and physical name.
 The binary table-record reader validates length framing without copying or
 parsing schema/index definitions. A regression resolves a record with a 256 KiB
 definition using a 16 KiB allocation budget. Negative lookups check the catalog
-inventory to distinguish absence from a corrupt name index. Further profiling
-should measure remote leader discovery and query-response name projection;
-those still perform work per request and per response, respectively.
+inventory to distinguish absence from a corrupt name index. Restore-job lists
+share one request-owned catalog snapshot and a physical-to-logical name map
+between authorization and rendering, including bindings for renamed legacy
+tables. A regression checks that 40 jobs use one snapshot and that a subsequent
+request reloads the projection before applying grants.
+
+The remaining performance opportunities below are code-path observations,
+not measured throughput claims:
+
+- Split-node resolution uses the mutation forwarding driver, which fetches
+  metadata status before the catalog RPC, even for reads. A direct read path
+  should return and validate authority/incarnation evidence and retain bounded
+  rediscovery on leader changes. Skipping identity checks or caching names with
+  a TTL would weaken the current correctness guarantees. Global NDJSON queries
+  currently repeat resolution per line.
+- Query-response name projection parses and serializes the entire response to
+  change its table label. Carrying the logical response name to the final
+  encoder would eliminate that second body traversal and allocation.
+- Namespace table listings collect status and construct responses for all
+  tables before filtering, then repeatedly scan catalog bindings. Select the
+  relevant identities first and join through a map before collecting status.
+- Catalog mutation validation and Raft apply decode all physical table
+  definitions to construct an identity inventory. An identity-only inventory
+  would reduce serialized metadata work for clusters with large schemas.
+
+These optimizations can be scoped independently of the optional M1–M3 refactors.
+
+The public API smoke E2E currently exposes a correctness gap in joins: primary
+table routes resolve catalog names, but native right-hand join targets still
+reach physical table lookup unchanged. For example, joining `docs` to
+`customers` fails with `TableNotFound` after both tables are created through the
+catalog. Resolve all native join targets before planning and execution, while
+retaining logical names for authorization, row filters, and response labels;
+foreign-source targets must keep their existing semantics. This regression
+must be fixed before merge, independently of the performance work above.
