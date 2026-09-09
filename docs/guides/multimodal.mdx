@@ -3,10 +3,12 @@ title: Multimodal Embeddings
 description: Index and search images, audio, and documents with executable Antfly workflows
 prerequisites:
   - Antfly installed and running
-  - Antfly inference with the ClipClap model for native image or audio embeddings
+  - Antfly Inference with the ClipClap model for native image or audio embeddings
 difficulty: intermediate
 estimatedTime: "20 min"
 tags: [multimodal, images, pdf, embeddings]
+sidebar: concepts
+order: 6
 ---
 
 <Questions>
@@ -17,7 +19,9 @@ tags: [multimodal, images, pdf, embeddings]
 - Which embedding providers can maintain an index?
 </Questions>
 
-## Choose the right ingestion shape
+Antfly indexes images, audio, and documents in one of three shapes, and the choice decides what runs at write time, what is stored durably, and which providers can maintain the index. ClipClap, the native model, puts text, images, and audio in one vector space, so a plain-language query can return a picture and a picture can return its neighbors.
+
+## Choose the Ingestion Shape
 
 Antfly supports three explicit multimodal workflows:
 
@@ -37,7 +41,7 @@ call on every write and makes retries, cost, and durable intermediate output
 observable. It also prevents an index configuration from parsing successfully
 and failing only after ingestion starts.
 
-## Native image and audio embeddings
+## Native Image and Audio Embeddings
 
 ClipClap embeds text, images, and audio into one vector space. Install it once:
 
@@ -48,7 +52,7 @@ antfly inference pull antflydb/clipclap:gguf:Q4_K
 Restart `antfly standalone` if the running inference service does not discover
 the newly installed model.
 
-### Define the source field
+### Define the Source Field
 
 Link annotations make the remote-media intent visible in the table schema and
 available to tooling. The index template still controls when the URL is fetched.
@@ -74,7 +78,7 @@ antfly table create --table product_catalog \
   }'
 ```
 
-### Create the managed index
+### Create the Managed Index
 
 ```bash
 antfly index create --table product_catalog \
@@ -95,7 +99,8 @@ model during index creation and records its dimension, so omit `dimension`
 unless you want creation to verify an expected value.
 
 For remote URLs, configure `remote_content` with the narrowest required host or
-object-store allowlist. Remote access is denied by default; private and special
+object-store allowlist. An omitted allowlist leaves template fetches
+unrestricted rather than denied, so set one deliberately; private and special
 IP addresses remain blocked unless explicitly enabled. Data URIs do not require
 network access, but they are still subject to request and decoded-media limits.
 
@@ -108,7 +113,7 @@ antfly index wait --table product_catalog \
   --timeout 20m
 ```
 
-### Search with text
+### Search with Text
 
 Because ClipClap shares a vector space across modalities, ordinary text can
 retrieve matching images:
@@ -121,7 +126,7 @@ antfly query --table product_catalog \
   --limit 10
 ```
 
-### Search with an image URL
+### Search with an Image URL
 
 Use `embedding_template` to turn the query value into a media part using the
 same embedding model as the index:
@@ -142,7 +147,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
 For an inline data URI, use `{{media url=this}}` instead. Avoid logging or
 persisting large data URIs in query histories.
 
-## Precompute descriptions when text retrieval is the goal
+## Precomputed Descriptions for Text Retrieval
 
 If users search for detailed attributes that a joint embedding model does not
 capture well, generate a caption or transcript in the application and store it
@@ -174,7 +179,7 @@ This shape is efficient for repeated rebuilds: captioning runs once, the
 description can be inspected or corrected, and changing the embedding model
 does not repeat vision inference.
 
-## Bring your own vectors
+## Application-Managed Vectors
 
 Use an external index when the application already calls Gemini, Vertex, Cohere,
 OpenRouter, or another embedding service that is not executable by managed
@@ -198,7 +203,7 @@ Managed index creation accepts `antfly`, `ollama`, `openai`, and `bedrock`.
 Provider names exposed by broader embedding APIs are not automatically valid
 for managed indexing.
 
-## Durable PDF ingestion
+## Durable PDF Ingestion
 
 Template helpers are request-time transformations; they do not persist PDF
 pages or make OCR output independently reprocessable. Use a
@@ -230,7 +235,7 @@ OCR. For formats outside the built-in parser, use the
 `remotePDF` remains a compatibility helper for template-time extraction, but it
 is deprecated. Prefer durable extraction for production workflows.
 
-## Operational guidance
+## Operational Guidance
 
 - Keep `remote_content` allowlists narrow and use dedicated read-only object
   storage credentials.
@@ -243,3 +248,20 @@ is deprecated. Prefer durable extraction for production workflows.
   when it differs.
 - Monitor index status and wait for the required coverage before serving a new
   index to users.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Add a ClipClap image index over the photo_url field of my products table and search it by description", and use this page to judge the result.
+
+## Next Steps
+
+- [Quickstart](/docs/guides/quickstart#image-search): the same image index built over the Wikipedia thumbnails
+- [Artifact-Backed Indexes](/docs/guides/artifact-indexes): searching extracted PDF pages and chunks alongside whole documents
+- [Antfly Inference](/docs/guides/inference): pulling ClipClap and the other local models

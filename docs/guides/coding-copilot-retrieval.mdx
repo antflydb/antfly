@@ -1,0 +1,189 @@
+---
+title: "Power a Coding Copilot's Retrieval"
+description: "A repo index that answers both exact symbol lookups and intent questions, returned as a context block sized to your model's budget"
+order: 5
+---
+
+<Questions>
+- How do I index a codebase for retrieval?
+- How do I combine exact symbol search with semantic code search?
+- How do I fit retrieved code into a model's context budget?
+- Why does my coding assistant miss relevant files?
+</Questions>
+
+## The Result
+
+Your copilot asks Antfly for context and gets back the files that matter, whether it asked by symbol name (`parseConfig`) or by intent ("where are configuration defaults applied?"), already trimmed to fit its context window:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "where configuration defaults are applied",
+    "queries": [{
+      "table": "repo",
+      "full_text_search": {"query": "body:parseConfig"},
+      "semantic_search": "where configuration defaults are applied",
+      "indexes": ["code"],
+      "fields": ["path", "body"],
+      "limit": 30,
+      "reranker": {
+        "provider": "antfly",
+        "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+        "field": "body",
+        "candidate_count": 50
+      },
+      "pruner": {"min_score_ratio": 0.5}
+    }],
+    "stream": false
+  }'
+```
+
+```json
+{
+  "hits": [
+    {
+      "_id": "internal/config/defaults.go",
+      "_source": {
+        "path": "internal/config/defaults.go",
+        "body": "package config\n\n// applyDefaults fills unset fields..."
+      }
+    },
+    {
+      "_id": "internal/config/parse.go",
+      "_source": {
+        "path": "internal/config/parse.go",
+        "body": "package config\n\nfunc parseConfig(raw []byte) (*Config, error) {...}"
+      }
+    }
+  ]
+}
+```
+
+## Before You Start
+
+Antfly running in standalone mode with the embedding and reranking models pulled, which the [Quickstart](/docs/guides/quickstart) leaves you with:
+
+```bash
+curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+```
+
+## Build It
+
+### 1. Index the Repo
+
+One embeddings index over file contents. Code wants smaller chunks than prose, so a function does not get split from its signature:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/repo \
+  -H "Content-Type: application/json" \
+  -d '{
+    "indexes": {
+      "code": {
+        "type": "embeddings",
+        "template": "{{path}} {{body}}",
+        "embedder": {
+          "provider": "antfly",
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
+        },
+        "chunker": {
+          "provider": "antfly",
+          "text": {
+            "target_tokens": 150,
+            "overlap_tokens": 20
+          }
+        }
+      }
+    }
+  }'
+```
+
+Insert one document per file, keyed by path:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/repo/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inserts": {
+      "internal/config/defaults.go": {
+        "path": "internal/config/defaults.go",
+        "body": "package config\n\n// applyDefaults fills unset fields...\nfunc applyDefaults(c *Config) {...}"
+      },
+      "internal/config/parse.go": {
+        "path": "internal/config/parse.go",
+        "body": "package config\n\nfunc parseConfig(raw []byte) (*Config, error) {...}"
+      }
+    }
+  }'
+```
+
+In a real pipeline, walk the tree and batch a few hundred files per request. Re-insert a file when it changes and the index updates in place. Embedding runs in the background, so wait for the index before the first query:
+
+```bash
+antfly index wait --table repo --index code --until complete --timeout 10m
+```
+
+### 2. Query Both Ways at Once
+
+Exact symbols come from the keyword side. Intent comes from the semantic side. One query runs both and fuses the ranked lists:
+
+```bash
+antfly query --table repo \
+  --full-text-search 'body:parseConfig' \
+  --semantic-search "where configuration defaults are applied" \
+  --indexes "code" \
+  --fields "path,body" \
+  --limit 30
+```
+
+Build the keyword side from the literal tokens in the copilot's request (identifiers, error strings, file names) and the semantic side from its description of the task, since each side finds what the other misses.
+
+### 3. Rerank Against the Task
+
+Fusion gets the right candidates into the pool. A cross-encoder reranker orders them by how well each one serves what the copilot is trying to do, so rerank against the task description rather than the symbol:
+
+```bash
+antfly query --table repo \
+  --full-text-search 'body:parseConfig' \
+  --semantic-search "where configuration defaults are applied" \
+  --indexes "code" \
+  --fields "path,body" \
+  --limit 30 \
+  --reranker '{
+    "provider": "antfly",
+    "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+    "field": "body",
+    "candidate_count": 50
+  }' \
+  --pruner '{"min_score_ratio": 0.5}'
+```
+
+### 4. Fit the Context Budget
+
+The retrieval agent hands back the reranked, pruned hits in one envelope, most relevant first, and three settings decide how much text that is: `limit` caps how many documents can come back, the pruner drops the weak tail before that page is cut, and `fields` decides how much of each document travels. That is the call shown in The Result. With no `steps.generation` block it returns context and sources, not an answer, which is what your copilot's model wants to be handed. (`max_context_tokens` is not the lever here: it bounds the documents an agentic run puts into a tool response, and a pipeline-mode request ignores it.)
+
+## Tradeoffs
+
+The context budget is the setting to get right, and the common mistake is making it bigger than the copilot needs.
+
+A copilot can't know what it failed to retrieve. If the function that already solves the problem never reaches its context, it reinvents that function, and the failure looks like a bad model rather than a bad lookup. A bigger window does not fix this, because a window filled with near-misses buries the one file that mattered and spends tokens doing it.
+
+The budget forces a choice among candidates, which is the point. A `limit` of 20 to 30 with a `fields` projection that carries only what the model reads is a good starting point for a copilot that also carries the user's open file; raise it for a model with a large window, lower it when the copilot's own prompt is already long. Watch what gets cut on real tasks. If the right file is being dropped, the pruner is too tight, not the budget.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Index this repository into Antfly and wire up hybrid retrieval with reranking and a tight, pruned context budget", and use this page to judge the result.
+
+## Next Steps
+
+- [Tune Hybrid Search](/docs/guides/hybrid-search): fusion weights, reranking, and pruning in depth
+- [Quickstart](/docs/guides/quickstart): the same queries in the TypeScript, Python, and Go SDKs

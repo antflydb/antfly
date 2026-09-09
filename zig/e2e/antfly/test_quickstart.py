@@ -283,6 +283,7 @@ def test_public_quickstart_default_field_searches_dynamic_strings(
     ]
 
 
+@pytest.mark.fresh_antfly_process
 def test_public_quickstart_query_string_boolean_controls(stateful_api):
     table = f"quickstart_boolean_{time.time_ns()}"
     stateful_api.create_table(table, num_shards=1)
