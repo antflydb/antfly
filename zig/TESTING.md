@@ -3,6 +3,18 @@
 The root build exposes a default test aggregate plus package-scoped and
 special-purpose test tiers.
 
+## Build ownership
+
+`build.zig` resolves public options and connects owner constructors. Substantial
+library definitions live in `lib/<owner>/build_support.zig`. Antfly's runtime,
+embedded artifacts, benchmarks, generators, and test suites live in
+`pkg/antfly/build/`; inference constructors live in `pkg/inference/build/` and
+serve both package and root entrypoints. Small library definitions stay inline.
+
+Pass compatible module and generated-input handles into constructors. Native and
+WASM configurations remain separate. Runtime archive boundaries, link order, and
+test selections belong to their owners; moving a definition does not change them.
+
 ## Default Tests
 
 Run the default test suite from the repository root:

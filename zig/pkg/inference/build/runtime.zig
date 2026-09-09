@@ -720,7 +720,7 @@ fn addTokenizerDataModule(b: *std.Build, paths: Paths, register_public_modules: 
     });
 }
 
-fn addSentencePieceProtoModule(
+pub fn addSentencePieceProtoModule(
     b: *std.Build,
     protobuf_dep: *std.Build.Dependency,
     paths: Paths,

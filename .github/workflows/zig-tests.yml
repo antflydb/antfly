@@ -149,6 +149,11 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/inference/build/**' \
+            ':(glob)zig/lib/**/build_support.zig' \
+            ':(glob)zig/lib/**/build.zig' \
+            zig/tools/build_support.zig \
             zig/lib/httpx \
             zig/lib/objectstore \
             zig/pkg/antfly/src/api/backups.zig \
@@ -182,6 +187,11 @@ jobs:
             ':(glob)zig/lib/raft/**' \
             Makefile \
             zig/build.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/inference/build/**' \
+            ':(glob)zig/lib/**/build_support.zig' \
+            ':(glob)zig/lib/**/build.zig' \
+            zig/tools/build_support.zig \
             .github/workflows/zig-tests.yml
           then
             echo "trace_validate=false" >> "$GITHUB_OUTPUT"

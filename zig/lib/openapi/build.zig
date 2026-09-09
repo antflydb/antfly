@@ -21,24 +21,7 @@ pub fn build(b: *std.Build) void {
     const httpx_dep = b.dependency("httpx", .{});
     const httpx_mod = httpx_dep.module("httpx");
 
-    // Main library module
-    const openapi_mod = b.createModule(.{
-        .root_source_file = b.path("src/openapi.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // CLI executable
-    const exe = b.addExecutable(.{
-        .name = "openapi-zig",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    exe.root_module.addImport("openapi", openapi_mod);
-    exe.root_module.addImport("httpx", httpx_mod);
+    const exe = addCompiler(b, b.path("."), target, optimize, httpx_mod);
     b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);
@@ -67,6 +50,35 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("e2e", "Run end-to-end tests");
     e2e_step.dependOn(&e2e_modular.step);
     e2e_step.dependOn(&run_tests.step);
+}
+
+/// Construct the generator with paths and dependencies resolved by its caller.
+pub fn addCompiler(
+    b: *std.Build,
+    root: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    httpx_mod: *std.Build.Module,
+) *std.Build.Step.Compile {
+    // Main library module
+    const openapi_mod = b.createModule(.{
+        .root_source_file = root.path(b, "src/openapi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // CLI executable
+    const exe = b.addExecutable(.{
+        .name = "openapi-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = root.path(b, "src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("openapi", openapi_mod);
+    exe.root_module.addImport("httpx", httpx_mod);
+    return exe;
 }
 
 // ─── Build helper for consumers ──────────────────────────────────────────────
