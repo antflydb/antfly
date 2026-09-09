@@ -225,9 +225,13 @@ pub const Endpoint = struct {
         if (control.check) |check| try check(control.ptr);
         var pending = Pending{};
         self.mutex.lockUncancelable(self.io);
-        if (self.closed.load(.acquire) or self.pending.count() >= max_requests) {
+        if (self.closed.load(.acquire)) {
             self.mutex.unlock(self.io);
             return error.InferenceWorkerUnavailable;
+        }
+        if (self.pending.count() >= max_requests) {
+            self.mutex.unlock(self.io);
+            return error.QueueFull;
         }
         const id = self.next_id;
         self.next_id = std.math.add(u64, id, 2) catch {
@@ -334,9 +338,13 @@ pub const Endpoint = struct {
         _ = try payload.size();
         var offer = Offer{};
         self.mutex.lockUncancelable(self.io);
-        if (self.closed.load(.acquire) or self.offers.count() >= max_requests) {
+        if (self.closed.load(.acquire)) {
             self.mutex.unlock(self.io);
-            return error.ResourceTemporarilyUnavailable;
+            return error.InferenceWorkerUnavailable;
+        }
+        if (self.offers.count() >= max_requests) {
+            self.mutex.unlock(self.io);
+            return error.QueueFull;
         }
         const transfer = self.next_transfer;
         self.next_transfer = std.math.add(u64, transfer, 1) catch {
@@ -365,7 +373,11 @@ pub const Endpoint = struct {
             if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
             try self.waitTick(&offer.ready);
         }
-        if (!offer.accepted) return error.ResourceTemporarilyUnavailable;
+        // No payload or finish frame has crossed this boundary. A denied
+        // request has not executed and can be retried after sibling admission
+        // drains. Response denial is translated to terminal capacity below:
+        // the original request may already have executed successfully.
+        if (!offer.accepted) return error.QueueFull;
         const parts = payload.body_segments orelse &.{payload.body};
         for (0..parts.len + 1) |index| {
             const part = if (index == 0) payload.metadata else parts[index - 1];
@@ -572,14 +584,14 @@ pub const Endpoint = struct {
         const response = self.handler(self.context, request) catch |err| {
             // Terminal failure never needs message credit or an offer slot.
             // Even a completely full recipient can finish this one request.
-            self.sendFrame(if (err == error.ResourceTemporarilyUnavailable) .capacity else .failure, request.id, "") catch {};
+            self.sendFrame(if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) .capacity else .failure, request.id, "") catch {};
             return;
         };
         defer response.deinit();
         self.sendMessage(.response, request.id, response.view(), .{ .ptr = request, .check = Request.check }) catch |err| {
             // Terminal failure never needs message credit or an offer slot.
             // Even a completely full recipient can finish this one request.
-            self.sendFrame(if (err == error.ResourceTemporarilyUnavailable) .capacity else .failure, request.id, "") catch {};
+            self.sendFrame(if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) .capacity else .failure, request.id, "") catch {};
         };
     }
 };
@@ -589,6 +601,7 @@ const TestPair = struct {
     child: Endpoint,
     files: [4]std.Io.File,
     cancelled: std.atomic.Value(bool) = .init(false),
+    handled: std.atomic.Value(usize) = .init(0),
     cancel_seen: std.Io.Event = .unset,
 
     fn init(self: *TestPair) !void {
@@ -630,6 +643,7 @@ const TestPair = struct {
     fn closed(_: *anyopaque) void {}
     fn handle(raw: *anyopaque, request: *Request) !OwnedPayload {
         const self: *TestPair = @ptrCast(@alignCast(raw));
+        _ = self.handled.fetchAdd(1, .monotonic);
         if (std.mem.eql(u8, request.payload.view().body, "nested"))
             return request.endpoint.call(.{ .body = "echo" }, .{});
         if (std.mem.eql(u8, request.payload.view().body, "cancel")) {
@@ -732,7 +746,8 @@ test "inference worker bulk capacity rejects one request and leaves nested resou
     const occupied = try pair.child.allocateLocked(0, body.len);
     pair.child.mutex.unlock(pair.child.io);
     defer occupied.deinit();
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pair.parent.call(.{ .body = body }, .{}));
+    try std.testing.expectError(error.QueueFull, pair.parent.call(.{ .body = body }, .{}));
+    try std.testing.expectEqual(@as(usize, 0), pair.handled.load(.monotonic));
     const nested = try pair.parent.call(.{ .body = "nested" }, .{});
     defer nested.deinit();
     try std.testing.expectEqualStrings("echo", nested.view().body);

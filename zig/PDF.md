@@ -5254,6 +5254,35 @@ provide independent cache ownership and device-domain KV admission.
 
 ## Open decisions
 
+### Execution-path qualification and admission recovery
+
+The September render-control experiments exposed two distinct ingestion paths.
+`full_index`/`enrichments` precompute generated artifacts into the commit; `write`
+uses durable enrichment replay. Both use bounded PDF rendering, but the shared
+window scheduler currently belongs to replay. A multi-consumer full-index run
+therefore does not measure replay's render reuse. Benchmark provenance must pin
+the sync level and require final artifact/vector coverage for either path.
+
+The long-term convergence is a document execution session independent of its
+publication sink: immutable prepared source, bounded page windows, task-specific
+consumers, and typed staged results. Precommit execution must collect into the
+pending commit, while replay retains attempt-scoped durable staging and lease
+recovery. Share preparation/execution policy, not mutable runtime state or the
+commit protocol. Moving full-index work after commit merely to activate replay
+would change failure/atomicity semantics and is not this optimization.
+
+Speculative render preparers snapshot their owner's cancellation/deadline and
+lifecycle token before dispatch. Renewing an operation timeout for scratch retry
+must never renew the request deadline or read a sibling's mutable active guard.
+
+Local inference transport now distinguishes a request rejected before dispatch
+(`QueueFull`) from response-capacity/transport failure after possible execution.
+Only the former enters the scheduler's bounded drain-and-retry path. RPC request
+offers are admitted before attachment transfer; response denial remains a
+generic retryable failure, not a claim that model execution never occurred.
+This preserves useful parallel consumers without repeatedly restarting a whole
+document for admission pressure or blindly replaying successful generation.
+
 - Whether immutable font program parsing should eventually be frozen and
   shared across render windows. The safe implementation retains a private font
   cache only for the joined waves of one bounded batch and keeps image caches

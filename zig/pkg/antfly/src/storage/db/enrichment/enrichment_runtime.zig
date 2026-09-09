@@ -14479,6 +14479,10 @@ fn renderRuntimePdfWindow(
 /// lane; no second caller touches the session until this preparation returns.
 const RuntimePdfRenderWindowPreparer = struct {
     runtime: *EnrichmentRuntime,
+    // Snapshot the owner's guard before dispatch: shared consumers may change
+    // runtime.active_provider_guard while a speculative window is rendering.
+    guard: ForegroundCatchUpGuard = .{},
+    lifecycle: CancellationToken = .none,
     producer: asset_producer_mod.Producer,
     coordinator: *RuntimePdfOcrCoordinator,
     config: document_extraction_mod.Config,
@@ -14494,7 +14498,8 @@ const RuntimePdfRenderWindowPreparer = struct {
 
     fn isCancelled(context: ?*const anyopaque) bool {
         const self: *const @This() = @ptrCast(@alignCast(context orelse return true));
-        return self.cancel_requested.load(.acquire) or
+        self.guard.check() catch return true;
+        return self.lifecycle.isCancelled() or self.cancel_requested.load(.acquire) or
             platform_time.monotonicNs() >= self.coordinator.deadline.deadline_ns;
     }
 
@@ -14507,7 +14512,8 @@ const RuntimePdfRenderWindowPreparer = struct {
     }
 
     fn prepareMode(self: *const @This(), start_index: usize, speculative: bool) !RuntimePdfRenderWindow {
-        if (self.cancel_requested.load(.acquire)) return error.Canceled;
+        try self.guard.check();
+        if (self.lifecycle.isCancelled() or self.cancel_requested.load(.acquire)) return error.Canceled;
         self.coordinator.beginOperation(self.runtime.syncWaitTimeoutMs());
         self.coordinator.session.setCancellationProbe(self.cancellationProbe());
         const available_bytes = try self.coordinator.availableRenderBytes();
@@ -14536,6 +14542,39 @@ const RuntimePdfRenderWindowPreparer = struct {
         return window;
     }
 };
+
+test "enrichment PDF preparers retain owner cancellation across operation retries" {
+    var coordinator: RuntimePdfOcrCoordinator = undefined;
+    coordinator.deadline = .{ .deadline_ns = std.math.maxInt(u64) };
+    var local = std.atomic.Value(bool).init(false);
+    var owner = std.atomic.Value(bool).init(false);
+    var lifecycle = std.atomic.Value(bool).init(false);
+    inline for (.{ RuntimePdfRenderWindowPreparer, PdfEmbeddingWindowPreparer }) |Preparer| {
+        // No runtime/provider access is needed by the worker's copied probe.
+        var preparer: Preparer = undefined;
+        preparer.coordinator = &coordinator;
+        preparer.cancel_requested = &local;
+        preparer.guard = .{ .cancellation = CancellationToken.fromAtomic(&owner) };
+        preparer.lifecycle = CancellationToken.fromAtomic(&lifecycle);
+        const probe = preparer.cancellationProbe();
+        try probe.check();
+        owner.store(true, .release);
+        try std.testing.expectError(error.Canceled, probe.check());
+        owner.store(false, .release);
+        preparer.guard.deadline_ns = 0;
+        // A renewed per-operation deadline must not renew the owner's deadline.
+        coordinator.deadline.deadline_ns = std.math.maxInt(u64);
+        try std.testing.expectError(error.Canceled, probe.check());
+        preparer.guard.deadline_ns = null;
+        lifecycle.store(true, .release);
+        try std.testing.expectError(error.Canceled, probe.check());
+        lifecycle.store(false, .release);
+        local.store(true, .release);
+        try std.testing.expectError(error.Canceled, probe.check());
+        local.store(false, .release);
+        try probe.check();
+    }
+}
 
 /// A one-shot launch hook, not another executor. The callback and context are
 /// copied into the task so this stack-local hook need not survive the launch.
@@ -14723,6 +14762,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         const coordinator = pdf_coordinator orelse return error.InvalidPdfRenderCoordinator;
         pdf_window_preparer = .{
             .runtime = runtime,
+            .guard = runtime.active_provider_guard,
+            .lifecycle = runtime.config.cancellation,
             .producer = invocation_producer,
             .coordinator = coordinator,
             .config = config,
@@ -20681,6 +20722,8 @@ const PdfEmbeddingPreparedWindow = struct {
 
 const PdfEmbeddingWindowPreparer = struct {
     runtime: *EnrichmentRuntime,
+    guard: ForegroundCatchUpGuard = .{},
+    lifecycle: CancellationToken = .none,
     coordinator: *RuntimePdfOcrCoordinator,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     render_config: document_extraction_mod.Config,
@@ -20698,7 +20741,8 @@ const PdfEmbeddingWindowPreparer = struct {
 
     fn isCancelled(raw: ?*const anyopaque) bool {
         const self: *const @This() = @ptrCast(@alignCast(raw orelse return true));
-        return self.cancel_requested.load(.acquire) or
+        self.guard.check() catch return true;
+        return self.lifecycle.isCancelled() or self.cancel_requested.load(.acquire) or
             platform_time.monotonicNs() >= self.coordinator.deadline.deadline_ns;
     }
 
@@ -20711,6 +20755,8 @@ const PdfEmbeddingWindowPreparer = struct {
     }
 
     fn prepareMode(self: *const @This(), first_item: usize, speculative: bool) !PdfEmbeddingPreparedWindow {
+        try self.guard.check();
+        if (self.lifecycle.isCancelled() or self.cancel_requested.load(.acquire)) return error.Canceled;
         // A speculative window is prepared on an Io worker while the
         // enrichment worker consumes and stages the current window. Keep all
         // allocations reachable from that task on a thread-safe allocator;
@@ -21369,6 +21415,8 @@ fn processPdfPageImageEmbeddingWithAllocator(
     var prefetch_cancel_requested: std.atomic.Value(bool) = .init(false);
     const window_preparer = PdfEmbeddingWindowPreparer{
         .runtime = runtime,
+        .guard = runtime.active_provider_guard,
+        .lifecycle = runtime.config.cancellation,
         .coordinator = coordinator,
         .resource_manager = resource_tracker.manager,
         .render_config = render_config,

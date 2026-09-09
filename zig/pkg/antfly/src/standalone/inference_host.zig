@@ -851,7 +851,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
     if (state.worker) |worker| {
         // Mirror the shared local request gate before crossing the transport.
-        if (!state.node.tryAcquireRequestSlot()) return error.ResourceTemporarilyUnavailable;
+        if (!state.node.tryAcquireRequestSlot()) return error.QueueFull;
         defer state.node.releaseRequestSlot();
         const result = try worker_runtime.invokeProvider(worker, context);
         var json = switch (result) {
