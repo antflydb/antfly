@@ -18,8 +18,8 @@ pub const BuildInfo = struct {
     module: *std.Build.Module,
     object: *std.Build.Step.Compile,
 
-    /// Call only at a final executable/shared-library/test link. Runtime
-    /// archives import `module` directly and must not depend on `object`.
+    /// Call only for final release-metadata consumers. Runtime archives and
+    /// unit tests import `module` directly and must not depend on `object`.
     pub fn link(self: BuildInfo, module: *std.Build.Module) void {
         module.addImport("build_info", self.module);
         module.addObject(self.object);

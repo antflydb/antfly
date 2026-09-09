@@ -156,6 +156,42 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assertNotIn("jit-source-identity", output)
         self.assertEqual(self.probe(output), before)
 
+        # Inactive settings are absent from product cache identities, but remain
+        # available to CPU-hosted backend qualification tests.
+        self.build("cache-product-options", "cache-qualification-options")
+        for settings, expected in (
+            (("-Dcuda-artifacts=portable",), "portable auto wasm32 false"),
+            (("-Dwasm-memory-model=wasm64",), "fatbin auto wasm64 false"),
+            (("-Dwebgpu=true",), "fatbin auto wasm32 true"),
+        ):
+            with self.subTest(settings=settings):
+                output = self.build(
+                    "cache-probe", "cache-product-options", settings=settings
+                )
+                self.assert_archives(output)
+                self.assertEqual(self.probe(output), before)
+                self.assertEqual(
+                    self.probe(output, "OPTIONS_PROBE"), "fatbin auto wasm32 false"
+                )
+                qualified = self.build("cache-qualification-options", settings=settings)
+                self.assertEqual(self.probe(qualified, "OPTIONS_PROBE"), expected)
+
+        enabled = self.build(
+            "cache-product-options",
+            backend="cuda",
+            settings=("-Dcuda-artifacts=portable",),
+        )
+        self.assertEqual(
+            self.probe(enabled, "OPTIONS_PROBE"), "portable auto wasm32 false"
+        )
+
+        # The real test module graph must stay cached when release metadata changes.
+        self.build("cache-unit-tests")
+        unit_versioned = self.build("cache-unit-tests", version="cache-after")
+        self.assertRegex(unit_versioned, r"compile test Debug \S+ cached")
+        self.assertNotRegex(unit_versioned, r"compile test Debug \S+ success")
+        self.assertNotIn("antfly-build-info", unit_versioned)
+
         for schema in SCHEMAS:
             with self.subTest(schema=schema):
                 path = self.own(schema)
@@ -228,6 +264,33 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assertIn(
             "FileNotFound", self.build("runtime-unit-api_kernel", succeeds=False)
         )
+
+    def test_host_generator_cache_contracts(self):
+        names = ("openapi-zig", "antfly-quant-kernel-codegen", "protoc-zig", "yacc-zig")
+        self.build("cache-host-tools")
+        for settings in (
+            ("-Doptimize=ReleaseFast",),
+            ("-Doptimize=ReleaseSafe", "-Dcuda-artifacts=portable", "-Dwebgpu=true"),
+            ("-Dtarget=x86_64-linux-musl", "-Doptimize=ReleaseFast"),
+        ):
+            with self.subTest(settings=settings):
+                output = self.build("cache-host-tools", settings=settings)
+                for name in names:
+                    self.assertRegex(
+                        output, rf"compile exe {name} ReleaseSafe \S+ cached"
+                    )
+
+        # Real generator source remains an input despite independence from the
+        # product profile, target, and inactive backend settings.
+        source = self.own("zig/pkg/inference/src/quant_kernel_codegen_main.zig")
+        source.write_bytes(source.read_bytes() + b"\n// generator cache regression\n")
+        output = self.build("cache-host-tools")
+        self.assertRegex(
+            output, r"compile exe antfly-quant-kernel-codegen ReleaseSafe \S+ success"
+        )
+        for name in names:
+            if name != "antfly-quant-kernel-codegen":
+                self.assertRegex(output, rf"compile exe {name} ReleaseSafe \S+ cached")
 
     def test_enabled_backend_identities(self):
         for backend, source in (("metal", METAL), ("cuda", CUDA)):

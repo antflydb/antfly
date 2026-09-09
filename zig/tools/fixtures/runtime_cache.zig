@@ -29,6 +29,75 @@ pub fn build(b: *std.Build) void {
         inference.inference_hf_tokenizer_mod.import_table.get("inference_tokenizer") != inference.inference_tokenizer_mod)
         @panic("tokenizer dependencies do not share the configured modules");
     const sources = b.addWriteFiles();
+    var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+    for (b.top_level_steps.values()) |top| collectSteps(&top.step, &steps, &modules);
+    const host_tools = b.step("cache-host-tools", "Compile the actual host generators");
+    const unit_tests = b.step("cache-unit-tests", "Exercise actual test imports with stable metadata");
+    unit_tests.dependOn(&b.addRunArtifact(artifacts.runtime.antfly_main_tests).step);
+    var template: ?*std.Build.Step.Compile = null;
+    var host_count: usize = 0;
+    var test_count: usize = 0;
+    var iterator = steps.keyIterator();
+    while (iterator.next()) |entry| {
+        const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
+        if (artifact.kind.isTest()) {
+            var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+            rejectMetadata(artifact.root_module, inference.build_info_object, &seen);
+            test_count += 1;
+        }
+        if (artifact.root_module.root_source_file) |source| switch (source) {
+            .src_path => |path| {
+                if (std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) template = artifact;
+                if (artifact.kind.isTest() and std.mem.endsWith(u8, path.sub_path, "/lite_main.zig"))
+                    unit_tests.dependOn(&b.addRunArtifact(artifact).step);
+            },
+            else => {},
+        };
+        if (std.mem.eql(u8, artifact.name, "antfly-inference-audio-bench") and
+            artifact.root_module.import_table.contains("build_options"))
+            @panic("audio benchmark depends on inference build options");
+        for ([_][]const u8{ "openapi-zig", "antfly-quant-kernel-codegen", "protoc-zig", "yacc-zig" }) |name| {
+            if (!std.mem.eql(u8, artifact.name, name)) continue;
+            // yacc-zig also has an installed, product-configured executable.
+            // Select the instance actually used for SQL generation.
+            if (std.mem.eql(u8, name, "yacc-zig") and !isSqlGenerator(b, artifact)) continue;
+            if (artifact.root_module.optimize != .ReleaseSafe or
+                !artifact.root_module.resolved_target.?.query.eql(b.graph.host.query))
+                std.debug.panic("{s} inherits product configuration", .{name});
+            if (artifact.root_module.import_table.contains("build_options"))
+                std.debug.panic("{s} inherits backend options", .{name});
+            host_tools.dependOn(&artifact.step);
+            host_count += 1;
+        }
+    }
+    if (host_count != 4 or test_count == 0) @panic("cache fixture did not inspect the expected production graph");
+    const template_tests = template orelse @panic("missing Antfly template suite");
+    template_tests.root_module.root_source_file = sources.add("template_test.zig",
+        \\test "unit metadata is stable without a release object" {
+        \\    try @import("std").testing.expectEqualStrings("test", @import("build_info").version());
+        \\}
+    );
+    unit_tests.dependOn(&b.addRunArtifact(template_tests).step);
+
+    inline for (.{ .{ "cache-product-options", inference.build_options_mod }, .{ "cache-qualification-options", inference.qualification_build_options_mod } }) |probe| {
+        const executable = b.addExecutable(.{
+            .name = probe[0],
+            .root_module = b.createModule(.{
+                .root_source_file = sources.add("options_probe.zig",
+                    \\pub fn main() void {
+                    \\    const options = @import("options");
+                    \\    @import("std").debug.print("OPTIONS_PROBE {s} {s} {s} {}\n", .{
+                    \\        options.cuda_artifacts, options.cuda_libraries, options.wasm_memory_model, options.enable_webgpu,
+                    \\    });
+                    \\}
+                ),
+                .target = b.graph.host,
+                .imports = &.{.{ .name = "options", .module = probe[1] }},
+            }),
+        });
+        b.step(probe[0], "Read actual configured backend options").dependOn(&b.addRunArtifact(executable).step);
+    }
     inline for (std.meta.tags(runtime.RuntimeLibraryUnit)) |unit| {
         const artifact = artifacts.runtime.runtime_library_artifacts[@intFromEnum(unit)].?;
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -119,4 +188,44 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
             std.debug.panic("remote CLI depends on local implementation: {s}", .{name});
         inspect(entry.value_ptr.*, unit, metadata, seen);
     }
+}
+
+// Follow generated sources as well as explicit steps, without freezing module
+// graphs before the fixture replaces the expensive compilation bodies.
+fn collectSteps(step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((steps.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    for (step.dependencies.items) |dependency| collectSteps(dependency, steps, modules);
+    if (step.cast(std.Build.Step.Compile)) |artifact| collectModules(artifact.root_module, steps, modules);
+}
+
+fn collectModules(module: *std.Build.Module, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((modules.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    if (module.root_source_file) |source| switch (source) {
+        .generated => |generated| collectSteps(generated.file.step, steps, modules),
+        else => {},
+    };
+    for (module.link_objects.items) |object| switch (object) {
+        .other_step => |artifact| collectSteps(&artifact.step, steps, modules),
+        else => {},
+    };
+    for (module.import_table.values()) |dependency| collectModules(dependency, steps, modules);
+}
+
+fn rejectMetadata(module: *std.Build.Module, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    for (module.link_objects.items) |object| switch (object) {
+        .other_step => |artifact| {
+            if (artifact == metadata) @panic("unit test depends on release metadata");
+            rejectMetadata(artifact.root_module, metadata, seen);
+        },
+        else => {},
+    };
+    for (module.import_table.values()) |dependency| rejectMetadata(dependency, metadata, seen);
+}
+
+fn isSqlGenerator(b: *std.Build, artifact: *std.Build.Step.Compile) bool {
+    var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+    collectSteps(&b.top_level_steps.get("sql-grammar-generated-check").?.step, &steps, &modules);
+    return steps.contains(&artifact.step);
 }

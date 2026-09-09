@@ -41,8 +41,7 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
     ctx.step("gliner2-entity-training-readiness", "Run GLiNER2 entity training readiness").dependOn(&readiness.step);
 
     const suite = tests.create(ctx);
-    const bge = benches.createBge(ctx).bge_m3_e2e_bench_exe;
-    const bge_tests = ctx.b.addTest(.{ .root_module = bge.root_module });
+    const bge_tests = benches.createBge(ctx).tests;
     const test_step = tests.addDefault(ctx, suite, .{
         .codegen = checks.createCodegen(ctx).quant_kernel_codegen_test_check,
         .cuda_source = checks.createCudaSourceCheck(ctx).cuda_artifact_source_policy_check,

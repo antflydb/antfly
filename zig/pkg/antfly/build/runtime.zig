@@ -89,7 +89,7 @@ pub const AddRuntimeOptions = struct {
     libantfly_link_mod: *std.Build.Module,
 };
 pub const AddRuntimeResult = struct {
-    antfly_main_mod: *std.Build.Module,
+    antfly_main_tests: *std.Build.Step.Compile,
     antfly_main: *std.Build.Step.Compile,
     runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
 };
@@ -108,16 +108,29 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const antfly_client_pkg_mod = options.antfly_client_pkg_mod;
     const capi_mod = options.capi_mod;
     const libantfly_link_mod = options.libantfly_link_mod;
-    const antfly_main_mod = b.createModule(.{
+    const main_module_options: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("pkg/antfly/src/main.zig"),
         .target = target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .imports = &.{
+            .{ .name = "antfly-client", .module = antfly_client_pkg_mod },
+            .{ .name = "structlog", .module = structlog_mod },
+            .{ .name = "antfly_platform", .module = platform_mod },
+            .{ .name = "antfly_hash", .module = hash_mod },
+            .{ .name = "build_info", .module = production_antfly_imports.build_info.module },
+        },
+    };
+    const antfly_main_mod = b.createModule(main_module_options);
+    // Tests share imports, not the product's final-link inputs and archives.
+    const antfly_main_tests = b.addTest(.{
+        .root_module = b.createModule(main_module_options),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
-    antfly_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    antfly_main_mod.addImport("structlog", structlog_mod);
-    antfly_main_mod.addImport("antfly_platform", platform_mod);
-    antfly_main_mod.addImport("antfly_hash", hash_mod);
+    addMacosSdkPaths(b, antfly_main_tests.root_module, target);
     production_antfly_imports.build_info.link(antfly_main_mod);
     production_antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, antfly_main_mod, target);
@@ -303,7 +316,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         setStripRecursively(capi_mod, &visited);
     }
     return .{
-        .antfly_main_mod = antfly_main_mod,
+        .antfly_main_tests = antfly_main_tests,
         .antfly_main = antfly_main,
         .runtime_library_artifacts = runtime_library_artifacts,
     };

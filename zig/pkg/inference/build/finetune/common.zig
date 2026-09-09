@@ -206,7 +206,7 @@ fn configureNative(
 ) void {
     if (native_link != .none or containsImport(imports, .inference_internal)) {
         artifact.root_module.addImport("build_info", ctx.build_info_mod);
-        artifact.root_module.addObject(ctx.build_info_object);
+        if (!artifact.kind.isTest()) artifact.root_module.addObject(ctx.build_info_object);
     }
     if (native_link != .none) ctx.identities.addImports(artifact.root_module);
     // inference_internal already owns the Metal translation unit. Adding it to

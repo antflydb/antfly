@@ -166,7 +166,7 @@ pub const AntflyRootImports = struct {
 
     pub fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         self.configureRuntime(b, mod, include_lmdb_c, link_libc, true);
-        self.build_info.link(mod);
+        mod.addImport("build_info", self.build_info.module);
     }
 
     /// Remote commands depend on client contracts and transport. In particular,

@@ -98,6 +98,8 @@ pub const Graph = struct {
     identities: jit_identity.Modules,
     build_options: *std.Build.Step.Options,
     build_options_mod: *std.Build.Module,
+    /// Explicit settings for backend qualification, including inactive backends.
+    qualification_build_options_mod: *std.Build.Module,
     json_mod: *std.Build.Module,
     httpx_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
@@ -148,6 +150,12 @@ pub fn create(config: Config) Graph {
 
     const build_options = addBuildOptions(b, backend);
     const build_options_mod = build_options.createModule();
+    const qualification_options = addExplicitBuildOptions(b, backend);
+    // Equal generated files must share one module identity in a compilation.
+    const qualification_build_options_mod = if (std.mem.eql(u8, build_options.contents.items, qualification_options.contents.items))
+        build_options_mod
+    else
+        qualification_options.createModule();
     const identities = jit_identity.create(b, b.path(paths.inference_root), backend.enable_metal, backend.enable_cuda);
 
     const json_mod = shared.json orelse createSharedModule(config, "lib/json/src/mod.zig");
@@ -359,6 +367,7 @@ pub fn create(config: Config) Graph {
         .identities = identities,
         .build_options = build_options,
         .build_options_mod = build_options_mod,
+        .qualification_build_options_mod = qualification_build_options_mod,
         .json_mod = json_mod,
         .httpx_mod = httpx_mod,
         .platform_mod = platform_mod,
@@ -471,7 +480,21 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     }
 }
 
+/// Product artifacts depend only on settings for compiled backends.
 pub fn addBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.Step.Options {
+    var active = backend;
+    if (!active.enable_cuda) {
+        active.cuda_artifacts = "fatbin";
+        active.cuda_libraries = "auto";
+    }
+    if (!active.enable_wasm) {
+        active.enable_webgpu = false;
+        active.wasm_memory_model = "wasm32";
+    }
+    return addExplicitBuildOptions(b, active);
+}
+
+fn addExplicitBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.Step.Options {
     const options = b.addOptions();
     addCommonOptions(options, backend);
     options.addOption(bool, "enable_ffmpeg_audio", backend.enable_ffmpeg_audio);
@@ -556,8 +579,8 @@ fn addInferenceApiModule(
     }
 
     const openapi_dep = b.dependency("openapi", .{
-        .target = target,
-        .optimize = optimize,
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
     });
     const convert = b.addSystemCommand(&.{
         "uv",

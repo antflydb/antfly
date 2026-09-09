@@ -624,7 +624,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        quant_kernel_cuda_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_attention_diff_exe.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_attention_diff_exe.root_module);
         quant_kernel_cuda_attention_diff_exe.root_module.link_libc = true;
         const run_quant_kernel_cuda_attention_diff = b.addRunArtifact(quant_kernel_cuda_attention_diff_exe);
@@ -665,7 +665,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_paged_attention_diff_exe.root_module);
         quant_kernel_cuda_paged_attention_diff_exe.root_module.link_libc = true;
         const quant_kernel_cuda_paged_attention_diff_tests = b.addTest(.{
@@ -675,7 +675,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_paged_attention_diff_tests.root_module);
         quant_kernel_cuda_paged_attention_diff_tests.root_module.link_libc = true;
         const run_quant_kernel_cuda_paged_attention_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_tests);
@@ -708,7 +708,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        quant_kernel_cuda_paged_prefill_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_prefill_diff_exe.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_paged_prefill_diff_exe.root_module);
         quant_kernel_cuda_paged_prefill_diff_exe.root_module.link_libc = true;
         const quant_kernel_cuda_paged_prefill_diff_tests = b.addTest(.{
@@ -718,7 +718,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        quant_kernel_cuda_paged_prefill_diff_tests.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_paged_prefill_diff_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_paged_prefill_diff_tests.root_module);
         quant_kernel_cuda_paged_prefill_diff_tests.root_module.link_libc = true;
         const run_quant_kernel_cuda_paged_prefill_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_tests);
@@ -748,7 +748,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        quant_kernel_cuda_ffn_diff_exe.root_module.addImport("build_options", build_options_mod);
+        quant_kernel_cuda_ffn_diff_exe.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
         runtime_graph.identities.addImports(quant_kernel_cuda_ffn_diff_exe.root_module);
         quant_kernel_cuda_ffn_diff_exe.root_module.link_libc = true;
         const run_quant_kernel_cuda_ffn_diff = b.addRunArtifact(quant_kernel_cuda_ffn_diff_exe);
@@ -1484,9 +1484,7 @@ pub fn build(b: *std.Build) void {
     const tests = suite.tests;
     const run_cli_tests = suite.run_cli_tests;
 
-    const bge_m3_e2e_bench_tests = b.addTest(.{
-        .root_module = bge_m3_e2e_bench_exe.root_module,
-    });
+    const bge_m3_e2e_bench_tests = bge_benchmark.tests;
     const run_bge_m3_e2e_bench_tests = b.addRunArtifact(bge_m3_e2e_bench_tests);
     const bge_m3_e2e_bench_test_step = b.step(
         "test-bge-m3-e2e-benchmark",
@@ -1543,7 +1541,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"wasm_compute:"},
     });
-    wasm_compute_tests.root_module.addImport("build_options", build_options_mod);
+    wasm_compute_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
     wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);
     wasm_compute_tests.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1598,7 +1596,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"projector"},
     });
-    web_projector_tests.root_module.addImport("build_options", build_options_mod);
+    web_projector_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     web_projector_tests.root_module.addImport("httpx", httpx_mod);
     web_projector_tests.root_module.addImport("inference_api", inference_api_mod);
     web_projector_tests.root_module.addImport("inference_audio", inference_audio_mod);

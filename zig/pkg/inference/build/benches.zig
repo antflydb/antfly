@@ -124,7 +124,6 @@ pub fn addAudio(ctx: Context) void {
             .optimize = .ReleaseFast,
         }),
     });
-    audio_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
     audio_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     audio_bench_exe.root_module.link_libc = true;
     const run_audio_bench = ctx.addRunArtifact(audio_bench_exe);
@@ -137,18 +136,21 @@ pub fn addAudio(ctx: Context) void {
 
 pub const CreateBgeResult = struct {
     bge_m3_e2e_bench_exe: *std.Build.Step.Compile,
+    tests: *std.Build.Step.Compile,
 };
 
 pub fn createBge(ctx: Context) CreateBgeResult {
     const b = ctx.b;
+    const module_options: std.Build.Module.CreateOptions = .{
+        .root_source_file = ctx.path("src/bench/bge_m3_e2e.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    };
     const bge_m3_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-bge-m3-e2e-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = ctx.path("src/bench/bge_m3_e2e.zig"),
-            .target = ctx.target,
-            .optimize = ctx.optimize,
-        }),
+        .root_module = b.createModule(module_options),
     });
+    const tests = b.addTest(.{ .root_module = b.createModule(module_options) });
     const bge_m3_runtime_mod = b.createModule(.{
         .root_source_file = ctx.path("src/bge_m3_runtime.zig"),
         .target = ctx.target,
@@ -184,19 +186,22 @@ pub fn createBge(ctx: Context) CreateBgeResult {
     bge_m3_runtime_mod.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     bge_m3_runtime_mod.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
     bge_m3_runtime_mod.addImport("antfly_extracting", ctx.graph.extracting_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("ml", ctx.graph.ml_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("pjrt", ctx.graph.pjrt_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("antfly_image", ctx.graph.image_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("onnx_graph", ctx.graph.onnx_graph_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("bge_m3_runtime", bge_m3_runtime_mod);
-    ctx.configureNativeTool(bge_m3_e2e_bench_exe, ctx.backend.enable_metal);
-    runtime_build.configureOnnxRuntime(b, bge_m3_e2e_bench_exe.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
+    for ([_]*std.Build.Step.Compile{ bge_m3_e2e_bench_exe, tests }) |artifact| {
+        artifact.root_module.addImport("build_options", ctx.graph.build_options_mod);
+        artifact.root_module.addImport("ml", ctx.graph.ml_mod);
+        artifact.root_module.addImport("pjrt", ctx.graph.pjrt_mod);
+        artifact.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+        artifact.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
+        artifact.root_module.addImport("antfly_image", ctx.graph.image_mod);
+        artifact.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
+        artifact.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
+        artifact.root_module.addImport("onnx_graph", ctx.graph.onnx_graph_mod);
+        artifact.root_module.addImport("bge_m3_runtime", bge_m3_runtime_mod);
+        ctx.configureNativeTool(artifact, ctx.backend.enable_metal);
+        runtime_build.configureOnnxRuntime(b, artifact.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
+    }
     return .{
         .bge_m3_e2e_bench_exe = bge_m3_e2e_bench_exe,
+        .tests = tests,
     };
 }

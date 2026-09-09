@@ -260,7 +260,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     addSnowballRegenStep(b);
     addSnowballCheckStep(b);
     const openapi_build = b.lazyImport(@This(), "openapi") orelse return null;
-    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, optimize, addLocalHttpxModule(b, b.graph.host, optimize));
+    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .ReleaseSafe, addLocalHttpxModule(b, b.graph.host, .ReleaseSafe));
     const openapi_sources = addOpenApiSourceSteps(b, openapi_codegen);
     const update_public_openapi = b.addUpdateSourceFiles();
     update_public_openapi.addCopyFileToSource(openapi_sources.public_spec, "../openapi.yaml");
@@ -282,7 +282,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root = b.path("lib/sql"),
         .target = target,
         .optimize = optimize,
-        .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, optimize),
+        .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .ReleaseSafe),
         .compare_tool = tools_build.addFileCompareTool(b, b.path("tools")),
         .grammar_label = "lib/sql/grammar/antfly_sql.y",
     });
@@ -1488,17 +1488,10 @@ pub fn create(b: *std.Build) ?Artifacts {
         .capi_mod = capi_mod,
         .libantfly_link_mod = libantfly_link_mod,
     });
-    const antfly_main_mod = runtime.antfly_main_mod;
     const antfly_main = runtime.antfly_main;
     const runtime_library_artifacts = runtime.runtime_library_artifacts;
 
-    const antfly_main_tests = b.addTest(.{
-        .root_module = antfly_main_mod,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
+    const antfly_main_tests = runtime.antfly_main_tests;
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
     addRuntimeTestFilters(b, run_antfly_main_tests, selectTestFilters(b, &.{}));
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
@@ -1528,16 +1521,20 @@ pub fn create(b: *std.Build) ?Artifacts {
     antfly_step.dependOn(&install_antfly.step);
     antfly_step.dependOn(&install_antfarm_assets.step);
 
-    const lite_main_mod = b.createModule(.{
+    const lite_module_options: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("pkg/antfly/src/lite_main.zig"),
         .target = target,
         .optimize = optimize,
-    });
+        .imports = &.{
+            .{ .name = "build_info", .module = build_info.module },
+            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "structlog", .module = structlog_mod },
+            .{ .name = "antfly_platform", .module = platform_mod },
+            .{ .name = "antfly_hash", .module = hash_mod },
+        },
+    };
+    const lite_main_mod = b.createModule(lite_module_options);
     build_info.link(lite_main_mod);
-    lite_main_mod.addOptions("build_options", build_options);
-    lite_main_mod.addImport("structlog", structlog_mod);
-    lite_main_mod.addImport("antfly_platform", platform_mod);
-    lite_main_mod.addImport("antfly_hash", hash_mod);
     const lite_main = b.addExecutable(.{
         .name = "antfly-lite",
         .root_module = lite_main_mod,
@@ -1559,7 +1556,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_antfly_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
     run_antfly_lite_cli_smoke.addArtifactArg(antfly_main);
     const lite_main_tests = b.addTest(.{
-        .root_module = lite_main_mod,
+        .root_module = b.createModule(lite_module_options),
         .filters = &.{"lite main compiles"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

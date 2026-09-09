@@ -17,6 +17,9 @@
 extern fn antfly_build_info_version(length: *usize) [*]const u8;
 
 pub fn version() []const u8 {
+    // Unit tests exercise metadata consumers with a deterministic value. The
+    // release object belongs only to binaries that report a release version.
+    if (@import("builtin").is_test) return "test";
     var length: usize = undefined;
     const pointer = antfly_build_info_version(&length);
     return pointer[0..length];

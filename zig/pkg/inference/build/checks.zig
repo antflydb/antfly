@@ -30,11 +30,10 @@ pub fn createCodegen(ctx: Context) CreateCodegenResult {
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/quant_kernel_codegen_main.zig"),
             .target = b.graph.host,
-            .optimize = ctx.optimize,
+            .optimize = .ReleaseSafe,
+            .link_libc = true,
         }),
     });
-    quant_kernel_codegen_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
-    quant_kernel_codegen_exe.root_module.link_libc = ctx.backend.link_libc;
     const quant_kernel_codegen_check = ctx.addRunArtifact(quant_kernel_codegen_exe);
     if (ctx.args) |args| {
         quant_kernel_codegen_check.addArgs(args);

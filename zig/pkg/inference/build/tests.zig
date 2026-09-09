@@ -43,9 +43,9 @@ pub fn create(ctx: Context) Suite {
         .filters = main_test_filters,
         .test_runner = runtime_filter_test_runner,
     });
-    ctx.graph.linkBuildInfo(tests.root_module);
+    tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     ctx.graph.identities.addImports(tests.root_module);
-    tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);
     tests.root_module.addImport("inference_api", ctx.graph.inference_api_mod);
@@ -94,7 +94,7 @@ pub fn create(ctx: Context) Suite {
         .filters = main_test_filters,
         .test_runner = runtime_filter_test_runner,
     });
-    ctx.graph.linkBuildInfo(cli_tests.root_module);
+    cli_tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     cli_tests.root_module.addImport("inference", ctx.graph.inference_mod);
     cli_tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
     cli_tests.root_module.addImport("structlog", ctx.graph.structlog_mod);
@@ -144,7 +144,6 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
                 .optimize = ctx.optimize,
             }),
         });
-        ctx.graph.linkBuildInfo(fixture.root_module);
         fixture.root_module.addImport("inference", ctx.graph.inference_mod);
         fixture.root_module.addImport("httpx", ctx.graph.httpx_mod);
         fixture.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
