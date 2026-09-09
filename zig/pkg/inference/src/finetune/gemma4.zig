@@ -1552,6 +1552,7 @@ pub fn prepareMultimodalInputsFromChatData(
     defer dummy_ws.resident_weights.deinit(allocator);
     defer dummy_ws.lazy_weights.deinit(allocator);
     var native_engine = native_compute.NativeCompute.init(allocator, &dummy_ws, null);
+    defer native_engine.deinit();
     const projector_cb = native_engine.computeBackend();
     var media_token_cache = PrepareMediaTokenCache{};
     defer media_token_cache.deinit(allocator);

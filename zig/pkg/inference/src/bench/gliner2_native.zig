@@ -815,6 +815,7 @@ pub fn main(init: std.process.Init) !void {
     switch (cfg.backend) {
         .native => {
             var compute = NativeCompute.init(allocator, &weight_store, null);
+            defer compute.deinit();
             const cb = compute.computeBackend();
             try runBenchmark(allocator, &cb, cfg, inputs, &weight_store);
         },

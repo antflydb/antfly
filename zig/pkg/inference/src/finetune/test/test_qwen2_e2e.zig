@@ -329,6 +329,7 @@ test "Qwen2 e2e: loss decreases over training steps" {
 
     // 2. Create compute backend.
     var native = NativeCompute.init(allocator, &weight_store, null);
+    defer native.deinit();
     var cb = native.computeBackend();
 
     // 3. Create the RealAutodiffTrainer with LoRA targeting q_proj + v_proj.

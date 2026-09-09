@@ -375,3 +375,24 @@ Please ensure:
 ## Support
 
 For issues and feature requests, please use the [GitHub issue tracker](https://github.com/antfly/antfly-sdk-ts/issues).
+
+## Agent capacity errors
+
+Retrieval and query-builder HTTP capacity failures reject with `InferenceCapacityError`,
+which exposes `retryable`, `reason`, `code`, and `retryAfterMs`. Once an SSE stream has
+started, receive the same typed error through `onErrorDetail`; the existing `onError`
+callback still receives a message string. Retry only after the indicated delay.
+
+```typescript
+import { AntflyClient, InferenceCapacityError } from '@antfly/sdk';
+
+const client = new AntflyClient({ baseUrl: 'http://localhost:8080' });
+const request = { query: 'Find relevant notes', queries: [{ table: 'notes' }] };
+await client.streamRetrievalAgent(request, {
+  onErrorDetail(error) {
+    if (error instanceof InferenceCapacityError) {
+      console.log(`Retry after ${error.retryAfterMs} ms: ${error.reason}`);
+    }
+  },
+});
+```

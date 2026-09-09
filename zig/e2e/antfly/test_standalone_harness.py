@@ -16,6 +16,10 @@
 
 import pytest
 import requests
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -23,6 +27,119 @@ import conftest as e2e_conftest
 import helpers
 import test_backup_restore as backups
 import test_standalone as standalone
+
+
+@pytest.mark.parametrize(
+    "failure_phase, preservation, retained",
+    [
+        ("none", "failure", False),
+        ("setup", "failure", True),
+        ("call", "failure", True),
+        ("teardown", "failure", True),
+        ("earlier_call", "failure", True),
+        ("teardown", "never", False),
+        ("none", "always", True),
+        ("cleanup", "never", False),
+    ],
+)
+def test_cli_runtime_preservation_uses_completed_module_reports(
+    tmp_path, failure_phase, preservation, retained
+):
+    # Run real pytest finalizers and the real CLI fixture: a mocked report cannot
+    # expose the ordering between module shutdown and the last teardown report.
+    probe = tmp_path / "test_cli_preservation.py"
+    probe.write_text("""
+import os
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+
+import pytest
+import conftest as harness
+import test_cli as cli_tests
+
+cli_server = cli_tests.cli_server
+phase = os.environ["PROBE_FAILURE_PHASE"]
+
+@pytest.fixture(scope="module")
+def cli_inference_servers():
+    def server_factory(*args):
+        server = object.__new__(harness.StandaloneAntflyServer)
+        server.tempdir = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        root = Path(server.tempdir.name)
+        Path("runtime-path").write_text(str(root))
+        server.log_file = (root / "server.log").open("w")
+        server.log_file.write("retained diagnostics")
+        server.proc = None
+        server.port_reservations = SimpleNamespace(close=lambda: None)
+        server._stop_process = lambda: Path("process-stopped").touch()
+        if phase == "cleanup":
+            def cleanup_error():
+                raise OSError("injected cleanup failure")
+            server.tempdir.cleanup = cleanup_error
+        return server
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("ANTFLY_BIN", sys.executable)
+        patch.setattr(cli_tests, "find_free_port", lambda: 0)
+        patch.setattr(cli_tests, "StandaloneAntflyServer", server_factory)
+        yield {}
+        # This dependency finalizes after cli_server has stopped its process.
+        assert Path("process-stopped").exists()
+        assert Path(Path("runtime-path").read_text()).exists()
+        if phase == "teardown":
+            raise RuntimeError("injected teardown failure")
+
+@pytest.fixture
+def setup_probe(cli_server):
+    if phase == "setup":
+        raise RuntimeError("injected setup failure")
+
+def test_first(cli_server):
+    assert phase != "earlier_call", "injected earlier call failure"
+
+def test_last(cli_server, setup_probe):
+    assert phase != "call", "injected call failure"
+""")
+    env = os.environ.copy()
+    env.update(
+        PYTHONPATH=str(Path(e2e_conftest.__file__).parent),
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+        PROBE_FAILURE_PHASE=failure_phase,
+        ANTFLY_E2E_PRESERVE_ROOT="1" if preservation == "always" else "0",
+        ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE=("1" if preservation == "failure" else "0"),
+    )
+    env.pop("PYTEST_ADDOPTS", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "xdist.plugin",
+            "-p",
+            "conftest",
+            "--confcutdir",
+            str(tmp_path),
+            "-q",
+            str(probe),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = result.stdout + result.stderr
+    assert "INTERNALERROR" not in output, output
+    assert result.returncode == (0 if failure_phase == "none" else 1), output
+    if failure_phase != "none":
+        assert "injected" in output, output
+    root = Path((tmp_path / "runtime-path").read_text())
+    assert root.exists() is retained, output
+    if retained:
+        assert (root / "server.log").read_text() == "retained diagnostics"
 
 
 @pytest.mark.parametrize("total", [10 * 1024**3, 1024**4])
@@ -287,13 +404,78 @@ def test_table_cleanup_does_not_hide_server_crash(monkeypatch, outcome):
 
 def test_table_cleanup_does_not_retry_after_deadline(monkeypatch):
     api, calls = _cleanup_api(monkeypatch, [requests.Timeout("delete timed out"), 204])
-    clock = iter([0.0, 0.0, 30.0])
-    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: next(clock))
+    clock = [0.0]
+    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: clock[0])
+    delete = api.s.delete
+
+    def timed_out_delete(*args, **kwargs):
+        clock[0] = 30.0
+        return delete(*args, **kwargs)
+
+    api.s.delete = timed_out_delete
     errors = e2e_conftest._cleanup_created_tables(api, {"table"})
     assert len(errors) == 1
     assert "delete timed out" in errors[0]
     assert len(calls) == 1
     assert calls[0][1]["timeout"] == 30
+    assert not api._request_lock.locked()
+
+
+def test_table_cleanup_does_not_retry_when_sleep_passes_deadline(monkeypatch):
+    api, calls = _cleanup_api(monkeypatch, [requests.ConnectionError("reset"), 204])
+    clock = [0.0]
+    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        e2e_conftest.time, "sleep", lambda _: clock.__setitem__(0, 31.0)
+    )
+    errors = e2e_conftest._cleanup_created_tables(api, {"table"})
+    assert len(errors) == 1
+    assert "deadline expired" in errors[0]
+    assert len(calls) == 1
+    assert not api._request_lock.locked()
+
+
+@pytest.mark.parametrize(
+    "delay, acquired, request_timeout",
+    [(30.0, False, None), (31.0, True, None), (29.0, True, 1.0)],
+)
+def test_table_cleanup_bounds_lock_wait_and_rechecks_deadline(
+    monkeypatch, delay, acquired, request_timeout
+):
+    api, calls = _cleanup_api(monkeypatch, [204])
+    clock = [0.0]
+    monkeypatch.setattr(e2e_conftest.time, "monotonic", lambda: clock[0])
+
+    class ContendedLock:
+        releases = 0
+
+        def acquire(self, *, timeout=-1):
+            assert timeout == 30.0, "cleanup must bound the lock wait"
+            clock[0] += delay
+            return acquired
+
+        def release(self):
+            self.releases += 1
+
+        def __enter__(self):
+            self.acquire()
+
+        def __exit__(self, *args):
+            self.release()
+
+    lock = ContendedLock()
+    api._request_lock = lock
+    errors = e2e_conftest._cleanup_created_tables(api, {"table"})
+    assert lock.releases == int(acquired)
+    if request_timeout is None:
+        assert calls == []
+        assert len(errors) == 1
+        assert "cleanup server diagnostics" in errors[0]
+        assert "request lock" in errors[0] or "deadline" in errors[0]
+    else:
+        assert errors == []
+        assert len(calls) == 1
+        assert calls[0][1]["timeout"] == request_timeout
 
 
 def _seed_cluster(monkeypatch, outcomes):
@@ -310,12 +492,14 @@ def _seed_cluster(monkeypatch, outcomes):
         outcome = next(pending)
         if isinstance(outcome, Exception):
             raise outcome
-        status, body = outcome
+        status, body, *headers = outcome
         response = requests.Response()
         response.status_code = status
         response._content = body
         response.url = url
         response.request = requests.Request("POST", url).prepare()
+        if headers:
+            response.headers.update(headers[0])
         return response
 
     return (
@@ -327,6 +511,123 @@ def _seed_cluster(monkeypatch, outcomes):
         SimpleNamespace(post=post),
         calls,
     )
+
+
+def _create_not_admitted():
+    return (
+        503,
+        b'{"code":"metadata_leader_unavailable","retryable":true}',
+        {"X-Antfly-Metadata-Mutation-Not-Admitted": "true", "Retry-After": "1"},
+    )
+
+
+@pytest.mark.parametrize("success_status", [200, 202])
+def test_cluster_create_retries_only_proven_non_admission(
+    monkeypatch, capsys, success_status
+):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch, [_create_not_admitted(), (success_status, b"{}")]
+    )
+    definition = {"num_shards": 3, "description": "backup"}
+    assert (
+        backups._create_cluster_table_when_admitted(
+            cluster, session, "docs", definition
+        )
+        == {}
+    )
+    assert [call["json"] for call in calls] == [definition, definition]
+    assert [call["timeout"] for call in calls] == [30.0, 29.0]
+    assert "admitted after 2 attempts" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        (
+            409,
+            b"table mutation outcome is unknown; observe table state before retrying",
+        ),
+        (409, b"table already exists"),
+        (503, _create_not_admitted()[1]),
+        (503, _create_not_admitted()[1], {"X-Antfly-Metadata-Not-Leader": "true"}),
+        (
+            503,
+            _create_not_admitted()[1],
+            {"X-Antfly-Metadata-Mutation-Not-Admitted": "false"},
+        ),
+        (
+            503,
+            _create_not_admitted()[1],
+            {
+                **_create_not_admitted()[2],
+                "X-Antfly-Raft-Mutation-Outcome": "unknown-v1",
+            },
+        ),
+        (
+            503,
+            _create_not_admitted()[1],
+            {
+                **_create_not_admitted()[2],
+                "X-Antfly-Raft-Mutation-Outcome": "committed-v1",
+            },
+        ),
+        (
+            503,
+            b'{"code":"metadata_leader_unavailable","retryable":false}',
+            _create_not_admitted()[2],
+        ),
+        (
+            503,
+            b'{"code":"different_error","retryable":true}',
+            _create_not_admitted()[2],
+        ),
+        (503, b"malformed response", _create_not_admitted()[2]),
+        (500, b"internal failure"),
+        requests.ConnectionError("response lost"),
+        requests.Timeout("request timed out"),
+    ],
+)
+def test_cluster_create_does_not_replay_uncertain_outcomes(monkeypatch, outcome):
+    cluster, session, calls = _seed_cluster(monkeypatch, [outcome])
+    with pytest.raises(AssertionError, match="cluster write diagnostics"):
+        backups._create_cluster_table_when_admitted(cluster, session, "docs", {})
+    assert len(calls) == 1
+
+
+def test_cluster_create_deadline_bounds_requests_and_retains_rejection(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [_create_not_admitted()] * 3)
+    with pytest.raises(AssertionError, match="admission deadline exceeded") as exc:
+        backups._create_cluster_table_when_admitted(
+            cluster, session, "docs", {}, timeout_s=2.5
+        )
+    assert [call["timeout"] for call in calls] == [2.5, 1.5, 0.5]
+    assert "last_status=503" in str(exc.value)
+    assert "cluster write diagnostics" in str(exc.value)
+
+
+def test_cluster_create_does_not_send_after_backoff_overshoots_deadline(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [_create_not_admitted()])
+    monkeypatch.setattr(
+        backups.time,
+        "sleep",
+        lambda _: monkeypatch.setattr(backups.time, "monotonic", lambda: 31.0),
+    )
+    with pytest.raises(AssertionError, match="admission deadline exceeded"):
+        backups._create_cluster_table_when_admitted(cluster, session, "docs", {})
+    assert len(calls) == 1
+
+
+def test_cluster_create_stops_when_server_exits(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [_create_not_admitted()])
+
+    def assert_alive():
+        if calls:
+            raise RuntimeError("data server exited")
+
+    cluster.assert_processes_alive = assert_alive
+    with pytest.raises(RuntimeError, match="data server exited"):
+        backups._create_cluster_table_when_admitted(cluster, session, "docs", {})
+    assert len(calls) == 1
 
 
 def test_cluster_seed_waits_for_precommit_write_admission(monkeypatch):

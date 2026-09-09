@@ -47,14 +47,21 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
 
     var current = std.ArrayListUnmanaged(PositionedSection).empty;
     defer current.deinit(alloc);
-    var current_tokens: usize = 0;
     var previous_text: []const u8 = "";
     var previous_start: usize = 0;
     var chunk_id: u32 = 0;
 
     for (sections) |section| {
-        const section_tokens = try countTokens(alloc, tokenizer, section.text);
-        if (current_tokens > 0 and current_tokens + section_tokens > target_tokens) {
+        // Empty and tokenizer-empty sections (such as whitespace) are only
+        // boundaries. They must not anchor a span or emit a chunk artifact.
+        if (section.tokens == 0) continue;
+        const section_tokens = section.tokens;
+        // Count the actual source span, including separators between sections.
+        const candidate_tokens = if (current.items.len > 0)
+            try countTokens(alloc, tokenizer, text[current.items[0].start .. section.start + section.text.len])
+        else
+            section_tokens;
+        if (current.items.len > 0 and candidate_tokens > target_tokens) {
             try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
             previous_start = current.items[0].start;
             chunk_id += 1;
@@ -62,18 +69,20 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
 
             previous_text = chunks.items[chunks.items.len - 1].text.?;
             current.clearRetainingCapacity();
-            current_tokens = 0;
 
             if (overlap_tokens > 0 and previous_text.len > 0) {
-                const overlap_start = computeOverlapStart(alloc, tokenizer, previous_text, overlap_tokens);
+                // A full-size next section leaves no room for overlap.
+                const overlap_budget = @min(overlap_tokens, target_tokens -| section_tokens);
+                const overlap_start = try computeOverlapStart(alloc, tokenizer, previous_text, overlap_budget);
                 const overlap_text = previous_text[overlap_start..];
                 if (overlap_text.len > 0) {
-                    try current.append(alloc, .{
-                        .text = overlap_text,
-                        .start = previous_start + overlap_start,
-                        .tokens = try countTokens(alloc, tokenizer, overlap_text),
-                    });
-                    current_tokens = current.items[0].tokens;
+                    const overlap_candidate_tokens = try countTokens(alloc, tokenizer, text[previous_start + overlap_start .. section.start + section.text.len]);
+                    if (overlap_candidate_tokens <= target_tokens) {
+                        try current.append(alloc, .{
+                            .text = overlap_text,
+                            .start = previous_start + overlap_start,
+                        });
+                    }
                 }
             }
         }
@@ -83,7 +92,6 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
             .start = section.start,
             .tokens = section_tokens,
         });
-        current_tokens += section_tokens;
     }
 
     if (current.items.len > 0 and chunks.items.len < max_chunks) {
@@ -176,40 +184,45 @@ fn appendTokenWindowChunks(
     section: PositionedSection,
     target_tokens: usize,
     out: *std.ArrayListUnmanaged(PositionedSection),
-) !void {
+) anyerror!void {
     var encoded_with_offsets = try tokenizer.encodeWithOffsets(alloc, section.text);
     if (encoded_with_offsets) |*encoded| {
         defer encoded.deinit(alloc);
         if (encoded.ids.items.len == 0) return;
-        if (try appendTokenWindowChunksWithOffsets(alloc, section, encoded, target_tokens, out)) return;
-        try appendTokenWindowChunksByDecodedSearch(alloc, tokenizer, section, encoded.ids.items, target_tokens, out);
+        if (try appendTokenWindowChunksWithOffsets(alloc, tokenizer, section, encoded, target_tokens, out)) return;
+        try appendTokenWindowChunksBySource(alloc, tokenizer, section, encoded.ids.items.len, target_tokens, out);
         return;
     }
 
     const token_ids = try tokenizer.tokenizer().encode(alloc, section.text);
     defer alloc.free(token_ids);
     if (token_ids.len == 0) return;
-    try appendTokenWindowChunksByDecodedSearch(alloc, tokenizer, section, token_ids, target_tokens, out);
+    try appendTokenWindowChunksBySource(alloc, tokenizer, section, token_ids.len, target_tokens, out);
 }
 
 fn appendTokenWindowChunksWithOffsets(
     alloc: Allocator,
+    tokenizer: *HfTokenizer,
     section: PositionedSection,
     encoded: anytype,
     target_tokens: usize,
     out: *std.ArrayListUnmanaged(PositionedSection),
-) !bool {
+) anyerror!bool {
     const token_len = encoded.ids.items.len;
     if (encoded.offsets.items.len != token_len) return false;
     const offsets = encoded.offsets.items;
 
     var start_token: usize = 0;
+    var previous_end: usize = 0;
     while (start_token < token_len) {
         const token_count = @min(target_tokens, token_len - start_token);
         const start_rel: usize = offsets[start_token][0];
         const end_rel: usize = offsets[start_token + token_count - 1][1];
         if (start_rel > end_rel or end_rel > section.text.len) return false;
-        if (start_rel == end_rel and end_rel < section.text.len) return false;
+        if (start_rel >= end_rel or start_rel < previous_end) return false;
+        if (previousUtf8Boundary(section.text, start_rel) != start_rel or
+            previousUtf8Boundary(section.text, end_rel) != end_rel) return false;
+        previous_end = end_rel;
         start_token += token_count;
     }
 
@@ -218,52 +231,65 @@ fn appendTokenWindowChunksWithOffsets(
         const token_count = @min(target_tokens, token_len - start_token);
         const start_rel: usize = offsets[start_token][0];
         const end_rel: usize = offsets[start_token + token_count - 1][1];
-        try out.append(alloc, .{
+        try appendValidatedTokenWindow(alloc, tokenizer, .{
             .text = section.text[start_rel..end_rel],
             .start = section.start + start_rel,
-            .tokens = token_count,
-        });
+        }, section.text.len, target_tokens, out);
         start_token += token_count;
     }
     return true;
 }
 
-fn appendTokenWindowChunksByDecodedSearch(
+fn appendTokenWindowChunksBySource(
     alloc: Allocator,
     tokenizer: *HfTokenizer,
     section: PositionedSection,
-    token_ids: []const i32,
+    total_tokens: usize,
     target_tokens: usize,
     out: *std.ArrayListUnmanaged(PositionedSection),
-) !void {
-    var start_token: usize = 0;
-    var search_start: usize = 0;
-    while (start_token < token_ids.len) {
-        const token_count = @min(target_tokens, token_ids.len - start_token);
-        const piece_text = try tokenizer.tokenizer().decode(alloc, token_ids[start_token .. start_token + token_count]);
-        defer alloc.free(piece_text);
-        const remaining_tokens = token_ids.len - start_token;
-        const rel, const end_rel = findDecodedWindow(section.text, search_start, piece_text) orelse blk: {
-            const fallback_end = fallbackWindowEnd(section.text, search_start, token_count, remaining_tokens);
-            break :blk .{ search_start, fallback_end };
-        };
-        const start = section.start + rel;
-        try out.append(alloc, .{
-            .text = section.text[rel..end_rel],
-            .start = start,
-            .tokens = token_count,
-        });
-        search_start = end_rel;
-        start_token += token_count;
+) anyerror!void {
+    // Decoded tokens may be normalized or contain [UNK], so substring search
+    // cannot establish source offsets. Partition the original bytes instead;
+    // proportional boundaries are only hints and every span is revalidated.
+    var remaining_tokens = total_tokens;
+    var start_rel: usize = 0;
+    while (remaining_tokens > 0 and start_rel < section.text.len) {
+        const token_count = @min(target_tokens, remaining_tokens);
+        const end_rel = fallbackWindowEnd(section.text, start_rel, token_count, remaining_tokens);
+        try appendValidatedTokenWindow(alloc, tokenizer, .{
+            .text = section.text[start_rel..end_rel],
+            .start = section.start + start_rel,
+        }, section.text.len, target_tokens, out);
+        start_rel = end_rel;
+        remaining_tokens -= token_count;
     }
 }
 
-fn findDecodedWindow(text: []const u8, search_start: usize, piece_text: []const u8) ?struct { usize, usize } {
-    if (piece_text.len == 0 or search_start > text.len) return null;
-    const rel = std.mem.indexOfPos(u8, text, search_start, piece_text) orelse return null;
-    const end = rel + piece_text.len;
-    if (end > text.len) return null;
-    return .{ rel, end };
+fn appendValidatedTokenWindow(
+    alloc: Allocator,
+    tokenizer: *HfTokenizer,
+    window: PositionedSection,
+    parent_bytes: usize,
+    target_tokens: usize,
+    out: *std.ArrayListUnmanaged(PositionedSection),
+) anyerror!void {
+    if (window.text.len == 0) return;
+    // A continuation token can become several tokens when its source substring
+    // is encoded alone. Store the independent count, not the original ID count.
+    const tokens = try countTokens(alloc, tokenizer, window.text);
+    if (tokens <= target_tokens) {
+        try out.append(alloc, .{ .text = window.text, .start = window.start, .tokens = tokens });
+    } else if (window.text.len < parent_bytes) {
+        try appendTokenWindowChunks(alloc, tokenizer, window, target_tokens, out);
+    } else {
+        // Offset normalization or source-boundary fallback can retain the whole
+        // parent span. Require byte progress before trying another token split.
+        var split = previousUtf8Boundary(window.text, window.text.len / 2);
+        if (split == 0) split = nextUtf8Boundary(window.text, 1);
+        if (split >= window.text.len) return error.ChunkTokenBudgetTooSmall;
+        try appendTokenWindowChunks(alloc, tokenizer, .{ .text = window.text[0..split], .start = window.start }, target_tokens, out);
+        try appendTokenWindowChunks(alloc, tokenizer, .{ .text = window.text[split..], .start = window.start + split }, target_tokens, out);
+    }
 }
 
 fn fallbackWindowEnd(text: []const u8, start: usize, token_count: usize, remaining_tokens: usize) usize {
@@ -303,13 +329,23 @@ fn countTokens(alloc: Allocator, tokenizer: *HfTokenizer, text: []const u8) !usi
     return ids.len;
 }
 
-fn computeOverlapStart(alloc: Allocator, tokenizer: *HfTokenizer, text: []const u8, overlap_tokens: usize) usize {
-    const ids = tokenizer.tokenizer().encode(alloc, text) catch return 0;
-    defer alloc.free(ids);
-    if (ids.len <= overlap_tokens) return 0;
-    const overlap_text = tokenizer.tokenizer().decode(alloc, ids[ids.len - overlap_tokens ..]) catch return 0;
-    defer alloc.free(overlap_text);
-    return std.mem.lastIndexOf(u8, text, overlap_text) orelse 0;
+fn computeOverlapStart(alloc: Allocator, tokenizer: *HfTokenizer, text: []const u8, overlap_tokens: usize) !usize {
+    if (overlap_tokens == 0) return text.len;
+    // Decoded tokens are normalized text, not a searchable source substring.
+    // If offsets are unavailable, omit overlap rather than retaining a prefix.
+    var encoded = (try tokenizer.encodeWithOffsets(alloc, text)) orelse return text.len;
+    defer encoded.deinit(alloc);
+    if (encoded.ids.items.len != encoded.offsets.items.len) return text.len;
+    const first = encoded.ids.items.len -| overlap_tokens;
+    for (encoded.offsets.items[first..]) |offset| {
+        const start: usize = offset[0];
+        if (start >= text.len or start > offset[1] or offset[1] > text.len) return text.len;
+        if (previousUtf8Boundary(text, start) != start) continue;
+        // Starting inside a word can change its tokenization. Only keep a
+        // suffix that fits the overlap budget when encoded independently.
+        if (try countTokens(alloc, tokenizer, text[start..]) <= overlap_tokens) return start;
+    }
+    return text.len;
 }
 
 test "fixed text chunker splits by token target" {
@@ -339,15 +375,147 @@ test "fixed text chunker rejects invalid overlap" {
     }));
 }
 
-test "decoded token window search starts from current cursor" {
-    const found = findDecodedWindow("repeat repeat", 7, "repeat") orelse return error.ExpectedMatch;
-    try std.testing.expectEqual(@as(usize, 7), found[0]);
-    try std.testing.expectEqual(@as(usize, 13), found[1]);
-}
-
-test "decoded token window fallback clamps to source bounds" {
-    try std.testing.expect(findDecodedWindow("abc", 0, "[UNK]") == null);
+test "token window fallback clamps to source bounds" {
     const end = fallbackWindowEnd("abc", 1, 1, 2);
     try std.testing.expect(end <= 3);
     try std.testing.expect(end > 1);
+}
+
+test "fixed text overlap preserves source offsets despite normalization" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    const text = "alpha beta gamma HELLO, WORLD!";
+    const start = try computeOverlapStart(alloc, tokenizer, text, 4);
+    try std.testing.expectEqualStrings("HELLO, WORLD!", text[start..]);
+    try std.testing.expectEqual(text.len, try computeOverlapStart(alloc, tokenizer, text, 0));
+    try std.testing.expectEqual(@as(usize, 0), try computeOverlapStart(alloc, tokenizer, text, 100));
+}
+
+test "fixed text overlap advances bounded chunks through mixed source text" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    const paragraph = "Korean HISTORY: Major Events (1950–1953), Seoul! Café, 日本語. Repeated WORDS; punctuation changes.\n\n";
+    const text = paragraph ** 80;
+    const chunks = try chunkText(alloc, text, .{ .target_tokens = 200, .overlap_tokens = 25, .max_chunks = 200 });
+    defer alloc.free(chunks);
+    try std.testing.expect(chunks.len > 1 and chunks.len < 200);
+    for (chunks, 0..) |chunk, i| {
+        const start = chunk.start_char.?;
+        const end = chunk.end_char.?;
+        try std.testing.expectEqualStrings(text[start..end], chunk.text.?);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.text.?));
+        try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 200);
+        if (i > 0) {
+            try std.testing.expect(start > chunks[i - 1].start_char.?);
+            try std.testing.expect(end > chunks[i - 1].end_char.?);
+        }
+    }
+    try std.testing.expect(chunks[chunks.len - 1].end_char.? >= std.mem.trimEnd(u8, text, "\n").len);
+}
+
+test "fixed text overlap leaves room for full sections and counts separators" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    for ([_][]const u8{ "alpha beta gamma delta\n\nepsilon zeta eta theta", "alpha,beta,gamma,delta,epsilon,zeta,eta,theta" }) |text| {
+        const chunks = try chunkText(alloc, text, .{ .target_tokens = 4, .overlap_tokens = 2, .separator = "," });
+        defer alloc.free(chunks);
+        for (chunks) |chunk| try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 4);
+        try std.testing.expectEqual(text.len, chunks[chunks.len - 1].end_char.?);
+    }
+}
+
+test "fixed text chunker bounds custom separator edge sections" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    for ([_][]const u8{ ",alpha", "alpha,beta,", ",,alpha,,,beta,,", " ,alpha", ",,," }) |text| {
+        const chunks = try chunkText(alloc, text, .{ .target_tokens = 1, .overlap_tokens = 0, .separator = "," });
+        defer alloc.free(chunks);
+        for (chunks, 0..) |chunk, i| {
+            try std.testing.expect(chunk.text.?.len > 0);
+            try std.testing.expect(chunk.start_char.? < chunk.end_char.?);
+            try std.testing.expectEqualStrings(text[chunk.start_char.?..chunk.end_char.?], chunk.text.?);
+            try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 1);
+            if (i > 0) try std.testing.expect(chunk.start_char.? >= chunks[i - 1].end_char.?);
+        }
+        if (std.mem.indexOf(u8, text, "alpha") != null) {
+            var found = false;
+            for (chunks) |chunk| if (std.mem.eql(u8, chunk.text.?, "alpha")) {
+                found = true;
+            };
+            try std.testing.expect(found);
+        } else try std.testing.expectEqual(@as(usize, 0), chunks.len);
+    }
+}
+
+test "fixed text token windows are independently bounded after continuation splits" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    for ([_][]const u8{ "unaffordable", "UNAFFORDABLE", "antidisestablishmentarianism", "unbelievably", "encyclopaedia", "normalization" }) |text| {
+        for ([_]usize{ 1, 2, 3 }) |target| {
+            const chunks = try chunkText(alloc, text, .{ .target_tokens = target, .overlap_tokens = 0 });
+            defer alloc.free(chunks);
+            var end: usize = 0;
+            for (chunks) |chunk| {
+                try std.testing.expectEqual(end, chunk.start_char.?);
+                try std.testing.expect(chunk.text.?.len > 0);
+                try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= target);
+                end = chunk.end_char.?;
+            }
+            try std.testing.expectEqual(text.len, end);
+        }
+    }
+    var windows = std.ArrayListUnmanaged(PositionedSection).empty;
+    defer windows.deinit(alloc);
+    const text = "unaffordable";
+    try appendValidatedTokenWindow(alloc, tokenizer, .{ .text = text, .start = 0 }, text.len, 1, &windows);
+    var end: usize = 0;
+    for (windows.items) |window| {
+        try std.testing.expectEqual(end, window.start);
+        try std.testing.expect(try countTokens(alloc, tokenizer, window.text) <= 1);
+        end = window.start + window.text.len;
+    }
+    try std.testing.expectEqual(text.len, end);
+}
+
+test "fixed text fallback preserves normalized and unknown source spans" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    for ([_][]const u8{ "AbcabcЖ", "HELLOhelloЖ", "NORMALnormalЖ", "AabcabcЖ", "caféCAFÉ", "İstanbulistanbul", "aéæa", "unaffordableЖ", "😀abc", "abc😀def" }) |text| {
+        for ([_]usize{ 1, 2, 3 }) |target| {
+            const chunks = try chunkText(alloc, text, .{ .target_tokens = target, .overlap_tokens = 0, .max_chunks = 1000 });
+            defer alloc.free(chunks);
+            var end: usize = 0;
+            for (chunks) |chunk| {
+                try std.testing.expectEqual(end, chunk.start_char.?);
+                try std.testing.expect(chunk.text.?.len > 0);
+                try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.text.?));
+                try std.testing.expectEqualStrings(text[chunk.start_char.?..chunk.end_char.?], chunk.text.?);
+                try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= target);
+                end = chunk.end_char.?;
+            }
+            try std.testing.expectEqual(text.len, end);
+        }
+    }
+}
+
+test "fixed text chunker omits tokenizer empty sections" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    for ([_][]const u8{ " ,alpha", "alpha, \t", " ,alpha, \t", " \t, \r" }) |text| {
+        const chunks = try chunkText(alloc, text, .{ .target_tokens = 1, .overlap_tokens = 0, .separator = "," });
+        defer alloc.free(chunks);
+        try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, text, "alpha") != null) 1 else 0), chunks.len);
+        for (chunks) |chunk| {
+            try std.testing.expect(std.mem.trim(u8, chunk.text.?, " \t\r\n").len > 0);
+            try std.testing.expectEqual(@as(usize, 1), try countTokens(alloc, tokenizer, chunk.text.?));
+            try std.testing.expectEqualStrings(text[chunk.start_char.?..chunk.end_char.?], chunk.text.?);
+        }
+    }
 }

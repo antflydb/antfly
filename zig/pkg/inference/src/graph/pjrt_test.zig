@@ -192,6 +192,7 @@ test "pjrt_compiler: linear partition compiles to valid HLO" {
     defer cleanupWeights(allocator, &weight_setup.ws, weight_setup.tensors);
 
     var compute = NativeCompute.init(allocator, &weight_setup.ws, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     // Partition: everything goes to PJRT
@@ -266,6 +267,7 @@ test "pjrt_executor: linear layer end-to-end" {
     defer cleanupWeights(allocator, &weight_setup.ws, weight_setup.tensors);
 
     var compute = NativeCompute.init(allocator, &weight_setup.ws, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     // Partition
@@ -375,6 +377,7 @@ test "pjrt_executor: embedding lookup uses runtime embedding ids" {
     defer cleanupWeights(allocator, &weight_setup.ws, weight_setup.tensors);
 
     var compute = NativeCompute.init(allocator, &weight_setup.ws, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     const supportsEmbedding = struct {
@@ -523,6 +526,7 @@ test "pjrt_model_runtime: decode uses single token id" {
     defer cleanupWeights(allocator, &weight_setup.ws, weight_setup.tensors);
 
     var compute = NativeCompute.init(allocator, &weight_setup.ws, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     const supportsEmbedding = struct {
@@ -598,6 +602,7 @@ test "pjrt_executor: gelu activation end-to-end" {
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
 
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     // Partition
@@ -699,6 +704,7 @@ test "pjrt_executor: linear + rms_norm + gelu pipeline" {
     defer cleanupWeights(allocator, &weight_setup.ws, weight_setup.tensors);
 
     var compute = NativeCompute.init(allocator, &weight_setup.ws, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     const caps = [_]Capability{
@@ -843,6 +849,7 @@ test "pjrt_executor: element-wise add end-to-end" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     const caps = [_]Capability{

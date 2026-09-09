@@ -2353,6 +2353,10 @@ pub fn build(b: *std.Build) void {
     });
     @call(.auto, configureEmbeddedModule, .{ b, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
     embedded_support_mod.addImport("antfly_scraping", scraping_mod);
+    embedded_support_mod.addImport("antfly_resolver", resolver_mod);
+    embedded_support_mod.addImport("antfly_matcher", matcher_mod);
+    embedded_support_mod.addImport("antfly_reader_config", reader_config_mod);
+    embedded_support_mod.addImport("antfly_transcribing", transcribing_mod);
 
     const embedded_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
@@ -3274,26 +3278,31 @@ pub fn build(b: *std.Build) void {
     const lib_image_bench_step = b.step("lib-image-bench", "Build and install lib-image-bench");
     lib_image_bench_step.dependOn(&b.addInstallArtifact(lib_image_bench, .{}).step);
 
+    const pdf_bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "pdf-optimize",
+        "Optimization for the isolated PDF executable",
+    ) orelse .ReleaseFast;
     const pdf_bench_image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_image_mod.addImport("antfly_hash", hash_bench_mod);
     const pdf_bench_font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     const pdf_bench_pdf_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     const pdf_bench_standard_fonts_mod = b.createModule(.{
         .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
@@ -3306,7 +3315,7 @@ pub fn build(b: *std.Build) void {
     const pdf_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_mod.addImport("antfly_pdf", pdf_bench_pdf_mod);
     const lib_pdf_bench = b.addExecutable(.{
@@ -3564,6 +3573,18 @@ pub fn build(b: *std.Build) void {
     const run_embedded_tests = addFilteredTestRunArtifact(b, embedded_tests);
     const embedded_test_step = b.step("embedded-test", "Run embedded API tests");
     embedded_test_step.dependOn(&run_embedded_tests.step);
+    // Imported module roots do not collect their own tests through the package
+    // surface test, so run the API fixtures in their owning module as well.
+    const embedded_api_tests = b.addTest(.{
+        .root_module = embedded_api_mod,
+        .filters = &.{
+            "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
+            "embedded api hosted profile drains derived indexing without native runtimes",
+            "embedded api hosted profile persists text index across reopen over storage",
+        },
+    });
+    const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
+    embedded_test_step.dependOn(&run_embedded_api_tests.step);
 
     const antfly_embedded_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_pkg_mod,
@@ -5554,6 +5575,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table scan as ndjson",
         "api http server routes table query through read schema full text index",
         "api http server serves table query response envelope",
+        "api http server query string boolean controls survive reopen",
         "api http server executes public Query filter roots and compositions",
         "public table query handler preserves structured filter and hierarchy diagnostics",
         "query dependency errors expose a stable JSON retry contract",

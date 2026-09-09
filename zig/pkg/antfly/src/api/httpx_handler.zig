@@ -4807,6 +4807,10 @@ pub const AntflyApiHandler = struct {
                 error.UnsupportedAgentToolProvider => return jsonErrorResponse(ctx, 400, "agent tools require an Antfly or OpenAI tool-capable generator"),
                 error.GenerateRequestFailed, error.EmptyResponse => return jsonErrorResponse(ctx, 502, "agent generation failed"),
                 error.RateLimit => return jsonErrorResponse(ctx, 429, "agent generation rate limited"),
+                error.GenerationCapacityUnavailable => {
+                    try ctx.setHeader("Retry-After", "1");
+                    return ctx.status(503).json(connections_api.generationCapacityFailure());
+                },
                 error.TableNotFound => {
                     _ = ctx.status(404);
                     return ctx.text("not found");

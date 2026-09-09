@@ -67,6 +67,8 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - uses: ./.github/actions/setup-github-cli
+
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
@@ -700,6 +702,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
+      - uses: ./.github/actions/setup-github-cli
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
@@ -1011,6 +1014,12 @@ jobs:
           token_format: access_token
       - name: Install crane
         uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      - name: Install envsubst for cosign installer
+        run: |
+          if ! command -v envsubst >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends gettext-base
+          fi
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Commit digest-pinned container version and channel aliases
         env:
@@ -1098,6 +1107,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare-release-promotion.outputs.promotion_controller_commit }}
+      - uses: ./.github/actions/setup-github-cli
       - name: Publish the verified GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
